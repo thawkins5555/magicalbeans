@@ -1,0 +1,678 @@
+/* The IPAM page: subnet discovery and inventory, IP conflicts, and read-only
+   browsing of what a Windows DHCP server reports about its own scopes and
+   leases. Three sub-views inside one tab, switched locally rather than as
+   separate top-level tabs — none of them is a whole module on its own. */
+(() => {
+  const view = {
+    sub: 'subnets',
+    subnets: [], subnetId: null,
+    hosts: [], hostSort: { key: 'ip', descending: false },
+    conflicts: [],
+    dhcpServers: [], dhcpServerId: null,
+    dhcpScopes: [], dhcpLeases: [],
+    leaseSort: { key: 'ip', descending: false },
+  };
+
+  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function ago(ts) {
+    if (!ts) return 'never';
+    const age = Date.now() / 1000 - ts;
+    if (age < 5) return 'just now';
+    if (age < 90) return `${Math.round(age)}s ago`;
+    if (age < 5400) return `${Math.round(age / 60)}m ago`;
+    if (age < 172800) return `${(age / 3600).toFixed(1)}h ago`;
+    return `${(age / 86400).toFixed(1)}d ago`;
+  }
+
+  /* A small utilization donut, drawn with the standard stroke-dasharray
+     trick — one circle per slice, each dashed to show only its own arc —
+     rather than computing SVG arc paths by hand for three fixed slices. */
+  function usageDonut(usage, size) {
+    const u = usage || {};
+    const total = u.total || (u.alive + u.seen_down + (u.never_seen || 0)) || 0;
+    const radius = size / 2 - 3;
+    const circumference = 2 * Math.PI * radius;
+    const slices = [
+      { value: u.alive || 0, color: 'var(--ok)' },
+      { value: u.seen_down || 0, color: 'var(--warn)' },
+      { value: u.never_seen || 0, color: 'var(--hairline)' },
+    ];
+    const svg = App.svgNode('svg', { width: size, height: size,
+      viewBox: `0 0 ${size} ${size}`, class: 'usage-donut' });
+    if (!total) {
+      svg.appendChild(App.svgNode('circle', {
+        cx: size / 2, cy: size / 2, r: radius, fill: 'none',
+        stroke: 'var(--hairline)', 'stroke-width': 5,
+      }));
+      return svg;
+    }
+    let offset = 0;
+    for (const slice of slices) {
+      if (!slice.value) continue;
+      const length = (slice.value / total) * circumference;
+      svg.appendChild(App.svgNode('circle', {
+        cx: size / 2, cy: size / 2, r: radius, fill: 'none',
+        stroke: slice.color, 'stroke-width': 5,
+        'stroke-dasharray': `${length} ${circumference - length}`,
+        'stroke-dashoffset': -offset,
+        transform: `rotate(-90 ${size / 2} ${size / 2})`,
+      }));
+      offset += length;
+    }
+    return svg;
+  }
+
+  function usageTooltipText(subnet) {
+    const u = subnet.usage || {};
+    const pct = (n) => u.total ? `${Math.round((n / u.total) * 100)}%` : '0%';
+    return [
+      `${subnet.label} — ${subnet.cidr}`,
+      `${u.total || 0} usable address(es)`,
+      `alive        ${u.alive || 0}  (${pct(u.alive || 0)})`,
+      `seen, down   ${u.seen_down || 0}  (${pct(u.seen_down || 0)})`,
+      `never seen   ${u.never_seen || 0}  (${pct(u.never_seen || 0)})`,
+    ].join('\n');
+  }
+
+  /* The larger chart for whichever subnet is currently selected, above its
+     host table — same donut helper as the sidebar, just bigger, with the
+     counts spelled out beside it rather than left to a tooltip. */
+  function drawSubnetDetail() {
+    const container = App.el('ipam-subnet-detail');
+    const subnet = view.subnets.find((s) => s.id === view.subnetId);
+    container.innerHTML = '';
+    if (!subnet) {
+      container.innerHTML = '<p class="hint">Add a subnet on the left to see its address usage here.</p>';
+      return;
+    }
+
+    container.appendChild(usageDonut(subnet.usage, 120));
+
+    const u = subnet.usage || {};
+    const total = u.total || 0;
+    const pct = (n) => total ? `${Math.round((n / total) * 100)}%` : '0%';
+    const scan = subnet.last_scan;
+    const scanLine = subnet.scanning ? 'Scanning now\u2026'
+      : scan ? `Last scan ${ago(scan.finished)} \u00b7 ${scan.alive}/${scan.addresses} answered` +
+               (scan.conflicts ? `, ${scan.conflicts} new conflict(s)` : '')
+      : 'Never scanned yet';
+
+    const text = document.createElement('div');
+    text.className = 'subnet-detail-text';
+    text.innerHTML =
+      `<div class="subnet-detail-title">${escape(subnet.label)}` +
+      `${subnet.enabled ? '' : ' (disabled)'} \u2014 ${escape(subnet.cidr)}</div>` +
+      `<div class="subnet-detail-rows">` +
+      `<div><span class="legend-dot" style="background:var(--ok)"></span>Alive` +
+      ` <b>${u.alive || 0}</b> <span class="hint">(${pct(u.alive || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--warn)"></span>Seen before, now down` +
+      ` <b>${u.seen_down || 0}</b> <span class="hint">(${pct(u.seen_down || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Never seen` +
+      ` <b>${u.never_seen || 0}</b> <span class="hint">(${pct(u.never_seen || 0)})</span></div>` +
+      `</div>` +
+      `<div class="hint">${total} usable address(es) \u00b7 ${escape(scanLine)}</div>`;
+    container.appendChild(text);
+  }
+
+  /* -------------------------------------------------------------- sub-tabs */
+
+  function selectSub(name) {
+    view.sub = name;
+    for (const btn of document.querySelectorAll('.subtab')) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const page of document.querySelectorAll('.subpage')) {
+      page.classList.toggle('active', page.id === `ipam-sub-${name}`);
+    }
+  }
+
+  /* ---------------------------------------------------------------- status */
+
+  function drawStatus() {
+    const ipam = (App.state.serverState || {}).ipam || {};
+    const dot = App.el('ipam-dot');
+    dot.style.background = ipam.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('ipam-status').textContent = ipam.running
+      ? 'Worker running' : 'Worker stopped';
+    const parts = [];
+    if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
+    if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
+    App.el('ipam-counters').textContent = parts.join(' · ');
+
+    const badge = App.el('ipam-conflict-badge');
+    const count = ipam.open_conflicts || 0;
+    badge.textContent = count;
+    badge.hidden = count === 0;
+  }
+
+  /* -------------------------------------------------------------- subnets */
+
+  function renderSubnets() {
+    const table = App.el('ipam-subnet-table');
+    table.innerHTML = '';
+    const body = document.createElement('tbody');
+    for (const subnet of view.subnets) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable' + (subnet.id === view.subnetId ? ' selected' : '');
+      const scan = subnet.last_scan;
+      const scanText = subnet.scanning ? 'scanning…'
+        : scan ? `${scan.alive}/${scan.addresses} alive · ${ago(scan.finished)}`
+        : 'never scanned';
+
+      const td = document.createElement('td');
+      const row = document.createElement('div');
+      row.className = 'subnet-row';
+      row.appendChild(usageDonut(subnet.usage, 30));
+      const text = document.createElement('div');
+      text.className = 'subnet-row-text';
+      text.innerHTML =
+        `<div class="name">${escape(subnet.label)}${subnet.enabled ? '' : ' (disabled)'}</div>` +
+        `<div class="host">${escape(subnet.cidr)}</div>` +
+        `<div class="hint">${escape(scanText)}</div>`;
+      row.appendChild(text);
+      td.appendChild(row);
+      tr.appendChild(td);
+
+      const tip = usageTooltipText(subnet);
+      tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
+      tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.onclick = () => {
+        view.subnetId = subnet.id;
+        renderSubnets();
+        drawSubnetDetail();
+        loadHosts();
+      };
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  function subnetForm(subnet) {
+    const s = subnet || {};
+    return `
+      <fieldset><legend>SUBNET</legend>
+        <label>CIDR <input id="sn-cidr" placeholder="10.20.3.0/24" value="${escape(s.cidr ?? '')}"></label>
+        <label>Label <input id="sn-label" value="${escape(s.label ?? '')}"></label>
+        <label>VLAN <input id="sn-vlan" value="${escape(s.vlan ?? '')}"></label>
+        <p class="hint" id="sn-error"></p>
+      </fieldset>`;
+  }
+
+  async function addSubnet() {
+    App.modal('Add subnet', subnetForm(null), [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (b) => {
+        try {
+          const payload = await App.post('/api/ipam/subnets', {
+            cidr: b.querySelector('#sn-cidr').value.trim(),
+            label: b.querySelector('#sn-label').value.trim(),
+            vlan: b.querySelector('#sn-vlan').value.trim(),
+          });
+          view.subnetId = payload.id;
+          App.closeModal();
+          await loadSubnets();
+        } catch (error) {
+          b.querySelector('#sn-error').innerHTML =
+            `<span class="err">${escape(error.message)}</span>`;
+        }
+      } },
+    ]);
+  }
+
+  async function editSubnet() {
+    const subnet = view.subnets.find((s) => s.id === view.subnetId);
+    if (!subnet) return;
+    App.modal('Edit subnet', subnetForm(subnet) +
+      `<label class="check"><input type="checkbox" id="sn-enabled" ${subnet.enabled ? 'checked' : ''}> Enabled</label>`,
+      [
+        { label: 'Cancel', onClick: App.closeModal },
+        { label: 'Remove subnet', onClick: async () => {
+          await App.del(`/api/ipam/subnets/${subnet.id}`);
+          view.subnetId = null;
+          App.closeModal();
+          await loadSubnets();
+        } },
+        { label: 'Clear stats', onClick: async (b) => {
+          try {
+            const result = await App.post(`/api/ipam/subnets/${subnet.id}/clear`, {});
+            b.querySelector('#sn-error').innerHTML =
+              `<span style="color:var(--ok)">Cleared ${result.hosts} host(s) and ` +
+              `${result.scans} scan record(s). The subnet itself is unchanged ` +
+              `and its conflict history is kept — the next scan starts fresh.</span>`;
+            await loadSubnets();
+          } catch (error) {
+            b.querySelector('#sn-error').innerHTML =
+              `<span class="err">${escape(error.message)}</span>`;
+          }
+        } },
+        { label: 'Save', primary: true, onClick: async (b) => {
+          await App.put(`/api/ipam/subnets/${subnet.id}`, {
+            cidr: b.querySelector('#sn-cidr').value.trim(),
+            label: b.querySelector('#sn-label').value.trim(),
+            vlan: b.querySelector('#sn-vlan').value.trim(),
+            enabled: b.querySelector('#sn-enabled').checked,
+          });
+          App.closeModal();
+          await loadSubnets();
+        } },
+      ]);
+  }
+
+  async function scanNow() {
+    if (!view.subnetId) return;
+    await App.post(`/api/ipam/subnets/${view.subnetId}/scan`, {});
+    App.refreshNow('ipam');
+  }
+
+  async function loadSubnets() {
+    const payload = await App.get('/api/ipam/subnets');
+    view.subnets = payload.subnets;
+    if (view.subnetId && !view.subnets.some((s) => s.id === view.subnetId)) {
+      view.subnetId = null;
+    }
+    if (!view.subnetId && view.subnets.length) view.subnetId = view.subnets[0].id;
+    renderSubnets();
+    drawSubnetDetail();
+    await loadHosts();
+  }
+
+  /* ---------------------------------------------------------------- hosts */
+
+  /* `last_up` is when the address last actually replied; `first_seen` is
+     when it was first probed, which is not the same thing and was labelled
+     as though it were. An address that has never answered now shows "never"
+     rather than a recent-looking timestamp left by the last sweep. */
+  const HOST_COLUMNS = [
+    { key: 'ip', label: 'IP address', width: 130, value: (r) => r.ip },
+    { key: 'mac', label: 'MAC', width: 150, value: (r) => r.mac || '' },
+    { key: 'alive', label: 'Alive', width: 70, value: (r) => (r.alive ? 1 : 0) },
+    { key: 'hostname', label: 'Hostname', width: 220, value: (r) => r.hostname || '' },
+    { key: 'last_up', label: 'Last reply', width: 110, numeric: true,
+      align: 'left', descendingFirst: true, value: (r) => r.last_up },
+    { key: 'first_seen', label: 'First probed', width: 120, numeric: true,
+      align: 'left', value: (r) => r.first_seen },
+  ];
+
+  function onHostSort(key, descending) {
+    view.hostSort = { key, descending };
+    drawHosts();
+  }
+
+  function drawHosts() {
+    const table = App.grid(App.el('ipam-hosts-table'),
+      { name: 'ipam-hosts', columns: HOST_COLUMNS, sort: view.hostSort, onSort: onHostSort });
+    const body = document.createElement('tbody');
+    const aliveOnly = App.el('ipam-alive-only').checked;
+    const rows = App.sortRows(
+      aliveOnly ? view.hosts.filter((h) => h.alive) : view.hosts,
+      view.hostSort.key, view.hostSort.descending, HOST_COLUMNS);
+    for (const host of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${escape(host.ip)}</td>` +
+        `<td>${escape(host.mac || '—')}</td>` +
+        `<td>${host.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
+        `<td>${escape(host.hostname || '')}</td>` +
+        `<td>${ago(host.last_up)}</td>` +
+        `<td>${ago(host.first_seen)}</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.el('ipam-hosts-count').textContent = `${rows.length} of ${view.hosts.length}`;
+  }
+
+  async function loadHosts() {
+    if (!view.subnetId) {
+      view.hosts = [];
+      drawHosts();
+      return;
+    }
+    const payload = await App.get('/api/ipam/hosts', { subnet_id: view.subnetId });
+    view.hosts = payload.hosts;
+    drawHosts();
+  }
+
+  /* ----------------------------------------------------------- conflicts */
+
+  function drawConflicts() {
+    const table = App.el('ipam-conflicts-table');
+    table.innerHTML = '<thead><tr><th>IP address</th><th>First MAC</th>' +
+      '<th>Second MAC</th><th>Source</th><th>Detected</th><th>Last seen</th>' +
+      '<th></th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const c of view.conflicts) {
+      const tr = document.createElement('tr');
+      const sourceText = c.source === 'scan_dhcp'
+        ? 'wire vs. DHCP lease' : 'wire, two scans';
+      tr.innerHTML =
+        `<td>${escape(c.ip)}</td><td>${escape(c.mac_a)}</td><td>${escape(c.mac_b)}</td>` +
+        `<td>${sourceText}</td><td>${ago(c.detected)}</td><td>${ago(c.last_seen)}</td><td></td>`;
+      if (!c.resolved) {
+        const button = document.createElement('button');
+        button.textContent = 'Mark resolved';
+        button.onclick = async () => {
+          await App.post(`/api/ipam/conflicts/${c.id}/resolve`, {});
+          await loadConflicts();
+        };
+        tr.lastElementChild.appendChild(button);
+      } else {
+        tr.lastElementChild.textContent = `resolved ${ago(c.resolved)}`;
+      }
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.el('ipam-conflicts-count').textContent =
+      `${view.conflicts.length} ${App.el('ipam-show-resolved').checked ? '' : 'open '}conflict(s)`;
+  }
+
+  async function loadConflicts() {
+    const resolved = App.el('ipam-show-resolved').checked;
+    const payload = await App.get('/api/ipam/conflicts', resolved ? { resolved: 1 } : {});
+    view.conflicts = payload.conflicts;
+    drawConflicts();
+  }
+
+  /* ---------------------------------------------------------------- dhcp */
+
+  function renderDhcpServers() {
+    const table = App.el('ipam-dhcp-server-table');
+    table.innerHTML = '';
+    const body = document.createElement('tbody');
+    for (const server of view.dhcpServers) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable' + (server.id === view.dhcpServerId ? ' selected' : '');
+      const statusText = server.polling ? 'polling…'
+        : server.last_status === 'ok' ? `ok · ${ago(server.last_poll)}`
+        : server.last_status === 'error' ? `error · ${ago(server.last_poll)}`
+        : 'never polled';
+      const statusClass = server.last_status === 'error' ? 'sev sev-1' : 'hint';
+      const authText = server.has_credential
+        ? `stored credential \u00b7 ${escape(server.username || '')}` : 'ambient identity';
+      tr.innerHTML =
+        `<td><div class="name">${escape(server.label)}${server.enabled ? '' : ' (disabled)'}</div>` +
+        `<div class="host">${escape(server.address)}</div>` +
+        `<div class="hint">${authText}</div>` +
+        `<div class="${statusClass}">${escape(statusText)}</div></td>`;
+      tr.onclick = () => {
+        view.dhcpServerId = server.id;
+        renderDhcpServers();
+        loadDhcpDetail();
+      };
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  function dhcpServerForm(server) {
+    const s = server || {};
+    return `
+      <fieldset><legend>SERVER</legend>
+        <label>Hostname or address <input id="dh-address" placeholder="dhcp01.corp.local" value="${escape(s.address ?? '')}"></label>
+        <label>Label <input id="dh-label" value="${escape(s.label ?? '')}"></label>
+        <p class="hint">Read-only: scopes and leases only, never a write.</p>
+      </fieldset>
+      <fieldset><legend>AUTHENTICATION</legend>
+        <label>Username <input id="dh-username" placeholder="CORP\\svc-sappiwhere-ro" value="${escape(s.username ?? '')}"></label>
+        <label>Password <input id="dh-password" type="password" autocomplete="new-password" placeholder="${s.has_credential ? 'stored — leave blank to keep it' : 'leave blank to skip a stored credential'}"></label>
+        <p class="hint">${s.has_credential
+          ? 'A credential is stored, encrypted for this machine only. Fill in both fields to replace it, or leave both blank and save to keep it as is.'
+          : 'Leave both blank to authenticate as whichever Windows account runs SappiWhere, or via a matching entry in Windows Credential Manager for this server\u2019s name — nothing is stored either way. Fill in both to store a read-only credential instead, encrypted for this machine.'}</p>
+      </fieldset>
+      <div class="hint" id="dh-error"></div>`;
+  }
+
+  function readDhcpForm(box) {
+    return {
+      address: box.querySelector('#dh-address').value.trim(),
+      label: box.querySelector('#dh-label').value.trim(),
+      username: box.querySelector('#dh-username').value.trim(),
+      password: box.querySelector('#dh-password').value,
+    };
+  }
+
+  /* Saves address/label, then applies whatever the credential fields say:
+     both filled -> store/replace it; both blank -> leave it as it was. A
+     single filled field is treated as blank, since a lone username or a lone
+     password is not something the backend can act on either. */
+  async function applyCredential(serverId, fields) {
+    if (fields.username && fields.password) {
+      await App.post(`/api/ipam/dhcp/servers/${serverId}/credential`,
+        { username: fields.username, password: fields.password });
+    }
+  }
+
+  async function addDhcpServer() {
+    App.modal('Add DHCP server', dhcpServerForm(null), [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (b) => {
+        const fields = readDhcpForm(b);
+        try {
+          const payload = await App.post('/api/ipam/dhcp/servers', {
+            address: fields.address, label: fields.label,
+          });
+          await applyCredential(payload.id, fields);
+          view.dhcpServerId = payload.id;
+          App.closeModal();
+          await loadDhcpServers();
+        } catch (error) {
+          b.querySelector('#dh-error').innerHTML =
+            `<span class="err">${escape(error.message)}</span>`;
+        }
+      } },
+    ]);
+  }
+
+  async function editDhcpServer() {
+    const server = view.dhcpServers.find((s) => s.id === view.dhcpServerId);
+    if (!server) return;
+    const box = App.modal('Edit DHCP server', dhcpServerForm(server) +
+      `<label class="check"><input type="checkbox" id="dh-enabled" ${server.enabled ? 'checked' : ''}> Enabled</label>`,
+      [
+        { label: 'Cancel', onClick: App.closeModal },
+        { label: 'Remove server', onClick: async () => {
+          await App.del(`/api/ipam/dhcp/servers/${server.id}`);
+          view.dhcpServerId = null;
+          App.closeModal();
+          await loadDhcpServers();
+        } },
+        { label: 'Clear credential', onClick: async (b) => {
+          await App.del(`/api/ipam/dhcp/servers/${server.id}/credential`);
+          b.querySelector('#dh-username').value = '';
+          b.querySelector('#dh-password').value = '';
+          b.querySelector('#dh-error').innerHTML =
+            '<span style="color:var(--ok)">Stored credential cleared.</span>';
+        } },
+        { label: 'Test connection', onClick: async (b) => {
+          const fields = readDhcpForm(b);
+          // An untouched password field means "use whatever is already
+          // configured" -- the stored credential if there is one, ambient
+          // identity otherwise -- rather than testing with a blank password.
+          const payload = fields.password
+            ? { username: fields.username, password: fields.password } : {};
+          const result = await App.post(`/api/ipam/dhcp/servers/${server.id}/test`, payload);
+          // Test failures can carry PowerShell's exact multi-line output
+          // (stdout/stderr, exit code) rather than a one-line summary; a
+          // <pre> preserves that formatting instead of collapsing it into
+          // an unreadable run-on line.
+          b.querySelector('#dh-error').innerHTML = result.ok
+            ? `<span style="color:var(--ok)">Reachable — DHCP Server ${escape(result.version)}, ${result.scope_count} scope(s)</span>`
+            : `<pre class="err">${escape(result.error)}</pre>`;
+        } },
+        { label: 'Save', primary: true, onClick: async (b) => {
+          const fields = readDhcpForm(b);
+          await App.put(`/api/ipam/dhcp/servers/${server.id}`, {
+            address: fields.address, label: fields.label,
+            enabled: b.querySelector('#dh-enabled').checked,
+          });
+          await applyCredential(server.id, fields);
+          App.closeModal();
+          await loadDhcpServers();
+        } },
+      ]);
+  }
+
+  async function pollNow() {
+    if (!view.dhcpServerId) return;
+    await App.post(`/api/ipam/dhcp/servers/${view.dhcpServerId}/poll`, {});
+    App.refreshNow('ipam');
+  }
+
+  function renderDhcpScopes() {
+    const table = App.el('ipam-dhcp-scope-table');
+    table.innerHTML = '<thead><tr><th>Scope</th><th>Name</th><th>Range</th>' +
+      '<th>Mask</th><th>State</th><th>Lease</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const scope of view.dhcpScopes) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${escape(scope.scope_id)}</td><td>${escape(scope.name || '')}</td>` +
+        `<td>${escape(scope.start_ip)} – ${escape(scope.end_ip)}</td>` +
+        `<td>${escape(scope.mask || '')}</td><td>${escape(scope.state || '')}</td>` +
+        `<td>${scope.lease_duration_s ? App.span(scope.lease_duration_s) : ''}</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  const LEASE_COLUMNS = [
+    { key: 'ip', label: 'IP address', width: 130, value: (r) => r.ip },
+    { key: 'mac', label: 'MAC', width: 150, value: (r) => r.mac || '' },
+    { key: 'hostname', label: 'Hostname', width: 200, value: (r) => r.hostname || '' },
+    { key: 'state', label: 'State', width: 140, value: (r) => r.address_state || '' },
+    { key: 'expires', label: 'Lease expires', width: 150, numeric: true,
+      align: 'left', value: (r) => r.lease_expires || 0 },
+  ];
+
+  function onLeaseSort(key, descending) {
+    view.leaseSort = { key, descending };
+    drawLeases();
+  }
+
+  function drawLeases() {
+    const table = App.grid(App.el('ipam-dhcp-lease-table'),
+      { name: 'ipam-leases', columns: LEASE_COLUMNS, sort: view.leaseSort, onSort: onLeaseSort });
+    const body = document.createElement('tbody');
+    const rows = App.sortRows(view.dhcpLeases, view.leaseSort.key,
+      view.leaseSort.descending, LEASE_COLUMNS);
+    for (const lease of rows) {
+      const tr = document.createElement('tr');
+      const state = lease.is_reservation
+        ? `<span class="sev sev-5">${escape(lease.address_state || 'reservation')}</span>`
+        : escape(lease.address_state || '');
+      tr.innerHTML =
+        `<td>${escape(lease.ip)}</td><td>${escape(lease.mac || '')}</td>` +
+        `<td>${escape(lease.hostname || lease.description || '')}</td>` +
+        `<td>${state}</td>` +
+        `<td>${lease.lease_expires ? App.stamp(lease.lease_expires) : ''}</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;
+  }
+
+  async function loadDhcpServers() {
+    const payload = await App.get('/api/ipam/dhcp/servers');
+    view.dhcpServers = payload.servers;
+    if (view.dhcpServerId && !view.dhcpServers.some((s) => s.id === view.dhcpServerId)) {
+      view.dhcpServerId = null;
+    }
+    if (!view.dhcpServerId && view.dhcpServers.length) view.dhcpServerId = view.dhcpServers[0].id;
+    renderDhcpServers();
+    await loadDhcpDetail();
+  }
+
+  async function loadDhcpDetail() {
+    if (!view.dhcpServerId) {
+      view.dhcpScopes = []; view.dhcpLeases = [];
+      renderDhcpScopes(); drawLeases();
+      return;
+    }
+    const [scopes, leases] = await Promise.all([
+      App.get('/api/ipam/dhcp/scopes', { server_id: view.dhcpServerId }),
+      App.get('/api/ipam/dhcp/leases', { server_id: view.dhcpServerId }),
+    ]);
+    view.dhcpScopes = scopes.scopes;
+    view.dhcpLeases = leases.leases;
+    renderDhcpScopes();
+    drawLeases();
+  }
+
+  /* ------------------------------------------------------------- settings */
+
+  function settingsDialog() {
+    const s = App.state.ipamSettings || {};
+    const check = (id, label, on) =>
+      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
+    const number = (id, label, value, attrs = '') =>
+      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    App.modal('IPAM settings', `
+      <fieldset><legend>SCANNING</legend>
+        ${check('i-enabled', 'Run the IPAM worker', s.enabled)}
+        ${number('i-interval', 'Scan every', s.scan_interval_minutes, 'min=5')} minutes
+        ${number('i-timeout', 'Ping timeout (ms)', s.ping_timeout_ms, 'min=100 step=100')}
+        ${number('i-workers', 'Concurrent pings', s.ping_workers, 'min=1 max=256')}
+        ${number('i-maxaddr', 'Largest subnet allowed (addresses)', s.max_scan_addresses, 'min=16 step=256')}
+        <p class="hint">A subnet larger than this is refused when added, not silently truncated —
+          raise it deliberately if you mean to sweep something this size. Conflict detection needs
+          SappiWhere to be on the same network segment as a subnet; ARP does not cross a router,
+          so a remote subnet still reports which addresses are alive, just not their MAC addresses.</p>
+      </fieldset>
+      <fieldset><legend>DHCP</legend>
+        ${number('i-dhcp-interval', 'Poll every', s.dhcp_poll_interval_minutes, 'min=5')} minutes
+        ${number('i-dhcp-timeout', 'Poll timeout (s)', s.dhcp_timeout_s, 'min=5')}
+        ${check('i-resolve', 'Resolve discovered hosts to names', s.resolve_hosts)}
+      </fieldset>
+      <fieldset><legend>RETENTION</legend>
+        ${number('i-host-days', 'Forget addresses not seen for', s.host_retention_days, 'min=1')} days
+        ${number('i-conflict-days', 'Forget resolved conflicts after', s.conflict_retention_days, 'min=1')} days
+        ${number('i-scan-days', 'Keep scan history for', s.scan_history_days, 'min=1')} days
+      </fieldset>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async (box) => {
+        const on = (id) => box.querySelector(id).checked;
+        const num = (id) => Number(box.querySelector(id).value);
+        await App.post('/api/settings', { scope: 'ipam', values: {
+          enabled: on('#i-enabled'),
+          scan_interval_minutes: num('#i-interval'),
+          ping_timeout_ms: num('#i-timeout'),
+          ping_workers: num('#i-workers'),
+          max_scan_addresses: num('#i-maxaddr'),
+          dhcp_poll_interval_minutes: num('#i-dhcp-interval'),
+          dhcp_timeout_s: num('#i-dhcp-timeout'),
+          resolve_hosts: on('#i-resolve'),
+          host_retention_days: num('#i-host-days'),
+          conflict_retention_days: num('#i-conflict-days'),
+          scan_history_days: num('#i-scan-days'),
+        } });
+        await App.loadState();
+        App.closeModal();
+      } },
+    ], { buttonsTop: true });
+  }
+
+  /* --------------------------------------------------------------- lifecycle */
+
+  async function refresh() {
+    await Promise.all([loadSubnets(), loadConflicts(), loadDhcpServers()]);
+    drawStatus();
+  }
+
+  function init() {
+    for (const btn of document.querySelectorAll('.subtab')) {
+      btn.onclick = () => selectSub(btn.dataset.subtab);
+    }
+    App.el('ipam-settings').onclick = settingsDialog;
+    App.el('ipam-add-subnet').onclick = addSubnet;
+    App.el('ipam-edit-subnet').onclick = editSubnet;
+    App.el('ipam-scan-now').onclick = scanNow;
+    App.el('ipam-add-dhcp').onclick = addDhcpServer;
+    App.el('ipam-edit-dhcp').onclick = editDhcpServer;
+    App.el('ipam-poll-now').onclick = pollNow;
+    App.el('ipam-alive-only').onchange = drawHosts;
+    App.el('ipam-show-resolved').onchange = loadConflicts;
+  }
+
+  App.pages.ipam = { init, refresh, fastTick: drawStatus };
+})();

@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SappiWhere</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<nav id="tabs">
+  <button class="tab active" data-tab="netpath">NETPATH</button>
+  <button class="tab" data-tab="netflow">NETFLOW</button>
+  <button class="tab" data-tab="syslog">SYSLOG</button>
+  <button class="tab" data-tab="ipam">IPAM</button>
+  <button class="tab" data-tab="debug">DEBUG</button>
+  <button class="tab" data-tab="settings">SETTINGS</button>
+  <span class="grow"></span>
+  <span id="version" class="conn"></span>
+  <span id="whoami" class="conn user"></span>
+  <button id="signout" class="linkish">Sign out</button>
+  <span id="conn" class="conn">connecting…</span>
+</nav>
+
+<!-- ============================ NETPATH ============================ -->
+<section id="page-netpath" class="page active">
+ <div class="cols" data-splitter="netpath-main">
+  <aside class="sidebar pane" data-grow="1">
+    <h2>Destinations</h2>
+    <ul id="target-list" class="target-list"></ul>
+    <div class="row">
+      <button id="target-add" class="primary">Add</button>
+      <button id="target-edit">Edit</button>
+      <button id="target-remove">Remove</button>
+    </div>
+    <button id="target-trace">Trace now</button>
+    <div class="card">
+      <h3>Window summary</h3>
+      <div class="stat" id="stat-healthy">Healthy   —</div>
+      <div class="stat" id="stat-rtt">Avg RTT   —</div>
+      <div class="stat" id="stat-traces">Traces    —</div>
+      <div class="stat" id="stat-routes">Routes    —</div>
+    </div>
+    <p class="legend">
+      green healthy · amber degraded · red no reply ·
+      orange hatched refused · teal striped skipped (interval too short) ·
+      violet probe failed
+    </p>
+  </aside>
+  <div class="divider"></div>
+
+  <main class="content pane" data-grow="4">
+   <div class="rows" data-splitter="netpath-body">
+    <div class="pane" data-grow="3">
+    <header class="bar">
+      <span class="section">ROUTE</span>
+      <span id="route-summary" class="hint"></span>
+      <span class="grow"></span>
+      <button id="route-live" class="primary" hidden>Return to live</button>
+      <button id="route-expand">Expand silent hops</button>
+      <button id="route-zoom-out" class="icon">&minus;</button>
+      <button id="route-zoom-in" class="icon">+</button>
+      <span id="route-zoom" class="hint zoom">100%</span>
+      <button id="route-fit">Fit</button>
+      <button id="netpath-settings" class="module-settings">Settings</button>
+    </header>
+    <p id="target-terms" class="hint pad terms"></p>
+    <div id="route-canvas" class="canvas"><svg id="route-svg"></svg></div>
+    </div>
+    <div class="divider"></div>
+    <div class="pane" data-grow="2">
+    <header class="bar">
+      <span class="section">TIMELINE</span>
+      <span id="block-label" class="hint"></span>
+      <span class="grow"></span>
+      <select id="range-select"></select>
+      <button id="tl-back" class="icon">&lsaquo;</button>
+      <button id="tl-out" class="icon">&minus;</button>
+      <button id="tl-in" class="icon">+</button>
+      <button id="tl-fwd" class="icon">&rsaquo;</button>
+      <label class="check"><input type="checkbox" id="tl-follow" checked> Follow now</label>
+      <button id="tl-reset">Reset</button>
+    </header>
+    <div id="timeline" class="timeline"><svg id="timeline-svg"></svg></div>
+    <p class="hint pad">
+      Click a block for the route as it was at that moment · drag to focus a range ·
+      buttons above to zoom and pan · right-click to clear
+    </p>
+    </div>
+   </div>
+  </main>
+ </div>
+</section>
+
+<!-- ============================ NETFLOW ============================ -->
+<section id="page-netflow" class="page">
+  <div class="card strip">
+    <span id="nf-dot" class="dot"></span>
+    <span id="nf-status" class="stat">Collector stopped</span>
+    <span id="nf-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="nf-test">Send test packet</button>
+    <button id="nf-toggle">Start collector</button>
+    <button id="nf-settings" class="module-settings">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Window <select id="nf-range"></select></label>
+    <label>Group by <select id="nf-dimension"></select></label>
+    <label>Source <input id="nf-src" size="10" placeholder="10.20."></label>
+    <label>Destination <input id="nf-dst" size="10" placeholder="any"></label>
+    <label>Port <input id="nf-port" size="5"></label>
+    <select id="nf-protocol"></select>
+    <select id="nf-exporter"></select>
+    <label class="check"><input type="checkbox" id="nf-resolve"> Resolve names</label>
+    <button id="nf-apply">Apply</button>
+    <button id="nf-clear">Clear</button>
+  </div>
+
+  <header class="bar">
+    <span class="section">TRAFFIC OVER TIME</span>
+    <span id="nf-totals" class="hint"></span>
+    <span class="grow"></span>
+    <span id="nf-window" class="stat"></span>
+    <button id="nf-back" class="icon">&lsaquo;</button>
+    <button id="nf-out" class="icon">&minus;</button>
+    <button id="nf-in" class="icon">+</button>
+    <button id="nf-fwd" class="icon">&rsaquo;</button>
+    <label class="check"><input type="checkbox" id="nf-follow" checked> Follow now</label>
+    <button id="nf-reset">Reset</button>
+  </header>
+  <div class="rows" data-splitter="netflow-body">
+   <div class="pane pad-x" data-grow="3">
+    <div id="nf-chart" class="canvas chart"><svg id="nf-chart-svg"></svg></div>
+    <p class="hint">Drag across the chart to zoom into a range · scroll to zoom</p>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="4">
+    <div class="cols" data-splitter="netflow-lower">
+     <div class="pane" data-grow="2">
+      <header class="bar"><span class="section" id="nf-top-title">TOP APPLICATION</span></header>
+      <div id="nf-bars" class="bars"></div>
+     </div>
+     <div class="divider"></div>
+     <div class="pane" data-grow="3">
+      <header class="bar">
+        <span class="section">FLOW RECORDS</span>
+        <span class="grow"></span>
+        <select id="nf-order" title="Which 250 records the server returns. Click a column heading to arrange them.">
+          <option value="bytes">Top 250 by volume</option>
+          <option value="packets">Top 250 by packets</option>
+          <option value="time">Most recent 250</option>
+        </select>
+      </header>
+      <div class="table-wrap"><table id="nf-table"></table></div>
+     </div>
+    </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================= SYSLOG ============================= -->
+<section id="page-syslog" class="page">
+  <div class="card strip">
+    <span id="sl-dot" class="dot"></span>
+    <span id="sl-status" class="stat">Collector stopped</span>
+    <span id="sl-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="sl-test">Send test message</button>
+    <button id="sl-toggle">Start collector</button>
+    <button id="sl-settings" class="module-settings">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Search <input id="sl-q" size="26" placeholder="any part of a message, app, host or IP"></label>
+    <label>Window <select id="sl-range"></select></label>
+    <label>Severity <select id="sl-severity"></select></label>
+    <label>Facility <select id="sl-facility"></select></label>
+    <label>Source IP <input id="sl-source" size="13" placeholder="10.20.3.4"></label>
+    <label>Host <input id="sl-host" size="12" placeholder="core-sw-01"></label>
+    <label>App <input id="sl-app" size="10"></label>
+    <button id="sl-apply" class="primary">Search</button>
+    <button id="sl-clear">Clear</button>
+    <label class="check"><input type="checkbox" id="sl-follow" checked> Live</label>
+    <span id="sl-took" class="took"></span>
+  </div>
+
+  <div class="rows" data-splitter="syslog-body">
+   <div class="pane pad-x" data-grow="2">
+    <header class="bar">
+      <span class="section">MESSAGES PER HOUR</span>
+      <span id="sl-hist-summary" class="hint"></span>
+    </header>
+    <div id="sl-hist" class="canvas chart"><svg id="sl-hist-svg"></svg></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="5">
+    <header class="bar">
+      <span class="section">MESSAGES</span>
+      <span id="sl-count" class="hint"></span>
+      <span class="grow"></span>
+      <select id="sl-limit">
+        <option value="300">300 rows</option>
+        <option value="1000">1000 rows</option>
+        <option value="2000">2000 rows</option>
+      </select>
+    </header>
+    <div class="cols" data-splitter="syslog-lower">
+     <div class="pane" data-grow="3">
+      <div class="table-wrap"><table id="syslog-table"></table></div>
+     </div>
+     <div class="divider"></div>
+     <div class="pane" data-grow="1">
+      <pre id="sl-detail" class="detail">Select a message to see all of its fields and the raw line as it arrived.</pre>
+     </div>
+    </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================== IPAM ================================ -->
+<section id="page-ipam" class="page">
+  <div class="card strip">
+    <span id="ipam-dot" class="dot"></span>
+    <span id="ipam-status" class="stat">Worker stopped</span>
+    <span id="ipam-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="ipam-settings" class="module-settings">Settings</button>
+  </div>
+
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
+    <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
+    <button class="subtab" data-subtab="dhcp">DHCP</button>
+  </nav>
+
+  <div id="ipam-sub-subnets" class="subpage active">
+   <div class="cols" data-splitter="ipam-subnets">
+    <aside class="sidebar pane" data-grow="1">
+      <div class="bar">
+        <span class="section">SUBNETS</span>
+        <span class="grow"></span>
+        <button id="ipam-scan-now">Scan now</button>
+        <button id="ipam-edit-subnet">Edit</button>
+        <button id="ipam-add-subnet" class="primary">Add</button>
+      </div>
+      <div class="table-wrap"><table id="ipam-subnet-table"></table></div>
+      <p class="hint pad-x" style="padding-top:8px">
+        <span style="color:var(--ok)">&#9679;</span> alive &nbsp;
+        <span style="color:var(--warn)">&#9679;</span> seen before, now down &nbsp;
+        <span style="color:var(--faint)">&#9679;</span> never seen
+      </p>
+    </aside>
+    <div class="divider"></div>
+    <div class="pane pad-x pad-b" data-grow="3">
+      <header class="bar">
+        <span class="section">HOSTS</span>
+        <span id="ipam-hosts-count" class="hint"></span>
+        <span class="grow"></span>
+        <label class="check"><input type="checkbox" id="ipam-alive-only" checked> Alive only</label>
+      </header>
+      <div id="ipam-subnet-detail" class="subnet-detail"></div>
+      <div class="table-wrap"><table id="ipam-hosts-table"></table></div>
+    </div>
+   </div>
+  </div>
+
+  <div id="ipam-sub-conflicts" class="subpage">
+    <div class="bar pad-x">
+      <span class="section">IP CONFLICTS</span>
+      <span id="ipam-conflicts-count" class="hint"></span>
+      <span class="grow"></span>
+      <label class="check"><input type="checkbox" id="ipam-show-resolved"> Show resolved</label>
+    </div>
+    <p class="hint pad-x">A conflict means the same address has answered as two different MAC
+      addresses — either directly on the wire across two scans, or the wire disagrees with what
+      the DHCP server's own lease record says. Neither side clears itself; mark one resolved once
+      you know what happened.</p>
+    <div class="table-wrap pad-x pad-b" style="flex:1"><table id="ipam-conflicts-table"></table></div>
+  </div>
+
+  <div id="ipam-sub-dhcp" class="subpage">
+   <div class="cols" data-splitter="ipam-dhcp">
+    <aside class="sidebar pane" data-grow="1">
+      <div class="bar">
+        <span class="section">DHCP SERVERS</span>
+        <span class="grow"></span>
+        <button id="ipam-poll-now">Poll now</button>
+        <button id="ipam-edit-dhcp">Edit</button>
+        <button id="ipam-add-dhcp" class="primary">Add</button>
+      </div>
+      <div class="table-wrap"><table id="ipam-dhcp-server-table"></table></div>
+      <p class="hint pad-x" style="padding-top:8px">Read-only: scopes and leases only, never a
+        write. Authenticates as whichever Windows account runs SappiWhere, or a matching
+        Windows Credential Manager entry for that server's name — nothing is stored here.</p>
+    </aside>
+    <div class="divider"></div>
+    <div class="pane pad-x pad-b" data-grow="3">
+      <header class="bar">
+        <span class="section">SCOPES</span>
+      </header>
+      <div class="table-wrap" style="max-height:180px"><table id="ipam-dhcp-scope-table"></table></div>
+      <header class="bar" style="margin-top:10px">
+        <span class="section">LEASES</span>
+        <span id="ipam-lease-count" class="hint"></span>
+      </header>
+      <div class="table-wrap"><table id="ipam-dhcp-lease-table"></table></div>
+    </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================= DEBUG ============================= -->
+<section id="page-debug" class="page">
+  <div class="card strip"><span id="dbg-summary" class="stat"></span></div>
+  <div class="rows" data-splitter="debug-body">
+   <div class="pane" data-grow="65">
+    <header class="bar"><span class="section">TRACE WORKERS</span></header>
+    <div id="dbg-workers-wrap" class="table-wrap workers"><table id="dbg-workers"></table></div>
+    <header class="bar"><span class="section">DNS LOOKUPS IN PROGRESS</span></header>
+    <div id="dbg-dns-wrap" class="table-wrap workers-small"><table id="dbg-dns"></table></div>
+    <header class="bar"><span class="section">IPAM AGENTS RUNNING</span></header>
+    <div id="dbg-ipam-wrap" class="table-wrap workers-small"><table id="dbg-ipam"></table></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane" data-grow="35">
+  <header class="bar wrap">
+    <span class="section">EVENT LOG</span>
+    <label>Destination <select id="dbg-target"></select></label>
+    <span id="dbg-categories" class="cats"></span>
+    <label>Contains <input id="dbg-search" size="18" placeholder="text in event or detail"></label>
+    <span class="grow"></span>
+    <label class="check"><input type="checkbox" id="dbg-follow" checked> Follow</label>
+    <button id="dbg-pause">Pause</button>
+    <button id="dbg-clear">Clear</button>
+    <button id="dbg-export">Export</button>
+  </header>
+  <div class="cols pad-x pad-b" data-splitter="debug-events" style="flex:1;min-height:0">
+    <div class="pane" data-grow="3"><div class="table-wrap"><table id="dbg-events"></table></div></div>
+    <div class="divider"></div>
+    <div class="pane" data-grow="2"><pre id="dbg-detail" class="detail">Select an event to see its detail — the exact command that ran and the raw output it returned.</pre></div>
+  </div>
+   </div>
+  </div>
+</section>
+
+<!-- =========================== SETTINGS ============================ -->
+<section id="page-settings" class="page">
+  <div class="scroll">
+    <p class="hint">
+      These apply across every module. NetPath's worker pool, retention and
+      destination defaults are under Settings on the NetPath tab; the
+      collector's listener, sampling and storage are under Settings on the
+      NetFlow tab.
+    </p>
+    <fieldset>
+      <legend>REVERSE DNS</legend>
+      <label class="check"><input type="checkbox" id="set-dns-enabled"> Resolve addresses to names</label>
+      <label>Lookup threads <input type="number" id="set-dns-workers" min="1" max="32"></label>
+      <label>Lookup timeout <input type="number" id="set-dns-timeout" min="0.5" max="30" step="0.5"> s</label>
+      <label>Cache answers for <input type="number" id="set-dns-cache" min="1" max="365"> days</label>
+      <label>Query server <input id="set-dns-server" placeholder="blank = this machine's own resolver"></label>
+      <label class="check"><input type="checkbox" id="set-dns-nslookup">
+        Fall back to nslookup when the system resolver finds nothing</label>
+      <p class="hint">Shared by both modules: NetPath names hop addresses with it, NetFlow names
+        flow endpoints. Each address is queried once per cache period, so a quiet Debug log
+        means everything is already known.</p>
+      <p class="hint">Three attempts per address: the system resolver, then a PTR query straight
+        to the server named above if one is given, then nslookup. The fallbacks matter for
+        internal addresses whose reverse zone the system resolver will not answer for — if
+        nslookup finds a name, so will this. The Debug log records which method answered.</p>
+    </fieldset>
+    <fieldset>
+      <legend>REFRESH RATES</legend>
+      <label>NetPath <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
+      <label>NetFlow <input type="number" id="set-refresh-netflow" min="1" max="3600" step="5"> s</label>
+      <label>Syslog <input type="number" id="set-refresh-syslog" min="1" max="3600" step="5"> s</label>
+      <label>Debug <input type="number" id="set-refresh-debug" min="0.1" max="60" step="0.5"> s</label>
+      <p class="hint">Set per module because they want different rates. The route graph is
+        cheap and benefits from feeling live; the flow charts are aggregations over a whole
+        window and barely change in a few seconds, so a slow rate costs nothing and saves a
+        lot of work. The Debug page's elapsed counters advance smoothly ten times a second
+        without asking the server again, so its rate only controls how often new events and
+        worker state are fetched.</p>
+    </fieldset>
+    <fieldset>
+      <legend>DATA FILES</legend>
+      <label>Application <input id="set-app-path" readonly></label>
+      <label>Traces <input id="set-trace-path" readonly></label>
+      <label>Flows <input id="set-flow-path" readonly></label>
+      <label>Syslog <input id="set-syslog-path" readonly></label>
+      <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
+        <span class="usage" id="use-trace"></span></label>
+      <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
+        <span class="usage" id="use-flow"></span></label>
+      <label>Syslog database cap <input type="number" id="set-syslog-cap" min="16" step="256"> MB
+        <span class="usage" id="use-syslog"></span></label>
+      <p class="hint" id="set-sizes"></p>
+      <p class="hint">Checked every 15 minutes. When a file is over its cap the oldest records are
+        deleted until it fits, so the cap wins over the retention setting.</p>
+      <p class="hint">The application file holds settings, accounts and the shared reverse-DNS
+        cache. It has no cap because it does not grow with traffic — it is the one to back up,
+        and the three record files can be rebuilt by simply collecting again.</p>
+    </fieldset>
+    <fieldset>
+      <legend>SIGN-IN</legend>
+      <label>Idle timeout <input type="number" id="set-idle-minutes" min="1" max="1440" step="1"> min</label>
+      <label>Maximum session length <input type="number" id="set-session-hours" min="1" max="168" step="1"> h</label>
+      <p class="hint">Idle timeout signs a session out after this long with no mouse or keyboard
+        activity in the browser — a tab left open in the background does not by itself count as
+        activity. Maximum session length is a hard ceiling: signed out this long after signing in
+        regardless of activity. Changing either applies to every session at the next check, not
+        only new ones.</p>
+    </fieldset>
+    <fieldset>
+      <legend>YOUR PASSWORD</legend>
+      <label>Current <input type="password" id="pw-current" autocomplete="current-password"></label>
+      <label>New <input type="password" id="pw-new" autocomplete="new-password"></label>
+      <label>Repeat <input type="password" id="pw-repeat" autocomplete="new-password"></label>
+      <div class="row"><button id="pw-save" class="primary">Change password</button></div>
+      <p class="hint" id="pw-status">At least 12 characters. A short phrase is easier to
+        remember and harder to guess than a mangled word. Changing it signs out every session
+        using this account, including this one.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>USERS</legend>
+      <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
+      <div class="row" style="margin-top:10px">
+        <input id="new-username" placeholder="username" size="18">
+        <input id="new-password" type="password" placeholder="initial password" size="22">
+        <button id="add-user">Add user</button>
+      </div>
+      <p class="hint" id="users-status">Every account has full access; there are no roles yet,
+        so adding one is an administrative act. A new user must change the initial password when
+        they first sign in.</p>
+      <p class="hint" id="sessions-line"></p>
+    </fieldset>
+
+    <fieldset>
+      <legend>MAINTENANCE</legend>
+      <div class="row">
+        <button data-maint="redns">Re-run reverse DNS</button>
+        <button data-maint="prune_traces">Delete old traces</button>
+        <button data-maint="prune_flows">Delete stored flows</button>
+        <button data-maint="prune_syslog">Delete stored syslog</button>
+        <button id="reset-layout">Reset panel sizes</button>
+      </div>
+      <p class="hint">These act immediately and cannot be undone.</p>
+    </fieldset>
+  </div>
+  <div class="bar footer">
+    <span id="set-status" class="hint"></span>
+    <span class="grow"></span>
+    <button id="set-revert">Revert</button>
+    <button id="set-apply" class="primary">Apply changes</button>
+  </div>
+</section>
+
+<div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
+
+<script src="/app.js"></script>
+<script src="/netpath.js"></script>
+<script src="/netflow.js"></script>
+<script src="/syslog.js"></script>
+<script src="/ipam.js"></script>
+<script src="/debug.js"></script>
+<script src="/settings.js"></script>
+</body>
+</html>

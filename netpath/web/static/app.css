@@ -1,0 +1,680 @@
+/* The desktop palette, unchanged: dark instrument chrome with a light route
+   canvas. The canvas keeps its own variables because greys that work on black
+   have no contrast on white. */
+:root {
+  --bg: #0E1116;
+  --panel: #151A21;
+  --raised: #1B222B;
+  --hairline: #2A323D;
+  --grid: #222933;
+  --text: #DCE3EA;
+  --muted: #7C8794;
+  --faint: #4C5561;
+  --accent: #7AA2F7;
+  --ok: #3FB950;
+  --warn: #E3B341;
+  --fail: #F85149;
+  --blocked: #FF8A65;
+  --overrun: #4DB6AC;
+  --error: #A371F7;
+  --nodata: #1E242D;
+
+  --canvas: #FFFFFF;
+  --canvas-panel: #F4F6F9;
+  --canvas-hairline: #C9D2DD;
+  --canvas-grid: #E4E9F0;
+  --canvas-text: #161C24;
+  --canvas-muted: #55606E;
+  --canvas-faint: #8A94A2;
+  --canvas-accent: #2F5FC4;
+  --canvas-ok: #1B7F3B;
+  --canvas-warn: #9A6510;
+
+  --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
+}
+
+* { box-sizing: border-box; }
+/* A class selector beats the user agent's [hidden] rule, so any element given
+   display by a class of its own stays visible when hidden. The modal did
+   exactly that and covered the page with a click-blocking overlay. */
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------ tabs */
+#tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+  padding: 0 12px;
+  flex: none;
+}
+.tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 10px 22px;
+  font: 600 12px/1 var(--ui);
+  letter-spacing: 0.8px;
+  cursor: pointer;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* Sub-navigation inside a single tab (IPAM's Subnets / Conflicts / DHCP),
+   one visual size down from the top-level tab strip. */
+.subtabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--raised);
+  border-bottom: 1px solid var(--hairline);
+  padding: 0 12px;
+  flex: none;
+}
+.subtab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 8px 16px;
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 0.6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.subtab:hover { color: var(--text); }
+.subtab.active { color: var(--text); border-bottom-color: var(--accent); }
+.subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
+.subpage.active { display: flex; }
+
+.badge {
+  background: var(--warn);
+  color: #1a1a1a;
+  border-radius: 9px;
+  padding: 1px 7px;
+  font: 700 10px/1.4 var(--ui);
+}
+.conn { color: var(--faint); font: 11px var(--mono); padding-right: 4px; }
+.conn.user { color: var(--muted); }
+button.linkish {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+button.linkish:hover { color: var(--accent); }
+.conn.bad { color: var(--fail); }
+
+.page { display: none; flex: 1; min-height: 0; }
+/* Column by default, so a new module cannot be forgotten here and end up
+   laying its panels out side by side. NetPath is the one that wants a row,
+   because its destination list sits beside the content. */
+.page.active { display: flex; flex-direction: column; }
+#page-netpath.active { flex-direction: row; }
+
+/* --------------------------------------------------------------- widgets */
+button {
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 5px 12px;
+  font: 13px var(--ui);
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { color: var(--faint); border-color: var(--grid); cursor: default; }
+button.primary { background: var(--accent); color: #0E1116; border: none; font-weight: 600; }
+button.primary:hover { background: #97B6FF; }
+button.icon { width: 32px; padding: 5px 0; text-align: center; }
+button.module-settings {
+  background: var(--raised);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  padding: 5px 14px;
+}
+button.module-settings:hover { background: var(--accent); color: #0E1116; }
+
+input, select, textarea {
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+  font: 13px var(--ui);
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+input[readonly] { color: var(--muted); }
+label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+label.check { cursor: pointer; }
+input[type=checkbox] { accent-color: var(--accent); }
+
+.section {
+  color: var(--muted);
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 1.4px;
+}
+.hint { color: var(--faint); font-size: 11px; }
+.hint.pad { padding: 2px 12px 6px; margin: 0; }
+.terms { font-family: var(--mono); padding: 0 12px 6px; }
+.terms b { color: var(--muted); font-weight: 600; }
+body.tiny .terms { display: none; }
+.stat { font-family: var(--mono); font-size: 12px; white-space: pre; }
+.grow { flex: 1; }
+.zoom { min-width: 40px; text-align: center; }
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  flex: none;
+}
+.bar.wrap { flex-wrap: wrap; }
+.bar.footer { border-top: 1px solid var(--hairline); background: var(--panel); }
+.row { display: flex; gap: 6px; }
+.row button { flex: 1; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.card.strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 12px 4px;
+  flex: none;
+}
+/* A flex item's default min-width is auto, and .stat sets white-space: pre, so
+   its minimum width is the whole string. A long status — a bind error, say —
+   could not shrink and pushed the buttons out of the card entirely. */
+.card.strip > .stat, .card.strip > .hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;
+}
+.card.strip > .stat.error { color: var(--fail); }
+.card.strip > button { flex: none; }
+.card.strip > .dot { flex: none; }
+.card h3 {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--faint); }
+
+/* -------------------------------------------------------------- netpath */
+.sidebar {
+  width: 290px;
+  flex: none;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+}
+.sidebar h2 {
+  margin: 0;
+  color: var(--muted);
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+}
+.target-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  flex: 1;
+  min-height: 160px;
+  overflow: auto;
+}
+.target-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.target-list li:hover { background: var(--grid); }
+/* The active destination stays legible and bold whatever else has focus. */
+.target-list li.selected {
+  background: var(--raised);
+  border-color: var(--hairline);
+  font-weight: 700;
+}
+.target-list .name { color: var(--text); }
+.target-list .host { color: var(--muted); font-size: 11px; }
+.legend { color: var(--faint); font-size: 11px; margin: 0; }
+
+/* Sidebar table rows (IPAM's subnets and DHCP servers) want the same weight
+   .target-list already gives its <li> rows, but aren't inside one. */
+.name { color: var(--text); font-weight: 600; }
+.host { color: var(--muted); font-size: 11px; }
+
+/* A subnet row: a small utilization donut beside its label, rather than a
+   second column, so it reads as part of the row instead of a separate table
+   field to align. */
+.subnet-row { display: flex; align-items: center; gap: 10px; }
+.subnet-row-text { min-width: 0; flex: 1; }
+.usage-donut { flex: none; }
+
+/* The larger detail chart shown for whichever subnet is selected. */
+.subnet-detail {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  flex: none;
+}
+.subnet-detail-title { font: 600 13px/1.3 var(--ui); color: var(--text); margin-bottom: 6px; }
+.subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: 12px; margin-bottom: 4px; }
+.legend-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+
+.content { flex: 1; display: flex; flex-direction: column; min-width: 0; padding-right: 12px; }
+.canvas {
+  flex: 1;
+  min-height: 150px;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-hairline);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.canvas svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+  /* Dragging a diagram is a pan, not a text selection. Without this the
+     browser starts selecting the SVG labels under the pointer and leaves them
+     highlighted until the selection is cleared. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.canvas svg.dragging { cursor: grabbing; }
+.timeline svg { user-select: none; -webkit-user-select: none; }
+.canvas.chart { background: var(--panel); border-color: var(--hairline); }
+.timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: 6px; }
+.timeline svg { width: 100%; height: 100%; display: block; }
+
+/* -------------------------------------------------------------- netflow */
+#page-netflow .canvas.chart { flex: 1; min-height: 120px; margin: 0 12px; }
+.split { display: flex; gap: 12px; padding: 0 12px 12px; flex: 1; min-height: 0; }
+.split.events { padding: 0 12px 12px; }
+.pad-x { padding: 0 12px; }
+.pad-b { padding-bottom: 10px; }
+.pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.pane.grow-pane { flex: 2; }
+.bars { flex: 1; overflow: auto; background: var(--panel); border-radius: 6px; padding: 6px; }
+.bar-row { position: relative; height: 24px; margin-bottom: 2px; }
+.bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; opacity: 0.55; }
+.bar-label, .bar-value {
+  position: absolute; top: 0; line-height: 24px;
+  font-family: var(--mono); font-size: 12px;
+}
+.bar-label { left: 8px; color: var(--text); }
+.bar-value { right: 8px; color: var(--muted); }
+
+.table-wrap {
+  flex: 1;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  min-height: 0;
+}
+.table-wrap.workers { flex: 1; min-height: 80px; margin: 0 12px; }
+.table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 12px 10px; }
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+th {
+  position: sticky; top: 0;
+  background: var(--raised);
+  color: var(--muted);
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+  font-weight: 600;
+  user-select: none;
+}
+td { padding: 4px 8px; border-bottom: 1px solid var(--grid); color: var(--text); }
+tr:nth-child(even) td { background: var(--raised); }
+tr.clickable { cursor: pointer; }
+tr.selected td { background: var(--hairline); }
+td.num { text-align: right; }
+
+/* Sortable, resizable tables. Fixed layout so the colgroup widths are obeyed
+   exactly rather than treated as suggestions the browser may widen. Every
+   column gets an explicit width in the colgroup, so the header row and the
+   body rows are laid out from the same numbers rather than the browser
+   inferring widths from whichever row it looks at first. */
+table.grid { table-layout: fixed; }
+table.grid th.num, table.grid td.num { text-align: right; }
+table.grid td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+th.sortable { cursor: pointer; }
+th.sortable:hover { color: var(--text); }
+/* The caret is a real element rather than a positioned ::after: absolutely
+   positioned children of a table cell are unreliable under
+   border-collapse: collapse, and it kept the header sticky, which an
+   overriding `position: relative` would have silently broken. It is always
+   present and only transparent when the column is not the sorted one, so
+   nothing shifts sideways as the sort moves between columns. */
+th .sort-caret {
+  margin-left: 6px;
+  font-size: 8px;
+  opacity: 0;
+}
+th.sort-asc, th.sort-desc { color: var(--text); }
+th.sort-asc .sort-caret, th.sort-desc .sort-caret { opacity: 1; }
+th .grip {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1;
+}
+th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
+
+/* --------------------------------------------------------------- syslog */
+.sev { display: inline-block; width: 62px; font-weight: 600; }
+.sev-0, .sev-1, .sev-2 { color: var(--fail); }
+.sev-3 { color: var(--blocked); }
+.sev-4 { color: var(--warn); }
+.sev-5 { color: var(--text); }
+.sev-6 { color: var(--muted); }
+.sev-7 { color: var(--faint); }
+#syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
+.took { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+
+/* ---------------------------------------------------------------- debug */
+.cats { display: inline-flex; gap: 10px; }
+.detail {
+  flex: 1;
+  margin: 0;
+  padding: 10px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  white-space: pre-wrap;
+  min-width: 0;
+}
+.cat-trace { color: var(--accent); }
+.cat-dns { color: var(--muted); }
+.cat-netflow { color: var(--ok); }
+.cat-ipam { color: var(--accent); }
+.cat-system { color: var(--faint); }
+.cat-error { color: var(--fail); }
+
+/* ------------------------------------------------------------- settings */
+#page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px 16px; min-height: 0; }
+fieldset {
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  background: var(--panel);
+  margin: 0 0 14px;
+  padding: 10px 14px 14px;
+}
+legend {
+  color: var(--muted);
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 1.2px;
+  padding: 0 4px;
+}
+fieldset label { display: flex; margin: 8px 0; gap: 8px; align-items: center; }
+fieldset label input:not([type=checkbox]) { width: 220px; }
+fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: 12px; }
+fieldset .hint { margin: 8px 0 0; }
+.usage {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 10px;
+  white-space: nowrap;
+}
+.usage .bar {
+  display: inline-block;
+  width: 90px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--grid);
+  margin: 0 6px;
+  vertical-align: middle;
+  overflow: hidden;
+}
+.usage .bar i { display: block; height: 100%; background: var(--accent); }
+.usage.warn .bar i { background: var(--warn); }
+.usage.full .bar i { background: var(--fail); }
+
+/* A visible scrollbar: this page scrolls and a thin auto-hiding bar gives no
+   hint that there is more below. */
+#page-settings .scroll::-webkit-scrollbar { width: 14px; }
+#page-settings .scroll::-webkit-scrollbar-track {
+  background: var(--panel); border-left: 1px solid var(--hairline);
+}
+#page-settings .scroll::-webkit-scrollbar-thumb {
+  background: var(--faint); border-radius: 5px; border: 2px solid var(--panel);
+}
+#page-settings .scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+#page-settings .scroll { scrollbar-color: var(--faint) var(--panel); scrollbar-width: auto; }
+
+/* ------------------------------------------------------------ splitters */
+[data-splitter] { display: flex; min-height: 0; min-width: 0; flex: 1; }
+[data-splitter].rows { flex-direction: column; }
+[data-splitter].cols { flex-direction: row; }
+[data-splitter] > .pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.divider {
+  flex: none;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+.rows > .divider { height: 8px; cursor: row-resize; }
+.cols > .divider { width: 8px; cursor: col-resize; }
+/* The grab area is wider than the visible line, so it is easy to hit. */
+.divider::after {
+  content: '';
+  position: absolute;
+  background: var(--hairline);
+  border-radius: 2px;
+  transition: background 120ms;
+}
+.rows > .divider::after { left: 12px; right: 12px; top: 3px; height: 2px; }
+.cols > .divider::after { top: 12px; bottom: 12px; left: 3px; width: 2px; }
+.divider:hover::after { background: var(--accent); }
+body.resizing-v, body.resizing-v * { cursor: row-resize !important; user-select: none; }
+body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select: none; }
+
+/* --------------------------------------------------------- idle banner */
+.idle-banner {
+  position: fixed;
+  z-index: 60;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: var(--raised);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: var(--text);
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.idle-banner button {
+  background: var(--warn);
+  color: #1a1a1a;
+  border: none;
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* -------------------------------------------------------------- tooltip */
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  pointer-events: none;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 7px 9px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  max-width: 460px;
+}
+
+/* --------------------------------------------------------------- density */
+/* Everything below keeps a laptop usable: the panes are resizable, but the
+   defaults should already fit rather than needing to be dragged first. */
+body.compact { font-size: 12px; }
+body.compact .bar { padding: 5px 10px; }
+body.compact .tab { padding: 7px 16px; }
+body.compact .card { padding: 7px 10px; }
+body.compact .card.strip { margin: 6px 10px 2px; }
+body.compact th { padding: 4px 7px; }
+body.compact td { padding: 3px 7px; }
+body.compact .canvas { min-height: 120px; }
+body.compact .sidebar { width: 240px; padding: 8px; }
+body.compact fieldset { padding: 8px 10px 10px; }
+body.compact fieldset label { margin: 5px 0; }
+
+body.tiny .tab { padding: 5px 12px; }
+body.tiny .bar { padding: 4px 8px; gap: 6px; }
+body.tiny .canvas { min-height: 90px; }
+body.tiny .sidebar { width: 210px; }
+body.tiny .legend, body.tiny .hint.pad { display: none; }
+
+/* ---------------------------------------------------------------- login */
+body.login-page {
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+}
+.login-box {
+  width: 340px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 26px 28px 22px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.login-box h1 {
+  margin: 0;
+  font-size: 20px;
+  letter-spacing: 0.5px;
+}
+.login-box h1 { margin-bottom: 18px; }
+.login-box form { display: flex; flex-direction: column; gap: 4px; }
+.login-box label {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  margin-top: 10px;
+}
+.login-box input { padding: 8px 10px; font-size: 14px; }
+.login-box button { margin-top: 18px; padding: 9px; font-size: 14px; }
+.login-box .err { margin: 12px 0 0; font-size: 12px; }
+#login-note { margin-top: 18px; }
+
+/* ---------------------------------------------------------------- modal */
+.modal {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 20;
+}
+.modal-box {
+  background: var(--bg);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 18px 20px;
+  min-width: 420px;
+  max-width: 640px;
+  max-height: 86vh;
+  overflow: auto;
+}
+.modal-box h2 { margin: 0 0 12px; font-size: 15px; }
+.modal-box .row { justify-content: flex-end; margin-top: 14px; }
+.modal-box .row.top {
+  margin: 0 0 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--hairline);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
+}
+.modal-box .row button { flex: none; }
+.modal-box pre {
+  background: var(--panel); border: 1px solid var(--hairline); border-radius: 4px;
+  padding: 10px; font-family: var(--mono); font-size: 12px; overflow: auto;
+  white-space: pre-wrap;
+}
+.modal-box fieldset { margin-bottom: 10px; }
+.err { color: var(--fail); }

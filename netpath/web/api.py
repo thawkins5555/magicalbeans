@@ -1,0 +1,1192 @@
+"""JSON endpoints.
+
+Each handler takes the service, the parsed query string and the decoded body,
+and returns something json-serialisable. The HTTP plumbing is in server.py so
+this file stays about the data.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+from ..analysis import availability, build_timeline, build_topology
+from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
+from ..tracer import expected_budget, unreachable_text
+from ..flowdb import DIMENSIONS
+from ..eventlog import CATEGORIES, ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY, SYSTEM as SYSTEM_CATEGORY
+from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
+
+MIN_BLOCK_PX = 3
+
+
+def _num(params, key, default=None, cast=float):
+    value = params.get(key)
+    if value in (None, ""):
+        return default
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _window(params) -> tuple[float, float]:
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 3600)
+    if t1 <= t0:
+        t1 = t0 + 60
+    return t0, t1
+
+
+# ------------------------------------------------------------------ general
+
+def get_state(service, params, body) -> dict:
+    from .. import __version__
+
+    names = service.hostname_stats()
+    session = service.sessions.get(params.get("_token", ""))
+    idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
+                      if session else None)
+    return {
+        "version": __version__,
+        "session": {
+            "username": session["username"] if session else "",
+            "must_change": bool(
+                (service.app_db.user(session["username"]) or {})["must_change"])
+            if session and service.app_db.user(session["username"]) else False,
+            "idle_timeout_minutes": service.sessions.idle_seconds // 60,
+            "idle_seconds_remaining":
+                max(0, round(idle_remaining)) if idle_remaining is not None else None,
+        },
+        "settings": service.settings,
+        "flow_settings": service.flow_settings,
+        "dimensions": list(DIMENSIONS),
+        "categories": CATEGORIES,
+        "severities": SEVERITIES,
+        "facilities": FACILITIES,
+        "syslog_settings": service.syslog_settings,
+        "ipam_settings": service.ipam_settings,
+        "uptime_s": time.time() - service.started_at,
+        "collector": {
+            "running": service.collector.running,
+            "status": service.collector.status_text(),
+            "counters": service.collector.counters,
+            "decoder": service.collector.decoder.stats,
+        },
+        "dns": {
+            "running": bool(service.resolver._thread
+                            and service.resolver._thread.is_alive()),
+            **names,
+        },
+        "syslog": {
+            "running": service.syslog.running,
+            "status": service.syslog.status_text(),
+            "counters": service.syslog.counters,
+            "ports": service.syslog.ports,
+            "fts": service.syslog_db.fts,
+            "index_ready": service.syslog_db.index_ready,
+            "index_done": service.syslog_db.index_progress[0],
+            "index_total": service.syslog_db.index_progress[1],
+        },
+        "ipam": {
+            "running": service.ipam.running,
+            **service.ipam.state(),
+            "open_conflicts": len(service.ipam_db.conflicts()),
+        },
+        "storage": {
+            "app_path": service.app_db.path,
+            "trace_path": service.db.path,
+            "flow_path": service.flow_db.path,
+            "syslog_path": service.syslog_db.path,
+            "ipam_path": service.ipam_db.path,
+            "app_bytes": service.app_db.size_bytes(),
+            "trace_bytes": service.db.size_bytes(),
+            "flow_bytes": service.flow_db.size_bytes(),
+            "syslog_bytes": service.syslog_db.size_bytes(),
+            "ipam_bytes": service.ipam_db.size_bytes(),
+        },
+    }
+
+
+# ------------------------------------------------------------------ netpath
+
+def _target_json(service, row) -> dict:
+    last = service.db.last_trace(row["id"])
+    keys = row.keys()
+    return {
+        "id": row["id"],
+        "host": row["host"],
+        "label": row["label"],
+        "interval_s": row["interval_s"],
+        "max_hops": row["max_hops"],
+        "probes": row["probes"],
+        "timeout_s": row["timeout_s"] if "timeout_s" in keys else 2.0,
+        "warn_rtt_ms": row["warn_rtt_ms"],
+        "warn_loss": row["warn_loss"],
+        "enabled": bool(row["enabled"]),
+        "status": last["status"] if last else "none",
+        "last_rtt_ms": last["rtt_ms"] if last else None,
+        "last_run": last["started_ts"] if last else None,
+    }
+
+
+def get_targets(service, params, body) -> dict:
+    return {"targets": [_target_json(service, row) for row in service.db.targets()]}
+
+
+def post_target(service, params, body) -> dict:
+    defaults = service.settings
+    host = str(body.get("host", "")).strip()
+    if not host:
+        raise ValueError("A destination host or address is required")
+    target_id = service.db.add_target(
+        host=host,
+        label=str(body.get("label") or host).strip(),
+        interval_s=int(body.get("interval_s", defaults["default_interval_s"])),
+        max_hops=int(body.get("max_hops", defaults["default_max_hops"])),
+        probes=int(body.get("probes", defaults["default_probes"])),
+        warn_rtt_ms=float(body.get("warn_rtt_ms", defaults["default_warn_rtt_ms"])),
+        warn_loss=float(body.get("warn_loss", defaults["default_warn_loss"])),
+        timeout_s=float(body.get("timeout_s", defaults["default_timeout_s"])),
+    )
+    service.monitor.trace_now(target_id)
+    return {"id": target_id}
+
+
+def put_target(service, params, body, target_id: int) -> dict:
+    fields = {k: v for k, v in body.items()
+              if k in {"host", "label", "interval_s", "max_hops", "probes",
+                       "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
+    service.db.update_target(target_id, **fields)
+    return {"ok": True}
+
+
+def delete_target(service, params, body, target_id: int) -> dict:
+    service.db.remove_target(target_id)
+    return {"ok": True}
+
+
+def trace_now(service, params, body, target_id: int) -> dict:
+    service.monitor.trace_now(target_id)
+    return {"ok": True}
+
+
+def _block_size(service, target, span: float, width_px: float) -> tuple[float, int]:
+    """One block per poll, unless that would be finer than the display can draw."""
+    interval = max(float(target["interval_s"]), 1.0)
+    ceiling = max(int(max(width_px, 200) / MIN_BLOCK_PX), 20)
+    multiple = max(1, math.ceil((span / interval) / ceiling))
+    return interval * multiple, multiple
+
+
+def get_timeline(service, params, body) -> dict:
+    target_id = int(params.get("target", 0))
+    target = service.db.target(target_id)
+    if target is None:
+        return {"buckets": [], "summary": {}}
+
+    t0, t1 = _window(params)
+    width = _num(params, "width", 1200)
+    bucket_s, per_block = _block_size(service, target, t1 - t0, width)
+    traces = service.db.traces_between(target_id, t0, t1)
+    buckets = build_timeline(traces, t0, t1, bucket_s)
+    ok_pct, avg_rtt, count = availability(traces)
+
+    return {
+        "t0": t0,
+        "t1": t1,
+        "bucket_s": bucket_s,
+        "polls_per_block": per_block,
+        "buckets": [
+            {
+                "t0": b.t0, "t1": b.t1, "status": b.status, "total": b.total,
+                "avg_rtt": b.avg_rtt, "avg_loss": b.avg_loss,
+                "max_loss": b.max_loss, "path_changed": b.path_changed,
+                "icmp_code": b.icmp_code, "icmp_from": b.icmp_from,
+                "icmp_text": unreachable_text(b.icmp_code) if b.icmp_code else "",
+                "note": b.note,
+                "counts": dict(b.counts),
+            }
+            for b in buckets
+        ],
+        "summary": {"healthy_pct": ok_pct, "avg_rtt": avg_rtt, "traces": count},
+    }
+
+
+def _topology_json(service, topo, refusal) -> dict:
+    code, address = refusal
+    nodes = []
+    for node in topo.nodes.values():
+        nodes.append({
+            "key": f"{node.ttl}|{node.ip or ''}",
+            "ttl": node.ttl,
+            "ip": node.ip,
+            "label": node.label,
+            "hostname": node.hostname_label,
+            "rtt": node.avg_rtt,
+            "loss": node.avg_loss,
+            "traces": node.traces,
+            "share": topo.share(node.traces),
+            "is_destination": node.is_destination,
+            "is_timeout": node.is_timeout,
+            "refusal": code if (address and node.ip == address) else None,
+            "refusal_text": unreachable_text(code) if (address and node.ip == address) else "",
+        })
+    edges = [
+        {"src": f"{e.src[0]}|{e.src[1] or ''}",
+         "dst": f"{e.dst[0]}|{e.dst[1] or ''}",
+         "share": topo.share(e.traces)}
+        for e in topo.edges
+    ]
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "columns": {str(ttl): [f"{n.ttl}|{n.ip or ''}" for n in col]
+                    for ttl, col in topo.columns.items()},
+        "silent_runs": topo.silent_runs(),
+        "total_traces": topo.total_traces,
+        "distinct_paths": topo.distinct_paths,
+        "refusal": {"code": code, "from": address,
+                    "text": unreachable_text(code) if code else ""},
+    }
+
+
+def get_topology(service, params, body) -> dict:
+    target_id = int(params.get("target", 0))
+    target = service.db.target(target_id)
+    if target is None:
+        return {"nodes": [], "edges": [], "columns": {}, "total_traces": 0}
+
+    pinned = _num(params, "at")
+    if pinned:
+        span = _num(params, "tolerance", float(target["interval_s"]))
+        trace = service.db.trace_nearest(target_id, pinned, max_delta=max(span, 30))
+        if trace is None:
+            return {"nodes": [], "edges": [], "columns": {}, "total_traces": 0,
+                    "snapshot": {"found": False, "at": pinned}}
+        rows = service.db.hop_rows_for_trace(trace["id"])
+        names = service.app_db.hostnames({r["ip"] for r in rows})
+        topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
+                              hostnames=names)
+        keys = trace.keys()
+        code = trace["icmp_code"] if "icmp_code" in keys else None
+        payload = _topology_json(service, topo, (code, trace["icmp_from"]
+                                                 if "icmp_from" in keys else None))
+        payload["snapshot"] = {
+            "found": True,
+            "at": trace["started_ts"],
+            "status": trace["status"],
+            "rtt_ms": trace["rtt_ms"],
+            "loss_pct": trace["loss_pct"],
+            "error": trace["error"],
+            "icmp_code": code,
+            "icmp_from": trace["icmp_from"] if "icmp_from" in keys else None,
+        }
+        return payload
+
+    t0, t1 = _window(params)
+    rows = service.db.hop_rows_between(target_id, t0, t1)
+    names = service.app_db.hostnames({r["ip"] for r in rows})
+    topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
+                          hostnames=names)
+
+    code = address = None
+    for trace in reversed(service.db.traces_between(target_id, t0, t1)):
+        keys = trace.keys()
+        if "icmp_code" in keys and trace["icmp_code"]:
+            code, address = trace["icmp_code"], trace["icmp_from"]
+            break
+    payload = _topology_json(service, topo, (code, address))
+    payload["snapshot"] = {"found": False}
+    return payload
+
+
+# ------------------------------------------------------------------ netflow
+
+def _flow_filters(params) -> dict:
+    return {
+        "src_ip": params.get("src", ""),
+        "dst_ip": params.get("dst", ""),
+        "port": params.get("port") or None,
+        "protocol": _num(params, "protocol", None, int),
+        "exporter": params.get("exporter") or None,
+    }
+
+
+ADDRESS_DIMENSIONS = ("Source", "Destination", "Conversation")
+ARROW = " \u2192 "
+
+
+def _address_names(service, dimension: str, keys) -> dict:
+    """Reverse-DNS names for the addresses behind a set of grouping keys.
+
+    Only for the dimensions that are addresses. A conversation key holds two of
+    them, so both sides are looked up and substituted.
+    """
+    if dimension not in ADDRESS_DIMENSIONS:
+        return {}
+    if not service.flow_settings.get("resolve_addresses"):
+        return {}
+    addresses = set()
+    for key in keys:
+        text = str(key or "")
+        if not text or text.startswith("\u2014"):
+            continue
+        addresses.update(part.strip() for part in text.split(ARROW))
+    return {ip: name for ip, name in service.app_db.hostnames(addresses).items() if name}
+
+
+def _flow_label(service, dimension: str, key, names: dict | None = None) -> str:
+    if key is None:
+        return "unknown"
+    text = str(key)
+    if text.startswith("\u2014"):
+        return text
+    if dimension == "Application":
+        return port_name(key, bool(service.flow_settings.get("resolve_ports", True)))
+    if dimension == "Protocol":
+        return protocol_name(key)
+    if dimension in ("Ingress interface", "Egress interface"):
+        return service.flow_db.interface_names().get(text, text)
+    if dimension in ("Source AS", "Destination AS"):
+        return f"AS{text}"
+    if names and dimension in ADDRESS_DIMENSIONS:
+        # Named where a name exists, address where it does not, so an internal
+        # host with no PTR record still reads sensibly beside a named one.
+        return ARROW.join(names.get(part.strip(), part.strip())
+                          for part in text.split(ARROW))
+    return text
+
+
+def _flow_bucket(service, span: float) -> float:
+    configured = int(service.flow_settings.get("bucket_seconds", 0) or 0)
+    if configured:
+        return float(configured)
+    for limit, bucket in [(900, 10), (7200, 60), (43200, 300),
+                          (172800, 900), (1209600, 3600)]:
+        if span <= limit:
+            return float(bucket)
+    return 21600.0
+
+
+def get_flow_overview(service, params, body) -> dict:
+    t0, t1 = _window(params)
+    span = t1 - t0
+    dimension = params.get("dimension", "Application")
+    filters = _flow_filters(params)
+    bucket = _flow_bucket(service, span)
+    top_n = int(service.flow_settings.get("top_n", 10))
+
+    times, series, bucket_s = service.flow_db.series(
+        t0, t1, dimension, filters, bucket, limit=8)
+    top_rows = service.flow_db.top(t0, t1, dimension, filters, top_n)
+    totals = service.flow_db.totals(t0, t1, filters)
+
+    names = _address_names(service, dimension,
+                           list(series) + [row["key"] for row in top_rows])
+
+    return {
+        "t0": t0, "t1": t1, "bucket_s": bucket_s, "dimension": dimension,
+        "times": times,
+        "series": [{"name": _flow_label(service, dimension, key, names),
+                    "values": values}
+                   for key, values in series.items()],
+        "top": [{"key": str(row["key"]),
+                 "label": _flow_label(service, dimension, row["key"], names),
+                 "bytes": row["bytes"] or 0,
+                 "bytes_text": format_bytes(row["bytes"]),
+                 "rate_text": format_rate(row["bytes"], span),
+                 "packets": row["packets"] or 0,
+                 "flows": row["flows"]}
+                for row in top_rows],
+        "totals": {
+            "bytes": totals["bytes"], "packets": totals["packets"],
+            "flows": totals["flows"],
+            "bytes_text": format_bytes(totals["bytes"]),
+            "rate_text": format_rate(totals["bytes"], span),
+            "packets_text": format_packets(totals["packets"]),
+        },
+        "exporters": [{"address": row["address"], "version": row["version"],
+                       "flows": row["flows"], "last_seen": row["last_seen"]}
+                      for row in service.flow_db.exporters()],
+    }
+
+
+def get_flow_records(service, params, body) -> dict:
+    t0, t1 = _window(params)
+    filters = _flow_filters(params)
+    order = params.get("order", "bytes")
+    rows = service.flow_db.flows(t0, t1, filters, limit=250, order=order)
+
+    resolve_ports = bool(service.flow_settings.get("resolve_ports", True))
+    names = {}
+    if service.flow_settings.get("resolve_addresses"):
+        addresses = {r["src_ip"] for r in rows} | {r["dst_ip"] for r in rows}
+        names = {ip: name for ip, name
+                 in service.app_db.hostnames(addresses).items() if name}
+    interfaces = service.flow_db.interface_names()
+
+    records = []
+    for row in rows:
+        sampling = row["sampling"] or 1
+        records.append({
+            "ts": row["ts_end"],
+            "src_ip": row["src_ip"],
+            "src_name": names.get(row["src_ip"]),
+            "src_port": port_name(row["src_port"], resolve_ports),
+            # The number as well as the label: "443 https" sorts as text
+            # between 44 and 45, which is not what clicking the column means.
+            "src_port_num": row["src_port"],
+            "dst_ip": row["dst_ip"],
+            "dst_name": names.get(row["dst_ip"]),
+            "dst_port": port_name(row["dst_port"], resolve_ports),
+            "dst_port_num": row["dst_port"],
+            "protocol": protocol_name(row["protocol"]),
+            "bytes": (row["bytes"] or 0) * sampling,
+            "bytes_text": format_bytes((row["bytes"] or 0) * sampling),
+            "packets": (row["packets"] or 0) * sampling,
+            "packets_text": format_packets((row["packets"] or 0) * sampling),
+            "in_if": interfaces.get(f"{row['exporter']}:{row['in_if']}",
+                                    str(row["in_if"])),
+            "out_if": interfaces.get(f"{row['exporter']}:{row['out_if']}",
+                                     str(row["out_if"])),
+            "exporter": row["exporter"],
+        })
+    return {"records": records}
+
+
+def post_collector(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.flow_settings["enabled"] = True
+        service.flow_db.save_settings({"enabled": True})
+        service.collector.start(service.flow_settings)
+    elif action == "stop":
+        service.flow_settings["enabled"] = False
+        service.flow_db.save_settings({"enabled": False})
+        service.collector.stop()
+    return {"running": service.collector.running,
+            "status": service.collector.status_text()}
+
+
+def post_test_packet(service, params, body) -> dict:
+    """A v5 header declaring zero records: valid, decodable, carries nothing."""
+    import socket
+    host = "127.0.0.1"
+    port = int(service.flow_settings.get("port", 2055))
+    packet = bytes(1) + bytes([5]) + bytes(22)
+    sent, error = True, None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(packet, (host, port))
+        sock.close()
+    except OSError as exc:
+        sent, error = False, str(exc)
+
+    script = (
+        "$udp = [System.Net.Sockets.UdpClient]::new()\n"
+        f'$udp.Connect("{host}", {port})\n'
+        "$bytes = New-Object byte[] 24\n"
+        "$bytes[1] = 5          # NetFlow v5 header, zero records\n"
+        "[void]$udp.Send($bytes, $bytes.Length)\n"
+        "$udp.Close()\n"
+        f'Write-Host "sent 24 bytes to {host}:{port}"'
+    )
+    return {"sent": sent, "error": error, "host": host, "port": port,
+            "script": script}
+
+
+# -------------------------------------------------------------------- debug
+
+def get_debug(service, params, body) -> dict:
+    since = int(_num(params, "since", 0, int) or 0)
+    state = service.monitor.worker_state()
+    schedule = service.monitor.next_runs()
+    now = time.time()
+
+    workers = []
+    running = queued = 0
+    for target in service.db.targets():
+        last = service.db.last_trace(target["id"])
+        work = state.get(target["id"])
+        keys = target.keys()
+        timeout_s = float(target["timeout_s"]) if "timeout_s" in keys else 2.0
+        entry = {
+            "id": target["id"],
+            "label": target["label"] or target["host"],
+            "host": target["host"],
+            "state": "scheduled" if target["enabled"] else "disabled",
+            "elapsed": None,
+            "budget": expected_budget(target["max_hops"], target["probes"], timeout_s),
+            "last_run": last["started_ts"] if last else None,
+            "duration": last["duration_s"] if last else None,
+            "next_run": schedule.get(target["id"]),
+            "interval_s": target["interval_s"],
+            "status": last["status"] if last else "none",
+        }
+        if work:
+            if work.get("started"):
+                running += 1
+                entry["state"] = "tracing"
+                entry["elapsed"] = now - work["started"]
+            else:
+                queued += 1
+                entry["state"] = "queued"
+                entry["elapsed"] = now - (work.get("queued") or now)
+        workers.append(entry)
+
+    events = [
+        {"seq": e.seq, "ts": e.ts, "clock": e.clock, "category": e.category,
+         "target": e.target, "message": e.message, "detail": e.detail}
+        for e in service.log.since(since)
+    ]
+
+    # One row per address currently out for a reverse lookup.
+    dns_state = service.resolver.worker_state()
+    dns_workers = sorted(
+        [{"ip": ip, "elapsed": now - info["started"]}
+         for ip, info in dns_state.items() if info["started"]],
+        key=lambda row: row["elapsed"], reverse=True)
+
+    # One row per subnet currently being scanned, one per DHCP server
+    # currently being polled — both come from the same worker, so they share
+    # a table rather than needing a section each for what is usually zero or
+    # one row.
+    ipam_state = service.ipam.state()
+    ipam_workers = []
+    if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
+        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets()}
+        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers()}
+        for subnet_id, started in ipam_state.get("scan_started", {}).items():
+            subnet = subnets_by_id.get(subnet_id)
+            ipam_workers.append({
+                "kind": "scan",
+                "label": subnet["label"] if subnet else f"subnet #{subnet_id}",
+                "elapsed": now - started,
+            })
+        for server_id, started in ipam_state.get("poll_started", {}).items():
+            dhcp_server = servers_by_id.get(server_id)
+            ipam_workers.append({
+                "kind": "poll",
+                "label": dhcp_server["label"] if dhcp_server else f"server #{server_id}",
+                "elapsed": now - started,
+            })
+        ipam_workers.sort(key=lambda row: row["elapsed"], reverse=True)
+
+    return {
+        "workers": workers,
+        "dns_workers": dns_workers,
+        "ipam_workers": ipam_workers,
+        "events": events,
+        "last_seq": service.log.last_seq,
+        "targets": sorted({e["target"] for e in events if e["target"]}),
+        "summary": {
+            "scheduler": service.monitor.running,
+            "workers_busy": running,
+            "workers_total": service.monitor.workers,
+            "queued": queued,
+            "resolver": bool(service.resolver._thread
+                             and service.resolver._thread.is_alive()),
+            "dns_pending": len(dns_workers),
+            "collector": service.collector.running,
+            "packets": service.collector.counters["packets"],
+            "ipam": service.ipam.running,
+            "ipam_active": len(ipam_workers),
+            "buffered": len(service.log.all()),
+        },
+    }
+
+
+def post_debug_clear(service, params, body) -> dict:
+    service.log.clear()
+    return {"last_seq": service.log.last_seq}
+
+
+# ----------------------------------------------------------------- settings
+
+def post_settings(service, params, body) -> dict:
+    scope = str(body.get("scope", "global"))
+    values = body.get("values") or {}
+    if scope == "netpath":
+        return {"settings": service.apply_netpath_settings(values)}
+    if scope == "netflow":
+        return {"flow_settings": service.apply_netflow_settings(values)}
+    if scope == "syslog":
+        return {"syslog_settings": service.apply_syslog_settings(values)}
+    if scope == "ipam":
+        return {"ipam_settings": service.apply_ipam_settings(values)}
+    return {"settings": service.apply_global_settings(values)}
+
+
+def post_maintenance(service, params, body) -> dict:
+    action = str(body.get("action", ""))
+    if action == "redns":
+        removed = service.app_db.clear_hostnames()
+        return {"message": f"Cleared {removed} cached names; "
+                           f"lookups restart within 15s"}
+    if action == "prune_traces":
+        days = float(service.settings.get("trace_retention_days", 90))
+        removed = service.db.prune(days)
+        return {"message": f"Deleted {removed} traces older than {days:.0f} days"}
+    if action == "prune_flows":
+        removed = service.flow_db.prune(0, 0)
+        return {"message": f"Deleted {removed} flow records"}
+    if action == "prune_syslog":
+        removed = service.syslog_db.prune(0, 0)
+        return {"message": f"Deleted {removed} syslog messages"}
+    if action == "prune_ipam":
+        hosts = service.ipam_db.prune_hosts(0)
+        conflicts = service.ipam_db.prune_conflicts(0)
+        scans = service.ipam_db.prune_scans(0)
+        return {"message": f"Deleted {hosts} host record(s), {conflicts} "
+                           f"resolved conflict(s), {scans} scan record(s)"}
+    return {"message": "Unknown action"}
+
+
+# ------------------------------------------------------------------- syslog
+
+def _syslog_filters(params) -> dict:
+    return {
+        "text": params.get("q", ""),
+        "severity": params.get("severity") or None,
+        "facility": params.get("facility") or None,
+        "source": params.get("source", ""),
+        "host": params.get("host", ""),
+        "app": params.get("app", ""),
+    }
+
+
+def get_syslog_overview(service, params, body) -> dict:
+    """Histogram plus the context the page needs; deliberately cheap."""
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    bucket = _num(params, "bucket", 3600)
+    filters = _syslog_filters(params)
+
+    buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
+    stats = service.syslog_db.stats()
+    return {
+        "t0": t0, "t1": t1, "bucket_s": bucket,
+        "buckets": buckets,
+        "stats": stats,
+        "sources": [{"source": row["source"], "count": row["n"],
+                     "last_seen": row["last_seen"]}
+                    for row in service.syslog_db.sources()],
+    }
+
+
+def get_syslog_search(service, params, body) -> dict:
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    limit = int(_num(params, "limit", 300, int) or 300)
+    filters = _syslog_filters(params)
+
+    started = time.time()
+    rows = service.syslog_db.search(t0, t1, filters, limit=min(limit, 2000))
+    elapsed_ms = (time.time() - started) * 1000
+
+    names = {}
+    if service.syslog_settings.get("resolve_sources"):
+        names = {ip: name for ip, name in
+                 service.app_db.hostnames({row["source"] for row in rows}).items()
+                 if name}
+
+    return {
+        "took_ms": round(elapsed_ms, 1),
+        "fts": service.syslog_db.fts,
+        "messages": [
+            {
+                "id": row["id"], "ts": row["ts"], "source": row["source"],
+                "source_name": names.get(row["source"], ""),
+                "host": row["host"] or "", "app": row["app"] or "",
+                "procid": row["procid"] or "", "msgid": row["msgid"] or "",
+                "severity": row["severity"],
+                "severity_name": severity_name(row["severity"]),
+                "facility": row["facility"],
+                "facility_name": facility_name(row["facility"]),
+                "message": row["message"], "raw": row["raw"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def post_syslog_collector(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.syslog_settings["enabled"] = True
+        service.syslog_db.save_settings({"enabled": True})
+        service.syslog.start(service.syslog_settings)
+    elif action == "stop":
+        service.syslog_settings["enabled"] = False
+        service.syslog_db.save_settings({"enabled": False})
+        service.syslog.stop()
+    return {"running": service.syslog.running,
+            "status": service.syslog.status_text()}
+
+
+def post_syslog_test(service, params, body) -> dict:
+    """Send a message to our own listener, to prove the socket receives."""
+    import socket as _socket
+    host = "127.0.0.1"
+    port = int(service.syslog_settings.get("port", 514))
+    stamp = time.strftime("%b %d %H:%M:%S")
+    line = (f"<134>{stamp} sappiwhere SappiWhere: loopback test message "
+            f"at {stamp}").encode()
+    sent, error = True, None
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.sendto(line, (host, port))
+        sock.close()
+    except OSError as exc:
+        sent, error = False, str(exc)
+
+    script = (
+        "$udp = [System.Net.Sockets.UdpClient]::new()\n"
+        f'$udp.Connect("{host}", {port})\n'
+        f'$bytes = [Text.Encoding]::ASCII.GetBytes("<134>{stamp} '
+        'sappiwhere SappiWhere: loopback test message")\n'
+        "[void]$udp.Send($bytes, $bytes.Length)\n"
+        "$udp.Close()"
+    )
+    return {"sent": sent, "error": error, "host": host, "port": port,
+            "script": script}
+
+
+# ---------------------------------------------------------------------- ipam
+
+def _subnet_json(row) -> dict:
+    return {"id": row["id"], "cidr": row["cidr"], "label": row["label"],
+            "vlan": row["vlan"], "enabled": bool(row["enabled"]),
+            "created": row["created_ts"]}
+
+
+def get_ipam_subnets(service, params, body) -> dict:
+    from ..ipam_scan import subnet_size
+
+    subnets = [_subnet_json(row) for row in service.ipam_db.subnets()]
+    worker_state = service.ipam.state()
+    # Only the most recent scan per subnet matters here; recent_scans()
+    # returns newest-first across every subnet, so the first hit per id wins.
+    latest: dict[int, dict] = {}
+    for row in service.ipam_db.recent_scans(limit=1000):
+        latest.setdefault(row["subnet_id"], dict(row))
+    for subnet in subnets:
+        subnet["scanning"] = subnet["id"] in worker_state["scanning"]
+        last = latest.get(subnet["id"])
+        subnet["last_scan"] = {
+            "started": last["started_ts"], "finished": last["finished_ts"],
+            "addresses": last["addresses"], "alive": last["alive"],
+            "conflicts": last["conflicts"], "status": last["status"],
+            "error": last["error"],
+        } if last else None
+
+        # Alive / previously-seen-but-down / never-seen, for the utilization
+        # pie chart. Never-seen is a subtraction rather than a count, since
+        # an address nothing has ever answered on has no row in `hosts` to
+        # count in the first place.
+        counts = service.ipam_db.host_counts(subnet["id"])
+        try:
+            total = subnet_size(subnet["cidr"])
+        except ValueError:
+            total = None
+        never_seen = (max(0, total - counts["alive"] - counts["seen_down"])
+                      if total is not None else None)
+        subnet["usage"] = {"alive": counts["alive"], "seen_down": counts["seen_down"],
+                           "never_seen": never_seen, "total": total}
+    return {"subnets": subnets}
+
+
+def post_ipam_subnet(service, params, body) -> dict:
+    from ..ipam_scan import usable_addresses, SubnetTooLarge
+
+    cidr = str(body.get("cidr", "")).strip()
+    if not cidr:
+        raise ValueError("A subnet in CIDR form is required, e.g. 10.20.3.0/24")
+    max_addresses = int(service.ipam_settings.get("max_scan_addresses", 1024))
+    try:
+        usable_addresses(cidr, max_addresses)
+    except SubnetTooLarge as exc:
+        raise ValueError(str(exc))
+    subnet_id = service.ipam_db.add_subnet(
+        cidr, label=body.get("label") or cidr, vlan=body.get("vlan") or None)
+    service.log.add(IPAM_CATEGORY, f"Added subnet {cidr}")
+    return {"id": subnet_id}
+
+
+def put_ipam_subnet(service, params, body, subnet_id) -> dict:
+    fields = {k: v for k, v in body.items() if k in
+             ("cidr", "label", "vlan", "enabled")}
+    service.ipam_db.update_subnet(subnet_id, **fields)
+    return {"ok": True}
+
+
+def delete_ipam_subnet(service, params, body, subnet_id) -> dict:
+    service.ipam_db.remove_subnet(subnet_id)
+    service.log.add(IPAM_CATEGORY, f"Removed subnet #{subnet_id}")
+    return {"ok": True}
+
+
+def post_ipam_subnet_scan(service, params, body, subnet_id) -> dict:
+    if not service.ipam_db.subnet(subnet_id):
+        raise ValueError("No such subnet")
+    service.ipam.scan_now(subnet_id)
+    return {"ok": True}
+
+
+def post_ipam_subnet_clear(service, params, body, subnet_id) -> dict:
+    subnet = service.ipam_db.subnet(subnet_id)
+    if not subnet:
+        raise ValueError("No such subnet")
+    if subnet_id in service.ipam.state()["scanning"]:
+        raise ValueError(
+            "A scan of this subnet is running right now — wait for it to "
+            "finish before clearing, so it doesn't write results back in "
+            "behind the clear.")
+    result = service.ipam_db.clear_subnet_data(subnet_id)
+    service.log.add(IPAM_CATEGORY,
+                    f"Cleared discovered hosts and scan history for "
+                    f"{subnet['label']} ({result['hosts']} host(s), "
+                    f"{result['scans']} scan record(s))")
+    return {"ok": True, **result}
+
+
+def get_ipam_hosts(service, params, body) -> dict:
+    subnet_id = params.get("subnet_id")
+    rows = service.ipam_db.hosts(int(subnet_id) if subnet_id else None)
+    names = {}
+    if service.ipam_settings.get("resolve_hosts", True):
+        names = {ip: name for ip, name in
+                 service.app_db.hostnames({r["ip"] for r in rows}).items() if name}
+    return {"hosts": [
+        {"ip": r["ip"], "mac": r["mac"], "alive": bool(r["alive"]),
+         "hostname": names.get(r["ip"], ""), "subnet_id": r["subnet_id"],
+         "subnet_label": r["subnet_label"], "first_seen": r["first_seen"],
+         "last_seen": r["last_seen"], "last_up": r["last_up"]}
+        for r in rows]}
+
+
+def get_ipam_conflicts(service, params, body) -> dict:
+    include_resolved = params.get("resolved") == "1"
+    rows = service.ipam_db.conflicts(include_resolved=include_resolved)
+    return {"conflicts": [
+        {"id": r["id"], "ip": r["ip"], "mac_a": r["mac_a"], "mac_b": r["mac_b"],
+         "source": r["source"], "detected": r["detected_ts"],
+         "last_seen": r["last_seen_ts"], "resolved": r["resolved_ts"]}
+        for r in rows]}
+
+
+def post_ipam_conflict_resolve(service, params, body, conflict_id) -> dict:
+    service.ipam_db.resolve_conflict(conflict_id)
+    return {"ok": True}
+
+
+def _dhcp_server_json(row) -> dict:
+    return {"id": row["id"], "address": row["address"], "label": row["label"],
+            "enabled": bool(row["enabled"]), "last_poll": row["last_poll_ts"],
+            "last_status": row["last_status"], "last_error": row["last_error"],
+            # The username is not sensitive on its own and is shown so the
+            # form can be prefilled; the password never appears in any
+            # response, encrypted or not — only whether one is stored.
+            "username": row["username"], "has_credential": bool(row["password_enc"])}
+
+
+def get_ipam_dhcp_servers(service, params, body) -> dict:
+    servers = [_dhcp_server_json(row) for row in service.ipam_db.dhcp_servers()]
+    worker_state = service.ipam.state()
+    for server in servers:
+        server["polling"] = server["id"] in worker_state["polling"]
+    return {"servers": servers}
+
+
+def post_ipam_dhcp_server(service, params, body) -> dict:
+    address = str(body.get("address", "")).strip()
+    if not address:
+        raise ValueError("A hostname or address is required")
+    server_id = service.ipam_db.add_dhcp_server(
+        address, label=body.get("label") or address)
+    service.log.add(IPAM_CATEGORY, f"Added DHCP server {address}")
+    return {"id": server_id}
+
+
+def put_ipam_dhcp_server(service, params, body, server_id) -> dict:
+    fields = {k: v for k, v in body.items() if k in ("address", "label", "enabled")}
+    service.ipam_db.update_dhcp_server(server_id, **fields)
+    return {"ok": True}
+
+
+def delete_ipam_dhcp_server(service, params, body, server_id) -> dict:
+    service.ipam_db.remove_dhcp_server(server_id)
+    service.log.add(IPAM_CATEGORY, f"Removed DHCP server #{server_id}")
+    return {"ok": True}
+
+
+def post_ipam_dhcp_server_poll(service, params, body, server_id) -> dict:
+    if not service.ipam_db.dhcp_server(server_id):
+        raise ValueError("No such DHCP server")
+    service.ipam.poll_dhcp_now(server_id)
+    return {"ok": True}
+
+
+def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
+    from ..ipam_dhcp import DhcpUnavailable, test_connection
+    from ..ipam_worker import credential_for_server
+
+    server = service.ipam_db.dhcp_server(server_id)
+    if not server:
+        raise ValueError("No such DHCP server")
+
+    # Testing an in-progress edit checks whatever is currently typed, before
+    # it is saved; otherwise fall back to whatever credential already exists.
+    username = body.get("username")
+    password = body.get("password")
+    if username is None:
+        username, password = credential_for_server(server)
+
+    try:
+        result = test_connection(
+            server["address"],
+            timeout_s=float(service.ipam_settings.get("dhcp_timeout_s", 30)),
+            username=username or None, password=password or None)
+    except (DhcpUnavailable, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        username = password = None
+    return result
+
+
+def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
+    from .. import dpapi
+
+    server = service.ipam_db.dhcp_server(server_id)
+    if not server:
+        raise ValueError("No such DHCP server")
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are both required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only. Use Windows Credential Manager instead: "
+            f"cmdkey /add:{server['address']} /user:<account> /pass:<password>")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.ipam_db.set_dhcp_credential(server_id, username, encrypted)
+    service.log.add(IPAM_CATEGORY,
+                    f"Stored a credential for DHCP server {server['label']}")
+    return {"ok": True}
+
+
+def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
+    server = service.ipam_db.dhcp_server(server_id)
+    if not server:
+        raise ValueError("No such DHCP server")
+    service.ipam_db.clear_dhcp_credential(server_id)
+    service.log.add(IPAM_CATEGORY, f"Cleared the stored credential for DHCP "
+                                   f"server {server['label']}")
+    return {"ok": True}
+
+
+def get_ipam_dhcp_scopes(service, params, body) -> dict:
+    server_id = params.get("server_id")
+    rows = service.ipam_db.dhcp_scopes(int(server_id) if server_id else None)
+    return {"scopes": [
+        {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
+         "scope_id": r["scope_id"], "name": r["name"], "start_ip": r["start_ip"],
+         "end_ip": r["end_ip"], "mask": r["mask"], "state": r["state"],
+         "lease_duration_s": r["lease_duration_s"], "description": r["description"],
+         "polled": r["polled_ts"]}
+        for r in rows]}
+
+
+def get_ipam_dhcp_leases(service, params, body) -> dict:
+    server_id = params.get("server_id")
+    scope_id = params.get("scope_id")
+    rows = service.ipam_db.dhcp_leases(
+        int(server_id) if server_id else None, scope_id or None)
+    return {"leases": [
+        {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
+         "scope_id": r["scope_id"], "ip": r["ip"], "mac": r["mac"],
+         "hostname": r["hostname"], "address_state": r["address_state"],
+         "lease_expires": r["lease_expires_ts"],
+         "is_reservation": bool(r["is_reservation"]),
+         "description": r["description"], "polled": r["polled_ts"]}
+        for r in rows]}
+
+
+# --------------------------------------------------------------------- auth
+
+def _client(params) -> str:
+    return params.get("_client", "")
+
+
+def post_login(service, params, body) -> dict:
+    """Verify a password. Deliberately slow to fail, and vague about why."""
+    from ..auth import needs_rehash, hash_password, verify_password
+
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    client = _client(params)
+
+    delay = service.throttle.delay_for(username, client)
+    if delay:
+        time.sleep(min(delay, 5))
+
+    row = service.app_db.user(username) if username else None
+    stored = row["password"] if row else None
+
+    # Hash something even when the account does not exist, so the time taken
+    # cannot be used to discover which usernames are real.
+    if stored is None:
+        verify_password(password, "scrypt$16384$8$1$" + "A" * 24 + "$" + "A" * 44)
+        service.throttle.record_failure(username or "?", client)
+        service.log.add(ERROR_CATEGORY, f"Failed sign-in for "
+                                        f"{username or '(blank)'} from {client}")
+        raise PermissionError("Wrong username or password")
+
+    if not verify_password(password, stored):
+        service.throttle.record_failure(username, client)
+        service.log.add(ERROR_CATEGORY,
+                        f"Failed sign-in for {row['username']} from {client}")
+        raise PermissionError("Wrong username or password")
+
+    service.throttle.clear(username, client)
+    service.app_db.touch_login(row["username"])
+
+    # Upgrade the stored hash quietly, now that we hold the password.
+    if needs_rehash(stored):
+        service.app_db.set_password(row["username"], hash_password(password),
+                                must_change=bool(row["must_change"]))
+
+    token = service.sessions.create(row["username"], client,
+                                    str(body.get("_agent", "")))
+    service.log.add(SYSTEM_CATEGORY, f"{row['username']} signed in from {client}")
+    return {"token": token, "username": row["username"],
+            "must_change": bool(row["must_change"])}
+
+
+def post_logout(service, params, body) -> dict:
+    token = params.get("_token", "")
+    session = service.sessions.get(token)
+    if session:
+        service.log.add(SYSTEM_CATEGORY, f"{session['username']} signed out")
+    service.sessions.destroy(token)
+    return {"ok": True}
+
+
+def post_heartbeat(service, params, body) -> dict:
+    """Confirms a person is present. server.py has already touched the
+    session for any POST by the time this runs; the only job left is to hand
+    back a fresh countdown so the client's warning banner resets."""
+    return {"ok": True, "idle_timeout_minutes": service.sessions.idle_seconds // 60}
+
+
+def get_session(service, params, body) -> dict:
+    session = service.sessions.get(params.get("_token", ""))
+    if not session:
+        return {"authenticated": False}
+    row = service.app_db.user(session["username"])
+    idle_remaining = service.sessions.idle_seconds - (time.time() - session["last_seen"])
+    return {
+        "authenticated": True,
+        "username": session["username"],
+        "must_change": bool(row["must_change"]) if row else False,
+        "idle_timeout_minutes": service.sessions.idle_seconds // 60,
+        "idle_seconds_remaining": max(0, round(idle_remaining)),
+    }
+
+
+def get_users(service, params, body) -> dict:
+    return {
+        "users": [
+            {"username": row["username"], "created": row["created_ts"],
+             "updated": row["updated_ts"], "last_login": row["last_login"],
+             "must_change": bool(row["must_change"])}
+            for row in service.app_db.users()
+        ],
+        "sessions": service.sessions.active(),
+    }
+
+
+def post_user(service, params, body) -> dict:
+    from ..auth import AuthError, check_password_quality, check_username, hash_password
+
+    try:
+        username = check_username(str(body.get("username", "")))
+        password = str(body.get("password", ""))
+        check_password_quality(password, username)
+    except AuthError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if service.app_db.user(username):
+        raise ValueError(f"There is already an account called {username}")
+
+    service.app_db.add_user(username, hash_password(password), must_change=True)
+    service.log.add(SYSTEM_CATEGORY,
+                    f"Account {username} created by "
+                    f"{params.get('_username', 'someone')}")
+    return {"username": username}
+
+
+def delete_user(service, params, body, username: str = "") -> dict:
+    # The client sends it in the body; the query string is a convenience for
+    # anyone driving the API by hand.
+    target = str(body.get("username", "") or params.get("username", "")
+                 or username).strip()
+    me = params.get("_username", "")
+    if not target:
+        raise ValueError("Which account?")
+
+    if target.lower() == me.lower():
+        raise ValueError("You cannot delete the account you are signed in with")
+    if not service.app_db.user(target):
+        raise ValueError(f"No account called {target}")
+    if service.app_db.user_count() <= 1:
+        raise ValueError("That is the only account; there would be no way back in")
+
+    service.app_db.remove_user(target)
+    ended = service.sessions.destroy_user(target)
+    service.log.add(SYSTEM_CATEGORY,
+                    f"Account {target} removed by {me}; {ended} session(s) ended")
+    return {"removed": target}
+
+
+def post_password(service, params, body) -> dict:
+    """Change a password: your own with the current one, or anyone's as a reset."""
+    from ..auth import (AuthError, check_password_quality, hash_password,
+                        verify_password)
+
+    me = params.get("_username", "")
+    target = str(body.get("username", "") or me)
+    new = str(body.get("new_password", ""))
+    resetting = target.lower() != me.lower()
+
+    row = service.app_db.user(target)
+    if not row:
+        raise ValueError(f"No account called {target}")
+
+    if not resetting:
+        # Changing your own password needs the current one, so a walk-up at an
+        # unlocked screen cannot lock the real owner out.
+        if not verify_password(str(body.get("current_password", "")), row["password"]):
+            raise PermissionError("That is not the current password")
+
+    try:
+        check_password_quality(new, target)
+    except AuthError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if verify_password(new, row["password"]):
+        raise ValueError("That is already the password")
+
+    service.app_db.set_password(target, hash_password(new), must_change=resetting)
+    ended = service.sessions.destroy_user(target)
+    service.log.add(SYSTEM_CATEGORY,
+                    f"Password for {target} changed by {me}; "
+                    f"{ended} session(s) ended")
+    return {"username": target, "sessions_ended": ended, "reset": resetting}
