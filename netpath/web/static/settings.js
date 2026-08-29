@@ -26,7 +26,75 @@
     App.el('set-flow-path').value = storage.flow_path || '';
     App.el('set-syslog-path').value = storage.syslog_path || '';
     showUsage(storage);
+    showUpdateInfo(server);
     status('Showing saved settings', 'var(--faint)');
+  }
+
+  /* --------------------------------------------------------------- update */
+
+  function showUpdateInfo(server) {
+    App.el('update-version').textContent = server.version ? `v${server.version}` : '';
+    const commit = (server.update || {}).installed_commit;
+    App.el('update-commit').textContent = commit ? commit.slice(0, 10) : 'unknown';
+  }
+
+  function updateStatus(message, colour) {
+    const el = App.el('update-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--faint)';
+  }
+
+  async function checkForUpdate() {
+    const button = App.el('update-now');
+    button.disabled = true;
+    updateStatus('Checking github.com for the latest commit…', 'var(--muted)');
+    let payload;
+    try {
+      payload = await App.post('/api/update', {});
+    } catch (error) {
+      updateStatus(error.message, 'var(--fail)');
+      button.disabled = false;
+      return;
+    }
+    if (!payload.ok) {
+      updateStatus(payload.error || 'Update failed', 'var(--fail)');
+      button.disabled = false;
+      return;
+    }
+    if (payload.up_to_date) {
+      updateStatus(`Already up to date — ${payload.commit} “${payload.message}”.`,
+                   'var(--ok)');
+      button.disabled = false;
+      return;
+    }
+    updateStatus(`Installed ${payload.commit} “${payload.message}” — restarting…`,
+                 'var(--ok)');
+    waitForRestart();
+  }
+
+  /* The service is a single process; restarting it drops every connection for
+     a moment and, since sessions are in-memory, ends every session including
+     this one. Poll the public session endpoint with a plain fetch — not
+     App.get, which would redirect to /login on the first 401 rather than
+     waiting for the server to actually come back — until it answers, then
+     send the browser to sign back in. */
+  async function waitForRestart() {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      try {
+        await fetch('/api/session', { cache: 'no-store' });
+        updateStatus('Back up — signing back in…', 'var(--ok)');
+        setTimeout(() => { window.location.href = '/login'; }, 500);
+        return;
+      } catch (error) {
+        // still down — keep polling
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    updateStatus('Still not reachable after a minute — check the service directly.',
+                 'var(--fail)');
+    App.el('update-now').disabled = false;
   }
 
   /* What each database is using now, against the cap set beside it. The cap
@@ -230,6 +298,7 @@
     }
     App.el('set-apply').onclick = apply;
     App.el('set-revert').onclick = load;
+    App.el('update-now').onclick = checkForUpdate;
     for (const button of document.querySelectorAll('[data-maint]')) {
       button.onclick = () => maintenance(button.dataset.maint);
     }

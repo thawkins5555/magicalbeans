@@ -42,6 +42,7 @@ def _window(params) -> tuple[float, float]:
 
 def get_state(service, params, body) -> dict:
     from .. import __version__
+    from ..selfupdate import INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY
 
     names = service.hostname_stats()
     session = service.sessions.get(params.get("_token", ""))
@@ -49,6 +50,10 @@ def get_state(service, params, body) -> dict:
                       if session else None)
     return {
         "version": __version__,
+        "update": {
+            "installed_commit": service.app_db.meta(INSTALLED_COMMIT_KEY),
+            "installed_at": service.app_db.meta(INSTALLED_AT_KEY),
+        },
         "session": {
             "username": session["username"] if session else "",
             "must_change": bool(
@@ -616,6 +621,17 @@ def post_settings(service, params, body) -> dict:
     if scope == "ipam":
         return {"ipam_settings": service.apply_ipam_settings(values)}
     return {"settings": service.apply_global_settings(values)}
+
+
+def post_update(service, params, body) -> dict:
+    from .. import selfupdate
+
+    result = selfupdate.apply(service.app_db)
+    if result.get("ok") and not result.get("up_to_date"):
+        service.log.add(SYSTEM_CATEGORY,
+                        f"Updated to commit {result['commit']}: "
+                        f"{result['message']}; restarting")
+    return result
 
 
 def post_maintenance(service, params, body) -> dict:

@@ -438,6 +438,20 @@
     </fieldset>
 
     <fieldset>
+      <legend>SOFTWARE UPDATE</legend>
+      <p class="hint">Running <span id="update-version"></span>, commit
+        <span id="update-commit">unknown</span>. Checks
+        <code>github.com/thawkins5555/magicalbeans</code> for the latest
+        <code>main</code> and, if there is anything new, downloads it, swaps it
+        in and restarts the service — which signs everyone out, this session
+        included, so it lands you back on the sign-in page.</p>
+      <div class="row">
+        <button id="update-now" class="primary">Check for update &amp; restart</button>
+      </div>
+      <p class="hint" id="update-status"></p>
+    </fieldset>
+
+    <fieldset>
       <legend>MAINTENANCE</legend>
       <div class="row">
         <button data-maint="redns">Re-run reverse DNS</button>

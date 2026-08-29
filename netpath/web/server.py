@@ -79,6 +79,7 @@ ROUTES = [
     ("POST", r"^/api/debug/clear$", api.post_debug_clear),
     ("POST", r"^/api/settings$", api.post_settings),
     ("POST", r"^/api/maintenance$", api.post_maintenance),
+    ("POST", r"^/api/update$", api.post_update),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler)
