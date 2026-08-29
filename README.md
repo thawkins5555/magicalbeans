@@ -514,22 +514,25 @@ open, and with no console window to close by accident.
 
 ## Layout
 
+The interface lives entirely in the browser now — `web/static/` — talking to
+the backend over the JSON endpoints in `web/api.py`. `console.py` is the only
+thing left with a native window: the small service-status console described
+above, not the application itself.
+
 ```
 netpath/
+  __main__.py      CLI entry point: parses args, starts headless or console mode
+  console.py       the service console window (PySide6): status, connections,
+                   listener settings, captured output
   tracer.py        runs traceroute/tracert, parses output into hops
-  db.py            SQLite schema and queries
+  db.py            SQLite schema and queries for traces and hops
   monitor.py       background scheduler and thread pool, status classification,
                    reverse-DNS resolver
   analysis.py      traces -> topology graph, traces -> timeline buckets
-  pathview.py      route graph (QGraphicsView)
-  timelineview.py  status strip, latency trace, zoom/pan/select
-  mainwindow.py    window, target list, range controls
-  theme.py         palettes (dark chrome, light route canvas), fonts, stylesheet
+  theme.py         palettes, fonts and stylesheet for the console window
   nfdecode.py      NetFlow v5/v9/IPFIX packet decoding and template cache
-  collector.py     UDP listener and batched writer
+  collector.py     UDP listener and batched writer for NetFlow
   flowdb.py        flow storage, settings, aggregation queries
-  flowcharts.py    stacked area and top-N bar charts
-  flowtab.py       the NetFlow page and its settings dialog
   services.py      port and protocol names, byte and rate formatting
   syslogparse.py   RFC 3164 and RFC 5424 message parsing
   syslogd.py       syslog UDP/TCP listener
@@ -538,14 +541,35 @@ netpath/
   procs.py         launching child processes with no console window
   auth.py          password hashing, users, sessions, login throttling
   eventlog.py      bounded in-memory event buffer shared by all workers
-  debugtab.py      the debug page
-  settingstab.py   the global settings page
-  settingsui.py    shared group and hint widgets for settings screens
+  appdb.py         shared settings and accounts (app.db)
+  dpapi.py         Windows DPAPI wrapper for encrypting stored DHCP credentials
+  ipamdb.py        subnet, host, conflict storage and queries
+  ipam_scan.py     subnet ping sweep and ARP-table reconciliation
+  ipam_dhcp.py     polls a Windows DHCP server's scopes, leases and reservations
+  ipam_worker.py   background scheduler for subnet scans and DHCP polling
   web/
-    service.py     headless service: databases, scheduler, resolver, collector
-    api.py         JSON endpoints
-    server.py      HTTP server, routing, static files
+    __init__.py    exports Service and WebServer
+    service.py     headless service: opens the databases, starts the
+                   scheduler, resolver and collectors
+    api.py         JSON endpoints — one function per route, grouped by
+                   NetPath, NetFlow, syslog, IPAM, auth and users
+    server.py      HTTP(S) server: routing, sessions/cookies, access log,
+                   serving static/
     static/        the browser interface
+      index.html   the six-tab shell (NetPath, NetFlow, Syslog, IPAM,
+                   Debug, Settings)
+      login.html   the sign-in page
+      app.css      shared styling for the whole interface
+      app.js       shared plumbing: server calls, tab switching, the
+                   refresh loop, modals
+      netpath.js   NetPath tab: route graph, timeline, destinations
+      netflow.js   NetFlow tab: traffic chart, top-N, flow table, filters
+      syslog.js    Syslog tab: message table, filters, collector settings
+      ipam.js      IPAM tab: subnets & hosts, conflicts, DHCP
+      debug.js     Debug tab: trace workers, event log
+      settings.js  Settings tab: reverse DNS, refresh interval, database
+                   locations, maintenance
+      login.js     sign-in form and idle/session-timeout handling
 ```
 
 Traces and hops go in `traces` and `hops`, with resolved names in `hostnames`. A hop row exists per distinct address seen at that TTL in that run, plus a null-address row when every probe timed out — that is what lets a single run show a fork, and what makes the `no reply` boxes appear in the graph.
