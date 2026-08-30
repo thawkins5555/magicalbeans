@@ -145,10 +145,28 @@ def _swap_in(new_netpath: str) -> None:
         raise
 
 
+def _relaunch_args() -> list[str]:
+    """The command that starts this app fresh, as the `netpath` module
+    rather than a bare script path.
+
+    `sys.argv` alone is not enough to rebuild this: `-m netpath` rewrites
+    `sys.argv[0]` to `__main__.py`'s resolved file path, and launching that
+    path directly — rather than through `-m` — drops the package context
+    every relative import in this app depends on (`from . import
+    selfupdate`, `from .web import Service`, and so on), crashing on the
+    very first one with "attempted relative import with no known parent
+    package". `-m netpath` is what actually restores that context; the
+    rest of the original argv, past whatever argv[0] happened to be,
+    still carries the flags this was launched with.
+    """
+    return [sys.executable, "-m", "netpath"] + sys.argv[1:]
+
+
 def _restart_posix() -> None:
     """`execve` replaces this process image in place: same PID, no gap
     where nothing is listening."""
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    args = _relaunch_args()
+    os.execv(args[0], args)
 
 
 RESTART_LOG = os.path.join(_APP_ROOT, "update_restart.log")
@@ -191,10 +209,10 @@ def _restart_windows() -> None:
     creationflags |= (subprocess.CREATE_NEW_PROCESS_GROUP
                       | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
 
-    args = [sys.executable] + sys.argv
+    args = _relaunch_args()
     _log_restart(f"restarting pid={os.getpid()} headless={headless} args={args}")
     try:
-        proc = subprocess.Popen(args, cwd=os.getcwd(), close_fds=True,
+        proc = subprocess.Popen(args, cwd=_APP_ROOT, close_fds=True,
                                 creationflags=creationflags)
         time.sleep(0.5)   # long enough to catch an immediate failure to start
         _log_restart(f"spawned pid={proc.pid} alive_after_0.5s={proc.poll() is None}")
