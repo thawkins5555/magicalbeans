@@ -233,8 +233,16 @@ def _friendly_error(message: str) -> str:
             f"installed there, separately from the DHCP Server role "
             f"actually running. Fix, on the DHCP server as Administrator:\n"
             f"  Install-WindowsFeature RSAT-DHCP\n"
-            f"No reboot needed; a new session picks it up immediately. "
-            f"Confirm with: Get-Module -ListAvailable DhcpServer")
+            f"Confirm with: Get-Module -ListAvailable DhcpServer\n\n"
+            f"If that already shows the module installed and this error "
+            f"still happens, the WinRM service itself was already running "
+            f"before the feature was added and is still using its old "
+            f"environment — an interactive session picks up the change "
+            f"immediately, a long-running service does not. Restart it, "
+            f"on the DHCP server:\n"
+            f"  Restart-Service WinRM\n"
+            f"A full reboot of the DHCP server is the fallback if that "
+            f"alone doesn't clear it.")
     return message
 
 
