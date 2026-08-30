@@ -484,21 +484,38 @@
           b.querySelector('#dh-error').innerHTML =
             '<span style="color:var(--ok)">Stored credential cleared.</span>';
         } },
-        { label: 'Test connection', onClick: async (b) => {
+        { label: 'Test connection', onClick: async (b, button) => {
           const fields = readDhcpForm(b);
           // An untouched password field means "use whatever is already
           // configured" -- the stored credential if there is one, ambient
           // identity otherwise -- rather than testing with a blank password.
           const payload = fields.password
             ? { username: fields.username, password: fields.password } : {};
-          const result = await App.post(`/api/ipam/dhcp/servers/${server.id}/test`, payload);
-          // Test failures can carry PowerShell's exact multi-line output
-          // (stdout/stderr, exit code) rather than a one-line summary; a
-          // <pre> preserves that formatting instead of collapsing it into
-          // an unreadable run-on line.
-          b.querySelector('#dh-error').innerHTML = result.ok
-            ? `<span style="color:var(--ok)">Reachable — DHCP Server ${escape(result.version)}, ${result.scope_count} scope(s)</span>`
-            : `<pre class="err">${escape(result.error)}</pre>`;
+          const errorBox = b.querySelector('#dh-error');
+          const label = button.textContent;
+          // This can take a while -- it's a PowerShell round trip to the
+          // DHCP server, over WinRM when a credential is set -- so say so
+          // immediately rather than leaving the dialog looking inert until
+          // the response lands.
+          button.disabled = true;
+          button.textContent = 'Testing…';
+          errorBox.innerHTML = '<span class="hint">Testing connection — this can take up to '
+            + 'thirty seconds…</span>';
+          try {
+            const result = await App.post(`/api/ipam/dhcp/servers/${server.id}/test`, payload);
+            // Test failures can carry PowerShell's exact multi-line output
+            // (stdout/stderr, exit code) rather than a one-line summary; a
+            // <pre> preserves that formatting instead of collapsing it into
+            // an unreadable run-on line.
+            errorBox.innerHTML = result.ok
+              ? `<span style="color:var(--ok)">Reachable — DHCP Server ${escape(result.version)}, ${result.scope_count} scope(s)</span>`
+              : `<pre class="err">${escape(result.error)}</pre>`;
+          } catch (error) {
+            errorBox.innerHTML = `<span class="err">${escape(error.message)}</span>`;
+          } finally {
+            button.disabled = false;
+            button.textContent = label;
+          }
         } },
         { label: 'Save', primary: true, onClick: async (b) => {
           const fields = readDhcpForm(b);

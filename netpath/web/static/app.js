@@ -263,7 +263,7 @@ const App = (() => {
       const button = document.createElement('button');
       button.textContent = spec.label;
       if (spec.primary) button.className = 'primary';
-      button.onclick = () => spec.onClick(box);
+      button.onclick = () => spec.onClick(box, button);
       row.appendChild(button);
     }
     wrap.hidden = false;
