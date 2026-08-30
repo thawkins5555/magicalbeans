@@ -111,11 +111,16 @@ def listener_for(service, args):
 
 
 def run_headless(args) -> int:
+    from . import selfupdate
     from .web import WebServer
 
     service = build_service(args)
     host, port, cert, key = listener_for(service, args)
     server = WebServer(service, host=host, port=port, certfile=cert, keyfile=key)
+    # So a self-update releases the port and closes the databases before
+    # spawning its replacement, not after — see schedule_restart()'s note.
+    selfupdate.set_before_restart_hook(
+        lambda: (server.stop(), service.shutdown()))
 
     if not server.start(block=False):
         print(server.error)
@@ -144,7 +149,7 @@ def run_console(args) -> int:
     """The service console: a window showing the server and who is on it."""
     from PySide6.QtWidgets import QApplication
 
-    from . import theme
+    from . import selfupdate, theme
     from .console import ConsoleWindow, OutputCapture
     from .web import WebServer
 
@@ -156,6 +161,10 @@ def run_console(args) -> int:
     service = build_service(args)
     host, port, cert, key = listener_for(service, args)
     server = WebServer(service, host=host, port=port, certfile=cert, keyfile=key)
+    # So a self-update releases the port and closes the databases before
+    # spawning its replacement, not after — see schedule_restart()'s note.
+    selfupdate.set_before_restart_hook(
+        lambda: (server.stop(), service.shutdown()))
     server.start(block=False)          # the console reports a failure to bind
 
     app = QApplication(sys.argv)

@@ -203,11 +203,37 @@ def _restart_windows() -> None:
     os._exit(0)
 
 
+# Set by __main__.py once the web server and service exist, so the restart
+# can release the port and close the databases before spawning a replacement
+# rather than after — see the note on _before_restart in schedule_restart().
+_before_restart_hook = None
+
+
+def set_before_restart_hook(fn) -> None:
+    global _before_restart_hook
+    _before_restart_hook = fn
+
+
 def schedule_restart(delay: float = 1.5) -> None:
     """Restart after `delay` seconds, so the response to this request has
-    time to reach the browser first."""
+    time to reach the browser first.
+
+    The replacement is spawned only after the hook has released the port and
+    closed the databases, not before: spawning first and cleaning up after
+    left a window where the new process tried to bind the same port and open
+    the same SQLite files while the old one was still holding both, lost
+    that race, and died — and by the time the old process finally let go,
+    there was nobody left to take its place.
+    """
     def _go():
         time.sleep(delay)
+        if _before_restart_hook is not None:
+            _log_restart("running before-restart hook (stop server, "
+                        "shut down service)")
+            try:
+                _before_restart_hook()
+            except Exception as exc:
+                _log_restart(f"before-restart hook failed: {exc}")
         _restart_windows() if os.name == "nt" else _restart_posix()
     threading.Thread(target=_go, name="sappiwhere-update-restart",
                      daemon=True).start()
