@@ -92,6 +92,7 @@ GLOBAL_DEFAULTS = {
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
     "max_syslog_db_mb": 1024,
+    "max_ipam_db_mb": 256,
 }
 
 # Tables this file took over whole. `settings` is not among them: that table

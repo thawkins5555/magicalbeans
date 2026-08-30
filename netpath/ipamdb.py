@@ -577,3 +577,37 @@ class IpamDatabase:
             except OSError:
                 pass
         return total
+
+    def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest scan records until the file fits under the cap.
+
+        Scan history is the one table here that grows without bound —
+        subnets, hosts and open conflicts are all bounded by what currently
+        exists on the network, not by time. Deletes in chunks and vacuums
+        between them, because SQLite does not return space to the filesystem
+        until it is vacuumed — without that the loop would never see the
+        size fall and would empty the table.
+        """
+        if max_bytes <= 0:
+            return 0
+        removed = 0
+        for _ in range(6):
+            if self.size_bytes() <= max_bytes:
+                break
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM scans").fetchone()["n"]
+                if total <= 200:
+                    break
+                chunk = max(int(total * 0.15), 200)
+                cur = self._conn.execute(
+                    "DELETE FROM scans WHERE id IN "
+                    "(SELECT id FROM scans ORDER BY started_ts LIMIT ?)", (chunk,))
+                removed += cur.rowcount or 0
+                self._conn.commit()
+                self._conn.execute("VACUUM")
+                # VACUUM alone does not shrink the files in WAL mode: the freed
+                # pages sit in the write-ahead log until it is checkpointed and
+                # truncated, so the loop would never see the size fall.
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return removed

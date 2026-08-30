@@ -311,3 +311,11 @@ class Service:
                 self.log.add(SYSTEM, f"Syslog database over its "
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest messages")
+
+        cap = int(self.settings.get("max_ipam_db_mb", 0)) * 1024 * 1024
+        if cap:
+            removed = self.ipam_db.trim_to_size(cap)
+            if removed:
+                self.log.add(SYSTEM, f"IPAM database over its "
+                                     f"{cap // 1048576} MB cap: removed "
+                                     f"{removed} oldest scan records")

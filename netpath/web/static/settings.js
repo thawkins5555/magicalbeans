@@ -17,6 +17,7 @@
     App.el('set-trace-cap').value = s.max_trace_db_mb;
     App.el('set-flow-cap').value = s.max_flow_db_mb;
     App.el('set-syslog-cap').value = s.max_syslog_db_mb;
+    App.el('set-ipam-cap').value = s.max_ipam_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
 
@@ -25,6 +26,7 @@
     App.el('set-trace-path').value = storage.trace_path || '';
     App.el('set-flow-path').value = storage.flow_path || '';
     App.el('set-syslog-path').value = storage.syslog_path || '';
+    App.el('set-ipam-path').value = storage.ipam_path || '';
     showUsage(storage);
     showUpdateInfo(server);
     status('Showing saved settings', 'var(--faint)');
@@ -69,7 +71,28 @@
     }
     updateStatus(`Installed ${payload.commit} “${payload.message}” — restarting…`,
                  'var(--ok)');
+    showRestartModal(payload);
     waitForRestart();
+  }
+
+  /* Blocks the whole screen while the restart is in flight: there is nothing
+     useful to do with the rest of the UI mid-restart anyway (every request
+     will 401 the instant the old session dies), and a plain status line
+     off in Settings is easy to miss if you've wandered to another tab. */
+  function showRestartModal(payload) {
+    App.state.modalLocked = true;
+    App.modal('Updating SappiWhere', `
+      <p>Installed <b>${escape(payload.commit)}</b> — “${escape(payload.message)}”.</p>
+      <p>Restarting the service to load it. This signs everyone out, this
+      session included — you'll land back on the sign-in page automatically
+      once it's back.</p>
+      <p class="hint" id="restart-modal-status">Waiting for the service to
+      come back…</p>`, []);
+  }
+
+  function restartModalStatus(message) {
+    const el = document.getElementById('restart-modal-status');
+    if (el) el.textContent = message;
   }
 
   /* The service is a single process; restarting it drops every connection for
@@ -85,15 +108,22 @@
       try {
         await fetch('/api/session', { cache: 'no-store' });
         updateStatus('Back up — signing back in…', 'var(--ok)');
+        restartModalStatus('Back up — signing back in…');
+        App.state.modalLocked = false;
         setTimeout(() => { window.location.href = '/login'; }, 500);
         return;
       } catch (error) {
         // still down — keep polling
       }
+      restartModalStatus('Waiting for the service to come back… '
+        + `(${Math.max(0, Math.round((deadline - Date.now()) / 1000))}s left)`);
       await new Promise((resolve) => setTimeout(resolve, 1500));
     }
     updateStatus('Still not reachable after a minute — check the service directly.',
                  'var(--fail)');
+    restartModalStatus('Still not reachable after a minute — check the '
+      + 'service directly. You can close this and try again.');
+    App.state.modalLocked = false;
     App.el('update-now').disabled = false;
   }
 
@@ -104,6 +134,7 @@
       ['use-trace', storage.trace_bytes, Number(App.el('set-trace-cap').value)],
       ['use-flow', storage.flow_bytes, Number(App.el('set-flow-cap').value)],
       ['use-syslog', storage.syslog_bytes, Number(App.el('set-syslog-cap').value)],
+      ['use-ipam', storage.ipam_bytes, Number(App.el('set-ipam-cap').value)],
     ];
     for (const [id, bytes, capMb] of rows) {
       const el = App.el(id);
@@ -117,7 +148,7 @@
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
     const total = (storage.trace_bytes || 0) + (storage.flow_bytes || 0)
-      + (storage.syslog_bytes || 0) + (storage.app_bytes || 0);
+      + (storage.syslog_bytes || 0) + (storage.app_bytes || 0) + (storage.ipam_bytes || 0);
     App.el('set-sizes').textContent =
       `${App.bytes(total)} on disk in total. Sizes include each file's `
       + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
@@ -144,6 +175,7 @@
       max_trace_db_mb: Number(App.el('set-trace-cap').value),
       max_flow_db_mb: Number(App.el('set-flow-cap').value),
       max_syslog_db_mb: Number(App.el('set-syslog-cap').value),
+      max_ipam_db_mb: Number(App.el('set-ipam-cap').value),
       session_idle_minutes: Number(App.el('set-idle-minutes').value),
       session_max_hours: Number(App.el('set-session-hours').value),
     };
@@ -292,7 +324,7 @@
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     loadUsers().catch(() => {});
-    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-syslog-cap']) {
+    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-syslog-cap', 'set-ipam-cap']) {
       App.el(id).oninput = () =>
         showUsage((App.state.serverState || {}).storage || {});
     }

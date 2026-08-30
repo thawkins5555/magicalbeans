@@ -389,18 +389,23 @@
       <label>Traces <input id="set-trace-path" readonly></label>
       <label>Flows <input id="set-flow-path" readonly></label>
       <label>Syslog <input id="set-syslog-path" readonly></label>
+      <label>IPAM <input id="set-ipam-path" readonly></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
         <span class="usage" id="use-flow"></span></label>
       <label>Syslog database cap <input type="number" id="set-syslog-cap" min="16" step="256"> MB
         <span class="usage" id="use-syslog"></span></label>
+      <label>IPAM database cap <input type="number" id="set-ipam-cap" min="16" step="64"> MB
+        <span class="usage" id="use-ipam"></span></label>
       <p class="hint" id="set-sizes"></p>
       <p class="hint">Checked every 15 minutes. When a file is over its cap the oldest records are
-        deleted until it fits, so the cap wins over the retention setting.</p>
+        deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
+        oldest scan history first — subnets, discovered hosts and open conflicts describe the
+        network as it is now, not a log, so they aren't what a size cap trims.</p>
       <p class="hint">The application file holds settings, accounts and the shared reverse-DNS
         cache. It has no cap because it does not grow with traffic — it is the one to back up,
-        and the three record files can be rebuilt by simply collecting again.</p>
+        and the other four files can all be rebuilt by simply collecting again.</p>
     </fieldset>
     <fieldset>
       <legend>SIGN-IN</legend>

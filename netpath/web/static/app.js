@@ -9,6 +9,7 @@ const App = (() => {
     categories: [],
     refreshMs: 2000,
     timer: null,
+    modalLocked: false,
   };
 
   const pages = {};
@@ -271,7 +272,10 @@ const App = (() => {
     return box;
   }
 
-  const closeModal = () => { document.getElementById('modal').hidden = true; };
+  const closeModal = () => {
+    if (state.modalLocked) return;
+    document.getElementById('modal').hidden = true;
+  };
 
   function el(id) { return document.getElementById(id); }
 
