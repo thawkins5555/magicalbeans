@@ -215,6 +215,16 @@ def _friendly_error(message: str) -> str:
             f"  winrm set winrm/config/client '@{{TrustedHosts=\"<address>\"}}'\n"
             f"That falls back to NTLM and skips verifying the server's "
             f"identity, so prefer the hostname fix where the address has one.")
+    if "CIM server" in message:
+        return (
+            f"{message}\n\nThis one is on the DHCP server itself: WinRM "
+            f"reached it and authenticated fine, but once there, the "
+            f"DhcpServer cmdlets talk to it over CIM/WMI, and this account "
+            f"isn't authorized for that — a different permission from "
+            f"WinRM access. It needs membership in the DHCP server's local "
+            f"`DHCP Users` group (Administrator rights are not required, "
+            f"just that group), added on the DHCP server itself, not here."
+        )
     return message
 
 
