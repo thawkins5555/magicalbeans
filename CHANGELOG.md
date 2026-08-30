@@ -1,10 +1,120 @@
 # SappiWhere — Changelog
 
-Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`. A guide to what the application does is in `FEATURES.md`. How credentials are protected is in `CREDENTIAL-SECURITY.md`.
+Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`. A guide to what the application does is in `FEATURES.md`, and how it does it in `INTERNALS.md`. How credentials are protected is in `CREDENTIAL-SECURITY.md`.
 
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.7.0 — Scope sort by IP, half-width buttons, IPAM as a DNS fallback
+
+- **Scopes sort by IP address** too now, alongside Least available (the
+  default), Most available and Name — numerically, so 10.0.10.0 doesn't
+  sort ahead of 10.0.2.0.
+- **Change password and Check for update & restart** no longer stretch to
+  the full width of their row.
+- **NetFlow and Syslog can get a name from IPAM when DNS has nothing.** The
+  reverse-DNS resolver falls back to whatever a DHCP lease says a device's
+  hostname is when a PTR lookup comes back empty, and caches that the same
+  as a real DNS answer — in the one shared cache both modules already read
+  from, so neither needed any changes of its own.
+- **Syslog's Messages header gets a Hostname checkbox**, on by default,
+  next to the message count: unchecked, the Source column always shows the
+  raw address even when a name is known.
+
+### 4.6.0 – 4.6.3 — DHCP reformatted to match Subnets & Hosts
+
+The DHCP page now mirrors Subnets & Hosts one level down. Server selection
+moved into a compact dropdown at the top; the sidebar it vacated now holds
+**Scopes**, each with a mini utilization donut — leased, reserved,
+available — the same visual language as the subnet donuts. Selecting a
+scope shows a bigger version of that donut above its **Leases** table,
+filtered to just that scope, the same way the Hosts table already filters
+to the selected subnet.
+
+- Scopes sort by **Least available** (the default), **Most available** or
+  **Name**.
+- The detail header adds the scope's own **subnet**, computed from its
+  network identity (ScopeId + mask) rather than the narrower dynamic
+  range, and its configured **router** address (DHCP option 3), fetched
+  per scope and not previously read at all.
+- `dhcp_scopes` gained a `router` column, added to existing databases
+  through the same `ALTER TABLE` migration pattern already used for the
+  DHCP credential fields.
+
+### 4.5.0 – 4.5.1 — Find: search IPAM by hostname, IP or MAC
+
+A search box in the IPAM strip answers the direction browsing by subnet
+never could: given a name, MAC or partial IP, what's the address. Checks
+three sources at once — hosts SappiWhere's own sweep discovered, DHCP
+leases and reservations, and the shared reverse-DNS cache — and merges
+matches found in more than one by IP. A result outside every configured
+subnet isn't a bug: DHCP polling reads a server's scopes independently of
+what subnets are being swept, and each result names which source found it.
+
+### 4.5.2 – 4.5.7 — DHCP Test Connection: reliability and readable errors
+
+Test Connection went from a silent "PowerShell exited with code 0, no
+output" to actually working, through a real chain of distinct failures
+found and fixed against a production DHCP server:
+
+- **The root cause of the silent failure**: the script was piped to
+  PowerShell over stdin with `-Command -`, which is unreliable for a
+  multi-statement script with scriptblocks and try/catch on native
+  Windows PowerShell — it can read and execute nothing while still
+  exiting 0. Switched to writing the script to a temp `.ps1` file and
+  running it with `-File`, the officially supported way, written with a
+  UTF-8 BOM so Windows PowerShell 5.1 reads it correctly regardless of
+  the system codepage.
+- **WinRM TrustedHosts, CIM/WMI access-denied, and DhcpServer
+  module-not-loaded** errors — each a distinct, genuine step in getting a
+  credentialed connection working (Kerberos can't vouch for a bare IP;
+  the account needs the DHCP server's local `DHCP Users` group, a
+  separate permission from WinRM access; and the DHCP server needs
+  `RSAT-DHCP` installed, which can silently not take effect until WinRM
+  itself is restarted) — now come back with the actual fix appended
+  rather than the raw PowerShell message alone.
+- **The button itself shows progress**: disabled and relabeled "Testing…"
+  for the duration, since a PowerShell round trip over WinRM can
+  legitimately take up to thirty seconds and previously gave no
+  indication anything was happening.
+
+### 4.4.0 — A blocking restart dialog, and an IPAM database cap
+
+Clicking the update button now grays out the screen with a modal
+explaining a restart is in progress and that it will sign everyone out,
+rather than leaving that as a status line easy to miss on another tab.
+IPAM's `ipam.db` gets the same size-cap treatment the other three
+databases already had — 256 MB by default, trimming the oldest scan
+history first, since subnets, hosts and open conflicts describe the
+network as it is now rather than a log a cap should be trimming.
+
+### 4.2.0 – 4.3.6 — A self-update button
+
+Settings gained one button: check `github.com/thawkins5555/magicalbeans`'s
+`main` branch for a commit newer than what's installed, and if there is
+one, download it over plain HTTPS, swap it into the running install, and
+restart. Getting the restart itself to actually work reliably took three
+real, distinct bugs found against production Windows servers, each fixed
+in turn:
+
+- **`CERTIFICATE_VERIFY_FAILED`** on a Windows server with no route to
+  fetch a missing root certificate — fixed by vendoring Mozilla's CA
+  bundle (the same one `pip` ships) and trusting it alongside the system
+  store rather than instead of it.
+- **The restart not restarting at all.** `os.execv` behaves nothing like
+  POSIX exec on Windows — it spawns a new process and ends the old one —
+  and a naive replacement process was losing a race for the port and the
+  databases against the process it was replacing, then separately dying
+  within milliseconds of starting for a second, unrelated reason.
+- **The actual root cause of that second death**: the relaunch command
+  was rebuilt from `sys.argv`, but `-m netpath` rewrites `sys.argv[0]` to
+  `__main__.py`'s resolved file path — so every restart was actually
+  running that path as a bare script rather than `-m netpath`, which
+  drops the package context every relative import in this app needs and
+  crashes instantly with no visible error on `pythonw.exe`. Fixed by
+  rebuilding the relaunch command as `-m netpath` explicitly rather than
+  trusting `sys.argv[0]`.
 
 ### 2.7.0 — Three IPAM display bugs fixed
 

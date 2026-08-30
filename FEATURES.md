@@ -1,9 +1,11 @@
 # SappiWhere — Features
 
-What the application does, by module. Setup and firewall rules are in
-`README.md` and `NETWORK-AND-STORAGE-REQUIREMENTS.md`; the build history is in
-`CHANGELOG.md`; exactly how passwords and credentials are protected is in
-`CREDENTIAL-SECURITY.md`.
+What the application does, by module — the overview, deliberately light on
+mechanism. For how each of this actually works underneath — which file,
+which function, which algorithm — see `INTERNALS.md`. Setup and firewall
+rules are in `README.md` and `NETWORK-AND-STORAGE-REQUIREMENTS.md`; the
+build history is in `CHANGELOG.md`; exactly how passwords and credentials
+are protected is in `CREDENTIAL-SECURITY.md`.
 
 Six tabs: **NetPath**, **NetFlow**, **Syslog**, **IPAM**, then **Debug** and
 **Settings**, which stay rightmost so adding a module never moves them.
@@ -204,11 +206,13 @@ and the chart series and bar labels when grouping by Source, Destination or
 Conversation. The address is shown until an answer arrives, and
 stays if there is no PTR record; hovering a named cell shows both.
 
-Each address gets three attempts: the system resolver, then a PTR query straight
+Each address gets four attempts: the system resolver, then a PTR query straight
 to a nominated server if **Query server** is set on the Settings tab, then
-`nslookup`. The fallbacks matter for internal ranges whose reverse zone the
-system resolver will not answer for — if nslookup finds a name, so will this —
-and the Debug log records which method produced each answer.
+`nslookup`, then — if none of those found a PTR record — whatever IPAM's DHCP
+polling knows the address as, for a device that answers DHCP but was never
+given a DNS entry. The fallbacks matter for internal ranges whose reverse zone
+the system resolver will not answer for — if nslookup finds a name, so will
+this — and the Debug log records which method produced each answer.
 
 Lookups use the same cache and the same threads as NetPath's hop names, since
 the reverse DNS setting is global. Only the endpoints carrying the most traffic
@@ -247,9 +251,13 @@ A collector, a search, and an hourly histogram.
   written — a device stuck in a debug loop costs nothing beyond the parse.
   Filtered messages are counted separately so the filter never looks like loss.
 - **Sending addresses can be resolved to names**, through the same cache and
-  threads as NetPath's hop names.
+  threads as NetPath's hop names — including, when DNS has nothing, whatever
+  IPAM's DHCP polling knows the address as.
 - **Send test message** sends one to the collector over loopback and shows the
   PowerShell equivalent, the same as the NetFlow test packet.
+- **Hostname**, next to the message count above the table, switches the
+  Source column between the resolved name and the raw address — on by
+  default. The detail panel for a selected message always shows both.
 
 ### Search
 
@@ -304,6 +312,19 @@ arrival time** in the settings.
 
 Three views inside one tab, switched locally: Subnets & Hosts, Conflicts, and
 DHCP.
+
+### Find
+
+A search box in the IPAM strip answers the direction browsing by subnet
+can't: "what's the IP for printer-3rd-floor" or "who is
+aa:bb:cc:dd:ee:ff", rather than "what's on 10.20.3.0/24". Type at least two
+characters of a hostname, IP address or MAC address and it checks
+everything IPAM knows at once — hosts its own sweep discovered, DHCP leases
+and reservations, and the shared reverse-DNS cache — and shows every match
+in one list with its address, MAC, alive status, subnet and which of those
+sources found it. A result outside every subnet configured here isn't a
+bug: DHCP polling reads a server's scopes on its own, independent of what
+subnets IPAM has been told to sweep, and the source column says so.
 
 ### Subnets & Hosts
 
@@ -367,6 +388,17 @@ reservation through the `DhcpServer` PowerShell module's own `Get-*` cmdlets
 — nothing else. There is no write path: nothing in this application can
 change a scope, add or remove a reservation, or touch anything on the DHCP
 server.
+
+The layout mirrors Subnets & Hosts one level down: pick a server from the
+dropdown at the top, and its scopes fill the sidebar — each with a mini
+donut of leased (green), reserved (blue) and available (gray) addresses,
+sorted by **Least available**, **Most available**, **Name** or **IP
+address**, defaulting to least available so the scope closest to running
+out is the first thing you see. Selecting one shows a bigger version of the
+same donut above its Leases table, filtered to just that scope, with the
+counts spelled out alongside the scope's own subnet (from its network
+identity, not the narrower dynamic range) and its configured router
+address where one is set.
 
 **Two ways to authenticate, per server.**
 
@@ -464,12 +496,30 @@ clearest case: NetPath uses it to name hop addresses and NetFlow to name flow
 endpoints.
 
 **Database size caps** — one per database, defaulting to 512 MB for traces,
-2 GB for flows and 1 GB for syslog — are checked every 15 minutes. When a file is over its
-cap the oldest records are deleted in chunks until it fits, so the cap wins
-over the retention setting.
+2 GB for flows, 1 GB for syslog and 256 MB for IPAM — are checked every 15
+minutes. When a file is over its cap the oldest records are deleted in
+chunks until it fits, so the cap wins over the retention setting. For IPAM
+that means the oldest scan history first — subnets, discovered hosts and
+open conflicts describe the network as it is now, not a log, so a size cap
+isn't what trims those; the day-based retention settings on the IPAM
+Settings dialog are.
 
 Nothing needs a restart: both thread pools resize live and the collector
 rebinds its socket.
+
+### Software update
+
+One button — **Check for update & restart** — checks
+`github.com/thawkins5555/magicalbeans`'s `main` branch for a commit newer
+than what's installed. If there is one, it downloads it over plain HTTPS,
+swaps it into the running install, and restarts the service so the new
+code takes effect immediately; if not, it says so and stops there. The
+screen grays out with a status dialog for the duration, since restarting
+signs everyone out — sessions are in memory — and it lands you back on the
+sign-in page once the service answers again. **Change password**,
+elsewhere on this page, is the only other place a full page reload
+follows a button press for the same reason: changing your own password
+ends every session on that account, this one included.
 
 ---
 

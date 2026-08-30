@@ -67,7 +67,8 @@ _APP_ROOT = os.path.dirname(_NETPATH_DIR)
 _CACERT_PATH = os.path.join(_NETPATH_DIR, "cacert.pem")
 
 _COPY_ALONGSIDE = ("requirements.txt", "README.md", "CHANGELOG.md", "FEATURES.md",
-                   "CREDENTIAL-SECURITY.md", "NETWORK-AND-STORAGE-REQUIREMENTS.md")
+                   "INTERNALS.md", "CREDENTIAL-SECURITY.md",
+                   "NETWORK-AND-STORAGE-REQUIREMENTS.md")
 
 
 def _ssl_context() -> ssl.SSLContext:

@@ -1,9 +1,10 @@
 # SappiWhere
 
-See also: `FEATURES.md` for what each module does, `NETWORK-AND-STORAGE-REQUIREMENTS.md`
-for ports and protocols, `CHANGELOG.md` for the build history, and
-`CREDENTIAL-SECURITY.md` for exactly how passwords and stored credentials are
-protected.
+See also: `FEATURES.md` for what each module does, `INTERNALS.md` for how
+each one actually works — file by file, mechanism by mechanism —
+`NETWORK-AND-STORAGE-REQUIREMENTS.md` for ports and protocols, `CHANGELOG.md`
+for the build history, and `CREDENTIAL-SECURITY.md` for exactly how passwords
+and stored credentials are protected.
 
 Six tabs at the top of the window: **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Debug**, a live view of what the background threads are doing; and **Settings**.
 
