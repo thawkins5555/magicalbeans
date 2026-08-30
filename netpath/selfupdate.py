@@ -151,6 +151,19 @@ def _restart_posix() -> None:
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+RESTART_LOG = os.path.join(_APP_ROOT, "update_restart.log")
+
+
+def _log_restart(line: str) -> None:
+    """A plain file rather than the in-memory event log: that log dies with
+    the process, which is exactly the moment this needs to survive."""
+    try:
+        with open(RESTART_LOG, "a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+    except OSError:
+        pass
+
+
 def _restart_windows() -> None:
     """Windows has no true in-place exec — Python's `os.execv` emulates it by
     starting a new process and then ending this one, and if a supervisor
@@ -158,23 +171,35 @@ def _restart_windows() -> None:
     this process, its cleanup can kill that new process the instant this one
     exits, so the "restart" silently becomes a stop.
 
-    Spawn the replacement fully detached first — its own console, its own
-    process group, and a best-effort attempt to break out of any job object
-    this process is in — and only end this one once it exists. If the
-    breakaway is refused and a supervisor kills the child alongside this
-    process anyway, that supervisor's own restart policy is the fallback:
-    either way the files already swapped in by `_swap_in` are what the next
-    launch reads.
+    Spawn the replacement first and only end this one once it exists. Headless
+    gets a fully detached, windowless child, matching how it already runs.
+    A console/GUI session gets its replacement in a new, visible console
+    instead of a hidden detached one — some antivirus/EDR products treat "a
+    process spawns a windowless child and immediately exits" as a hallmark of
+    something trying to hide, and would rather block or kill exactly that
+    shape of restart. Either way this also tries to break out of any job
+    object this process is in; if that is refused and a supervisor kills the
+    child alongside this process anyway, that supervisor's own restart policy
+    is the fallback — the files `_swap_in` already put in place are what the
+    next launch reads regardless of which path actually restarts it.
     """
     import subprocess
-    creationflags = (subprocess.DETACHED_PROCESS
-                     | subprocess.CREATE_NEW_PROCESS_GROUP
-                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+
+    headless = "--headless" in sys.argv or "--web" in sys.argv
+    creationflags = (subprocess.DETACHED_PROCESS if headless
+                     else subprocess.CREATE_NEW_CONSOLE)
+    creationflags |= (subprocess.CREATE_NEW_PROCESS_GROUP
+                      | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+
+    args = [sys.executable] + sys.argv
+    _log_restart(f"restarting pid={os.getpid()} headless={headless} args={args}")
     try:
-        subprocess.Popen([sys.executable] + sys.argv, cwd=os.getcwd(),
-                         close_fds=True, creationflags=creationflags)
-    except OSError:
-        pass  # a supervisor's restart policy is the fallback
+        proc = subprocess.Popen(args, cwd=os.getcwd(), close_fds=True,
+                                creationflags=creationflags)
+        time.sleep(0.5)   # long enough to catch an immediate failure to start
+        _log_restart(f"spawned pid={proc.pid} alive_after_0.5s={proc.poll() is None}")
+    except OSError as exc:
+        _log_restart(f"spawn failed: {exc}")
     os._exit(0)
 
 

@@ -8,3 +8,5 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+update_restart.log
+netpath.bak-*/
