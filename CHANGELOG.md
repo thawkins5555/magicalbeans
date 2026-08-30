@@ -6,6 +6,22 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.9.0 — DHCP leased-IP trend chart, tab persists on reload, Dashboard tab
+
+- **DHCP scopes get a leased-IP trend chart**, a thin line chart under the
+  usage donut showing the last 24 hours or 7 days, toggled per scope, with
+  a hover tooltip for the exact count (and percentage, where known) at any
+  point. One snapshot is recorded per scope on every poll, kept separately
+  from the live scope/lease data those polls otherwise replace wholesale,
+  so the trend survives every subsequent poll. A new **Keep DHCP
+  leased-IP history for** setting (default 35 days) controls retention.
+- **Reloading the page now returns to whichever tab was open**, instead of
+  always resetting to NetPath. Remembered per browser, the same way panel
+  sizes and column widths already are.
+- **A new Dashboard tab**, at the far left of the tab list ahead of
+  NetPath. Currently a placeholder with nothing on it yet — reserved space
+  for a future cross-module overview.
+
 ### 4.8.1 — Resizable Syslog and NetFlow columns
 
 - **Syslog's message table can now be resized** column by column, the same

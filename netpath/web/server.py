@@ -76,6 +76,7 @@ ROUTES = [
     ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)/credential$", api.delete_ipam_dhcp_server_credential),
     ("GET", r"^/api/ipam/dhcp/scopes$", api.get_ipam_dhcp_scopes),
     ("GET", r"^/api/ipam/dhcp/leases$", api.get_ipam_dhcp_leases),
+    ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history),
     ("GET", r"^/api/debug$", api.get_debug),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear),
     ("POST", r"^/api/settings$", api.post_settings),

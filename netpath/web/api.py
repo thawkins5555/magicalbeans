@@ -14,6 +14,7 @@ from ..analysis import availability, build_timeline, build_topology
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
+from ..ipamdb import scope_size
 from ..eventlog import CATEGORIES, ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY, SYSTEM as SYSTEM_CATEGORY
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 
@@ -1044,18 +1045,6 @@ def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict
     return {"ok": True}
 
 
-def _scope_size(start_ip: str, end_ip: str) -> int | None:
-    """Addresses in a scope's range, inclusive — for the utilization donut,
-    the DHCP equivalent of subnet_size() for a swept subnet."""
-    import ipaddress
-    try:
-        start = int(ipaddress.IPv4Address(start_ip))
-        end = int(ipaddress.IPv4Address(end_ip))
-    except (ValueError, TypeError):
-        return None
-    return max(0, end - start + 1)
-
-
 def _scope_subnet(scope_id: str, mask: str) -> str | None:
     """The scope's own network, in CIDR form — its ScopeId is the network
     address and SubnetMask its mask, which together describe the subnet the
@@ -1088,7 +1077,7 @@ def get_ipam_dhcp_scopes(service, params, body) -> dict:
         leases = by_scope.get((r["server_id"], r["scope_id"]), [])
         reserved = sum(1 for row in leases if row["is_reservation"])
         leased = len(leases) - reserved
-        total = _scope_size(r["start_ip"], r["end_ip"])
+        total = scope_size(r["start_ip"], r["end_ip"])
         available = max(0, total - leased - reserved) if total is not None else None
         scopes.append({
             "id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
@@ -1115,6 +1104,22 @@ def get_ipam_dhcp_leases(service, params, body) -> dict:
          "lease_expires": r["lease_expires_ts"],
          "is_reservation": bool(r["is_reservation"]),
          "description": r["description"], "polled": r["polled_ts"]}
+        for r in rows]}
+
+
+def get_ipam_dhcp_scope_history(service, params, body) -> dict:
+    """Leased/reserved/total over time for one scope, for the trend chart
+    above its lease table. One point per DHCP poll that landed in the
+    window — usually tens to a few hundred, never enough to need bucketing."""
+    server_id = params.get("server_id")
+    scope_id = params.get("scope_id", "")
+    if not server_id or not scope_id:
+        return {"points": []}
+    t0, t1 = _window(params)
+    rows = service.ipam_db.scope_usage_history(int(server_id), scope_id, t0, t1)
+    return {"points": [
+        {"ts": r["polled_ts"], "leased": r["leased"], "reserved": r["reserved"],
+         "total": r["total"]}
         for r in rows]}
 
 

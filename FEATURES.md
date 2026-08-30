@@ -7,8 +7,10 @@ rules are in `README.md` and `NETWORK-AND-STORAGE-REQUIREMENTS.md`; the
 build history is in `CHANGELOG.md`; exactly how passwords and credentials
 are protected is in `CREDENTIAL-SECURITY.md`.
 
-Six tabs: **NetPath**, **NetFlow**, **Syslog**, **IPAM**, then **Debug** and
-**Settings**, which stay rightmost so adding a module never moves them.
+Seven tabs: **Dashboard**, **NetPath**, **NetFlow**, **Syslog**, **IPAM**,
+then **Debug** and **Settings**, which stay rightmost so adding a module
+never moves them. Dashboard is currently a placeholder — reserved space for
+a future cross-module overview, not yet holding anything of its own.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -16,6 +18,10 @@ divider resets that one, and **Reset panel sizes** on the Settings tab resets
 them all. The chrome also tightens automatically below 900 pixels of viewport
 height, and again below 700, so a laptop gets a usable layout before anything
 is dragged.
+
+**Reloading the page returns to whichever tab was open**, not back to
+NetPath — the browser remembers the last tab the same way it remembers
+panel sizes and column widths, per browser rather than per account.
 
 ## How it runs
 
@@ -433,6 +439,15 @@ same donut above its Leases table, filtered to just that scope, with the
 counts spelled out alongside the scope's own subnet (from its network
 identity, not the narrower dynamic range) and its configured router
 address where one is set.
+
+Underneath that, a thin chart tracks the scope's leased-IP count over the
+**last 24 hours** or **last 7 days** — one point per DHCP poll, filled area
+under a line, with the current count and how much it has moved over the
+window spelled out above it. Hovering shows the exact count (and, where
+known, the percentage of the scope) at any point along it. This is
+separate history from the live figures beside the donut: a poll's usage is
+snapshotted every time regardless of whether anything changed, so the
+chart still shows a flat line for a quiet scope rather than no data.
 
 **Two ways to authenticate, per server.**
 

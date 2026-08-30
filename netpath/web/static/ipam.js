@@ -12,6 +12,7 @@
     dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
     leaseSort: { key: 'ip', descending: false },
     scopeSort: 'least',
+    scopeTrendWindow: '24h', scopeTrend: [],
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -621,9 +622,11 @@
       tr.addEventListener('mouseleave', App.hideTooltip);
       tr.onclick = () => {
         view.dhcpScopeId = scope.id;
+        view.scopeTrend = [];
         renderDhcpScopes();
         drawScopeDetail();
         loadDhcpLeases();
+        loadScopeTrend();
       };
       body.appendChild(tr);
     }
@@ -631,17 +634,21 @@
   }
 
   /* The larger chart for whichever scope is currently selected, above its
-     lease table — same layout as drawSubnetDetail(). */
+     lease table — same layout as drawSubnetDetail(), plus a thin trend
+     strip underneath showing how the leased-IP count has moved recently. */
   function drawScopeDetail() {
     const container = App.el('ipam-scope-detail');
     const scope = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    container.classList.add('scope-detail-stacked');
     container.innerHTML = '';
     if (!scope) {
       container.innerHTML = '<p class="hint">Pick a scope on the left to see its address usage here.</p>';
       return;
     }
 
-    container.appendChild(scopeDonut(scope.usage, 120));
+    const top = document.createElement('div');
+    top.className = 'subnet-detail-row';
+    top.appendChild(scopeDonut(scope.usage, 120));
 
     const u = scope.usage || {};
     const total = u.total || 0;
@@ -664,7 +671,112 @@
       `</div>` +
       `<div class="hint">${total} address(es) in range \u00b7 ${escape(scope.state || '')} \u00b7 ` +
       `polled ${ago(scope.polled)}</div>`;
-    container.appendChild(text);
+    top.appendChild(text);
+    container.appendChild(top);
+    container.appendChild(scopeTrendSection());
+    drawScopeTrend();
+  }
+
+  /* --------------------------------------------------------- leased-IP trend */
+
+  function scopeTrendSection() {
+    const wrap = document.createElement('div');
+    wrap.className = 'scope-trend';
+    const header = document.createElement('div');
+    header.className = 'scope-trend-header';
+    const label = document.createElement('span');
+    label.id = 'ipam-scope-trend-label';
+    label.className = 'hint';
+    label.textContent = 'Leased IPs';
+    header.appendChild(label);
+
+    const toggle = document.createElement('div');
+    toggle.className = 'scope-trend-toggle';
+    for (const [key, text] of [['24h', '24h'], ['7d', '7d']]) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'linkish' + (view.scopeTrendWindow === key ? ' active' : '');
+      btn.textContent = text;
+      btn.onclick = () => {
+        view.scopeTrendWindow = key;
+        loadScopeTrend();
+      };
+      toggle.appendChild(btn);
+    }
+    header.appendChild(toggle);
+    wrap.appendChild(header);
+
+    const chart = document.createElement('div');
+    chart.id = 'ipam-scope-trend-chart';
+    chart.className = 'scope-trend-chart';
+    wrap.appendChild(chart);
+    return wrap;
+  }
+
+  async function loadScopeTrend() {
+    const scope = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    if (!scope) { view.scopeTrend = []; drawScopeTrend(); return; }
+    const now = Date.now() / 1000;
+    const span = view.scopeTrendWindow === '7d' ? 7 * 86400 : 86400;
+    const payload = await App.get('/api/ipam/dhcp/scope-history', {
+      server_id: view.dhcpServerId, scope_id: scope.scope_id,
+      t0: now - span, t1: now,
+    });
+    view.scopeTrend = payload.points;
+    drawScopeTrend();
+  }
+
+  function drawScopeTrend() {
+    const chartEl = App.el('ipam-scope-trend-chart');
+    const labelEl = App.el('ipam-scope-trend-label');
+    if (!chartEl) return;   // the scope changed again before this landed
+    chartEl.innerHTML = '';
+
+    const points = view.scopeTrend || [];
+    const windowText = view.scopeTrendWindow === '7d' ? 'last 7 days' : 'last 24 hours';
+    if (points.length < 2) {
+      if (labelEl) labelEl.textContent = `Leased IPs (${windowText}): not enough history yet`;
+      return;
+    }
+
+    const width = chartEl.clientWidth || 400;
+    const height = 40;
+    const padX = 2, padY = 4;
+    const t0 = points[0].ts;
+    const t1 = points[points.length - 1].ts;
+    const span = Math.max(t1 - t0, 1);
+    const maxLeased = Math.max(1, ...points.map((p) => p.leased));
+    const x = (ts) => padX + ((ts - t0) / span) * (width - padX * 2);
+    const y = (v) => height - padY - (v / maxLeased) * (height - padY * 2);
+
+    const line = points.map((p) => `${x(p.ts).toFixed(1)},${y(p.leased).toFixed(1)}`).join(' ');
+    const area = `${x(t0).toFixed(1)},${height - padY} ${line} ${x(t1).toFixed(1)},${height - padY}`;
+
+    const svg = App.svgNode('svg', {
+      width: '100%', height, viewBox: `0 0 ${width} ${height}`,
+      preserveAspectRatio: 'none',
+    });
+    svg.appendChild(App.svgNode('polygon', { points: area, fill: 'var(--ok)', opacity: 0.15 }));
+    svg.appendChild(App.svgNode('polyline', {
+      points: line, fill: 'none', stroke: 'var(--ok)', 'stroke-width': 1.5,
+      'vector-effect': 'non-scaling-stroke',
+    }));
+
+    const tip = points.map((p) =>
+      `${new Date(p.ts * 1000).toLocaleString()}  ${p.leased} leased` +
+      (p.total ? ` (${Math.round((p.leased / p.total) * 100)}%)` : '')).join('\n');
+    svg.addEventListener('mousemove', (event) => App.tooltip(tip, event));
+    svg.addEventListener('mouseleave', App.hideTooltip);
+    chartEl.appendChild(svg);
+
+    const last = points[points.length - 1].leased;
+    const first = points[0].leased;
+    const delta = last - first;
+    const deltaText = delta === 0 ? 'flat' : (delta > 0 ? `up ${delta}` : `down ${-delta}`);
+    if (labelEl) {
+      labelEl.textContent =
+        `Leased IPs (${windowText}): ${last} now, ${deltaText} over the window`;
+    }
   }
 
   const LEASE_COLUMNS = [
@@ -729,6 +841,7 @@
     renderDhcpScopes();
     drawScopeDetail();
     await loadDhcpLeases();
+    await loadScopeTrend();
   }
 
   async function loadDhcpLeases() {
@@ -773,6 +886,7 @@
         ${number('i-host-days', 'Forget addresses not seen for', s.host_retention_days, 'min=1')} days
         ${number('i-conflict-days', 'Forget resolved conflicts after', s.conflict_retention_days, 'min=1')} days
         ${number('i-scan-days', 'Keep scan history for', s.scan_history_days, 'min=1')} days
+        ${number('i-dhcp-history-days', 'Keep DHCP leased-IP history for', s.dhcp_history_days, 'min=7')} days
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
@@ -790,6 +904,7 @@
           host_retention_days: num('#i-host-days'),
           conflict_retention_days: num('#i-conflict-days'),
           scan_history_days: num('#i-scan-days'),
+          dhcp_history_days: num('#i-dhcp-history-days'),
         } });
         await App.loadState();
         App.closeModal();

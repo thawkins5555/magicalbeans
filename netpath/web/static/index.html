@@ -9,6 +9,7 @@
 <body>
 
 <nav id="tabs">
+  <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab active" data-tab="netpath">NETPATH</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
@@ -21,6 +22,15 @@
   <button id="signout" class="linkish">Sign out</button>
   <span id="conn" class="conn">connecting…</span>
 </nav>
+
+<!-- =========================== DASHBOARD ============================ -->
+<section id="page-dashboard" class="page">
+  <div class="pad-x pad-b" style="padding-top:14px">
+    <h2>Dashboard</h2>
+    <p class="hint">Nothing here yet — this is a placeholder for a future
+      cross-module overview.</p>
+  </div>
+</section>
 
 <!-- ============================ NETPATH ============================ -->
 <section id="page-netpath" class="page active">
@@ -503,6 +513,7 @@
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
 <script src="/app.js"></script>
+<script src="/dashboard.js"></script>
 <script src="/netpath.js"></script>
 <script src="/netflow.js"></script>
 <script src="/syslog.js"></script>

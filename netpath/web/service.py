@@ -414,6 +414,8 @@ class Service:
             float(self.ipam_settings.get("conflict_retention_days", 90)))
         self.ipam_db.prune_scans(
             float(self.ipam_settings.get("scan_history_days", 30)))
+        self.ipam_db.prune_scope_history(
+            float(self.ipam_settings.get("dhcp_history_days", 35)))
 
         cap = int(self.settings.get("max_syslog_db_mb", 0)) * 1024 * 1024
         if cap:

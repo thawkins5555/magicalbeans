@@ -314,6 +314,24 @@ body.tiny .terms { display: none; }
   margin-right: 6px;
 }
 
+/* The DHCP scope detail stacks the donut+text row above a thin trend chart,
+   rather than the single flex row every other .subnet-detail uses — this
+   only overrides display, so the panel styling above still applies. */
+.subnet-detail.scope-detail-stacked { display: block; }
+.subnet-detail-row { display: flex; align-items: center; gap: 20px; }
+.scope-trend { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
+.scope-trend-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.scope-trend-toggle { display: flex; gap: 2px; }
+.scope-trend-toggle button.linkish { padding: 1px 6px; }
+.scope-trend-toggle button.linkish.active { color: var(--accent); font-weight: 700; }
+.scope-trend-chart { width: 100%; height: 40px; }
+.scope-trend-chart svg { display: block; }
+
 .content { flex: 1; display: flex; flex-direction: column; min-width: 0; padding-right: 12px; }
 .canvas {
   flex: 1;

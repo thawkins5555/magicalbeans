@@ -547,8 +547,11 @@ const App = (() => {
 
   /* ------------------------------------------------------------- tabs */
 
+  const TAB_KEY = 'sappiwhere.tab';
+
   function selectTab(name) {
     state.tab = name;
+    try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
     for (const tab of document.querySelectorAll('.tab')) {
       tab.classList.toggle('active', tab.dataset.tab === name);
     }
@@ -684,7 +687,16 @@ const App = (() => {
     for (const page of Object.values(pages)) {
       if (page.init) page.init();
     }
-    selectTab('netpath');
+    // A refresh should land back on whichever module was open, not reset to
+    // NetPath — but only if that tab still exists (a build could drop one).
+    let initialTab = 'netpath';
+    try {
+      const stored = localStorage.getItem(TAB_KEY);
+      if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
+        initialTab = stored;
+      }
+    } catch (error) { /* private browsing, or storage full: default to netpath */ }
+    selectTab(initialTab);
     restartTimer();
   }
 

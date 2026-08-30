@@ -16,7 +16,7 @@ from .eventlog import ERROR, IPAM, NullLog, SYSTEM
 from .ipam_dhcp import DhcpUnavailable
 from .ipam_dhcp import poll as dhcp_poll
 from .ipam_scan import SubnetTooLarge, normalize_mac, read_arp_table, sweep, usable_addresses
-from .ipamdb import IpamDatabase
+from .ipamdb import IpamDatabase, scope_size
 
 
 def credential_for_server(server) -> tuple[str | None, str | None]:
@@ -249,7 +249,30 @@ class IpamWorker:
 
         self.db.replace_dhcp_scopes(server_id, snapshot.scopes)
         self.db.replace_dhcp_leases(server_id, snapshot.leases)
+        self._record_scope_history(server_id)
         self.db.set_dhcp_poll_result(server_id, ok=True)
         self.log.add(IPAM, f"Polled {server['label']}: {len(snapshot.scopes)} "
                            f"scope(s), {len(snapshot.leases)} lease(s)",
                      target=server["address"])
+
+    def _record_scope_history(self, server_id: int) -> None:
+        """One leased/reserved/total snapshot per scope, so the DHCP page can
+        chart usage over time. Reads back what was just written rather than
+        the raw poll snapshot, so this always agrees with what the API's own
+        usage figures are computed from."""
+        try:
+            scopes = self.db.dhcp_scopes(server_id)
+            leases = self.db.dhcp_leases(server_id)
+            by_scope: dict[str, list] = {}
+            for lease in leases:
+                by_scope.setdefault(lease["scope_id"], []).append(lease)
+            for scope in scopes:
+                scope_leases = by_scope.get(scope["scope_id"], [])
+                reserved = sum(1 for row in scope_leases if row["is_reservation"])
+                leased = len(scope_leases) - reserved
+                total = scope_size(scope["start_ip"], scope["end_ip"])
+                self.db.record_scope_usage(server_id, scope["scope_id"],
+                                           leased, reserved, total)
+        except Exception:
+            import traceback
+            traceback.print_exc()

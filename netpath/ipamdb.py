@@ -23,10 +23,24 @@ DHCP server's records are stale, and either is worth a look.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 import threading
 import time
+
+
+def scope_size(start_ip: str, end_ip: str) -> int | None:
+    """Addresses in a DHCP scope's dynamic range, inclusive — shared by the
+    usage donut and the leased-IP history, so both agree on what "total"
+    means for a scope."""
+    try:
+        start = int(ipaddress.IPv4Address(start_ip))
+        end = int(ipaddress.IPv4Address(end_ip))
+    except (ValueError, TypeError):
+        return None
+    return max(0, end - start + 1)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subnets (
@@ -140,6 +154,23 @@ CREATE TABLE IF NOT EXISTS dhcp_leases (
 CREATE INDEX IF NOT EXISTS ix_dhcp_leases_scope ON dhcp_leases(server_id, scope_id);
 CREATE INDEX IF NOT EXISTS ix_dhcp_leases_mac ON dhcp_leases(mac);
 
+-- One usage snapshot per scope per poll, so the DHCP page can chart the
+-- leased-IP count over time rather than only ever showing the current
+-- figure. dhcp_scopes/dhcp_leases above are replaced wholesale on every
+-- poll and hold no history of their own — this is deliberately separate
+-- so that replacement never loses anything.
+CREATE TABLE IF NOT EXISTS dhcp_scope_history (
+    id        INTEGER PRIMARY KEY,
+    server_id INTEGER NOT NULL REFERENCES dhcp_servers(id) ON DELETE CASCADE,
+    scope_id  TEXT    NOT NULL,
+    leased    INTEGER NOT NULL,
+    reserved  INTEGER NOT NULL,
+    total     INTEGER,
+    polled_ts REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_dhcp_scope_history
+    ON dhcp_scope_history(server_id, scope_id, polled_ts);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -162,6 +193,7 @@ DEFAULTS = {
     "resolve_hosts": True,
     "dhcp_poll_interval_minutes": 15,
     "dhcp_timeout_s": 30,
+    "dhcp_history_days": 35,
 }
 
 
@@ -485,6 +517,7 @@ class IpamDatabase:
         with self._lock:
             self._conn.execute("DELETE FROM dhcp_scopes WHERE server_id=?", (server_id,))
             self._conn.execute("DELETE FROM dhcp_leases WHERE server_id=?", (server_id,))
+            self._conn.execute("DELETE FROM dhcp_scope_history WHERE server_id=?", (server_id,))
             self._conn.execute("DELETE FROM dhcp_servers WHERE id=?", (server_id,))
             self._conn.commit()
 
@@ -563,6 +596,32 @@ class IpamDatabase:
                 f"SELECT l.*, s.label AS server_label FROM dhcp_leases l"
                 f" JOIN dhcp_servers s ON s.id = l.server_id{where}"
                 f" ORDER BY l.ip", params).fetchall()
+
+    def record_scope_usage(self, server_id: int, scope_id: str, leased: int,
+                           reserved: int, total: int | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO dhcp_scope_history(server_id, scope_id, leased,"
+                " reserved, total, polled_ts) VALUES (?,?,?,?,?,?)",
+                (server_id, scope_id, leased, reserved, total, time.time()))
+            self._conn.commit()
+
+    def scope_usage_history(self, server_id: int, scope_id: str,
+                            t0: float, t1: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT leased, reserved, total, polled_ts FROM dhcp_scope_history"
+                " WHERE server_id=? AND scope_id=? AND polled_ts>=? AND polled_ts<=?"
+                " ORDER BY polled_ts",
+                (server_id, scope_id, t0, t1)).fetchall()
+
+    def prune_scope_history(self, older_than_days: float) -> int:
+        cutoff = time.time() - older_than_days * 86400
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM dhcp_scope_history WHERE polled_ts < ?", (cutoff,))
+            self._conn.commit()
+        return cur.rowcount or 0
 
     def dhcp_lease_for_ip(self, ip: str) -> sqlite3.Row | None:
         """The freshest lease record for an address, across every server —

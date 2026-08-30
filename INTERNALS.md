@@ -99,7 +99,7 @@ each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 | `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
-| `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, IPAM's own settings |
+| `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
 
 ---
 
@@ -594,6 +594,58 @@ error substrings from real field failures (`"TrustedHosts"`, `"CIM
 server"`, `"DhcpServer" ... "not loaded"`) and appends the specific fix
 for each, without hiding PowerShell's own message.
 
+### Leased-IP history (`dhcp_scope_history`, in `ipamdb.py`)
+
+`dhcp_scopes`/`dhcp_leases` are replaced wholesale on every poll
+(`replace_dhcp_scopes()`/`replace_dhcp_leases()` in `ipamdb.py` —
+`DELETE FROM ... WHERE server_id=?` then a bulk `INSERT`), so they hold
+only the current snapshot and nothing about how it got there. The DHCP
+page's trend chart needs the "how it got there" part, which is what
+`dhcp_scope_history` is for: one row per scope per poll — `leased`,
+`reserved`, `total`, `polled_ts` — that is *only ever inserted, never
+replaced*, so a scope's history survives every subsequent poll that
+overwrites `dhcp_scopes`/`dhcp_leases` out from under it.
+
+`IpamWorker._poll()` (`ipam_worker.py`) calls
+`_record_scope_history(server_id)` immediately after the two `replace_*`
+calls land. Rather than trust field names on the raw PowerShell snapshot
+(`snapshot.scopes`/`snapshot.leases`), it re-reads what was just
+committed (`db.dhcp_scopes()`/`db.dhcp_leases()`) and counts leased vs.
+reserved the same way `api.get_ipam_dhcp_scopes()` does — both now share
+one `scope_size(start_ip, end_ip)` function in `ipamdb.py` (moved there
+from a private duplicate in `web/api.py`) so a scope's "total" figure can
+never quietly diverge between the live donut and the history chart.
+
+`GET /api/ipam/dhcp/scope-history` (`api.get_ipam_dhcp_scope_history`)
+takes `server_id`, `scope_id`, and a `t0`/`t1` window via the same
+`_window()` helper NetPath's timeline endpoint uses, and returns every
+history row in range — no bucketing, since even a 7-day window at the
+default 15-minute poll interval is under 700 rows, trivial for an SVG
+polyline. `ipam.js`'s `loadScopeTrend()` computes `t0`/`t1` itself from a
+`24h`/`7d` toggle (`view.scopeTrendWindow`) rather than the server
+choosing a default, so the two window buttons are just two different
+requests, not two rendering modes of one payload.
+
+`drawScopeTrend()` draws a plain filled-line chart by hand (`App.svgNode`,
+same primitive every other hand-drawn chart in this app uses — no shared
+"line chart" helper exists or was added for this, consistent with the
+one-off SVG-building style already used for the route graph and
+timelines): x is `polled_ts` mapped linearly across the container width, y
+is `leased` scaled to the window's own peak, `vector-effect:
+non-scaling-stroke` so the line stays a crisp 1.5px regardless of the
+`viewBox` scaling trick used to make the SVG responsive. A single
+`mousemove` listener on the whole `<svg>` shows one tooltip string built
+from every point up front (`App.tooltip`) rather than per-point hit
+targets — cheap enough at these point counts, and avoids a nearest-point
+search on every mouse move.
+
+`remove_dhcp_server()` deletes `dhcp_scope_history` rows alongside
+`dhcp_scopes`/`dhcp_leases` (manual cascade, matching how those two are
+already cleaned up rather than relying on the `ON DELETE CASCADE`
+foreign key alone). `Service.run_maintenance()` prunes rows older than
+`dhcp_history_days` (default 35 — comfortably past the 7-day chart with
+margin) the same way it prunes the reverse-DNS and ASN caches.
+
 ### Scheduling and conflict detection (`ipam_worker.py`)
 
 `IpamWorker._tick()` runs every 5 seconds and, for each enabled subnet
@@ -870,3 +922,23 @@ Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+**Which tab is active persists the same way** (`TAB_KEY =
+'sappiwhere.tab'`). `selectTab(name)` writes the tab name to
+`localStorage` on every switch, wrapped in the same try/catch every other
+`localStorage` write in this file uses (private browsing or a full quota
+must not break tab switching). `start()` reads it back before the very
+first `selectTab()` call, validating the stored name against an actual
+`.tab[data-tab="..."]` element in the DOM before trusting it — a build
+that renamed or dropped a tab falls back to `'netpath'` rather than
+landing on a dead tab. This runs once, before `restartTimer()`, so the
+very first paint already shows the right module rather than flashing
+NetPath first.
+
+**Dashboard** (`dashboard.js`) is a placeholder module, registered the
+same way every other page is (`App.pages.dashboard = { init, refresh }`,
+both no-ops) purely so it participates correctly in the tab machinery
+above — `selectTab`/`master()`/the reload-restores-tab logic all key off
+`pages[name]` existing, so a tab with no module registered would either
+throw or silently never refresh. `page-dashboard`'s markup in
+`index.html` is static content, no chart or table of its own yet.
