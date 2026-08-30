@@ -945,22 +945,46 @@ markup's own default (`class="tab active"` on the NetPath button,
 entire window, on every single reload, regardless of which tab was
 actually last open.
 
-The fix is a small inline `<script>` in `index.html` itself, placed after
-every `.tab`/`.page` element but before the first external `<script src>`
-tag. Being inline, it has no network fetch of its own and runs
-synchronously the instant the parser reaches it — before the browser has
-even requested `app.js`, let alone run it — so it applies the same
-`localStorage` lookup and the same `.active`-class toggle `selectTab()`
-does, closing the visible window to however long `index.html` itself
-takes to arrive (typically single-digit milliseconds on a LAN; measured
-around 30ms end-to-end in a loaded/sandboxed test environment). It
-deliberately does *nothing* beyond that class toggle — no `state.tab`
-write, no `activate()`, no fetch — because at the point it runs, no page
-module's `init()` has executed yet and nothing else is safe to touch.
-`start()`'s own `selectTab(initialTab)` call still runs exactly as
-before, once `init()` has wired up every module; it just re-applies
-classes that, in the common case, are already correct, which is a
-no-op `classList.toggle` and not a visible change.
+A first attempt closed most of that window with a second inline
+`<script>` placed at the end of `<body>`, applying the same
+`localStorage` lookup and class toggle before the external scripts even
+started loading. That narrowed the flash a great deal but didn't remove
+it: the script still sat after the *entire* rest of the page's markup —
+all seven `.page` sections, hundreds of lines — so on a slow enough
+connection the browser could still paint a frame or two of the static
+default before the parser physically reached it.
+
+**The actual fix moves the decision into `<head>`, before `<body>` has a
+single byte of content to mis-paint in the first place.** A tiny inline
+script there sets `document.documentElement.dataset.tab` (defaulting to
+`'netpath'` if nothing is stored or `localStorage` throws) — reading
+`localStorage` is all it does, and `<html>` already exists the moment any
+`<head>` script runs, so this has nothing to wait on. `app.css` — loaded
+by the `<link>` just above it, and render-blocking by the same browser
+behavior that prevents FOUC generally — carries one `html[data-tab="X"]`
+rule per tab, each duplicating what `.tab.active`/`.page.active` already
+do (`color`/`border-bottom-color` for the tab button, `display:flex` for
+the page, with `#page-netpath` alone getting `flex-direction: row` to
+match its `.active` counterpart). The static `active` classes are gone
+from `index.html`'s NetPath button and section entirely — there is no
+default left to flash, only whichever `html[data-tab]` rule matches. By
+the time `<body>` has anything to paint, the attribute the CSS keys off
+is already sitting on `<html>`, set in `<head>`, before that paint could
+possibly have happened.
+
+`selectTab(name)` in `app.js` sets the same `dataset.tab` on every call,
+not just once — required, not cosmetic: without it, the attribute stays
+stuck on whatever the page loaded with, and clicking a different tab
+would leave the *old* `html[data-tab]` page and the *newly* `.active` one
+both matching a `display:flex` rule at once. With it, the attribute and
+the `.active` classes are always updated together in the same function,
+so the two mechanisms can never disagree — one governs the first paint,
+the other governs everything after, and they hand off exactly once,
+silently.
+
+Verified with real screenshots (not computed-style polling, which can
+report styles that never actually get painted) captured every 50ms
+through an artificially throttled reload — none of them show NetPath.
 
 **A fresh sign-in always opens on Dashboard.** `login.js` writes
 `'dashboard'` under the same `'sappiwhere.tab'` key immediately before its

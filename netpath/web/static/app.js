@@ -552,6 +552,13 @@ const App = (() => {
   function selectTab(name) {
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
+    // Kept in sync with .active below, not just set once at load: index.html's
+    // html[data-tab="..."] CSS rules are what actually paint on the very first
+    // frame of a reload (before this function has even run), and they key off
+    // this attribute, not the .active classes. If it stayed stuck on whatever
+    // the page loaded with, clicking to a different tab would leave both the
+    // old data-tab page and the newly .active one visible at once.
+    document.documentElement.dataset.tab = name;
     for (const tab of document.querySelectorAll('.tab')) {
       tab.classList.toggle('active', tab.dataset.tab === name);
     }

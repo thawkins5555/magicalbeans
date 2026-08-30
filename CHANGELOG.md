@@ -6,6 +6,18 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.9.3 — NetPath flash on reload actually fixed this time
+
+4.9.2's fix helped but wasn't enough: it ran from a script near the end of
+`index.html`, so on a slower load the browser could still paint a frame
+of the static default (NetPath) before the parser reached it. This one
+moves the decision into `<head>`, before the page has any body content to
+mis-paint at all — a tiny script there tags `<html>` with the remembered
+tab, and the stylesheet (loaded right alongside it, before anything below
+renders) uses that tag to decide what's visible from the very first
+frame. There's no static default left to flash; only whichever tab was
+actually open.
+
 ### 4.9.2 — No more NetPath flash on reload
 
 - **Reloading no longer flashes NetPath** before settling on the tab you
