@@ -144,6 +144,11 @@
      is only meaningful next to the number it is capping. */
   function showUsage(storage) {
     const rows = [
+      // No cap field backs this one — it's deliberately uncapped (see the
+      // DATA FILES hint) — so it always renders with an empty bar and just
+      // the byte count, the same way the loop below already renders any
+      // row whose cap comes back 0.
+      ['use-app', storage.app_bytes, 0],
       ['use-trace', storage.trace_bytes, Number(App.el('set-trace-cap').value)],
       ['use-flow', storage.flow_bytes, Number(App.el('set-flow-cap').value)],
       ['use-snmp', storage.snmp_bytes, Number(App.el('set-snmp-cap').value)],

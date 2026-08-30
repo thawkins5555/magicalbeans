@@ -681,7 +681,8 @@
     </fieldset>
     <fieldset>
       <legend>DATA FILES</legend>
-      <label>Application <input id="set-app-path" readonly></label>
+      <label>Application <input id="set-app-path" readonly>
+        <span class="usage" id="use-app"></span></label>
       <label>Traces <input id="set-trace-path" readonly></label>
       <label>Flows <input id="set-flow-path" readonly></label>
       <label>SNMP traps <input id="set-snmp-path" readonly></label>
@@ -708,9 +709,11 @@
         deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
         oldest scan history first — subnets, discovered hosts and open conflicts describe the
         network as it is now, not a log, so they aren't what a size cap trims.</p>
-      <p class="hint">The application file holds settings, accounts and the shared reverse-DNS
-        cache. It has no cap because it does not grow with traffic — it is the one to back up,
-        and the other four files can all be rebuilt by simply collecting again.</p>
+      <p class="hint">The application file holds settings, accounts, and the shared reverse-DNS
+        and ASN caches — one row per address rather than one row per event, so it stays small
+        on its own; those caches are already bounded by age via the DNS and ASN cache-days
+        settings above, not by a size cap. It has no cap because it is the one file worth
+        backing up — the other seven can all be rebuilt by simply collecting again.</p>
     </fieldset>
     <fieldset>
       <legend>SIGN-IN</legend>

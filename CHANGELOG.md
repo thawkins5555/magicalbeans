@@ -6,6 +6,20 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.11.2 — The application database's own size shown on Settings
+
+- **The application database (`app.db` — settings, accounts, and the
+  reverse-DNS/ASN caches) now shows its current size on the Settings
+  page**, alongside the other seven data files, so the "on disk in total"
+  figure at the bottom is no longer the only place its size is visible.
+  It still has no size cap, deliberately: it holds one row per address
+  rather than one per event, so it stays small on its own, and its caches
+  are already bounded by age via the DNS/ASN cache-days settings rather
+  than by a size cap — the hint text under DATA FILES explains why. The
+  same section's "the other four files" hint had also gone stale as Nodes,
+  Alerts, IPAM and SNMP Trap were added since it was written; it now says
+  seven.
+
 ### 4.11.1 — Live MTR coloring on the route graph, ASN fallback names
 
 - **A NetPath route-graph node now turns amber or red when its continuous
