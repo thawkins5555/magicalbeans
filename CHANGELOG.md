@@ -6,6 +6,18 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.8.1 — Resizable Syslog and NetFlow columns
+
+- **Syslog's message table can now be resized** column by column, the same
+  drag-the-header-edge mechanism NetFlow and IPAM already use. Widths are
+  remembered per browser and clear with the rest via **Reset layout**.
+- **NetFlow's column widths now default close to what each field actually
+  needs** — narrow for ports, protocol and byte/packet counts — rather
+  than one uniform width for every column, so Source and Destination (the
+  two that can hold a long resolved hostname) get the extra room instead.
+  Anyone who already dragged a NetFlow column keeps that width; this only
+  changes the starting point for columns nobody has touched yet.
+
 ### 4.8.0 — Flow-to-path correlation, continuous per-hop probing, ASN/owner lookup
 
 - **Flow-to-path correlation.** Every row in the NetFlow table now carries a

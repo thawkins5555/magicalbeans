@@ -288,6 +288,10 @@ A collector, a search, and an hourly histogram.
 - **Hostname**, next to the message count above the table, switches the
   Source column between the resolved name and the raw address — on by
   default. The detail panel for a selected message always shows both.
+- **The message table resizes**, the same way NetFlow's flow record table
+  does. Drag the edge of a heading to widen or narrow the column; the
+  widths are remembered per browser, and **Reset layout** on the Settings
+  tab clears them back to defaults.
 
 ### Search
 

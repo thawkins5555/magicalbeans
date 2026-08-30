@@ -145,12 +145,23 @@
 
   /* ------------------------------------------------------------- table */
 
-  const COLUMNS = ['Time', 'Severity', 'Source', 'Host', 'App', 'Message'];
+  /* Widths are only defaults — the grip on each header drags them wider or
+     narrower, and App.grid remembers whatever a browser last dragged them
+     to. Message gets the most room since it's the column actually being
+     read; Source and Host are wide enough for a resolved hostname, not
+     just the raw address, since either can show one. */
+  const COLUMNS = [
+    { key: 'ts', label: 'Time', width: 92 },
+    { key: 'severity', label: 'Severity', width: 90 },
+    { key: 'source', label: 'Source', width: 160 },
+    { key: 'host', label: 'Host', width: 140 },
+    { key: 'app', label: 'App', width: 100 },
+    { key: 'message', label: 'Message', width: 520 },
+  ];
 
   function drawTable() {
-    const table = App.el('syslog-table');
-    table.innerHTML =
-      `<thead><tr>${COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+    const table = App.grid(App.el('syslog-table'),
+      { name: 'syslog-messages', columns: COLUMNS });
     const body = document.createElement('tbody');
     for (const row of view.messages) {
       const tr = document.createElement('tr');

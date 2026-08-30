@@ -317,23 +317,28 @@
      Bytes displays "4.2 MB" but must order by the number behind it, and the
      address columns order by the name when there is one, because that is what
      the eye is reading down. */
+  /* Widths are only defaults — the grip on each header drags them wider or
+     narrower, and App.grid remembers whatever a browser last dragged them
+     to. Source and Destination default wider than the rest since either
+     can show a resolved hostname rather than a bare address; everything
+     else only needs room for what it actually holds. */
   const COLUMNS = [
     { key: 'ts', label: 'Time', numeric: true, descendingFirst: true,
-      value: (r) => r.ts },
-    { key: 'src', label: 'Source', value: (r) => r.src_name || r.src_ip },
+      width: 92, value: (r) => r.ts },
+    { key: 'src', label: 'Source', width: 190, value: (r) => r.src_name || r.src_ip },
     { key: 'src_port', label: 'Src port', numeric: true,
-      value: (r) => r.src_port_num },
-    { key: 'dst', label: 'Destination', value: (r) => r.dst_name || r.dst_ip },
+      width: 96, value: (r) => r.src_port_num },
+    { key: 'dst', label: 'Destination', width: 190, value: (r) => r.dst_name || r.dst_ip },
     { key: 'dst_port', label: 'Dst port', numeric: true,
-      value: (r) => r.dst_port_num },
-    { key: 'protocol', label: 'Proto' },
+      width: 96, value: (r) => r.dst_port_num },
+    { key: 'protocol', label: 'Proto', width: 76 },
     { key: 'bytes', label: 'Bytes', numeric: true, descendingFirst: true,
-      value: (r) => r.bytes },
+      width: 84, value: (r) => r.bytes },
     { key: 'packets', label: 'Packets', numeric: true, descendingFirst: true,
-      value: (r) => r.packets },
-    { key: 'interfaces', label: 'In/Out', sortable: false,
+      width: 84, value: (r) => r.packets },
+    { key: 'interfaces', label: 'In/Out', sortable: false, width: 96,
       value: (r) => `${r.in_if} / ${r.out_if}` },
-    { key: 'exporter', label: 'Exporter' },
+    { key: 'exporter', label: 'Exporter', width: 120 },
     { key: 'route', label: '', sortable: false, width: 84, value: () => '' },
   ];
 
