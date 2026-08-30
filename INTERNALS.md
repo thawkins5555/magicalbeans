@@ -927,13 +927,40 @@ without needing a server round trip or a per-user setting.
 'sappiwhere.tab'`). `selectTab(name)` writes the tab name to
 `localStorage` on every switch, wrapped in the same try/catch every other
 `localStorage` write in this file uses (private browsing or a full quota
-must not break tab switching). `start()` reads it back before the very
+must not break tab switching). `start()` reads it back before its own
 first `selectTab()` call, validating the stored name against an actual
 `.tab[data-tab="..."]` element in the DOM before trusting it — a build
 that renamed or dropped a tab falls back to `'netpath'` rather than
-landing on a dead tab. This runs once, before `restartTimer()`, so the
-very first paint already shows the right module rather than flashing
-NetPath first.
+landing on a dead tab.
+
+That `start()`-driven restore alone still flashes NetPath on every
+reload, because it runs late: `start()` is called from a `DOMContentLoaded`
+listener, which fires only after every `<script src>` tag in `index.html`
+has been fetched and executed (eight of them, each its own blocking
+network round trip since `server.py` serves scripts `no-cache` with an
+`ETag`), and even then `start()` itself `await`s `loadState()` — a ninth
+round trip, to `/api/state` — before it reaches `selectTab()`. The static
+markup's own default (`class="tab active"` on the NetPath button,
+`class="page active"` on `#page-netpath`) is what paints during that
+entire window, on every single reload, regardless of which tab was
+actually last open.
+
+The fix is a small inline `<script>` in `index.html` itself, placed after
+every `.tab`/`.page` element but before the first external `<script src>`
+tag. Being inline, it has no network fetch of its own and runs
+synchronously the instant the parser reaches it — before the browser has
+even requested `app.js`, let alone run it — so it applies the same
+`localStorage` lookup and the same `.active`-class toggle `selectTab()`
+does, closing the visible window to however long `index.html` itself
+takes to arrive (typically single-digit milliseconds on a LAN; measured
+around 30ms end-to-end in a loaded/sandboxed test environment). It
+deliberately does *nothing* beyond that class toggle — no `state.tab`
+write, no `activate()`, no fetch — because at the point it runs, no page
+module's `init()` has executed yet and nothing else is safe to touch.
+`start()`'s own `selectTab(initialTab)` call still runs exactly as
+before, once `init()` has wired up every module; it just re-applies
+classes that, in the common case, are already correct, which is a
+no-op `classList.toggle` and not a visible change.
 
 **A fresh sign-in always opens on Dashboard.** `login.js` writes
 `'dashboard'` under the same `'sappiwhere.tab'` key immediately before its

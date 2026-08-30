@@ -6,6 +6,15 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.9.2 — No more NetPath flash on reload
+
+- **Reloading no longer flashes NetPath** before settling on the tab you
+  were actually on. The remembered tab is now applied by a small inline
+  script that runs the instant the page's markup is parsed, rather than
+  waiting on every module's script file to load and the app's own first
+  server round trip — both of which the previous fix still had to wait
+  through before it could act.
+
 ### 4.9.1 — Sign-in always opens on Dashboard
 
 - **Signing in now always lands on the Dashboard tab**, regardless of

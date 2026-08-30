@@ -512,6 +512,32 @@
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
+<!-- Applies the remembered tab before any external script has even been
+     fetched, let alone run app.js's own startup sequence — inline and
+     synchronous, so there is nothing to wait on. Without this, a reload
+     paints NetPath (the static markup's own default) for however long it
+     takes the script tags below to load and app.js to reach its first
+     await, then snaps to the real tab; this closes that window to
+     nothing. app.js's selectTab() reapplies the same classes once it
+     actually runs, which is a harmless no-op here — this script only
+     ever narrows a visible flash, it never owns the tab state. -->
+<script>
+(function () {
+  try {
+    var stored = localStorage.getItem('sappiwhere.tab');
+    if (!stored || !document.querySelector('.tab[data-tab="' + stored + '"]')) return;
+    var tabs = document.querySelectorAll('.tab');
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].classList.toggle('active', tabs[i].dataset.tab === stored);
+    }
+    var pages = document.querySelectorAll('.page');
+    for (var j = 0; j < pages.length; j++) {
+      pages[j].classList.toggle('active', pages[j].id === 'page-' + stored);
+    }
+  } catch (error) { /* private browsing, or storage full: keep the static default */ }
+})();
+</script>
+
 <script src="/app.js"></script>
 <script src="/dashboard.js"></script>
 <script src="/netpath.js"></script>
