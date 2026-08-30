@@ -145,12 +145,45 @@ def _swap_in(new_netpath: str) -> None:
         raise
 
 
+def _restart_posix() -> None:
+    """`execve` replaces this process image in place: same PID, no gap
+    where nothing is listening."""
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _restart_windows() -> None:
+    """Windows has no true in-place exec — Python's `os.execv` emulates it by
+    starting a new process and then ending this one, and if a supervisor
+    (a Windows service wrapper, a job-object-based process tree) is watching
+    this process, its cleanup can kill that new process the instant this one
+    exits, so the "restart" silently becomes a stop.
+
+    Spawn the replacement fully detached first — its own console, its own
+    process group, and a best-effort attempt to break out of any job object
+    this process is in — and only end this one once it exists. If the
+    breakaway is refused and a supervisor kills the child alongside this
+    process anyway, that supervisor's own restart policy is the fallback:
+    either way the files already swapped in by `_swap_in` are what the next
+    launch reads.
+    """
+    import subprocess
+    creationflags = (subprocess.DETACHED_PROCESS
+                     | subprocess.CREATE_NEW_PROCESS_GROUP
+                     | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0))
+    try:
+        subprocess.Popen([sys.executable] + sys.argv, cwd=os.getcwd(),
+                         close_fds=True, creationflags=creationflags)
+    except OSError:
+        pass  # a supervisor's restart policy is the fallback
+    os._exit(0)
+
+
 def schedule_restart(delay: float = 1.5) -> None:
-    """Re-exec after `delay` seconds, so the response to this request has
+    """Restart after `delay` seconds, so the response to this request has
     time to reach the browser first."""
     def _go():
         time.sleep(delay)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        _restart_windows() if os.name == "nt" else _restart_posix()
     threading.Thread(target=_go, name="sappiwhere-update-restart",
                      daemon=True).start()
 
