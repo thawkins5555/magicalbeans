@@ -6,6 +6,26 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.11.1 — Live MTR coloring on the route graph, ASN fallback names
+
+- **A NetPath route-graph node now turns amber or red when its continuous
+  (MTR-style) probing is degraded or failing**, using the same warn/fail
+  thresholds — that destination's own `warn_rtt_ms`/`warn_loss` — a
+  scheduled trace is judged by. This only applies to a hop that actually
+  has continuous probing running (`hop_probe_enabled` on that
+  destination); a hop with no live probe data keeps its previous coloring.
+  The live signal outranks even "this is the destination" in the node's
+  color priority, so a target that's currently degraded is not painted the
+  same reassuring green as a healthy one — it shows an "MTR: DEGRADED" or
+  "MTR: HIGH LOSS" badge and matching border/accent color instead, and the
+  hover tooltip names which one.
+- **A hop with no PTR record now shows its ASN's org name instead of "no
+  PTR record", when one is known.** `asn_lookup()` only ever resolves
+  ASN/org data for globally routable addresses, so this fallback is
+  naturally limited to external hops — an internal address with no PTR
+  still shows "no PTR record" exactly as before. A real PTR name, once
+  found, still always wins over the ASN fallback.
+
 ### 4.11.0 — Nodes and Alerts
 
 - **Two new tabs, Nodes and Alerts**, inserted between Dashboard and

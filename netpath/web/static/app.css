@@ -29,6 +29,7 @@
   --canvas-accent: #2F5FC4;
   --canvas-ok: #1B7F3B;
   --canvas-warn: #9A6510;
+  --canvas-fail: #B3261E;
 
   --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;

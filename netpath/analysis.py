@@ -52,12 +52,26 @@ class PathNode:
 
     @property
     def hostname_label(self) -> str:
-        """What to print under the address."""
+        """What to print under the address.
+
+        A hop with no PTR record is still worth naming if it's an external
+        address: asn_lookup() only ever populates asn/asn_org for globally
+        routable addresses (namelookup.is_global gates it), so falling back
+        to the ASN's org name here is automatically limited to external
+        hops \u2014 an internal address with no PTR still shows "no PTR record",
+        exactly as before.
+        """
         if self.ip is None:
             return ""
         if not self.hostname_known:
             return "resolving\u2026"
-        return self.hostname or "no PTR record"
+        if self.hostname:
+            return self.hostname
+        if self.asn_org:
+            return self.asn_org
+        if self.asn:
+            return f"AS{self.asn}"
+        return "no PTR record"
 
     @property
     def is_timeout(self) -> bool:

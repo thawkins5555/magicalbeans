@@ -229,6 +229,11 @@ traces it appeared in.
 - **ASN and owner**, when known, appear in a hop's tooltip beneath its name —
   `AS15169 (GOOGLE, US)` — so you can see which network a route is on and
   where it leaves your own provider.
+- **A hop with no PTR record shows its ASN's org name instead**, when one is
+  known — `GOOGLE, US` in place of "no PTR record". Since ASNs are only ever
+  looked up for public addresses, this only ever applies to external hops;
+  an unnamed hop inside your own network still reads "no PTR record". A real
+  PTR name, once found, always wins over the ASN fallback.
 
 ### Continuous per-hop probing (MTR-style)
 
@@ -245,6 +250,13 @@ an improvement or a regression on the old path.
 This is real, continuous ICMP traffic for as long as it stays on, which is
 why it defaults to off — turn it on for the destinations you want to watch
 closely, not every one.
+
+A hop with live probe stats crossing that destination's own warn thresholds
+turns amber on the route graph, with an "MTR: DEGRADED" badge; 100% loss
+turns it red with "MTR: HIGH LOSS". This is a more current signal than the
+traceroute-derived colors around it, so it outranks even the destination's
+own green "target" marker — a target that's live-degraded is not painted
+the same reassuring green as a healthy one.
 
 ### Timeline
 

@@ -403,6 +403,21 @@
     fit(svg, group, width, height);
   }
 
+  /* Mirrors monitor.py's classify(): the same warn/fail thresholds a
+     scheduled trace is judged by, applied to a hop's live continuous
+     (MTR-style) probe stats instead of a single trace. null means this
+     node either has no continuous probing running, or its live stats are
+     within the destination's own thresholds. */
+  function mtrSeverity(node, target) {
+    if (!target || !node.probe_count) return null;
+    const loss = node.probe_loss || 0;
+    if (loss >= 100) return 'fail';
+    const rtt = node.probe_rtt_avg;
+    if (loss > target.warn_loss) return 'warn';
+    if (rtt !== null && rtt !== undefined && rtt > target.warn_rtt_ms) return 'warn';
+    return null;
+  }
+
   function attachTip(element, text) {
     element.addEventListener('mousemove', (event) => {
       if (view.panDrag) return;   // a pan is not a hover
@@ -413,9 +428,16 @@
 
   function nodeBox(x, y, node) {
     const g = App.svgNode('g', { transform: `translate(${x},${y})` });
+    const mtr = mtrSeverity(node, currentTarget());
     let border = 'var(--canvas-hairline)', accent = 'var(--canvas-accent)';
     if (node.refusal) { border = accent = 'var(--blocked)'; }
     else if (node.is_timeout) { border = accent = 'var(--canvas-faint)'; }
+    // A live continuous-probe problem is a more urgent, more current signal
+    // than the traceroute-derived verdicts below it, so it outranks even
+    // "this is the destination" — a target that's currently degraded should
+    // not be painted the same reassuring green as a healthy one.
+    else if (mtr === 'fail') { border = accent = 'var(--canvas-fail)'; }
+    else if (mtr === 'warn') { border = accent = 'var(--canvas-warn)'; }
     else if (node.is_destination) { border = accent = 'var(--canvas-ok)'; }
     else if (node.share < 0.99) border = 'var(--canvas-warn)';
 
@@ -454,6 +476,12 @@
     if (node.refusal) {
       text(NODE_W - 8, 18, `REFUSED ${node.refusal}`, 10, 'var(--blocked)', 700)
         .setAttribute('text-anchor', 'end');
+    } else if (mtr === 'fail') {
+      text(NODE_W - 8, 18, 'MTR: HIGH LOSS', 10, 'var(--canvas-fail)', 700)
+        .setAttribute('text-anchor', 'end');
+    } else if (mtr === 'warn') {
+      text(NODE_W - 8, 18, 'MTR: DEGRADED', 10, 'var(--canvas-warn)', 700)
+        .setAttribute('text-anchor', 'end');
     } else if (node.is_destination) {
       text(NODE_W - 8, 18, 'TARGET', 10, 'var(--canvas-ok)', 700)
         .setAttribute('text-anchor', 'end');
@@ -480,6 +508,8 @@
       if (rttAvg !== null && rttAvg !== undefined) {
         tip.push(`RTT (live) ${rttMin.toFixed(1)}/${rttAvg.toFixed(1)}/${rttMax.toFixed(1)} ms (min/avg/max)`);
       }
+      if (mtr === 'fail') tip.push('Continuous probing: HIGH LOSS');
+      else if (mtr === 'warn') tip.push('Continuous probing: degraded (over the warn threshold)');
     }
     attachTip(g, tip.join('\n'));
     return g;
