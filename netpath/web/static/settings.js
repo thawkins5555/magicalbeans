@@ -15,10 +15,12 @@
     App.el('set-asn-server').value = s.asn_server || '';
     App.el('set-refresh-netpath').value = s.netpath_refresh_s;
     App.el('set-refresh-netflow').value = s.netflow_refresh_s;
+    App.el('set-refresh-snmp').value = s.snmp_refresh_s;
     App.el('set-refresh-syslog').value = s.syslog_refresh_s;
     App.el('set-refresh-debug').value = s.debug_refresh_s;
     App.el('set-trace-cap').value = s.max_trace_db_mb;
     App.el('set-flow-cap').value = s.max_flow_db_mb;
+    App.el('set-snmp-cap').value = s.max_snmp_db_mb;
     App.el('set-syslog-cap').value = s.max_syslog_db_mb;
     App.el('set-ipam-cap').value = s.max_ipam_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
@@ -28,6 +30,7 @@
     App.el('set-app-path').value = storage.app_path || '';
     App.el('set-trace-path').value = storage.trace_path || '';
     App.el('set-flow-path').value = storage.flow_path || '';
+    App.el('set-snmp-path').value = storage.snmp_path || '';
     App.el('set-syslog-path').value = storage.syslog_path || '';
     App.el('set-ipam-path').value = storage.ipam_path || '';
     showUsage(storage);
@@ -136,6 +139,7 @@
     const rows = [
       ['use-trace', storage.trace_bytes, Number(App.el('set-trace-cap').value)],
       ['use-flow', storage.flow_bytes, Number(App.el('set-flow-cap').value)],
+      ['use-snmp', storage.snmp_bytes, Number(App.el('set-snmp-cap').value)],
       ['use-syslog', storage.syslog_bytes, Number(App.el('set-syslog-cap').value)],
       ['use-ipam', storage.ipam_bytes, Number(App.el('set-ipam-cap').value)],
     ];
@@ -151,7 +155,8 @@
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
     const total = (storage.trace_bytes || 0) + (storage.flow_bytes || 0)
-      + (storage.syslog_bytes || 0) + (storage.app_bytes || 0) + (storage.ipam_bytes || 0);
+      + (storage.snmp_bytes || 0) + (storage.syslog_bytes || 0)
+      + (storage.app_bytes || 0) + (storage.ipam_bytes || 0);
     App.el('set-sizes').textContent =
       `${App.bytes(total)} on disk in total. Sizes include each file's `
       + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
@@ -176,10 +181,12 @@
       asn_server: App.el('set-asn-server').value.trim(),
       netpath_refresh_s: Number(App.el('set-refresh-netpath').value),
       netflow_refresh_s: Number(App.el('set-refresh-netflow').value),
+      snmp_refresh_s: Number(App.el('set-refresh-snmp').value),
       syslog_refresh_s: Number(App.el('set-refresh-syslog').value),
       debug_refresh_s: Number(App.el('set-refresh-debug').value),
       max_trace_db_mb: Number(App.el('set-trace-cap').value),
       max_flow_db_mb: Number(App.el('set-flow-cap').value),
+      max_snmp_db_mb: Number(App.el('set-snmp-cap').value),
       max_syslog_db_mb: Number(App.el('set-syslog-cap').value),
       max_ipam_db_mb: Number(App.el('set-ipam-cap').value),
       session_idle_minutes: Number(App.el('set-idle-minutes').value),
@@ -190,6 +197,7 @@
     status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
            `NetPath ${values.netpath_refresh_s}s · ` +
            `NetFlow ${values.netflow_refresh_s}s · ` +
+           `SNMP ${values.snmp_refresh_s}s · ` +
            `Syslog ${values.syslog_refresh_s}s · ` +
            `Debug ${values.debug_refresh_s}s · ` +
            `idle timeout ${values.session_idle_minutes}min`, 'var(--ok)');
@@ -330,7 +338,7 @@
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     loadUsers().catch(() => {});
-    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-syslog-cap', 'set-ipam-cap']) {
+    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap', 'set-ipam-cap']) {
       App.el(id).oninput = () =>
         showUsage((App.state.serverState || {}).storage || {});
     }

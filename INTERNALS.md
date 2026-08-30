@@ -27,6 +27,10 @@ netpath/
   syslogparse.py   RFC 3164 / RFC 5424 parsing
   syslogd.py       syslog UDP/TCP listener
   syslogdb.py      syslog storage, rollup counts, FTS5 trigram search
+  trapdecode.py    SNMP trap BER/ASN.1 decode + encode, v3 USM auth
+  trapoids.py      well-known OID names, enum tables, default severities
+  snmptrapd.py     SNMP trap UDP listener
+  snmptrapdb.py    SNMP trap storage, rollup counts
   namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup
   procs.py         subprocess launch without a console window
   auth.py          password hashing, sessions, login throttling
@@ -433,6 +437,101 @@ triggered inside `activate()` no-ops (`refresh()` returns immediately when
 already-updated target/window state. The window itself pads ±5 minutes
 around the flow's own timestamp — a single flow record is a point in
 time, but the route graph needs a span to draw traces from.
+
+---
+
+## SNMP Trap
+
+### Decoding (`trapdecode.py`, `trapoids.py`)
+
+`Reader` walks a byte range and returns `(tag, value_start, value_end)`
+TLVs as absolute offsets into the original datagram rather than slices —
+required for SNMPv3 authentication, which has to hash the original buffer
+with `msgAuthenticationParameters` zero-filled *in place*, byte-identical
+to what the sender signed. `Decoder.decode()` follows `nfdecode.Decoder`'s
+shape exactly: one `try/except` around the whole body, a `.stats` counter
+dict, never raises past its own boundary, returns `None` on any failure.
+
+v1's `Trap-PDU` (tag `0xA4`) and v2c/v3's `SNMPv2-Trap-PDU`/
+`InformRequest-PDU` (tags `0xA7`/`0xA6`, structurally a `GetResponse-PDU`)
+are different shapes read by different methods (`_read_trap_v1` /
+`_read_trap_v2`); `_finish()` reconciles them onto one identity axis
+afterward — `_read_trap_v1` maps a v1 trap's generic/specific numbers onto
+the v2 `snmpTrapOID` space per RFC 3584 §3.1 so both versions are
+searchable and filterable together.
+
+v3 (`_decode_v3`) reads `msgFlags` to determine `auth`/`priv`, then always
+decodes `msgSecurityParameters` (cleartext regardless of security level —
+RFC 3414 §6). If `auth`, `_verify_v3()` looks up the user's
+`(protocol, password)`, derives a localized key via `_localized_key()`
+(RFC 3414 A.2.1/A.2.2: hash exactly 1 MiB of the repeated password, then
+`hash(key || engineID || key)`; cached per `(protocol, password, engine)`
+since the 1 MiB hash costs real milliseconds), zero-fills a `bytearray`
+copy of the datagram at the authentication parameter's recorded offsets,
+and compares an HMAC computed over that copy against what was sent, via
+`hmac.compare_digest`. If `priv`, the `ScopedPDU` is encrypted and is not
+parsed further — the standard library has no AES/DES implementation, and
+this app takes no third-party dependencies — the trap is stored with
+`auth_state="encrypted"` and everything the header carries in the clear;
+`AUTH_PROTOCOLS`'s comment block marks exactly where a future
+`trapcrypto.py` would plug in (`decrypt(protocol, key, priv_params,
+engine_boots, engine_time, ciphertext) -> bytes | None`), so decryption
+lands here without restructuring anything.
+
+`trapoids.py` is a name table, not a MIB compiler — parsing SMIv1/SMIv2
+ASN.1 modules is a substantial parser project of its own and out of scope
+for a stdlib-only app. `Decoder.resolve_oid()` does exact-match first,
+then walks the OID's arcs looking for the longest known *prefix* so an
+unrecognized instance under a known table entry still resolves
+(`ifDescr.7` for `1.3.6.1.2.1.2.2.1.2.7`). `Decoder.severity_for()` does
+the same longest-prefix-wins search over `severity_rules`, which starts
+from `trapoids.DEFAULT_SEVERITY_RULES` and is re-sorted by `-len(prefix)`
+whenever admin-supplied rules are appended in `configure()`, so a specific
+rule always beats a vendor-wide one regardless of the order either list
+was written in.
+
+The encoder half (`build_v1_trap`, `build_v2c_trap`,
+`build_inform_response`) is small and total, used by `post_snmp_test` and
+by the inform-acknowledgement path. `build_inform_response()` splices the
+acknowledged inform's own varbind-list bytes back verbatim — via
+`Trap.varbinds_tlv_span`, the full TLV span (tag byte included) recorded
+while parsing — rather than re-encoding the varbinds from their decoded
+Python values, so nothing can be lost in a round trip through the decoder.
+
+### Listener (`snmptrapd.py`)
+
+Same rx/tx split as NetFlow's and Syslog's collectors, UDP only — SNMP has
+no TCP transport in practice. `_accepted_source()` gates before decoding
+(a rejected packet is never parsed, same as Syslog); `_accepted_community()`
+necessarily runs after, since the community lives inside the packet.
+`_enqueue()` filters on `trap.severity > min_severity` before the queue,
+the same volume-control-at-the-door pattern Syslog uses.
+
+`_acknowledge()` replies to a v1/v2c `InformRequest` on the same socket it
+arrived on — still receive-only work, since it answers rather than
+queries — using the recorded `varbinds_tlv_span` to splice the response
+together without re-encoding. v3 informs are deliberately not
+acknowledged: doing so correctly means acting as the authoritative SNMP
+engine (answering discovery `Report`s, tracking `engineBoots`/
+`engineTime`), which is USM's other half and belongs with a future poller.
+
+### Storage (`snmptrapdb.py`)
+
+`trap_counts` is a rollup table maintained incrementally as traps arrive,
+the same shape as Syslog's `log_counts`, so the histogram costs at most a
+few dozen rows to read regardless of how large `traps` has grown.
+
+No FTS5, unlike Syslog. Syslog needs a trigram index because a busy
+firewall can produce millions of lines a day; traps run two to four
+orders of magnitude rarer, and the useful queries are on indexed columns
+(`ts`, `severity`, `source`, `trap_oid`) — a `LIKE` over `varbind_text`,
+already narrowed by the time window, reads a handful of rows. Varbinds are
+one JSON column (`varbinds`), not a child table: a varbind list is read
+exactly once, whole, by the detail panel for a selected row, never
+joined, grouped or aggregated — a child table would add write
+amplification on the hot insert path to buy an ability nothing asks for,
+and free-text search over the varbinds is already served by the
+denormalized `varbind_text` column.
 
 ---
 

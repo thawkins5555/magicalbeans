@@ -93,6 +93,7 @@ GLOBAL_DEFAULTS = {
     # things that move by the second.
     "netpath_refresh_s": 2,
     "netflow_refresh_s": 30,
+    "snmp_refresh_s": 10,
     "syslog_refresh_s": 10,
     "debug_refresh_s": 1,
     "web_host": "0.0.0.0",
@@ -107,6 +108,7 @@ GLOBAL_DEFAULTS = {
     "session_max_hours": 12,
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
+    "max_snmp_db_mb": 256,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,
 }

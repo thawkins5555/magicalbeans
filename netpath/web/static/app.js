@@ -577,6 +577,8 @@ const App = (() => {
     state.settings = payload.settings;
     state.flowSettings = payload.flow_settings;
     state.syslogSettings = payload.syslog_settings;
+    state.snmpSettings = payload.snmp_settings;
+    state.trap_kinds = payload.trap_kinds;
     state.ipamSettings = payload.ipam_settings;
     state.dimensions = payload.dimensions;
     state.categories = payload.categories;
@@ -612,7 +614,8 @@ const App = (() => {
 
   function rateFor(page) {
     const key = { netpath: 'netpath_refresh_s', netflow: 'netflow_refresh_s',
-                  syslog: 'syslog_refresh_s', debug: 'debug_refresh_s' }[page];
+                  snmp: 'snmp_refresh_s', syslog: 'syslog_refresh_s',
+                  debug: 'debug_refresh_s' }[page];
     const seconds = Number(state.settings[key]);
     return Math.max(seconds > 0 ? seconds : 2, 0.1) * 1000;
   }

@@ -40,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "settings and accounts (defaults next to --db)")
     parser.add_argument("--ipam-db", default=None,
                         help="path to the IPAM SQLite file (defaults next to --db)")
+    parser.add_argument("--snmp-db", default=None,
+                        help="path to the SNMP trap SQLite file (defaults next to --db)")
     parser.add_argument("--add", action="append", default=[], metavar="HOST",
                         help="add a destination on startup (repeatable)")
 
@@ -81,12 +83,19 @@ def ipam_path_for(args) -> str:
     return os.path.join(os.path.dirname(args.db) or ".", "ipam.db")
 
 
+def snmp_path_for(args) -> str:
+    if args.snmp_db:
+        return args.snmp_db
+    return os.path.join(os.path.dirname(args.db) or ".", "snmptraps.db")
+
+
 def build_service(args):
     """Open the databases, seed any destinations, and start the collectors."""
     from .web import Service
 
     service = Service(args.db, flow_path_for(args), syslog_path_for(args),
-                      app_path_for(args), ipam_path_for(args))
+                      app_path_for(args), ipam_path_for(args),
+                      snmp_path_for(args))
     existing = {row["host"] for row in service.db.targets()}
     for host in args.add:
         if host not in existing:

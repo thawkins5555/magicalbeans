@@ -143,6 +143,7 @@ button.linkish:hover { color: var(--accent); }
 html[data-tab="dashboard"] .tab[data-tab="dashboard"],
 html[data-tab="netpath"] .tab[data-tab="netpath"],
 html[data-tab="netflow"] .tab[data-tab="netflow"],
+html[data-tab="snmp"] .tab[data-tab="snmp"],
 html[data-tab="syslog"] .tab[data-tab="syslog"],
 html[data-tab="ipam"] .tab[data-tab="ipam"],
 html[data-tab="debug"] .tab[data-tab="debug"],
@@ -152,6 +153,7 @@ html[data-tab="settings"] .tab[data-tab="settings"] {
 }
 html[data-tab="dashboard"] #page-dashboard,
 html[data-tab="netflow"] #page-netflow,
+html[data-tab="snmp"] #page-snmp,
 html[data-tab="syslog"] #page-syslog,
 html[data-tab="ipam"] #page-ipam,
 html[data-tab="debug"] #page-debug,
@@ -481,6 +483,7 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 .sev-6 { color: var(--muted); }
 .sev-7 { color: var(--faint); }
 #syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
+#snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
 .took { font-family: var(--mono); font-size: 11px; color: var(--faint); }
 
 /* ---------------------------------------------------------------- debug */

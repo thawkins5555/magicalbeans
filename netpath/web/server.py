@@ -52,6 +52,10 @@ ROUTES = [
     ("GET", r"^/api/netflow/records$", api.get_flow_records),
     ("POST", r"^/api/netflow/collector$", api.post_collector),
     ("POST", r"^/api/netflow/testpacket$", api.post_test_packet),
+    ("GET", r"^/api/snmp/overview$", api.get_snmp_overview),
+    ("GET", r"^/api/snmp/traps$", api.get_snmp_traps),
+    ("POST", r"^/api/snmp/collector$", api.post_snmp_collector),
+    ("POST", r"^/api/snmp/test$", api.post_snmp_test),
     ("GET", r"^/api/syslog/overview$", api.get_syslog_overview),
     ("GET", r"^/api/syslog/search$", api.get_syslog_search),
     ("POST", r"^/api/syslog/collector$", api.post_syslog_collector),
@@ -121,7 +125,8 @@ class AccessLog:
             entry = {"ts": time.time(), "client": client, "method": method,
                      "path": path, "status": status, "ms": ms}
             if not path.startswith(("/app.", "/netpath.js", "/netflow.js",
-                                    "/syslog.js", "/debug.js", "/settings.js")):
+                                    "/snmp.js", "/syslog.js", "/debug.js",
+                                    "/settings.js")):
                 self.recent.appendleft(entry)
             info = self.clients.setdefault(client, {
                 "requests": 0, "first_seen": time.time(), "last_seen": 0.0,

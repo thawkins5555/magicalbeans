@@ -28,6 +28,7 @@
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab" data-tab="netpath">NETPATH</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
+  <button class="tab" data-tab="snmp">SNMP TRAP</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="ipam">IPAM</button>
   <button class="tab" data-tab="debug">DEBUG</button>
@@ -179,6 +180,66 @@
         </select>
       </header>
       <div class="table-wrap"><table id="nf-table"></table></div>
+     </div>
+    </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================== SNMP TRAP =========================== -->
+<section id="page-snmp" class="page">
+  <div class="card strip">
+    <span id="sn-dot" class="dot"></span>
+    <span id="sn-status" class="stat">Receiver stopped</span>
+    <span id="sn-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="sn-test">Send test trap</button>
+    <button id="sn-toggle">Start receiver</button>
+    <button id="sn-settings" class="module-settings">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Search <input id="sn-q" size="26" placeholder="any part of a trap name, OID, varbind or IP"></label>
+    <label>Window <select id="sn-range"></select></label>
+    <label>Severity <select id="sn-severity"></select></label>
+    <label>Trap <select id="sn-kind"></select></label>
+    <label>Version <select id="sn-version"></select></label>
+    <label>Source IP <input id="sn-source" size="13" placeholder="10.20.3.4"></label>
+    <label>OID or name <input id="sn-oid" size="16" placeholder="linkDown"></label>
+    <button id="sn-apply" class="primary">Search</button>
+    <button id="sn-clear">Clear</button>
+    <label class="check"><input type="checkbox" id="sn-follow" checked> Live</label>
+    <span id="sn-took" class="took"></span>
+  </div>
+
+  <div class="rows" data-splitter="snmp-body">
+   <div class="pane pad-x" data-grow="2">
+    <header class="bar">
+      <span class="section">TRAPS PER HOUR</span>
+      <span id="sn-hist-summary" class="hint"></span>
+    </header>
+    <div id="sn-hist" class="canvas chart"><svg id="sn-hist-svg"></svg></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="5">
+    <header class="bar">
+      <span class="section">TRAPS</span>
+      <span id="sn-count" class="hint"></span>
+      <label class="check"><input type="checkbox" id="sn-show-hostname" checked> Hostname</label>
+      <span class="grow"></span>
+      <select id="sn-limit">
+        <option value="300">300 rows</option>
+        <option value="1000">1000 rows</option>
+        <option value="2000">2000 rows</option>
+      </select>
+    </header>
+    <div class="cols" data-splitter="snmp-lower">
+     <div class="pane" data-grow="3">
+      <div class="table-wrap"><table id="snmp-table"></table></div>
+     </div>
+     <div class="divider"></div>
+     <div class="pane" data-grow="1">
+      <pre id="sn-detail" class="detail">Select a trap to see every varbind with its OID and typed value.</pre>
      </div>
     </div>
    </div>
@@ -424,6 +485,7 @@
       <legend>REFRESH RATES</legend>
       <label>NetPath <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
       <label>NetFlow <input type="number" id="set-refresh-netflow" min="1" max="3600" step="5"> s</label>
+      <label>SNMP <input type="number" id="set-refresh-snmp" min="1" max="3600" step="5"> s</label>
       <label>Syslog <input type="number" id="set-refresh-syslog" min="1" max="3600" step="5"> s</label>
       <label>Debug <input type="number" id="set-refresh-debug" min="0.1" max="60" step="0.5"> s</label>
       <p class="hint">Set per module because they want different rates. The route graph is
@@ -438,12 +500,15 @@
       <label>Application <input id="set-app-path" readonly></label>
       <label>Traces <input id="set-trace-path" readonly></label>
       <label>Flows <input id="set-flow-path" readonly></label>
+      <label>SNMP traps <input id="set-snmp-path" readonly></label>
       <label>Syslog <input id="set-syslog-path" readonly></label>
       <label>IPAM <input id="set-ipam-path" readonly></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
         <span class="usage" id="use-flow"></span></label>
+      <label>SNMP trap database cap <input type="number" id="set-snmp-cap" min="16" step="64"> MB
+        <span class="usage" id="use-snmp"></span></label>
       <label>Syslog database cap <input type="number" id="set-syslog-cap" min="16" step="256"> MB
         <span class="usage" id="use-syslog"></span></label>
       <label>IPAM database cap <input type="number" id="set-ipam-cap" min="16" step="64"> MB
@@ -512,6 +577,7 @@
         <button data-maint="redns">Re-run reverse DNS</button>
         <button data-maint="prune_traces">Delete old traces</button>
         <button data-maint="prune_flows">Delete stored flows</button>
+        <button data-maint="prune_snmp">Delete stored traps</button>
         <button data-maint="prune_syslog">Delete stored syslog</button>
         <button id="reset-layout">Reset panel sizes</button>
       </div>
@@ -532,6 +598,7 @@
 <script src="/dashboard.js"></script>
 <script src="/netpath.js"></script>
 <script src="/netflow.js"></script>
+<script src="/snmp.js"></script>
 <script src="/syslog.js"></script>
 <script src="/ipam.js"></script>
 <script src="/debug.js"></script>

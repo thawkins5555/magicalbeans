@@ -7,6 +7,7 @@ this file stays about the data.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 
@@ -17,6 +18,8 @@ from ..flowdb import DIMENSIONS
 from ..ipamdb import scope_size
 from ..eventlog import CATEGORIES, ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY, SYSTEM as SYSTEM_CATEGORY
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
+from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
+from .. import trapoids
 
 MIN_BLOCK_PX = 3
 
@@ -71,6 +74,8 @@ def get_state(service, params, body) -> dict:
         "severities": SEVERITIES,
         "facilities": FACILITIES,
         "syslog_settings": service.syslog_settings,
+        "snmp_settings": service.snmp_settings,
+        "trap_kinds": list(trapoids.KINDS),
         "ipam_settings": service.ipam_settings,
         "uptime_s": time.time() - service.started_at,
         "collector": {
@@ -94,6 +99,13 @@ def get_state(service, params, body) -> dict:
             "index_done": service.syslog_db.index_progress[0],
             "index_total": service.syslog_db.index_progress[1],
         },
+        "snmp": {
+            "running": service.snmp.running,
+            "status": service.snmp.status_text(),
+            "counters": service.snmp.counters,
+            "ports": service.snmp.ports,
+            "decoder": service.snmp.decoder.stats,
+        },
         "ipam": {
             "running": service.ipam.running,
             **service.ipam.state(),
@@ -104,11 +116,13 @@ def get_state(service, params, body) -> dict:
             "trace_path": service.db.path,
             "flow_path": service.flow_db.path,
             "syslog_path": service.syslog_db.path,
+            "snmp_path": service.snmp_db.path,
             "ipam_path": service.ipam_db.path,
             "app_bytes": service.app_db.size_bytes(),
             "trace_bytes": service.db.size_bytes(),
             "flow_bytes": service.flow_db.size_bytes(),
             "syslog_bytes": service.syslog_db.size_bytes(),
+            "snmp_bytes": service.snmp_db.size_bytes(),
             "ipam_bytes": service.ipam_db.size_bytes(),
         },
     }
@@ -648,6 +662,8 @@ def post_settings(service, params, body) -> dict:
         return {"flow_settings": service.apply_netflow_settings(values)}
     if scope == "syslog":
         return {"syslog_settings": service.apply_syslog_settings(values)}
+    if scope == "snmp":
+        return {"snmp_settings": service.apply_snmp_settings(values)}
     if scope == "ipam":
         return {"ipam_settings": service.apply_ipam_settings(values)}
     return {"settings": service.apply_global_settings(values)}
@@ -680,6 +696,9 @@ def post_maintenance(service, params, body) -> dict:
     if action == "prune_syslog":
         removed = service.syslog_db.prune(0, 0)
         return {"message": f"Deleted {removed} syslog messages"}
+    if action == "prune_snmp":
+        removed = service.snmp_db.prune(0, 0)
+        return {"message": f"Deleted {removed} stored traps"}
     if action == "prune_ipam":
         hosts = service.ipam_db.prune_hosts(0)
         conflicts = service.ipam_db.prune_conflicts(0)
@@ -797,6 +816,157 @@ def post_syslog_test(service, params, body) -> dict:
     )
     return {"sent": sent, "error": error, "host": host, "port": port,
             "script": script}
+
+
+# --------------------------------------------------------------------- snmp
+
+def _snmp_filters(params) -> dict:
+    return {
+        "text": params.get("q", ""),
+        "severity": params.get("severity") or None,
+        "version": params.get("version") or None,
+        "kind": params.get("kind", ""),
+        "source": params.get("source", ""),
+        "oid": params.get("oid", ""),
+        "community": params.get("community", ""),
+    }
+
+
+def get_snmp_overview(service, params, body) -> dict:
+    """Histogram plus the context the page needs; deliberately cheap."""
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    bucket = _num(params, "bucket", 3600)
+    filters = _snmp_filters(params)
+
+    buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
+    stats = service.snmp_db.stats()
+    return {
+        "t0": t0, "t1": t1, "bucket_s": bucket,
+        "buckets": buckets,
+        "stats": stats,
+        "sources": [{"source": row["source"], "count": row["n"],
+                     "last_seen": row["last_seen"]}
+                    for row in service.snmp_db.recent_sources()],
+        "kinds": [{"kind": row["trap_kind"], "count": row["n"]}
+                  for row in service.snmp_db.kinds()],
+    }
+
+
+def get_snmp_traps(service, params, body) -> dict:
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    limit = int(_num(params, "limit", 300, int) or 300)
+    filters = _snmp_filters(params)
+
+    started = time.time()
+    rows = service.snmp_db.search(t0, t1, filters, limit=min(limit, 2000))
+    elapsed_ms = (time.time() - started) * 1000
+
+    names = {}
+    if service.snmp_settings.get("resolve_sources"):
+        names = {ip: name for ip, name in
+                 service.app_db.hostnames({row["source"] for row in rows}).items()
+                 if name}
+
+    traps = []
+    for row in rows:
+        try:
+            varbinds = json.loads(row["varbinds"] or "[]")
+        except ValueError:
+            varbinds = []
+        traps.append({
+            "id": row["id"], "ts": row["ts"], "source": row["source"],
+            "source_name": names.get(row["source"], ""),
+            "version": row["version"],
+            "version_name": VERSION_NAMES.get(row["version"], "?"),
+            "community": row["community"] or "",
+            "engine_id": row["engine_id"] or "",
+            "security": row["security"] or "",
+            "auth_state": row["auth_state"] or "",
+            "trap_oid": row["trap_oid"] or "",
+            "trap_name": row["trap_name"] or "",
+            "trap_kind": row["trap_kind"] or "",
+            "severity": row["severity"],
+            "severity_name": severity_name(row["severity"]),
+            "generic": row["generic"], "specific": row["specific"],
+            "generic_name": (GENERIC_NAMES[row["generic"]]
+                             if row["generic"] is not None
+                             and 0 <= row["generic"] < len(GENERIC_NAMES) else ""),
+            "enterprise": row["enterprise"] or "",
+            "agent_addr": row["agent_addr"] or "",
+            "uptime": row["uptime"] or 0,
+            "uptime_text": format_ticks(row["uptime"] or 0),
+            "is_inform": bool(row["is_inform"]),
+            "varbind_n": row["varbind_n"],
+            "varbinds": varbinds,
+        })
+    return {"took_ms": round(elapsed_ms, 1), "traps": traps}
+
+
+def post_snmp_collector(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.snmp_settings["enabled"] = True
+        service.snmp_db.save_settings({"enabled": True})
+        service.snmp.start(service.snmp_settings)
+    elif action == "stop":
+        service.snmp_settings["enabled"] = False
+        service.snmp_db.save_settings({"enabled": False})
+        service.snmp.stop()
+    return {"running": service.snmp.running,
+            "status": service.snmp.status_text()}
+
+
+def post_snmp_test(service, params, body) -> dict:
+    """Send a real trap to our own listener, to prove the socket receives.
+
+    The packet is built by the same encoder the inform acknowledgement uses,
+    so a successful round trip exercises both halves.
+    """
+    import socket as _socket
+    from ..trapdecode import build_v1_trap, build_v2c_trap
+
+    host = "127.0.0.1"
+    port = int(service.snmp_settings.get("port", 162))
+    version = str(body.get("version", "v2c")).lower()
+    community = (str(service.snmp_settings.get("accepted_communities", ""))
+                 .replace(",", "\n").split("\n")[0].strip() or "public")
+    ticks = int((time.time() - service.started_at) * 100)
+
+    if version == "v1":
+        packet = build_v1_trap(community, "1.3.6.1.4.1.8072.9999", host,
+                               generic=0, specific=0, uptime_ticks=ticks)
+    else:
+        packet = build_v2c_trap(
+            community, "1.3.6.1.6.3.1.1.5.1", ticks,
+            [("1.3.6.1.2.1.1.5.0", enc_octets("sappiwhere")),
+             ("1.3.6.1.2.1.1.6.0", enc_octets("loopback test trap"))])
+
+    sent, error = True, None
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.sendto(packet, (host, port))
+        sock.close()
+    except OSError as exc:
+        sent, error = False, str(exc)
+
+    # PowerShell has no SNMP client, so the equivalent is the same bytes on
+    # the same socket. The trap is a fixed, valid coldStart, so it can be
+    # sent verbatim from anywhere that can reach this listener.
+    hexed = ",".join(f"0x{b:02X}" for b in packet)
+    script = (
+        "$udp = [System.Net.Sockets.UdpClient]::new()\n"
+        f'$udp.Connect("{host}", {port})\n'
+        f"$bytes = [byte[]]@({hexed})\n"
+        "[void]$udp.Send($bytes, $bytes.Length)\n"
+        "$udp.Close()"
+    )
+    command = (f"snmptrap -v 2c -c {community} {host}:{port} '' "
+               f"1.3.6.1.6.3.1.1.5.1")
+    return {"sent": sent, "error": error, "host": host, "port": port,
+            "version": version, "community": community,
+            "bytes": len(packet), "script": script, "command": command}
 
 
 # ---------------------------------------------------------------------- ipam

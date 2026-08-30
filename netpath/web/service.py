@@ -21,6 +21,8 @@ from ..flowdb import FlowDatabase
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
+from ..snmptrapd import TrapCollector
+from ..snmptrapdb import SnmpTrapDatabase
 from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
 
@@ -29,7 +31,7 @@ MAINTENANCE_INTERVAL_S = 900
 
 class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
-                 app_db_path: str, ipam_db_path: str):
+                 app_db_path: str, ipam_db_path: str, snmp_db_path: str):
         self.log = EventLog()
         self.app_db = AppDatabase(app_db_path)
         # Before the trace database is opened for normal use: on an install
@@ -41,12 +43,14 @@ class Service:
         self.flow_db = FlowDatabase(flow_db_path)
         self.syslog_db = SyslogDatabase(syslog_db_path)
         self.ipam_db = IpamDatabase(ipam_db_path)
+        self.snmp_db = SnmpTrapDatabase(snmp_db_path)
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
         self.flow_settings = self.flow_db.settings()
         self.syslog_settings = self.syslog_db.settings()
         self.ipam_settings = self.ipam_db.settings()
+        self.snmp_settings = self.snmp_db.settings()
 
         self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
@@ -77,6 +81,7 @@ class Service:
         )
         self.collector = Collector(self.flow_db, log=self.log)
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)
+        self.snmp = TrapCollector(self.snmp_db, log=self.log)
         self.ipam = IpamWorker(self.ipam_db, log=self.log)
 
         self.sessions = SessionStore(
@@ -116,6 +121,8 @@ class Service:
             self.collector.start(self.flow_settings)
         if self.syslog_settings.get("enabled", True):
             self.syslog.start(self.syslog_settings)
+        if self.snmp_settings.get("enabled", True):
+            self.snmp.start(self.snmp_settings)
         if self.ipam_settings.get("enabled", True):
             self.ipam.start()
 
@@ -145,10 +152,12 @@ class Service:
         self.asn_resolver.shutdown()
         self.collector.stop()
         self.syslog.stop()
+        self.snmp.stop()
         self.ipam.shutdown()
         self.db.close()
         self.flow_db.close()
         self.syslog_db.close()
+        self.snmp_db.close()
         self.ipam_db.close()
         self.app_db.close()
 
@@ -219,6 +228,15 @@ class Service:
             self.syslog.start(self.syslog_settings)
         self.log.add(SYSTEM, "Syslog settings applied")
         return self.syslog_settings
+
+    def apply_snmp_settings(self, values: dict) -> dict:
+        self.snmp_settings.update(values)
+        self.snmp_db.save_settings(self.snmp_settings)
+        self.snmp.stop()
+        if self.snmp_settings.get("enabled"):
+            self.snmp.start(self.snmp_settings)
+        self.log.add(SYSTEM, "SNMP trap settings applied")
+        return self.snmp_settings
 
     def apply_ipam_settings(self, values: dict) -> dict:
         self.ipam_settings.update(values)
@@ -357,6 +375,9 @@ class Service:
         if self.syslog_settings.get("resolve_sources"):
             addresses.extend(row["source"] for row
                              in self.syslog_db.sources(limit=100))
+        if self.snmp_settings.get("resolve_sources"):
+            addresses.extend(row["source"] for row
+                             in self.snmp_db.recent_sources(limit=100))
         if self.ipam_settings.get("resolve_hosts", True):
             addresses.extend(row["ip"] for row in self.ipam_db.hosts()
                              if row["alive"])
@@ -403,6 +424,9 @@ class Service:
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),
             int(self.syslog_settings.get("max_rows", 20_000_000)))
+        self.snmp_db.prune(
+            float(self.snmp_settings.get("retention_days", 90)),
+            int(self.snmp_settings.get("max_rows", 5_000_000)))
         self.app_db.prune_hostnames(
             max(float(self.settings.get("dns_cache_days", 7)) * 4, 30))
         self.app_db.prune_asn_cache(
@@ -424,6 +448,14 @@ class Service:
                 self.log.add(SYSTEM, f"Syslog database over its "
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest messages")
+
+        cap = int(self.settings.get("max_snmp_db_mb", 0)) * 1024 * 1024
+        if cap:
+            removed = self.snmp_db.trim_to_size(cap)
+            if removed:
+                self.log.add(SYSTEM, f"SNMP trap database over its "
+                                     f"{cap // 1048576} MB cap: removed "
+                                     f"{removed} oldest traps")
 
         cap = int(self.settings.get("max_ipam_db_mb", 0)) * 1024 * 1024
         if cap:

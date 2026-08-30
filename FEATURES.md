@@ -272,6 +272,79 @@ trace scheduler. Retention, a row cap and a file size cap all apply.
 
 ---
 
+## SNMP Trap — trap and inform receiver
+
+A receiver, a search, and an hourly histogram, graphically the same shape as
+Syslog. Receive-only: there is no SNMP polling (GET/GETBULK) yet, and no
+alerting engine ties traps, syslog and future ping/SNMP polling together yet.
+
+### Collection
+
+- **SNMPv1, v2c and v3** over UDP, each individually toggleable. All BER/
+  ASN.1 decoding is hand-written — no third-party SNMP or ASN.1 library —
+  and never raises past its own decode boundary: a malformed or truncated
+  packet is counted and dropped rather than crashing the receiver.
+- **v1's Trap-PDU** (enterprise, agent address, generic/specific trap
+  numbers) is decoded on its own terms and also mapped onto the same
+  snmpTrapOID identity v2c uses, so both versions are one searchable,
+  filterable axis rather than two.
+- **v3 authentication is verified** — MD5, SHA1, and the SHA-224/256/384/
+  512 variants — against a list of configured users, each a `name / SHA /
+  password` line. The digest is computed over the whole message with the
+  authentication field blanked in place, per RFC 3414. A trap sent
+  authPriv is detected and its header decoded, but the encrypted payload
+  is not decrypted — decryption needs a block cipher the standard library
+  does not provide, and this app takes no third-party dependencies. Such
+  traps are stored and flagged as encrypted, not decoded, rather than
+  dropped.
+- **Every trap gets a severity, 0–7** — the exact scale Syslog uses — via a
+  built-in OID-prefix rule table (coldStart, linkDown, bgpEstablished and
+  the rest of the common ones) plus an admin-editable override list, so a
+  future alerting engine can treat a trap and a syslog line the same way.
+- **OID names resolve through a built-in table** of roughly 150 entries
+  covering the standard MIBs and about twenty vendor roots, with
+  longest-prefix matching so an unrecognized instance under a known table
+  still shows a name (`ifDescr.7` rather than a bare OID). This is a name
+  table, not a MIB compiler — `.mib`/`.my` files are not parsed. An
+  admin-editable `OID = name` list extends it.
+- **InformRequests are acknowledged** for v1 and v2c — a reply on the same
+  socket the inform arrived on, which keeps this receive-only since it
+  answers rather than queries. v3 informs are not acknowledged: doing so
+  correctly means acting as the authoritative SNMP engine, which belongs
+  with a future poller.
+- **Source and community access control**, the same allow-list-or-
+  auto-accept shape Syslog uses for sending addresses, plus a separate
+  list for v1/v2c communities (which travel in cleartext in the packet,
+  so this is a filter, not a secret).
+- **Sending addresses can be resolved to names**, through the same cache
+  NetPath and Syslog use.
+- **Send test trap** sends a real coldStart trap to the receiver's own
+  bound port and shows the PowerShell and net-snmp equivalents, the same
+  loopback-proof pattern NetFlow and Syslog use.
+
+### Search
+
+Free text across the trap name, OID, community/user, source and every
+varbind's text, plus filters for severity (at this level and worse), trap
+kind, SNMP version, source IP and OID/name. Traps are rare enough — orders
+of magnitude fewer than syslog messages — that a plain indexed scan is fast
+without needing Syslog's trigram search index.
+
+### Histogram
+
+Traps per hour for the last 24 hours, stacked by severity, from the same
+kind of hourly rollup table Syslog's histogram reads — it does not get
+slower as the database fills. Clicking an hour narrows the search to it.
+
+### Detail panel
+
+Every varbind for the selected trap, each with its resolved name, OID,
+decoded type and value — including MAC addresses recognized from six-byte
+binary strings, TimeTicks rendered as `Xd HH:MM:SS`, and known enums (like
+`ifOperStatus`) shown by name rather than as a bare number.
+
+---
+
 ## Syslog — message collection
 
 A collector, a search, and an hourly histogram.

@@ -19,6 +19,7 @@ in full in `CREDENTIAL-SECURITY.md`, not repeated here.
 | --- | --- | --- | --- |
 | Web interface | TCP | 8443 (configurable) | Only when running with `--headless` |
 | NetFlow / IPFIX collector | UDP | 2055 (configurable) | Only if the NetFlow module is used |
+| SNMP trap receiver | UDP | 162 (configurable) | Only if the SNMP Trap module is used |
 | Syslog collector | UDP | 514 (configurable) | Only if the Syslog module is used |
 | Syslog collector | TCP | 514 (configurable, off by default) | Only if TCP syslog is enabled |
 | ICMP Time Exceeded (type 11) replies from routers | ICMP | — | Yes, for NetPath |
@@ -39,6 +40,11 @@ Syslog's standard port is 514, but binding below 1024 needs administrator or
 root rights. Running the collector on 5140 and pointing devices at that avoids
 the privilege entirely, which is usually the better answer on Windows.
 
+SNMP's standard trap port is 162, with the same privilege requirement below
+1024; 1162 avoids it. On Windows, the built-in "SNMP Trap" service also binds
+162 by default and will silently take traps meant for this app — stop that
+service first, or use a different port.
+
 On Windows each listening port needs an inbound firewall rule:
 
 ```powershell
@@ -46,6 +52,8 @@ New-NetFirewallRule -DisplayName "SappiWhere web" `
     -Direction Inbound -Protocol TCP -LocalPort 8443 -Action Allow
 New-NetFirewallRule -DisplayName "SappiWhere syslog" `
     -Direction Inbound -Protocol UDP -LocalPort 514 -Action Allow
+New-NetFirewallRule -DisplayName "SappiWhere SNMP trap" `
+    -Direction Inbound -Protocol UDP -LocalPort 162 -Action Allow
 ```
 
 On Windows this needs an inbound firewall rule:
@@ -118,15 +126,17 @@ browser with no internet access works normally.
 
 ### Not used
 
-sFlow, SNMP, syslog, NetFlow over TCP or SCTP, and IPv6 flow export are not
-supported. The application makes no outbound connection to the internet other
-than DNS and the traceroute probes themselves.
+sFlow, SNMP polling (GET/GETBULK), syslog over TLS, NetFlow over TCP or
+SCTP, and IPv6 flow export are not supported. SNMP is received only —
+traps and informs in, nothing queried out. The application makes no
+outbound connection to the internet other than DNS and the traceroute
+probes themselves.
 
 ---
 
 ## Storage
 
-Five SQLite databases and nothing else. No registry keys, no temporary files
+Six SQLite databases and nothing else. No registry keys, no temporary files
 left behind, no writes to the application folder at runtime — the code
 directory can be read-only.
 
@@ -137,10 +147,11 @@ directory can be read-only.
 | `app.db` | Global settings, user accounts, the shared reverse-DNS cache | Distinct addresses seen — kilobytes |
 | `netpath.db` | Destinations, traces, per-hop samples, NetPath settings | Trace frequency |
 | `flows.db` | Flow records, exporters, interface names, NetFlow settings | Exported flow volume |
+| `snmptraps.db` | Traps, hourly rollup counts, SNMP Trap settings | Trap rate — normally light; a device stuck in a fault loop is the exception |
 | `syslog.db` | Messages, hourly rollup counts, the search index, Syslog settings | Message rate — the substring index is roughly the size of the messages again |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential | Subnet sizes swept and DHCP scope sizes — bounded by the per-subnet address cap |
 
-The split is deliberate. The four record files each hold one module's data and
+The split is deliberate. The five record files each hold one module's data and
 that module's own settings; nothing else goes in them. Configuration read by
 more than one module, and the accounts that guard all of it, are in `app.db`,
 which is not subject to any size cap and is never trimmed by maintenance.
@@ -155,7 +166,7 @@ existence back but not its usability — DPAPI will not decrypt it there, and
 the DHCP server needs its credential re-entered on the new machine. Everything
 else in the file restores normally.
 
-All five sit in one folder, chosen at first run:
+All six sit in one folder, chosen at first run:
 
 | Platform | Default location |
 | --- | --- |
@@ -167,7 +178,7 @@ Override any of them individually:
 ```
 python -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db \
                   --syslog-db D:\data\syslog.db --app-db D:\data\app.db \
-                  --ipam-db D:\data\ipam.db
+                  --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db
 ```
 
 Running as a service, set these explicitly. The default resolves against the
@@ -197,9 +208,9 @@ hop.
 trace. Without the cache a busy install would generate a DNS query per hop per
 poll, which is both slow and rude to the DNS servers.
 
-**Hourly syslog counts** are kept alongside the messages so the timeline reads
-24 rows rather than scanning a day of messages. Without it the histogram gets
-slower every day the collector runs.
+**Hourly syslog and SNMP trap counts** are kept alongside the messages/traps
+so the timeline reads at most a few dozen rows rather than scanning a day of
+records. Without it the histogram gets slower every day the collector runs.
 
 **User accounts** hold a username and a salted scrypt hash. No password is
 stored, in any form, at any point. See `FEATURES.md`.
@@ -219,6 +230,7 @@ Rough shapes to start from:
 | --- | --- | --- |
 | NetPath | destinations × polls per day × hops | a few MB per destination per month |
 | NetFlow | flow records exported | tens of MB to several GB per day |
+| SNMP Trap | traps per device per day | ~200 bytes per trap; normally the smallest of the record files |
 | Syslog | messages per second | ~150 bytes per message |
 
 ### What keeps it bounded
@@ -226,9 +238,11 @@ Rough shapes to start from:
 Three limits, checked every 15 minutes, in this order:
 
 1. **Retention** — delete anything older than N days. Per module.
-2. **Row cap** — delete the oldest rows beyond a count. NetFlow and Syslog.
+2. **Row cap** — delete the oldest rows beyond a count. NetFlow, SNMP Trap and
+   Syslog.
 3. **Size cap** — delete oldest records in chunks until the file fits. Per
-   database, defaulting to 512 MB for traces, 2 GB for flows, 1 GB for syslog.
+   database, defaulting to 512 MB for traces, 2 GB for flows, 256 MB for
+   SNMP traps, 1 GB for syslog.
 
 The size cap wins over the other two: if retention says keep 30 days but the
 cap is reached at 9, the ninth day is where it stops. That is deliberate —
@@ -242,7 +256,9 @@ filesystem rather than left as free pages inside the file.
 
 - No password, in any form other than a salted hash.
 - No session token; sessions are in memory and end when the service stops.
-- No packet captures. NetFlow stores decoded flow records, not packets; syslog
-  stores decoded messages plus the original line.
+- No packet captures. NetFlow stores decoded flow records, not packets;
+  syslog stores decoded messages plus the original line; SNMP Trap stores
+  decoded traps only — the original datagram is kept only if **Store the
+  original datagram** is turned on in its settings, off by default.
 - No debug event log. What the Debug tab shows is a memory buffer, discarded on
   stop.

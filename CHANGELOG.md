@@ -6,6 +6,50 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.10.0 — SNMP trap receiver
+
+- **A new SNMP Trap tab**, between NetFlow and Syslog, receiving and
+  decoding SNMPv1, v2c and v3 traps and informs over UDP. All BER/ASN.1
+  parsing is hand-written (stdlib only, no third-party SNMP/ASN.1
+  library), never raises past its own decode boundary, and mirrors
+  NetFlow's binary decoder in shape. Graphically it matches Syslog: a
+  status strip, a filterable search bar, an hourly severity-stacked
+  histogram, a resizable table and a detail panel showing every varbind
+  with its OID, type and value.
+- **v1 and v2c traps** are fully decoded, including the SNMPv1 Trap-PDU's
+  distinct enterprise/agent-address/generic/specific shape, mapped onto
+  the same snmpTrapOID identity space v2c uses (RFC 3584) so both
+  versions are one searchable axis.
+- **v3 support verifies USM authentication** (MD5, SHA1, and the SHA-224/
+  256/384/512 variants from RFC 7860) against configured users, computing
+  the HMAC over the whole message with the authentication parameters
+  blanked in place. Traps sent authPriv are detected and their header
+  decoded, but the encrypted payload is not decrypted — the standard
+  library has no AES/DES implementation and this app takes no
+  third-party dependencies. A named seam (`trapcrypto.py`) is left for a
+  future hand-rolled decryptor.
+- **Every trap gets a normalized severity**, 0–7 on the exact same scale
+  Syslog uses, via a built-in rule table plus an admin-editable
+  OID-prefix override — so a future alerting engine can treat traps and
+  syslog lines uniformly without translating between two vocabularies.
+  OID names resolve through a built-in table of the common MIBs (~150
+  entries) plus an admin-editable `OID = name` list; this is a name
+  table, not a MIB compiler, so `.mib` files are not parsed.
+- **InformRequests are acknowledged** for v1/v2c, a reply on the same
+  socket the inform arrived on — still receive-only, since it answers
+  rather than queries. v3 informs are not acknowledged, since doing so
+  correctly means acting as the authoritative SNMP engine, which belongs
+  with a future poller.
+- **A "Send test trap" button** sends a real coldStart trap to the
+  receiver's own bound port, with the equivalent PowerShell and
+  net-snmp commands shown alongside — the same loopback proof pattern
+  Syslog and NetFlow already use.
+- This is receive-only: there is no SNMP polling (GET/GETBULK) yet, and
+  no alerting engine ties traps, syslog and future ping/SNMP polling
+  together yet — both are intentionally out of scope here, and the data
+  model (the shared severity scale, especially) is built so neither is
+  precluded later.
+
 ### 4.9.3 — NetPath flash on reload actually fixed this time
 
 4.9.2's fix helped but wasn't enough: it ran from a script near the end of

@@ -392,6 +392,7 @@ class ConsoleWindow(QMainWindow):
             ("App", self.service.app_db, 0),
             ("Traces", self.service.db, settings.get("max_trace_db_mb", 0)),
             ("Flows", self.service.flow_db, settings.get("max_flow_db_mb", 0)),
+            ("SNMP traps", self.service.snmp_db, settings.get("max_snmp_db_mb", 0)),
             ("Syslog", self.service.syslog_db, settings.get("max_syslog_db_mb", 0)),
             ("IPAM", self.service.ipam_db, 0),
         ]
@@ -554,6 +555,7 @@ class ConsoleWindow(QMainWindow):
             f"{len(service.db.targets())} destinations \u00b7 "
             f"{service.monitor.workers} workers",
             f"NetFlow   {service.collector.status_text()}",
+            f"SNMP      {service.snmp.status_text()}",
             f"Syslog    {service.syslog.status_text()}",
             f"DNS       {names['named']}/{names['cached']} named"
             + (f", {names['pending']} pending" if names["pending"] else ""),

@@ -22,11 +22,12 @@ from dataclasses import dataclass, field
 TRACE = "trace"
 DNS = "dns"
 NETFLOW = "netflow"
+SNMP = "snmp"
 IPAM = "ipam"
 SYSTEM = "system"
 ERROR = "error"
 
-CATEGORIES = [TRACE, DNS, NETFLOW, IPAM, SYSTEM, ERROR]
+CATEGORIES = [TRACE, DNS, NETFLOW, SNMP, IPAM, SYSTEM, ERROR]
 
 DETAIL_LIMIT = 6000
 
