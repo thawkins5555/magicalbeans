@@ -11,6 +11,7 @@
     dhcpServers: [], dhcpServerId: null,
     dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
     leaseSort: { key: 'ip', descending: false },
+    scopeSort: 'name',
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -563,11 +564,25 @@
     ].join('\n');
   }
 
+  function sortedScopes() {
+    const scopes = view.dhcpScopes.slice();
+    if (view.scopeSort === 'available') {
+      // Most room first; a scope whose range couldn't be parsed sorts last
+      // rather than crowding in among ones we actually have a figure for.
+      scopes.sort((a, b) => (b.usage?.available ?? -1) - (a.usage?.available ?? -1));
+    } else {
+      scopes.sort((a, b) =>
+        (a.name || a.scope_id).localeCompare(b.name || b.scope_id, undefined,
+                                             { numeric: true, sensitivity: 'base' }));
+    }
+    return scopes;
+  }
+
   function renderDhcpScopes() {
     const table = App.el('ipam-dhcp-scope-table');
     table.innerHTML = '';
     const body = document.createElement('tbody');
-    for (const scope of view.dhcpScopes) {
+    for (const scope of sortedScopes()) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (scope.id === view.dhcpScopeId ? ' selected' : '');
 
@@ -811,8 +826,8 @@
     }
     const rows = results.map((r) => `<tr>` +
       `<td>${escape(r.hostname || '—')}</td>` +
-      `<td>${escape(r.ip)}</td>` +
-      `<td>${escape(r.mac || '—')}</td>` +
+      `<td style="white-space:nowrap">${escape(r.ip)}</td>` +
+      `<td style="white-space:nowrap">${escape(r.mac || '—')}</td>` +
       `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'
         : r.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
       `<td>${escape(r.subnet || '—')}</td>` +
@@ -839,6 +854,10 @@
       view.dhcpServerId = Number(event.target.value) || null;
       view.dhcpScopeId = null;
       loadDhcpScopes();
+    };
+    App.el('ipam-scope-sort').onchange = (event) => {
+      view.scopeSort = event.target.value;
+      renderDhcpScopes();
     };
     App.el('ipam-alive-only').onchange = drawHosts;
     App.el('ipam-show-resolved').onchange = loadConflicts;

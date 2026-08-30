@@ -224,7 +224,7 @@
     <span id="ipam-dot" class="dot"></span>
     <span id="ipam-status" class="stat">Worker stopped</span>
     <span id="ipam-counters" class="hint"></span>
-    <label>Find <input id="ipam-search-q" size="22" placeholder="hostname, IP or MAC address"></label>
+    <label>Find <input id="ipam-search-q" size="30" placeholder="hostname, IP or MAC address"></label>
     <button id="ipam-search-btn">Search</button>
     <span class="grow"></span>
     <button id="ipam-settings" class="module-settings">Settings</button>
@@ -298,6 +298,11 @@
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
         <span class="section">SCOPES</span>
+        <span class="grow"></span>
+        <select id="ipam-scope-sort">
+          <option value="name">Sort: Name</option>
+          <option value="available">Sort: Available</option>
+        </select>
       </div>
       <div class="table-wrap"><table id="ipam-dhcp-scope-table"></table></div>
     </aside>
