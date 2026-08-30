@@ -33,6 +33,10 @@
         document.getElementById('password').focus();
         return;
       }
+      // A fresh sign-in always lands on Dashboard, whatever tab was open
+      // last time — app.js's own reload-preserves-tab logic (same
+      // 'sappiwhere.tab' key) takes over for every reload after this one.
+      try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full: not worth failing */ }
       window.location.href = '/';
     } catch (err) {
       show('The server did not answer. It may have stopped.');

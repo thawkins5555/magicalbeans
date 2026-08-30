@@ -935,6 +935,20 @@ landing on a dead tab. This runs once, before `restartTimer()`, so the
 very first paint already shows the right module rather than flashing
 NetPath first.
 
+**A fresh sign-in always opens on Dashboard.** `login.js` writes
+`'dashboard'` under the same `'sappiwhere.tab'` key immediately before its
+`window.location.href = '/'` on a successful credential check — the two
+files share nothing else (login.html "shares the stylesheet and nothing
+else" with the rest of the app, so this key name is duplicated as a
+literal rather than imported), but agreeing on the key is enough for
+`app.js`'s existing restore-on-load logic to pick it up with no
+special-casing on that side: a login looks exactly like a reload that
+happens to find `'dashboard'` already stored. The "already signed in,
+bounce back to /" redirect on the login page itself (`fetch('/api/session')`
+finding an existing session) does *not* set this key — that path isn't a
+login, just a page that immediately sends an already-authenticated visitor
+onward, so whatever tab they had open stays open.
+
 **Dashboard** (`dashboard.js`) is a placeholder module, registered the
 same way every other page is (`App.pages.dashboard = { init, refresh }`,
 both no-ops) purely so it participates correctly in the tab machinery

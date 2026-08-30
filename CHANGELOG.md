@@ -6,6 +6,13 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.9.1 — Sign-in always opens on Dashboard
+
+- **Signing in now always lands on the Dashboard tab**, regardless of
+  which tab a previous session left active. A reload while already
+  signed in still returns to whichever tab was open, as of 4.9.0 — this
+  only changes what a fresh login itself opens to.
+
 ### 4.9.0 — DHCP leased-IP trend chart, tab persists on reload, Dashboard tab
 
 - **DHCP scopes get a leased-IP trend chart**, a thin line chart under the

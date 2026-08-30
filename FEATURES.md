@@ -22,6 +22,9 @@ is dragged.
 **Reloading the page returns to whichever tab was open**, not back to
 NetPath — the browser remembers the last tab the same way it remembers
 panel sizes and column widths, per browser rather than per account.
+**Signing in always opens on Dashboard**, though: a fresh login is a new
+visit, not a reload, so it starts from the same place every time rather
+than wherever a previous session happened to leave off.
 
 ## How it runs
 
