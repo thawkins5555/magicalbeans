@@ -11,7 +11,7 @@
     dhcpServers: [], dhcpServerId: null,
     dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
     leaseSort: { key: 'ip', descending: false },
-    scopeSort: 'name',
+    scopeSort: 'least',
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -566,14 +566,19 @@
 
   function sortedScopes() {
     const scopes = view.dhcpScopes.slice();
-    if (view.scopeSort === 'available') {
-      // Most room first; a scope whose range couldn't be parsed sorts last
-      // rather than crowding in among ones we actually have a figure for.
+    if (view.scopeSort === 'most') {
+      // A scope whose range couldn't be parsed sorts last rather than
+      // masquerading as the roomiest one.
       scopes.sort((a, b) => (b.usage?.available ?? -1) - (a.usage?.available ?? -1));
-    } else {
+    } else if (view.scopeSort === 'name') {
       scopes.sort((a, b) =>
         (a.name || a.scope_id).localeCompare(b.name || b.scope_id, undefined,
                                              { numeric: true, sensitivity: 'base' }));
+    } else {
+      // Default: least available first, so the scope closest to running out
+      // is the first thing you see. An unparseable range sorts last here
+      // too, rather than masquerading as the most urgent one.
+      scopes.sort((a, b) => (a.usage?.available ?? Infinity) - (b.usage?.available ?? Infinity));
     }
     return scopes;
   }
