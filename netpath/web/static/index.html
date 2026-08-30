@@ -198,6 +198,7 @@
     <header class="bar">
       <span class="section">MESSAGES</span>
       <span id="sl-count" class="hint"></span>
+      <label class="check"><input type="checkbox" id="sl-show-hostname" checked> Hostname</label>
       <span class="grow"></span>
       <select id="sl-limit">
         <option value="300">300 rows</option>
@@ -303,6 +304,7 @@
           <option value="least" selected>Sort: Least available</option>
           <option value="most">Sort: Most available</option>
           <option value="name">Sort: Name</option>
+          <option value="ip">Sort: IP address</option>
         </select>
       </div>
       <div class="table-wrap"><table id="ipam-dhcp-scope-table"></table></div>
@@ -432,7 +434,7 @@
       <label>Current <input type="password" id="pw-current" autocomplete="current-password"></label>
       <label>New <input type="password" id="pw-new" autocomplete="new-password"></label>
       <label>Repeat <input type="password" id="pw-repeat" autocomplete="new-password"></label>
-      <div class="row"><button id="pw-save" class="primary">Change password</button></div>
+      <div class="row"><button id="pw-save" class="primary half">Change password</button></div>
       <p class="hint" id="pw-status">At least 12 characters. A short phrase is easier to
         remember and harder to guess than a mangled word. Changing it signs out every session
         using this account, including this one.</p>
@@ -461,7 +463,7 @@
         in and restarts the service — which signs everyone out, this session
         included, so it lands you back on the sign-in page.</p>
       <div class="row">
-        <button id="update-now" class="primary">Check for update &amp; restart</button>
+        <button id="update-now" class="primary half">Check for update &amp; restart</button>
       </div>
       <p class="hint" id="update-status"></p>
     </fieldset>

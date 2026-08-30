@@ -12,6 +12,7 @@
     hist: null,
     messages: [],
     selected: null,
+    showHostname: true,
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -157,7 +158,7 @@
       tr.innerHTML =
         `<td>${App.clock(row.ts)}</td>` +
         `<td><span class="sev sev-${row.severity}">${row.severity_name}</span></td>` +
-        `<td>${escape(row.source_name || row.source)}</td>` +
+        `<td>${escape((view.showHostname && row.source_name) || row.source)}</td>` +
         `<td>${escape(row.host)}</td>` +
         `<td>${escape(row.app)}</td>` +
         `<td class="msg">${escape(row.message)}</td>`;
@@ -389,6 +390,10 @@
     App.el('sl-follow').onchange = (event) => {
       view.follow = event.target.checked;
       App.refreshNow('syslog');
+    };
+    App.el('sl-show-hostname').onchange = (event) => {
+      view.showHostname = event.target.checked;
+      drawTable();
     };
     App.el('sl-settings').onclick = settingsDialog;
     App.el('sl-test').onclick = sendTest;

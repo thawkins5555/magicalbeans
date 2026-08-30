@@ -63,6 +63,7 @@ class Service:
             extra_ips=self._extra_resolve_targets,
             server=str(self.settings.get("dns_server", "")),
             use_nslookup=bool(self.settings.get("dns_use_nslookup", True)),
+            ipam_db=self.ipam_db,
         )
         self.collector = Collector(self.flow_db, log=self.log)
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)

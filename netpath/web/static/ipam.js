@@ -564,6 +564,15 @@
     ].join('\n');
   }
 
+  /* Dotted-quad to a comparable integer -- plain string comparison would put
+     "10.0.10.0" before "10.0.2.0", which is not the order anyone means by
+     "sort by IP address". */
+  function ipToNumber(ip) {
+    const parts = String(ip || '0.0.0.0').split('.').map(Number);
+    return ((parts[0] || 0) * 2 ** 24) + ((parts[1] || 0) * 2 ** 16) +
+      ((parts[2] || 0) * 2 ** 8) + (parts[3] || 0);
+  }
+
   function sortedScopes() {
     const scopes = view.dhcpScopes.slice();
     if (view.scopeSort === 'most') {
@@ -574,6 +583,8 @@
       scopes.sort((a, b) =>
         (a.name || a.scope_id).localeCompare(b.name || b.scope_id, undefined,
                                              { numeric: true, sensitivity: 'base' }));
+    } else if (view.scopeSort === 'ip') {
+      scopes.sort((a, b) => ipToNumber(a.scope_id) - ipToNumber(b.scope_id));
     } else {
       // Default: least available first, so the scope closest to running out
       // is the first thing you see. An unparseable range sorts last here

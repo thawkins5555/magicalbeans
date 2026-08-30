@@ -273,14 +273,21 @@ class Resolver:
     inline would add a lookup to every hop of every run, for routers whose
     names almost never change. Instead each address is looked up once here and
     cached in app.db for a week, where every module can read it.
+
+    An address with no PTR record falls back to IPAM's own idea of its name —
+    what a DHCP lease says the client called itself — before giving up.
+    Plenty of devices never get a DNS entry at all but still asked a DHCP
+    server for an address, and that's the only name anything here will ever
+    have for them.
     """
 
     def __init__(self, db: Database, app_db, workers: int = 8,
                  poll_s: float = 15.0,
                  timeout_s: float = 3.0, on_resolved=None, log=None,
                  cache_ttl_s: float = 7 * 86400, extra_ips=None,
-                 server: str = "", use_nslookup: bool = True):
+                 server: str = "", use_nslookup: bool = True, ipam_db=None):
         self.db = db
+        self.ipam_db = ipam_db
         # Candidates come from the trace database; the cache they are checked
         # against and written to is the application's, because NetFlow and
         # Syslog read the same names.
@@ -403,19 +410,27 @@ class Resolver:
                                 use_nslookup=self.use_nslookup)
         except Exception:
             name, how = None, "error"
-        finally:
-            elapsed = time.time() - started
-            # The method is logged because it is the useful diagnostic: a name
-            # that only nslookup finds says the system resolver is the problem,
-            # not the DNS records.
-            self.log.add(DNS, f"PTR {ip} \u2192 {name or 'no record'} "
-                              f"[{how}] ({elapsed:.2f}s)")
+
+        if not name and self.ipam_db is not None:
             try:
-                self.app_db.set_hostname(ip, name)
-                if self.on_resolved:
-                    self.on_resolved(ip, name)
+                lease = self.ipam_db.dhcp_lease_for_ip(ip)
+                if lease and lease["hostname"]:
+                    name, how = lease["hostname"], "dhcp"
             except Exception:
                 pass
-            with self._lock:
-                self._pending.discard(ip)
-                self._started.pop(ip, None)
+
+        elapsed = time.time() - started
+        # The method is logged because it is the useful diagnostic: a name
+        # that only nslookup or DHCP finds says DNS itself has nothing for
+        # this address, not that the lookup failed outright.
+        self.log.add(DNS, f"PTR {ip} \u2192 {name or 'no record'} "
+                          f"[{how}] ({elapsed:.2f}s)")
+        try:
+            self.app_db.set_hostname(ip, name)
+            if self.on_resolved:
+                self.on_resolved(ip, name)
+        except Exception:
+            pass
+        with self._lock:
+            self._pending.discard(ip)
+            self._started.pop(ip, None)

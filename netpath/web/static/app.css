@@ -193,6 +193,7 @@ body.tiny .terms { display: none; }
 .bar.footer { border-top: 1px solid var(--hairline); background: var(--panel); }
 .row { display: flex; gap: 6px; }
 .row button { flex: 1; }
+.row button.half { flex: 0 1 50%; }
 
 .card {
   background: var(--panel);
