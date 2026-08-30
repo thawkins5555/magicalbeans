@@ -282,30 +282,32 @@
   </div>
 
   <div id="ipam-sub-dhcp" class="subpage">
+    <div class="bar">
+      <span class="section">DHCP SERVER</span>
+      <select id="ipam-dhcp-server-select"></select>
+      <span id="ipam-dhcp-server-status" class="hint"></span>
+      <span class="grow"></span>
+      <button id="ipam-poll-now">Poll now</button>
+      <button id="ipam-edit-dhcp">Edit</button>
+      <button id="ipam-add-dhcp" class="primary">Add</button>
+    </div>
+    <p class="hint pad-x">Read-only: scopes and leases only, never a write. Authenticates as
+      whichever Windows account runs SappiWhere, or a matching Windows Credential Manager entry
+      for that server's name — nothing is stored here.</p>
    <div class="cols" data-splitter="ipam-dhcp">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
-        <span class="section">DHCP SERVERS</span>
-        <span class="grow"></span>
-        <button id="ipam-poll-now">Poll now</button>
-        <button id="ipam-edit-dhcp">Edit</button>
-        <button id="ipam-add-dhcp" class="primary">Add</button>
+        <span class="section">SCOPES</span>
       </div>
-      <div class="table-wrap"><table id="ipam-dhcp-server-table"></table></div>
-      <p class="hint pad-x" style="padding-top:8px">Read-only: scopes and leases only, never a
-        write. Authenticates as whichever Windows account runs SappiWhere, or a matching
-        Windows Credential Manager entry for that server's name — nothing is stored here.</p>
+      <div class="table-wrap"><table id="ipam-dhcp-scope-table"></table></div>
     </aside>
     <div class="divider"></div>
     <div class="pane pad-x pad-b" data-grow="3">
       <header class="bar">
-        <span class="section">SCOPES</span>
-      </header>
-      <div class="table-wrap" style="max-height:180px"><table id="ipam-dhcp-scope-table"></table></div>
-      <header class="bar" style="margin-top:10px">
         <span class="section">LEASES</span>
         <span id="ipam-lease-count" class="hint"></span>
       </header>
+      <div id="ipam-scope-detail" class="subnet-detail"></div>
       <div class="table-wrap"><table id="ipam-dhcp-lease-table"></table></div>
     </div>
    </div>

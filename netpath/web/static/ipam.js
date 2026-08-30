@@ -9,7 +9,7 @@
     hosts: [], hostSort: { key: 'ip', descending: false },
     conflicts: [],
     dhcpServers: [], dhcpServerId: null,
-    dhcpScopes: [], dhcpLeases: [],
+    dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
     leaseSort: { key: 'ip', descending: false },
   };
 
@@ -28,17 +28,13 @@
 
   /* A small utilization donut, drawn with the standard stroke-dasharray
      trick — one circle per slice, each dashed to show only its own arc —
-     rather than computing SVG arc paths by hand for three fixed slices. */
-  function usageDonut(usage, size) {
-    const u = usage || {};
-    const total = u.total || (u.alive + u.seen_down + (u.never_seen || 0)) || 0;
+     rather than computing SVG arc paths by hand for three fixed slices.
+     Takes slices directly so subnets and DHCP scopes, which break their
+     addresses down into genuinely different categories, can both use it. */
+  function donut(slices, size) {
+    const total = slices.reduce((sum, s) => sum + (s.value || 0), 0);
     const radius = size / 2 - 3;
     const circumference = 2 * Math.PI * radius;
-    const slices = [
-      { value: u.alive || 0, color: 'var(--ok)' },
-      { value: u.seen_down || 0, color: 'var(--warn)' },
-      { value: u.never_seen || 0, color: 'var(--hairline)' },
-    ];
     const svg = App.svgNode('svg', { width: size, height: size,
       viewBox: `0 0 ${size} ${size}`, class: 'usage-donut' });
     if (!total) {
@@ -62,6 +58,24 @@
       offset += length;
     }
     return svg;
+  }
+
+  function usageDonut(usage, size) {
+    const u = usage || {};
+    return donut([
+      { value: u.alive || 0, color: 'var(--ok)' },
+      { value: u.seen_down || 0, color: 'var(--warn)' },
+      { value: u.never_seen || 0, color: 'var(--hairline)' },
+    ], size);
+  }
+
+  function scopeDonut(usage, size) {
+    const u = usage || {};
+    return donut([
+      { value: u.leased || 0, color: 'var(--ok)' },
+      { value: u.reserved || 0, color: 'var(--accent)' },
+      { value: u.available || 0, color: 'var(--hairline)' },
+    ], size);
   }
 
   function usageTooltipText(subnet) {
@@ -376,33 +390,32 @@
 
   /* ---------------------------------------------------------------- dhcp */
 
-  function renderDhcpServers() {
-    const table = App.el('ipam-dhcp-server-table');
-    table.innerHTML = '';
-    const body = document.createElement('tbody');
-    for (const server of view.dhcpServers) {
-      const tr = document.createElement('tr');
-      tr.className = 'clickable' + (server.id === view.dhcpServerId ? ' selected' : '');
-      const statusText = server.polling ? 'polling…'
-        : server.last_status === 'ok' ? `ok · ${ago(server.last_poll)}`
-        : server.last_status === 'error' ? `error · ${ago(server.last_poll)}`
-        : 'never polled';
-      const statusClass = server.last_status === 'error' ? 'sev sev-1' : 'hint';
-      const authText = server.has_credential
-        ? `stored credential \u00b7 ${escape(server.username || '')}` : 'ambient identity';
-      tr.innerHTML =
-        `<td><div class="name">${escape(server.label)}${server.enabled ? '' : ' (disabled)'}</div>` +
-        `<div class="host">${escape(server.address)}</div>` +
-        `<div class="hint">${authText}</div>` +
-        `<div class="${statusClass}">${escape(statusText)}</div></td>`;
-      tr.onclick = () => {
-        view.dhcpServerId = server.id;
-        renderDhcpServers();
-        loadDhcpDetail();
-      };
-      body.appendChild(tr);
+  /* One DHCP server is picked at a time via a dropdown rather than a full
+     sidebar table -- that sidebar space belongs to SCOPES now, mirroring
+     Subnets & Hosts, and most installs have only a couple of servers
+     (a failover pair, typically) rather than a long list worth scrolling. */
+  function renderDhcpServerSelect() {
+    const select = App.el('ipam-dhcp-server-select');
+    select.innerHTML = view.dhcpServers.length
+      ? view.dhcpServers.map((s) =>
+          `<option value="${s.id}" ${s.id === view.dhcpServerId ? 'selected' : ''}>` +
+          `${escape(s.label)}${s.enabled ? '' : ' (disabled)'}</option>`).join('')
+      : '<option value="">No DHCP servers configured</option>';
+
+    const server = view.dhcpServers.find((s) => s.id === view.dhcpServerId);
+    const statusEl = App.el('ipam-dhcp-server-status');
+    if (!server) {
+      statusEl.textContent = '';
+      return;
     }
-    table.appendChild(body);
+    const statusText = server.polling ? 'polling…'
+      : server.last_status === 'ok' ? `ok · ${ago(server.last_poll)}`
+      : server.last_status === 'error' ? `error · ${ago(server.last_poll)}`
+      : 'never polled';
+    const authText = server.has_credential
+      ? `stored credential · ${escape(server.username || '')}` : 'ambient identity';
+    statusEl.className = server.last_status === 'error' ? 'sev sev-1' : 'hint';
+    statusEl.textContent = `${server.address} · ${authText} · ${statusText}`;
   }
 
   function dhcpServerForm(server) {
@@ -536,21 +549,89 @@
     App.refreshNow('ipam');
   }
 
+  /* Mirrors renderSubnets(): one row per scope with a mini utilization
+     donut, in the sidebar this now shares the same layout with. */
+  function scopeTooltipText(scope) {
+    const u = scope.usage || {};
+    const pct = (n) => u.total ? `${Math.round((n / u.total) * 100)}%` : '0%';
+    return [
+      `${scope.name || scope.scope_id} — ${scope.start_ip}–${scope.end_ip}`,
+      `${u.total ?? '?'} address(es) in range`,
+      `leased       ${u.leased || 0}  (${pct(u.leased || 0)})`,
+      `reserved     ${u.reserved || 0}  (${pct(u.reserved || 0)})`,
+      `available    ${u.available ?? '?'}  (${pct(u.available || 0)})`,
+    ].join('\n');
+  }
+
   function renderDhcpScopes() {
     const table = App.el('ipam-dhcp-scope-table');
-    table.innerHTML = '<thead><tr><th>Scope</th><th>Name</th><th>Range</th>' +
-      '<th>Mask</th><th>State</th><th>Lease</th></tr></thead>';
+    table.innerHTML = '';
     const body = document.createElement('tbody');
     for (const scope of view.dhcpScopes) {
       const tr = document.createElement('tr');
-      tr.innerHTML =
-        `<td>${escape(scope.scope_id)}</td><td>${escape(scope.name || '')}</td>` +
-        `<td>${escape(scope.start_ip)} – ${escape(scope.end_ip)}</td>` +
-        `<td>${escape(scope.mask || '')}</td><td>${escape(scope.state || '')}</td>` +
-        `<td>${scope.lease_duration_s ? App.span(scope.lease_duration_s) : ''}</td>`;
+      tr.className = 'clickable' + (scope.id === view.dhcpScopeId ? ' selected' : '');
+
+      const td = document.createElement('td');
+      const row = document.createElement('div');
+      row.className = 'subnet-row';
+      row.appendChild(scopeDonut(scope.usage, 30));
+      const text = document.createElement('div');
+      text.className = 'subnet-row-text';
+      text.innerHTML =
+        `<div class="name">${escape(scope.name || scope.scope_id)}</div>` +
+        `<div class="host">${escape(scope.start_ip)} – ${escape(scope.end_ip)}</div>` +
+        `<div class="hint">${escape(scope.state || '')}</div>`;
+      row.appendChild(text);
+      td.appendChild(row);
+      tr.appendChild(td);
+
+      const tip = scopeTooltipText(scope);
+      tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
+      tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.onclick = () => {
+        view.dhcpScopeId = scope.id;
+        renderDhcpScopes();
+        drawScopeDetail();
+        loadDhcpLeases();
+      };
       body.appendChild(tr);
     }
     table.appendChild(body);
+  }
+
+  /* The larger chart for whichever scope is currently selected, above its
+     lease table — same layout as drawSubnetDetail(). */
+  function drawScopeDetail() {
+    const container = App.el('ipam-scope-detail');
+    const scope = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    container.innerHTML = '';
+    if (!scope) {
+      container.innerHTML = '<p class="hint">Pick a scope on the left to see its address usage here.</p>';
+      return;
+    }
+
+    container.appendChild(scopeDonut(scope.usage, 120));
+
+    const u = scope.usage || {};
+    const total = u.total || 0;
+    const pct = (n) => total ? `${Math.round((n / total) * 100)}%` : '0%';
+
+    const text = document.createElement('div');
+    text.className = 'subnet-detail-text';
+    text.innerHTML =
+      `<div class="subnet-detail-title">${escape(scope.name || scope.scope_id)}` +
+      ` — ${escape(scope.start_ip)}–${escape(scope.end_ip)}</div>` +
+      `<div class="subnet-detail-rows">` +
+      `<div><span class="legend-dot" style="background:var(--ok)"></span>Leased` +
+      ` <b>${u.leased || 0}</b> <span class="hint">(${pct(u.leased || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--accent)"></span>Reserved` +
+      ` <b>${u.reserved || 0}</b> <span class="hint">(${pct(u.reserved || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Available` +
+      ` <b>${u.available || 0}</b> <span class="hint">(${pct(u.available || 0)})</span></div>` +
+      `</div>` +
+      `<div class="hint">${total} address(es) in range \u00b7 ${escape(scope.state || '')} \u00b7 ` +
+      `polled ${ago(scope.polled)}</div>`;
+    container.appendChild(text);
   }
 
   const LEASE_COLUMNS = [
@@ -596,23 +677,37 @@
       view.dhcpServerId = null;
     }
     if (!view.dhcpServerId && view.dhcpServers.length) view.dhcpServerId = view.dhcpServers[0].id;
-    renderDhcpServers();
-    await loadDhcpDetail();
+    renderDhcpServerSelect();
+    await loadDhcpScopes();
   }
 
-  async function loadDhcpDetail() {
+  async function loadDhcpScopes() {
     if (!view.dhcpServerId) {
-      view.dhcpScopes = []; view.dhcpLeases = [];
-      renderDhcpScopes(); drawLeases();
+      view.dhcpScopes = []; view.dhcpScopeId = null; view.dhcpLeases = [];
+      renderDhcpScopes(); drawScopeDetail(); drawLeases();
       return;
     }
-    const [scopes, leases] = await Promise.all([
-      App.get('/api/ipam/dhcp/scopes', { server_id: view.dhcpServerId }),
-      App.get('/api/ipam/dhcp/leases', { server_id: view.dhcpServerId }),
-    ]);
-    view.dhcpScopes = scopes.scopes;
-    view.dhcpLeases = leases.leases;
+    const payload = await App.get('/api/ipam/dhcp/scopes', { server_id: view.dhcpServerId });
+    view.dhcpScopes = payload.scopes;
+    if (view.dhcpScopeId && !view.dhcpScopes.some((s) => s.id === view.dhcpScopeId)) {
+      view.dhcpScopeId = null;
+    }
+    if (!view.dhcpScopeId && view.dhcpScopes.length) view.dhcpScopeId = view.dhcpScopes[0].id;
     renderDhcpScopes();
+    drawScopeDetail();
+    await loadDhcpLeases();
+  }
+
+  async function loadDhcpLeases() {
+    if (!view.dhcpScopeId) {
+      view.dhcpLeases = [];
+      drawLeases();
+      return;
+    }
+    const scope = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    const payload = await App.get('/api/ipam/dhcp/leases',
+      { server_id: view.dhcpServerId, scope_id: scope ? scope.scope_id : '' });
+    view.dhcpLeases = payload.leases;
     drawLeases();
   }
 
@@ -740,6 +835,11 @@
     App.el('ipam-add-dhcp').onclick = addDhcpServer;
     App.el('ipam-edit-dhcp').onclick = editDhcpServer;
     App.el('ipam-poll-now').onclick = pollNow;
+    App.el('ipam-dhcp-server-select').onchange = (event) => {
+      view.dhcpServerId = Number(event.target.value) || null;
+      view.dhcpScopeId = null;
+      loadDhcpScopes();
+    };
     App.el('ipam-alive-only').onchange = drawHosts;
     App.el('ipam-show-resolved').onchange = loadConflicts;
     App.el('ipam-search-btn').onclick = searchHosts;

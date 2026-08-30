@@ -1015,16 +1015,47 @@ def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict
     return {"ok": True}
 
 
+def _scope_size(start_ip: str, end_ip: str) -> int | None:
+    """Addresses in a scope's range, inclusive — for the utilization donut,
+    the DHCP equivalent of subnet_size() for a swept subnet."""
+    import ipaddress
+    try:
+        start = int(ipaddress.IPv4Address(start_ip))
+        end = int(ipaddress.IPv4Address(end_ip))
+    except (ValueError, TypeError):
+        return None
+    return max(0, end - start + 1)
+
+
 def get_ipam_dhcp_scopes(service, params, body) -> dict:
     server_id = params.get("server_id")
     rows = service.ipam_db.dhcp_scopes(int(server_id) if server_id else None)
-    return {"scopes": [
-        {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
-         "scope_id": r["scope_id"], "name": r["name"], "start_ip": r["start_ip"],
-         "end_ip": r["end_ip"], "mask": r["mask"], "state": r["state"],
-         "lease_duration_s": r["lease_duration_s"], "description": r["description"],
-         "polled": r["polled_ts"]}
-        for r in rows]}
+
+    # Grouped by (server_id, scope_id) rather than scope_id alone: two
+    # different DHCP servers can each have a scope named the same thing
+    # (10.20.3.0 is a popular choice everywhere), and this runs across
+    # every server's leases at once when no server_id filter is given.
+    by_scope: dict[tuple, list] = {}
+    for lease in service.ipam_db.dhcp_leases(int(server_id) if server_id else None):
+        by_scope.setdefault((lease["server_id"], lease["scope_id"]), []).append(lease)
+
+    scopes = []
+    for r in rows:
+        leases = by_scope.get((r["server_id"], r["scope_id"]), [])
+        reserved = sum(1 for row in leases if row["is_reservation"])
+        leased = len(leases) - reserved
+        total = _scope_size(r["start_ip"], r["end_ip"])
+        available = max(0, total - leased - reserved) if total is not None else None
+        scopes.append({
+            "id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
+            "scope_id": r["scope_id"], "name": r["name"], "start_ip": r["start_ip"],
+            "end_ip": r["end_ip"], "mask": r["mask"], "state": r["state"],
+            "lease_duration_s": r["lease_duration_s"], "description": r["description"],
+            "polled": r["polled_ts"],
+            "usage": {"leased": leased, "reserved": reserved,
+                     "available": available, "total": total},
+        })
+    return {"scopes": scopes}
 
 
 def get_ipam_dhcp_leases(service, params, body) -> dict:
