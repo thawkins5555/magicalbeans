@@ -659,6 +659,53 @@
     drawStatus();
   }
 
+  /* --------------------------------------------------------------- search
+
+     The reverse direction from browsing a subnet: "what's the IP for
+     printer-3rd-floor" rather than "what's on 10.20.3.0/24". Searches
+     DHCP-reported client hostnames and the shared reverse-DNS cache
+     together, server-side (see Service.ipam_search), and shows whatever
+     it finds in a modal rather than a dedicated view — this is a lookup,
+     not something that needs its own place in the page. */
+
+  async function searchHosts() {
+    const query = App.el('ipam-search-q').value.trim();
+    if (query.length < 2) {
+      App.modal('Find host', '<p>Type at least two characters of a hostname.</p>',
+        [{ label: 'OK', primary: true, onClick: App.closeModal }]);
+      return;
+    }
+    let payload;
+    try {
+      payload = await App.get('/api/ipam/search', { q: query });
+    } catch (error) {
+      App.modal('Find host', `<p class="err">${escape(error.message)}</p>`,
+        [{ label: 'OK', primary: true, onClick: App.closeModal }]);
+      return;
+    }
+    App.modal(`Find host: “${escape(query)}”`, resultsTable(payload.results),
+      [{ label: 'Close', primary: true, onClick: App.closeModal }]);
+  }
+
+  function resultsTable(results) {
+    if (!results.length) {
+      return '<p>No DHCP-reported or reverse-DNS hostname matches that.</p>';
+    }
+    const rows = results.map((r) => `<tr>` +
+      `<td>${escape(r.hostname || '—')}</td>` +
+      `<td>${escape(r.ip)}</td>` +
+      `<td>${escape(r.mac || '—')}</td>` +
+      `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'
+        : r.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
+      `<td>${escape(r.subnet || '—')}</td>` +
+      `<td class="hint">${escape(r.sources.join(', '))}</td>` +
+      `</tr>`).join('');
+    return `<div class="table-wrap" style="max-height:50vh">
+      <table><thead><tr><th>Hostname</th><th>IP</th><th>MAC</th>
+      <th>Status</th><th>Subnet</th><th>Source</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }
+
   function init() {
     for (const btn of document.querySelectorAll('.subtab')) {
       btn.onclick = () => selectSub(btn.dataset.subtab);
@@ -672,6 +719,8 @@
     App.el('ipam-poll-now').onclick = pollNow;
     App.el('ipam-alive-only').onchange = drawHosts;
     App.el('ipam-show-resolved').onchange = loadConflicts;
+    App.el('ipam-search-btn').onclick = searchHosts;
+    App.el('ipam-search-q').onkeydown = (e) => { if (e.key === 'Enter') searchHosts(); };
   }
 
   App.pages.ipam = { init, refresh, fastTick: drawStatus };

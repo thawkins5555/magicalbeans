@@ -566,6 +566,21 @@ class IpamDatabase:
                 "SELECT * FROM dhcp_leases WHERE ip=? ORDER BY polled_ts DESC LIMIT 1",
                 (ip,)).fetchone()
 
+    def search_dhcp_hostnames(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
+        """Leases and reservations whose client-reported hostname contains
+        `query` — the forward half of IPAM's name lookup: what a device
+        called itself when it got the address, rather than what reverse DNS
+        says now. A hostname a client reported once but that has since
+        changed is still searchable here even if PTR has moved on."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT l.*, s.label AS server_label FROM dhcp_leases l"
+                " JOIN dhcp_servers s ON s.id = l.server_id"
+                " WHERE l.hostname LIKE ?"
+                " ORDER BY (l.hostname LIKE ?) DESC, l.hostname"
+                " LIMIT ?",
+                (f"%{query}%", f"{query}%", limit)).fetchall()
+
     # ------------------------------------------------------------------ size
 
     def size_bytes(self) -> int:

@@ -236,6 +236,53 @@ class Service:
         stats["pending"] = len(self.app_db.unknown_ips(seen))
         return stats
 
+    def ipam_search(self, query: str, limit: int = 50) -> list[dict]:
+        """Hosts whose hostname matches `query` — the complement to
+        browsing by subnet: "what's the IP for printer-3rd-floor" rather
+        than "what's on 10.20.3.0/24". Two independent sources, since
+        neither alone is complete: DHCP-reported client hostnames and the
+        shared reverse-DNS cache built from PTR lookups on discovered
+        hosts. A host known to both is merged into one result rather than
+        shown twice.
+        """
+        results: dict[str, dict] = {}
+
+        for row in self.ipam_db.search_dhcp_hostnames(query, limit):
+            entry = results.setdefault(row["ip"], {
+                "ip": row["ip"], "hostname": row["hostname"], "mac": row["mac"],
+                "sources": [], "subnet": None, "alive": None,
+            })
+            kind = "DHCP reservation" if row["is_reservation"] else "DHCP lease"
+            server = row["server_label"] or "DHCP server"
+            entry["sources"].append(f"{kind} ({server})")
+
+        for row in self.app_db.search_hostnames(query, limit):
+            entry = results.setdefault(row["ip"], {
+                "ip": row["ip"], "hostname": row["hostname"], "mac": None,
+                "sources": [], "subnet": None, "alive": None,
+            })
+            if not entry["hostname"]:
+                entry["hostname"] = row["hostname"]
+            entry["sources"].append("reverse DNS")
+
+        if results:
+            for host in self.ipam_db.hosts():
+                entry = results.get(host["ip"])
+                if not entry:
+                    continue
+                entry["alive"] = bool(host["alive"])
+                entry["mac"] = entry["mac"] or host["mac"]
+                if host["subnet_id"] is not None:
+                    subnet = self.ipam_db.subnet(host["subnet_id"])
+                    entry["subnet"] = subnet["cidr"] if subnet else None
+
+        query_lower = query.lower()
+        ordered = sorted(
+            results.values(),
+            key=lambda e: (not (e["hostname"] or "").lower().startswith(query_lower),
+                           (e["hostname"] or "").lower()))
+        return ordered[:limit]
+
     # ---------------------------------------------------------- maintenance
 
     def _extra_resolve_targets(self) -> list:

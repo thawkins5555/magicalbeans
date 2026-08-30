@@ -771,6 +771,13 @@ def post_syslog_test(service, params, body) -> dict:
 
 # ---------------------------------------------------------------------- ipam
 
+def get_ipam_search(service, params, body) -> dict:
+    query = (params.get("q") or "").strip()
+    if len(query) < 2:
+        return {"results": []}
+    return {"results": service.ipam_search(query)}
+
+
 def _subnet_json(row) -> dict:
     return {"id": row["id"], "cidr": row["cidr"], "label": row["label"],
             "vlan": row["vlan"], "enabled": bool(row["enabled"]),

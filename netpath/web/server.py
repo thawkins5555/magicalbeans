@@ -56,6 +56,7 @@ ROUTES = [
     ("GET", r"^/api/syslog/search$", api.get_syslog_search),
     ("POST", r"^/api/syslog/collector$", api.post_syslog_collector),
     ("POST", r"^/api/syslog/test$", api.post_syslog_test),
+    ("GET", r"^/api/ipam/search$", api.get_ipam_search),
     ("GET", r"^/api/ipam/subnets$", api.get_ipam_subnets),
     ("POST", r"^/api/ipam/subnets$", api.post_ipam_subnet),
     ("PUT", r"^/api/ipam/subnets/(\d+)$", api.put_ipam_subnet),
