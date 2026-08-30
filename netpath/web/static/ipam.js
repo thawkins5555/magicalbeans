@@ -662,16 +662,21 @@
   /* --------------------------------------------------------------- search
 
      The reverse direction from browsing a subnet: "what's the IP for
-     printer-3rd-floor" rather than "what's on 10.20.3.0/24". Searches
-     DHCP-reported client hostnames and the shared reverse-DNS cache
-     together, server-side (see Service.ipam_search), and shows whatever
-     it finds in a modal rather than a dedicated view — this is a lookup,
-     not something that needs its own place in the page. */
+     printer-3rd-floor" or "who is aa:bb:cc:dd:ee:ff" rather than "what's
+     on 10.20.3.0/24". Matches IP, MAC and hostname against everything
+     IPAM has -- hosts its own sweep discovered, DHCP leases and
+     reservations, and the shared reverse-DNS cache -- server-side (see
+     Service.ipam_search), and shows whatever it finds in a modal rather
+     than a dedicated view: this is a lookup, not something that needs
+     its own place in the page. A result can land outside every subnet
+     configured here; that's DHCP polling reading a server's scopes on
+     its own, not this host being pulled from somewhere unexpected, and
+     the Source column always says which of the three found it. */
 
   async function searchHosts() {
     const query = App.el('ipam-search-q').value.trim();
     if (query.length < 2) {
-      App.modal('Find host', '<p>Type at least two characters of a hostname.</p>',
+      App.modal('Find', '<p>Type at least two characters of a hostname, IP or MAC.</p>',
         [{ label: 'OK', primary: true, onClick: App.closeModal }]);
       return;
     }
@@ -679,17 +684,18 @@
     try {
       payload = await App.get('/api/ipam/search', { q: query });
     } catch (error) {
-      App.modal('Find host', `<p class="err">${escape(error.message)}</p>`,
+      App.modal('Find', `<p class="err">${escape(error.message)}</p>`,
         [{ label: 'OK', primary: true, onClick: App.closeModal }]);
       return;
     }
-    App.modal(`Find host: “${escape(query)}”`, resultsTable(payload.results),
+    App.modal(`Find: “${escape(query)}”`, resultsTable(payload.results),
       [{ label: 'Close', primary: true, onClick: App.closeModal }]);
   }
 
   function resultsTable(results) {
     if (!results.length) {
-      return '<p>No DHCP-reported or reverse-DNS hostname matches that.</p>';
+      return '<p>Nothing IPAM has discovered, been told about by DHCP, or '
+        + 'resolved a name for matches that.</p>';
     }
     const rows = results.map((r) => `<tr>` +
       `<td>${escape(r.hostname || '—')}</td>` +

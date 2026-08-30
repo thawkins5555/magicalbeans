@@ -566,20 +566,39 @@ class IpamDatabase:
                 "SELECT * FROM dhcp_leases WHERE ip=? ORDER BY polled_ts DESC LIMIT 1",
                 (ip,)).fetchone()
 
-    def search_dhcp_hostnames(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
-        """Leases and reservations whose client-reported hostname contains
-        `query` — the forward half of IPAM's name lookup: what a device
-        called itself when it got the address, rather than what reverse DNS
-        says now. A hostname a client reported once but that has since
-        changed is still searchable here even if PTR has moved on."""
+    def search_hosts(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
+        """Discovered hosts whose address or MAC contains `query`. Bare IP
+        and MAC lookups belong here rather than in the DHCP or reverse-DNS
+        searches: a host SappiWhere's own sweep found can be alive with
+        neither a lease nor a PTR record to its name."""
+        like = f"%{query}%"
+        with self._lock:
+            return self._conn.execute(
+                "SELECT h.*, s.cidr AS subnet_cidr FROM hosts h"
+                " LEFT JOIN subnets s ON s.id = h.subnet_id"
+                " WHERE h.ip LIKE ? OR h.mac LIKE ?"
+                " ORDER BY h.ip LIMIT ?",
+                (like, like, limit)).fetchall()
+
+    def search_dhcp(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
+        """Leases and reservations whose IP, MAC, client-reported hostname or
+        description contains `query`. Hostname is the forward half of IPAM's
+        name lookup — what a device called itself when it got the address,
+        rather than what reverse DNS says now — but IP and MAC belong here
+        too: a lease is often the only record of a device that never
+        answered SappiWhere's own ping sweep (asleep, off-segment, or behind
+        a firewall that drops ICMP but still asked the DHCP server for an
+        address)."""
+        like = f"%{query}%"
         with self._lock:
             return self._conn.execute(
                 "SELECT l.*, s.label AS server_label FROM dhcp_leases l"
                 " JOIN dhcp_servers s ON s.id = l.server_id"
-                " WHERE l.hostname LIKE ?"
-                " ORDER BY (l.hostname LIKE ?) DESC, l.hostname"
+                " WHERE l.ip LIKE ? OR l.mac LIKE ? OR l.hostname LIKE ?"
+                "    OR l.description LIKE ?"
+                " ORDER BY (l.hostname LIKE ?) DESC, l.ip"
                 " LIMIT ?",
-                (f"%{query}%", f"{query}%", limit)).fetchall()
+                (like, like, like, like, f"{query}%", limit)).fetchall()
 
     # ------------------------------------------------------------------ size
 

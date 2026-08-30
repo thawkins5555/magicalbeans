@@ -237,51 +237,76 @@ class Service:
         return stats
 
     def ipam_search(self, query: str, limit: int = 50) -> list[dict]:
-        """Hosts whose hostname matches `query` — the complement to
-        browsing by subnet: "what's the IP for printer-3rd-floor" rather
-        than "what's on 10.20.3.0/24". Two independent sources, since
-        neither alone is complete: DHCP-reported client hostnames and the
-        shared reverse-DNS cache built from PTR lookups on discovered
-        hosts. A host known to both is merged into one result rather than
-        shown twice.
+        """Every host IPAM knows anything about whose IP, MAC, hostname or
+        (for a lease) description contains `query` — the complement to
+        browsing by subnet: "what's the IP for printer-3rd-floor" or
+        "who is aa:bb:cc:dd:ee:ff" rather than "what's on 10.20.3.0/24".
+
+        Three independent sources, since none alone is complete: hosts
+        SappiWhere's own sweep discovered, DHCP-reported leases and
+        reservations, and the shared reverse-DNS cache built from PTR
+        lookups. A result outside every subnet configured here isn't a
+        bug — DHCP polling reads a server's scopes independently of what
+        subnets IPAM has been told to sweep, so a lease can exist for a
+        range nothing here is watching; the `sources` entry always says
+        which of the three found it.
         """
         results: dict[str, dict] = {}
+        placed: set[str] = set()   # already has subnet/alive from its own sweep row
 
-        for row in self.ipam_db.search_dhcp_hostnames(query, limit):
-            entry = results.setdefault(row["ip"], {
-                "ip": row["ip"], "hostname": row["hostname"], "mac": row["mac"],
+        def entry(ip: str) -> dict:
+            return results.setdefault(ip, {
+                "ip": ip, "hostname": None, "mac": None,
                 "sources": [], "subnet": None, "alive": None,
             })
+
+        for row in self.ipam_db.search_hosts(query, limit):
+            found = entry(row["ip"])
+            found["mac"] = found["mac"] or row["mac"]
+            found["alive"] = bool(row["alive"])
+            found["subnet"] = row["subnet_cidr"]
+            found["sources"].append("discovered by SappiWhere's own sweep")
+            placed.add(row["ip"])
+
+        for row in self.ipam_db.search_dhcp(query, limit):
+            found = entry(row["ip"])
+            found["hostname"] = found["hostname"] or row["hostname"]
+            found["mac"] = found["mac"] or row["mac"]
             kind = "DHCP reservation" if row["is_reservation"] else "DHCP lease"
             server = row["server_label"] or "DHCP server"
-            entry["sources"].append(f"{kind} ({server})")
+            found["sources"].append(f"{kind} ({server})")
 
         for row in self.app_db.search_hostnames(query, limit):
-            entry = results.setdefault(row["ip"], {
-                "ip": row["ip"], "hostname": row["hostname"], "mac": None,
-                "sources": [], "subnet": None, "alive": None,
-            })
-            if not entry["hostname"]:
-                entry["hostname"] = row["hostname"]
-            entry["sources"].append("reverse DNS")
+            found = entry(row["ip"])
+            found["hostname"] = found["hostname"] or row["hostname"]
+            found["sources"].append("reverse DNS")
 
-        if results:
-            for host in self.ipam_db.hosts():
-                entry = results.get(host["ip"])
-                if not entry:
+        # Fill in subnet/alive for anything not already placed above — a
+        # DHCP- or DNS-only match whose address happens to also be a
+        # currently discovered host.
+        missing = set(results) - placed
+        if missing:
+            host_rows = {row["ip"]: row for row in self.ipam_db.hosts()}
+            for ip in missing:
+                host = host_rows.get(ip)
+                if not host:
                     continue
-                entry["alive"] = bool(host["alive"])
-                entry["mac"] = entry["mac"] or host["mac"]
+                found = results[ip]
+                found["alive"] = bool(host["alive"])
+                found["mac"] = found["mac"] or host["mac"]
                 if host["subnet_id"] is not None:
                     subnet = self.ipam_db.subnet(host["subnet_id"])
-                    entry["subnet"] = subnet["cidr"] if subnet else None
+                    found["subnet"] = subnet["cidr"] if subnet else None
 
         query_lower = query.lower()
-        ordered = sorted(
-            results.values(),
-            key=lambda e: (not (e["hostname"] or "").lower().startswith(query_lower),
-                           (e["hostname"] or "").lower()))
-        return ordered[:limit]
+
+        def sort_key(e: dict):
+            name = (e["hostname"] or "").lower()
+            return (not name.startswith(query_lower),
+                   query_lower not in e["ip"],
+                   name or e["ip"])
+
+        return sorted(results.values(), key=sort_key)[:limit]
 
     # ---------------------------------------------------------- maintenance
 

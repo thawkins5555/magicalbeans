@@ -232,15 +232,16 @@ class AppDatabase:
 
     def search_hostnames(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
         """Cached names — from PTR lookups on hop, flow, syslog and IPAM
-        addresses alike — whose hostname contains `query`. The forward half
-        of what this cache is for: it exists to turn an address into a name
-        for display, but the same table answers "what's the IP for this
-        name" just as well."""
+        addresses alike — whose hostname or IP contains `query`. The forward
+        half of what this cache is for: it exists to turn an address into a
+        name for display, but the same table answers "what's the IP for this
+        name" just as well, and an IP substring is worth matching here too
+        since a caller may already half-know the address."""
         with self._lock:
             return self._conn.execute(
-                "SELECT ip, hostname FROM hostnames WHERE hostname LIKE ?"
+                "SELECT ip, hostname FROM hostnames WHERE hostname LIKE ? OR ip LIKE ?"
                 " ORDER BY (hostname LIKE ?) DESC, hostname LIMIT ?",
-                (f"%{query}%", f"{query}%", limit)).fetchall()
+                (f"%{query}%", f"%{query}%", f"{query}%", limit)).fetchall()
 
     def set_hostname(self, ip: str, hostname: str | None) -> None:
         with self._lock:
