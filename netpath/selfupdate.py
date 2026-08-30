@@ -25,6 +25,16 @@ up the new files on the next import. Sessions are in-memory (see appdb.py),
 so everyone signed in — this request included — is signed out by it; the web
 UI expects that and sends people back to the sign-in page once it sees the
 server answering again.
+
+`cacert.pem` beside this file is Mozilla's CA bundle, the same one `pip` and
+`certifi` vendor, checked in rather than pulled from a package at run time so
+a headless install still needs nothing but the standard library. It exists
+because a locked-down Windows server's own certificate store can be missing
+whatever root GitHub's certificate chains to, with no route to Windows
+Update's on-demand fetch to fill the gap — `urlopen()`'s default context
+then fails with CERTIFICATE_VERIFY_FAILED even though the machine can reach
+github.com fine. Trusting this bundle in addition to — not instead of — the
+system store means either one having the right root is enough.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import sys
 import tarfile
 import tempfile
@@ -53,9 +64,22 @@ USER_AGENT = "SappiWhere-Updater"
 # being replaced and that directory's parent is where it lives.
 _NETPATH_DIR = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT = os.path.dirname(_NETPATH_DIR)
+_CACERT_PATH = os.path.join(_NETPATH_DIR, "cacert.pem")
 
 _COPY_ALONGSIDE = ("requirements.txt", "README.md", "CHANGELOG.md", "FEATURES.md",
                    "CREDENTIAL-SECURITY.md", "NETWORK-AND-STORAGE-REQUIREMENTS.md")
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """The system's trusted CAs plus our vendored bundle, so either one
+    having the certificate GitHub needs is enough to verify the connection."""
+    context = ssl.create_default_context()
+    if os.path.isfile(_CACERT_PATH):
+        try:
+            context.load_verify_locations(cafile=_CACERT_PATH)
+        except ssl.SSLError:
+            pass  # a corrupt bundle shouldn't break the system store's own certs
+    return context
 
 
 def latest_commit(timeout: float = 10.0) -> dict:
@@ -64,7 +88,8 @@ def latest_commit(timeout: float = 10.0) -> dict:
     request = urllib.request.Request(
         url, headers={"Accept": "application/vnd.github+json",
                       "User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout,
+                                context=_ssl_context()) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return {
         "sha": payload["sha"],
@@ -76,7 +101,8 @@ def latest_commit(timeout: float = 10.0) -> dict:
 def _download_tarball(sha: str, dest_path: str, timeout: float = 60.0) -> None:
     url = f"https://codeload.github.com/{OWNER}/{REPO}/tar.gz/{sha}"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response, \
+    with urllib.request.urlopen(request, timeout=timeout,
+                                context=_ssl_context()) as response, \
          open(dest_path, "wb") as handle:
         shutil.copyfileobj(response, handle)
 
