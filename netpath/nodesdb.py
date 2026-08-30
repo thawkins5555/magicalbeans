@@ -39,6 +39,31 @@ CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
     created_ts      REAL NOT NULL
 );
 
+-- A group's own snmp_version/community/v3_* columns above are its
+-- "primary" credential — unconditionally always present and always tried
+-- first, exactly as before this table existed, so a single-credential
+-- profile (still the common case) needs no migration and no behavior
+-- change at all. This table holds only the ADDITIONAL alternates a
+-- profile wants tried after the primary — a mixed-vendor subnet where
+-- some devices answer the primary community/version and others need a
+-- different one entirely. Tried in id order (insertion order); the
+-- poller caches whichever candidate last worked for a given device, so a
+-- profile with several alternates does not cost extra requests on every
+-- poll — only on a device's first poll, or after its cached credential
+-- stops working.
+CREATE TABLE IF NOT EXISTS group_credentials (
+    id              INTEGER PRIMARY KEY,
+    group_id        INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    label           TEXT,                            -- optional, e.g. "Cisco gear"
+    snmp_version    INTEGER NOT NULL DEFAULT 1,       -- 0=v1, 1=v2c, 3=v3
+    community       TEXT,
+    v3_user         TEXT,
+    v3_auth_proto   TEXT,
+    v3_auth_pass_enc BLOB,
+    created_ts      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_group_credentials_group ON group_credentials(group_id, id);
+
 CREATE TABLE IF NOT EXISTS devices (
     id              INTEGER PRIMARY KEY,
     ip              TEXT NOT NULL UNIQUE,
@@ -370,6 +395,68 @@ class NodesDatabase:
                                (group_id,))
             self._conn.commit()
 
+    # ----------------------------------------------------- group credentials
+
+    def group_credentials(self, group_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM group_credentials WHERE group_id = ? ORDER BY id",
+                (group_id,)).fetchall()
+
+    def group_credential(self, credential_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM group_credentials WHERE id = ?",
+                (credential_id,)).fetchone()
+
+    def add_group_credential(self, group_id: int, *, label: str = "",
+                             snmp_version: int = 1, community: str | None = None,
+                             v3_user: str | None = None,
+                             v3_auth_proto: str | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO group_credentials(group_id, label, snmp_version,"
+                " community, v3_user, v3_auth_proto, created_ts)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (group_id, label, snmp_version, community, v3_user, v3_auth_proto,
+                 time.time()))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def update_group_credential(self, credential_id: int, **fields) -> None:
+        allowed = {k: v for k, v in fields.items() if k in
+                  ("label", "snmp_version", "community", "v3_user", "v3_auth_proto")}
+        if not allowed:
+            return
+        clauses = ", ".join(f"{key} = ?" for key in allowed)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE group_credentials SET {clauses} WHERE id = ?",
+                (*allowed.values(), credential_id))
+            self._conn.commit()
+
+    def set_group_credential_password(self, credential_id: int, user: str,
+                                      auth_proto: str, password_enc: bytes) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE group_credentials SET v3_user=?, v3_auth_proto=?,"
+                " v3_auth_pass_enc=? WHERE id=?",
+                (user, auth_proto, password_enc, credential_id))
+            self._conn.commit()
+
+    def clear_group_credential_password(self, credential_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE group_credentials SET v3_auth_pass_enc=NULL WHERE id=?",
+                (credential_id,))
+            self._conn.commit()
+
+    def remove_group_credential(self, credential_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM group_credentials WHERE id = ?", (credential_id,))
+            self._conn.commit()
+
     # ---------------------------------------------------------------- devices
 
     def devices(self, group_id: int | None = None, status: str | None = None,
@@ -487,6 +574,33 @@ class NodesDatabase:
         if config.get("oid_set") is None:
             config["oid_set"] = "auto"
         return config
+
+    _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
+                       "v3_auth_pass_enc")
+
+    def credential_candidates(self, device_row: sqlite3.Row) -> list[dict]:
+        """The ordered list of SNMP credentials to try polling this device
+        with. A device that has any of its own credential override columns
+        set is a human saying "I know this device's real credentials" —
+        exactly one candidate, tried alone, the same single-credential
+        behavior this had before profiles could hold more than one. A
+        device with no override defers entirely to its profile: the
+        profile's own primary credential (its snmp_version/community/v3_*
+        columns — always present, unconditionally tried first) followed by
+        every row in group_credentials, in the order they were added. A
+        device with no profile at all falls back to a bare v2c/public
+        guess, matching the Default profile's own seeded values."""
+        keys = self._CREDENTIAL_KEYS
+        if any(device_row[k] is not None for k in keys if k in device_row.keys()):
+            return [{k: device_row[k] if k in device_row.keys() else None for k in keys}]
+        group_row = self.group(device_row["group_id"]) if device_row["group_id"] else None
+        if group_row is None:
+            return [{"snmp_version": 1, "community": "public", "v3_user": None,
+                     "v3_auth_proto": None, "v3_auth_pass_enc": None}]
+        candidates = [{k: group_row[k] for k in keys}]
+        candidates.extend({k: row[k] for k in keys}
+                          for row in self.group_credentials(group_row["id"]))
+        return candidates
 
     def record_poll(self, device_id: int, *, ping_ok, ping_rtt_ms, snmp_ok,
                     snmp_error, identity: dict | None,

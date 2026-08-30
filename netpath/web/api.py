@@ -1362,7 +1362,7 @@ def _device_json(row) -> dict:
     }
 
 
-def _group_json(row) -> dict:
+def _group_json(service, row) -> dict:
     return {
         "id": row["id"], "name": row["name"], "snmp_version": row["snmp_version"],
         "community": row["community"], "v3_user": row["v3_user"],
@@ -1372,6 +1372,22 @@ def _group_json(row) -> dict:
         "snmp_timeout_s": row["snmp_timeout_s"], "snmp_retries": row["snmp_retries"],
         "ping_enabled": bool(row["ping_enabled"]), "snmp_enabled": bool(row["snmp_enabled"]),
         "oid_set": row["oid_set"], "is_default": bool(row["is_default"]),
+        "created_ts": row["created_ts"],
+        # The profile's own snmp_version/community/v3_* above are its
+        # "primary" credential — always present, always tried first. This
+        # is every ADDITIONAL credential the poller falls back to in
+        # order when the primary doesn't work for a given device.
+        "credentials": [_group_credential_json(r)
+                        for r in service.nodes_db.group_credentials(row["id"])],
+    }
+
+
+def _group_credential_json(row) -> dict:
+    return {
+        "id": row["id"], "group_id": row["group_id"], "label": row["label"],
+        "snmp_version": row["snmp_version"], "community": row["community"],
+        "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
+        "has_credential": bool(row["v3_auth_pass_enc"]),
         "created_ts": row["created_ts"],
     }
 
@@ -1694,7 +1710,7 @@ def delete_nodes_device_credential(service, params, body, device_id) -> dict:
 
 
 def get_nodes_groups(service, params, body) -> dict:
-    return {"groups": [_group_json(r) for r in service.nodes_db.groups()]}
+    return {"groups": [_group_json(service, r) for r in service.nodes_db.groups()]}
 
 
 def post_nodes_group(service, params, body) -> dict:
@@ -1761,6 +1777,82 @@ def delete_nodes_group_credential(service, params, body, group_id) -> dict:
     service.nodes_db.clear_group_credential(group_id)
     service.log.add(NODES_CATEGORY,
                     f"Cleared the stored SNMPv3 credential for profile {row['name']}")
+    return {"ok": True}
+
+
+# ---------------------------------------------------- additional credentials
+#
+# A profile's own snmp_version/community/v3_* columns (above) are its
+# always-present "primary" credential. These endpoints manage the
+# ADDITIONAL credentials a profile can hold in its group_credentials table
+# — alternates the poller tries, in order, for any device on this profile
+# that doesn't answer the primary. Same shape throughout as the primary
+# credential's own endpoints just above.
+
+_GROUP_CREDENTIAL_EDITABLE = ("label", "snmp_version", "community", "v3_user",
+                              "v3_auth_proto")
+
+
+def post_nodes_group_credentials(service, params, body, group_id) -> dict:
+    row = service.nodes_db.group(group_id)
+    if not row:
+        raise ValueError("No such polling profile")
+    fields = {k: v for k, v in body.items() if k in _GROUP_CREDENTIAL_EDITABLE}
+    credential_id = service.nodes_db.add_group_credential(group_id, **fields)
+    service.log.add(NODES_CATEGORY,
+                    f"Added an additional SNMP credential to profile {row['name']}")
+    return {"id": credential_id}
+
+
+def put_nodes_group_credential(service, params, body, group_id, credential_id) -> dict:
+    cred = service.nodes_db.group_credential(credential_id)
+    if not cred or cred["group_id"] != int(group_id):
+        raise ValueError("No such credential")
+    fields = {k: v for k, v in body.items() if k in _GROUP_CREDENTIAL_EDITABLE}
+    service.nodes_db.update_group_credential(credential_id, **fields)
+    return {"ok": True}
+
+
+def delete_nodes_group_credential_row(service, params, body, group_id, credential_id) -> dict:
+    cred = service.nodes_db.group_credential(credential_id)
+    if not cred or cred["group_id"] != int(group_id):
+        raise ValueError("No such credential")
+    service.nodes_db.remove_group_credential(credential_id)
+    return {"ok": True}
+
+
+def post_nodes_group_credential_secret(service, params, body, group_id, credential_id) -> dict:
+    from .. import dpapi
+
+    cred = service.nodes_db.group_credential(credential_id)
+    if not cred or cred["group_id"] != int(group_id):
+        raise ValueError("No such credential")
+    user = str(body.get("v3_user", "")).strip()
+    password = str(body.get("v3_auth_pass", ""))
+    auth_proto = str(body.get("v3_auth_proto", "")).strip()
+    if not user or not password or not auth_proto:
+        raise ValueError("A username, auth protocol, and password are all required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.nodes_db.set_group_credential_password(credential_id, user, auth_proto, encrypted)
+    service.log.add(NODES_CATEGORY, "Stored an SNMPv3 credential for an additional "
+                                    f"credential on profile {cred['label'] or credential_id}")
+    return {"ok": True}
+
+
+def delete_nodes_group_credential_secret(service, params, body, group_id, credential_id) -> dict:
+    cred = service.nodes_db.group_credential(credential_id)
+    if not cred or cred["group_id"] != int(group_id):
+        raise ValueError("No such credential")
+    service.nodes_db.clear_group_credential_password(credential_id)
     return {"ok": True}
 
 

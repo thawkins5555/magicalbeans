@@ -447,18 +447,141 @@
 
   function drawProfilesTable() {
     const table = App.el('nd-profiles-table');
-    table.innerHTML = '<thead><tr><th>Name</th><th>Version</th><th>Interval</th></tr></thead>';
+    table.innerHTML = '<thead><tr><th>Name</th><th>Version</th><th>Credentials</th><th>Interval</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const g of view.groups) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.groupSelected === g.id ? ' selected' : '');
+      const extra = (g.credentials || []).length;
       tr.innerHTML = `<td>${escape(g.name)}${g.is_default ? ' <span class="hint">(default)</span>' : ''}</td>` +
         `<td>${{0:'v1',1:'v2c',3:'v3'}[g.snmp_version] || g.snmp_version}</td>` +
+        `<td>${extra ? `1 + ${extra} more` : '1'}</td>` +
         `<td>${g.poll_interval_s}s</td>`;
       tr.onclick = () => { view.groupSelected = g.id; drawProfilesTable(); };
       body.appendChild(tr);
     }
     table.appendChild(body);
+  }
+
+  /* --------------------------------------------------- additional credentials
+     A profile's own version/community/v3-user fields above are its always-
+     present "primary" credential. This section manages the group_credentials
+     list the poller falls back to, in order, for a device on this profile
+     that doesn't answer the primary — a mix of vendors or SNMP versions on
+     one profile. Requires the profile to already exist (a new, unsaved
+     profile has nowhere to attach a credential row to yet — same rule the
+     device-level credential form already follows). */
+
+  function credentialSummary(c) {
+    const ver = { 0: 'v1', 1: 'v2c', 3: 'v3' }[c.snmp_version] || c.snmp_version;
+    const who = c.snmp_version === 3 ? (c.v3_user || '(no username)') : (c.community || '(no community)');
+    return `${ver} · ${who}`;
+  }
+
+  function credentialsListHtml(credentials) {
+    if (!credentials.length) return '<p class="hint">No additional credentials yet.</p>';
+    const rows = credentials.map((c) => `
+      <tr>
+        <td>${escape(c.label || '—')}</td>
+        <td>${escape(credentialSummary(c))}</td>
+        <td>${c.snmp_version === 3 ? (c.has_credential ? 'password stored' : 'no password yet') : ''}</td>
+        <td><button type="button" class="cred-remove" data-cred-id="${c.id}">Remove</button></td>
+      </tr>`).join('');
+    return `<table><thead><tr><th>Label</th><th>Credential</th><th></th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+
+  function addCredentialFormHtml() {
+    return `
+      <label>Label <input id="nd-pc-label" placeholder="optional, e.g. “Cisco gear”"></label>
+      <label>SNMP version <select id="nd-pc-version">
+        <option value="0">v1</option>
+        <option value="1" selected>v2c</option>
+        <option value="3">v3</option>
+      </select></label>
+      <label>Community (v1/v2c) <input id="nd-pc-community"></label>
+      <label>v3 username <input id="nd-pc-v3user"></label>
+      <label>v3 auth protocol <select id="nd-pc-authproto">
+        ${['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'].map((x) =>
+          `<option value="${x}">${x}</option>`).join('')}
+      </select></label>
+      <label>v3 auth password <input id="nd-pc-authpass" type="password"></label>
+      <button type="button" id="nd-pc-add">Add credential</button>
+      <p class="hint" id="nd-pc-status"></p>`;
+  }
+
+  function credentialsSectionHtml(g) {
+    if (!g.id) {
+      return `<fieldset><legend>ADDITIONAL CREDENTIALS</legend>
+        <p class="hint">Save this profile first, then reopen Edit to add more
+          credentials for it.</p></fieldset>`;
+    }
+    return `<fieldset><legend>ADDITIONAL CREDENTIALS</legend>
+      <p class="hint">Tried, in order, after the primary credential above,
+        for any device on this profile that doesn't answer it.</p>
+      <div id="nd-p-creds-list">${credentialsListHtml(g.credentials || [])}</div>
+      ${addCredentialFormHtml()}
+    </fieldset>`;
+  }
+
+  async function refreshCredentialsList(box, groupId) {
+    const payload = await App.get('/api/nodes/groups');
+    const g = (payload.groups || []).find((x) => x.id === groupId);
+    box.querySelector('#nd-p-creds-list').innerHTML = credentialsListHtml((g && g.credentials) || []);
+    wireCredentialRemoveButtons(box, groupId);
+  }
+
+  function wireCredentialRemoveButtons(box, groupId) {
+    for (const btn of box.querySelectorAll('.cred-remove')) {
+      btn.onclick = async () => {
+        await App.del(`/api/nodes/groups/${groupId}/credentials/${btn.dataset.credId}`);
+        await refreshCredentialsList(box, groupId);
+      };
+    }
+  }
+
+  function wireCredentialsSection(box, groupId) {
+    const addBtn = box.querySelector('#nd-pc-add');
+    if (!addBtn) return;   // no groupId yet — the "save first" hint is shown instead
+    const status = box.querySelector('#nd-pc-status');
+    addBtn.onclick = async () => {
+      const fields = {
+        label: box.querySelector('#nd-pc-label').value.trim(),
+        snmp_version: Number(box.querySelector('#nd-pc-version').value),
+        community: box.querySelector('#nd-pc-community').value.trim(),
+        v3_user: box.querySelector('#nd-pc-v3user').value.trim(),
+        v3_auth_proto: box.querySelector('#nd-pc-authproto').value,
+      };
+      const authPass = box.querySelector('#nd-pc-authpass').value;
+      status.innerHTML = '';
+      addBtn.disabled = true;
+      try {
+        // The credential row and its optional v3 password are two
+        // separate requests — a DPAPI failure on the second (this
+        // machine can't encrypt a stored secret) must not make it look
+        // like "Add credential" silently did nothing: the row itself is
+        // still created and shown, just without a password stored yet.
+        const result = await App.post(`/api/nodes/groups/${groupId}/credentials`, fields);
+        if (authPass && fields.v3_user && fields.v3_auth_proto) {
+          try {
+            await App.post(`/api/nodes/groups/${groupId}/credentials/${result.id}/secret`,
+              { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto, v3_auth_pass: authPass });
+          } catch (error) {
+            status.innerHTML = `<span class="err">Credential added, but its password ` +
+              `wasn't stored: ${escape(error.message)}</span>`;
+          }
+        }
+        await refreshCredentialsList(box, groupId);
+        for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user', 'nd-pc-authpass']) {
+          box.querySelector(`#${id}`).value = '';
+        }
+      } catch (error) {
+        status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
+      } finally {
+        addBtn.disabled = false;
+      }
+    };
+    wireCredentialRemoveButtons(box, groupId);
   }
 
   function profileForm(g) {
@@ -481,10 +604,11 @@
       <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
-      <div class="row" style="justify-content:flex-start;gap:14px">
+      <div style="display:flex;justify-content:flex-start;gap:14px">
         <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>
         <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>
-      </div>`;
+      </div>
+      ${credentialsSectionHtml(p)}`;
   }
 
   function profileFields(box) {
@@ -503,7 +627,7 @@
   }
 
   function addProfile() {
-    App.modal('Add polling profile', profileForm({}), [
+    const box = App.modal('Add polling profile', profileForm({}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
@@ -518,12 +642,13 @@
         App.refreshNow('nodes');
       } },
     ]);
+    box.classList.add('wide');
   }
 
   function editProfile() {
     const g = view.groups.find((x) => x.id === view.groupSelected);
     if (!g) return;
-    App.modal(`Edit ${g.name}`, profileForm(g), [
+    const box = App.modal(`Edit ${g.name}`, profileForm(g), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
@@ -537,6 +662,8 @@
         App.refreshNow('nodes');
       } },
     ]);
+    box.classList.add('wide');
+    wireCredentialsSection(box, g.id);
   }
 
   function removeProfile() {

@@ -333,6 +333,16 @@ weaker cipher or a plaintext file. `POST .../credential` and `DELETE
 .../credential` are the only two operations exposed — store or clear,
 never reveal.
 
+A polling profile can hold more than one SNMP credential — its own
+primary one plus any number of additional alternates in
+`group_credentials`, tried in order for a device that doesn't answer the
+primary. Every alternate's optional v3 password follows the identical
+rule: `POST .../credentials/{id}/secret` and `DELETE
+.../credentials/{id}/secret`, same DPAPI-or-refuse behavior, same
+`has_credential: bool`-only exposure, one row's password decrypted at a
+time, immediately before that row's own signing attempt, same as the
+primary credential's.
+
 **An SNMP *community* string (v1/v2c) is not treated the same way, and
 that is deliberate, not an oversight.** It is stored and shown in the
 clear, in the device list, in the edit form, in the API response. A

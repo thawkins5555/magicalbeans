@@ -174,6 +174,35 @@ next poll (`_snmp_get` invalidates the cache entry and raises
 `_AuthFailure`, causing a fresh discovery next time) rather than a
 background expiry timer.
 
+**Multiple credentials per profile.** A polling profile's own `snmp_version`/
+`community`/`v3_*` columns are its "primary" credential, unconditionally
+always present and always tried first — a single-credential profile (still
+the common case) needed no migration and no behavior change at all when
+this was added. `group_credentials` is a purely additive child table
+holding only the *extra* alternates a profile wants tried after the
+primary; `NodesDatabase.credential_candidates(device_row)` resolves the
+ordered list to try for a given device: a device's own credential override,
+if it has one set, is always exactly one candidate (a human already told
+this app the real credentials for this specific device, so nothing else is
+worth trying); otherwise it's the profile's primary credential followed by
+every `group_credentials` row for that profile, in `id` order (insertion
+order — no separate priority column). `NodePoller._credentials` is an
+in-memory `device_id -> winning candidate index` cache, the same
+process-lifetime-only tradeoff `EngineCache` above already makes:
+`_poll_snmp_scalars_with_credential()` tries the cached index first, and
+only walks the full candidate list from the top on a cache miss or if the
+cached one stops working — so a profile covering several vendors or SNMP
+versions costs one extra request per untried candidate only on a device's
+first poll, or after its working credential stops answering, not on every
+poll after that. Every failure `_poll_snmp_scalars()` alone could raise —
+`SnmpTimeout`, `SnmpUnsupported` (an authPriv alternate in an otherwise
+usable list), `_AuthFailure`, any other `SnmpError` — is credential-specific
+in a mixed profile, so all of `SnmpError`'s subclasses are caught uniformly
+while trying candidates and only re-raised, as the last one seen, once
+every candidate has failed; the caller's existing status/counter
+classification in `_poll_device` is unaffected; it just sees the same
+exception type a single-credential poll would have raised.
+
 `counter_rate()` and `detect_reboot()` are pure functions, unit-tested in
 the module's own `__main__` block with no network needed. A 32-bit
 counter that decreased is assumed to have wrapped once; a 64-bit counter

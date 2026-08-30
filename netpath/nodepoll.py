@@ -199,6 +199,13 @@ class NodePoller:
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
         self._last_completed: float = 0.0
+        # device_id -> index into db.credential_candidates(device) that last
+        # worked, so a profile with several alternate credentials (a
+        # mixed-vendor subnet, say) costs one extra request only on a
+        # device's first poll or after its cached credential stops working,
+        # not on every poll thereafter. In-memory and process-lifetime only,
+        # the same tradeoff EngineCache above already makes.
+        self._credentials: dict[int, int] = {}
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
                          "unsupported": 0, "errors": 0, "overruns": 0}
         self.error: str | None = None
@@ -291,9 +298,14 @@ class NodePoller:
     def promote(self, job_id: int, result_ids: list[int]) -> list[int]:
         """Creates a devices row per discovery result, carrying the
         discovered community/version as a per-device override only when it
-        differs from the target group's own. Already-promoted result ids
-        are a no-op rather than a duplicate-IP error, so a second promote
-        call with an overlapping selection is always safe to retry."""
+        matches none of the target group's own credentials — its primary
+        credential or any additional one — so a device that a profile's
+        existing credential list already covers keeps trying that shared
+        list (and benefits from any future credential added to the
+        profile) instead of being pinned to one override. Already-promoted
+        result ids are a no-op rather than a duplicate-IP error, so a
+        second promote call with an overlapping selection is always safe
+        to retry."""
         device_ids = []
         for result_id in result_ids:
             result = self.db.discovery_result(result_id)
@@ -311,9 +323,13 @@ class NodePoller:
             group_row = self.db.group(group_id) if group_id else None
             overrides = {}
             if result["snmp_ok"] and result["community_or_user"]:
-                if group_row is None or group_row["community"] != result["community_or_user"]:
+                known = [group_row] + list(self.db.group_credentials(group_id)) \
+                       if group_row is not None else []
+                matches_known = any(
+                    g["community"] == result["community_or_user"]
+                    and g["snmp_version"] == result["snmp_version"] for g in known)
+                if not matches_known:
                     overrides["community"] = result["community_or_user"]
-                if group_row is None or group_row["snmp_version"] != result["snmp_version"]:
                     overrides["snmp_version"] = result["snmp_version"]
             device_id = self.db.add_device(
                 result["ip"], result["sys_name"] or result["ip"],
@@ -415,8 +431,9 @@ class NodePoller:
 
         if config.get("snmp_enabled"):
             try:
-                identity, uptime_ticks, metrics = self._poll_snmp_scalars(device, config)
-                interfaces = self._poll_interfaces(device, config)
+                cred_config, identity, uptime_ticks, metrics = \
+                    self._poll_snmp_scalars_with_credential(device, config)
+                interfaces = self._poll_interfaces(device, cred_config)
                 snmp_ok = True
             except SnmpUnsupported as exc:
                 snmp_ok = False
@@ -591,6 +608,39 @@ class NodePoller:
     def _check_error_status(response: Response) -> None:
         if response.error_status == 16:   # authorizationError
             raise _AuthFailure("authorization error")
+
+    def _poll_snmp_scalars_with_credential(self, device, config: dict):
+        """Resolves which SNMP credential actually works for this device
+        this poll, then fetches the system scalars with it — one function,
+        so a working credential is never fetched twice. Tries the cached
+        last-known-good candidate (from self._credentials) first; on a
+        cache miss, or if that candidate no longer works, walks the full
+        candidate list from db.credential_candidates() in order. Every
+        failure mode a single-credential poll could hit (SnmpTimeout,
+        SnmpUnsupported, _AuthFailure, or any other SnmpError) is credential
+        -specific in a mixed profile — a v3 authPriv alternate is
+        SnmpUnsupported while a v2c alternate right after it might work
+        fine — so all of SnmpError's subclasses are caught uniformly here
+        and only re-raised, as the last one seen, once every candidate has
+        failed. Returns (winning_config, identity, uptime_ticks, metrics);
+        raises the same exception _poll_snmp_scalars alone would if no
+        candidate works, so the caller's existing except chain still
+        classifies the failure exactly as before this feature existed."""
+        candidates = self.db.credential_candidates(device)
+        cached_index = self._credentials.get(device["id"])
+        order = [cached_index] if cached_index is not None and cached_index < len(candidates) else []
+        order += [i for i in range(len(candidates)) if i not in order]
+        last_error: Exception | None = None
+        for index in order:
+            trial_config = {**config, **candidates[index]}
+            try:
+                identity, uptime_ticks, metrics = self._poll_snmp_scalars(device, trial_config)
+            except SnmpError as exc:
+                last_error = exc
+                continue
+            self._credentials[device["id"]] = index
+            return trial_config, identity, uptime_ticks, metrics
+        raise last_error or SnmpTimeout(f"no reply from {device['ip']}")
 
     def _poll_snmp_scalars(self, device, config: dict):
         oids = list(nodeoids.SYSTEM_SCALARS.values())

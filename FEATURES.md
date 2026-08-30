@@ -71,6 +71,19 @@ own subtabs.
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled — and can override any of it individually. One profile,
   `Default`, always exists.
+- **A profile can hold more than one SNMP credential**, of the same
+  version or different ones — useful when one profile covers a mix of
+  vendors or SNMP versions on the same subnet. Its own version/community/
+  v3 fields are the "primary" credential, always tried first; any
+  additional ones added under ADDITIONAL CREDENTIALS in the profile's
+  Edit dialog are tried after it, in the order they were added, for any
+  device that doesn't answer the primary. Whichever credential answers is
+  remembered per device, so a poll only pays for trying several
+  credentials on a device's first poll (or after its working one stops
+  answering), not on every poll after that. A device with its own
+  credential override still uses exactly that one, unchanged — the
+  profile's list only comes into play for a device relying on the
+  profile.
 - **The scheduler is shaped like NetPath's own trace `Monitor`**, not
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
   due-time seeding from each device's own last poll time, so a restart

@@ -6,6 +6,32 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.12.0 — Multiple SNMP credentials per polling profile
+
+- **A Nodes polling profile can now hold more than one SNMP credential**,
+  of the same version or different ones — a profile's Edit dialog gains
+  an ADDITIONAL CREDENTIALS section under its existing primary
+  version/community/v3 fields, where any number of alternates can be
+  added, each with its own version and community or v3 username/auth
+  protocol/password. Useful for a profile covering a mix of vendors or
+  SNMP versions on the same subnet, rather than needing one profile per
+  credential.
+  - The profile's own primary credential is always tried first,
+    unchanged; additional credentials are tried after it, in the order
+    they were added, for any device on that profile that doesn't answer
+    the primary.
+  - Whichever credential answers is cached per device, so trying several
+    candidates only costs extra requests on a device's first poll (or
+    after its working credential stops answering) — not on every poll
+    after that.
+  - A device with its own credential override is unaffected: it still
+    uses exactly that one credential alone, the same as before this
+    feature existed. The profile's list only matters for a device
+    relying on the profile.
+  - Each additional credential's optional SNMPv3 password follows the
+    exact same DPAPI-encrypted, Windows-only, never-returned rule as
+    every other stored credential in this app.
+
 ### 4.11.3 — A silent hop is no longer flagged "MTR: High Loss"
 
 - **A hop that has never once answered a continuous (MTR-style) probe no
