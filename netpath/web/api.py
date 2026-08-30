@@ -129,6 +129,7 @@ def _target_json(service, row) -> dict:
         "warn_rtt_ms": row["warn_rtt_ms"],
         "warn_loss": row["warn_loss"],
         "enabled": bool(row["enabled"]),
+        "hop_probe_enabled": bool(row["hop_probe_enabled"]) if "hop_probe_enabled" in keys else False,
         "status": last["status"] if last else "none",
         "last_rtt_ms": last["rtt_ms"] if last else None,
         "last_run": last["started_ts"] if last else None,
@@ -163,6 +164,8 @@ def put_target(service, params, body, target_id: int) -> dict:
               if k in {"host", "label", "interval_s", "max_hops", "probes",
                        "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
     service.db.update_target(target_id, **fields)
+    if "hop_probe_enabled" in body:
+        service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
     return {"ok": True}
 
 
@@ -218,10 +221,17 @@ def get_timeline(service, params, body) -> dict:
     }
 
 
-def _topology_json(service, topo, refusal) -> dict:
+def _topology_json(service, topo, refusal, target_id: int | None = None) -> dict:
     code, address = refusal
+    # Continuous-probe stats: cumulative counters kept alongside whatever the
+    # scheduled traceroutes themselves derived, so a hop shows both "what the
+    # traceroute history looks like" and "what live pinging says right now".
+    probe_stats = service.db.hop_stats_for_target(target_id) if target_id else {}
     nodes = []
     for node in topo.nodes.values():
+        stats = probe_stats.get(node.ip) if node.ip else None
+        probes = stats["probes"] if stats else 0
+        answered = probes - (stats["lost"] if stats else 0)
         nodes.append({
             "key": f"{node.ttl}|{node.ip or ''}",
             "ttl": node.ttl,
@@ -236,6 +246,13 @@ def _topology_json(service, topo, refusal) -> dict:
             "is_timeout": node.is_timeout,
             "refusal": code if (address and node.ip == address) else None,
             "refusal_text": unreachable_text(code) if (address and node.ip == address) else "",
+            "asn": node.asn,
+            "asn_org": node.asn_org,
+            "probe_count": probes,
+            "probe_loss": (100.0 * stats["lost"] / probes) if stats and probes else None,
+            "probe_rtt_min": stats["rtt_min"] if stats else None,
+            "probe_rtt_avg": (stats["rtt_sum"] / answered) if stats and answered else None,
+            "probe_rtt_max": stats["rtt_max"] if stats else None,
         })
     edges = [
         {"src": f"{e.src[0]}|{e.src[1] or ''}",
@@ -270,13 +287,16 @@ def get_topology(service, params, body) -> dict:
             return {"nodes": [], "edges": [], "columns": {}, "total_traces": 0,
                     "snapshot": {"found": False, "at": pinned}}
         rows = service.db.hop_rows_for_trace(trace["id"])
-        names = service.app_db.hostnames({r["ip"] for r in rows})
+        ips = {r["ip"] for r in rows}
+        names = service.app_db.hostnames(ips)
+        asn_data = service.app_db.asn_info(ips)
         topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
-                              hostnames=names)
+                              hostnames=names, asn_data=asn_data)
         keys = trace.keys()
         code = trace["icmp_code"] if "icmp_code" in keys else None
         payload = _topology_json(service, topo, (code, trace["icmp_from"]
-                                                 if "icmp_from" in keys else None))
+                                                 if "icmp_from" in keys else None),
+                                 target_id)
         payload["snapshot"] = {
             "found": True,
             "at": trace["started_ts"],
@@ -291,9 +311,11 @@ def get_topology(service, params, body) -> dict:
 
     t0, t1 = _window(params)
     rows = service.db.hop_rows_between(target_id, t0, t1)
-    names = service.app_db.hostnames({r["ip"] for r in rows})
+    ips = {r["ip"] for r in rows}
+    names = service.app_db.hostnames(ips)
+    asn_data = service.app_db.asn_info(ips)
     topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
-                          hostnames=names)
+                          hostnames=names, asn_data=asn_data)
 
     code = address = None
     for trace in reversed(service.db.traces_between(target_id, t0, t1)):
@@ -301,7 +323,7 @@ def get_topology(service, params, body) -> dict:
         if "icmp_code" in keys and trace["icmp_code"]:
             code, address = trace["icmp_code"], trace["icmp_from"]
             break
-    payload = _topology_json(service, topo, (code, address))
+    payload = _topology_json(service, topo, (code, address), target_id)
     payload["snapshot"] = {"found": False}
     return payload
 
@@ -430,6 +452,11 @@ def get_flow_records(service, params, body) -> dict:
         names = {ip: name for ip, name
                  in service.app_db.hostnames(addresses).items() if name}
     interfaces = service.flow_db.interface_names()
+    # Flow-to-path correlation: which NetPath target (if any) last traced a
+    # route ending at each address, so the frontend can offer a "view route"
+    # link without a per-row round trip.
+    addr_targets = service.db.targets_by_destination_ips(
+        {r["src_ip"] for r in rows} | {r["dst_ip"] for r in rows})
 
     records = []
     for row in rows:
@@ -442,10 +469,12 @@ def get_flow_records(service, params, body) -> dict:
             # The number as well as the label: "443 https" sorts as text
             # between 44 and 45, which is not what clicking the column means.
             "src_port_num": row["src_port"],
+            "src_target_id": addr_targets.get(row["src_ip"]),
             "dst_ip": row["dst_ip"],
             "dst_name": names.get(row["dst_ip"]),
             "dst_port": port_name(row["dst_port"], resolve_ports),
             "dst_port_num": row["dst_port"],
+            "dst_target_id": addr_targets.get(row["dst_ip"]),
             "protocol": protocol_name(row["protocol"]),
             "bytes": (row["bytes"] or 0) * sampling,
             "bytes_text": format_bytes((row["bytes"] or 0) * sampling),

@@ -90,12 +90,13 @@ in WAL mode, since freed pages sit in the write-ahead log until it's
 checkpointed and truncated. Capped at 6 iterations so a runaway cap
 setting can't loop forever. `Service.run_maintenance()` (`web/service.py`)
 calls all four every 15 minutes, plus the day-based retention prunes for
-each module and `AppDatabase.prune_hostnames()` for the reverse-DNS cache.
+each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
+`AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
 | File | Owner class | Holds |
 | --- | --- | --- |
-| `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `hostnames` (the shared reverse-DNS cache), a `meta` table for one-off markers like the update-installed commit |
-| `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, NetPath's own settings |
+| `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
+| `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, IPAM's own settings |
@@ -174,6 +175,81 @@ than silently skipping the slot — the timeline needs to distinguish "the
 app wasn't running" (a true gap) from "this destination's traces are
 backing up" (an overrun), and only the latter has a fix that involves
 touching that destination's settings rather than the app itself.
+
+### Continuous per-hop probing (`HopProber`, in `monitor.py`)
+
+A scheduled trace samples a path once per `interval_s`; `HopProber` fills
+the gaps for targets that opt in (`targets.hop_probe_enabled`, off by
+default), with a background thread pool (`_loop()`, 4s cadence by default)
+that sends one `tracer.ping()` — a single ICMP echo via the system `ping`
+binary, the same subprocess-based, no-raw-sockets design as `run_trace()` —
+to every IP currently known as a hop of an enabled target.
+
+It never discovers hops on its own. `Monitor._run_one()` calls
+`Service._on_trace_complete()` after every finished trace (wired through
+`Monitor`'s existing `on_complete` callback slot), which calls
+`HopProber.refresh_hops(target_id)`: this reads the just-completed trace's
+hop IPs via `db.hop_rows_for_trace(db.last_trace(target_id)["id"])` and
+diffs them against what was probed last time. A changed hop set — a route
+change — triggers `db.reset_hop_stats(target_id, keep_ips=current)`, which
+deletes rows for any IP no longer on the path; this is why continuous
+probing never shows a hop's numbers gradually drifting after a route
+change, they reset cleanly instead.
+
+Storage is `db.py`'s `hop_stats` table, one row per `(target_id, ip)` with
+running counters (`probes`, `lost`, `rtt_sum`, `rtt_min`, `rtt_max`,
+`updated_ts`) rather than one row per probe — `record_hop_probe()` reads
+the existing row, folds in the new `PingResult`, and writes it back via
+`INSERT ... ON CONFLICT DO UPDATE`. A target probed every few seconds for
+weeks still costs one row per hop, not thousands. `_topology_json()` in
+`api.py` joins this table's data into each node's response
+(`probe_count`, `probe_loss`, `probe_rtt_min/avg/max`) alongside whatever
+`build_topology()` derived from the traceroute history itself — the two
+are independent measurements of the same path, shown side by side in the
+hop tooltip in `netpath.js` rather than merged into one number.
+
+### ASN and owner lookup (`AsnResolver`, in `monitor.py` + `namelookup.py`)
+
+Structured exactly like `Resolver` — its own polling loop, its own thread
+pool, its own cache table (`asn_cache` in `appdb.py`, mirroring
+`hostnames` but with a much longer default TTL: 30 days versus 7, since an
+address's ASN/owner changes far less often than its PTR record) — but
+targeting `db.distinct_hop_ips()` filtered through
+`AppDatabase.unknown_asn_ips()` instead of `unknown_ips()`. It does no
+independent hop discovery: every address `Resolver` already names a
+hostname for is automatically a candidate here too.
+
+The lookup itself (`namelookup.asn_lookup()`) uses Team Cymru's DNS-based
+whois, which answers ordinary recursive DNS queries against two public
+zones rather than requiring contact with Cymru's own servers directly:
+`d.c.b.a.origin.asn.cymru.com` (reversed IP) returns a TXT record whose
+first field is the originating ASN (`"15169 | 8.8.8.0/24 | US | arin |
+..."`), and a second query against `AS<asn>.asn.cymru.com` returns the
+short organization name (`"...| GOOGLE, US"`). Both queries go through
+`namelookup.query_txt()`, a hand-rolled raw-UDP TXT query added alongside
+the existing `query_ptr()` — same packet encode/decode helpers
+(`_encode()`, `_read_name()`), same one-shot-socket-per-query shape, just
+a different record type (`TXT = 16`) and multi-string TXT rdata
+reassembly. There's no portable way to discover the system's configured
+DNS resolver via raw sockets (unlike `Resolver`, which gets that for free
+from `socket.gethostbyaddr()` for its primary PTR attempt), so `asn_lookup`
+takes an explicit `server` (the `asn_server` setting, a separate value
+from `dns_server` since an internal-only resolver used for PTR lookups may
+not do public-internet recursion) and falls back to a public resolver
+(`8.8.8.8`) when none is configured.
+
+**Privacy guardrail**: `asn_lookup()` gates on
+`ipaddress.ip_address(ip).is_global` before opening any socket — not
+`is_private` alone, which would miss loopback, link-local and CGNAT
+(`100.64.0.0/10`) addresses that `is_global` correctly excludes in one
+check (verified directly: `is_global` is `False` for `10.x`, `192.168.x`,
+`127.0.0.1`, `169.254.x` and `100.64.x` alike, `True` only for real
+public addresses). A non-global address returns `(None, None)`
+immediately, with no DNS packet ever sent — confirmed by timing (~70µs,
+no network round trip) against a private test address. Since the vast
+majority of any traced path's early hops are internal addresses, this
+guardrail is not an edge case; it fires on nearly every trace, on nearly
+every hop before the path leaves the local network.
 
 ### Reverse DNS (`Resolver`, in `monitor.py`)
 
@@ -310,6 +386,53 @@ interface, AS, ToS) and multiplies every byte/packet figure by the
 flow's stored `sampling` rate before returning it, since that's the only
 point downstream of decode where the true (unsampled) volume can still be
 reconstructed.
+
+### Flow-to-path correlation
+
+NetPath only keeps trace history for pre-configured `targets` — there is
+no reverse index from an arbitrary IP to a target, and a target's `host`
+field can be a hostname whose current resolution has drifted from what it
+was when last traced. So matching a flow's destination IP against NetPath
+data means answering "which target's *most recent successful trace*
+actually ended at this exact IP" rather than a literal string match — the
+same question `db.destination_ip(target_id)` already answers in the other
+direction (given a target, what did it last reach). `db.py`'s
+`target_by_destination_ip(ip)` and its bulk form
+`targets_by_destination_ips(ips)` answer it: for each target, compute its
+`destination_ip()` (already indexed via `ix_hops_ip`, since it reads the
+final hop of the most recent `reached=1` trace) and check whether that
+equals the address being asked about — a scan over targets (typically a
+handful to a few dozen), each an indexed lookup, rather than one raw SQL
+join trying to encode "final hop of the most recent trace" as a single
+query, which would risk matching an *intermediate* hop shared by several
+targets' paths instead of the actual destination.
+
+`api.get_flow_records()` calls `targets_by_destination_ips()` once per
+request, over every distinct source and destination IP already present in
+that page's flow rows, and stamps `src_target_id`/`dst_target_id` onto
+each record. This means the frontend's "→ Route" button's enabled/disabled
+state is known the instant the table renders — no per-row round trip when
+a user clicks it, and no dead click. `netflow.js`'s `drawTable()` renders
+an active `button.linkish` when `dst_target_id` is set, or a greyed `—`
+with an explanatory tooltip when it isn't.
+
+The cross-tab jump itself has no dedicated backend endpoint — it is pure
+frontend state hand-off. `netpath.js` exports `activate(opts)` on
+`App.pages.netpath` (alongside the existing `init`/`refresh`); calling it
+with `{targetId, t0, t1}` sets `view.targetId`, clears pinned/expanded/
+zoom state left over from whatever was previously showing, and calls the
+existing `setWindow(t0, t1, false)` to move the time window and trigger a
+refresh. `App.selectTab(name)` (`app.js`) already calls `page.activate()`
+with no arguments on every ordinary tab switch — a pre-existing hook that
+happened to have no implementation on the NetPath page before this
+feature — so the click handler in `netflow.js` calls `activate()` with
+the real options *before* `App.selectTab('netpath')`: the first refresh
+triggered inside `activate()` no-ops (`refresh()` returns immediately when
+`App.state.tab !== 'netpath'`), and `selectTab`'s own subsequent
+`refreshNow('netpath')` does the actual fetch, now against the
+already-updated target/window state. The window itself pads ±5 minutes
+around the flow's own timestamp — a single flow record is a point in
+time, but the route graph needs a span to draw traces from.
 
 ---
 

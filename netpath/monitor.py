@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .db import Database
 from .eventlog import DNS, ERROR, NullLog, SYSTEM, TRACE
-from .namelookup import reverse
-from .tracer import TraceResult, expected_budget, run_trace
+from .namelookup import asn_lookup, reverse
+from .tracer import TraceResult, expected_budget, ping, run_trace
 
 
 def classify(result: TraceResult, warn_rtt_ms: float, warn_loss: float) -> str:
@@ -434,3 +434,220 @@ class Resolver:
         with self._lock:
             self._pending.discard(ip)
             self._started.pop(ip, None)
+
+
+class AsnResolver:
+    """Fills in ASN/organization for hop addresses, out of band — the same
+    pattern as Resolver, against the longer-lived asn_cache table instead of
+    the hostnames cache, since ASN assignment changes far less often than a
+    PTR record. Targets exactly the addresses Resolver already names
+    (db.distinct_hop_ips()), so there is no separate IP-discovery mechanism:
+    every hop that gets a reverse-DNS name is a candidate for an ASN too.
+    """
+
+    def __init__(self, db: Database, app_db, workers: int = 4,
+                 poll_s: float = 30.0, timeout_s: float = 3.0,
+                 cache_ttl_s: float = 30 * 86400, server: str = "",
+                 on_resolved=None, log=None):
+        self.db = db
+        self.app_db = app_db
+        self.workers = workers
+        self.poll_s = poll_s
+        self.timeout_s = timeout_s
+        self.cache_ttl_s = cache_ttl_s
+        self.server = server or ""
+        self.on_resolved = on_resolved
+        self.log = log or NullLog()
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._pending: set[str] = set()
+        self._lock = threading.Lock()
+
+    def configure(self, workers: int, timeout_s: float,
+                  cache_ttl_s: float | None = None,
+                  server: str | None = None) -> None:
+        self.timeout_s = float(timeout_s)
+        if cache_ttl_s:
+            self.cache_ttl_s = float(cache_ttl_s)
+        if server is not None:
+            self.server = server or ""
+        workers = max(1, int(workers))
+        if workers != self.workers:
+            previous = self._executor
+            self._executor = ThreadPoolExecutor(max_workers=workers)
+            self.workers = workers
+            previous.shutdown(wait=False)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="netpath-asn", daemon=True)
+        self._thread.start()
+        self.log.add(SYSTEM, f"ASN/owner resolver started "
+                             f"({self.workers} threads, {self.timeout_s:.0f}s timeout)")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def shutdown(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def inflight(self) -> set[str]:
+        with self._lock:
+            return set(self._pending)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                batch = self.app_db.unknown_asn_ips(
+                    self.db.distinct_hop_ips(), self.cache_ttl_s)[:40]
+                for ip in batch:
+                    with self._lock:
+                        if ip in self._pending:
+                            continue
+                        self._pending.add(ip)
+                    self._executor.submit(self._resolve, ip)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            self._stop.wait(self.poll_s)
+
+    def _resolve(self, ip: str) -> None:
+        try:
+            asn, org = asn_lookup(ip, server=self.server, timeout_s=self.timeout_s)
+        except Exception:
+            asn, org = None, None
+        self.log.add(DNS, f"ASN {ip} → "
+                          f"{f'AS{asn} ({org})' if asn else 'none/private'}")
+        try:
+            self.app_db.set_asn(ip, asn, org)
+            if self.on_resolved:
+                self.on_resolved(ip, asn, org)
+        except Exception:
+            pass
+        with self._lock:
+            self._pending.discard(ip)
+
+
+class HopProber:
+    """Continuous, MTR-style per-hop probing for targets that opt in.
+
+    A scheduled traceroute (Monitor) says what the path looked like at one
+    moment; this fills the gaps between those moments with a steady stream of
+    single pings to every hop already seen on a target's most recent trace,
+    so loss/RTT stats accumulate continuously instead of only refreshing at
+    the traceroute's own interval. It learns which addresses to probe from
+    Monitor's completed traces rather than discovering hops on its own — no
+    separate topology logic to keep in sync.
+
+    Off by default, opt-in per target: this adds a sustained stream of ICMP
+    traffic to every hop of every enabled target's path, which is a real cost
+    on a production network, not just background CPU.
+    """
+
+    def __init__(self, db: Database, workers: int = 8, interval_s: float = 4.0,
+                 timeout_s: float = 1.5, log=None):
+        self.db = db
+        self.workers = workers
+        self.interval_s = interval_s
+        self.timeout_s = timeout_s
+        self.log = log or NullLog()
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._enabled: set[int] = set()
+        self._hops: dict[int, set[str]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def set_enabled(self, target_id: int, enabled: bool) -> None:
+        with self._lock:
+            if enabled:
+                self._enabled.add(target_id)
+            else:
+                self._enabled.discard(target_id)
+                self._hops.pop(target_id, None)
+        if enabled:
+            self.refresh_hops(target_id)
+
+    def sync_enabled(self, targets) -> None:
+        """Reconcile the enabled set with each target row's own flag, e.g. on
+        startup or after targets are reloaded from the database."""
+        with self._lock:
+            self._enabled = {t["id"] for t in targets
+                             if "hop_probe_enabled" in t.keys() and t["hop_probe_enabled"]}
+
+    def refresh_hops(self, target_id: int) -> None:
+        """Learn which hop IPs to probe from the target's latest completed
+        trace. Meant to be called from Monitor's on_complete callback, so
+        continuous probing always tracks the current path. Clears
+        accumulated stats for any hop that has dropped off the path, so a
+        route change never blends old-path and new-path numbers together."""
+        with self._lock:
+            if target_id not in self._enabled:
+                return
+        try:
+            last = self.db.last_trace(target_id)
+            if last is None:
+                return
+            rows = self.db.hop_rows_for_trace(last["id"])
+        except Exception:
+            return
+        current = {row["ip"] for row in rows if row["ip"]}
+        with self._lock:
+            previous = self._hops.get(target_id, set())
+            self._hops[target_id] = current
+        if previous and previous != current:
+            try:
+                self.db.reset_hop_stats(target_id, current)
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stop.clear()
+        try:
+            self.sync_enabled(self.db.targets())
+            for target_id in list(self._enabled):
+                self.refresh_hops(target_id)
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._loop, name="netpath-hopprobe", daemon=True)
+        self._thread.start()
+        self.log.add(SYSTEM, f"Continuous hop probing started "
+                             f"({self.workers} threads, every {self.interval_s:.0f}s)")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def shutdown(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                jobs = [(target_id, ip) for target_id, ips in self._hops.items()
+                        if target_id in self._enabled for ip in ips]
+            for target_id, ip in jobs:
+                if self._stop.is_set():
+                    break
+                try:
+                    self._executor.submit(self._probe_one, target_id, ip)
+                except RuntimeError:
+                    break
+            self._stop.wait(self.interval_s)
+
+    def _probe_one(self, target_id: int, ip: str) -> None:
+        try:
+            result = ping(ip, timeout_s=self.timeout_s)
+            self.db.record_hop_probe(target_id, ip, result)
+        except Exception:
+            pass

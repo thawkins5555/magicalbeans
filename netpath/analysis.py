@@ -39,6 +39,8 @@ class PathNode:
     is_destination: bool = False
     hostname: str | None = None
     hostname_known: bool = False
+    asn: int | None = None
+    asn_org: str | None = None
 
     @property
     def key(self) -> tuple[int, str | None]:
@@ -114,7 +116,9 @@ class Topology:
 
 
 def build_topology(hop_rows, dest_ip: str | None = None,
-                   hostnames: dict[str, str | None] | None = None) -> Topology:
+                   hostnames: dict[str, str | None] | None = None,
+                   asn_data: dict[str, tuple[int | None, str | None]] | None = None
+                   ) -> Topology:
     """Collapse many traces into one graph.
 
     A node is a (TTL, address) pair. Two nodes in the same TTL column means the
@@ -153,9 +157,11 @@ def build_topology(hop_rows, dest_ip: str | None = None,
         signatures[sig] += 1
 
     hostnames = hostnames or {}
+    asn_data = asn_data or {}
     topo = Topology(total_traces=len(per_trace), distinct_paths=len(signatures))
     for key, count in node_counts.items():
         ttl, ip = key
+        asn, asn_org = asn_data.get(ip, (None, None))
         topo.nodes[key] = PathNode(
             ttl=ttl,
             ip=ip,
@@ -165,6 +171,8 @@ def build_topology(hop_rows, dest_ip: str | None = None,
             is_destination=bool(dest_ip) and ip == dest_ip,
             hostname=hostnames.get(ip),
             hostname_known=ip in hostnames,
+            asn=asn,
+            asn_org=asn_org,
         )
     for (src, dst), count in edge_counts.items():
         topo.edges.append(PathEdge(src=src, dst=dst, traces=count))

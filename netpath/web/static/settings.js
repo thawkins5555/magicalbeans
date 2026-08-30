@@ -10,6 +10,9 @@
     App.el('set-dns-cache').value = s.dns_cache_days;
     App.el('set-dns-server').value = s.dns_server || '';
     App.el('set-dns-nslookup').checked = s.dns_use_nslookup !== false;
+    App.el('set-asn-enabled').checked = s.asn_enabled !== false;
+    App.el('set-asn-cache').value = s.asn_cache_days;
+    App.el('set-asn-server').value = s.asn_server || '';
     App.el('set-refresh-netpath').value = s.netpath_refresh_s;
     App.el('set-refresh-netflow').value = s.netflow_refresh_s;
     App.el('set-refresh-syslog').value = s.syslog_refresh_s;
@@ -168,6 +171,9 @@
       dns_cache_days: Number(App.el('set-dns-cache').value),
       dns_server: App.el('set-dns-server').value.trim(),
       dns_use_nslookup: App.el('set-dns-nslookup').checked,
+      asn_enabled: App.el('set-asn-enabled').checked,
+      asn_cache_days: Number(App.el('set-asn-cache').value),
+      asn_server: App.el('set-asn-server').value.trim(),
       netpath_refresh_s: Number(App.el('set-refresh-netpath').value),
       netflow_refresh_s: Number(App.el('set-refresh-netflow').value),
       syslog_refresh_s: Number(App.el('set-refresh-syslog').value),

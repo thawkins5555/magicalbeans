@@ -113,8 +113,11 @@
         ? 'transparent' : STATUS_COLOR[target.status];
       if (target.status === 'none') dot.style.border = '1px solid var(--faint)';
       const text = document.createElement('span');
-      text.innerHTML = `<div class="name">${escape(target.label)}</div>` +
-                       `<div class="host">${escape(target.host)}</div>`;
+      text.innerHTML = `<div class="name">${escape(target.label)}` +
+                       (target.hop_probe_enabled
+                         ? ' <span title="Continuous per-hop probing is on for this destination" style="color:var(--accent);font-size:9px;font-weight:700;">MTR</span>'
+                         : '') +
+                       `</div><div class="host">${escape(target.host)}</div>`;
       li.append(dot, text);
       list.appendChild(li);
     }
@@ -143,7 +146,16 @@
       <fieldset><legend>THRESHOLDS</legend>
         ${field('Warn above (ms)', 'f-warn-rtt', t.warn_rtt_ms ?? d.default_warn_rtt_ms, 'type=number min=1')}
         ${field('Warn at loss (%)', 'f-warn-loss', t.warn_loss ?? d.default_warn_loss, 'type=number min=0 max=100')}
-      </fieldset>`;
+      </fieldset>
+      ${target ? `
+      <fieldset><legend>CONTINUOUS PROBING</legend>
+        <label class="check"><input type="checkbox" id="f-hop-probe" ${t.hop_probe_enabled ? 'checked' : ''}>
+          Ping every hop continuously for live loss/RTT (MTR-style)</label>
+        <p class="hint">Adds a steady stream of ICMP pings to each hop on this
+          path, on top of the scheduled traceroute above. Off by default —
+          only turn this on for paths you want to watch closely, since it is
+          sustained extra traffic for as long as it stays on.</p>
+      </fieldset>` : ''}`;
   }
 
   function wireBudget(box) {
@@ -163,6 +175,7 @@
 
   function readTargetForm(box) {
     const value = (id) => box.querySelector(id).value;
+    const probeEl = box.querySelector('#f-hop-probe');
     return {
       host: value('#f-host').trim(),
       label: value('#f-label').trim(),
@@ -172,6 +185,9 @@
       timeout_s: Number(value('#f-timeout')),
       warn_rtt_ms: Number(value('#f-warn-rtt')),
       warn_loss: Number(value('#f-warn-loss')),
+      // Only present on the edit form — a target must exist before it can
+      // opt in to continuous probing.
+      ...(probeEl ? { hop_probe_enabled: probeEl.checked } : {}),
     };
   }
 
@@ -448,12 +464,23 @@
 
     const tip = [`Address   ${node.label}`];
     if (node.hostname) tip.push(`Name      ${node.hostname}`);
+    if (node.asn) {
+      tip.push(`Network   AS${node.asn}${node.asn_org ? ` (${node.asn_org})` : ''}`);
+    }
     if (node.rtt) tip.push(`Avg RTT   ${node.rtt.toFixed(1)} ms`);
     if (!node.is_timeout) tip.push(`Loss      ${Math.round(node.loss || 0)}%`);
     if (node.traces) {
       tip.push(`Seen in   ${node.traces} traces (${Math.round(node.share * 100)}%)`);
     }
     if (node.refusal) tip.push(`Refused   ${node.refusal} — ${node.refusal_text}`);
+    if (node.probe_count) {
+      const rttMin = node.probe_rtt_min, rttAvg = node.probe_rtt_avg, rttMax = node.probe_rtt_max;
+      tip.push(`Continuous ${node.probe_count} probes, ` +
+        `${Math.round(node.probe_loss || 0)}% loss`);
+      if (rttAvg !== null && rttAvg !== undefined) {
+        tip.push(`RTT (live) ${rttMin.toFixed(1)}/${rttAvg.toFixed(1)}/${rttMax.toFixed(1)} ms (min/avg/max)`);
+      }
+    }
     attachTip(g, tip.join('\n'));
     return g;
   }
@@ -973,6 +1000,23 @@
     drawRoute();
   }
 
+  /* Entry point for other tabs (NetFlow's "view route" jump): select a
+     target and, optionally, a time window, without waiting for the user to
+     click it in the target list. Safe to call with no args — App.selectTab
+     already calls this with none on every ordinary tab switch. */
+  function activate(opts) {
+    if (!opts || !opts.targetId) return;
+    view.targetId = opts.targetId;
+    view.pinned = null;
+    view.expanded.clear();
+    view.expandAll = false;
+    view.userZoom = false;
+    view.pan = { x: 0, y: 0 };
+    if (opts.t0 !== undefined && opts.t1 !== undefined) {
+      setWindow(opts.t0, opts.t1, false);
+    }
+  }
+
   function init() {
     App.fillRanges(App.el('range-select'), 'Last hour');
     App.el('range-select').onchange = resetWindow;
@@ -1032,5 +1076,5 @@
     resetWindow();
   }
 
-  App.pages.netpath = { init, refresh };
+  App.pages.netpath = { init, refresh, activate };
 })();

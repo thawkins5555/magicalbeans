@@ -334,6 +334,7 @@
     { key: 'interfaces', label: 'In/Out', sortable: false,
       value: (r) => `${r.in_if} / ${r.out_if}` },
     { key: 'exporter', label: 'Exporter' },
+    { key: 'route', label: '', sortable: false, width: 84, value: () => '' },
   ];
 
   /* Which column the table is ordered by. Separate from the selector above it:
@@ -362,6 +363,33 @@
       ];
       tr.innerHTML = cells.map((value, index) =>
         `<td class="${COLUMNS[index].numeric ? 'num' : ''}">${value}</td>`).join('');
+
+      // Flow-to-path correlation: jump straight to the NetPath route that
+      // this conversation's destination was last traced over. Always shown,
+      // greyed when no target has ever traced that address, so the control's
+      // position in the row stays constant and its existence is discoverable.
+      const routeCell = document.createElement('td');
+      if (record.dst_target_id) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'linkish';
+        btn.title = `View the NetPath route to ${dst}`;
+        btn.textContent = '→ Route';
+        btn.onclick = (event) => {
+          event.stopPropagation();
+          App.pages.netpath.activate({
+            targetId: record.dst_target_id,
+            t0: record.ts - 300, t1: record.ts + 300,
+          });
+          App.selectTab('netpath');
+        };
+        routeCell.appendChild(btn);
+      } else {
+        routeCell.textContent = '—';
+        routeCell.style.color = 'var(--faint)';
+        routeCell.title = 'No NetPath target has traced a route to this destination';
+      }
+      tr.appendChild(routeCell);
 
       const tip = [
         new Date(record.ts * 1000).toLocaleString(),

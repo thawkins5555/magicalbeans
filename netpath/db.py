@@ -58,6 +58,18 @@ CREATE TABLE IF NOT EXISTS hops (
 CREATE INDEX IF NOT EXISTS ix_hops_trace ON hops(trace_id, ttl);
 CREATE INDEX IF NOT EXISTS ix_hops_ip ON hops(ip);
 
+CREATE TABLE IF NOT EXISTS hop_stats (
+    target_id  INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    ip         TEXT    NOT NULL,
+    probes     INTEGER NOT NULL DEFAULT 0,
+    lost       INTEGER NOT NULL DEFAULT 0,
+    rtt_sum    REAL    NOT NULL DEFAULT 0,
+    rtt_min    REAL,
+    rtt_max    REAL,
+    updated_ts REAL    NOT NULL,
+    PRIMARY KEY (target_id, ip)
+);
+
 -- NetPath's own settings. Global ones are in app.db; NetFlow and Syslog keep
 -- theirs in their own files.
 CREATE TABLE IF NOT EXISTS settings (
@@ -115,6 +127,9 @@ class Database:
         if "timeout_s" not in targets:
             self._conn.execute(
                 "ALTER TABLE targets ADD COLUMN timeout_s REAL NOT NULL DEFAULT 2.0")
+        if "hop_probe_enabled" not in targets:
+            self._conn.execute(
+                "ALTER TABLE targets ADD COLUMN hop_probe_enabled INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -174,6 +189,7 @@ class Database:
         allowed = {
             "host", "label", "interval_s", "max_hops", "probes",
             "warn_rtt_ms", "warn_loss", "timeout_s", "enabled",
+            "hop_probe_enabled",
         }
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
@@ -191,6 +207,7 @@ class Database:
             self._conn.execute("DELETE FROM hops WHERE trace_id IN "
                                "(SELECT id FROM traces WHERE target_id=?)", (target_id,))
             self._conn.execute("DELETE FROM traces WHERE target_id=?", (target_id,))
+            self._conn.execute("DELETE FROM hop_stats WHERE target_id=?", (target_id,))
             self._conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
             self._conn.commit()
 
@@ -335,6 +352,102 @@ class Database:
                 (target_id,),
             ).fetchone()
         return row["ip"] if row else None
+
+    def target_by_destination_ip(self, ip: str) -> sqlite3.Row | None:
+        """The target whose most recent successful trace ended exactly at this IP.
+
+        Reuses destination_ip()'s "final hop of the most recent reached trace"
+        definition rather than matching any hop along the path, so a shared
+        upstream router does not make every flow through it look like it went
+        to the same place. Target counts are small (a handful to a few dozen),
+        so a per-target scan of already-indexed queries is simpler and safer
+        than trying to encode the same "final hop" logic in one raw join.
+        """
+        with self._lock:
+            targets = self._conn.execute("SELECT id FROM targets").fetchall()
+        best_ts, best_id = None, None
+        for row in targets:
+            target_id = row["id"]
+            if self.destination_ip(target_id) != ip:
+                continue
+            last = self.last_trace(target_id)
+            if last is None:
+                continue
+            if best_ts is None or last["started_ts"] > best_ts:
+                best_ts, best_id = last["started_ts"], target_id
+        return self.target(best_id) if best_id is not None else None
+
+    def targets_by_destination_ips(self, ips) -> dict[str, int]:
+        """Bulk form of target_by_destination_ip, for annotating many flow rows
+        without one query per row."""
+        wanted = set(ips)
+        if not wanted:
+            return {}
+        with self._lock:
+            targets = self._conn.execute("SELECT id FROM targets").fetchall()
+        best: dict[str, tuple[float, int]] = {}
+        for row in targets:
+            target_id = row["id"]
+            ip = self.destination_ip(target_id)
+            if ip not in wanted:
+                continue
+            last = self.last_trace(target_id)
+            if last is None:
+                continue
+            ts = last["started_ts"]
+            if ip not in best or ts > best[ip][0]:
+                best[ip] = (ts, target_id)
+        return {ip: target_id for ip, (ts, target_id) in best.items()}
+
+    # -------------------------------------------------------- continuous probing
+
+    def record_hop_probe(self, target_id: int, ip: str, result) -> None:
+        """Upsert running probe counters for one hop. Never stores per-probe
+        rows — probes/lost/rtt_sum/rtt_min/rtt_max are cumulative counters, so
+        a target probed every few seconds for days does not bloat the table."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT probes, lost, rtt_sum, rtt_min, rtt_max FROM hop_stats"
+                " WHERE target_id=? AND ip=?", (target_id, ip)).fetchone()
+            probes = (row["probes"] if row else 0) + result.sent
+            lost = (row["lost"] if row else 0) + result.lost
+            rtt_sum = (row["rtt_sum"] if row else 0.0) + (result.rtt_ms or 0.0)
+            prev_min = row["rtt_min"] if row else None
+            prev_max = row["rtt_max"] if row else None
+            rtt_min = result.rtt_ms if result.rtt_ms is not None and (
+                prev_min is None or result.rtt_ms < prev_min) else prev_min
+            rtt_max = result.rtt_ms if result.rtt_ms is not None and (
+                prev_max is None or result.rtt_ms > prev_max) else prev_max
+            self._conn.execute(
+                "INSERT INTO hop_stats(target_id, ip, probes, lost, rtt_sum,"
+                " rtt_min, rtt_max, updated_ts) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(target_id, ip) DO UPDATE SET probes=excluded.probes,"
+                " lost=excluded.lost, rtt_sum=excluded.rtt_sum,"
+                " rtt_min=excluded.rtt_min, rtt_max=excluded.rtt_max,"
+                " updated_ts=excluded.updated_ts",
+                (target_id, ip, probes, lost, rtt_sum, rtt_min, rtt_max, time.time()))
+            self._conn.commit()
+
+    def hop_stats_for_target(self, target_id: int) -> dict[str, sqlite3.Row]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM hop_stats WHERE target_id=?", (target_id,)).fetchall()
+        return {row["ip"]: row for row in rows}
+
+    def reset_hop_stats(self, target_id: int, keep_ips) -> None:
+        """Drop stats for hops no longer on the current path, so a route
+        change never blends old-path and new-path numbers together."""
+        keep = set(keep_ips)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip FROM hop_stats WHERE target_id=?", (target_id,)).fetchall()
+            stale = [row["ip"] for row in rows if row["ip"] not in keep]
+            if stale:
+                marks = ",".join("?" * len(stale))
+                self._conn.execute(
+                    f"DELETE FROM hop_stats WHERE target_id=? AND ip IN ({marks})",
+                    (target_id, *stale))
+                self._conn.commit()
 
     def trace_nearest(self, target_id: int, ts: float,
                       max_delta: float | None = None):

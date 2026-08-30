@@ -591,4 +591,4 @@ each database holds and why, and what bounds their growth. **Delete traces older
 
 ## Worth adding next
 
-Flow-to-path correlation, so a conversation in the NetFlow tab can jump to the route it took; MTR-style continuous probing for per-hop loss statistics rather than one traceroute at a time; alerting on status transitions; ASN and owner lookup alongside the reverse-DNS names, so you can see where a route leaves your provider; a second graph pane for comparing two destinations that share upstream hops.
+Alerting on status transitions; a second graph pane for comparing two destinations that share upstream hops.

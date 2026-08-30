@@ -383,6 +383,18 @@
         nslookup finds a name, so will this. The Debug log records which method answered.</p>
     </fieldset>
     <fieldset>
+      <legend>ASN / OWNER LOOKUP</legend>
+      <label class="check"><input type="checkbox" id="set-asn-enabled"> Look up the network/owner for hop addresses</label>
+      <label>Cache answers for <input type="number" id="set-asn-cache" min="1" max="365"> days</label>
+      <label>Query server <input id="set-asn-server" placeholder="blank = a public resolver"></label>
+      <p class="hint">Shown beside the hostname in NetPath's route graph, so you can see which
+        network a route is on and where it leaves your own provider. Uses Team Cymru's
+        DNS-based whois, which needs a resolver that can reach the public internet — this may
+        need to be a different server than the one configured for reverse DNS above if that one
+        only answers for internal addresses. Private, loopback and carrier-grade-NAT addresses
+        are never looked up: no query is ever sent for them.</p>
+    </fieldset>
+    <fieldset>
       <legend>REFRESH RATES</legend>
       <label>NetPath <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
       <label>NetFlow <input type="number" id="set-refresh-netflow" min="1" max="3600" step="5"> s</label>

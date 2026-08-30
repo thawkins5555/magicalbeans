@@ -69,6 +69,25 @@ traces it appeared in.
   **Fit** to reframe. Wheel zoom is anchored on the pointer, so the hop under
   the cursor stays where it is. The level is shown as a percentage and survives
   refreshes, so live data does not throw you back to fit-all.
+- **ASN and owner**, when known, appear in a hop's tooltip beneath its name —
+  `AS15169 (GOOGLE, US)` — so you can see which network a route is on and
+  where it leaves your own provider.
+
+### Continuous per-hop probing (MTR-style)
+
+A destination can opt in to continuous probing — off by default, from its
+Edit dialog — which pings every hop on its current path every few seconds,
+independent of the scheduled traceroute above. Where a scheduled trace only
+samples the path once per interval, this builds up loss and RTT statistics
+between those samples too. A hop's tooltip then carries a second, live line —
+probe count, loss %, and min/avg/max RTT — alongside the per-traceroute
+numbers. When the path changes, statistics for hops that dropped off it are
+cleared rather than carried forward, so a route change is never disguised as
+an improvement or a regression on the old path.
+
+This is real, continuous ICMP traffic for as long as it stays on, which is
+why it defaults to off — turn it on for the destinations you want to watch
+closely, not every one.
 
 ### Timeline
 
@@ -176,6 +195,17 @@ in them sort to the bottom whichever way the column points.
 
 Filters for source, destination, port, protocol and exporter apply to all three
 at once. Clicking a bar filters to it.
+
+### Flow-to-path correlation
+
+A **→ Route** link on a flow record jumps straight to the NetPath route that
+traffic actually took, when one was ever traced to that destination —
+matched against each destination's real, last-known traced IP, not just its
+configured hostname. The link is greyed out rather than hidden when no
+destination has ever been traced there, so a flow to an untraced address
+still shows the control, just not an active one. Following it switches to
+the NetPath tab with that destination selected and the time window centred
+on the flow's own timestamp.
 
 ### Port names
 
@@ -485,15 +515,17 @@ Configuration sits at the level it belongs to.
 
 | Where | What |
 | --- | --- |
-| **Settings** tab | Reverse DNS, refresh interval, data files and size caps, maintenance |
+| **Settings** tab | Reverse DNS, ASN/owner lookup, refresh interval, data files and size caps, maintenance |
 | **Settings** button, top right of NetPath | Concurrent traces, retention, defaults for new destinations |
 | **Settings** button, top right of NetFlow | Listener, sampling, exporters, flow storage and display |
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
-| **Add** / **Edit** on a destination | That destination's own probe settings |
+| **Add** / **Edit** on a destination | That destination's own probe settings, and — Edit only — continuous per-hop probing |
 
 The Settings tab holds only what crosses module boundaries. Reverse DNS is the
 clearest case: NetPath uses it to name hop addresses and NetFlow to name flow
-endpoints.
+endpoints. ASN/owner lookup sits beside it for the same reason and can name a
+different query server, since a resolver good enough for internal reverse DNS
+may not be able to reach the public internet, which the ASN lookup needs.
 
 **Database size caps** — one per database, defaulting to 512 MB for traces,
 2 GB for flows, 1 GB for syslog and 256 MB for IPAM — are checked every 15

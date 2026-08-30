@@ -332,6 +332,51 @@ def expected_budget(max_hops: int, probes: int, timeout_s: float = 2.0) -> float
     return max_hops * probes * timeout_s + 15
 
 
+_UNIX_PING_TIME = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
+_WIN_PING_TIME = re.compile(r"time[=<]\s*(\d+)\s*ms", re.IGNORECASE)
+
+
+@dataclass
+class PingResult:
+    """One ICMP echo probe to a single address, for continuous hop probing
+    (MTR-style loss/RTT stats) rather than a full multi-hop traceroute."""
+
+    ip: str
+    sent: int
+    lost: int
+    rtt_ms: float | None
+    error: str | None = None
+
+
+def _ping_command(ip: str, timeout_s: float) -> list[str]:
+    exe = shutil.which("ping") or "ping"
+    if IS_WINDOWS:
+        return [exe, "-n", "1", "-w", str(max(1, int(timeout_s * 1000))), ip]
+    return [exe, "-n", "-c", "1", "-W", str(max(1, int(timeout_s))), ip]
+
+
+def ping(ip: str, timeout_s: float = 1.5) -> PingResult:
+    """One ICMP echo probe. Never raises — a failure comes back as full loss,
+    the same convention run_trace() uses for traceroute."""
+    command = _ping_command(ip, timeout_s)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s + 2,
+            **hidden(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return PingResult(ip, 1, 1, None, error=str(exc))
+    output = completed.stdout + "\n" + completed.stderr
+    pattern = _WIN_PING_TIME if IS_WINDOWS else _UNIX_PING_TIME
+    match = pattern.search(output)
+    if match:
+        return PingResult(ip, 1, 0, float(match.group(1)))
+    return PingResult(ip, 1, 1, None)
+
+
 def resolve(host: str) -> str | None:
     try:
         return socket.gethostbyname(host)

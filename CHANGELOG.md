@@ -6,6 +6,32 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.8.0 — Flow-to-path correlation, continuous per-hop probing, ASN/owner lookup
+
+- **Flow-to-path correlation.** Every row in the NetFlow table now carries a
+  "→ Route" link to the NetPath route that traffic actually took, when one
+  was ever traced — matched against each target's real, last-known
+  destination IP, not just its configured hostname. No matching route
+  greys the link out rather than hiding it, so the feature stays
+  discoverable. Jumping over selects the matching destination in NetPath
+  and centers its time window on the flow's own timestamp.
+- **Continuous, MTR-style per-hop probing**, opt-in per destination (off by
+  default — it adds a steady stream of ICMP pings to every hop of the path,
+  independent of the scheduled traceroute). Turn it on from a destination's
+  Edit dialog; the route graph's hop tooltips then show live cumulative
+  probe count, loss % and min/avg/max RTT alongside the per-traceroute
+  numbers. A route change automatically clears stats for hops that dropped
+  off the path, so old and new numbers are never blended together.
+- **ASN and organization lookup** for every hop, shown next to the
+  reverse-DNS name, so you can see where a route leaves your provider —
+  "AS15169 (GOOGLE, US)" and similar. Uses Team Cymru's DNS-based whois, on
+  its own long-lived cache (30 days by default) separate from the hostname
+  cache, since ownership changes far less often than a PTR record. Private,
+  loopback, link-local and carrier-grade-NAT addresses are never looked up
+  at all — no query naming an internal address ever leaves the host.
+  Configurable, including a dedicated query server, under Settings →
+  ASN / Owner Lookup.
+
 ### 4.7.0 — Scope sort by IP, half-width buttons, IPAM as a DNS fallback
 
 - **Scopes sort by IP address** too now, alongside Least available (the

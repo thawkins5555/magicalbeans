@@ -51,6 +51,18 @@ CREATE TABLE IF NOT EXISTS hostnames (
 );
 CREATE INDEX IF NOT EXISTS ix_hostnames_resolved ON hostnames(resolved_ts);
 
+-- ASN/organization for hop addresses, alongside the reverse-DNS name above.
+-- A standalone table rather than columns on hostnames: ASN assignment
+-- changes far less often than a PTR record, so it wants its own, much
+-- longer, TTL and its own pruning schedule.
+CREATE TABLE IF NOT EXISTS asn_cache (
+    ip          TEXT PRIMARY KEY,
+    asn         INTEGER,
+    org         TEXT,
+    resolved_ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_asn_cache_resolved ON asn_cache(resolved_ts);
+
 -- Housekeeping this file needs about itself. Not user-visible, and separate
 -- from `settings` so a marker can never be mistaken for a setting.
 CREATE TABLE IF NOT EXISTS meta (
@@ -62,6 +74,7 @@ CREATE TABLE IF NOT EXISTS meta (
 MIGRATION_MARKER = "migrated_from_netpath_db"
 
 HOSTNAME_TTL_S = 7 * 86400
+ASN_TTL_S = 30 * 86400
 
 # Global: read by more than one module, so it belongs to none of them.
 GLOBAL_DEFAULTS = {
@@ -71,6 +84,9 @@ GLOBAL_DEFAULTS = {
     "dns_cache_days": 7,
     "dns_server": "",              # blank = whatever this machine is set to use
     "dns_use_nslookup": True,
+    "asn_enabled": True,
+    "asn_cache_days": 30,
+    "asn_server": "",              # blank = a public recursive resolver
     # Per module, because they want very different rates: the route graph is
     # cheap and wants to feel live, the flow charts are expensive aggregations
     # that barely change in a few seconds, and the debug page is watching
@@ -297,6 +313,62 @@ class AppDatabase:
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM hostnames WHERE resolved_ts < ?", (cutoff,))
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    # -------------------------------------------------------------- asn_cache
+
+    def asn_info(self, ips) -> dict[str, tuple[int | None, str | None]]:
+        """Cached (asn, org) per address. A missing key means "not looked up
+        yet"; a (None, None) value means "looked up, nothing global/found"."""
+        ips = [ip for ip in set(ips) if ip]
+        if not ips:
+            return {}
+        found: dict[str, tuple[int | None, str | None]] = {}
+        with self._lock:
+            for chunk in range(0, len(ips), 400):
+                batch = ips[chunk:chunk + 400]
+                marks = ",".join("?" * len(batch))
+                rows = self._conn.execute(
+                    f"SELECT ip, asn, org FROM asn_cache WHERE ip IN ({marks})",
+                    batch).fetchall()
+                for row in rows:
+                    found[row["ip"]] = (row["asn"], row["org"])
+        return found
+
+    def unknown_asn_ips(self, ips, cache_ttl_s: float | None = None) -> list[str]:
+        """Of the addresses given, those with no fresh cached ASN answer.
+        Same shape as unknown_ips(), against the longer-lived asn_cache."""
+        ips = [ip for ip in dict.fromkeys(ips) if ip]
+        if not ips:
+            return []
+        cutoff = time.time() - (cache_ttl_s or ASN_TTL_S)
+        known: set[str] = set()
+        with self._lock:
+            for start in range(0, len(ips), 400):
+                batch = ips[start:start + 400]
+                marks = ",".join("?" * len(batch))
+                rows = self._conn.execute(
+                    f"SELECT ip FROM asn_cache WHERE ip IN ({marks})"
+                    f" AND resolved_ts >= ?", (*batch, cutoff)).fetchall()
+                known.update(row["ip"] for row in rows)
+        return [ip for ip in ips if ip not in known]
+
+    def set_asn(self, ip: str, asn: int | None, org: str | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO asn_cache(ip, asn, org, resolved_ts) VALUES (?,?,?,?)"
+                " ON CONFLICT(ip) DO UPDATE SET asn=excluded.asn,"
+                " org=excluded.org, resolved_ts=excluded.resolved_ts",
+                (ip, asn, org, time.time()),
+            )
+            self._conn.commit()
+
+    def prune_asn_cache(self, older_than_days: float) -> int:
+        cutoff = time.time() - older_than_days * 86400
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM asn_cache WHERE resolved_ts < ?", (cutoff,))
             self._conn.commit()
         return cur.rowcount or 0
 

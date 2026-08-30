@@ -20,7 +20,7 @@ from ..eventlog import SYSTEM, EventLog
 from ..flowdb import FlowDatabase
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
-from ..monitor import Monitor, Resolver
+from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
 
@@ -48,10 +48,12 @@ class Service:
         self.syslog_settings = self.syslog_db.settings()
         self.ipam_settings = self.ipam_db.settings()
 
+        self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
             self.db,
             workers=int(self.settings["trace_workers"]),
             log=self.log,
+            on_complete=self._on_trace_complete,
         )
         self.resolver = Resolver(
             self.db,
@@ -64,6 +66,14 @@ class Service:
             server=str(self.settings.get("dns_server", "")),
             use_nslookup=bool(self.settings.get("dns_use_nslookup", True)),
             ipam_db=self.ipam_db,
+        )
+        self.asn_resolver = AsnResolver(
+            self.db,
+            self.app_db,
+            timeout_s=float(self.settings.get("dns_timeout_s", 3.0)),
+            cache_ttl_s=float(self.settings.get("asn_cache_days", 30)) * 86400,
+            server=str(self.settings.get("asn_server", "")),
+            log=self.log,
         )
         self.collector = Collector(self.flow_db, log=self.log)
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)
@@ -97,8 +107,11 @@ class Service:
 
     def start(self) -> None:
         self.monitor.start()
+        self.hop_prober.start()
         if self.settings.get("dns_enabled", True):
             self.resolver.start()
+        if self.settings.get("asn_enabled", True):
+            self.asn_resolver.start()
         if self.flow_settings.get("enabled", True):
             self.collector.start(self.flow_settings)
         if self.syslog_settings.get("enabled", True):
@@ -127,7 +140,9 @@ class Service:
     def shutdown(self) -> None:
         self._stop.set()
         self.monitor.shutdown()   # waits briefly for running traces to land
+        self.hop_prober.shutdown()
         self.resolver.shutdown()
+        self.asn_resolver.shutdown()
         self.collector.stop()
         self.syslog.stop()
         self.ipam.shutdown()
@@ -155,6 +170,15 @@ class Service:
             self.resolver.start()
         else:
             self.resolver.stop()
+        self.asn_resolver.configure(
+            self.asn_resolver.workers,
+            float(self.settings.get("dns_timeout_s", 3.0)),
+            float(self.settings.get("asn_cache_days", 30)) * 86400,
+            server=str(self.settings.get("asn_server", "")))
+        if self.settings.get("asn_enabled", True):
+            self.asn_resolver.start()
+        else:
+            self.asn_resolver.stop()
         self.log.add(SYSTEM, "Global settings applied")
         self.run_maintenance(force=True)
         return self.settings
@@ -309,6 +333,18 @@ class Service:
 
         return sorted(results.values(), key=sort_key)[:limit]
 
+    def _on_trace_complete(self, target_id: int) -> None:
+        """Monitor's completion hook: hand the freshly-traced hop set to the
+        continuous prober, which only acts on it if that target opted in."""
+        try:
+            self.hop_prober.refresh_hops(target_id)
+        except Exception:
+            pass
+
+    def set_hop_probe_enabled(self, target_id: int, enabled: bool) -> None:
+        self.db.update_target(target_id, hop_probe_enabled=1 if enabled else 0)
+        self.hop_prober.set_enabled(target_id, enabled)
+
     # ---------------------------------------------------------- maintenance
 
     def _extra_resolve_targets(self) -> list:
@@ -369,6 +405,8 @@ class Service:
             int(self.syslog_settings.get("max_rows", 20_000_000)))
         self.app_db.prune_hostnames(
             max(float(self.settings.get("dns_cache_days", 7)) * 4, 30))
+        self.app_db.prune_asn_cache(
+            max(float(self.settings.get("asn_cache_days", 30)) * 4, 90))
 
         self.ipam_db.prune_hosts(
             float(self.ipam_settings.get("host_retention_days", 30)))
