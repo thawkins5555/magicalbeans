@@ -411,10 +411,20 @@
   function mtrSeverity(node, target) {
     if (!target || !node.probe_count) return null;
     const loss = node.probe_loss || 0;
-    if (loss >= 100) return 'fail';
-    const rtt = node.probe_rtt_avg;
+    // probe_rtt_min is set the first time a continuous probe ever succeeds
+    // and then never cleared (db.py's record_hop_probe only ever carries it
+    // forward), so it stays a true "has this hop ever replied" even once
+    // loss has since climbed back to 100% — unlike probe_rtt_avg, which is
+    // *derived* from rtt_sum/(probes-lost) and goes null the instant
+    // cumulative loss reaches 100%, same as a hop that never answered at
+    // all. A hop that rate-limits or silently drops ICMP by nature sits at
+    // 100% loss forever without that meaning anything changed, so only a
+    // hop with a real answer on record is worth flagging for it.
+    const hasAnswered = node.probe_rtt_min !== null && node.probe_rtt_min !== undefined;
+    if (loss >= 100) return hasAnswered ? 'fail' : null;
     if (loss > target.warn_loss) return 'warn';
-    if (rtt !== null && rtt !== undefined && rtt > target.warn_rtt_ms) return 'warn';
+    if (hasAnswered && node.probe_rtt_avg !== null && node.probe_rtt_avg !== undefined
+        && node.probe_rtt_avg > target.warn_rtt_ms) return 'warn';
     return null;
   }
 

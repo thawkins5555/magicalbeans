@@ -6,6 +6,21 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.11.3 — A silent hop is no longer flagged "MTR: High Loss"
+
+- **A hop that has never once answered a continuous (MTR-style) probe no
+  longer turns red with "MTR: HIGH LOSS".** Many routers along a real path
+  rate-limit or drop ICMP by nature and sit at 100% probe loss forever —
+  that isn't a fault, and flagging it as one buried the case that actually
+  matters: a hop that used to answer and has since gone dark. The route
+  graph now only raises the red "high loss" flag at 100% loss when that
+  hop has answered at least once (`probe_rtt_min` — set the first time a
+  probe succeeds and never cleared, independent of how much loss has piled
+  up since); a hop with no answer on record keeps its ordinary coloring,
+  the same as a hop with no continuous probing at all. The amber "MTR:
+  DEGRADED" tier (partial loss or elevated RTT over a destination's own
+  warn thresholds) is unaffected.
+
 ### 4.11.2 — The application database's own size shown on Settings
 
 - **The application database (`app.db` — settings, accounts, and the

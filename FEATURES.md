@@ -253,7 +253,12 @@ closely, not every one.
 
 A hop with live probe stats crossing that destination's own warn thresholds
 turns amber on the route graph, with an "MTR: DEGRADED" badge; 100% loss
-turns it red with "MTR: HIGH LOSS". This is a more current signal than the
+turns it red with "MTR: HIGH LOSS" — but only for a hop that has answered
+at least one probe. Plenty of routers along a real path rate-limit or drop
+ICMP by nature and sit at 100% loss forever without that meaning anything
+is wrong; a hop with no answer on record keeps its ordinary coloring
+instead, the same as a hop with no continuous probing at all. This is a
+more current signal than the
 traceroute-derived colors around it, so it outranks even the destination's
 own green "target" marker — a target that's live-degraded is not painted
 the same reassuring green as a healthy one.
