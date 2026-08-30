@@ -50,6 +50,154 @@ web framework. TLS is used when `--cert` and `--key` are supplied.
 
 ---
 
+## Nodes — SNMP poller and device inventory
+
+A filterable device table with at-a-glance status, and a per-device
+drill-down: a zoomable metric chart, an interface table and an event
+history. Discovery, polling profiles and vendor MIB upload live on their
+own subtabs.
+
+### Devices and polling
+
+- **Polled over SNMP v1, v2c or v3** (noAuthNoPriv/authNoPriv — authPriv
+  is rejected at session setup with a clear message, the same deferral
+  the SNMP Trap receiver made for inbound decryption: there is no AES/DES
+  in the standard library and this app takes no third-party dependency),
+  or **ping alone** for a device with SNMP switched off entirely. A
+  device's identity (`sysDescr`, `sysName`, vendor), interface table and
+  scalar metrics (CPU/memory where UCD-SNMP-MIB or HOST-RESOURCES-MIB is
+  present) all come from the same poll.
+- **A device inherits its settings from a "polling profile"** (a group) —
+  credentials, poll interval, timeout, retries, which of ping/SNMP are
+  enabled — and can override any of it individually. One profile,
+  `Default`, always exists.
+- **The scheduler is shaped like NetPath's own trace `Monitor`**, not
+  IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
+  due-time seeding from each device's own last poll time, so a restart
+  with hundreds of devices configured does not fire all of them at once.
+- **Status becomes "down" only after several consecutive failed polls**
+  (configurable), not the first one, and a device that was only ever
+  ping-reachable is distinguished from one that answered SNMP.
+- **Interface counters handle wraparound**: a 32-bit counter that
+  decreased is assumed to have wrapped once; a 64-bit counter (ifXTable's
+  high-capacity columns, preferred whenever present since a 32-bit octet
+  counter on a fast link can wrap more than once between polls) that
+  decreased is treated as a reset instead, since a genuine 64-bit wrap
+  would take centuries at any realistic speed.
+- **A reboot is detected** by comparing a device's reported `sysUpTime`
+  against what wall-clock time elapsed since the last poll would predict
+  — well outside a clock-skew grace band, and not explained by the
+  TimeTicks counter's own ~497-day wraparound.
+- **Test** checks ping and SNMP against whatever is currently typed in
+  the add/edit form, before it is saved, the same idiom IPAM's DHCP
+  server test already uses.
+
+### Discovery
+
+- **Per-device or per-subnet.** A subnet sweep pings every address first
+  (reusing IPAM's own sweep code, not a second implementation), then
+  attempts an SNMP v1/v2c identity probe — trying each configured
+  candidate community — against whichever addresses answered; a
+  single-device job always attempts SNMP even without a ping reply, since
+  a real device can have ICMP filtered. SNMPv3 is not auto-discovered: it
+  needs a username a blind sweep does not have.
+- **A subnet sweep refuses anything over the configured address-count
+  limit** before sending a single packet, the same guard IPAM's own
+  subnet scan uses.
+- **Results can be reviewed and selectively promoted** into real devices;
+  a result already promoted is a no-op to promote again, not a
+  duplicate-IP error. Discovery suggests a polling profile from the
+  device's vendor OID root where one matches, falling back to `Default`.
+
+### Vendor MIBs
+
+- **Uploaded and parsed by a hand-rolled, stdlib-only best-effort
+  reader** — not a MIB compiler, the same framing the SNMP Trap
+  receiver's own OID name table already used. It finds every
+  `OBJECT-TYPE`/`OBJECT IDENTIFIER`/`NOTIFICATION-TYPE` clause and
+  resolves its OID against whatever this app already knows (its own
+  built-in roots, or a previously uploaded MIB's objects) — never by
+  fetching an imported module automatically. Uploading a dependent MIB
+  before the one defining its parent branch leaves it partially resolved
+  until the parent is uploaded and Resolve is run again.
+- **Extracted objects can be reviewed and hand-corrected**; an
+  admin-edited object survives a later re-resolve of the same file.
+- **Resolved names also flow into the SNMP Trap page** — a trap from a
+  device an uploaded MIB describes shows a name instead of a raw OID
+  there too, without duplicating the name table.
+
+### Drill-down
+
+Selecting a device opens its identity, live status, a metric picker with
+a zoomable chart (recent points plotted directly; a wide window reads an
+hourly min/avg/max rollup instead of scanning months of raw samples), its
+current interface table, and a combined device/interface event history.
+
+---
+
+## Alerts — rule-based alerting and email notification
+
+Evaluates Nodes' device and interface state, incoming SNMP traps, Syslog
+messages and IPAM conflicts against a rule table, on the same 0–7
+severity scale every other module already uses, opening or incrementing
+alerts and optionally emailing about them.
+
+### Rules
+
+- **24 built-in rules** ship enabled: a device not responding, a device
+  recovering, a device rebooting, SNMP authentication failing, a device
+  needing unsupported SNMPv3 privacy, a poll running longer than its own
+  interval, an interface going down/up/flapping, ten CPU/memory/
+  interface-utilization/error-and-discard-rate/disk/ping-latency
+  thresholds, a critical or cold-start SNMP trap, a linkDown trap from a
+  device Nodes is not itself polling, a critical syslog line, and a new
+  IPAM address conflict.
+- **A built-in rule can be edited** (severity, enabled, which devices it
+  applies to by a substring filter, its threshold/clear-threshold/
+  consecutive-polls-before-firing where relevant, which template it
+  uses) but not deleted — disable it instead. A custom rule can be added
+  for anything the built-ins do not cover.
+- **Threshold rules use hysteresis**: a `threshold` and a lower
+  `clear_threshold`, plus a consecutive-polls-before-firing count, so a
+  value oscillating right at the edge does not open and close the same
+  alert every poll.
+- **Repeated occurrences increment one open alert** rather than opening a
+  duplicate — enforced by the database itself (an alert's dedup key can
+  only be open or acknowledged once at a time), not by application logic
+  that could race.
+
+### Notifications
+
+- **Email over the standard library's `smtplib`** — none, STARTTLS or
+  SSL/TLS, with or without certificate verification (turning verification
+  off is a deliberate, explicit opt-out, never a silent downgrade). A
+  rate limit caps emails per hour; past it, sending is suspended for the
+  rest of that hour and logged once, not per suppressed alert.
+- **An open alert emails once by default**; a re-notify interval can be
+  set to repeat while it stays open. An alert that clears — resolved
+  automatically by a matching recovery occurrence, or a threshold
+  dropping back below its clear value — can send its own notification,
+  using the generic "device recovered" template rather than replaying
+  the original problem's wording backwards; this is optional and can be
+  turned off.
+- **Test sends a real email** to an address typed in, using whatever SMTP
+  settings are currently in the form before they are saved — the same
+  "test what's typed" idiom as IPAM's DHCP test.
+
+### Templates
+
+- **5 built-in templates**, one each for a device going down, a device
+  recovering, a device rebooting, a threshold breach, and a
+  forwarded trap/syslog/IPAM event — using a hand-rolled `{{token}}`
+  substitution, not a templating library. Each can be freely edited and
+  reset to its shipped text; a built-in template cannot be deleted, since
+  a rule referencing it would otherwise lose its wording silently. A
+  custom template can be added and used by any rule.
+- **Preview renders a template** against a real recent alert, or a
+  synthetic sample when none exists yet, without sending anything.
+
+---
+
 ## NetPath — path monitoring
 
 Runs traceroutes to destinations you add, on a schedule, and keeps every one.
@@ -613,6 +761,8 @@ Configuration sits at the level it belongs to.
 | **Settings** tab | Reverse DNS, ASN/owner lookup, refresh interval, data files and size caps, maintenance |
 | **Settings** button, top right of NetPath | Concurrent traces, retention, defaults for new destinations |
 | **Settings** button, top right of NetFlow | Listener, sampling, exporters, flow storage and display |
+| **Settings** button, top right of Nodes | Poll worker pool, default interval/timeout/retries, down-after-failures, discovery, storage retention |
+| **Settings** button, top right of Alerts | Engine on/off, evaluation severity floor, SMTP server and credential, volume limits |
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
 | **Add** / **Edit** on a destination | That destination's own probe settings, and — Edit only — continuous per-hop probing |
 
@@ -623,13 +773,17 @@ different query server, since a resolver good enough for internal reverse DNS
 may not be able to reach the public internet, which the ASN lookup needs.
 
 **Database size caps** — one per database, defaulting to 512 MB for traces,
-2 GB for flows, 1 GB for syslog and 256 MB for IPAM — are checked every 15
-minutes. When a file is over its cap the oldest records are deleted in
-chunks until it fits, so the cap wins over the retention setting. For IPAM
-that means the oldest scan history first — subnets, discovered hosts and
-open conflicts describe the network as it is now, not a log, so a size cap
-isn't what trims those; the day-based retention settings on the IPAM
-Settings dialog are.
+2 GB for flows, 256 MB for SNMP traps, 1 GB for syslog, 256 MB for IPAM,
+1 GB for Nodes and 128 MB for Alerts — are checked every 15 minutes. When
+a file is over its cap the oldest records are deleted in chunks until it
+fits, so the cap wins over the retention setting. For IPAM that means the
+oldest scan history first — subnets, discovered hosts and open conflicts
+describe the network as it is now, not a log, so a size cap isn't what
+trims those; the day-based retention settings on the IPAM Settings
+dialog are. Nodes and Alerts follow the identical split: devices,
+polling profiles, interfaces and MIB objects describe the network as it
+is configured now and are never trimmed by a cap, only samples/events
+(Nodes) and resolved alerts/notifications (Alerts) are.
 
 Nothing needs a restart: both thread pools resize live and the collector
 rebinds its socket.
@@ -652,15 +806,18 @@ ends every session on that account, this one included.
 
 ## Data
 
-Five SQLite files, in WAL mode. One for the application, four for records.
+Eight SQLite files, in WAL mode. One for the application, seven for records.
 
 | File | Holds |
 | --- | --- |
 | `app.db` | Global settings, user accounts, the shared reverse-DNS cache |
 | `netpath.db` | Destinations, traces, per-hop samples, NetPath settings |
 | `flows.db` | Flow records, exporters, interface names, NetFlow settings |
+| `snmptraps.db` | Traps, an OID name table, SNMP Trap settings |
 | `syslog.db` | Messages, hourly rollup counts, search index, Syslog settings |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential |
+| `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials |
+| `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |
 
 Each record file holds its own module's data and its own module's settings, and
 nothing else. Anything read by more than one module — the reverse-DNS settings
@@ -673,9 +830,10 @@ again.
 
 Default location is `%APPDATA%\netpath-monitor\` on Windows and
 `~/.local/share/netpath-monitor/` elsewhere; override with `--db`, `--flow-db`,
-`--syslog-db`, `--app-db` and `--ipam-db`. All five upgrade their schema
-automatically on launch, and an install that predates `app.db` moves its
-settings, accounts and name cache into it on the first start.
+`--snmp-db`, `--syslog-db`, `--app-db`, `--ipam-db`, `--nodes-db` and
+`--alerts-db`. All eight upgrade their schema automatically on launch, and an
+install that predates `app.db` moves its settings, accounts and name cache
+into it on the first start.
 
 **Data > Export window to CSV** writes the current window's traces.
 

@@ -317,6 +317,33 @@ AUTH_PROTOCOLS = {                     # name -> (hashlib ctor, digest bytes)
     "SHA512": (hashlib.sha512, 48),    # RFC 7860 usmHMAC384SHA512
 }
 
+_KEY_CACHE: dict[tuple, bytes] = {}
+
+
+def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
+    """RFC 3414 A.2.1/A.2.2 password-to-key, then localisation to one engine.
+
+    Module level and shared, because snmppoll.py needs exactly the same
+    derivation the trap verifier does and the 1 MiB hash is expensive
+    enough that two caches would be two costs. Keyed on (protocol,
+    password, engine), so a password change or a re-keyed agent simply
+    misses.
+    """
+    entry = AUTH_PROTOCOLS.get(proto)
+    if entry is None or not password:
+        return None
+    ctor, _ = entry
+    key = (proto, password, engine_id)
+    cached = _KEY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    raw = password.encode("utf-8")
+    repeated = raw * (1048576 // len(raw) + 1)
+    ku = ctor(repeated[:1048576]).digest()
+    localized = ctor(ku + engine_id + ku).digest()
+    _KEY_CACHE[key] = localized
+    return localized
+
 
 class Decoder:
     def __init__(self, log=None):
@@ -333,7 +360,6 @@ class Decoder:
         self.users: dict[str, tuple[str, str]] = {}   # user -> (auth_proto, auth_pass)
         self.max_varbinds = 64
         self.max_value_chars = 512
-        self._key_cache: dict[tuple, bytes] = {}      # (proto, pass, engine) -> key
 
     # --------------------------------------------------------------- config
 
@@ -371,7 +397,10 @@ class Decoder:
             if len(parts) >= 3 and parts[0]:
                 users[parts[0]] = (parts[1].upper().replace("-", ""), parts[2])
         self.users = users
-        self._key_cache.clear()
+        # Not cleared here: the module-level key cache (localized_key's
+        # _KEY_CACHE) is shared with snmppoll.py's outbound signing and is
+        # keyed on (protocol, password, engine) — a changed password simply
+        # misses under its new key, so a stale entry is never returned.
 
     def resolve_oid(self, oid: str) -> str:
         """A readable name for an OID: exact hit, else the longest known prefix
@@ -624,26 +653,7 @@ class Decoder:
         return trap
 
     def _localized_key(self, proto: str, password: str, engine_id: bytes) -> bytes | None:
-        """RFC 3414 A.2.1/A.2.2 password-to-key, then localisation to one engine.
-
-        The first step hashes exactly 1 MiB of the repeated password, which
-        costs a few milliseconds — so the result is cached per (protocol,
-        password, engine), not recomputed for every trap.
-        """
-        entry = AUTH_PROTOCOLS.get(proto)
-        if entry is None or not password:
-            return None
-        ctor, _ = entry
-        key = (proto, password, engine_id)
-        cached = self._key_cache.get(key)
-        if cached is not None:
-            return cached
-        raw = password.encode("utf-8")
-        repeated = raw * (1048576 // len(raw) + 1)
-        ku = ctor(repeated[:1048576]).digest()
-        localized = ctor(ku + engine_id + ku).digest()
-        self._key_cache[key] = localized
-        return localized
+        return localized_key(proto, password, engine_id)
 
     def _verify_v3(self, data, trap, auth_start, auth_end) -> str:
         entry = self.users.get(trap.community)

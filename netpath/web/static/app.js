@@ -580,11 +580,19 @@ const App = (() => {
     state.snmpSettings = payload.snmp_settings;
     state.trap_kinds = payload.trap_kinds;
     state.ipamSettings = payload.ipam_settings;
+    state.nodesSettings = payload.nodes_settings;
+    state.alertsSettings = payload.alerts_settings;
     state.dimensions = payload.dimensions;
     state.categories = payload.categories;
     state.severities = payload.severities;
     state.facilities = payload.facilities;
     state.serverState = payload;
+    const alertsBadge = document.getElementById('alerts-tab-badge');
+    if (alertsBadge) {
+      const openCount = (payload.alerts || {}).open_count || 0;
+      alertsBadge.textContent = openCount;
+      alertsBadge.hidden = openCount === 0;
+    }
     if (payload.session) {
       state.session = payload.session;
       applySessionIdle(payload.session);
@@ -614,8 +622,9 @@ const App = (() => {
 
   function rateFor(page) {
     const key = { netpath: 'netpath_refresh_s', netflow: 'netflow_refresh_s',
-                  snmp: 'snmp_refresh_s', syslog: 'syslog_refresh_s',
-                  debug: 'debug_refresh_s' }[page];
+                  snmp: 'snmp_refresh_s', nodes: 'nodes_refresh_s',
+                  alerts: 'alerts_refresh_s', syslog: 'syslog_refresh_s',
+                  ipam: 'ipam_refresh_s', debug: 'debug_refresh_s' }[page];
     const seconds = Number(state.settings[key]);
     return Math.max(seconds > 0 ? seconds : 2, 0.1) * 1000;
   }

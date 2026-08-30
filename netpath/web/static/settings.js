@@ -14,15 +14,20 @@
     App.el('set-asn-cache').value = s.asn_cache_days;
     App.el('set-asn-server').value = s.asn_server || '';
     App.el('set-refresh-netpath').value = s.netpath_refresh_s;
+    App.el('set-refresh-nodes').value = s.nodes_refresh_s;
+    App.el('set-refresh-alerts').value = s.alerts_refresh_s;
     App.el('set-refresh-netflow').value = s.netflow_refresh_s;
     App.el('set-refresh-snmp').value = s.snmp_refresh_s;
     App.el('set-refresh-syslog').value = s.syslog_refresh_s;
+    App.el('set-refresh-ipam').value = s.ipam_refresh_s;
     App.el('set-refresh-debug').value = s.debug_refresh_s;
     App.el('set-trace-cap').value = s.max_trace_db_mb;
     App.el('set-flow-cap').value = s.max_flow_db_mb;
     App.el('set-snmp-cap').value = s.max_snmp_db_mb;
     App.el('set-syslog-cap').value = s.max_syslog_db_mb;
     App.el('set-ipam-cap').value = s.max_ipam_db_mb;
+    App.el('set-nodes-cap').value = s.max_nodes_db_mb;
+    App.el('set-alerts-cap').value = s.max_alerts_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
 
@@ -33,6 +38,8 @@
     App.el('set-snmp-path').value = storage.snmp_path || '';
     App.el('set-syslog-path').value = storage.syslog_path || '';
     App.el('set-ipam-path').value = storage.ipam_path || '';
+    App.el('set-nodes-path').value = storage.nodes_path || '';
+    App.el('set-alerts-path').value = storage.alerts_path || '';
     showUsage(storage);
     showUpdateInfo(server);
     status('Showing saved settings', 'var(--faint)');
@@ -142,6 +149,8 @@
       ['use-snmp', storage.snmp_bytes, Number(App.el('set-snmp-cap').value)],
       ['use-syslog', storage.syslog_bytes, Number(App.el('set-syslog-cap').value)],
       ['use-ipam', storage.ipam_bytes, Number(App.el('set-ipam-cap').value)],
+      ['use-nodes', storage.nodes_bytes, Number(App.el('set-nodes-cap').value)],
+      ['use-alerts', storage.alerts_bytes, Number(App.el('set-alerts-cap').value)],
     ];
     for (const [id, bytes, capMb] of rows) {
       const el = App.el(id);
@@ -156,7 +165,8 @@
     }
     const total = (storage.trace_bytes || 0) + (storage.flow_bytes || 0)
       + (storage.snmp_bytes || 0) + (storage.syslog_bytes || 0)
-      + (storage.app_bytes || 0) + (storage.ipam_bytes || 0);
+      + (storage.app_bytes || 0) + (storage.ipam_bytes || 0)
+      + (storage.nodes_bytes || 0) + (storage.alerts_bytes || 0);
     App.el('set-sizes').textContent =
       `${App.bytes(total)} on disk in total. Sizes include each file's `
       + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
@@ -180,15 +190,20 @@
       asn_cache_days: Number(App.el('set-asn-cache').value),
       asn_server: App.el('set-asn-server').value.trim(),
       netpath_refresh_s: Number(App.el('set-refresh-netpath').value),
+      nodes_refresh_s: Number(App.el('set-refresh-nodes').value),
+      alerts_refresh_s: Number(App.el('set-refresh-alerts').value),
       netflow_refresh_s: Number(App.el('set-refresh-netflow').value),
       snmp_refresh_s: Number(App.el('set-refresh-snmp').value),
       syslog_refresh_s: Number(App.el('set-refresh-syslog').value),
+      ipam_refresh_s: Number(App.el('set-refresh-ipam').value),
       debug_refresh_s: Number(App.el('set-refresh-debug').value),
       max_trace_db_mb: Number(App.el('set-trace-cap').value),
       max_flow_db_mb: Number(App.el('set-flow-cap').value),
       max_snmp_db_mb: Number(App.el('set-snmp-cap').value),
       max_syslog_db_mb: Number(App.el('set-syslog-cap').value),
       max_ipam_db_mb: Number(App.el('set-ipam-cap').value),
+      max_nodes_db_mb: Number(App.el('set-nodes-cap').value),
+      max_alerts_db_mb: Number(App.el('set-alerts-cap').value),
       session_idle_minutes: Number(App.el('set-idle-minutes').value),
       session_max_hours: Number(App.el('set-session-hours').value),
     };
@@ -196,6 +211,8 @@
     await App.loadState();
     status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
            `NetPath ${values.netpath_refresh_s}s · ` +
+           `Nodes ${values.nodes_refresh_s}s · ` +
+           `Alerts ${values.alerts_refresh_s}s · ` +
            `NetFlow ${values.netflow_refresh_s}s · ` +
            `SNMP ${values.snmp_refresh_s}s · ` +
            `Syslog ${values.syslog_refresh_s}s · ` +
@@ -338,7 +355,8 @@
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     loadUsers().catch(() => {});
-    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap', 'set-ipam-cap']) {
+    for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
+                     'set-ipam-cap', 'set-nodes-cap', 'set-alerts-cap']) {
       App.el(id).oninput = () =>
         showUsage((App.state.serverState || {}).storage || {});
     }

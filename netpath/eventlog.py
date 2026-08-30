@@ -23,11 +23,13 @@ TRACE = "trace"
 DNS = "dns"
 NETFLOW = "netflow"
 SNMP = "snmp"
+NODES = "nodes"
+ALERTS = "alerts"
 IPAM = "ipam"
 SYSTEM = "system"
 ERROR = "error"
 
-CATEGORIES = [TRACE, DNS, NETFLOW, SNMP, IPAM, SYSTEM, ERROR]
+CATEGORIES = [TRACE, DNS, NETFLOW, SNMP, NODES, ALERTS, IPAM, SYSTEM, ERROR]
 
 DETAIL_LIMIT = 6000
 

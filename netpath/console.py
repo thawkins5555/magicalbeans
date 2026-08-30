@@ -395,6 +395,8 @@ class ConsoleWindow(QMainWindow):
             ("SNMP traps", self.service.snmp_db, settings.get("max_snmp_db_mb", 0)),
             ("Syslog", self.service.syslog_db, settings.get("max_syslog_db_mb", 0)),
             ("IPAM", self.service.ipam_db, 0),
+            ("Nodes", self.service.nodes_db, settings.get("max_nodes_db_mb", 0)),
+            ("Alerts", self.service.alerts_db, settings.get("max_alerts_db_mb", 0)),
         ]
         lines = []
         for label, database, cap_mb in rows:
@@ -557,6 +559,8 @@ class ConsoleWindow(QMainWindow):
             f"NetFlow   {service.collector.status_text()}",
             f"SNMP      {service.snmp.status_text()}",
             f"Syslog    {service.syslog.status_text()}",
+            f"Nodes     {service.node_poller.status_text()}",
+            f"Alerts    {service.alert_engine.status_text()}",
             f"DNS       {names['named']}/{names['cached']} named"
             + (f", {names['pending']} pending" if names["pending"] else ""),
         ]

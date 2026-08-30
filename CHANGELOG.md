@@ -6,6 +6,76 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.11.0 — Nodes and Alerts
+
+- **Two new tabs, Nodes and Alerts**, inserted between Dashboard and
+  NetPath. This is the deferred work 4.10.0's SNMP Trap receiver named as
+  its own next step: polling, device inventory, and an alerting engine
+  tying traps, syslog and device/interface state together on one shared
+  0–7 severity scale.
+- **Nodes is a full SNMP poller and device inventory**, styled like the
+  rest of the app: a filterable, at-a-glance device table; a per-device
+  drill-down with a zoomable metric chart, an interface table and an
+  event history; per-device or per-device-group ("polling profile")
+  settings and credentials; and per-device or per-subnet discovery
+  (reusing IPAM's own ping sweep, then a best-effort SNMP v1/v2c identity
+  probe against each address that answers).
+  - Devices poll over **SNMP v1, v2c or v3** (noAuthNoPriv/authNoPriv;
+    authPriv is rejected with a clear message — decrypting it needs an
+    AES/DES implementation this app does not carry, the same call the
+    SNMP Trap receiver already made), or **ping alone** for a device with
+    SNMP turned off entirely.
+  - The scheduler is shaped like NetPath's own trace `Monitor`, not
+    IPAM's worker: a hot-resizable thread pool and restart-safe per-device
+    due-time seeding, so a service restart with hundreds of devices
+    configured polls each one on its own next-due schedule instead of
+    firing all of them at once.
+  - **Vendor MIBs can be uploaded** and parsed by a hand-rolled,
+    stdlib-only best-effort reader — not a MIB compiler, the same framing
+    the SNMP Trap receiver's own OID name table already used. IMPORTS are
+    resolved only against OIDs this app already knows (its own catalog,
+    or a previously uploaded MIB), so uploading a dependent MIB before
+    the one that defines its parent branch leaves it partially resolved
+    until the parent is uploaded and Resolve is run again. An uploaded
+    MIB's names also flow into the SNMP Trap page, so a trap from a
+    device that MIB describes shows a name instead of a raw OID there
+    too.
+  - 32-bit interface counters are treated as one wrap on a decrease;
+    64-bit counters (ifXTable, used whenever present since a 32-bit
+    counter on a fast link can wrap more than once between polls) treat
+    any decrease as a reset. A device's `sysUpTime` resetting well outside
+    a clock-skew grace band, and not explained by its own ~497-day
+    TimeTicks wraparound, is recorded as a reboot.
+- **Alerts evaluates Nodes' device/interface state, SNMP traps, Syslog
+  messages and IPAM conflicts** against a rule table, opening (or
+  incrementing) and auto-resolving alerts, with **24 built-in rules** —
+  device not responding, device rebooted, an interface flapping,
+  CPU/memory/interface-utilization/error-rate thresholds with hysteresis,
+  a critical trap or syslog line forwarded, and more — each editable
+  (severity, threshold, which devices it applies to) but not deletable;
+  a custom rule can be added for anything the built-ins don't cover.
+  - **Email notification** over stdlib `smtplib`, with **5 built-in
+    templates** using a hand-rolled `{{token}}` substitution (no template
+    engine dependency), each fully editable and resettable to its shipped
+    text. A resolved alert's own recovery email reuses the "device
+    recovered" template rather than replaying the original problem's
+    wording backwards.
+  - Repeated occurrences increment one alert rather than opening a
+    duplicate (an alert's dedup key can only be open once at a time,
+    enforced by the database itself); volume controls cap emails per hour
+    and can re-notify a still-open alert on an interval instead of only
+    once.
+- **Any new database's size and cap are on the Settings page**, same as
+  every other module: `nodes.db` and `alerts.db` join the storage list
+  with their own refresh rate, cap and maintenance action.
+- An SNMP community string is still stored and shown in the clear — it
+  travels in the clear in every packet the protocol defines, so it is a
+  filter, not a secret, the same reasoning `CREDENTIAL-SECURITY.md`
+  already applied to the SNMP Trap receiver. An SNMPv3 authentication
+  password and the SMTP password are both DPAPI-encrypted on Windows and
+  refused (with a clear message pointing at typing it into Test instead)
+  on any other platform, matching IPAM's DHCP credential exactly.
+
 ### 4.10.0 — SNMP trap receiver
 
 - **A new SNMP Trap tab**, between NetFlow and Syslog, receiving and

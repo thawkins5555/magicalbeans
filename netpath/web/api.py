@@ -16,7 +16,9 @@ from ..services import format_bytes, format_packets, format_rate, port_name, pro
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
 from ..ipamdb import scope_size
-from ..eventlog import CATEGORIES, ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY, SYSTEM as SYSTEM_CATEGORY
+from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
+                        ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY,
+                        NODES as NODES_CATEGORY, SYSTEM as SYSTEM_CATEGORY)
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
@@ -77,6 +79,8 @@ def get_state(service, params, body) -> dict:
         "snmp_settings": service.snmp_settings,
         "trap_kinds": list(trapoids.KINDS),
         "ipam_settings": service.ipam_settings,
+        "nodes_settings": service.nodes_settings,
+        "alerts_settings": service.alerts_settings,
         "uptime_s": time.time() - service.started_at,
         "collector": {
             "running": service.collector.running,
@@ -111,6 +115,19 @@ def get_state(service, params, body) -> dict:
             **service.ipam.state(),
             "open_conflicts": len(service.ipam_db.conflicts()),
         },
+        "nodes": {
+            "running": service.node_poller.running,
+            "status": service.node_poller.status_text(),
+            "counters": service.node_poller.counters,
+            "device_count": service.nodes_db.device_count(),
+            "device_counts": service.nodes_db.device_counts(),
+        },
+        "alerts": {
+            "running": service.alert_engine.running,
+            "status": service.alert_engine.status_text(),
+            "counters": service.alert_engine.counters,
+            "open_count": service.alerts_db.open_count(),
+        },
         "storage": {
             "app_path": service.app_db.path,
             "trace_path": service.db.path,
@@ -118,12 +135,16 @@ def get_state(service, params, body) -> dict:
             "syslog_path": service.syslog_db.path,
             "snmp_path": service.snmp_db.path,
             "ipam_path": service.ipam_db.path,
+            "nodes_path": service.nodes_db.path,
+            "alerts_path": service.alerts_db.path,
             "app_bytes": service.app_db.size_bytes(),
             "trace_bytes": service.db.size_bytes(),
             "flow_bytes": service.flow_db.size_bytes(),
             "syslog_bytes": service.syslog_db.size_bytes(),
             "snmp_bytes": service.snmp_db.size_bytes(),
             "ipam_bytes": service.ipam_db.size_bytes(),
+            "nodes_bytes": service.nodes_db.size_bytes(),
+            "alerts_bytes": service.alerts_db.size_bytes(),
         },
     }
 
@@ -666,6 +687,10 @@ def post_settings(service, params, body) -> dict:
         return {"snmp_settings": service.apply_snmp_settings(values)}
     if scope == "ipam":
         return {"ipam_settings": service.apply_ipam_settings(values)}
+    if scope == "nodes":
+        return {"nodes_settings": service.apply_nodes_settings(values)}
+    if scope == "alerts":
+        return {"alerts_settings": service.apply_alerts_settings(values)}
     return {"settings": service.apply_global_settings(values)}
 
 
@@ -705,6 +730,12 @@ def post_maintenance(service, params, body) -> dict:
         scans = service.ipam_db.prune_scans(0)
         return {"message": f"Deleted {hosts} host record(s), {conflicts} "
                            f"resolved conflict(s), {scans} scan record(s)"}
+    if action == "prune_nodes":
+        removed = service.nodes_db.prune(sample_days=0, event_days=0, discovery_days=0)
+        return {"message": f"Deleted {removed} stored sample(s)/event(s)"}
+    if action == "prune_alerts":
+        removed = service.alerts_db.prune(0)
+        return {"message": f"Deleted {removed} resolved alert(s)"}
     return {"message": "Unknown action"}
 
 
@@ -1291,6 +1322,972 @@ def get_ipam_dhcp_scope_history(service, params, body) -> dict:
         {"ts": r["polled_ts"], "leased": r["leased"], "reserved": r["reserved"],
          "total": r["total"]}
         for r in rows]}
+
+
+# -------------------------------------------------------------------- nodes
+
+def _tri(value):
+    """None/0/1 -> None/False/True. A device's own override columns are
+    NULL when "inherit from the group", which a blind bool() would
+    collapse into False — indistinguishable from an explicit off."""
+    return None if value is None else bool(value)
+
+
+def _device_json(row) -> dict:
+    return {
+        "id": row["id"], "ip": row["ip"], "name": row["name"],
+        "group_id": row["group_id"], "enabled": bool(row["enabled"]),
+        "snmp_version": row["snmp_version"], "community": row["community"],
+        "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
+        # The community string is not a secret — it travels in the clear in
+        # every packet the protocol defines — so it is shown as typed. Only
+        # the v3 auth password is ever redacted down to has_credential.
+        "has_credential": bool(row["v3_auth_pass_enc"]),
+        "poll_interval_s": row["poll_interval_s"],
+        "snmp_timeout_s": row["snmp_timeout_s"],
+        "snmp_retries": row["snmp_retries"],
+        "ping_enabled": _tri(row["ping_enabled"]),
+        "snmp_enabled": _tri(row["snmp_enabled"]),
+        "oid_set": row["oid_set"],
+        "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
+        "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
+        "sys_location": row["sys_location"], "vendor": row["vendor"],
+        "status": row["status"], "ping_ok": _tri(row["ping_ok"]),
+        "ping_rtt_ms": row["ping_rtt_ms"], "snmp_ok": _tri(row["snmp_ok"]),
+        "snmp_error": row["snmp_error"], "consecutive_fail": row["consecutive_fail"],
+        "last_poll_ts": row["last_poll_ts"], "last_up_ts": row["last_up_ts"],
+        "last_down_ts": row["last_down_ts"],
+        "last_uptime_ticks": row["last_uptime_ticks"],
+        "last_uptime_ts": row["last_uptime_ts"], "created_ts": row["created_ts"],
+    }
+
+
+def _group_json(row) -> dict:
+    return {
+        "id": row["id"], "name": row["name"], "snmp_version": row["snmp_version"],
+        "community": row["community"], "v3_user": row["v3_user"],
+        "v3_auth_proto": row["v3_auth_proto"],
+        "has_credential": bool(row["v3_auth_pass_enc"]),
+        "poll_interval_s": row["poll_interval_s"],
+        "snmp_timeout_s": row["snmp_timeout_s"], "snmp_retries": row["snmp_retries"],
+        "ping_enabled": bool(row["ping_enabled"]), "snmp_enabled": bool(row["snmp_enabled"]),
+        "oid_set": row["oid_set"], "is_default": bool(row["is_default"]),
+        "created_ts": row["created_ts"],
+    }
+
+
+def _discovery_job_json(row) -> dict:
+    return {"id": row["id"], "kind": row["kind"], "target": row["target"],
+            "state": row["state"], "total": row["total"], "probed": row["probed"],
+            "responded": row["responded"], "identified": row["identified"],
+            "started_ts": row["started_ts"], "finished_ts": row["finished_ts"],
+            "error": row["error"]}
+
+
+def _discovery_result_json(row) -> dict:
+    return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
+            "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
+            "community_or_user": row["community_or_user"],
+            "snmp_version": row["snmp_version"], "sys_descr": row["sys_descr"],
+            "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
+            "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
+            "promoted_device_id": row["promoted_device_id"]}
+
+
+_DEVICE_EDITABLE_BODY = ("name", "group_id", "enabled", "snmp_version", "community",
+                         "v3_user", "v3_auth_proto", "poll_interval_s",
+                         "snmp_timeout_s", "snmp_retries", "ping_enabled",
+                         "snmp_enabled", "oid_set")
+_GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
+                        "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
+                        "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
+
+
+def get_nodes_overview(service, params, body) -> dict:
+    """Histogram of device-event counts plus status-strip context;
+    mirrors get_snmp_overview's shape. nodesdb has no dedicated histogram
+    method — device_events volume is orders of magnitude lower than SNMP
+    trap volume, so a Python-side bucket pass over one window's rows is
+    always cheap enough, the same reasoning alertsdb.py's own histogram
+    already relies on for a live GROUP BY."""
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    bucket = _num(params, "bucket", 3600)
+    events = service.nodes_db.device_events(since_s=max(0.0, time.time() - t0))
+    buckets: dict[int, int] = {}
+    for row in events:
+        if row["ts"] < t0 or row["ts"] > t1:
+            continue
+        slot = int((row["ts"] - t0) // bucket)
+        buckets[slot] = buckets.get(slot, 0) + 1
+    histogram = [{"t": t0 + slot * bucket, "n": n} for slot, n in sorted(buckets.items())]
+    return {
+        "t0": t0, "t1": t1, "bucket_s": bucket,
+        "buckets": histogram,
+        "device_counts": service.nodes_db.device_counts(),
+        "poller": {
+            "running": service.node_poller.running,
+            "status": service.node_poller.status_text(),
+            "counters": service.node_poller.counters,
+        },
+    }
+
+
+def get_nodes_devices(service, params, body) -> dict:
+    group_id = params.get("group_id")
+    status = params.get("status") or None
+    text = params.get("q") or None
+    rows = service.nodes_db.devices(
+        group_id=int(group_id) if group_id else None, status=status, text=text)
+    worker_state = service.node_poller.worker_state()
+    devices = []
+    for row in rows:
+        device = _device_json(row)
+        device["polling"] = row["id"] in worker_state
+        devices.append(device)
+    return {"devices": devices}
+
+
+def post_nodes_device(service, params, body) -> dict:
+    ip = str(body.get("ip", "")).strip()
+    if not ip:
+        raise ValueError("An IP address is required")
+    if service.nodes_db.device_by_ip(ip):
+        raise ValueError(f"{ip} is already a device")
+    group_id = body.get("group_id")
+    overrides = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY
+                and k not in ("name", "group_id", "enabled")}
+    device_id = service.nodes_db.add_device(
+        ip, name=body.get("name") or None,
+        group_id=int(group_id) if group_id else None, **overrides)
+    service.log.add(NODES_CATEGORY, f"Added device {ip}")
+    return {"id": device_id}
+
+
+def get_nodes_device(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    device = _device_json(row)
+    device["effective_config"] = {
+        k: v for k, v in service.nodes_db.effective_config(row).items()
+        if k != "v3_auth_pass_enc"}
+    device["group_name"] = None
+    if row["group_id"]:
+        group = service.nodes_db.group(row["group_id"])
+        device["group_name"] = group["name"] if group else None
+    device["polling"] = device_id in service.node_poller.worker_state()
+    return {"device": device}
+
+
+def put_nodes_device(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
+    service.nodes_db.update_device(device_id, **fields)
+    return {"ok": True}
+
+
+def delete_nodes_device(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    service.nodes_db.remove_device(device_id)
+    service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
+    return {"ok": True}
+
+
+def post_nodes_device_poll(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    service.node_poller.poll_now(device_id)
+    return {"ok": True}
+
+
+def post_nodes_device_test(service, params, body, device_id) -> dict:
+    """Ping + SNMP against the in-progress-edit config carried in the
+    body, falling back to the saved one for anything not overridden — the
+    same "test what's typed before saving" idiom as IPAM's DHCP test.
+    Builds the SNMP request directly with snmppoll rather than going
+    through NodePoller/credential_for(), so a typed-but-unsaved v3
+    password is used once, in memory, and never touches DPAPI — the same
+    "usable without ever being persisted on a non-Windows box" property
+    CREDENTIAL-SECURITY.md documents for every other credential form."""
+    import random
+    from .. import nodeoids
+    from ..ipam_scan import ping_once
+    from ..nodepoll import DEFAULT_SNMP_PORT, _Session, credential_for
+    from ..snmppoll import (PDU_GET, PDU_REPORT, SnmpError, build_request,
+                            build_v3_request, discovery_probe)
+    from ..trapdecode import localized_key
+
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    config = service.nodes_db.effective_config(row)
+    # The edit form's overrides are tri-state (null means "inherit from
+    # the profile", distinct from an explicit false) — an explicit null
+    # here must fall through to the already-resolved effective config,
+    # not blank the field out.
+    for key in ("snmp_version", "poll_interval_s", "snmp_timeout_s", "snmp_retries",
+               "ping_enabled", "snmp_enabled"):
+        if key in body and body[key] is not None:
+            config[key] = body[key]
+
+    if "community" in body:
+        identity = body.get("community") or None
+    elif "v3_user" in body:
+        identity = body.get("v3_user") or None
+    else:
+        identity = None
+    auth_proto = body.get("v3_auth_proto") or config.get("v3_auth_proto")
+    password = body.get("v3_auth_pass")
+    if identity is None or (password is None and "v3_auth_pass" not in body):
+        stored_identity, stored_proto, stored_password = credential_for(config)
+        identity = identity if identity is not None else stored_identity
+        auth_proto = auth_proto or stored_proto
+        if password is None and "v3_auth_pass" not in body:
+            password = stored_password
+
+    result = {"ping": {"ok": None, "rtt_ms": None}, "snmp": {"ok": None, "error": None}}
+    timeout_s = float(config.get("snmp_timeout_s", 3.0))
+    if config.get("ping_enabled"):
+        started = time.time()
+        ping_ok = ping_once(row["ip"], timeout_ms=int(timeout_s * 1000))
+        result["ping"]["ok"] = ping_ok
+        if ping_ok:
+            result["ping"]["rtt_ms"] = (time.time() - started) * 1000.0
+
+    if config.get("snmp_enabled"):
+        version = int(config.get("snmp_version") or 1)
+        oids = list(nodeoids.SYSTEM_SCALARS.values())
+        try:
+            session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
+                               int(config.get("snmp_retries", 2)))
+            try:
+                if version in (0, 1):
+                    packet = build_request(version, identity or "public", PDU_GET,
+                                           random.randint(1, 2 ** 16), oids)
+                else:
+                    engine_reply = session.request(discovery_probe())
+                    auth_key = (localized_key(auth_proto, password, engine_reply.engine_id)
+                               if auth_proto and password else None)
+                    packet = build_v3_request(
+                        random.randint(1, 2 ** 16), random.randint(1, 2 ** 16),
+                        PDU_GET, oids, engine_id=engine_reply.engine_id,
+                        engine_boots=engine_reply.engine_boots,
+                        engine_time=engine_reply.engine_time, user=identity or "",
+                        auth_proto=auth_proto, auth_key=auth_key)
+                response = session.request(packet)
+                if version >= 3 and response.pdu_tag == PDU_REPORT:
+                    raise SnmpError("engine resync required (Report-PDU) — check "
+                                    "the SNMPv3 username and auth password")
+                if response.error_status == 16:
+                    raise SnmpError("authorization error")
+            finally:
+                session.close()
+            values = {vb["oid"]: vb["value"] for vb in response.varbinds
+                     if vb["type"] not in ("noSuchObject", "noSuchInstance")}
+            result["snmp"]["ok"] = True
+            result["snmp"]["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
+            result["snmp"]["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
+            result["snmp"]["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+        except SnmpError as exc:
+            result["snmp"]["ok"] = False
+            result["snmp"]["error"] = str(exc)
+        finally:
+            password = None
+    return result
+
+
+def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    rows = service.nodes_db.interfaces(device_id)
+    return {"interfaces": [
+        {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
+         "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
+         "admin_status": r["admin_status"], "oper_status": r["oper_status"],
+         "in_bps": r["in_bps"], "out_bps": r["out_bps"],
+         "in_error_rate": r["in_error_rate"], "out_error_rate": r["out_error_rate"],
+         "last_seen_ts": r["last_seen_ts"]}
+        for r in rows]}
+
+
+def get_nodes_device_metrics(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    rows = service.nodes_db.metrics(device_id)
+    return {"metrics": [
+        {"id": r["id"], "key": r["key"], "label": r["label"], "unit": r["unit"],
+         "kind": r["kind"], "last_value": r["last_value"], "last_ts": r["last_ts"]}
+        for r in rows]}
+
+
+def get_nodes_device_series(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    metric_id = params.get("metric_id")
+    if not metric_id:
+        raise ValueError("metric_id is required")
+    t0, t1 = _window(params)
+    points = service.nodes_db.series(device_id, int(metric_id), t0, t1)
+    return {"t0": t0, "t1": t1, "points": points}
+
+
+def get_nodes_device_events(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    since_s = _num(params, "since_s", None)
+    device_events = service.nodes_db.device_events(device_id=device_id, since_s=since_s)
+    interface_events = []
+    for iface in service.nodes_db.interfaces(device_id):
+        for ev in service.nodes_db.interface_events(interface_id=iface["id"], since_s=since_s):
+            interface_events.append({
+                "id": ev["id"], "interface_id": ev["interface_id"],
+                "if_index": iface["if_index"], "descr": iface["descr"],
+                "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]})
+    interface_events.sort(key=lambda e: e["ts"], reverse=True)
+    return {
+        "device_events": [
+            {"id": r["id"], "ts": r["ts"], "kind": r["kind"], "detail": r["detail"]}
+            for r in device_events],
+        "interface_events": interface_events,
+    }
+
+
+def post_nodes_device_credential(service, params, body, device_id) -> dict:
+    from .. import dpapi
+
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    user = str(body.get("v3_user", "")).strip()
+    password = str(body.get("v3_auth_pass", ""))
+    auth_proto = str(body.get("v3_auth_proto", "")).strip()
+    if not user or not password or not auth_proto:
+        raise ValueError("A username, auth protocol, and password are all required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only. The device can still be reached by typing the "
+            "password into Test each time; nothing will be saved here.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.nodes_db.set_device_credential(device_id, user, auth_proto, encrypted)
+    service.log.add(NODES_CATEGORY, f"Stored an SNMPv3 credential for {row['ip']}")
+    return {"ok": True}
+
+
+def delete_nodes_device_credential(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    service.nodes_db.clear_device_credential(device_id)
+    service.log.add(NODES_CATEGORY,
+                    f"Cleared the stored SNMPv3 credential for {row['ip']}")
+    return {"ok": True}
+
+
+def get_nodes_groups(service, params, body) -> dict:
+    return {"groups": [_group_json(r) for r in service.nodes_db.groups()]}
+
+
+def post_nodes_group(service, params, body) -> dict:
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("A name is required")
+    fields = {k: v for k, v in body.items()
+             if k in _GROUP_EDITABLE_BODY and k != "name"}
+    group_id = service.nodes_db.add_group(name, **fields)
+    service.log.add(NODES_CATEGORY, f"Added polling profile {name}")
+    return {"id": group_id}
+
+
+def put_nodes_group(service, params, body, group_id) -> dict:
+    if not service.nodes_db.group(group_id):
+        raise ValueError("No such polling profile")
+    fields = {k: v for k, v in body.items() if k in _GROUP_EDITABLE_BODY}
+    service.nodes_db.update_group(group_id, **fields)
+    return {"ok": True}
+
+
+def delete_nodes_group(service, params, body, group_id) -> dict:
+    row = service.nodes_db.group(group_id)
+    if not row:
+        raise ValueError("No such polling profile")
+    if row["is_default"]:
+        raise ValueError("The Default polling profile cannot be removed")
+    service.nodes_db.remove_group(group_id)
+    service.log.add(NODES_CATEGORY, f"Removed polling profile {row['name']}")
+    return {"ok": True}
+
+
+def post_nodes_group_credential(service, params, body, group_id) -> dict:
+    from .. import dpapi
+
+    row = service.nodes_db.group(group_id)
+    if not row:
+        raise ValueError("No such polling profile")
+    user = str(body.get("v3_user", "")).strip()
+    password = str(body.get("v3_auth_pass", ""))
+    auth_proto = str(body.get("v3_auth_proto", "")).strip()
+    if not user or not password or not auth_proto:
+        raise ValueError("A username, auth protocol, and password are all required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.nodes_db.set_group_credential(group_id, user, auth_proto, encrypted)
+    service.log.add(NODES_CATEGORY,
+                    f"Stored an SNMPv3 credential for profile {row['name']}")
+    return {"ok": True}
+
+
+def delete_nodes_group_credential(service, params, body, group_id) -> dict:
+    row = service.nodes_db.group(group_id)
+    if not row:
+        raise ValueError("No such polling profile")
+    service.nodes_db.clear_group_credential(group_id)
+    service.log.add(NODES_CATEGORY,
+                    f"Cleared the stored SNMPv3 credential for profile {row['name']}")
+    return {"ok": True}
+
+
+def post_nodes_discovery(service, params, body) -> dict:
+    kind = str(body.get("kind", "")).strip()
+    target = str(body.get("target", "")).strip()
+    if kind not in ("device", "subnet"):
+        raise ValueError("kind must be 'device' or 'subnet'")
+    if not target:
+        raise ValueError("A target is required")
+    overrides = {}
+    if body.get("communities"):
+        overrides["discovery_communities"] = body["communities"]
+    job_id = service.node_poller.start_discovery(kind, target, overrides=overrides or None)
+    service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
+    return {"id": job_id}
+
+
+def get_nodes_discovery(service, params, body) -> dict:
+    limit = int(_num(params, "limit", 50, int) or 50)
+    return {"jobs": [_discovery_job_json(r) for r in service.nodes_db.discovery_jobs(limit)]}
+
+
+def get_nodes_discovery_job(service, params, body, job_id) -> dict:
+    job = service.nodes_db.discovery_job(job_id)
+    if not job:
+        raise ValueError("No such discovery job")
+    results = service.nodes_db.discovery_results(job_id)
+    return {"job": _discovery_job_json(job),
+            "results": [_discovery_result_json(r) for r in results]}
+
+
+def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
+    if not service.nodes_db.discovery_job(job_id):
+        raise ValueError("No such discovery job")
+    service.node_poller.cancel_discovery(job_id)
+    return {"ok": True}
+
+
+def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
+    if not service.nodes_db.discovery_job(job_id):
+        raise ValueError("No such discovery job")
+    result_ids = body.get("result_ids") or []
+    if not result_ids:
+        raise ValueError("result_ids is required")
+    device_ids = service.node_poller.promote(job_id, [int(r) for r in result_ids])
+    service.log.add(NODES_CATEGORY,
+                    f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
+    return {"device_ids": device_ids}
+
+
+def post_nodes_collector(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.nodes_settings["enabled"] = True
+        service.nodes_db.save_settings({"enabled": True})
+        service.node_poller.start(service.nodes_settings)
+    elif action == "stop":
+        service.nodes_settings["enabled"] = False
+        service.nodes_db.save_settings({"enabled": False})
+        service.node_poller.stop()
+    return {"running": service.node_poller.running,
+            "status": service.node_poller.status_text()}
+
+
+def _mib_file_json(row) -> dict:
+    return {"id": row["id"], "filename": row["filename"], "module": row["module"],
+            "uploaded_ts": row["uploaded_ts"], "object_count": row["object_count"],
+            "unresolved": json.loads(row["unresolved"] or "[]"),
+            "parse_notes": row["parse_notes"]}
+
+
+def _mib_object_json(row) -> dict:
+    return {"id": row["id"], "mib_file_id": row["mib_file_id"], "name": row["name"],
+            "oid": row["oid"], "description": row["description"], "syntax": row["syntax"],
+            "enums": json.loads(row["enums"]) if row["enums"] else None,
+            "is_notification": bool(row["is_notification"]), "edited": bool(row["edited"])}
+
+
+def _object_to_dict(obj) -> dict:
+    return {"name": obj.name, "oid": obj.oid, "description": obj.description,
+            "syntax": obj.syntax, "enums": obj.enums,
+            "is_notification": obj.is_notification}
+
+
+def _known_oids_for_resolve(service) -> dict:
+    """WELL_KNOWN_ROOTS plus every OID this app has already resolved from
+    a previously uploaded MIB — the only "IMPORTS resolution" this parser
+    does: never by fetching the imported module itself, only against
+    what's already known (mibparse.py's own stated non-goal)."""
+    from .. import mibparse
+
+    known = dict(mibparse.WELL_KNOWN_ROOTS)
+    known.update(service.nodes_db.all_known_oids())
+    return known
+
+
+def get_nodes_mibs(service, params, body) -> dict:
+    return {"files": [_mib_file_json(r) for r in service.nodes_db.mib_files()]}
+
+
+def post_nodes_mib(service, params, body) -> dict:
+    """Upload is base64-encoded text inside the normal JSON body rather
+    than multipart/form-data — server.py's body parser only accepts
+    application/json for POST/PUT/DELETE, and touching that gate for one
+    route is a bigger change than the ~33% base64 overhead is worth for a
+    file capped at a few MB (max_mib_bytes)."""
+    import base64
+    from .. import mibparse
+
+    filename = str(body.get("filename", "")).strip() or "uploaded.mib"
+    content_b64 = body.get("content")
+    if not content_b64:
+        raise ValueError("content (base64-encoded MIB text) is required")
+    try:
+        raw = base64.b64decode(content_b64, validate=False)
+    except Exception:
+        raise ValueError("content is not valid base64")
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    if len(raw) > max_bytes:
+        raise ValueError(f"File exceeds the {max_bytes:,} byte limit")
+    text = raw.decode("utf-8", "replace")
+
+    result = mibparse.parse(text, max_bytes=max_bytes)
+    resolved_count, unresolved = mibparse.resolve(
+        result.objects, _known_oids_for_resolve(service))
+
+    mib_file_id = service.nodes_db.add_mib_file(
+        filename, result.module, len(result.objects), unresolved,
+        "; ".join(result.notes), content=text)
+    service.nodes_db.replace_mib_objects(
+        mib_file_id, [_object_to_dict(obj) for obj in result.objects])
+    service._snmp_settings_with_mibs()
+    service.log.add(NODES_CATEGORY,
+                    f"Uploaded MIB {filename} ({result.module or 'unknown module'}): "
+                    f"{resolved_count}/{len(result.objects)} object(s) resolved")
+    return {"id": mib_file_id, "module": result.module,
+            "object_count": len(result.objects), "resolved_count": resolved_count,
+            "unresolved": unresolved, "notes": result.notes}
+
+
+def get_nodes_mib(service, params, body, mib_file_id) -> dict:
+    row = service.nodes_db.mib_file(mib_file_id)
+    if not row:
+        raise ValueError("No such MIB file")
+    objects = service.nodes_db.mib_objects(mib_file_id)
+    return {"file": _mib_file_json(row),
+            "objects": [_mib_object_json(r) for r in objects]}
+
+
+def delete_nodes_mib(service, params, body, mib_file_id) -> dict:
+    row = service.nodes_db.mib_file(mib_file_id)
+    if not row:
+        raise ValueError("No such MIB file")
+    service.nodes_db.remove_mib_file(mib_file_id)
+    service._snmp_settings_with_mibs()
+    service.log.add(NODES_CATEGORY, f"Removed MIB {row['filename']}")
+    return {"ok": True}
+
+
+def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
+    """Re-parses the file's own stored text from scratch (mib_objects only
+    keeps the final oid or NULL, not the parent/last_arc an unresolved
+    object needs to retry) and resolves again against everything
+    currently known — this is the whole "upload CISCO-SMI after
+    CISCO-PROCESS-MIB, then hit resolve" story."""
+    from .. import mibparse
+
+    row = service.nodes_db.mib_file(mib_file_id)
+    if not row:
+        raise ValueError("No such MIB file")
+    if not row["content"]:
+        raise ValueError("This file's original text was not retained "
+                         "(uploaded before this feature could re-resolve) "
+                         "— re-upload it to enable Resolve.")
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    result = mibparse.parse(row["content"], max_bytes=max_bytes)
+    resolved_count, unresolved = mibparse.resolve(
+        result.objects, _known_oids_for_resolve(service))
+
+    service.nodes_db.update_mib_file(
+        mib_file_id, module=result.module, object_count=len(result.objects),
+        unresolved=unresolved, parse_notes="; ".join(result.notes))
+    service.nodes_db.replace_mib_objects(
+        mib_file_id, [_object_to_dict(obj) for obj in result.objects])
+    service._snmp_settings_with_mibs()
+    service.log.add(NODES_CATEGORY,
+                    f"Re-resolved MIB {row['filename']}: "
+                    f"{resolved_count}/{len(result.objects)} object(s) resolved")
+    return {"object_count": len(result.objects), "resolved_count": resolved_count,
+            "unresolved": unresolved}
+
+
+def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
+    objects = {r["id"]: r for r in service.nodes_db.mib_objects(mib_file_id)}
+    if obj_id not in objects:
+        raise ValueError("No such MIB object")
+    fields = {k: v for k, v in body.items()
+             if k in ("name", "oid", "description", "syntax", "enums")}
+    service.nodes_db.update_mib_object(obj_id, **fields)
+    service._snmp_settings_with_mibs()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ alerts
+
+def _alert_json(row) -> dict:
+    from .. import alertmail
+
+    severity = row["severity"]
+    return {
+        "id": row["id"], "rule_id": row["rule_id"], "dedup_key": row["dedup_key"],
+        "entity_kind": row["entity_kind"], "entity_id": row["entity_id"],
+        "entity_label": row["entity_label"], "severity": severity,
+        "severity_name": alertmail.SEVERITY_NAMES[severity] if 0 <= severity <= 7
+                        else str(severity),
+        "message": row["message"], "detail": row["detail"], "state": row["state"],
+        "count": row["count"], "opened_ts": row["opened_ts"], "last_ts": row["last_ts"],
+        "acked_ts": row["acked_ts"], "acked_by": row["acked_by"],
+        "ack_note": row["ack_note"], "resolved_ts": row["resolved_ts"],
+        "resolved_by": row["resolved_by"],
+    }
+
+
+def _rule_json(row) -> dict:
+    return {
+        "id": row["id"], "key": row["key"], "name": row["name"], "kind": row["kind"],
+        "source_kind": row["source_kind"], "severity": row["severity"],
+        "enabled": bool(row["enabled"]), "is_builtin": bool(row["is_builtin"]),
+        "device_filter": row["device_filter"], "threshold": row["threshold"],
+        "clear_threshold": row["clear_threshold"], "for_polls": row["for_polls"],
+        "template_id": row["template_id"], "created_ts": row["created_ts"],
+    }
+
+
+def _template_json(row, with_tokens: bool = False) -> dict:
+    result = {
+        "id": row["id"], "key": row["key"], "name": row["name"],
+        "subject": row["subject"], "body": row["body"], "is_html": bool(row["is_html"]),
+        "is_builtin": bool(row["is_builtin"]), "updated_ts": row["updated_ts"],
+    }
+    if with_tokens:
+        from .. import alertmail
+        result["tokens"] = alertmail.token_reference()
+    return result
+
+
+def get_alerts_overview(service, params, body) -> dict:
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 86400)
+    bucket = _num(params, "bucket", 3600)
+    return {
+        "t0": t0, "t1": t1, "bucket_s": bucket,
+        "buckets": service.alerts_db.histogram(t0, t1, bucket),
+        "summary": service.alerts_db.open_summary(),
+        "engine": {
+            "running": service.alert_engine.running,
+            "status": service.alert_engine.status_text(),
+            "counters": service.alert_engine.counters,
+        },
+    }
+
+
+def get_alerts(service, params, body) -> dict:
+    state = params.get("state") or None
+    severity = params.get("severity")
+    rule_id = params.get("rule_id")
+    device_text = params.get("device") or None
+    text = params.get("q") or None
+    t0 = _num(params, "t0", None)
+    t1 = _num(params, "t1", None)
+    limit = int(_num(params, "limit", 300, int) or 300)
+    rows = service.alerts_db.alerts(
+        state=state, severity=int(severity) if severity else None,
+        rule_id=int(rule_id) if rule_id else None, device_text=device_text,
+        text=text, t0=t0, t1=t1, limit=min(limit, 2000))
+    rule_names = {r["id"]: r["name"] for r in service.alerts_db.rules()}
+    alerts = []
+    for row in rows:
+        alert = _alert_json(row)
+        alert["rule_name"] = rule_names.get(row["rule_id"], "")
+        alerts.append(alert)
+    return {"alerts": alerts}
+
+
+def get_alert(service, params, body, alert_id) -> dict:
+    row = service.alerts_db.alert(alert_id)
+    if not row:
+        raise ValueError("No such alert")
+    alert = _alert_json(row)
+    rule = service.alerts_db.rule(row["rule_id"])
+    alert["rule_name"] = rule["name"] if rule else ""
+    notifications = service.alerts_db.notifications_for(alert_id)
+    return {"alert": alert, "notifications": [
+        {"id": n["id"], "kind": n["kind"], "ts": n["ts"], "to_addr": n["to_addr"],
+         "subject": n["subject"], "ok": bool(n["ok"]), "error": n["error"]}
+        for n in notifications]}
+
+
+def post_alert_ack(service, params, body, alert_id) -> dict:
+    if not service.alerts_db.alert(alert_id):
+        raise ValueError("No such alert")
+    service.alerts_db.acknowledge(alert_id, params.get("_username", ""),
+                                  str(body.get("note", "")))
+    return {"ok": True}
+
+
+def post_alert_resolve(service, params, body, alert_id) -> dict:
+    if not service.alerts_db.alert(alert_id):
+        raise ValueError("No such alert")
+    service.alerts_db.resolve(alert_id, params.get("_username", ""))
+    return {"ok": True}
+
+
+def post_alerts_ack_all(service, params, body) -> dict:
+    n = service.alerts_db.acknowledge_all(params.get("_username", ""))
+    return {"acknowledged": n}
+
+
+def get_alerts_rules(service, params, body) -> dict:
+    return {"rules": [_rule_json(r) for r in service.alerts_db.rules()]}
+
+
+def post_alerts_rule(service, params, body) -> dict:
+    key = str(body.get("key", "")).strip()
+    name = str(body.get("name", "")).strip()
+    kind = str(body.get("kind", "")).strip()
+    source_kind = str(body.get("source_kind", "") or "")
+    if not key or not name or not kind:
+        raise ValueError("key, name and kind are all required")
+    if kind not in ("device_event", "interface_event", "threshold", "trap",
+                    "syslog", "ipam"):
+        raise ValueError("Unrecognized rule kind")
+    if service.alerts_db.rule_by_key(key):
+        raise ValueError(f"A rule with key '{key}' already exists")
+    fields = {k: v for k, v in body.items() if k in
+             ("severity", "enabled", "device_filter", "threshold",
+              "clear_threshold", "for_polls", "template_id")}
+    rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
+    service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
+    return {"id": rule_id}
+
+
+def put_alerts_rule(service, params, body, rule_id) -> dict:
+    row = service.alerts_db.rule(rule_id)
+    if not row:
+        raise ValueError("No such rule")
+    allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
+                    "clear_threshold", "for_polls", "template_id")
+    if not row["is_builtin"]:
+        allowed_keys = allowed_keys + ("kind", "source_kind")
+    fields = {k: v for k, v in body.items() if k in allowed_keys}
+    service.alerts_db.update_rule(rule_id, **fields)
+    return {"ok": True}
+
+
+def delete_alerts_rule(service, params, body, rule_id) -> dict:
+    row = service.alerts_db.rule(rule_id)
+    if not row:
+        raise ValueError("No such rule")
+    if row["is_builtin"]:
+        raise ValueError("A built-in rule cannot be deleted — disable it instead")
+    service.alerts_db.remove_rule(rule_id)
+    service.log.add(ALERTS_CATEGORY, f"Removed alert rule {row['name']}")
+    return {"ok": True}
+
+
+def get_alerts_templates(service, params, body) -> dict:
+    return {"templates": [_template_json(r, with_tokens=True)
+                          for r in service.alerts_db.templates()]}
+
+
+def post_alerts_template(service, params, body) -> dict:
+    key = str(body.get("key", "")).strip()
+    name = str(body.get("name", "")).strip()
+    subject = str(body.get("subject", ""))
+    template_body = str(body.get("body", ""))
+    if not key or not name or not subject or not template_body:
+        raise ValueError("key, name, subject and body are all required")
+    if service.alerts_db.template_by_key(key):
+        raise ValueError(f"A template with key '{key}' already exists")
+    template_id = service.alerts_db.add_template(
+        key, name, subject, template_body, is_html=bool(body.get("is_html")))
+    service.log.add(ALERTS_CATEGORY, f"Added email template {name}")
+    return {"id": template_id}
+
+
+def put_alerts_template(service, params, body, template_id) -> dict:
+    if not service.alerts_db.template(template_id):
+        raise ValueError("No such template")
+    fields = {k: v for k, v in body.items()
+             if k in ("name", "subject", "body", "is_html")}
+    service.alerts_db.update_template(template_id, **fields)
+    return {"ok": True}
+
+
+def post_alerts_template_reset(service, params, body, template_id) -> dict:
+    row = service.alerts_db.template(template_id)
+    if not row:
+        raise ValueError("No such template")
+    if not row["is_builtin"]:
+        raise ValueError("Only a built-in template has shipped text to reset to")
+    service.alerts_db.reset_template(template_id)
+    return {"ok": True}
+
+
+def delete_alerts_template(service, params, body, template_id) -> dict:
+    row = service.alerts_db.template(template_id)
+    if not row:
+        raise ValueError("No such template")
+    if row["is_builtin"]:
+        raise ValueError(
+            "A built-in template cannot be deleted — a rule referencing "
+            "it would otherwise lose its wording silently")
+    service.alerts_db.remove_template(template_id)
+    service.log.add(ALERTS_CATEGORY, f"Removed email template {row['name']}")
+    return {"ok": True}
+
+
+def post_alerts_template_preview(service, params, body, template_id) -> dict:
+    """Renders against a real recent alert (alert_id in the body) or a
+    synthetic sample when none is given, so Preview works even before any
+    alert of that kind has ever fired. Sends nothing."""
+    from .. import alertmail
+
+    row = service.alerts_db.template(template_id)
+    if not row:
+        raise ValueError("No such template")
+    alert_id = body.get("alert_id")
+    if alert_id:
+        alert_row = service.alerts_db.alert(int(alert_id))
+        if not alert_row:
+            raise ValueError("No such alert")
+        rule_row = service.alerts_db.rule(alert_row["rule_id"])
+        context = alertmail.build_context(alert_row, rule_row)
+    else:
+        now = time.time()
+        fake_alert = {"entity_label": "sample-device (10.20.3.5)",
+                     "entity_id": "10.20.3.5", "message": "This is a sample alert.",
+                     "detail": "", "severity": 4, "count": 1,
+                     "opened_ts": now, "last_ts": now}
+        context = alertmail.build_context(
+            fake_alert, {"name": "Sample rule"},
+            extra={"metric_label": "CPU", "value": "95%", "threshold": "90%",
+                  "previous_uptime": "12d 4h", "current_uptime": "0d 0h 2m",
+                  "trap_name": "coldStart", "trap_oid": "1.3.6.1.6.3.1.1.5.1",
+                  "varbinds": "(sample)"})
+    return {"subject": alertmail.render(row["subject"], context),
+            "body": alertmail.render(row["body"], context)}
+
+
+def post_alerts_smtp_credential(service, params, body) -> dict:
+    from .. import dpapi
+
+    password = str(body.get("password", ""))
+    if not password:
+        raise ValueError("A password is required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only. A test email can still use a password typed "
+            "into Test each time; nothing will be saved here.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.alerts_db.set_smtp_credential(encrypted)
+    service.log.add(ALERTS_CATEGORY, "Stored the SMTP credential")
+    return {"ok": True}
+
+
+def delete_alerts_smtp_credential(service, params, body) -> dict:
+    service.alerts_db.clear_smtp_credential()
+    service.log.add(ALERTS_CATEGORY, "Cleared the stored SMTP credential")
+    return {"ok": True}
+
+
+def post_alerts_smtp_test(service, params, body) -> dict:
+    """Sends a real test email, using in-progress-edit SMTP settings from
+    the body when present, else the saved ones — the same "test what's
+    typed before saving" idiom as IPAM's DHCP test and the SNMP Trap/
+    Syslog "send test" buttons."""
+    from .. import alertmail, dpapi
+
+    to_addr = str(body.get("to", "")).strip()
+    if not to_addr:
+        raise ValueError("A recipient address is required")
+    settings = dict(service.alerts_settings)
+    for key in ("smtp_host", "smtp_port", "smtp_security", "smtp_verify_cert",
+               "smtp_username", "smtp_from", "smtp_from_name", "smtp_timeout_s"):
+        if key in body:
+            settings[key] = body[key]
+    password = body.get("password")
+    if password is None:
+        blob = service.alerts_db.smtp_password_enc()
+        if blob:
+            try:
+                password = dpapi.unprotect(blob).decode("utf-8")
+            except Exception:
+                password = None
+    subject = "SappiWhere test email"
+    body_text = "This is a test email from SappiWhere's Alerts module."
+    try:
+        alertmail.send(settings, password, [to_addr], subject, body_text)
+        ok, error = True, ""
+    except Exception as exc:
+        ok, error = False, str(exc)
+    finally:
+        password = None
+    service.alerts_db.record_notification(None, "test", to_addr, subject, ok, error)
+    return {"ok": ok, "error": error} if not ok else {"ok": True}
+
+
+def post_alerts_engine(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.alerts_settings["enabled"] = True
+        service.alerts_db.save_settings({"enabled": True})
+        service.alert_engine.start()
+    elif action == "stop":
+        service.alerts_settings["enabled"] = False
+        service.alerts_db.save_settings({"enabled": False})
+        service.alert_engine.stop()
+    return {"running": service.alert_engine.running,
+            "status": service.alert_engine.status_text()}
 
 
 # --------------------------------------------------------------------- auth

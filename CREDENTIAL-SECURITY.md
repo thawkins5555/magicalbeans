@@ -13,6 +13,8 @@ ways:
 | A person's web login password | Nowhere — only a hash is stored, in `app.db` | No. Never was — a hash is a one-way function. |
 | A session token, after signing in | In memory only, on the server | Not applicable — it isn't a secret derived from anything; it's random data that exists once, in memory, and is compared to itself. |
 | An optional DHCP polling credential | Encrypted in `ipam.db`, if you chose to store one | No — SappiWhere can decrypt it (that's the point), but it never leaves the process as plaintext, and a copy of the file on other hardware cannot decrypt it at all. |
+| An optional SNMPv3 authentication password (Nodes) | Encrypted in `nodes.db`, per device or per polling profile, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
+| An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 
 Everything below explains why each row is true.
 
@@ -319,10 +321,74 @@ actual recovery.
 
 ---
 
-## 4. What this application deliberately never does
+## 4. The optional SNMPv3 authentication password (Nodes)
+
+A device polled with SNMPv3 needs a username and an authentication
+password, stored per device or per polling profile (`netpath/nodesdb.py`,
+`netpath/dpapi.py`) — the same opt-in shape as the DHCP credential above,
+and the same underlying mechanism: DPAPI-encrypted, machine-scoped, never
+returned by any API response (only `has_credential: bool`), refused
+outright on any platform other than Windows rather than falling back to a
+weaker cipher or a plaintext file. `POST .../credential` and `DELETE
+.../credential` are the only two operations exposed — store or clear,
+never reveal.
+
+**An SNMP *community* string (v1/v2c) is not treated the same way, and
+that is deliberate, not an oversight.** It is stored and shown in the
+clear, in the device list, in the edit form, in the API response. A
+community string is not a secret by the protocol's own design — SNMPv1
+and v2c send it in cleartext inside every single packet, request and
+response alike, to anyone who can see the wire. Encrypting it at rest
+while it travels in the open on every poll would be theater: it protects
+against reading the database file but not against the one thing that
+actually exposes it, a packet capture on the path to the device. It is a
+filter, the same word `CREDENTIAL-SECURITY.md`'s SNMP Trap coverage
+already used for the identical fact on the receiving side. Only the
+SNMPv3 authentication *password* — which is never transmitted in the
+clear, only ever proved via an HMAC computed over it — gets the DPAPI
+treatment this section describes.
+
+Plaintext exists only as long as one poll takes: `nodepoll.credential_for()`
+decrypts a device or profile's stored password immediately before signing
+that one request and never caches it, the same "decrypt fresh every use,
+discard immediately after" discipline `ipam_worker.credential_for_server()`
+established for DHCP. A password typed into the **Test** button on the
+add/edit device form, before the device is even saved, is used the same
+way — signed into that one test request in memory — and is never written
+to `nodes.db` unless the **Save** (not Test) path is used and a password
+was actually entered.
+
+## 5. The optional SMTP password (Alerts)
+
+Alerts' email notification (`netpath/alertmail.py`, `netpath/alertsdb.py`)
+needs a password only when the configured mail server requires
+authentication; a server that accepts anonymous relay from this host, or
+sending disabled entirely (the default), stores nothing. One password for
+the whole module — not per rule or per recipient, since there is one SMTP
+identity Alerts sends as — encrypted the identical DPAPI, machine-scoped
+way as the DHCP and SNMPv3 credentials, never returned by any API
+response, refused on non-Windows. `POST /api/alerts/smtp/credential` and
+`DELETE /api/alerts/smtp/credential` store or clear it; there is no
+"reveal" path.
+
+**Send test email** works two ways: with a password already stored, it
+decrypts and uses that; with one typed into the Settings dialog but not
+yet saved, it signs in with that instead, for exactly that one test
+message — the same "test what's currently in the form, before it's
+saved" idiom the DHCP connection test and the Nodes device test both use.
+Either way the plaintext exists only for the one SMTP session it
+authenticates, then is discarded.
+
+TLS is the default, not an afterthought: `smtp_security` defaults to
+`starttls`, and `smtp_verify_cert` defaults to on. Turning certificate
+verification off is a real, logged configuration choice — an explicit
+opt-out visible in the settings dialog — never a silent downgrade a
+misconfiguration could trigger by accident.
+
+## 6. What this application deliberately never does
 
 - Never stores a password in a form that can be turned back into the
-  password — not the web login, not a DHCP credential.
+  password — not the web login, not a DHCP, SNMPv3 or SMTP credential.
 - Never returns a password or an encrypted password blob through any API
   response.
 - Never builds a shell or PowerShell command by inserting a credential (or
@@ -341,16 +407,20 @@ actual recovery.
   `NETWORK-AND-STORAGE-REQUIREMENTS.md` for the complete, closed list of
   every outbound connection this application makes.
 
-## 5. What is still the administrator's job
+## 7. What is still the administrator's job
 
 Encryption and hashing close the gaps this application controls. A few
 things remain outside its reach entirely:
 
-- **Least privilege for a stored DHCP credential.** Create it as a dedicated
-  read-only account — membership in the DHCP server's local `DHCP Users`
-  group is enough — rather than reusing a domain admin account because it's
-  convenient. SappiWhere enforces that the *calls* it makes are read-only;
-  it cannot enforce what the account itself is authorized to do beyond that.
+- **Least privilege for a stored DHCP, SNMPv3 or SMTP credential.** Create
+  a dedicated read-only DHCP account — membership in the DHCP server's
+  local `DHCP Users` group is enough — rather than reusing a domain admin
+  account because it's convenient; give an SNMPv3 polling user read-only
+  access on the device side; give the SMTP account only send rights, not a
+  full mailbox. SappiWhere enforces that the calls it makes with a
+  credential are read-only (DHCP) or exactly what the credential is for
+  (an SNMP GET, an SMTP send); it cannot enforce what the account itself
+  is authorized to do beyond that.
 - **TLS in any deployment that matters.** `--cert`/`--key` turns on HTTPS and
   with it the `Secure` cookie flag; without it, session cookies (though still
   `HttpOnly` and `SameSite=Strict`) travel in the clear on the network.

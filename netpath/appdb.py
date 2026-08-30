@@ -92,9 +92,13 @@ GLOBAL_DEFAULTS = {
     # that barely change in a few seconds, and the debug page is watching
     # things that move by the second.
     "netpath_refresh_s": 2,
+    "nodes_refresh_s": 10,
+    "alerts_refresh_s": 10,
     "netflow_refresh_s": 30,
     "snmp_refresh_s": 10,
     "syslog_refresh_s": 10,
+    "ipam_refresh_s": 30,          # was missing entirely; app.js's rateFor()
+                                    # silently fell back to a hardcoded 2000ms
     "debug_refresh_s": 1,
     "web_host": "0.0.0.0",
     "web_port": 8443,
@@ -108,6 +112,8 @@ GLOBAL_DEFAULTS = {
     "session_max_hours": 12,
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
+    "max_nodes_db_mb": 1024,       # samples accumulate; closer to flows than traps
+    "max_alerts_db_mb": 128,       # alert/notification history, much lighter
     "max_snmp_db_mb": 256,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,

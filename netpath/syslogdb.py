@@ -412,6 +412,19 @@ class SyslogDatabase:
                 by[key] = by.get(key, 0) + row["n"]
         return buckets
 
+    def rows_since(self, last_id: int, limit: int = 500) -> list[sqlite3.Row]:
+        """Rows newer than last_id, oldest first — same cursor-read contract
+        as SnmpTrapDatabase.traps_since, used by the alert engine."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM logs WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (int(last_id), int(limit))).fetchall()
+
+    def max_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(id) AS m FROM logs").fetchone()
+        return int(row["m"] or 0)
+
     def sources(self, since_s: float = 86400, limit: int = 50) -> list[sqlite3.Row]:
         cutoff = time.time() - since_s
         with self._lock:

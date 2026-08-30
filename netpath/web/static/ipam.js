@@ -136,10 +136,10 @@
 
   function selectSub(name) {
     view.sub = name;
-    for (const btn of document.querySelectorAll('.subtab')) {
+    for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.classList.toggle('active', btn.dataset.subtab === name);
     }
-    for (const page of document.querySelectorAll('.subpage')) {
+    for (const page of document.querySelectorAll('#page-ipam .subpage')) {
       page.classList.toggle('active', page.id === `ipam-sub-${name}`);
     }
   }
@@ -973,7 +973,7 @@
   }
 
   function init() {
-    for (const btn of document.querySelectorAll('.subtab')) {
+    for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => selectSub(btn.dataset.subtab);
     }
     App.el('ipam-settings').onclick = settingsDialog;

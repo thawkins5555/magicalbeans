@@ -1,0 +1,588 @@
+/* The Alerts page: open/acked/resolved alerts with a histogram, rules and
+   email templates. Table/modal patterns follow snmp.js and ipam.js. */
+(() => {
+  const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
+                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--faint)'];
+  const PAD = { left: 40, right: 10, top: 8, bottom: 18 };
+
+  const view = {
+    t0: Date.now() / 1000 - 86400,
+    t1: Date.now() / 1000,
+    alerts: [],
+    selected: null,
+    rules: [],
+    rulesSelected: null,
+    templates: [],
+    templatesSelected: null,
+    hist: null,
+  };
+
+  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function ago(ts) {
+    if (!ts) return '—';
+    const age = Date.now() / 1000 - ts;
+    if (age < 5) return 'just now';
+    if (age < 90) return `${Math.round(age)}s ago`;
+    if (age < 5400) return `${Math.round(age / 60)}m ago`;
+    return `${(age / 3600).toFixed(1)}h ago`;
+  }
+
+  function window_() {
+    const seconds = Number(App.el('alerts-range').value) || 86400;
+    view.t1 = Date.now() / 1000;
+    view.t0 = view.t1 - seconds;
+    return { t0: view.t0, t1: view.t1 };
+  }
+
+  function filters() {
+    return {
+      state: App.el('alerts-filter-state').value,
+      severity: App.el('alerts-filter-sev').value,
+      rule_id: App.el('alerts-filter-rule').value,
+      device: App.el('alerts-filter-device').value.trim(),
+      q: App.el('alerts-filter-text').value.trim(),
+    };
+  }
+
+  /* ------------------------------------------------------------ status */
+
+  function drawStatus() {
+    const server = App.state.serverState || {};
+    const alerts = server.alerts || { counters: {} };
+    App.el('alerts-status').textContent = alerts.status || 'Engine stopped';
+    App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('alerts-toggle').textContent = alerts.running ? 'Stop engine' : 'Start engine';
+    const c = alerts.counters || {};
+    App.el('alerts-counters').textContent =
+      `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
+      `${c.emails_sent || 0} emails sent` +
+      (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
+      (c.send_errors ? ` · ${c.send_errors} send errors` : '');
+    const badge = App.el('alerts-open-badge');
+    const openCount = alerts.open_count || 0;
+    badge.textContent = openCount;
+    badge.hidden = openCount === 0;
+  }
+
+  /* --------------------------------------------------------- histogram */
+
+  function drawHistogram() {
+    const svg = App.el('alerts-hist-svg');
+    svg.innerHTML = '';
+    const box = App.el('alerts-hist').getBoundingClientRect();
+    const width = Math.max(box.width, 300);
+    const height = Math.max(box.height, 70);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const data = view.hist;
+    if (!data || !data.length) {
+      svg.appendChild(App.svgNode('text', {
+        x: width / 2, y: height / 2, 'text-anchor': 'middle',
+        fill: 'var(--faint)', 'font-size': 12 }, 'No alerts in this window'));
+      return;
+    }
+    const plot = { x: PAD.left, y: PAD.top,
+      w: Math.max(width - PAD.left - PAD.right, 10),
+      h: Math.max(height - PAD.top - PAD.bottom, 10) };
+    const peak = Math.max(...data.map((b) => b.total), 1);
+    const slotWidth = plot.w / data.length;
+    data.forEach((bucket, index) => {
+      const x = plot.x + index * slotWidth;
+      const w = Math.max(slotWidth - 1, 1);
+      if (!bucket.total) return;
+      let bottom = plot.y + plot.h;
+      const severities = Object.keys(bucket.by_severity).map(Number).sort((a, b) => b - a);
+      for (const sev of severities) {
+        const count = bucket.by_severity[String(sev)];
+        const h = (count / peak) * plot.h;
+        bottom -= h;
+        svg.appendChild(App.svgNode('rect', {
+          x, y: bottom, width: w, height: Math.max(h, 1),
+          fill: SEV_COLOR[sev] || 'var(--muted)', 'fill-opacity': 0.85 }));
+      }
+      const hit = App.svgNode('rect', { x, y: plot.y, width: w, height: plot.h,
+        fill: 'transparent', style: 'cursor:pointer' });
+      hit.addEventListener('mousemove', (event) =>
+        App.tooltip(`${new Date(bucket.t0 * 1000).toLocaleString()}\n${bucket.total} alert(s)`, event));
+      hit.addEventListener('mouseleave', App.hideTooltip);
+      svg.appendChild(hit);
+    });
+  }
+
+  /* ------------------------------------------------------------- table */
+
+  const COLUMNS = [
+    { key: 'severity', label: 'Sev', width: 60 },
+    { key: 'state', label: 'State', width: 80 },
+    { key: 'entity_label', label: 'Object', width: 170 },
+    { key: 'rule_name', label: 'Rule', width: 150 },
+    { key: 'message', label: 'Message', width: 260 },
+    { key: 'count', label: 'Count', width: 60, numeric: true },
+    { key: 'opened_ts', label: 'Opened', width: 90, numeric: true },
+    { key: 'last_ts', label: 'Last seen', width: 90, numeric: true },
+  ];
+
+  function drawTable() {
+    const table = App.grid(App.el('alerts-table'), { name: 'alerts', columns: COLUMNS });
+    const body = document.createElement('tbody');
+    for (const row of view.alerts) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
+      tr.innerHTML =
+        `<td><span class="sev sev-${row.severity}">${row.severity}</span></td>` +
+        `<td>${escape(row.state)}</td>` +
+        `<td>${escape(row.entity_label)}</td>` +
+        `<td>${escape(row.rule_name)}</td>` +
+        `<td class="msg">${escape(row.message)}</td>` +
+        `<td>${row.count > 1 ? row.count : ''}</td>` +
+        `<td>${ago(row.opened_ts)}</td>` +
+        `<td>${ago(row.last_ts)}</td>`;
+      tr.onclick = () => { view.selected = row.id; drawTable(); showDetail(row); };
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.el('alerts-count').textContent = `${view.alerts.length} shown`;
+  }
+
+  function showDetail(row) {
+    App.el('alerts-detail-empty').hidden = true;
+    const el = App.el('alerts-detail');
+    el.hidden = false;
+    const rows = view.rules.length ? view.rules : [];
+    const rule = rows.find((r) => r.id === row.rule_id);
+    el.innerHTML = `
+      <div class="bar"><span class="section sev sev-${row.severity}">${escape(row.severity_name)}</span>
+        <span class="grow"></span>
+        ${row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
+        ${row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}</div>
+      <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
+      <p>${escape(row.message)}</p>
+      ${row.detail ? `<p class="hint">${escape(row.detail)}</p>` : ''}
+      <p class="hint">Opened ${new Date(row.opened_ts * 1000).toLocaleString()} · ` +
+        `last seen ${new Date(row.last_ts * 1000).toLocaleString()} · occurred ${row.count} time(s)</p>
+      ${row.acked_by ? `<p class="hint">Acknowledged by ${escape(row.acked_by)}${row.ack_note ? `: ${escape(row.ack_note)}` : ''}</p>` : ''}
+      ${row.resolved_ts ? `<p class="hint">Resolved ${new Date(row.resolved_ts * 1000).toLocaleString()}${row.resolved_by ? ` by ${escape(row.resolved_by)}` : ' automatically'}</p>` : ''}
+      <div class="bar"><span class="section">NOTIFICATIONS</span></div>
+      <div id="alerts-d-notifications" class="hint">Loading…</div>`;
+    const resolveBtn = document.getElementById('alerts-d-resolve');
+    if (resolveBtn) resolveBtn.onclick = async () => {
+      await App.post(`/api/alerts/${row.id}/resolve`, {});
+      App.refreshNow('alerts');
+    };
+    const ackBtn = document.getElementById('alerts-d-ack');
+    if (ackBtn) ackBtn.onclick = async () => {
+      await App.post(`/api/alerts/${row.id}/ack`, {});
+      App.refreshNow('alerts');
+    };
+    App.get(`/api/alerts/${row.id}`).then((full) => {
+      const box = document.getElementById('alerts-d-notifications');
+      if (!box) return;
+      if (!full.notifications.length) { box.textContent = 'None sent.'; return; }
+      box.innerHTML = full.notifications.map((n) =>
+        `<div>${new Date(n.ts * 1000).toLocaleString()} — ${escape(n.kind)} to ${escape(n.to_addr)}: ` +
+        `${n.ok ? 'sent' : `<span class="err">failed (${escape(n.error)})</span>`}</div>`).join('');
+    }).catch(() => {});
+  }
+
+  /* --------------------------------------------------------------- rules */
+
+  function drawRulesTable() {
+    const table = App.el('alerts-rules-table');
+    table.innerHTML = '<thead><tr><th>Name</th><th>Kind</th><th>Sev</th><th>On</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const r of view.rules) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable' + (view.rulesSelected === r.id ? ' selected' : '');
+      tr.innerHTML = `<td>${escape(r.name)}${r.is_builtin ? '' : ' <span class="hint">(custom)</span>'}</td>` +
+        `<td>${escape(r.kind)}${r.source_kind ? `: ${escape(r.source_kind)}` : ''}</td>` +
+        `<td><span class="sev sev-${r.severity}">${r.severity}</span></td>` +
+        `<td>${r.enabled ? 'yes' : 'no'}</td>`;
+      tr.onclick = () => { view.rulesSelected = r.id; drawRulesTable(); };
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  function templateOptionsHtml(selectedId) {
+    return `<option value="">(none)</option>` + view.templates.map((t) =>
+      `<option value="${t.id}" ${t.id === selectedId ? 'selected' : ''}>${escape(t.name)}</option>`).join('');
+  }
+
+  function editRule() {
+    const r = view.rules.find((x) => x.id === view.rulesSelected);
+    if (!r) return;
+    const isThreshold = r.kind === 'threshold';
+    App.modal(`Edit ${r.name}`, `
+      <label>Name <input id="ar-name" value="${escape(r.name)}"></label>
+      <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
+        `<option value="${n}" ${r.severity === n ? 'selected' : ''}>${n} ${App.state.severities?.[n] || ''}</option>`).join('')}</select></label>
+      <label class="check"><input type="checkbox" id="ar-enabled" ${r.enabled ? 'checked' : ''}> Enabled</label>
+      <label>Device filter (substring, blank = all) <input id="ar-devfilter" value="${escape(r.device_filter || '')}"></label>
+      <label>Template <select id="ar-template">${templateOptionsHtml(r.template_id)}</select></label>
+      ${isThreshold ? `
+      <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
+      <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
+      <label>Consecutive polls before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>` : ''}
+      `, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async (box) => {
+        const values = {
+          name: box.querySelector('#ar-name').value.trim(),
+          severity: Number(box.querySelector('#ar-sev').value),
+          enabled: box.querySelector('#ar-enabled').checked,
+          device_filter: box.querySelector('#ar-devfilter').value.trim(),
+          template_id: box.querySelector('#ar-template').value ? Number(box.querySelector('#ar-template').value) : null,
+        };
+        if (isThreshold) {
+          values.threshold = Number(box.querySelector('#ar-threshold').value);
+          values.clear_threshold = Number(box.querySelector('#ar-clear').value);
+          values.for_polls = Number(box.querySelector('#ar-forpolls').value);
+        }
+        await App.put(`/api/alerts/rules/${r.id}`, values);
+        App.closeModal();
+        App.refreshNow('alerts');
+      } },
+    ]);
+  }
+
+  function addRule() {
+    App.modal('Add custom rule', `
+      <label>Key (stable identifier) <input id="ar-key" placeholder="my_custom_rule"></label>
+      <label>Name <input id="ar-name"></label>
+      <label>Kind <select id="ar-kind">
+        <option value="device_event">device_event</option>
+        <option value="interface_event">interface_event</option>
+        <option value="threshold">threshold</option>
+        <option value="trap">trap</option>
+        <option value="syslog">syslog</option>
+        <option value="ipam">ipam</option>
+      </select></label>
+      <label>Source kind (meaning depends on kind — e.g. device_event: down/up/rebooted; threshold: a metric key) <input id="ar-source"></label>
+      <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
+        `<option value="${n}" ${n === 4 ? 'selected' : ''}>${n} ${App.state.severities?.[n] || ''}</option>`).join('')}</select></label>
+      <label>Template <select id="ar-template">${templateOptionsHtml(null)}</select></label>
+      <label>Threshold (threshold rules only) <input id="ar-threshold" type="number" step="0.1"></label>
+      <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (box) => {
+        const key = box.querySelector('#ar-key').value.trim();
+        const name = box.querySelector('#ar-name').value.trim();
+        if (!key || !name) return;
+        const values = {
+          key, name, kind: box.querySelector('#ar-kind').value,
+          source_kind: box.querySelector('#ar-source').value.trim(),
+          severity: Number(box.querySelector('#ar-sev').value),
+          template_id: box.querySelector('#ar-template').value ? Number(box.querySelector('#ar-template').value) : null,
+        };
+        const t = box.querySelector('#ar-threshold').value;
+        const c = box.querySelector('#ar-clear').value;
+        if (t) values.threshold = Number(t);
+        if (c) values.clear_threshold = Number(c);
+        await App.post('/api/alerts/rules', values);
+        App.closeModal();
+        App.refreshNow('alerts');
+      } },
+    ]);
+  }
+
+  function removeRule() {
+    const r = view.rules.find((x) => x.id === view.rulesSelected);
+    if (!r || r.is_builtin) return;
+    App.modal('Remove rule', `<p>Remove <b>${escape(r.name)}</b>?</p>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Remove', primary: true, onClick: async () => {
+        await App.del(`/api/alerts/rules/${r.id}`);
+        App.closeModal();
+        view.rulesSelected = null;
+        App.refreshNow('alerts');
+      } },
+    ]);
+  }
+
+  /* ----------------------------------------------------------- templates */
+
+  function drawTemplatesTable() {
+    const table = App.el('alerts-templates-table');
+    table.innerHTML = '<thead><tr><th>Name</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const t of view.templates) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable' + (view.templatesSelected === t.id ? ' selected' : '');
+      tr.innerHTML = `<td>${escape(t.name)}${t.is_builtin ? '' : ' <span class="hint">(custom)</span>'}</td>`;
+      tr.onclick = () => { view.templatesSelected = t.id; drawTemplatesTable(); };
+      tr.ondblclick = () => editTemplate(t.id);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  function editTemplate(id) {
+    const t = view.templates.find((x) => x.id === id) ||
+      view.templates.find((x) => x.id === view.templatesSelected);
+    if (!t) return;
+    const tokens = t.tokens || [];
+    const box = App.modal(`Edit template: ${t.name}`, `
+      <label>Name <input id="at-name" value="${escape(t.name)}" ${t.is_builtin ? 'readonly' : ''}></label>
+      <label>Subject <input id="at-subject" value="${escape(t.subject)}"></label>
+      <label>Body <textarea id="at-body" rows="10">${escape(t.body)}</textarea></label>
+      <label class="check"><input type="checkbox" id="at-html" ${t.is_html ? 'checked' : ''}> HTML body</label>
+      <div class="bar"><span class="section">TOKENS (click to insert)</span></div>
+      <div id="at-tokens" style="max-height:140px;overflow:auto;border:1px solid var(--hairline);border-radius:4px;padding:6px">
+        ${tokens.map((tok) => `<div class="clickable token-row" data-token="${escape(tok.token)}"><code>{{${escape(tok.token)}}}</code> — ${escape(tok.description)}</div>`).join('')}
+      </div>
+      <div id="at-preview" class="hint"></div>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Preview', onClick: async (box) => {
+        // Preview requires the template already saved; save first then preview.
+        await saveTemplate(box, t, true);
+      } },
+      ...(t.is_builtin ? [{ label: 'Reset to default', onClick: async () => {
+        await App.post(`/api/alerts/templates/${t.id}/reset`, {});
+        App.closeModal();
+        App.refreshNow('alerts');
+      } }] : []),
+      { label: 'Save', primary: true, onClick: (box) => saveTemplate(box, t, false) },
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+    for (const row of box.querySelectorAll('.token-row')) {
+      row.onclick = () => {
+        const textarea = box.querySelector('#at-body');
+        const pos = textarea.selectionStart || textarea.value.length;
+        const token = `{{${row.dataset.token}}}`;
+        textarea.value = textarea.value.slice(0, pos) + token + textarea.value.slice(pos);
+        textarea.focus();
+      };
+    }
+  }
+
+  async function saveTemplate(box, t, previewOnly) {
+    const values = {
+      name: box.querySelector('#at-name').value.trim(),
+      subject: box.querySelector('#at-subject').value,
+      body: box.querySelector('#at-body').value,
+      is_html: box.querySelector('#at-html').checked,
+    };
+    await App.put(`/api/alerts/templates/${t.id}`, values);
+    if (previewOnly) {
+      const preview = await App.post(`/api/alerts/templates/${t.id}/preview`, {});
+      box.querySelector('#at-preview').innerHTML =
+        `<div class="bar"><span class="section">PREVIEW</span></div>` +
+        `<p><b>${escape(preview.subject)}</b></p><pre>${escape(preview.body)}</pre>`;
+      return;
+    }
+    App.closeModal();
+    App.refreshNow('alerts');
+  }
+
+  function addTemplate() {
+    App.modal('Add template', `
+      <label>Key (stable identifier) <input id="at-key" placeholder="my_template"></label>
+      <label>Name <input id="at-name"></label>
+      <label>Subject <input id="at-subject"></label>
+      <label>Body <textarea id="at-body" rows="8"></textarea></label>
+      <label class="check"><input type="checkbox" id="at-html"> HTML body</label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (box) => {
+        const key = box.querySelector('#at-key').value.trim();
+        const name = box.querySelector('#at-name').value.trim();
+        if (!key || !name) return;
+        await App.post('/api/alerts/templates', {
+          key, name, subject: box.querySelector('#at-subject').value,
+          body: box.querySelector('#at-body').value,
+          is_html: box.querySelector('#at-html').checked,
+        });
+        App.closeModal();
+        App.refreshNow('alerts');
+      } },
+    ], { buttonsTop: true });
+  }
+
+  /* ---------------------------------------------------------- settings */
+
+  function settingsDialog() {
+    const s = App.state.alertsSettings || {};
+    const check = (id, label, on) =>
+      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
+    const number = (id, label, value, attrs = '') =>
+      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const box = App.modal('Alerts settings', `
+      <fieldset><legend>ENGINE</legend>
+        ${check('as-enabled', 'Run the alert engine', s.enabled)}
+        <label>Evaluate severity <select id="as-minsev"></select> and worse (syslog/traps only)</label>
+        ${number('as-retention', 'Keep resolved alerts for', s.retention_days, 'min=1')} days
+      </fieldset>
+      <fieldset><legend>EMAIL SERVER</legend>
+        ${check('as-email', 'Send email notifications', s.email_enabled)}
+        <label>SMTP host <input id="as-host" value="${escape(s.smtp_host || '')}"></label>
+        ${number('as-port', 'Port', s.smtp_port, 'min=1 max=65535')}
+        <label>Security <select id="as-security">
+          <option value="none" ${s.smtp_security === 'none' ? 'selected' : ''}>None</option>
+          <option value="starttls" ${!s.smtp_security || s.smtp_security === 'starttls' ? 'selected' : ''}>STARTTLS</option>
+          <option value="ssl" ${s.smtp_security === 'ssl' ? 'selected' : ''}>SSL/TLS</option>
+        </select></label>
+        ${check('as-verify', 'Verify server certificate', s.smtp_verify_cert !== false)}
+        <label>Username <input id="as-user" value="${escape(s.smtp_username || '')}"></label>
+        <label>Password <input id="as-pass" type="password"
+          placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>
+        <p class="hint" id="as-cred-status"></p>
+      </fieldset>
+      <fieldset><legend>IDENTITY &amp; RECIPIENTS</legend>
+        <label>From address <input id="as-from" value="${escape(s.smtp_from || '')}"></label>
+        <label>From name <input id="as-fromname" value="${escape(s.smtp_from_name || '')}"></label>
+        <label>Default recipients (comma-separated) <input id="as-to" value="${escape(s.smtp_to_default || '')}"></label>
+      </fieldset>
+      <fieldset><legend>VOLUME</legend>
+        ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
+        ${check('as-clear', 'Send an email when an alert clears', s.notify_on_clear)}
+        ${number('as-maxhour', 'Max emails per hour', s.max_emails_per_hour, 'min=1')}
+      </fieldset>
+      <fieldset><legend>TEST</legend>
+        <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
+        <p class="hint" id="as-test-status"></p>
+      </fieldset>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Send test', onClick: async (box) => {
+        const to = box.querySelector('#as-testto').value.trim();
+        const status = box.querySelector('#as-test-status');
+        if (!to) { status.textContent = 'Enter a recipient first'; return; }
+        status.textContent = 'Sending…';
+        try {
+          const result = await App.post('/api/alerts/smtp/test', { to });
+          status.textContent = result.ok ? 'Sent.' : `Failed: ${result.error}`;
+        } catch (error) {
+          status.textContent = `Error: ${error.message}`;
+        }
+      } },
+      { label: 'Save', primary: true, onClick: async (box) => {
+        const on = (id) => box.querySelector(id).checked;
+        const num = (id) => Number(box.querySelector(id).value);
+        const text = (id) => box.querySelector(id).value.trim();
+        const password = box.querySelector('#as-pass').value;
+        if (password) {
+          try {
+            await App.post('/api/alerts/smtp/credential', { password });
+          } catch (error) {
+            box.querySelector('#as-cred-status').textContent = error.message;
+            return;
+          }
+        }
+        await App.post('/api/settings', { scope: 'alerts', values: {
+          enabled: on('#as-enabled'), min_severity: Number(box.querySelector('#as-minsev').value),
+          retention_days: num('#as-retention'), email_enabled: on('#as-email'),
+          smtp_host: text('#as-host'), smtp_port: num('#as-port'),
+          smtp_security: box.querySelector('#as-security').value,
+          smtp_verify_cert: on('#as-verify'), smtp_username: text('#as-user'),
+          smtp_from: text('#as-from'), smtp_from_name: text('#as-fromname'),
+          smtp_to_default: text('#as-to'), renotify_minutes: num('#as-renotify'),
+          notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
+        } });
+        await App.loadState();
+        App.closeModal();
+        App.refreshNow('alerts');
+      } },
+    ], { buttonsTop: true });
+    const select = box.querySelector('#as-minsev');
+    (App.state.severities || []).forEach((name, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = name;
+      select.appendChild(option);
+    });
+    select.value = String(s.min_severity ?? 7);
+  }
+
+  /* ----------------------------------------------------------- refresh */
+
+  async function refresh() {
+    if (App.state.tab !== 'alerts') return;
+    drawStatus();
+    const { t0, t1 } = window_();
+    const span = t1 - t0;
+    const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
+    const f = filters();
+    const [overview, list, rules, templates] = await Promise.all([
+      App.get('/api/alerts/overview', { t0, t1, bucket }),
+      App.get('/api/alerts', f),
+      App.get('/api/alerts/rules'),
+      App.get('/api/alerts/templates'),
+    ]);
+    view.hist = overview.buckets;
+    view.alerts = list.alerts;
+    view.rules = rules.rules;
+    view.templates = templates.templates;
+    if (view.selected && !view.alerts.some((a) => a.id === view.selected)) {
+      view.selected = null;
+      App.el('alerts-detail-empty').hidden = false;
+      App.el('alerts-detail').hidden = true;
+    }
+    fillRuleFilter();
+    drawHistogram();
+    drawTable();
+    drawRulesTable();
+    drawTemplatesTable();
+  }
+
+  function fillRuleFilter() {
+    const select = App.el('alerts-filter-rule');
+    const current = select.value;
+    select.innerHTML = '<option value="">any rule</option>' +
+      view.rules.map((r) => `<option value="${r.id}">${escape(r.name)}</option>`).join('');
+    select.value = current;
+  }
+
+  function init() {
+    for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
+      btn.onclick = () => selectSub(btn.dataset.subtab);
+    }
+    App.fillRanges(App.el('alerts-range'), 'Last 24 hours');
+    const sev = App.el('alerts-filter-sev');
+    sev.innerHTML = '<option value="">Any severity</option>';
+    (App.state.severities || []).forEach((name, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = `${name} and worse`;
+      sev.appendChild(option);
+    });
+    App.el('alerts-apply').onclick = () => App.refreshNow('alerts');
+    for (const id of ['alerts-filter-device', 'alerts-filter-text']) {
+      App.el(id).onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('alerts'); };
+    }
+    for (const id of ['alerts-filter-sev', 'alerts-filter-state', 'alerts-filter-rule', 'alerts-range']) {
+      App.el(id).onchange = () => App.refreshNow('alerts');
+    }
+    App.el('alerts-ack-all').onclick = async () => {
+      await App.post('/api/alerts/ack-all', {});
+      App.refreshNow('alerts');
+    };
+    App.el('alerts-toggle').onclick = async () => {
+      const running = (App.state.serverState.alerts || {}).running;
+      await App.post('/api/alerts/engine', { action: running ? 'stop' : 'start' });
+      await App.loadState();
+      App.refreshNow('alerts');
+    };
+    App.el('alerts-settings').onclick = settingsDialog;
+    App.el('alerts-add-rule').onclick = addRule;
+    App.el('alerts-edit-rule').onclick = editRule;
+    App.el('alerts-remove-rule').onclick = removeRule;
+    App.el('alerts-add-template').onclick = addTemplate;
+    App.el('alerts-edit-template').onclick = () => editTemplate(view.templatesSelected);
+
+    for (const event of ['resize', 'panes-resized']) {
+      window.addEventListener(event, () => {
+        if (App.state.tab === 'alerts') drawHistogram();
+      });
+    }
+  }
+
+  function selectSub(name) {
+    for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const page of document.querySelectorAll('#page-alerts > .subpage')) {
+      page.classList.toggle('active', page.id === `alerts-sub-${name}`);
+    }
+  }
+
+  App.pages.alerts = { init, refresh, fastTick: drawStatus };
+})();

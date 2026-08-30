@@ -6,8 +6,9 @@ disk, in one place.
 Nothing outside this document is opened, contacted or written: there is no
 telemetry, no update check, no outbound connection and no file created anywhere
 other than the locations below. How the credentials that do exist — a web
-login password, an optional stored DHCP credential — are protected is covered
-in full in `CREDENTIAL-SECURITY.md`, not repeated here.
+login password, an optional stored DHCP credential, an optional stored
+SNMPv3 or SMTP credential — are protected is covered in full in
+`CREDENTIAL-SECURITY.md`, not repeated here.
 
 ---
 
@@ -79,6 +80,10 @@ reachable.
 | IPAM subnet discovery | ICMP Echo Request (type 8) | — | One ping per address in an enabled subnet, on a schedule |
 | IPAM DHCP polling, ambient identity or Credential Manager | TCP (MS-RPC) | 135, plus a dynamic high port | To each configured Windows DHCP server; read-only |
 | IPAM DHCP polling, a stored credential | TCP (WinRM) | 5985 (HTTP) or 5986 (HTTPS) | Only for a server with a username and password saved; read-only |
+| Nodes SNMP polling | UDP | 161 (fixed) | GET/GETBULK to each configured device, on its own poll interval |
+| Nodes ping monitoring | ICMP Echo Request (type 8) | — | One ping per device with ping enabled, on its own poll interval |
+| Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers |
+| Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
 
 Traceroute probes go to every destination you add, and to every router on the
 path to it. Firewalls between here and a destination need to permit the probe
@@ -113,6 +118,12 @@ SappiWhere — nothing is transmitted on the wire beyond the ping itself; the
 address-to-MAC mapping comes from the operating system's own ARP cache, which
 only reflects the local broadcast domain regardless.
 
+Nodes polls port 161 always — it is the standard SNMP agent port and is not
+currently configurable per device or profile. An SNMPv3 device with only
+`authPriv` configured is rejected at session setup rather than polled: this
+app has no AES/DES implementation and takes no third-party dependency, the
+same deferral the SNMP Trap receiver made for inbound decryption.
+
 ### Local
 
 | Purpose | Protocol | Address |
@@ -126,17 +137,18 @@ browser with no internet access works normally.
 
 ### Not used
 
-sFlow, SNMP polling (GET/GETBULK), syslog over TLS, NetFlow over TCP or
-SCTP, and IPv6 flow export are not supported. SNMP is received only —
-traps and informs in, nothing queried out. The application makes no
-outbound connection to the internet other than DNS and the traceroute
-probes themselves.
+sFlow, syslog over TLS, NetFlow over TCP or SCTP, and IPv6 flow export are
+not supported. SNMPv3 `authPriv` is not supported for polling, and v3
+informs are not acknowledged — see `FEATURES.md`. The application makes no
+outbound connection to the internet other than DNS, the traceroute probes
+themselves, and — only if Alerts' email notification is turned on — the
+configured SMTP server.
 
 ---
 
 ## Storage
 
-Six SQLite databases and nothing else. No registry keys, no temporary files
+Eight SQLite databases and nothing else. No registry keys, no temporary files
 left behind, no writes to the application folder at runtime — the code
 directory can be read-only.
 
@@ -150,23 +162,28 @@ directory can be read-only.
 | `snmptraps.db` | Traps, hourly rollup counts, SNMP Trap settings | Trap rate — normally light; a device stuck in a fault loop is the exception |
 | `syslog.db` | Messages, hourly rollup counts, the search index, Syslog settings | Message rate — the substring index is roughly the size of the messages again |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential | Subnet sizes swept and DHCP scope sizes — bounded by the per-subnet address cap |
+| `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials | Device count × poll frequency × metrics per device |
+| `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
 
-The split is deliberate. The five record files each hold one module's data and
-that module's own settings; nothing else goes in them. Configuration read by
-more than one module, and the accounts that guard all of it, are in `app.db`,
-which is not subject to any size cap and is never trimmed by maintenance.
+The split is deliberate. The seven record files each hold one module's data
+and that module's own settings; nothing else goes in them. Configuration
+read by more than one module, and the accounts that guard all of it, are in
+`app.db`, which is not subject to any size cap and is never trimmed by
+maintenance.
 
 For backups that means `app.db` is the file that matters. Losing a record file
 costs history; losing `app.db` costs the configuration and every account.
 
-One caveat specific to `ipam.db`: if a DHCP server has a stored credential, its
-password is encrypted with Windows DPAPI, tied to the machine that encrypted
-it. Restoring `ipam.db` onto different hardware brings the credential's
-existence back but not its usability — DPAPI will not decrypt it there, and
-the DHCP server needs its credential re-entered on the new machine. Everything
-else in the file restores normally.
+One caveat specific to `ipam.db`, `nodes.db` and `alerts.db`: any stored
+credential in them — a DHCP server's password, a device or polling profile's
+SNMPv3 auth password, the SMTP password — is encrypted with Windows DPAPI,
+tied to the machine that encrypted it. Restoring one of these files onto
+different hardware brings the credential's existence back but not its
+usability — DPAPI will not decrypt it there, and the credential needs
+re-entering on the new machine. Everything else in each file restores
+normally.
 
-All six sit in one folder, chosen at first run:
+All eight sit in one folder, chosen at first run:
 
 | Platform | Default location |
 | --- | --- |
@@ -178,7 +195,8 @@ Override any of them individually:
 ```
 python -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db \
                   --syslog-db D:\data\syslog.db --app-db D:\data\app.db \
-                  --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db
+                  --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db \
+                  --nodes-db D:\data\nodes.db --alerts-db D:\data\alerts.db
 ```
 
 Running as a service, set these explicitly. The default resolves against the
@@ -232,6 +250,8 @@ Rough shapes to start from:
 | NetFlow | flow records exported | tens of MB to several GB per day |
 | SNMP Trap | traps per device per day | ~200 bytes per trap; normally the smallest of the record files |
 | Syslog | messages per second | ~150 bytes per message |
+| Nodes | devices × poll frequency × metrics per device | a few hundred bytes per device per poll; raw samples roll up into hourly min/avg/max after 3 days |
+| Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
 
 ### What keeps it bounded
 
@@ -242,7 +262,12 @@ Three limits, checked every 15 minutes, in this order:
    Syslog.
 3. **Size cap** — delete oldest records in chunks until the file fits. Per
    database, defaulting to 512 MB for traces, 2 GB for flows, 256 MB for
-   SNMP traps, 1 GB for syslog.
+   SNMP traps, 1 GB for syslog, 1 GB for Nodes and 128 MB for Alerts.
+   Nodes and Alerts trim only their genuinely historical tables — metric
+   samples and device/interface events for Nodes, resolved alerts and
+   notification history for Alerts — never the current-state tables
+   (devices, polling profiles, interfaces, MIB objects, rules, templates)
+   that describe things as they are configured now, not a log.
 
 The size cap wins over the other two: if retention says keep 30 days but the
 cap is reached at 9, the ninth day is where it stops. That is deliberate —

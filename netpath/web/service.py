@@ -11,6 +11,8 @@ from __future__ import annotations
 import threading
 import time
 
+from ..alertengine import AlertEngine
+from ..alertsdb import AlertsDatabase
 from ..auth import (DEFAULT_PASSWORD, DEFAULT_USER, LoginThrottle,
                     SessionStore, hash_password)
 from ..appdb import AppDatabase, migrate_from
@@ -21,6 +23,8 @@ from ..flowdb import FlowDatabase
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
+from ..nodepoll import NodePoller
+from ..nodesdb import NodesDatabase
 from ..snmptrapd import TrapCollector
 from ..snmptrapdb import SnmpTrapDatabase
 from ..syslogd import SyslogCollector
@@ -31,7 +35,8 @@ MAINTENANCE_INTERVAL_S = 900
 
 class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
-                 app_db_path: str, ipam_db_path: str, snmp_db_path: str):
+                 app_db_path: str, ipam_db_path: str, snmp_db_path: str,
+                 nodes_db_path: str, alerts_db_path: str):
         self.log = EventLog()
         self.app_db = AppDatabase(app_db_path)
         # Before the trace database is opened for normal use: on an install
@@ -44,6 +49,8 @@ class Service:
         self.syslog_db = SyslogDatabase(syslog_db_path)
         self.ipam_db = IpamDatabase(ipam_db_path)
         self.snmp_db = SnmpTrapDatabase(snmp_db_path)
+        self.nodes_db = NodesDatabase(nodes_db_path)
+        self.alerts_db = AlertsDatabase(alerts_db_path)
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
@@ -51,6 +58,8 @@ class Service:
         self.syslog_settings = self.syslog_db.settings()
         self.ipam_settings = self.ipam_db.settings()
         self.snmp_settings = self.snmp_db.settings()
+        self.nodes_settings = self.nodes_db.settings()
+        self.alerts_settings = self.alerts_db.settings()
 
         self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
@@ -83,6 +92,12 @@ class Service:
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)
         self.snmp = TrapCollector(self.snmp_db, log=self.log)
         self.ipam = IpamWorker(self.ipam_db, log=self.log)
+        self.node_poller = NodePoller(self.nodes_db, log=self.log)
+        # Depends on nodes_db/snmp_db/syslog_db/ipam_db, so constructed last.
+        self.alert_engine = AlertEngine(
+            self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
+            syslog_db=self.syslog_db, ipam_db=self.ipam_db, app_db=self.app_db,
+            log=self.log)
 
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),
@@ -123,8 +138,13 @@ class Service:
             self.syslog.start(self.syslog_settings)
         if self.snmp_settings.get("enabled", True):
             self.snmp.start(self.snmp_settings)
+        self._snmp_settings_with_mibs()
         if self.ipam_settings.get("enabled", True):
             self.ipam.start()
+        if self.nodes_settings.get("enabled", True):
+            self.node_poller.start(self.nodes_settings)
+        if self.alerts_settings.get("enabled", True):
+            self.alert_engine.start()
 
         # After the collectors are up: an index refill is background work and
         # must not delay the service being reachable.
@@ -154,11 +174,16 @@ class Service:
         self.syslog.stop()
         self.snmp.stop()
         self.ipam.shutdown()
+        # Alerts reads Nodes' own data, so stop the reader before the writer.
+        self.alert_engine.stop()
+        self.node_poller.stop()
         self.db.close()
         self.flow_db.close()
         self.syslog_db.close()
         self.snmp_db.close()
         self.ipam_db.close()
+        self.nodes_db.close()
+        self.alerts_db.close()
         self.app_db.close()
 
     # ------------------------------------------------------------- settings
@@ -247,6 +272,36 @@ class Service:
             self.ipam.stop()
         self.log.add(SYSTEM, "IPAM settings applied")
         return self.ipam_settings
+
+    def apply_nodes_settings(self, values: dict) -> dict:
+        self.nodes_settings.update(values)
+        self.nodes_db.save_settings(self.nodes_settings)
+        self.node_poller.reconfigure(self.nodes_settings)
+        self.log.add(SYSTEM, "Nodes settings applied")
+        return self.nodes_settings
+
+    def apply_alerts_settings(self, values: dict) -> dict:
+        self.alerts_settings.update(values)
+        self.alerts_db.save_settings(self.alerts_settings)
+        self.alert_engine.reconfigure(self.alerts_settings)
+        self.log.add(SYSTEM, "Alerts settings applied")
+        return self.alerts_settings
+
+    def _snmp_settings_with_mibs(self) -> None:
+        """MIB-derived OID names apply to both what Nodes polls and what the
+        SNMP Trap page displays, so a name learned from an uploaded MIB is
+        merged into the trap decoder's own oid_names setting rather than
+        living only in Nodes' database. Merged into the live decoder only —
+        never written back into snmp_db's own stored setting — so the SNMP
+        Trap module's own Settings dialog still shows and edits exactly
+        what an admin typed there, and deleting a MIB in Nodes stops
+        contributing names on the next call without touching anything the
+        admin owns."""
+        extra = self.nodes_db.oid_name_lines()
+        if not extra:
+            return
+        merged = (self.snmp_settings.get("oid_names", "") + "\n" + extra).strip()
+        self.snmp.decoder.configure({**self.snmp_settings, "oid_names": merged})
 
     def _apply_port_names(self) -> None:
         from ..services import parse_custom_ports, set_custom_ports
@@ -381,6 +436,8 @@ class Service:
         if self.ipam_settings.get("resolve_hosts", True):
             addresses.extend(row["ip"] for row in self.ipam_db.hosts()
                              if row["alive"])
+        if self.nodes_settings.get("resolve_addresses", True):
+            addresses.extend(row["ip"] for row in self.nodes_db.devices())
         return addresses
 
     def _maintenance_loop(self) -> None:
@@ -464,3 +521,26 @@ class Service:
                 self.log.add(SYSTEM, f"IPAM database over its "
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest scan records")
+
+        self.nodes_db.prune(
+            sample_days=float(self.nodes_settings.get("sample_retention_days", 400)),
+            event_days=float(self.nodes_settings.get("event_retention_days", 180)),
+            discovery_days=float(self.nodes_settings.get("discovery_retention_days", 30)),
+            max_samples=int(self.nodes_settings.get("sample_row_cap_per_metric", 0)))
+        cap = int(self.settings.get("max_nodes_db_mb", 0)) * 1024 * 1024
+        if cap:
+            removed = self.nodes_db.trim_to_size(cap)
+            if removed:
+                self.log.add(SYSTEM, f"Nodes database over its "
+                                     f"{cap // 1048576} MB cap: removed "
+                                     f"{removed} oldest samples")
+
+        self.alerts_db.prune(
+            float(self.alerts_settings.get("retention_days", 180)))
+        cap = int(self.settings.get("max_alerts_db_mb", 0)) * 1024 * 1024
+        if cap:
+            removed = self.alerts_db.trim_to_size(cap)
+            if removed:
+                self.log.add(SYSTEM, f"Alerts database over its "
+                                     f"{cap // 1048576} MB cap: removed "
+                                     f"{removed} oldest resolved alerts")

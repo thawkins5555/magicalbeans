@@ -26,6 +26,8 @@
 
 <nav id="tabs">
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
+  <button class="tab" data-tab="nodes">NODES</button>
+  <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
   <button class="tab" data-tab="netpath">NETPATH</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="snmp">SNMP TRAP</button>
@@ -46,6 +48,185 @@
     <h2>Dashboard</h2>
     <p class="hint">Nothing here yet — this is a placeholder for a future
       cross-module overview.</p>
+  </div>
+</section>
+
+<!-- ============================= NODES ============================== -->
+<section id="page-nodes" class="page">
+  <div class="card strip">
+    <span id="nd-dot" class="dot"></span>
+    <span id="nd-status" class="stat">Poller stopped</span>
+    <span id="nd-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="nd-add-device" class="primary">Add device</button>
+    <button id="nd-toggle">Stop poller</button>
+    <button id="nd-settings" class="module-settings">Settings</button>
+  </div>
+
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="devices">DEVICES</button>
+    <button class="subtab" data-subtab="discovery">DISCOVERY</button>
+    <button class="subtab" data-subtab="profiles">PROFILES &amp; MIBS</button>
+  </nav>
+
+  <div id="nodes-sub-devices" class="subpage active">
+    <div class="bar wrap">
+      <label>Find <input id="nd-q" size="20"></label>
+      <label>Group <select id="nd-filter-group"></select></label>
+      <label>Status <select id="nd-filter-status">
+        <option value="">any status</option><option value="up">up</option>
+        <option value="down">down</option><option value="unsupported">unsupported</option>
+        <option value="auth">auth failed</option><option value="unknown">unknown</option>
+      </select></label>
+      <button id="nd-apply">Apply</button>
+      <span class="grow"></span>
+      <span id="nd-count" class="hint"></span>
+    </div>
+    <div class="cols" data-splitter="nodes-devices">
+      <div class="pane" data-grow="2">
+        <div class="table-wrap"><table id="nodes-table"></table></div>
+      </div>
+      <div class="divider"></div>
+      <aside class="pane pad-x pad-b" data-grow="3">
+        <div id="nd-detail-empty" class="hint">Select a device to see its stats.</div>
+        <div id="nd-detail" hidden>
+          <div class="bar">
+            <span id="nd-d-name" class="section"></span>
+            <span class="grow"></span>
+            <button id="nd-poll-now">Poll now</button>
+            <button id="nd-edit-device">Edit</button>
+            <button id="nd-remove-device">Remove</button>
+          </div>
+          <div id="nd-d-summary" class="hint"></div>
+          <div class="bar">
+            <label>Metric <select id="nd-d-metric"></select></label>
+            <select id="nd-d-range"></select>
+          </div>
+          <div id="nd-chart" class="canvas chart"><svg id="nd-chart-svg"></svg></div>
+          <nav class="subtabs">
+            <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
+            <button class="subtab" data-subtab="events">EVENTS</button>
+          </nav>
+          <div id="nd-d-sub-interfaces" class="subpage active">
+            <div class="table-wrap"><table id="nd-if-table"></table></div>
+          </div>
+          <div id="nd-d-sub-events" class="subpage">
+            <div class="table-wrap"><table id="nd-ev-table"></table></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <div id="nodes-sub-discovery" class="subpage">
+    <div class="bar wrap">
+      <label>Kind <select id="disc-kind"><option value="device">Single device</option>
+        <option value="subnet">Subnet</option></select></label>
+      <label>Target <input id="disc-target" size="20" placeholder="10.20.3.0/24"></label>
+      <label>Communities <input id="disc-communities" size="16" value="public"></label>
+      <button id="disc-start" class="primary">Start</button>
+    </div>
+    <div class="cols" data-splitter="nodes-discovery">
+      <div class="pane" data-grow="1">
+        <div class="table-wrap"><table id="disc-jobs-table"></table></div>
+      </div>
+      <div class="divider"></div>
+      <div class="pane pad-x pad-b" data-grow="2">
+        <div class="bar"><span class="section">RESULTS</span><span class="grow"></span>
+          <button id="disc-promote" class="primary">Promote selected</button></div>
+        <div class="table-wrap"><table id="disc-results-table"></table></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="nodes-sub-profiles" class="subpage">
+    <div class="cols" data-splitter="nodes-profiles">
+      <div class="pane pad-x pad-b" data-grow="1">
+        <div class="bar"><span class="section">POLLING PROFILES</span>
+          <span class="grow"></span>
+          <button id="nd-edit-profile">Edit</button>
+          <button id="nd-remove-profile">Remove</button>
+          <button id="nd-add-profile" class="primary">Add</button></div>
+        <div class="table-wrap"><table id="nd-profiles-table"></table></div>
+      </div>
+      <div class="divider"></div>
+      <div class="pane pad-x pad-b" data-grow="2">
+        <div class="bar"><span class="section">VENDOR MIBS</span>
+          <span class="grow"></span>
+          <button id="nd-upload-mib" class="primary">Upload MIB</button></div>
+        <div class="table-wrap"><table id="nd-mibs-table"></table></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================= ALERTS ============================== -->
+<section id="page-alerts" class="page">
+  <div class="card strip">
+    <span id="alerts-dot" class="dot"></span>
+    <span id="alerts-status" class="stat">Engine stopped</span>
+    <span id="alerts-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="alerts-ack-all">Acknowledge all</button>
+    <button id="alerts-toggle">Stop engine</button>
+    <button id="alerts-settings" class="module-settings">Settings</button>
+  </div>
+
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="current">ALERTS<span id="alerts-open-badge" class="badge" hidden></span></button>
+    <button class="subtab" data-subtab="rules">RULES &amp; TEMPLATES</button>
+  </nav>
+
+  <div id="alerts-sub-current" class="subpage active">
+    <div class="bar wrap">
+      <label>Severity <select id="alerts-filter-sev"></select></label>
+      <label>State <select id="alerts-filter-state">
+        <option value="unresolved" selected>open + acknowledged</option>
+        <option value="open">open</option>
+        <option value="acked">acknowledged</option>
+        <option value="resolved">resolved</option>
+        <option value="">any</option></select></label>
+      <label>Rule <select id="alerts-filter-rule"></select></label>
+      <label>Device <input id="alerts-filter-device" size="16"></label>
+      <label>Find <input id="alerts-filter-text" size="20"></label>
+      <select id="alerts-range"></select>
+      <button id="alerts-apply">Apply</button>
+      <span class="grow"></span>
+      <span id="alerts-count" class="hint"></span>
+    </div>
+    <div id="alerts-hist" class="canvas chart small"><svg id="alerts-hist-svg"></svg></div>
+    <div class="cols" data-splitter="alerts-main">
+      <div class="pane" data-grow="3">
+        <div class="table-wrap"><table id="alerts-table"></table></div>
+      </div>
+      <div class="divider"></div>
+      <aside class="pane pad-x pad-b" data-grow="2">
+        <div id="alerts-detail-empty" class="hint">Select an alert to see its detail.</div>
+        <div id="alerts-detail" hidden></div>
+      </aside>
+    </div>
+  </div>
+
+  <div id="alerts-sub-rules" class="subpage">
+    <div class="cols" data-splitter="alerts-rules">
+      <div class="pane pad-x pad-b" data-grow="3">
+        <div class="bar"><span class="section">RULES</span><span class="grow"></span>
+          <button id="alerts-edit-rule">Edit</button>
+          <button id="alerts-remove-rule">Remove</button>
+          <button id="alerts-add-rule" class="primary">Add rule</button></div>
+        <div class="table-wrap"><table id="alerts-rules-table"></table></div>
+      </div>
+      <div class="divider"></div>
+      <aside class="pane pad-x pad-b" data-grow="2">
+        <div class="bar"><span class="section">EMAIL TEMPLATES</span><span class="grow"></span>
+          <button id="alerts-edit-template">Edit</button>
+          <button id="alerts-add-template" class="primary">Add</button></div>
+        <div class="table-wrap"><table id="alerts-templates-table"></table></div>
+        <p class="hint">A built-in template can be edited freely and reset to
+          its shipped text, but not deleted — a rule that references it
+          would otherwise lose its wording silently.</p>
+      </aside>
+    </div>
   </div>
 </section>
 
@@ -484,9 +665,12 @@
     <fieldset>
       <legend>REFRESH RATES</legend>
       <label>NetPath <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
+      <label>Nodes <input type="number" id="set-refresh-nodes" min="1" max="3600" step="1"> s</label>
+      <label>Alerts <input type="number" id="set-refresh-alerts" min="1" max="3600" step="1"> s</label>
       <label>NetFlow <input type="number" id="set-refresh-netflow" min="1" max="3600" step="5"> s</label>
       <label>SNMP <input type="number" id="set-refresh-snmp" min="1" max="3600" step="5"> s</label>
       <label>Syslog <input type="number" id="set-refresh-syslog" min="1" max="3600" step="5"> s</label>
+      <label>IPAM <input type="number" id="set-refresh-ipam" min="1" max="3600" step="5"> s</label>
       <label>Debug <input type="number" id="set-refresh-debug" min="0.1" max="60" step="0.5"> s</label>
       <p class="hint">Set per module because they want different rates. The route graph is
         cheap and benefits from feeling live; the flow charts are aggregations over a whole
@@ -503,6 +687,8 @@
       <label>SNMP traps <input id="set-snmp-path" readonly></label>
       <label>Syslog <input id="set-syslog-path" readonly></label>
       <label>IPAM <input id="set-ipam-path" readonly></label>
+      <label>Nodes <input id="set-nodes-path" readonly></label>
+      <label>Alerts <input id="set-alerts-path" readonly></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
@@ -513,6 +699,10 @@
         <span class="usage" id="use-syslog"></span></label>
       <label>IPAM database cap <input type="number" id="set-ipam-cap" min="16" step="64"> MB
         <span class="usage" id="use-ipam"></span></label>
+      <label>Nodes database cap <input type="number" id="set-nodes-cap" min="16" step="64"> MB
+        <span class="usage" id="use-nodes"></span></label>
+      <label>Alerts database cap <input type="number" id="set-alerts-cap" min="16" step="16"> MB
+        <span class="usage" id="use-alerts"></span></label>
       <p class="hint" id="set-sizes"></p>
       <p class="hint">Checked every 15 minutes. When a file is over its cap the oldest records are
         deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
@@ -579,6 +769,8 @@
         <button data-maint="prune_flows">Delete stored flows</button>
         <button data-maint="prune_snmp">Delete stored traps</button>
         <button data-maint="prune_syslog">Delete stored syslog</button>
+        <button data-maint="prune_nodes">Delete stored samples</button>
+        <button data-maint="prune_alerts">Delete resolved alerts</button>
         <button id="reset-layout">Reset panel sizes</button>
       </div>
       <p class="hint">These act immediately and cannot be undone.</p>
@@ -596,6 +788,8 @@
 
 <script src="/app.js"></script>
 <script src="/dashboard.js"></script>
+<script src="/nodes.js"></script>
+<script src="/alerts.js"></script>
 <script src="/netpath.js"></script>
 <script src="/netflow.js"></script>
 <script src="/snmp.js"></script>

@@ -70,6 +70,9 @@ body {
   font: 600 12px/1 var(--ui);
   letter-spacing: 0.8px;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
@@ -141,6 +144,8 @@ button.linkish:hover { color: var(--accent); }
    .active in the raw HTML — removing that static default in favor of
    this is what actually closes the flash, not just narrows it. */
 html[data-tab="dashboard"] .tab[data-tab="dashboard"],
+html[data-tab="nodes"] .tab[data-tab="nodes"],
+html[data-tab="alerts"] .tab[data-tab="alerts"],
 html[data-tab="netpath"] .tab[data-tab="netpath"],
 html[data-tab="netflow"] .tab[data-tab="netflow"],
 html[data-tab="snmp"] .tab[data-tab="snmp"],
@@ -152,6 +157,8 @@ html[data-tab="settings"] .tab[data-tab="settings"] {
   border-bottom-color: var(--accent);
 }
 html[data-tab="dashboard"] #page-dashboard,
+html[data-tab="nodes"] #page-nodes,
+html[data-tab="alerts"] #page-alerts,
 html[data-tab="netflow"] #page-netflow,
 html[data-tab="snmp"] #page-snmp,
 html[data-tab="syslog"] #page-syslog,
@@ -388,6 +395,9 @@ body.tiny .terms { display: none; }
 .canvas svg.dragging { cursor: grabbing; }
 .timeline svg { user-select: none; -webkit-user-select: none; }
 .canvas.chart { background: var(--panel); border-color: var(--hairline); }
+/* A compact "at a glance" strip rather than a primary resizable panel —
+   the Alerts histogram sits above its own splitter, not inside one. */
+.canvas.small { flex: none; height: 90px; min-height: 90px; }
 .timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: 6px; }
 .timeline svg { width: 100%; height: 100%; display: block; }
 
@@ -484,6 +494,7 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 .sev-7 { color: var(--faint); }
 #syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
+#nodes-table td.msg, #alerts-table td.msg { white-space: pre-wrap; word-break: break-word; }
 .took { font-family: var(--mono); font-size: 11px; color: var(--faint); }
 
 /* ---------------------------------------------------------------- debug */
@@ -712,6 +723,16 @@ body.login-page {
   max-height: 86vh;
   overflow: auto;
 }
+/* The alert email template editor needs room for a subject/body pair
+   alongside a token palette; every other modal in the app is a plain
+   form and stays at the default width. Every other modal's <label>s
+   happen to wrap one-per-line simply because they are narrow enough
+   relative to the default 760px width — at 960px, several short labels
+   (Name/Subject/Body) fit on one packed row instead, so this width
+   variant forces one field per line explicitly rather than relying on
+   the same happy accident. */
+.modal-box.wide { max-width: 960px; }
+.modal-box.wide > label { display: flex; }
 .modal-box h2 { margin: 0 0 12px; font-size: 15px; }
 .modal-box .row { justify-content: flex-end; margin-top: 14px; }
 .modal-box .row.top {

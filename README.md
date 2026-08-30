@@ -6,7 +6,7 @@ each one actually works — file by file, mechanism by mechanism —
 for the build history, and `CREDENTIAL-SECURITY.md` for exactly how passwords
 and stored credentials are protected.
 
-Six tabs at the top of the window: **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Debug**, a live view of what the background threads are doing; and **Settings**.
+Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Debug**, a live view of what the background threads are doing; and **Settings**.
 
 ## NetPath
 
@@ -50,8 +50,9 @@ recommends, never in plain text and never recoverable. If the only account's
 password is lost, the way back is to stop the service and delete the `users`
 table from `app.db`; the default admin account is recreated on the next start.
 The exact mechanics — hashing parameters, login throttling, session cookie
-flags, and how IPAM's optional stored DHCP credential is protected — are in
-`CREDENTIAL-SECURITY.md`.
+flags, and how IPAM's optional stored DHCP credential, Nodes' optional
+SNMPv3 credential and Alerts' optional SMTP credential are protected — are
+in `CREDENTIAL-SECURITY.md`.
 
 **Idle timeout** signs a session out after 10 minutes with no real mouse or
 keyboard activity in the browser — adjustable on the Settings tab, under

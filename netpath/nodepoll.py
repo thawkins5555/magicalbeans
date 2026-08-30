@@ -1,0 +1,755 @@
+"""NodePoller: the per-device SNMP/ping scheduler.
+
+Monitor-shaped, not IpamWorker-shaped — a hot-resizable ThreadPoolExecutor,
+restart-safe per-device due-time seeding (from the device's own
+last_poll_ts, so a service restart does not fire every device at once),
+reschedule-before-run, overrun logging, and a wrap-everything/finally
+worker discipline, all copied from netpath/monitor.py's Monitor class.
+Nodes will typically manage far more devices than IPAM manages subnets, so
+the finer-grained, restart-safe scheduling Monitor already has is the
+right shape, not IpamWorker's coarser "unseen = immediately due" one.
+"""
+
+from __future__ import annotations
+
+import random
+import socket
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+from . import nodeoids
+from .eventlog import ERROR, NODES, NullLog
+from .ipam_scan import ping_once
+from .nodediscover import DiscoveryJob
+from .nodeoids import DEFAULT_SNMP_PORT
+from .nodesdb import NodesDatabase
+from .snmppoll import (
+    ERROR_STATUS, PDU_GET, PDU_GETNEXT, PDU_REPORT, Response, SnmpError,
+    SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
+    decode_response, discovery_probe,
+)
+from .trapdecode import localized_key
+
+MAX_UDP = 65535
+
+
+class EngineCache:
+    """One entry per device needing v3: device_id -> (engine_id, boots,
+    time, learned_at). A v3 device's first poll after startup (or after
+    this entry expires) sends discovery_probe() first, learns engine
+    parameters from the Report-PDU, then proceeds with the real signed
+    request. Entries are kept for the process lifetime — engine boots/time
+    only need refreshing if the target actually reboots or its clock skews
+    enough to be rejected, which shows up as an auth failure and triggers
+    a fresh discovery on the next poll, not a background expiry timer."""
+
+    def __init__(self):
+        self._entries: dict[int, tuple[bytes, int, int, float]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, device_id: int):
+        with self._lock:
+            return self._entries.get(device_id)
+
+    def set(self, device_id: int, engine_id: bytes, boots: int, engine_time: int) -> None:
+        with self._lock:
+            self._entries[device_id] = (engine_id, boots, engine_time, time.time())
+
+    def invalidate(self, device_id: int) -> None:
+        with self._lock:
+            self._entries.pop(device_id, None)
+
+
+class _Session:
+    """One UDP socket for one poll: send/recv with retry, closed after."""
+
+    def __init__(self, ip: str, port: int, timeout_s: float, retries: int):
+        self.ip = ip
+        self.port = port
+        self.timeout_s = max(0.2, float(timeout_s))
+        self.retries = max(0, int(retries))
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(self.timeout_s)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def request(self, packet: bytes) -> Response:
+        """Send, wait for a reply, decode it. Retries on timeout up to
+        self.retries times; raises SnmpTimeout if every attempt times out."""
+        last_error: Exception | None = None
+        for _ in range(self.retries + 1):
+            try:
+                self.sock.sendto(packet, (self.ip, self.port))
+                data, _addr = self.sock.recvfrom(MAX_UDP)
+                return decode_response(data)
+            except socket.timeout:
+                last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                continue
+            except OSError as exc:
+                last_error = SnmpError(str(exc))
+                continue
+        raise last_error or SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+
+
+def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
+    """Decrypt-just-in-time, the same shape as ipam_worker.credential_for_server:
+    returns (community_or_user, auth_proto, auth_password) with the DPAPI
+    blob decrypted immediately before use and never cached. `config` is
+    already the effective_config() merge of a device's own overrides over
+    its group's defaults."""
+    if int(config.get("snmp_version") or 1) == 3:
+        identity = config.get("v3_user")
+    else:
+        identity = config.get("community")
+    auth_proto = config.get("v3_auth_proto")
+    blob = config.get("v3_auth_pass_enc")
+    password = None
+    if blob:
+        try:
+            from . import dpapi
+            password = dpapi.unprotect(bytes(blob)).decode("utf-8")
+        except Exception:
+            password = None
+    return identity, auth_proto, password
+
+
+def counter_rate(previous: int | None, previous_ts: float, current: int | None,
+                 current_ts: float, bit_width: int, *,
+                 speed_bps: float | None = None) -> float | None:
+    """Per-second rate (units of the counter, e.g. bytes/sec for an octet
+    counter) from two counter samples, handling wraparound and rejecting
+    nonsense. A 32-bit counter that decreased is assumed to have wrapped
+    once; a 64-bit counter that decreased is assumed to have been reset
+    (rebooted/reinitialized) since a real wrap would take centuries at any
+    realistic speed. If speed_bps is given (bits/sec) and the implied rate
+    would exceed ~1.3x it, the sample is treated as a reset rather than a
+    multi-wrap and None is returned — this is why ifXTable's 64-bit
+    counters (nodeoids.IFX_TABLE) are preferred whenever present."""
+    if previous is None or current is None:
+        return None
+    dt = current_ts - previous_ts
+    if dt <= 0:
+        return None
+    if current >= previous:
+        rate = (current - previous) / dt
+    elif bit_width >= 64:
+        return None
+    else:
+        modulus = 2 ** bit_width
+        rate = (modulus - previous + current) / dt
+    if speed_bps and rate * 8 > speed_bps * 1.3:
+        return None
+    return rate
+
+
+def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | None,
+                  previous_ts: float) -> tuple[bool, str]:
+    """sysUpTime is a TimeTicks (hundredths of a second) since the agent's
+    own last (re)initialization, wrapping at ~497 days (2**32 hundredths).
+    A reboot is detected when the current uptime is significantly smaller
+    than the previous reading, ruling out two false-positive cases: a
+    497-day wrap (only plausible when the previous reading was already
+    enormous) and ordinary jitter (a 30-second grace band)."""
+    if previous_ticks is None:
+        return False, ""
+    elapsed_s = uptime_ts - previous_ts
+    if elapsed_s <= 0:
+        return False, ""
+    grace_ticks = 30 * 100
+    if uptime_ticks + grace_ticks >= previous_ticks:
+        return False, ""   # uptime kept increasing (or barely dipped): normal
+    wrap_modulus = 2 ** 32
+    near_wrap = previous_ticks > wrap_modulus - (elapsed_s * 100 + grace_ticks) * 2
+    if near_wrap:
+        return False, ""
+    return True, (f"uptime dropped from {previous_ticks} to {uptime_ticks} "
+                  f"hundredths of a second after {elapsed_s:.0f}s")
+
+
+def _ago(ts: float) -> str:
+    if not ts:
+        return "never"
+    age = time.time() - ts
+    if age < 5:
+        return "just now"
+    if age < 90:
+        return f"{age:.0f}s ago"
+    if age < 5400:
+        return f"{age / 60:.0f}m ago"
+    return f"{age / 3600:.1f}h ago"
+
+
+class NodePoller:
+    def __init__(self, db: NodesDatabase, log=None):
+        self.db = db
+        self.log = log or NullLog()
+        self._executor: ThreadPoolExecutor | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._queued: dict[int, float] = {}
+        self._started: dict[int, float] = {}
+        self._next_run: dict[int, float] = {}
+        self._engines = EngineCache()
+        self._discovery_jobs: dict[int, DiscoveryJob] = {}
+        self._last_completed: float = 0.0
+        self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
+                         "unsupported": 0, "errors": 0, "overruns": 0}
+        self.error: str | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, settings: dict | None = None) -> None:
+        self.stop()
+        self._stop.clear()
+        workers = max(1, int((settings or self.db.settings()).get("poll_workers", 16)))
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._thread = threading.Thread(target=self._loop, name="node-poller", daemon=True)
+        self._thread.start()
+
+    def reconfigure(self, settings: dict) -> None:
+        """Hot pool resize, matching Monitor.set_workers: build a new
+        executor, swap it in, let the old one drain in-flight work rather
+        than cancelling it. Starts/stops the loop only if `enabled`
+        actually changed."""
+        if settings.get("enabled", True):
+            if not self.running:
+                self.start(settings)
+                return
+            workers = max(1, int(settings.get("poll_workers", 16)))
+            if self._executor is not None and self._executor._max_workers == workers:
+                return
+            previous, self._executor = self._executor, ThreadPoolExecutor(max_workers=workers)
+            if previous:
+                previous.shutdown(wait=False)
+        elif self.running:
+            self.stop()
+
+    def stop(self) -> None:
+        self._stop.set()
+        for job in list(self._discovery_jobs.values()):
+            job.cancel()
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self._thread = None
+
+    def shutdown(self) -> None:
+        self.stop()
+
+    def status_text(self) -> str:
+        if self.error:
+            return self.error
+        if not self.running:
+            return "Poller stopped"
+        n = self.db.device_count()
+        return f"Polling {n} device(s) · last poll {_ago(self._last_completed)}"
+
+    def worker_state(self) -> dict:
+        with self._lock:
+            return {device_id: {"queued": self._queued.get(device_id),
+                                "started": self._started.get(device_id)}
+                    for device_id in set(self._queued) | set(self._started)}
+
+    def next_runs(self) -> dict[int, float]:
+        return dict(self._next_run)
+
+    def poll_now(self, device_id: int) -> None:
+        self._submit(device_id)
+
+    # ------------------------------------------------------------ discovery
+
+    def start_discovery(self, kind: str, target: str,
+                        overrides: dict | None = None) -> int:
+        settings = dict(self.db.settings())
+        if overrides:
+            settings.update(overrides)
+        job_id = self.db.add_discovery_job(kind, target)
+        job = DiscoveryJob(self.db, job_id, kind, target, settings, log=self.log)
+        self._discovery_jobs[job_id] = job
+        job.start()
+        return job_id
+
+    def cancel_discovery(self, job_id: int) -> None:
+        job = self._discovery_jobs.get(job_id)
+        if job is not None:
+            job.cancel()
+
+    def discovery_running(self, job_id: int) -> bool:
+        job = self._discovery_jobs.get(job_id)
+        return job is not None and job.running
+
+    def promote(self, job_id: int, result_ids: list[int]) -> list[int]:
+        """Creates a devices row per discovery result, carrying the
+        discovered community/version as a per-device override only when it
+        differs from the target group's own. Already-promoted result ids
+        are a no-op rather than a duplicate-IP error, so a second promote
+        call with an overlapping selection is always safe to retry."""
+        device_ids = []
+        for result_id in result_ids:
+            result = self.db.discovery_result(result_id)
+            if result is None or result["job_id"] != job_id:
+                continue
+            if result["promoted_device_id"]:
+                device_ids.append(result["promoted_device_id"])
+                continue
+            existing = self.db.device_by_ip(result["ip"])
+            if existing is not None:
+                self.db.mark_promoted(result_id, existing["id"])
+                device_ids.append(existing["id"])
+                continue
+            group_id = result["suggested_group_id"]
+            group_row = self.db.group(group_id) if group_id else None
+            overrides = {}
+            if result["snmp_ok"] and result["community_or_user"]:
+                if group_row is None or group_row["community"] != result["community_or_user"]:
+                    overrides["community"] = result["community_or_user"]
+                if group_row is None or group_row["snmp_version"] != result["snmp_version"]:
+                    overrides["snmp_version"] = result["snmp_version"]
+            device_id = self.db.add_device(
+                result["ip"], result["sys_name"] or result["ip"],
+                group_id=group_id, **overrides)
+            self.db.mark_promoted(result_id, device_id)
+            device_ids.append(device_id)
+        return device_ids
+
+    # ------------------------------------------------------------------ loop
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            now = time.time()
+            for device in self.db.devices():
+                if not device["enabled"]:
+                    continue
+                config = self.db.effective_config(device)
+                interval = config["poll_interval_s"]
+                due = self._next_run.get(device["id"])
+                if due is None:
+                    due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
+                    self._next_run[device["id"]] = due
+                if now >= due:
+                    self._next_run[device["id"]] = now + interval
+                    if device["id"] in self._started or device["id"] in self._queued:
+                        self._record_overrun(device, now)
+                    else:
+                        self._submit(device["id"])
+            self._stop.wait(1.0)
+
+    def _submit(self, device_id: int) -> None:
+        with self._lock:
+            if device_id in self._queued or device_id in self._started:
+                return
+            self._queued[device_id] = time.time()
+        try:
+            self._executor.submit(self._run_one, device_id)
+        except RuntimeError:
+            with self._lock:
+                self._queued.pop(device_id, None)
+
+    def _record_overrun(self, device, now) -> None:
+        self.counters["overruns"] += 1
+        running_for = now - self._started.get(device["id"], now)
+        interval = self.db.effective_config(device)["poll_interval_s"]
+        self.log.add(ERROR, f"Poll overrun for {device['name'] or device['ip']}: "
+                            f"still running after {running_for:.0f}s, interval is "
+                            f"{interval}s — lengthen the interval or shorten the "
+                            f"timeout.", target=device["ip"])
+        self.db.record_device_event(device["id"], "poll_overrun",
+                                    f"running {running_for:.0f}s")
+
+    def _run_one(self, device_id: int) -> None:
+        """Wrapped entirely in except Exception (a scheduler thread must
+        never die quietly); finally always clears _queued/_started for
+        this id regardless of outcome."""
+        with self._lock:
+            self._queued.pop(device_id, None)
+            self._started[device_id] = time.time()
+        try:
+            device = self.db.device(device_id)
+            if device is None or not device["enabled"]:
+                return
+            config = self.db.effective_config(device)
+            self.counters["polls"] += 1
+            self._poll_device(device, config)
+        except Exception:
+            self.counters["errors"] += 1
+            self.log.add(ERROR, f"Node poll worker error for device #{device_id}",
+                         detail=traceback.format_exc())
+            traceback.print_exc()
+        finally:
+            with self._lock:
+                self._started.pop(device_id, None)
+                self._last_completed = time.time()
+
+    # ---------------------------------------------------------------- poll
+
+    def _poll_device(self, device, config: dict) -> None:
+        device_id = device["id"]
+        ip = device["ip"]
+        now = time.time()
+
+        ping_ok = None
+        ping_rtt_ms = None
+        if config.get("ping_enabled"):
+            timeout_ms = int(float(config.get("snmp_timeout_s", 3.0)) * 1000)
+            started = time.time()
+            ping_ok = ping_once(ip, timeout_ms=timeout_ms)
+            if ping_ok:
+                ping_rtt_ms = (time.time() - started) * 1000.0
+
+        snmp_ok = None
+        snmp_error = ""
+        identity = None
+        uptime_ticks = None
+        interfaces: list[dict] = []
+        metrics: list[tuple] = []   # (key, label, unit, kind, value)
+
+        if config.get("snmp_enabled"):
+            try:
+                identity, uptime_ticks, metrics = self._poll_snmp_scalars(device, config)
+                interfaces = self._poll_interfaces(device, config)
+                snmp_ok = True
+            except SnmpUnsupported as exc:
+                snmp_ok = False
+                snmp_error = str(exc)
+                self.counters["unsupported"] += 1
+            except SnmpTimeout as exc:
+                snmp_ok = False
+                snmp_error = str(exc)
+                self.counters["timeout"] += 1
+            except _AuthFailure as exc:
+                snmp_ok = False
+                snmp_error = str(exc)
+                self.counters["auth_fail"] += 1
+            except SnmpError as exc:
+                snmp_ok = False
+                snmp_error = str(exc)
+                self.counters["errors"] += 1
+
+        # -------------------------------------------------------- status
+
+        down_after = int(self.db.settings().get("down_after_failures", 3))
+        if not config.get("snmp_enabled"):
+            # A ping-only device by design (SNMP off entirely) is reachable
+            # by ping alone, regardless of the "degrade gracefully when
+            # SNMP is failing" setting below — that setting is about a
+            # device that normally has SNMP on, not one configured without
+            # it. Ping-only is documented as a first-class configuration.
+            reachable = bool(ping_ok)
+        else:
+            ping_only_ok = bool(self.db.settings().get("unreachable_ping_only", False))
+            reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
+
+        if snmp_ok is False and snmp_error and "unsupported" in snmp_error.lower():
+            status = "unsupported"
+        elif reachable:
+            status = "up"
+        elif device["consecutive_fail"] + 1 >= down_after:
+            status = "down"
+        else:
+            status = device["status"] if device["status"] in ("up", "down") else "unknown"
+
+        previous = self.db.record_poll(
+            device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,
+            snmp_error=snmp_error, identity=identity, uptime_ticks=uptime_ticks,
+            status=status, reachable=reachable)
+        if previous is None:
+            return
+
+        if self.counters is not None and snmp_ok:
+            self.counters["ok"] += 1
+
+        # -------------------------------------------------------- events
+
+        was_status = previous["status"]
+        if status == "up" and was_status not in ("up",):
+            self.db.record_device_event(device_id, "up", "responding again")
+        elif status == "down" and was_status != "down":
+            self.db.record_device_event(device_id, "down", snmp_error or "not responding")
+        elif status == "unsupported" and was_status != "unsupported":
+            self.db.record_device_event(device_id, "unsupported", snmp_error)
+
+        if snmp_ok is False and snmp_error and isinstance(snmp_error, str) and \
+           "auth" in snmp_error.lower():
+            self.db.record_device_event(device_id, "auth_fail", snmp_error)
+        elif snmp_ok:
+            if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
+                self.db.record_device_event(device_id, "auth_ok", "")
+
+        if uptime_ticks is not None:
+            rebooted, note = detect_reboot(
+                uptime_ticks, now, previous["last_uptime_ticks"],
+                previous["last_uptime_ts"] or now)
+            if rebooted:
+                self.db.record_device_event(device_id, "rebooted", note)
+
+        # ----------------------------------------------------- interfaces
+
+        if interfaces:
+            # Captured before replace_interfaces() overwrites descr/alias/
+            # admin_status/oper_status — comparing against a post-replace
+            # read would always compare the new value to itself and never
+            # detect a link_up/link_down transition.
+            existing = {row["if_index"]: row for row in self.db.interfaces(device_id)}
+            result = self.db.replace_interfaces(device_id, interfaces)
+            for row in interfaces:
+                if_index = row["if_index"]
+                prior = existing.get(if_index)
+                in_bps = out_bps = in_err_rate = out_err_rate = None
+                if prior is not None:
+                    in_bps = counter_rate(
+                        prior["last_in_octets"], prior["last_sample_ts"] or 0,
+                        row.get("in_octets"), now, row.get("_octet_bits", 32),
+                        speed_bps=row.get("speed_bps"))
+                    out_bps = counter_rate(
+                        prior["last_out_octets"], prior["last_sample_ts"] or 0,
+                        row.get("out_octets"), now, row.get("_octet_bits", 32),
+                        speed_bps=row.get("speed_bps"))
+                self.db.update_interface_rate(
+                    device_id, if_index, in_octets=row.get("in_octets"),
+                    out_octets=row.get("out_octets"), in_bps=in_bps, out_bps=out_bps,
+                    in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=now)
+                interface_id = self.db.interface_id_for(device_id, if_index)
+                if interface_id is not None and prior is not None:
+                    if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
+                        kind = "link_up" if row.get("oper_status") == "up" else "link_down"
+                        if row.get("oper_status") in ("up", "down"):
+                            self.db.record_interface_event(
+                                interface_id, kind,
+                                f"{row.get('descr') or if_index}: {prior['oper_status']} -> {row.get('oper_status')}")
+                if interface_id is not None:
+                    label = row.get("descr") or f"if{if_index}"
+                    for suffix, unit, value in (
+                        ("in_bps", "bps", in_bps), ("out_bps", "bps", out_bps),
+                    ):
+                        if value is not None:
+                            self.db.record_metric_sample(
+                                device_id, f"if_{suffix}.{if_index}",
+                                f"{label} {suffix}", unit, "gauge", now, value)
+
+        for key, label, unit, kind, value in metrics:
+            self.db.record_metric_sample(device_id, key, label, unit, kind, now, value)
+
+    def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
+        """One GET round trip against a device, handling v1/v2c/v3
+        (noAuthNoPriv/authNoPriv only) transparently."""
+        version = int(config.get("snmp_version") or 1)
+        timeout_s = float(config.get("snmp_timeout_s", 3.0))
+        retries = int(config.get("snmp_retries", 2))
+        session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
+        try:
+            if version in (0, 1):
+                identity, _proto, _pw = credential_for(config)
+                packet = build_request(version, identity or "public", PDU_GET,
+                                       random.randint(1, 2**16), oids)
+                response = session.request(packet)
+                self._check_error_status(response)
+                return response
+
+            identity, auth_proto, password = credential_for(config)
+            engine = self._engines.get(device["id"])
+            if engine is None:
+                engine = self._discover_engine(session, device)
+            engine_id, boots, engine_time, _learned_at = engine
+            auth_key = localized_key(auth_proto, password, engine_id) \
+                if auth_proto and password else None
+            packet = build_v3_request(
+                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GET, oids,
+                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
+            response = session.request(packet)
+            if response.pdu_tag == PDU_REPORT:
+                # Out of time window, or unknown engine: refresh and fail
+                # this attempt cleanly; the next poll re-discovers.
+                self._engines.invalidate(device["id"])
+                raise _AuthFailure(f"{device['ip']}: engine resync required "
+                                   f"(received a Report-PDU)")
+            self._check_error_status(response)
+            return response
+        finally:
+            session.close()
+
+    def _discover_engine(self, session: _Session, device) -> tuple:
+        probe = discovery_probe()
+        response = session.request(probe)
+        if not response.engine_id:
+            raise SnmpError(f"{device['ip']}: no engine id in discovery reply")
+        self._engines.set(device["id"], response.engine_id, response.engine_boots,
+                          response.engine_time)
+        return self._engines.get(device["id"])
+
+    @staticmethod
+    def _check_error_status(response: Response) -> None:
+        if response.error_status == 16:   # authorizationError
+            raise _AuthFailure("authorization error")
+
+    def _poll_snmp_scalars(self, device, config: dict):
+        oids = list(nodeoids.SYSTEM_SCALARS.values())
+        response = self._snmp_get(device, config, oids)
+        values = {vb["oid"]: vb["value"] for vb in response.varbinds}
+        identity = {
+            "sys_descr": values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or "",
+            "sys_object_id": values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or "",
+            "sys_name": values.get(nodeoids.SYSTEM_SCALARS["sys_name"]) or "",
+            "sys_contact": values.get(nodeoids.SYSTEM_SCALARS["sys_contact"]) or "",
+            "sys_location": values.get(nodeoids.SYSTEM_SCALARS["sys_location"]) or "",
+        }
+        identity["vendor"] = nodeoids.vendor_for(identity["sys_object_id"])
+        uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+        uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
+
+        metrics = []
+        try:
+            extra_response = self._snmp_get(device, config, list(nodeoids.UCD_SNMP.values()))
+            extra = {vb["oid"]: vb["value"] for vb in extra_response.varbinds
+                     if vb["type"] not in ("noSuchObject", "noSuchInstance")}
+            idle = extra.get(nodeoids.UCD_SNMP["cpu_raw_idle"])
+            if isinstance(idle, (int, float)):
+                metrics.append(("cpu_pct", "CPU", "%", "gauge", max(0.0, 100.0 - float(idle))))
+            avail = extra.get(nodeoids.UCD_SNMP["mem_avail_kb"])
+            total = extra.get(nodeoids.UCD_SNMP["mem_total_kb"])
+            if isinstance(avail, (int, float)) and isinstance(total, (int, float)) and total:
+                metrics.append(("mem_pct", "Memory", "%", "gauge",
+                               max(0.0, 100.0 * (1 - float(avail) / float(total)))))
+        except SnmpError:
+            pass   # best-effort: UCD-SNMP-MIB not present on this device
+
+        return identity, uptime_ticks, metrics
+
+    def _poll_interfaces(self, device, config: dict) -> list[dict]:
+        """Walks the ifIndex column to discover interfaces, then GETs the
+        needed columns for each index in one round trip per interface."""
+        indexes = self._walk_indexes(device, config, nodeoids.IF_TABLE["if_index"])
+        if not indexes:
+            return []
+        rows = []
+        for if_index in indexes[:512]:   # a sane ceiling; real devices rarely exceed this
+            oids = [f"{oid}.{if_index}" for oid in nodeoids.IF_TABLE.values()]
+            ifx_oids = [f"{oid}.{if_index}" for oid in nodeoids.IFX_TABLE.values()]
+            try:
+                response = self._snmp_get(device, config, oids + ifx_oids)
+            except SnmpError:
+                continue
+            values = {vb["oid"]: vb for vb in response.varbinds}
+
+            def _val(table, key):
+                vb = values.get(f"{table[key]}.{if_index}")
+                return vb["value"] if vb and vb["type"] not in ("noSuchObject", "noSuchInstance") else None
+
+            speed = _val(nodeoids.IF_TABLE, "if_speed")
+            high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
+            speed_bps = (float(high_speed) * 1_000_000 if isinstance(high_speed, (int, float)) and high_speed
+                        else (float(speed) if isinstance(speed, (int, float)) else None))
+            hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
+            hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
+            in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
+            out_octets = hc_out if isinstance(hc_out, (int, float)) else _val(nodeoids.IF_TABLE, "if_out_octets")
+            octet_bits = 64 if isinstance(hc_in, (int, float)) or isinstance(hc_out, (int, float)) else 32
+
+            admin_raw = _val(nodeoids.IF_TABLE, "if_admin_status")
+            oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
+            rows.append({
+                "if_index": if_index,
+                "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
+                "alias": _val(nodeoids.IFX_TABLE, "if_alias") or "",
+                "phys_addr": (_val(nodeoids.IF_TABLE, "if_phys_addr") or ""),
+                "speed_bps": speed_bps,
+                "admin_status": {1: "up", 2: "down", 3: "testing"}.get(
+                    int(admin_raw), "") if admin_raw is not None else "",
+                "oper_status": {1: "up", 2: "down", 3: "testing", 4: "unknown",
+                               5: "dormant", 6: "notPresent", 7: "lowerLayerDown"}.get(
+                    int(oper_raw), "") if oper_raw is not None else "",
+                "in_octets": int(in_octets) if isinstance(in_octets, (int, float)) else None,
+                "out_octets": int(out_octets) if isinstance(out_octets, (int, float)) else None,
+                "_octet_bits": octet_bits,
+            })
+        return rows
+
+    def _walk_indexes(self, device, config: dict, base_oid: str) -> list[int]:
+        """Repeated GETNEXT (works for v1/v2c/v3 alike, avoiding a separate
+        GETBULK code path) to enumerate a column's index suffixes. Stops
+        when the walk leaves base_oid's subtree or hits a safety cap."""
+        indexes: list[int] = []
+        current = base_oid
+        for _ in range(512):
+            try:
+                response = self._snmp_get_next(device, config, current)
+            except SnmpError:
+                break
+            if not response.varbinds:
+                break
+            vb = response.varbinds[0]
+            oid = vb["oid"]
+            if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                break
+            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                break
+            suffix = oid[len(base_oid) + 1:]
+            try:
+                indexes.append(int(suffix))
+            except ValueError:
+                break
+            current = oid
+        return indexes
+
+    def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
+        version = int(config.get("snmp_version") or 1)
+        timeout_s = float(config.get("snmp_timeout_s", 3.0))
+        retries = int(config.get("snmp_retries", 2))
+        session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
+        try:
+            if version in (0, 1):
+                identity, _proto, _pw = credential_for(config)
+                packet = build_request(version, identity or "public", PDU_GETNEXT,
+                                       random.randint(1, 2**16), [oid])
+                return session.request(packet)
+            identity, auth_proto, password = credential_for(config)
+            engine = self._engines.get(device["id"])
+            if engine is None:
+                engine = self._discover_engine(session, device)
+            engine_id, boots, engine_time, _learned_at = engine
+            auth_key = localized_key(auth_proto, password, engine_id) \
+                if auth_proto and password else None
+            packet = build_v3_request(
+                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GETNEXT, [oid],
+                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
+            return session.request(packet)
+        finally:
+            session.close()
+
+
+class _AuthFailure(SnmpError):
+    """Internal: an authorization/engine-sync failure, reported to the
+    device as status 'auth' rather than a generic error or a timeout."""
+
+
+if __name__ == "__main__":
+    # counter_rate / detect_reboot are pure functions and provable without
+    # any network at all.
+    assert counter_rate(100, 0.0, 200, 10.0, 32) == 10.0
+    assert counter_rate(2**32 - 50, 0.0, 50, 10.0, 32) == 10.0        # one 32-bit wrap
+    assert counter_rate(2**63, 0.0, 5, 10.0, 64) is None              # 64-bit: reset, not a wrap
+    assert counter_rate(0, 0.0, 10**12, 1.0, 32, speed_bps=1e9) is None  # implausible vs. link speed
+    assert counter_rate(100, 5.0, 200, 5.0, 32) is None               # dt == 0
+    assert counter_rate(None, 0.0, 200, 10.0, 32) is None             # first poll
+    print("counter_rate OK")
+
+    ok, note = detect_reboot(100, 1010.0, 500_000, 1000.0)
+    assert ok, "a real restart must be detected"
+    ok, _ = detect_reboot(29_000, 300.0, 2**32 - 1000, 0.0)
+    assert not ok, "a 497-day TimeTicks wrap is not a reboot"
+    ok, _ = detect_reboot(130_000, 300.0, 100_000, 0.0)
+    assert not ok, "uptime going forwards is not a reboot"
+    print("detect_reboot OK")
+
+    print("all self-tests passed")

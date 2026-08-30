@@ -295,6 +295,22 @@ class SnmpTrapDatabase:
                 by[key] = by.get(key, 0) + row["n"]
         return buckets
 
+    def traps_since(self, last_id: int, limit: int = 500) -> list[sqlite3.Row]:
+        """Rows newer than last_id, oldest first. The alert engine reads
+        forward by id and keeps its own cursor, so it never re-reads a trap
+        and never depends on wall-clock ordering — a device with a bad
+        clock can file a trap timestamped in the past; its rowid is still
+        monotonic."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM traps WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (int(last_id), int(limit))).fetchall()
+
+    def max_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(id) AS m FROM traps").fetchone()
+        return int(row["m"] or 0)
+
     def recent_sources(self, since_s: float = 86400, limit: int = 100) -> list[sqlite3.Row]:
         cutoff = time.time() - since_s
         with self._lock:

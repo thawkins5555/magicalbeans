@@ -104,6 +104,262 @@ each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
+| `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, Alerts' own settings |
+
+---
+
+## Nodes
+
+### Wire format (`snmppoll.py`)
+
+Every BER/ASN.1 primitive (`Reader`, tag constants, `_signed`/`_unsigned`/
+`_oid`/`_decode_value`, `_tlv`/`enc_int`/`enc_unsigned`/`enc_octets`/
+`enc_oid`/`enc_varbind`) is imported from `trapdecode.py`, not
+duplicated — this file is purely the poller-specific half (request
+building, response decoding) of the same wire format the trap receiver
+already decodes. `build_request()` builds GET/GETNEXT/GETBULK/SET for
+v1/v2c; for GETBULK the second and third integers after request-id are
+non-repeaters/max-repetitions rather than error-status/error-index — same
+wire position (RFC 3416 §3), different meaning, so the caller has to know
+which PDU it's building. `decode_response()` is the mirror of the trap
+decoder's own decode path, reused for both a real Response-PDU and (in
+the self-test) decoding a just-built request back, since a Response-PDU
+and a Get/GetNext/GetBulk-PDU share the same request-id/slot-2/slot-3/
+varbind-list shape.
+
+v3 signing (`build_v3_request`) is the exact reverse of
+`trapdecode.Decoder._verify_v3`: assemble the full message with the
+authentication-parameters field zero-filled at its real length, compute
+an HMAC over the assembled bytes with that field still zeroed, then
+splice the digest into the same span `find_auth_span()` (a re-parse of
+the just-built message) locates — provably the same operation as
+verification, run in reverse, and cross-checked against the trap
+decoder's own verifier in the self-test. `localized_key()` (RFC 3414
+A.2.1/A.2.2 password-to-key + engine localization) was lifted from
+`Decoder._localized_key` to a module-level function in `trapdecode.py`
+so both the trap receiver's inbound verification and the poller's
+outbound signing share one implementation rather than risking drift
+between two. `discovery_probe()` builds the empty, unauthenticated,
+reportable GET RFC 3414 §4 defines for learning `engineID`/`engineBoots`/
+`engineTime` from a target's Report-PDU before any authenticated request
+can be built. `authPriv` is rejected — `decode_response` raises
+`SnmpUnsupported` if a decoded v3 message's `msgFlags` carry the privacy
+bit — matching the trap receiver's own inbound-decryption deferral;
+`nodesdb`'s schema has no privacy-protocol column at all, so the UI never
+offers configuring it in the first place.
+
+### Scheduler (`nodepoll.py`)
+
+`NodePoller` is shaped like NetPath's own `Monitor`, not `IpamWorker` —
+deliberately, because Nodes typically manages far more devices than IPAM
+manages subnets, and a restart must not fire every device's poll at
+once. A hot-resizable `ThreadPoolExecutor` (`reconfigure()` builds a new
+pool and lets the old one drain in-flight work rather than cancelling
+it, exactly like `Monitor.set_workers`), restart-safe per-device due-time
+seeding (`_loop()` seeds a device's first `_next_run` from its own
+`last_poll_ts + interval`, not `now`, so a device that was 90% of the way
+through its interval when the service stopped is not immediately
+re-polled the instant it restarts), reschedule-before-run, and overrun
+detection (a device still running when its next tick comes due logs once
+and records a `poll_overrun` device event rather than queuing a second
+concurrent poll of the same device) are all copied from `Monitor`'s own
+algorithm.
+
+`EngineCache` holds one `(engine_id, boots, engine_time, learned_at)`
+tuple per device needing v3, kept for the process lifetime — engine
+parameters only need refreshing if the target actually reboots or its
+clock skews enough to be rejected, which surfaces as a Report-PDU on the
+next poll (`_snmp_get` invalidates the cache entry and raises
+`_AuthFailure`, causing a fresh discovery next time) rather than a
+background expiry timer.
+
+`counter_rate()` and `detect_reboot()` are pure functions, unit-tested in
+the module's own `__main__` block with no network needed. A 32-bit
+counter that decreased is assumed to have wrapped once; a 64-bit counter
+that decreased is treated as a reset instead, since a genuine 64-bit wrap
+would take centuries at any realistic speed — this is why `_poll_interfaces`
+prefers ifXTable's high-capacity/high-speed columns whenever present. A
+`speed_bps`-derived implausibility check (the implied rate exceeding
+~1.3× the interface's own reported speed) catches the case a 32-bit
+counter's single-wrap assumption cannot: a link fast enough to wrap more
+than once between two polls is treated as a reset rather than a
+fabricated multi-wrap number. `detect_reboot()` compares actual vs.
+wall-clock-expected `sysUpTime` with a 30-second grace band, and
+explicitly excludes the case where the previous reading was already near
+`2**32` hundredths (TimeTicks' own ~497-day wraparound) so a genuine wrap
+is never misreported as a restart.
+
+`_poll_device()`'s status transitions use an explicit `reachable` flag
+threaded through to `nodesdb.record_poll()`, separate from the *display*
+status string: a device that just started failing keeps showing its last
+real status (`up` or `down`) during the `down_after_failures` grace
+window rather than flashing to `unknown` on a single missed poll, but
+`consecutive_fail` still has to advance on every one of those grace-window
+polls or the counter can never actually reach the threshold that would
+flip the display to `down` — the same chicken-and-egg shape as
+`alertengine.py`'s own threshold-hysteresis bug (below), independently
+present here and fixed the same way: increment the streak before, not
+inside, the branch that checks whether it crossed the line.
+
+### Discovery (`nodediscover.py`)
+
+`DiscoveryJob` runs on its own daemon thread, one per active job —
+`IpamWorker`'s per-job-thread shape, not `Monitor`'s pool, since a
+discovery sweep is a one-shot bounded task rather than a recurring
+per-target schedule. It reuses `ipam_scan.sweep()`/`usable_addresses()`
+for the ping half rather than reimplementing it, then attempts an
+unauthenticated v1/v2c SNMP identity GET (its own minimal single-shot UDP
+helper, not `nodepoll._Session`, to keep this module free of a
+module-level dependency on the poller and avoid a real import cycle)
+against whichever addresses answered, trying each configured candidate
+community in turn. `NodePoller` owns the dict of active jobs and exposes
+`start_discovery`/`cancel_discovery`/`promote`; `promote()` treats an
+already-promoted result as a no-op rather than a duplicate-IP error, so a
+partially-overlapping re-selection is always safe to retry.
+
+### MIB parser (`mibparse.py`)
+
+Not a MIB compiler, the same framing `trapoids.py` uses for its own OID
+name table. The whole strategy is one regex anchored on the literal
+`::=` token: `_OBJECT_TYPE_RE`/`_OBJECT_ID_RE`/`_NOTIFICATION_RE` find
+`NAME (OBJECT-TYPE|OBJECT IDENTIFIER|NOTIFICATION-TYPE) ... ::= { ... }`
+without needing to parse anything about the macro body in between.
+`_strip_comments_and_strings()` masks `-- comments` and `"quoted
+strings"` with spaces of the *same length*, preserving every other
+byte's offset — the structural regexes run against this masked text (so
+a `::=` or `--` sitting inside a DESCRIPTION string never gets mistaken
+for real syntax), while DESCRIPTION/SYNTAX extraction re-slices the
+*original*, unmasked text at the same span to recover the real content.
+`_parse_oid_tail()` handles the general case inside a `::= { ... }`
+clause: the first symbolic token is the parent, and every token after it
+— whether a bare number or an annotated arc like `dod(6)` — contributes
+one arc to a dotted `last_arc` chain, since a clause can carry more than
+one trailing numeric arc (`{ ifMIB 2 0 }`, a NOTIFICATION-TYPE's usual
+shape) as well as intermediate annotated arcs written for readability
+(`{ iso org(3) dod(6) 1 }`); a fully-numeric brace body is a literal OID
+needing no resolution at all.
+
+`resolve()` repeatedly resolves any object whose parent is now known
+(`WELL_KNOWN_ROOTS` plus every previously-resolved name, seeded by the
+caller from `NodesDatabase.all_known_oids()` across every uploaded MIB)
+until a fixed point, mutating each object's `.oid` in place and returning
+the sorted list of still-unresolved parent names — this is the whole
+"upload order matters" story: uploading a dependent MIB before the one
+defining its parent branch leaves it (and anything depending on *it*)
+unresolved, and re-running `resolve()` after the parent is uploaded
+finishes the chain without re-parsing anything. `nodes.db`'s `mib_files`
+table keeps the original uploaded text (`content` column) specifically
+so a later Resolve can re-parse from scratch — `mib_objects` only ever
+stores the final `oid` or `NULL`, never the `parent`/`last_arc` an
+unresolved object would need to retry.
+
+---
+
+## Alerts
+
+### Rule storage (`alertsdb.py`)
+
+`alerts.dedup_key` is enforced unique only while `state IN ('open',
+'acked')` — a partial unique index, not a full `UNIQUE` constraint,
+because the same dedup key legitimately recurs after a prior alert with
+that key resolves. `open_or_increment()` is a single `INSERT ... ON
+CONFLICT (dedup_key) WHERE state IN ('open','acked') DO UPDATE SET
+count = count + 1, ...` against that index — the whole "a repeated
+occurrence increments one alert instead of opening a duplicate" behavior
+lives in the database's own conflict resolution, not in application code
+that could race between a read and a write.
+
+24 built-in rules and 5 built-in templates are seeded via `INSERT OR
+IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
+so a re-open never duplicates, and an admin's edit to a built-in rule's
+severity or a template's wording survives a restart because the seed
+only inserts a row that does not yet exist, never updates one that does.
+A built-in rule's `remove_rule()`/template's `remove_template()` both
+refuse outright (disable instead) rather than deleting, since a future
+re-seed must never resurrect a half-configured duplicate underneath an
+admin who thought they'd removed it.
+
+### Evaluation cursors (`alertengine.py`)
+
+Each occurrence source (`device_events`, `interface_events`, `traps`,
+`syslog`, `ipam_conflicts`) has its own `meta` row tracking the last-seen
+id it has already evaluated. On a source's first-ever tick, the cursor
+seeds to that source's *current* max id — never to `0` — so a fresh
+install (or a newly-enabled Alerts module against months of pre-existing
+trap/syslog history) does not evaluate that entire backlog as brand-new
+occurrences the moment it turns on. This needed its own existence check,
+`has_cursor(source)` (`SELECT 1 FROM meta WHERE source=?`), distinct from
+`cursor(source)`'s int-returning `cursor()` — the two are easy to
+conflate, since `cursor()` returns `0` both when a row has never been
+seeded and when it has legitimately advanced back to `0`, and an earlier
+version of every `_drain_*` method here used `if cursor == 0:` to decide
+whether to seed, which correctly seeded on the very first tick but then
+kept re-seeding to the current max on *every subsequent* tick too —
+silently swallowing every new occurrence forever. Every drain method
+checks `has_cursor()` now, and advances the cursor only after a whole
+batch has been turned into occurrences (or explicitly skipped by
+severity filtering), never before, so a crash mid-batch re-evaluates
+that batch on restart rather than silently skipping part of it.
+
+Threshold rules (`_evaluate_thresholds`) have no cursor at all — a
+threshold is a state (above/below), not an event stream, so it is
+re-evaluated against every threshold-kind rule's device on every 5-second
+tick. Hysteresis is a `threshold`/`clear_threshold` gap plus a
+`for_polls` consecutive-breach counter, tracked in memory
+(`self._breach_streaks`, keyed by `(rule_id, device_id)`) rather than
+persisted — a restart resets it, an accepted cold-start cost given ticks
+are 5 seconds apart and `for_polls` defaults to 2. The streak has to be
+incremented *before* `evaluate_threshold()` is called, not inside the
+branch that checks whether it reached `for_polls` — the same
+chicken-and-egg shape `nodepoll.py`'s own `consecutive_fail` handling
+hit independently, and fixed the same way: an earlier version only
+incremented the streak once a breach had already been detected, which
+meant it could never actually reach `for_polls` and the alert could never
+fire.
+
+### Notifications (`alertmail.py`, `alertengine.py`)
+
+`{{token}}` substitution (`_TOKEN = re.compile(r"\{\{(\w+)\}\}")`) is
+hand-rolled, not Jinja2 or any templating library, matching the
+stdlib-only rule the rest of this app follows for BER/ASN.1 and MIB
+parsing alike. `build_context()` returns every token every template kind
+might use as one superset dict; an unknown token renders as an empty
+string rather than leaving a literal `{{token}}` in a sent email, a
+last-resort safety net since the template editor's own token palette is
+meant to prevent that ever mattering in practice.
+
+`_notify()` computes `{{device_ip}}` by looking up the device fresh at
+send time (`_device_ip_for()`, parsing `alerts.entity_id` back into a
+device id) rather than trusting anything carried on the `Occurrence` —
+`entity_id` is the device's *stable database id*, kept constant across
+an IP change specifically so the dedup key does not orphan itself, which
+means it is never the address itself; an early version passed
+`occurrence.device_ip` straight into the template context, which worked
+for a live device-down/up occurrence but produced `{{device_ip}}` →
+the device's numeric id for the synthesized "clear" notification below,
+since that occurrence has no live poll behind it to carry a real address.
+
+A resolution email (`_notify_clear()`, kind `"clear"` — the
+`notifications.kind` enum value the schema already reserved for this)
+fires when the CLEARS map (or a threshold dropping back below its clear
+value) auto-resolves an alert, gated by the `notify_on_clear` setting.
+It deliberately renders the generic `device_up` template rather than the
+*cleared* alert's own rule template: the cleared rule's own wording
+describes the original problem ("X stopped responding"), which would
+read backwards on an email announcing that the problem is over.
+`device_up` doubles as that generic "recovered" template for
+`interface_up` and every threshold clear too, the same reasoning that
+justified shipping only 5 built-in templates instead of one per rule.
+
+Rate limiting (`max_emails_per_hour`) prunes a rolling
+`self._sent_this_hour` list to the trailing 60 minutes and logs the
+suppression exactly once per hour crossed, not once per suppressed
+alert — alerts continue to open/increment/resolve and appear in the UI
+regardless of whether email is enabled or currently rate-limited;
+"evaluate rules" and "send email" are deliberately independent so a
+misconfigured or over-quota mail server never blinds the Alerts page
+itself.
 
 ---
 
