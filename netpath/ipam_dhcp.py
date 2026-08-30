@@ -225,6 +225,16 @@ def _friendly_error(message: str) -> str:
             f"`DHCP Users` group (Administrator rights are not required, "
             f"just that group), added on the DHCP server itself, not here."
         )
+    if "DhcpServer" in message and "not loaded" in message:
+        return (
+            f"{message}\n\nAlso on the DHCP server itself: the script got "
+            f"this far — WinRM and CIM access both worked — but the "
+            f"server's PowerShell management module for DHCP isn't "
+            f"installed there, separately from the DHCP Server role "
+            f"actually running. Fix, on the DHCP server as Administrator:\n"
+            f"  Install-WindowsFeature RSAT-DHCP\n"
+            f"No reboot needed; a new session picks it up immediately. "
+            f"Confirm with: Get-Module -ListAvailable DhcpServer")
     return message
 
 
