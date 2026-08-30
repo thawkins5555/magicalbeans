@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS dhcp_scopes (
     state            TEXT,
     lease_duration_s INTEGER,
     description      TEXT,
+    router           TEXT,
     polled_ts        REAL    NOT NULL,
     UNIQUE(server_id, scope_id)
 );
@@ -190,6 +191,11 @@ class IpamDatabase:
             if column not in servers:
                 self._conn.execute(
                     f"ALTER TABLE dhcp_servers ADD COLUMN {column} {definition}")
+
+        scopes = {row["name"] for row in
+                 self._conn.execute("PRAGMA table_info(dhcp_scopes)").fetchall()}
+        if "router" not in scopes:
+            self._conn.execute("ALTER TABLE dhcp_scopes ADD COLUMN router TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -512,11 +518,11 @@ class IpamDatabase:
             self._conn.execute("DELETE FROM dhcp_scopes WHERE server_id=?", (server_id,))
             self._conn.executemany(
                 "INSERT INTO dhcp_scopes(server_id, scope_id, name, start_ip,"
-                " end_ip, mask, state, lease_duration_s, description, polled_ts)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " end_ip, mask, state, lease_duration_s, description, router,"
+                " polled_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [(server_id, s.get("scope_id"), s.get("name"), s.get("start_ip"),
                   s.get("end_ip"), s.get("mask"), s.get("state"),
-                  s.get("lease_duration_s"), s.get("description"), now)
+                  s.get("lease_duration_s"), s.get("description"), s.get("router"), now)
                  for s in scopes])
             self._conn.commit()
 

@@ -71,6 +71,16 @@ $body = {
     $out = [ordered]@{ scopes = @(); leases = @(); reservations = @() }
     $scopeObjs = @(Get-DhcpServerv4Scope -ComputerName $ComputerName)
     $out.scopes = @($scopeObjs | ForEach-Object {
+        # The router (option 3) isn't set on every scope, so a missing one
+        # is not an error -- just nothing to report for that scope.
+        $router = $null
+        try {
+            $opt = Get-DhcpServerv4OptionValue -ComputerName $ComputerName `
+                -ScopeId $_.ScopeId -OptionId 3 -ErrorAction Stop
+            if ($opt -and $opt.Value -and $opt.Value.Count -gt 0) {
+                $router = $opt.Value[0].ToString()
+            }
+        } catch { $router = $null }
         [ordered]@{
             scope_id         = $_.ScopeId.ToString()
             name             = $_.Name
@@ -80,6 +90,7 @@ $body = {
             state            = $_.State.ToString()
             lease_duration_s = [int]$_.LeaseDuration.TotalSeconds
             description      = $_.Description
+            router           = $router
         }
     })
     foreach ($scope in $scopeObjs) {
@@ -415,7 +426,7 @@ def poll(server: str, timeout_s: float = 30.0,
             "start_ip": row.get("start_ip"), "end_ip": row.get("end_ip"),
             "mask": row.get("mask"), "state": row.get("state"),
             "lease_duration_s": row.get("lease_duration_s"),
-            "description": row.get("description"),
+            "description": row.get("description"), "router": row.get("router"),
         })
 
     return DhcpSnapshot(scopes=scopes, leases=leases, reservations=reservations)

@@ -641,6 +641,8 @@
     text.innerHTML =
       `<div class="subnet-detail-title">${escape(scope.name || scope.scope_id)}` +
       ` — ${escape(scope.start_ip)}–${escape(scope.end_ip)}</div>` +
+      `<div class="hint">Subnet ${escape(scope.subnet || 'unknown')} · Router ` +
+      `${escape(scope.router || 'not set')}</div>` +
       `<div class="subnet-detail-rows">` +
       `<div><span class="legend-dot" style="background:var(--ok)"></span>Leased` +
       ` <b>${u.leased || 0}</b> <span class="hint">(${pct(u.leased || 0)})</span></div>` +

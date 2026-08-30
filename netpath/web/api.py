@@ -1027,6 +1027,21 @@ def _scope_size(start_ip: str, end_ip: str) -> int | None:
     return max(0, end - start + 1)
 
 
+def _scope_subnet(scope_id: str, mask: str) -> str | None:
+    """The scope's own network, in CIDR form — its ScopeId is the network
+    address and SubnetMask its mask, which together describe the subnet the
+    scope belongs to. Deliberately not derived from start_ip/end_ip: those
+    mark the dynamic range, which is often narrower than the full subnet
+    once exclusions and static reservations are accounted for."""
+    import ipaddress
+    if not scope_id or not mask:
+        return None
+    try:
+        return str(ipaddress.ip_network(f"{scope_id}/{mask}", strict=False))
+    except ValueError:
+        return None
+
+
 def get_ipam_dhcp_scopes(service, params, body) -> dict:
     server_id = params.get("server_id")
     rows = service.ipam_db.dhcp_scopes(int(server_id) if server_id else None)
@@ -1051,6 +1066,7 @@ def get_ipam_dhcp_scopes(service, params, body) -> dict:
             "scope_id": r["scope_id"], "name": r["name"], "start_ip": r["start_ip"],
             "end_ip": r["end_ip"], "mask": r["mask"], "state": r["state"],
             "lease_duration_s": r["lease_duration_s"], "description": r["description"],
+            "router": r["router"], "subnet": _scope_subnet(r["scope_id"], r["mask"]),
             "polled": r["polled_ts"],
             "usage": {"leased": leased, "reserved": reserved,
                      "available": available, "total": total},
