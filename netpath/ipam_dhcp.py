@@ -195,6 +195,29 @@ def _validate_address(server: str) -> str:
     return server
 
 
+def _friendly_error(message: str) -> str:
+    """Append actionable guidance to a handful of WinRM errors this module's
+    credentialed path is known to hit, without hiding the original message —
+    the person editing the DHCP server still sees exactly what PowerShell
+    said, just with the fix appended rather than left as a lookup exercise.
+    """
+    if "TrustedHosts" in message:
+        return (
+            f"{message}\n\nThis is a WinRM client setting on the machine "
+            f"running SappiWhere, not the DHCP server — by default it will "
+            f"only use Kerberos to authenticate a remote target, and "
+            f"Kerberos cannot vouch for a bare IP address, only a hostname. "
+            f"Easiest fix: edit this server here and use its hostname or "
+            f"FQDN instead of its IP address; that alone resolves it, no "
+            f"WinRM configuration needed. If it must stay an IP address, "
+            f"add it to TrustedHosts on the SappiWhere machine instead, run "
+            f"as Administrator:\n"
+            f"  winrm set winrm/config/client '@{{TrustedHosts=\"<address>\"}}'\n"
+            f"That falls back to NTLM and skips verifying the server's "
+            f"identity, so prefer the hostname fix where the address has one.")
+    return message
+
+
 def _raw_output_message(returncode: int, stdout: str, stderr: str) -> str:
     """Build a diagnostic message that shows exactly what PowerShell printed,
     for cases where we could not make sense of it (empty output, or output
@@ -280,9 +303,9 @@ def _run(script: str, server: str, timeout_s: float,
         raise DhcpUnavailable(_raw_output_message(completed.returncode, output, stderr))
 
     if isinstance(payload, dict) and payload.get("error"):
-        raise DhcpUnavailable(payload["error"])
+        raise DhcpUnavailable(_friendly_error(payload["error"]))
     if isinstance(payload, dict) and payload.get("ok") is False:
-        raise DhcpUnavailable(payload.get("error") or "Unknown error")
+        raise DhcpUnavailable(_friendly_error(payload.get("error") or "Unknown error"))
     return payload
 
 
