@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -230,22 +231,39 @@ def _run(script: str, server: str, timeout_s: float,
     env["SAPPI_DHCP_USERNAME"] = username or ""
     env["SAPPI_DHCP_PASSWORD"] = password or ""
 
+    # A temp .ps1 file rather than piping the script in on stdin with
+    # `-Command -`: that form is unreliable for a multi-statement script with
+    # scriptblocks and try/catch on native Windows PowerShell — it can exit 0
+    # having read and executed nothing at all, with no output on either
+    # stream to say why. `-File` is the officially supported way to run a
+    # script and does not have that failure mode. UTF-8 with a BOM so Windows
+    # PowerShell 5.1 — which, unlike pwsh, guesses a script's encoding from
+    # its byte order mark and otherwise assumes the system codepage — reads
+    # it correctly regardless of what that codepage is.
+    fd, script_path = tempfile.mkstemp(suffix=".ps1", prefix="sappi-dhcp-")
     try:
-        completed = subprocess.run(
-            [binary, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-Command", "-"],
-            input=script, capture_output=True, text=True, timeout=timeout_s,
-            env=env, **hidden())
-    except subprocess.TimeoutExpired:
-        raise DhcpUnavailable(
-            f"{server} did not respond within {timeout_s:.0f}s")
-    except OSError as exc:
-        raise DhcpUnavailable(str(exc))
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as handle:
+            handle.write(script)
+        try:
+            completed = subprocess.run(
+                [binary, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-File", script_path],
+                capture_output=True, text=True, timeout=timeout_s,
+                env=env, **hidden())
+        except subprocess.TimeoutExpired:
+            raise DhcpUnavailable(
+                f"{server} did not respond within {timeout_s:.0f}s")
+        except OSError as exc:
+            raise DhcpUnavailable(str(exc))
     finally:
         # The password lived in this dict only as long as the call took;
         # drop the reference rather than let it linger in a local variable
         # for the rest of whatever calls _run().
         env["SAPPI_DHCP_PASSWORD"] = ""
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
 
     output = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
