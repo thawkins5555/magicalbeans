@@ -117,7 +117,6 @@ CREATE TABLE IF NOT EXISTS devices (
     created_ts      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_devices_group ON devices(group_id);
-CREATE INDEX IF NOT EXISTS ix_devices_device_group ON devices(device_group_id);
 CREATE INDEX IF NOT EXISTS ix_devices_status ON devices(status);
 
 CREATE TABLE IF NOT EXISTS interfaces (
@@ -294,12 +293,35 @@ class NodesDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
         self._seed()
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone,
+        so a column added to devices/groups after some installs already
+        have a nodes.db has to be added explicitly or an upgraded install
+        fails the moment anything queries it — the same convention `db.py`
+        and `ipamdb.py` already use for their own post-release columns.
+        """
+        devices = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(devices)").fetchall()}
+        if "device_group_id" not in devices:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN device_group_id INTEGER"
+                " REFERENCES device_groups(id) ON DELETE SET NULL")
+        # Not in SCHEMA's own CREATE INDEX block: that script runs before this
+        # method, so an index on a column added just above would fail on an
+        # upgraded install the same way querying the column itself would.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_devices_device_group"
+            " ON devices(device_group_id)")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
