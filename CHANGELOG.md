@@ -6,6 +6,24 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.17.1 — Code-review fixes for the 4.17.0 chart work
+
+- The wheel-zoom handler no longer goes dead when a zoom lands in a
+  window with no samples — it stays live so you can zoom back out.
+- Wheel-zooming now actually zooms around the point under the cursor
+  (the fix in 4.17.0 corrected the *span* but was discarding the
+  anchor and re-centering on "now" every time); the range dropdown
+  still resets to a live "now"-following window as before.
+- Removed a duplicate resize listener that redrew the chart twice per
+  divider-drag frame.
+- The interface list's Speed/In/Out columns sort blank values (no
+  sample yet) last again, instead of tying them with genuine zeros.
+- CPU/memory percent labels and error-rate labels on the chart now
+  show a decimal place and their unit consistently ("1.5%", "0.05
+  err/s") instead of a rounded, unit-less number.
+- A rapid run of wheel-zoom ticks can no longer have an earlier,
+  slower network response overwrite a later one's chart.
+
 ### 4.17.0 — Combined in/out graphs, chart fixes, sortable interfaces
 
 - **Interface upload and download are one graph now.** The device metric

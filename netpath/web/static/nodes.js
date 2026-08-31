@@ -2,7 +2,7 @@
    chart, discovery, polling profiles and vendor MIBs. Table/modal/chart
    patterns follow ipam.js (CRUD, subtabs) and netflow.js (the chart). */
 (() => {
-  const PAD = { left: 56, right: 12, top: 12, bottom: 22 };
+  const PAD = { left: 70, right: 12, top: 12, bottom: 22 };   // left fits "800.0 Kbps"
 
   const view = {
     devices: [],
@@ -14,6 +14,10 @@
     metricId: null,
     series: null,
     chartRange: 3600,
+    // Absolute [t0, t1] set by a wheel zoom, overriding chartRange until
+    // the range dropdown resets it to null — same "frozen window" idea
+    // netflow.js's/netpath.js's own charts already use for wheel zoom.
+    chartWindow: null,
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -142,7 +146,7 @@
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
-    fillMetricSelect();
+    fillMetricSelect(options);
     await loadSeries();
     drawIfaceTable();
     drawEventTable();
@@ -203,10 +207,9 @@
     return options;
   }
 
-  function fillMetricSelect() {
+  function fillMetricSelect(options) {
     const select = App.el('nd-d-metric');
     select.innerHTML = '';
-    const options = metricOptions();
     if (!options.length) {
       const opt = document.createElement('option');
       opt.textContent = 'No metrics yet';
@@ -223,26 +226,37 @@
   }
 
   async function loadSeries() {
+    // A quick run of wheel ticks fires loadSeries repeatedly; nothing
+    // stops an earlier request's response landing after a later one's.
+    // A ticket that must still be current when the response arrives
+    // keeps a stale, out-of-order series from becoming the displayed
+    // (and then zoomed-from) window.
+    const requestId = (view.seriesRequestId = (view.seriesRequestId || 0) + 1);
     if (!view.metricId) { view.series = null; drawChart(); return; }
-    const t1 = Date.now() / 1000;
-    const t0 = t1 - view.chartRange;
+    const [t0, t1] = view.chartWindow || (() => {
+      const now = Date.now() / 1000;
+      return [now - view.chartRange, now];
+    })();
     const sel = String(view.metricId);
     const fetchOne = (id) => App.get(
       `/api/nodes/devices/${view.selected}/series`, { metric_id: id, t0, t1 });
+    let series;
     if (sel.startsWith('pair:')) {
       const [, inId, outId] = sel.split(':');
       const inMetric = view.metrics.find((m) => String(m.id) === inId);
       const [a, b] = await Promise.all([fetchOne(inId), fetchOne(outId)]);
-      view.series = { t0: a.t0, t1: a.t1, unit: inMetric ? inMetric.unit : '',
+      series = { t0: a.t0, t1: a.t1, unit: inMetric ? inMetric.unit : '',
         series: [{ label: 'in', color: 'var(--ok)', points: a.points || [] },
                  { label: 'out', color: 'var(--accent)', points: b.points || [] }] };
     } else {
       const metric = view.metrics.find((m) => String(m.id) === sel);
       const result = await fetchOne(sel);
-      view.series = { t0: result.t0, t1: result.t1,
+      series = { t0: result.t0, t1: result.t1,
         unit: metric ? metric.unit : '',
         series: [{ label: '', color: 'var(--accent)', points: result.points || [] }] };
     }
+    if (requestId !== view.seriesRequestId) return;   // superseded — drop it
+    view.series = series;
     drawChart();
   }
 
@@ -260,8 +274,11 @@
      stores is not what a human reads on a gridline. */
   function formatMetricValue(unit, v) {
     if (unit === 'bps') return App.rate(v, 1);
-    if (unit === '%') return `${v.toFixed(0)}%`;
-    if (unit === 'err/s') return v.toFixed(2);
+    // niceCeiling can pick a fractional peak (1.5, 2.5, 7.5, 0.75, ...),
+    // so a whole-number %-label would round a 1.5% peak up to "2%" —
+    // one decimal place is honest about that.
+    if (unit === '%') return `${v.toFixed(1)}%`;
+    if (unit === 'err/s') return `${v.toFixed(2)} err/s`;
     const prefixes = ['', 'k', 'M', 'G', 'T'];
     let n = v;
     let i = 0;
@@ -281,25 +298,30 @@
     const width = Math.max(box.width, 300);
     const height = Math.max(box.height, 120);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    const seriesList = ((data && data.series) || [])
-      .map((s) => ({ ...s, points: s.points || [] }));
+    // No data object at all (nothing has ever loaded — e.g. no metric
+    // chosen yet) means there is no window to hand back for zooming
+    // either. An empty series list is different: the request window
+    // (data.t0/t1) is still known, so the caller can keep zooming out of
+    // an empty view instead of the wheel going dead — see below.
+    if (!data) return null;
+    const seriesList = (data.series || []).map((s) => ({ ...s, points: s.points || [] }));
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
       p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
         : (p.value != null ? [p.value] : [])));
-    if (!data || !allValues.length) {
+    const plot = { x: PAD.left, y: PAD.top,
+      w: Math.max(width - PAD.left - PAD.right, 10),
+      h: Math.max(height - PAD.top - PAD.bottom, 10) };
+    const { t0, t1 } = data;
+    const geo = { plot, width, t0, t1 };
+    if (!allValues.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
         fill: 'var(--faint)', 'font-size': 13,
       }, opts.emptyText || 'No data in this window'));
-      return null;
+      return geo;
     }
-    const padLeft = 70;   // "800.0 Kbps" must fit left of the axis
-    const plot = { x: padLeft, y: PAD.top,
-      w: Math.max(width - padLeft - PAD.right, 10),
-      h: Math.max(height - PAD.top - PAD.bottom, 10) };
     const peak = niceCeiling(Math.max(...allValues, 0.001));
-    const { t0, t1 } = data;
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
     const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
 
@@ -358,7 +380,7 @@
         fill: 'var(--faint)',
         'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
     }
-    return { plot, width, t0, t1 };
+    return geo;
   }
 
   function drawChart() {
@@ -374,7 +396,13 @@
       const scaleX = geo.width / rect.width;
       const cx = (event.clientX - rect.left) * scaleX;
       const anchor = geo.t0 + ((cx - geo.plot.x) / geo.plot.w) * (geo.t1 - geo.t0);
+      // The absolute [start, end] wheelWindow returns is what keeps the
+      // point under the cursor in place; keeping only the span and
+      // re-anchoring to "now" (as loadSeries does when not following)
+      // would recentre the window on every zoom instead of zooming
+      // around the cursor.
       const [nt0, nt1] = App.wheelWindow(event, geo.t0, geo.t1, anchor);
+      view.chartWindow = [nt0, nt1];
       view.chartRange = nt1 - nt0;
       loadSeries();
     };
@@ -386,12 +414,13 @@
       value: (r) => (r.descr || r.alias || '').toLowerCase() },
     { key: 'admin_status', label: 'Admin', width: 80 },
     { key: 'oper_status', label: 'Oper', width: 80 },
-    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true,
-      value: (r) => r.speed_bps || 0 },
-    { key: 'in_bps', label: 'In', width: 95, numeric: true,
-      value: (r) => r.in_bps || 0 },
-    { key: 'out_bps', label: 'Out', width: 95, numeric: true,
-      value: (r) => r.out_bps || 0 },
+    // No custom value() for these three: the default row[key] lookup
+    // preserves null/undefined so App.sortRows' blanks-sort-last rule
+    // applies — an interface with no speed or no rate sample yet should
+    // sort after a genuine 0, not be indistinguishable from one.
+    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true },
+    { key: 'in_bps', label: 'In', width: 95, numeric: true },
+    { key: 'out_bps', label: 'Out', width: 95, numeric: true },
   ];
 
   function onIfaceSort(key, descending) {
@@ -1481,18 +1510,17 @@
       await App.post(`/api/nodes/devices/${view.selected}/poll`, {});
     };
     App.el('nd-apply').onclick = () => App.refreshNow('nodes');
-    // Dragging the chart/list divider live-resizes the chart.
-    window.addEventListener('panes-resized', () => {
-      if (App.state.tab === 'nodes' && view.selected
-          && !App.el('nd-detail').hidden) drawChart();
-    });
     App.el('nd-q').onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('nodes'); };
     App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-d-metric').onchange = (e) => { view.metricId = e.target.value; loadSeries(); };
-    App.el('nd-d-range').onchange = (e) => { view.chartRange = Number(e.target.value); loadSeries(); };
+    App.el('nd-d-range').onchange = (e) => {
+      view.chartRange = Number(e.target.value);
+      view.chartWindow = null;   // back to following "now" at this span
+      loadSeries();
+    };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;

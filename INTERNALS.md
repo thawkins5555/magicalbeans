@@ -262,10 +262,31 @@ rollup band draws only for a single series; overlapping bands read as
 mud. The wheel-zoom handler is attached by ASSIGNMENT (`svg.onwheel =`)
 on every draw, never `addEventListener`: the chart redraws each refresh
 tick and accumulated listeners each zoomed from their own stale closure
-window — the "timeframe doesn't scale" bug. In/out interface metric
-pairs (`if_in_bps.N`/`if_out_bps.N`, same for `_err`) are joined into
-one picker option (`pair:<inId>:<outId>`) client-side; the storage and
+window — the "timeframe doesn't scale" bug. `drawSeriesChart` returns
+`null` only when it was handed no data object at all; an empty series
+list still returns the plot geometry (built from the *requested*
+t0/t1) so the wheel handler stays live and a zoom into a gap between
+samples can still zoom back out. In/out interface metric pairs
+(`if_in_bps.N`/`if_out_bps.N`, same for `_err`) are joined into one
+picker option (`pair:<inId>:<outId>`) client-side; the storage and
 series API stay strictly one-metric-per-id.
+
+**Device chart window model** (`nodes.js`, `view.chartRange`/
+`chartWindow`): the same "frozen window that a preset reselect resets"
+convention `netflow.js`/`netpath.js` already use for their own wheel
+zoom. `chartWindow` is `null` while the chart follows "now" at
+`chartRange` seconds (`loadSeries` recomputes `[now - chartRange, now]`
+on every load); a wheel zoom sets it to the absolute `[t0, t1]`
+`App.wheelWindow` returns and `loadSeries` uses that verbatim until the
+range `<select>` is changed, which clears it back to `null`. Keeping
+only the zoomed *span* and letting `loadSeries` re-anchor to "now" (the
+first cut of this fix) silently discarded `wheelWindow`'s whole anchor
+contract — zooming at any point in the chart would always recentre on
+the right edge instead of keeping the point under the cursor fixed.
+`loadSeries` also stamps each call with an incrementing
+`view.seriesRequestId` and drops its response if a later call has
+since started, so a quick run of wheel ticks can't have an earlier,
+slower response overwrite a newer one.
 
 **Selected-device fast poll** (`NodePoller.set_focus`): the browser
 POSTs `/api/nodes/devices/{id}/focus` on every Nodes-tab refresh tick
