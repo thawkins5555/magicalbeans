@@ -253,6 +253,20 @@ the pre-existing `ipam*`/`drawIpamWorkers()` shape, including the
 `fastTick()` branch that advances displayed elapsed time between fetches
 without re-polling.
 
+**One chart renderer** (`nodes.js drawSeriesChart`): the device metric
+chart and the interface dialog share one SVG renderer taking 1..n series
+(raw or rollup points), unit-aware Y labels (`formatMetricValue`), and
+time labels at fixed window fractions — sample-position labels cluster
+and overlap when polls occupy a corner of the window. The min/max
+rollup band draws only for a single series; overlapping bands read as
+mud. The wheel-zoom handler is attached by ASSIGNMENT (`svg.onwheel =`)
+on every draw, never `addEventListener`: the chart redraws each refresh
+tick and accumulated listeners each zoomed from their own stale closure
+window — the "timeframe doesn't scale" bug. In/out interface metric
+pairs (`if_in_bps.N`/`if_out_bps.N`, same for `_err`) are joined into
+one picker option (`pair:<inId>:<outId>`) client-side; the storage and
+series API stay strictly one-metric-per-id.
+
 **Selected-device fast poll** (`NodePoller.set_focus`): the browser
 POSTs `/api/nodes/devices/{id}/focus` on every Nodes-tab refresh tick
 while a device is selected; each call stores `(device_id, now + 15s,

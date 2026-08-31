@@ -6,6 +6,30 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.17.0 — Combined in/out graphs, chart fixes, sortable interfaces
+
+- **Interface upload and download are one graph now.** The device metric
+  picker offers a single "eth1 — traffic in/out (bps)" entry per
+  interface (and one "errors in/out") instead of separate in/out
+  metrics; both directions draw on one chart in different colors with a
+  small legend. CPU/memory and any unpaired metric stay single entries.
+- **The metric chart's Y-axis labels are finally real units** — "1.6
+  Mbps / 800.0 Kbps / 0.0 bps" for a bandwidth metric, "40%" for CPU —
+  instead of raw unformatted numbers. Time labels sit at fixed points
+  across the window rather than piling up wherever samples cluster.
+- **Fixed the erratic chart zoom**: every 2-second refresh was stacking
+  another mouse-wheel handler on the chart, so one scroll fired dozens
+  of stale zooms, each computed from an old time window. One handler,
+  always current, and the range dropdown and wheel now agree.
+- **A draggable divider now sits between the device chart and the
+  interface/event lists** — resize the split to taste; the position is
+  remembered, and the chart redraws live while dragging.
+- **The interface list is sortable** — click Descr, Admin, Oper, Speed,
+  In or Out to sort either way (numeric columns sort numerically), with
+  the same column-resize grips and width memory every other table has.
+- **"Manage groups" moved to the top-right of the Nodes page**, next to
+  Settings, out of the Devices filter bar.
+
 ### 4.16.0 — Discovery scan controls, cancel/discard flow, debug visibility
 
 - **The Debug page now shows discovery scans in progress** — a new

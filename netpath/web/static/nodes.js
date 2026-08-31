@@ -15,6 +15,7 @@
     series: null,
     chartRange: 3600,
     ifaces: [],
+    ifaceSort: { key: 'if_index', descending: false },
     events: null,
     discJobs: [],
     discSelected: null,
@@ -134,8 +135,9 @@
     view.metrics = metrics.metrics;
     view.ifaces = ifaces.interfaces;
     view.events = events;
-    if (!view.metricId || !view.metrics.some((m) => m.id === view.metricId)) {
-      view.metricId = view.metrics.length ? view.metrics[0].id : null;
+    const options = metricOptions();
+    if (!view.metricId || !options.some((o) => o.value === String(view.metricId))) {
+      view.metricId = options.length ? options[0].value : null;
     }
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
@@ -171,19 +173,50 @@
     App.el('nd-d-summary').textContent = lines.join('  ·  ');
   }
 
+  /* An interface's in/out directions are one thing to look at, not two:
+     the picker offers a single "traffic in/out" (and "errors in/out")
+     entry per interface, drawn as two colored lines on one chart. A
+     metric with no partner — and every non-interface metric — stays a
+     plain single entry whose value is its numeric id. */
+  function metricOptions() {
+    const pairs = {};
+    const options = [];
+    for (const m of view.metrics) {
+      const match = /^if_(in|out)_(bps|err)\.(\d+)$/.exec(m.key);
+      if (match) {
+        (pairs[`${match[2]}.${match[3]}`] = pairs[`${match[2]}.${match[3]}`] || {})[match[1]] = m;
+      } else {
+        options.push({ value: String(m.id), label: `${m.label} (${m.unit})` });
+      }
+    }
+    for (const [key, pair] of Object.entries(pairs)) {
+      if (pair.in && pair.out) {
+        const base = pair.in.label.replace(/ in_(bps|err)$/, '');
+        const kind = key.startsWith('bps.') ? 'traffic in/out' : 'errors in/out';
+        options.push({ value: `pair:${pair.in.id}:${pair.out.id}`,
+          label: `${base} — ${kind} (${pair.in.unit})` });
+      } else {
+        const m = pair.in || pair.out;
+        options.push({ value: String(m.id), label: `${m.label} (${m.unit})` });
+      }
+    }
+    return options;
+  }
+
   function fillMetricSelect() {
     const select = App.el('nd-d-metric');
     select.innerHTML = '';
-    if (!view.metrics.length) {
+    const options = metricOptions();
+    if (!options.length) {
       const opt = document.createElement('option');
       opt.textContent = 'No metrics yet';
       select.appendChild(opt);
       return;
     }
-    for (const m of view.metrics) {
+    for (const o of options) {
       const opt = document.createElement('option');
-      opt.value = String(m.id);
-      opt.textContent = `${m.label} (${m.unit})`;
+      opt.value = o.value;
+      opt.textContent = o.label;
       select.appendChild(opt);
     }
     select.value = String(view.metricId);
@@ -193,9 +226,23 @@
     if (!view.metricId) { view.series = null; drawChart(); return; }
     const t1 = Date.now() / 1000;
     const t0 = t1 - view.chartRange;
-    const result = await App.get(`/api/nodes/devices/${view.selected}/series`,
-      { metric_id: view.metricId, t0, t1 });
-    view.series = result;
+    const sel = String(view.metricId);
+    const fetchOne = (id) => App.get(
+      `/api/nodes/devices/${view.selected}/series`, { metric_id: id, t0, t1 });
+    if (sel.startsWith('pair:')) {
+      const [, inId, outId] = sel.split(':');
+      const inMetric = view.metrics.find((m) => String(m.id) === inId);
+      const [a, b] = await Promise.all([fetchOne(inId), fetchOne(outId)]);
+      view.series = { t0: a.t0, t1: a.t1, unit: inMetric ? inMetric.unit : '',
+        series: [{ label: 'in', color: 'var(--ok)', points: a.points || [] },
+                 { label: 'out', color: 'var(--accent)', points: b.points || [] }] };
+    } else {
+      const metric = view.metrics.find((m) => String(m.id) === sel);
+      const result = await fetchOne(sel);
+      view.series = { t0: result.t0, t1: result.t1,
+        unit: metric ? metric.unit : '',
+        series: [{ label: '', color: 'var(--accent)', points: result.points || [] }] };
+    }
     drawChart();
   }
 
@@ -209,32 +256,50 @@
     return 10 * base;
   }
 
-  function drawChart() {
-    const svg = App.el('nd-chart-svg');
-    svg.innerHTML = '';
-    const box = App.el('nd-chart').getBoundingClientRect();
-    const width = Math.max(box.width, 300);
-    const height = Math.max(box.height, 130);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  /* Axis-label formatting by metric unit — the raw number a metric
+     stores is not what a human reads on a gridline. */
+  function formatMetricValue(unit, v) {
+    if (unit === 'bps') return App.rate(v, 1);
+    if (unit === '%') return `${v.toFixed(0)}%`;
+    if (unit === 'err/s') return v.toFixed(2);
+    const prefixes = ['', 'k', 'M', 'G', 'T'];
+    let n = v;
+    let i = 0;
+    while (Math.abs(n) >= 1000 && i < prefixes.length - 1) { n /= 1000; i += 1; }
+    const text = Math.abs(n) >= 100 || Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1);
+    return `${text}${prefixes[i]}${unit ? ` ${unit}` : ''}`;
+  }
 
-    const data = view.series;
-    if (!data || !data.points || !data.points.length) {
+  /* The one chart renderer, shared by the device metric chart and the
+     interface dialog: 1..n series, raw or rollup points, unit-aware Y
+     labels, time labels at fixed window fractions (sample positions
+     cluster and overlap). Returns the plot geometry so the caller can
+     anchor wheel-zoom math, or null when there was nothing to draw. */
+  function drawSeriesChart(svg, wrap, data, opts = {}) {
+    svg.innerHTML = '';
+    const box = wrap.getBoundingClientRect();
+    const width = Math.max(box.width, 300);
+    const height = Math.max(box.height, 120);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const seriesList = ((data && data.series) || [])
+      .map((s) => ({ ...s, points: s.points || [] }));
+    const value = (p) => p.avg !== undefined ? p.avg : p.value;
+    const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
+      p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
+        : (p.value != null ? [p.value] : [])));
+    if (!data || !allValues.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
         fill: 'var(--faint)', 'font-size': 13,
-      }, 'No data in this window'));
-      return;
+      }, opts.emptyText || 'No data in this window'));
+      return null;
     }
-    const plot = { x: PAD.left, y: PAD.top,
-      w: Math.max(width - PAD.left - PAD.right, 10),
+    const padLeft = 70;   // "800.0 Kbps" must fit left of the axis
+    const plot = { x: padLeft, y: PAD.top,
+      w: Math.max(width - padLeft - PAD.right, 10),
       h: Math.max(height - PAD.top - PAD.bottom, 10) };
-    const points = data.points;
-    const isRollup = points[0].avg !== undefined;
-    const values = isRollup
-      ? points.flatMap((p) => [p.min, p.avg, p.max].filter((v) => v != null))
-      : points.map((p) => p.value).filter((v) => v != null);
-    const peak = niceCeiling(Math.max(...values, 0.001));
-    const t0 = data.t0, t1 = data.t1;
+    const peak = niceCeiling(Math.max(...allValues, 0.001));
+    const { t0, t1 } = data;
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
     const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
 
@@ -245,53 +310,103 @@
         x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)' }));
       svg.appendChild(App.svgNode('text', {
         x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 }, (peak * frac).toFixed(1)));
+        'font-family': 'var(--mono)', 'font-size': 10 },
+        formatMetricValue(data.unit || '', peak * frac)));
     }
 
-    if (isRollup) {
-      const band = points.filter((p) => p.min != null && p.max != null)
-        .map((p) => `${xFor(p.ts)},${yFor(p.max)}`).join(' ') + ' ' +
-        points.filter((p) => p.min != null && p.max != null).reverse()
-        .map((p) => `${xFor(p.ts)},${yFor(p.min)}`).join(' ');
-      svg.appendChild(App.svgNode('polygon', {
-        points: band, fill: 'var(--accent)', 'fill-opacity': 0.15, stroke: 'none' }));
-      const line = points.filter((p) => p.avg != null)
-        .map((p) => `${xFor(p.ts)},${yFor(p.avg)}`).join(' ');
-      svg.appendChild(App.svgNode('polyline', {
-        points: line, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.5 }));
-    } else {
-      const line = points.filter((p) => p.value != null)
-        .map((p) => `${xFor(p.ts)},${yFor(p.value)}`).join(' ');
-      svg.appendChild(App.svgNode('polyline', {
-        points: line, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 1.5 }));
+    // The min/max band only when a single series is drawn — two
+    // overlapping bands read as mud, the avg lines carry the story.
+    const drawBand = seriesList.length === 1;
+    for (const s of seriesList) {
+      const isRollup = s.points[0] && s.points[0].avg !== undefined;
+      if (isRollup && drawBand) {
+        const banded = s.points.filter((p) => p.min != null && p.max != null);
+        const band = banded.map((p) => `${xFor(p.ts)},${yFor(p.max)}`).join(' ') +
+          ' ' + banded.slice().reverse()
+          .map((p) => `${xFor(p.ts)},${yFor(p.min)}`).join(' ');
+        svg.appendChild(App.svgNode('polygon', {
+          points: band, fill: s.color, 'fill-opacity': 0.15, stroke: 'none' }));
+      }
+      const line = s.points.filter((p) => value(p) != null)
+        .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
+      if (line) {
+        svg.appendChild(App.svgNode('polyline', {
+          points: line, fill: 'none', stroke: s.color, 'stroke-width': 1.5 }));
+      }
     }
 
-    const every = Math.max(1, Math.floor(points.length / 6));
-    points.forEach((p, i) => {
-      if (i % every) return;
+    // Legend inside the plot's top-left when the lines need telling apart.
+    const labelled = seriesList.filter((s) => s.label);
+    if (labelled.length > 1) {
+      let x = plot.x + 8;
+      for (const s of labelled) {
+        svg.appendChild(App.svgNode('rect', {
+          x, y: plot.y + 4, width: 14, height: 3, fill: s.color }));
+        const text = App.svgNode('text', {
+          x: x + 18, y: plot.y + 9, fill: 'var(--faint)',
+          'font-family': 'var(--mono)', 'font-size': 10 }, s.label);
+        svg.appendChild(text);
+        x += 18 + s.label.length * 6.5 + 14;
+      }
+    }
+
+    for (const frac of (opts.fractions || [0, 0.5, 1])) {
+      const ts = t0 + (t1 - t0) * frac;
       svg.appendChild(App.svgNode('text', {
-        x: xFor(p.ts), y: height - 6, 'text-anchor': 'middle', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(p.ts, t1 - t0)));
-    });
+        x: xFor(ts), y: height - 6,
+        'text-anchor': frac === 0 ? 'start' : frac === 1 ? 'end' : 'middle',
+        fill: 'var(--faint)',
+        'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
+    }
+    return { plot, width, t0, t1 };
+  }
 
-    svg.addEventListener('wheel', (event) => {
+  function drawChart() {
+    const svg = App.el('nd-chart-svg');
+    const geo = drawSeriesChart(svg, App.el('nd-chart'), view.series,
+      { fractions: [0, 0.25, 0.5, 0.75, 1] });
+    // onwheel ASSIGNMENT, never addEventListener: this redraws on every
+    // refresh tick, and accumulated listeners each zoomed from their own
+    // stale time window — the "timeframe doesn't scale" bug.
+    svg.onwheel = geo === null ? null : (event) => {
       event.preventDefault();
       const rect = svg.getBoundingClientRect();
-      const scaleX = width / rect.width;
+      const scaleX = geo.width / rect.width;
       const cx = (event.clientX - rect.left) * scaleX;
-      const anchor = t0 + ((cx - plot.x) / plot.w) * (t1 - t0);
-      const [nt0, nt1] = App.wheelWindow(event, t0, t1, anchor);
+      const anchor = geo.t0 + ((cx - geo.plot.x) / geo.plot.w) * (geo.t1 - geo.t0);
+      const [nt0, nt1] = App.wheelWindow(event, geo.t0, geo.t1, anchor);
       view.chartRange = nt1 - nt0;
       loadSeries();
-    }, { passive: false });
+    };
+  }
+
+  const IFACE_COLUMNS = [
+    { key: 'if_index', label: '#', width: 55, numeric: true },
+    { key: 'descr', label: 'Descr', width: 170,
+      value: (r) => (r.descr || r.alias || '').toLowerCase() },
+    { key: 'admin_status', label: 'Admin', width: 80 },
+    { key: 'oper_status', label: 'Oper', width: 80 },
+    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true,
+      value: (r) => r.speed_bps || 0 },
+    { key: 'in_bps', label: 'In', width: 95, numeric: true,
+      value: (r) => r.in_bps || 0 },
+    { key: 'out_bps', label: 'Out', width: 95, numeric: true,
+      value: (r) => r.out_bps || 0 },
+  ];
+
+  function onIfaceSort(key, descending) {
+    view.ifaceSort = { key, descending };
+    drawIfaceTable();
   }
 
   function drawIfaceTable() {
-    const table = App.el('nd-if-table');
-    table.innerHTML = '<thead><tr><th>#</th><th>Descr</th><th>Admin</th>' +
-      '<th>Oper</th><th>Speed</th><th>In</th><th>Out</th></tr></thead>';
+    const table = App.grid(App.el('nd-if-table'),
+      { name: 'nodes-ifaces', columns: IFACE_COLUMNS,
+        sort: view.ifaceSort, onSort: onIfaceSort });
     const body = document.createElement('tbody');
-    for (const r of view.ifaces) {
+    const rows = App.sortRows(view.ifaces, view.ifaceSort.key,
+      view.ifaceSort.descending, IFACE_COLUMNS);
+    for (const r of rows) {
       const tr = document.createElement('tr');
       tr.className = 'clickable';
       tr.innerHTML =
@@ -308,59 +423,6 @@
   }
 
   /* ------------------------------------------- interface drill-down */
-
-  function drawIfaceChart(svg, wrap, series) {
-    svg.innerHTML = '';
-    const box = wrap.getBoundingClientRect();
-    const width = Math.max(box.width, 300);
-    const height = Math.max(box.height, 120);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    const all = [...series.inPts, ...series.outPts];
-    if (!all.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 13,
-      }, 'No samples yet — they arrive with each poll'));
-      return;
-    }
-    const padLeft = 70;   // wider than PAD.left: "800.0 Kbps" must fit
-    const plot = { x: padLeft, y: PAD.top,
-      w: Math.max(width - padLeft - PAD.right, 10),
-      h: Math.max(height - PAD.top - PAD.bottom, 10) };
-    const value = (p) => p.avg !== undefined ? p.avg : p.value;
-    const peak = niceCeiling(Math.max(...all.map((p) => value(p) || 0), 0.001));
-    const { t0, t1 } = series;
-    const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
-    const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
-    for (let step = 0; step <= 2; step += 1) {
-      const frac = step / 2;
-      const y = plot.y + plot.h - plot.h * frac;
-      svg.appendChild(App.svgNode('line', {
-        x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)' }));
-      svg.appendChild(App.svgNode('text', {
-        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 }, App.rate(peak * frac, 1)));
-    }
-    for (const [pts, color] of [[series.inPts, 'var(--ok)'],
-                                [series.outPts, 'var(--accent)']]) {
-      const line = pts.filter((p) => value(p) != null)
-        .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
-      if (line) {
-        svg.appendChild(App.svgNode('polyline', {
-          points: line, fill: 'none', stroke: color, 'stroke-width': 1.5 }));
-      }
-    }
-    // Time labels at fixed window fractions, not sample positions —
-    // samples often cluster in a corner of the hour and would overlap.
-    for (const frac of [0, 0.5, 1]) {
-      const ts = t0 + (t1 - t0) * frac;
-      svg.appendChild(App.svgNode('text', {
-        x: xFor(ts), y: height - 6,
-        'text-anchor': frac === 0 ? 'start' : frac === 1 ? 'end' : 'middle',
-        fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
-    }
-  }
 
   function ifaceStatsHtml(r) {
     const row = (label, val) =>
@@ -437,8 +499,10 @@
       const svg = box.querySelector('#ifd-chart-svg');
       const wrap = box.querySelector('#ifd-chart');
       if (!svg) { clearInterval(refreshTimer); return; }
-      drawIfaceChart(svg, wrap, { t0, t1,
-        inPts: (inS && inS.points) || [], outPts: (outS && outS.points) || [] });
+      drawSeriesChart(svg, wrap, { t0, t1, unit: 'bps', series: [
+        { label: 'in', color: 'var(--ok)', points: (inS && inS.points) || [] },
+        { label: 'out', color: 'var(--accent)', points: (outS && outS.points) || [] },
+      ] }, { emptyText: 'No samples yet — they arrive with each poll' });
       const fresh = (ifaces.interfaces || []).find((r) => r.if_index === ifIndex);
       if (fresh) box.querySelector('#ifd-stats').innerHTML = ifaceStatsHtml(fresh);
     }
@@ -1417,12 +1481,17 @@
       await App.post(`/api/nodes/devices/${view.selected}/poll`, {});
     };
     App.el('nd-apply').onclick = () => App.refreshNow('nodes');
+    // Dragging the chart/list divider live-resizes the chart.
+    window.addEventListener('panes-resized', () => {
+      if (App.state.tab === 'nodes' && view.selected
+          && !App.el('nd-detail').hidden) drawChart();
+    });
     App.el('nd-q').onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('nodes'); };
     App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
-    App.el('nd-d-metric').onchange = (e) => { view.metricId = Number(e.target.value); loadSeries(); };
+    App.el('nd-d-metric').onchange = (e) => { view.metricId = e.target.value; loadSeries(); };
     App.el('nd-d-range').onchange = (e) => { view.chartRange = Number(e.target.value); loadSeries(); };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
     App.el('nd-add-profile').onclick = addProfile;

@@ -203,7 +203,12 @@ a zoomable chart (recent points plotted directly; a wide window reads an
 hourly min/avg/max rollup instead of scanning months of raw samples), its
 current interface table, and a combined device/interface event history —
 the interface and event lists scroll independently of the chart and
-header above them once they outgrow the panel. Which SNMP identity
+header above them once they outgrow the panel, and a draggable divider
+between chart and lists sets the split (remembered per browser). An
+interface's in/out directions share one picker entry and one chart, drawn
+as two colored lines; axis labels are unit-formatted ("1.6 Mbps", "40%").
+The interface list sorts by any column — Descr, Admin, Oper, Speed,
+In, Out — the same way every other table in the app does. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.

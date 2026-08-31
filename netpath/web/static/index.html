@@ -59,6 +59,7 @@
     <span id="nd-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="nd-add-device" class="primary">Add device</button>
+    <button id="nd-manage-devgroups">Manage groups</button>
     <button id="nd-toggle">Stop poller</button>
     <button id="nd-settings" class="module-settings">Settings</button>
   </div>
@@ -80,7 +81,6 @@
         <option value="auth">auth failed</option><option value="unknown">unknown</option>
       </select></label>
       <button id="nd-apply">Apply</button>
-      <button id="nd-manage-devgroups">Manage groups</button>
       <span class="grow"></span>
       <span id="nd-count" class="hint"></span>
     </div>
@@ -104,16 +104,23 @@
             <label>Metric <select id="nd-d-metric"></select></label>
             <select id="nd-d-range"></select>
           </div>
-          <div id="nd-chart" class="canvas chart"><svg id="nd-chart-svg"></svg></div>
-          <nav class="subtabs">
-            <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
-            <button class="subtab" data-subtab="events">EVENTS</button>
-          </nav>
-          <div id="nd-d-sub-interfaces" class="subpage active">
-            <div class="table-wrap"><table id="nd-if-table"></table></div>
-          </div>
-          <div id="nd-d-sub-events" class="subpage">
-            <div class="table-wrap"><table id="nd-ev-table"></table></div>
+          <div class="rows" data-splitter="nodes-detail">
+            <div class="pane" data-grow="2">
+              <div id="nd-chart" class="canvas chart"><svg id="nd-chart-svg"></svg></div>
+            </div>
+            <div class="divider"></div>
+            <div class="pane" data-grow="3">
+              <nav class="subtabs">
+                <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
+                <button class="subtab" data-subtab="events">EVENTS</button>
+              </nav>
+              <div id="nd-d-sub-interfaces" class="subpage active">
+                <div class="table-wrap"><table id="nd-if-table"></table></div>
+              </div>
+              <div id="nd-d-sub-events" class="subpage">
+                <div class="table-wrap"><table id="nd-ev-table"></table></div>
+              </div>
+            </div>
           </div>
         </div>
       </aside>
