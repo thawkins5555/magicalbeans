@@ -10,6 +10,7 @@
     t1: Date.now() / 1000,
     alerts: [],
     selected: null,
+    checked: new Set(),
     rules: [],
     rulesSelected: null,
     templates: [],
@@ -125,11 +126,46 @@
 
   function drawTable() {
     const table = App.grid(App.el('alerts-table'), { name: 'alerts', columns: COLUMNS });
+    // A checkbox column, prepended after App.grid builds its own
+    // colgroup/thead — same pattern as the Nodes device table's bulk
+    // selection (App.grid's columns are a display/sort spec only, so a
+    // selection column that isn't sortable or width-persisted doesn't
+    // belong in COLUMNS itself).
+    const col = document.createElement('col');
+    col.style.width = '28px';
+    table.querySelector('colgroup').prepend(col);
+    const headRow = table.querySelector('thead tr');
+    const headCheck = document.createElement('th');
+    const selectAll = document.createElement('input');
+    selectAll.type = 'checkbox';
+    selectAll.title = 'Select all visible';
+    selectAll.checked = view.alerts.length > 0
+      && view.alerts.every((a) => view.checked.has(a.id));
+    selectAll.onchange = () => {
+      if (selectAll.checked) view.alerts.forEach((a) => view.checked.add(a.id));
+      else view.alerts.forEach((a) => view.checked.delete(a.id));
+      drawTable();
+    };
+    headCheck.appendChild(selectAll);
+    headRow.prepend(headCheck);
+
     const body = document.createElement('tbody');
     for (const row of view.alerts) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.innerHTML =
+      const checkTd = document.createElement('td');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = view.checked.has(row.id);
+      check.onclick = (e) => e.stopPropagation();   // don't also select the row
+      check.onchange = () => {
+        if (check.checked) view.checked.add(row.id);
+        else view.checked.delete(row.id);
+        drawBulkBar();
+      };
+      checkTd.appendChild(check);
+      tr.appendChild(checkTd);
+      tr.insertAdjacentHTML('beforeend',
         `<td><span class="sev sev-${row.severity}">${row.severity}</span></td>` +
         `<td>${escape(row.state)}</td>` +
         `<td>${escape(row.entity_label)}</td>` +
@@ -137,12 +173,30 @@
         `<td class="msg">${escape(row.message)}</td>` +
         `<td>${row.count > 1 ? row.count : ''}</td>` +
         `<td>${ago(row.opened_ts)}</td>` +
-        `<td>${ago(row.last_ts)}</td>`;
+        `<td>${ago(row.last_ts)}</td>`);
       tr.onclick = () => { view.selected = row.id; drawTable(); showDetail(row); };
       body.appendChild(tr);
     }
     table.appendChild(body);
     App.el('alerts-count').textContent = `${view.alerts.length} shown`;
+    drawBulkBar();
+  }
+
+  /* ------------------------------------------------------- bulk actions */
+
+  function drawBulkBar() {
+    const n = view.checked.size;
+    App.el('alerts-bulk-bar').hidden = n === 0;
+    if (n) App.el('alerts-bulk-count').textContent = `${n} selected`;
+  }
+
+  async function bulkResolve() {
+    const ids = [...view.checked];
+    if (!ids.length) return;
+    await App.post('/api/alerts/bulk-resolve', { alert_ids: ids });
+    if (view.selected && ids.includes(view.selected)) view.selected = null;
+    view.checked.clear();
+    App.refreshNow('alerts');
   }
 
   function showDetail(row) {
@@ -409,7 +463,7 @@
     const box = App.modal('Alerts settings', `
       <fieldset><legend>ENGINE</legend>
         ${check('as-enabled', 'Run the alert engine', s.enabled)}
-        <label>Evaluate severity <select id="as-minsev"></select> and worse (syslog/traps only)</label>
+        <label>Evaluate severity <select id="as-minsev"></select> and worse (syslog only)</label>
         ${number('as-retention', 'Keep resolved alerts for', s.retention_days, 'min=1')} days
       </fieldset>
       <fieldset><legend>EMAIL SERVER</legend>
@@ -511,6 +565,8 @@
     view.alerts = list.alerts;
     view.rules = rules.rules;
     view.templates = templates.templates;
+    view.checked = new Set([...view.checked].filter((id) =>
+      view.alerts.some((a) => a.id === id)));
     if (view.selected && !view.alerts.some((a) => a.id === view.selected)) {
       view.selected = null;
       App.el('alerts-detail-empty').hidden = false;
@@ -555,6 +611,8 @@
       await App.post('/api/alerts/ack-all', {});
       App.refreshNow('alerts');
     };
+    App.el('alerts-bulk-resolve').onclick = bulkResolve;
+    App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
     App.el('alerts-toggle').onclick = async () => {
       const running = (App.state.serverState.alerts || {}).running;
       await App.post('/api/alerts/engine', { action: running ? 'stop' : 'start' });

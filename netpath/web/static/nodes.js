@@ -827,6 +827,10 @@
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
               v3_auth_pass: authPass }).catch(() => {});
         }
+        // Poll it now rather than waiting for the next scheduled tick, and
+        // only after any v3 credential override above has been saved so
+        // the first poll already uses the device's final configuration.
+        await App.post(`/api/nodes/devices/${result.id}/poll`, {}).catch(() => {});
         App.closeModal();
         selectDevice(result.id);
         App.refreshNow('nodes');

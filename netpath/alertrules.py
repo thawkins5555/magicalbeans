@@ -30,6 +30,7 @@ class Occurrence:
     entity_label: str
     ts: float
     message: str
+    severity: int | None = None  # syslog occurrences only; 0=most severe
     detail: str = ""
     device_name: str = ""  # for device_filter matching, independent of entity_label's exact text
     device_ip: str = ""

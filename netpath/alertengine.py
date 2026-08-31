@@ -245,7 +245,8 @@ class AlertEngine:
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
                 entity_id=row["source"], entity_label=row["host"] or row["source"],
-                ts=row["ts"], message=row["message"] or "", device_ip=row["source"]))
+                ts=row["ts"], message=row["message"] or "", device_ip=row["source"],
+                severity=row["severity"]))
         if max_id > cursor:
             self.db.set_cursor("syslog", max_id)
         return occurrences
@@ -322,6 +323,13 @@ class AlertEngine:
                 continue
             if rule["kind"] in ("device_event", "interface_event", "trap"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
+                    continue
+            if rule["kind"] == "syslog" and occurrence.severity is not None:
+                # Lower number = more severe (RFC 5424): the rule's own
+                # severity is the threshold it fires at — "this severity
+                # and worse" — not just a label stamped on the resulting
+                # alert.
+                if occurrence.severity > rule["severity"]:
                     continue
             if not match_device(rule, occurrence):
                 continue

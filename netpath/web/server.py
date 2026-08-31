@@ -134,6 +134,7 @@ ROUTES = [
     ("POST", r"^/api/alerts/(\d+)/ack$", api.post_alert_ack),
     ("POST", r"^/api/alerts/(\d+)/resolve$", api.post_alert_resolve),
     ("POST", r"^/api/alerts/ack-all$", api.post_alerts_ack_all),
+    ("POST", r"^/api/alerts/bulk-resolve$", api.post_alerts_bulk_resolve),
     ("GET", r"^/api/alerts/rules$", api.get_alerts_rules),
     ("POST", r"^/api/alerts/rules$", api.post_alerts_rule),
     ("PUT", r"^/api/alerts/rules/(\d+)$", api.put_alerts_rule),

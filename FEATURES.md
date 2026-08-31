@@ -120,6 +120,11 @@ own subtabs.
 - **Status becomes "down" only after several consecutive failed polls**
   (configurable), not the first one, and a device that was only ever
   ping-reachable is distinguished from one that answered SNMP.
+- **A manually added device is polled immediately on save**, rather than
+  waiting for its next scheduled turn — and its very first poll ever
+  never fires a "Device recovered" alert on its own, since it was never
+  confirmed down in the first place. A genuine down→up transition on an
+  already-known device still alerts normally.
 - **Interface counters handle wraparound**: a 32-bit counter that
   decreased is assumed to have wrapped once; a 64-bit counter (ifXTable's
   high-capacity columns, preferred whenever present since a 32-bit octet
@@ -243,6 +248,14 @@ messages and IPAM conflicts against a rule table, on the same 0–7
 severity scale every other module already uses, opening or incrementing
 alerts and optionally emailing about them.
 
+### Working the alert list
+
+- **Alerts can be resolved individually or in bulk.** A checkbox column
+  on the alert list (with select-all-visible) reveals a bulk actions bar
+  with a single **Resolve selected**, applied to every checked alert in
+  one request — alongside the existing single-alert Resolve button in
+  the detail pane and the all-open **Acknowledge all** button.
+
 ### Rules
 
 - **24 built-in rules** ship enabled: a device not responding, a device
@@ -258,6 +271,13 @@ alerts and optionally emailing about them.
   consecutive-polls-before-firing where relevant, which template it
   uses) but not deleted — disable it instead. A custom rule can be added
   for anything the built-ins do not cover.
+- **A rule's severity is a threshold for syslog messages, not just a
+  label.** A syslog rule (built-in "Critical syslog message" included)
+  only fires for messages at least as severe as the rule's own severity
+  setting — a debug-level line no longer opens a "Critical" alert just
+  because it cleared the module-wide "Evaluate severity X and worse"
+  floor; that global setting is the outer gate, the per-rule severity is
+  the inner one.
 - **Threshold rules use hysteresis**: a `threshold` and a lower
   `clear_threshold`, plus a consecutive-polls-before-firing count, so a
   value oscillating right at the edge does not open and close the same

@@ -394,6 +394,21 @@ flip the display to `down` — the same chicken-and-egg shape as
 present here and fixed the same way: increment the streak before, not
 inside, the branch that checks whether it crossed the line.
 
+The "up" event (the one the built-in `device_up` alert rule reacts to as
+"Device recovered") is gated by `not first_poll`, where
+`first_poll = previous["last_poll_ts"] is None` — `previous` being the
+pre-update row `record_poll()` returns, so this is a direct read of
+whether the device has ever completed a poll before, not a guess from
+its status text. Without it, `add_device()` leaving a fresh row at the
+schema's `status='unknown'` default meant a brand-new device's very
+first successful poll satisfied `was_status not in ("up",)` exactly the
+same as a real down→up transition, firing (and emailing) a recovery
+alert for a device that was never actually down. Deliberately scoped to
+only the "up" branch: a device that comes up *down* or *unsupported* on
+its first poll still fires that event immediately, since knowing a
+just-added device is already unreachable is useful, only "recovered" is
+nonsensical with nothing to have recovered from.
+
 ### Discovery (`nodediscover.py`)
 
 `DiscoveryJob` runs on its own daemon thread, one per active job —
@@ -591,6 +606,38 @@ hit independently, and fixed the same way: an earlier version only
 incremented the streak once a breach had already been detected, which
 meant it could never actually reach `for_polls` and the alert could never
 fire.
+
+### Syslog severity matching (`alertrules.py`, `alertengine.py`)
+
+`rule["severity"]` used to be write-only from the matcher's point of
+view: `_apply()` stamped it onto the opened alert but never read it back
+to decide whether a rule should match at all, so the built-in "Critical
+syslog message" rule (severity 2) matched *every* syslog occurrence that
+cleared the module-wide `min_severity` floor in `_drain_syslog()` — the
+per-rule severity dropdown in the rule editor visually implies a
+threshold ("this severity and worse"), matching the global setting's own
+"Evaluate severity X and worse" wording, but nothing enforced that.
+`Occurrence` gained a `severity: int | None = None` field, populated only
+by `_drain_syslog()` from the row's own severity; `_apply()` skips a
+`kind == "syslog"` rule whenever `occurrence.severity > rule["severity"]`
+(lower number = more severe, same RFC 5424 convention as everywhere else
+in the app). The global `min_severity` floor in `_drain_syslog()` is
+still the outer gate — it decides which rows become occurrences at all —
+and the per-rule check is the inner one, deciding which of those
+occurrences match a *particular* rule; other kinds (`device_event`,
+`interface_event`, `trap`) carry no `severity` on their `Occurrence` and
+are unaffected, since `_apply()`'s check only fires when
+`occurrence.severity is not None`.
+
+### Bulk resolve (`alertsdb.py`)
+
+`resolve_many(alert_ids, by)` mirrors `resolve()`'s single-id `UPDATE`
+but over `WHERE id IN (?,?,...)` in one statement, the same shape as
+Nodes' `bulk_update_devices` — one transaction regardless of how many
+ids are selected, rather than looping a Python call per id. Both still
+carry `AND state IN ('open','acked')`, so resolving an already-resolved
+alert a second time (e.g. a stale checkbox from a previous filter view)
+is a harmless no-op rather than an error.
 
 ### Notifications (`alertmail.py`, `alertengine.py`)
 

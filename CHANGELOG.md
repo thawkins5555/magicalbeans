@@ -6,6 +6,26 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.20.0 — Bulk resolve alerts, poll-on-add, false recovery fix, syslog severity fix
+
+- **Alerts can be resolved in bulk.** A checkbox column on the alert
+  list (with select-all-visible) reveals a bulk actions bar with
+  **Resolve selected**, applied to every checked alert in one request.
+- **A manually added device is now polled immediately on save**,
+  instead of waiting for the next scheduled poll tick.
+- **Fixed a false "Device recovered" alert on every newly added
+  device**: a device's very first poll ever was indistinguishable from
+  a genuine down→up recovery, so any device that came up on its first
+  poll fired (and emailed) a recovery alert it never earned. A device
+  now has to have been polled before for "recovered" to mean anything.
+- **Fixed the Alerts engine mis-identifying syslog message severity**:
+  a rule's severity field was purely decorative — stamped on the opened
+  alert but never used to decide whether the rule matched — so any
+  syslog line clearing the single global severity floor could open the
+  built-in "Critical syslog message" alert regardless of its actual
+  severity. A rule's severity is now the threshold it fires at, same as
+  the global "Evaluate severity X and worse" setting it sits alongside.
+
 ### 4.19.0 — Syslog Host column cross-referenced from Nodes/DNS
 
 - **The Syslog Host column now falls back to a cross-referenced name**

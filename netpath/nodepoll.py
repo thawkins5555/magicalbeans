@@ -542,7 +542,8 @@ class NodePoller:
         # -------------------------------------------------------- events
 
         was_status = previous["status"]
-        if status == "up" and was_status not in ("up",):
+        first_poll = previous["last_poll_ts"] is None
+        if status == "up" and was_status not in ("up",) and not first_poll:
             self.db.record_device_event(device_id, "up", "responding again")
         elif status == "down" and was_status != "down":
             self.db.record_device_event(device_id, "down", snmp_error or "not responding")

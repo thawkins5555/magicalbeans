@@ -2429,6 +2429,19 @@ def post_alerts_ack_all(service, params, body) -> dict:
     return {"acknowledged": n}
 
 
+def _bulk_alert_ids(body) -> list[int]:
+    ids = body.get("alert_ids") or []
+    if not ids:
+        raise ValueError("alert_ids is required")
+    return [int(i) for i in ids]
+
+
+def post_alerts_bulk_resolve(service, params, body) -> dict:
+    alert_ids = _bulk_alert_ids(body)
+    n = service.alerts_db.resolve_many(alert_ids, params.get("_username", ""))
+    return {"resolved": n}
+
+
 def get_alerts_rules(service, params, body) -> dict:
     return {"rules": [_rule_json(r) for r in service.alerts_db.rules()]}
 

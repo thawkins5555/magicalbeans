@@ -500,6 +500,18 @@ class AlertsDatabase:
                 (time.time(), by, alert_id))
             self._conn.commit()
 
+    def resolve_many(self, alert_ids: list[int], by: str = "") -> int:
+        if not alert_ids:
+            return 0
+        marks = ",".join("?" * len(alert_ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?"
+                f" WHERE id IN ({marks}) AND state IN ('open','acked')",
+                (time.time(), by, *alert_ids))
+            self._conn.commit()
+            return cursor.rowcount or 0
+
     def resolve_by_dedup(self, dedup_key: str, by: str = "") -> sqlite3.Row | None:
         with self._lock:
             row = self._conn.execute(
