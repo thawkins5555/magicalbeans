@@ -1501,10 +1501,14 @@ def get_nodes_devices(service, params, body) -> dict:
     device_group_id = params.get("device_group_id")
     status = params.get("status") or None
     text = params.get("q") or None
+    # The frontend only ever sends this param when the "only offline"
+    # checkbox is checked, so its mere presence is the signal — no
+    # string-vs-boolean parsing of a possible "false" needed.
+    exclude_up = params.get("offline_only") is not None
     rows = service.nodes_db.devices(
         group_id=int(group_id) if group_id else None,
         device_group_id=int(device_group_id) if device_group_id else None,
-        status=status, text=text)
+        status=status, text=text, exclude_up=exclude_up)
     worker_state = service.node_poller.worker_state()
     devices = []
     for row in rows:
@@ -1579,6 +1583,41 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     service.nodes_db.remove_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     return {"ok": True}
+
+
+def _bulk_device_ids(body) -> list[int]:
+    ids = body.get("device_ids") or []
+    if not ids:
+        raise ValueError("device_ids is required")
+    return [int(i) for i in ids]
+
+
+def post_nodes_devices_bulk_update(service, params, body) -> dict:
+    device_ids = _bulk_device_ids(body)
+    fields = {}
+    if "group_id" in body:
+        group_id = body["group_id"]
+        if group_id is not None and not service.nodes_db.group(group_id):
+            raise ValueError("No such polling profile")
+        fields["group_id"] = group_id
+    if "device_group_id" in body:
+        device_group_id = body["device_group_id"]
+        if device_group_id is not None and not service.nodes_db.device_group(device_group_id):
+            raise ValueError("No such group")
+        fields["device_group_id"] = device_group_id
+    if not fields:
+        raise ValueError("Nothing to update")
+    service.nodes_db.bulk_update_devices(device_ids, **fields)
+    service.log.add(NODES_CATEGORY,
+                    f"Bulk-updated {len(device_ids)} device(s): {', '.join(fields)}")
+    return {"ok": True, "updated": len(device_ids)}
+
+
+def post_nodes_devices_bulk_delete(service, params, body) -> dict:
+    device_ids = _bulk_device_ids(body)
+    removed = service.nodes_db.bulk_remove_devices(device_ids)
+    service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
+    return {"ok": True, "removed": removed}
 
 
 def post_nodes_device_poll(service, params, body, device_id) -> dict:

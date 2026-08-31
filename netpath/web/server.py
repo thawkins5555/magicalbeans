@@ -84,6 +84,8 @@ ROUTES = [
     ("GET", r"^/api/nodes/overview$", api.get_nodes_overview),
     ("GET", r"^/api/nodes/devices$", api.get_nodes_devices),
     ("POST", r"^/api/nodes/devices$", api.post_nodes_device),
+    ("POST", r"^/api/nodes/devices/bulk-update$", api.post_nodes_devices_bulk_update),
+    ("POST", r"^/api/nodes/devices/bulk-delete$", api.post_nodes_devices_bulk_delete),
     ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device),
     ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device),
     ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device),

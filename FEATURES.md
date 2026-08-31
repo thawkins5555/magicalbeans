@@ -100,6 +100,14 @@ own subtabs.
   one group at a time (or none). Groups are managed from a small dialog
   next to the Devices filter bar; removing a group leaves its devices
   ungrouped rather than erroring.
+- **Devices can be selected and operated on in bulk.** A checkbox
+  column on the device list (with select-all-visible) reveals a bulk
+  actions bar: Set profile, Set group, Remove from group, and Delete —
+  each applied to every selected device in one request rather than one
+  per device.
+- **A "Only offline" checkbox** on the Devices filter bar shows devices
+  whose status isn't `up` (down, unknown, unsupported, or auth-failed) —
+  combinable with the Profile/Group/Status filters alongside it.
 - **The scheduler is shaped like NetPath's own trace `Monitor`**, not
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
   due-time seeding from each device's own last poll time, so a restart
@@ -211,7 +219,10 @@ The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out — the same way every other table in the app does. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
-status and any SNMP error always show.
+status and any SNMP error always show. A "Smoothed" checkbox next to the
+metric/range pickers applies a moving average to raw per-poll points
+(off by default, so real spikes stay visible unless smoothing is asked
+for); wide-window rollup views are unaffected by it.
 
 Clicking a port in the interface list opens that port's own dialog: a
 live up/down bandwidth graph of the last hour, its statistics and

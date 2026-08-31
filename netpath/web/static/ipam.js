@@ -762,10 +762,21 @@
       'vector-effect': 'non-scaling-stroke',
     }));
 
-    const tip = points.map((p) =>
-      `${new Date(p.ts * 1000).toLocaleString()}  ${p.leased} leased` +
-      (p.total ? ` (${Math.round((p.leased / p.total) * 100)}%)` : '')).join('\n');
-    svg.addEventListener('mousemove', (event) => App.tooltip(tip, event));
+    // One point's line under the cursor, not the whole series dumped into
+    // one tooltip on every move — same nearest-sample idiom netflow.js's
+    // own chart tooltip already uses.
+    const tipFor = (p) => `${new Date(p.ts * 1000).toLocaleString()}  ${p.leased} leased` +
+      (p.total ? ` (${Math.round((p.leased / p.total) * 100)}%)` : '');
+    svg.addEventListener('mousemove', (event) => {
+      const cx = event.offsetX * (width / svg.clientWidth);
+      let nearest = points[0];
+      let nearestDist = Infinity;
+      for (const p of points) {
+        const dist = Math.abs(x(p.ts) - cx);
+        if (dist < nearestDist) { nearest = p; nearestDist = dist; }
+      }
+      App.tooltip(tipFor(nearest), event);
+    });
     svg.addEventListener('mouseleave', App.hideTooltip);
     chartEl.appendChild(svg);
 

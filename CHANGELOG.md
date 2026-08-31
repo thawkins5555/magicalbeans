@@ -6,6 +6,35 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.18.0 — Bulk device operations, offline filter, chart smoothing, IPAM tooltip fix
+
+- **Devices can now be selected and operated on in bulk.** A checkbox
+  column on the Nodes → Devices table (plus a select-all-visible header
+  checkbox) reveals a bulk-actions bar with four actions: **Set
+  profile** and **Set group** (each a small dialog, applied to every
+  selected device in one request), **Remove from group** (no dialog —
+  a plain, reversible clear), and **Delete** (a confirmation listing
+  the devices, or just the count past ten). All four operate through
+  new bulk endpoints that update or remove every selected device in one
+  database transaction rather than one request per device.
+- **A new "Only offline" checkbox** on the Devices filter bar shows
+  devices whose status isn't `up` — down, unknown, unsupported, or
+  auth-failed — a genuinely different filter from picking "down" alone
+  from the existing Status dropdown, and combinable with every other
+  filter in the bar.
+- **The device metric chart has a "Smoothed" checkbox** next to the
+  metric and range pickers. Off by default (troubleshooting wants to
+  see real spikes), it applies a centered moving average to raw
+  per-poll points — window size scales with how many points are on
+  screen. Hourly rollup views (wide windows, already aggregated by the
+  backend) are unaffected by the checkbox; toggling it is a pure
+  redraw, no new network request.
+- **Fixed the IPAM → DHCP → Leases trend chart's tooltip**: it was
+  dumping the entire multi-day series — every point, one per line — into
+  one tooltip on every mouse movement, regardless of where the cursor
+  was. It now shows only the point nearest the cursor, the same
+  nearest-sample idiom the NetFlow chart's own tooltip already uses.
+
 ### 4.17.1 — Code-review fixes for the 4.17.0 chart work
 
 - The wheel-zoom handler no longer goes dead when a zoom lands in a

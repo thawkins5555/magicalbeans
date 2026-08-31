@@ -6,6 +6,7 @@
 
   const view = {
     devices: [],
+    devicesChecked: new Set(),
     groups: [],
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
@@ -18,6 +19,7 @@
     // the range dropdown resets it to null — same "frozen window" idea
     // netflow.js's/netpath.js's own charts already use for wheel zoom.
     chartWindow: null,
+    chartSmooth: false,
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -88,6 +90,28 @@
 
   function drawTable() {
     const table = App.grid(App.el('nodes-table'), { name: 'nodes-devices', columns: COLUMNS });
+    // A checkbox column, prepended after App.grid builds its own
+    // colgroup/thead — App.grid's columns are a display/sort spec only,
+    // so a selection column that isn't sortable or width-persisted
+    // doesn't belong in COLUMNS itself.
+    const col = document.createElement('col');
+    col.style.width = '28px';
+    table.querySelector('colgroup').prepend(col);
+    const headRow = table.querySelector('thead tr');
+    const headCheck = document.createElement('th');
+    const selectAll = document.createElement('input');
+    selectAll.type = 'checkbox';
+    selectAll.title = 'Select all visible';
+    selectAll.checked = view.devices.length > 0
+      && view.devices.every((d) => view.devicesChecked.has(d.id));
+    selectAll.onchange = () => {
+      if (selectAll.checked) view.devices.forEach((d) => view.devicesChecked.add(d.id));
+      else view.devices.forEach((d) => view.devicesChecked.delete(d.id));
+      drawTable();
+    };
+    headCheck.appendChild(selectAll);
+    headRow.prepend(headCheck);
+
     const body = document.createElement('tbody');
     const groupsById = {};
     for (const g of view.groups) groupsById[g.id] = g.name;
@@ -99,19 +123,115 @@
       const dot = `<span class="dot" style="background:${STATUS_COLOR[row.status] || 'var(--faint)'};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px"></span>`;
       const rtt = row.snmp_ok ? (row.ping_rtt_ms != null ? `${row.ping_rtt_ms.toFixed(0)} ms` : 'ok')
         : (row.ping_ok ? `${(row.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '—');
-      tr.innerHTML =
+      const checkTd = document.createElement('td');
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = view.devicesChecked.has(row.id);
+      check.onclick = (e) => e.stopPropagation();   // don't also selectDevice()
+      check.onchange = () => {
+        if (check.checked) view.devicesChecked.add(row.id);
+        else view.devicesChecked.delete(row.id);
+        drawBulkBar();
+      };
+      checkTd.appendChild(check);
+      tr.appendChild(checkTd);
+      tr.insertAdjacentHTML('beforeend',
         `<td>${dot}${escape(row.status)}</td>` +
         `<td>${escape(displayName(row))}<div class="hint">${escape(row.ip)}</div></td>` +
         `<td>${escape(groupsById[row.group_id] || '—')}</td>` +
         `<td>${escape(devGroupsById[row.device_group_id] || '—')}</td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${escape(rtt)}</td>` +
-        `<td>${ago(row.last_poll_ts)}</td>`;
+        `<td>${ago(row.last_poll_ts)}</td>`);
       tr.onclick = () => selectDevice(row.id);
       body.appendChild(tr);
     }
     table.appendChild(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
+    drawBulkBar();
+  }
+
+  /* ------------------------------------------------------- bulk actions */
+
+  function drawBulkBar() {
+    const n = view.devicesChecked.size;
+    App.el('nd-bulk-bar').hidden = n === 0;
+    if (n) App.el('nd-bulk-count').textContent = `${n} selected`;
+  }
+
+  function bulkClearSelection() {
+    view.devicesChecked.clear();
+    drawTable();
+  }
+
+  async function bulkUpdate(fields) {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    await App.post('/api/nodes/devices/bulk-update', { device_ids: ids, ...fields });
+    if (view.selected && ids.includes(view.selected)) {
+      // The open detail pane may now show a stale profile/group name.
+      await loadDetail();
+    }
+    view.devicesChecked.clear();
+    App.refreshNow('nodes');
+  }
+
+  function bulkSetProfile() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    App.modal(`Set profile for ${ids.length} device(s)`,
+      `<label>Polling profile <select id="nd-bulk-f-group">${groupOptionsHtml()}</select></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Set profile', primary: true, onClick: async (box) => {
+        const group_id = Number(box.querySelector('#nd-bulk-f-group').value) || null;
+        App.closeModal();
+        await bulkUpdate({ group_id });
+      } },
+    ]);
+  }
+
+  function bulkSetGroup() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    App.modal(`Set group for ${ids.length} device(s)`,
+      `<label>Group <select id="nd-bulk-f-devgroup">${deviceGroupOptionsHtml()}</select></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Set group', primary: true, onClick: async (box) => {
+        const device_group_id = Number(box.querySelector('#nd-bulk-f-devgroup').value) || null;
+        App.closeModal();
+        await bulkUpdate({ device_group_id });
+      } },
+    ]);
+  }
+
+  function bulkRemoveFromGroup() {
+    // No confirm dialog: same reversible, no-fanfare action removing a
+    // device's group already is from the single-device Edit form.
+    bulkUpdate({ device_group_id: null });
+  }
+
+  function bulkDeleteDevices() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    const names = ids.map((id) => {
+      const d = view.devices.find((x) => x.id === id);
+      return d ? displayName(d) : `#${id}`;
+    });
+    const list = names.length <= 10
+      ? `<ul>${names.map((n) => `<li>${escape(n)}</li>`).join('')}</ul>`
+      : `<p>${names.length} devices.</p>`;
+    App.modal('Delete devices',
+      `<p>Remove <b>${ids.length}</b> device(s)? This deletes their interfaces, ` +
+      `metric history and events.</p>${list}`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Delete', primary: true, onClick: async () => {
+        App.closeModal();
+        await App.post('/api/nodes/devices/bulk-delete', { device_ids: ids });
+        if (view.selected && ids.includes(view.selected)) view.selected = null;
+        view.devicesChecked.clear();
+        App.refreshNow('nodes');
+      } },
+    ]);
   }
 
   function selectDevice(id) {
@@ -270,6 +390,28 @@
     return 10 * base;
   }
 
+  /* Centered moving average over raw {ts, value} points, for the
+     Smoothed checkbox — window scales with point count so a handful of
+     samples isn't over-smoothed and a few thousand isn't under-smoothed,
+     and shrinks at the edges rather than reaching past the data. Applied
+     only to raw series (see the caller); rollup avg/min/max points never
+     pass through here. */
+  function movingAverage(points) {
+    const n = points.length;
+    if (n < 3) return points;
+    const window = Math.max(3, Math.min(9, Math.round(n / 20)));
+    const half = Math.floor(window / 2);
+    return points.map((p, i) => {
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(n - 1, i + half);
+      let sum = 0, count = 0;
+      for (let j = lo; j <= hi; j += 1) {
+        if (points[j].value != null) { sum += points[j].value; count += 1; }
+      }
+      return { ts: p.ts, value: count ? sum / count : null };
+    });
+  }
+
   /* Axis-label formatting by metric unit — the raw number a metric
      stores is not what a human reads on a gridline. */
   function formatMetricValue(unit, v) {
@@ -304,7 +446,14 @@
     // (data.t0/t1) is still known, so the caller can keep zooming out of
     // an empty view instead of the wheel going dead — see below.
     if (!data) return null;
-    const seriesList = (data.series || []).map((s) => ({ ...s, points: s.points || [] }));
+    const seriesList = (data.series || []).map((s) => {
+      const points = s.points || [];
+      // Smoothing only makes sense on raw per-poll points — an hourly
+      // rollup's avg/min/max is already an aggregate, and averaging an
+      // average would misrepresent it rather than clarify it.
+      const isRaw = points.length && points[0].avg === undefined;
+      return { ...s, points: opts.smooth && isRaw ? movingAverage(points) : points };
+    });
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
       p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
@@ -386,7 +535,7 @@
   function drawChart() {
     const svg = App.el('nd-chart-svg');
     const geo = drawSeriesChart(svg, App.el('nd-chart'), view.series,
-      { fractions: [0, 0.25, 0.5, 0.75, 1] });
+      { fractions: [0, 0.25, 0.5, 0.75, 1], smooth: view.chartSmooth });
     // onwheel ASSIGNMENT, never addEventListener: this redraws on every
     // refresh tick, and accumulated listeners each zoomed from their own
     // stale time window — the "timeframe doesn't scale" bug.
@@ -1447,8 +1596,11 @@
     const group_id = App.el('nd-filter-group').value;
     const device_group_id = App.el('nd-filter-devgroup').value;
     const status = App.el('nd-filter-status').value;
+    // Omitted entirely when unchecked, not sent as "false": App.get only
+    // drops params equal to '', so the API reads presence, not value.
+    const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
-      App.get('/api/nodes/devices', { q, group_id, device_group_id, status }),
+      App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only }),
       App.get('/api/nodes/groups'),
       App.get('/api/nodes/device-groups'),
       App.get('/api/nodes/mibs'),
@@ -1458,6 +1610,12 @@
     view.groups = groups.groups;
     view.deviceGroups = deviceGroups.groups;
     view.mibFiles = mibs.files;
+    // A filter/sort change can drop rows out from under a bulk
+    // selection — keep only ids still actually on screen.
+    const visibleIds = new Set(view.devices.map((d) => d.id));
+    for (const id of view.devicesChecked) {
+      if (!visibleIds.has(id)) view.devicesChecked.delete(id);
+    }
     if (view.selected && !view.devices.some((d) => d.id === view.selected)) {
       view.selected = null;
     }
@@ -1514,13 +1672,20 @@
     App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
+    App.el('nd-filter-offline').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
+    App.el('nd-bulk-profile').onclick = bulkSetProfile;
+    App.el('nd-bulk-group').onclick = bulkSetGroup;
+    App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
+    App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
+    App.el('nd-bulk-clear').onclick = bulkClearSelection;
     App.el('nd-d-metric').onchange = (e) => { view.metricId = e.target.value; loadSeries(); };
     App.el('nd-d-range').onchange = (e) => {
       view.chartRange = Number(e.target.value);
       view.chartWindow = null;   // back to following "now" at this span
       loadSeries();
     };
+    App.el('nd-d-smooth').onchange = (e) => { view.chartSmooth = e.target.checked; drawChart(); };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;

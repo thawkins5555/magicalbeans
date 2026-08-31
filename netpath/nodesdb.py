@@ -603,8 +603,8 @@ class NodesDatabase:
     # ---------------------------------------------------------------- devices
 
     def devices(self, group_id: int | None = None, status: str | None = None,
-               text: str | None = None, device_group_id: int | None = None
-               ) -> list[sqlite3.Row]:
+               text: str | None = None, device_group_id: int | None = None,
+               exclude_up: bool = False) -> list[sqlite3.Row]:
         clauses, params = [], []
         if group_id is not None:
             clauses.append("group_id = ?")
@@ -615,6 +615,13 @@ class NodesDatabase:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if exclude_up:
+            # "Offline" as a concept, not the literal status string:
+            # down, unknown, unsupported and auth-failed all mean "not
+            # currently confirmed working" — genuinely broader than
+            # picking 'down' alone from the status filter above, and the
+            # two are meant to be layerable rather than redundant.
+            clauses.append("status != 'up'")
         if text:
             clauses.append("(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?)")
             params.extend([f"%{text}%"] * 3)
@@ -690,6 +697,32 @@ class NodesDatabase:
                 f"UPDATE devices SET {clauses} WHERE id = ?",
                 (*allowed.values(), device_id))
             self._conn.commit()
+
+    def bulk_update_devices(self, device_ids: list[int], **fields) -> None:
+        """The same field allow-list as update_device, applied to many rows
+        in one statement/transaction rather than one round trip per
+        device — the shape post_nodes_discovery_promote's device_ids list
+        already established for "operate on many ids from one request"."""
+        allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        if not allowed or not device_ids:
+            return
+        clauses = ", ".join(f"{key} = ?" for key in allowed)
+        marks = ",".join("?" * len(device_ids))
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
+                (*allowed.values(), *device_ids))
+            self._conn.commit()
+
+    def bulk_remove_devices(self, device_ids: list[int]) -> int:
+        if not device_ids:
+            return 0
+        marks = ",".join("?" * len(device_ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"DELETE FROM devices WHERE id IN ({marks})", device_ids)
+            self._conn.commit()
+            return cursor.rowcount or 0
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
                               password_enc: bytes) -> None:

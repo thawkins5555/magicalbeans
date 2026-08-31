@@ -223,6 +223,31 @@ is a nullable FK with `ON DELETE SET NULL`, the same nullable-FK shape
 devices rather than requiring an in-use guard — unlike losing a polling
 profile, losing an organizational folder is harmless.
 
+**Bulk device operations** (`bulk_update_devices`/`bulk_remove_devices`,
+`nodesdb.py`; `post_nodes_devices_bulk_update`/`_bulk_delete`, `api.py`):
+one `UPDATE ... WHERE id IN (...)` / `DELETE ... WHERE id IN (...)`
+inside a single lock/commit per call, the same "operate on a list of
+ids from one request" shape `post_nodes_discovery_promote`'s
+`result_ids` list already established, rather than one HTTP round trip
+per device. `bulk_update_devices` reuses `update_device`'s
+`_DEVICE_EDITABLE` allow-list unchanged, so a bulk "remove from group"
+is exactly `device_group_id: null` through the same code path a
+single-device edit already uses — no separate "clear" endpoint. The
+frontend's checkbox column is layered onto `App.grid`'s output
+(prepending a `<col>`/`<th>`/`<td>` after the grid builds its own
+colgroup/thead) rather than added to `App.grid` itself, since
+selection isn't sortable or width-persisted the way real columns are.
+
+**"Only offline" filter.** `devices(exclude_up=True)` appends
+`status != 'up'` — deliberately not `status = 'down'`: down, unknown,
+unsupported and auth-failed are all "not currently confirmed working,"
+a broader and different question than the exact-match Status dropdown
+sitting right next to it. `get_nodes_devices` treats the query param's
+mere *presence* as the signal (`params.get("offline_only") is not
+None`) rather than parsing its value — the frontend only ever includes
+the key when the checkbox is checked, so there's no `"false"`-string
+edge case to parse around.
+
 **Default profile deletion and reassignment.** `remove_group()` no longer
 special-cases `is_default` — every profile, default or not, is refused
 deletion while `device_count_for_group()` is nonzero (a plain `COUNT(*)`,
@@ -270,6 +295,17 @@ samples can still zoom back out. In/out interface metric pairs
 (`if_in_bps.N`/`if_out_bps.N`, same for `_err`) are joined into one
 picker option (`pair:<inId>:<outId>`) client-side; the storage and
 series API stay strictly one-metric-per-id.
+
+**Chart smoothing** (`nodes.js movingAverage`): a centered moving
+average applied only to raw (non-rollup) series when the Smoothed
+checkbox is on (`opts.smooth`, read from `view.chartSmooth`), before
+peak/axis computation so the Y scale reflects what's actually plotted.
+Window size is `clamp(3, 9, round(n / 20))`, shrinking at the array's
+edges rather than reaching past the data. Rollup points (`avg`/`min`/
+`max`) are never smoothed — an hourly aggregate is already a form of
+smoothing, and averaging an average would misrepresent it. The
+interface dialog's own chart call site never passes `opts.smooth`, so
+it always renders raw.
 
 **Device chart window model** (`nodes.js`, `view.chartRange`/
 `chartWindow`): the same "frozen window that a preset reselect resets"
@@ -1227,10 +1263,15 @@ timelines): x is `polled_ts` mapped linearly across the container width, y
 is `leased` scaled to the window's own peak, `vector-effect:
 non-scaling-stroke` so the line stays a crisp 1.5px regardless of the
 `viewBox` scaling trick used to make the SVG responsive. A single
-`mousemove` listener on the whole `<svg>` shows one tooltip string built
-from every point up front (`App.tooltip`) rather than per-point hit
-targets — cheap enough at these point counts, and avoids a nearest-point
-search on every mouse move.
+`mousemove` listener on the whole `<svg>` finds the point nearest the
+cursor (linear scan over `points` comparing `x(p.ts)` distance — cheap
+enough at these point counts to skip a binary search) and shows only
+that point's line via `App.tooltip`, the same nearest-sample idiom
+`netflow.js`'s own chart tooltip already uses. An earlier version built
+one tooltip string from every point up front and showed that whole
+string on every mouse move regardless of cursor position — cheaper to
+compute, but the entire multi-day series dumped into one tooltip
+instead of the value actually under the cursor.
 
 `remove_dhcp_server()` deletes `dhcp_scope_history` rows alongside
 `dhcp_scopes`/`dhcp_leases` (manual cascade, matching how those two are
