@@ -179,11 +179,24 @@
     if (n) App.el('alerts-bulk-count').textContent = `${n} selected`;
   }
 
+  /* A bulk action changes state for potentially every alert on screen,
+     including whichever one is currently open in the detail pane — unlike
+     a single-row action, there's no cheap way to know if what's shown is
+     still accurate, so every bulk action always deselects rather than
+     leaving stale severity/state/button data on screen. refresh()'s own
+     cleanup only catches an alert that *vanished* from the list, which a
+     state change alone (still open, now acked) never does. */
+  function clearSelection() {
+    view.selected = null;
+    App.el('alerts-detail-empty').hidden = false;
+    App.el('alerts-detail').hidden = true;
+  }
+
   async function bulkResolve() {
     const ids = [...view.checked];
     if (!ids.length) return;
     await App.post('/api/alerts/bulk-resolve', { alert_ids: ids });
-    if (view.selected && ids.includes(view.selected)) view.selected = null;
+    clearSelection();
     view.checked.clear();
     App.refreshNow('alerts');
   }
@@ -636,6 +649,7 @@
     }
     App.el('alerts-ack-all').onclick = async () => {
       await App.post('/api/alerts/ack-all', {});
+      clearSelection();
       App.refreshNow('alerts');
     };
     App.el('alerts-bulk-resolve').onclick = bulkResolve;

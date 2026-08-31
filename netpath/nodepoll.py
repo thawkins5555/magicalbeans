@@ -488,6 +488,9 @@ class NodePoller:
                 cred_config, identity, uptime_ticks, metrics = \
                     self._poll_snmp_scalars_with_credential(device, config)
                 interfaces = self._poll_interfaces(device, cred_config)
+                if config.get("mib_file_id"):
+                    metrics = metrics + self._poll_custom_mib(
+                        device, cred_config, config["mib_file_id"])
                 snmp_ok = True
             except SnmpUnsupported as exc:
                 snmp_ok = False
@@ -538,6 +541,27 @@ class NodePoller:
 
         if self.counters is not None and snmp_ok:
             self.counters["ok"] += 1
+
+        # ---------------------------------------------------------- debug
+        # A per-poll trace, the same idea as monitor.py's own trace-logging
+        # convention (command + raw output in `detail`) — this is the
+        # concrete answer to "there should be a way to debug this": before
+        # this, `eventlog.NODES` was imported and never once used, so a
+        # device silently failing to poll left no record anywhere beyond
+        # its own current status/error fields.
+        detail_lines = [
+            f"ping       {'n/a' if ping_ok is None else ('ok' if ping_ok else 'no reply')}"
+            + (f" ({ping_rtt_ms:.0f} ms)" if ping_rtt_ms is not None else ""),
+            f"snmp       {'n/a' if snmp_ok is None else ('ok' if snmp_ok else 'failed')}",
+        ]
+        if snmp_ok:
+            detail_lines.append(f"interfaces {len(interfaces)}")
+            detail_lines.append(f"metrics    {len(metrics)}")
+        elif snmp_error:
+            detail_lines.append(f"error      {snmp_error}")
+        detail_lines.append(f"elapsed    {time.time() - now:.2f}s")
+        self.log.add(NODES, f"Polled {device['ip']}: {status}", target=device["ip"],
+                    detail="\n".join(detail_lines))
 
         # -------------------------------------------------------- events
 
@@ -742,18 +766,79 @@ class NodePoller:
 
         return identity, uptime_ticks, metrics
 
+    def _poll_custom_mib(self, device, config: dict, mib_file_id: int) -> list[tuple]:
+        """A device or its polling profile can be assigned one uploaded
+        MIB (nodesdb's mib_file_id override); this polls that MIB's own
+        resolved *scalar* objects and reports them under its own names —
+        the same best-effort shape as the UCD-SNMP-MIB block above (one
+        failed GET never fails the whole poll; a device that doesn't
+        answer any of this MIB's objects just contributes nothing).
+
+        mibparse.py stores an OBJECT-TYPE's own OID exactly as its MIB
+        clause names it (its position in the tree) — for a genuine
+        scalar, the actual instance to GET is that OID with the standard
+        ".0" suffix appended, the same convention nodeoids.SYSTEM_SCALARS'
+        own hand-written OIDs already bake in. Table objects are out of
+        scope here, same as HOST-RESOURCES-MIB never being walked above —
+        appending ".0" to a table column's OID (rather than a real row
+        index) always misses, so it just silently contributes nothing
+        rather than a per-row index-walk this pass doesn't attempt."""
+        objects = [o for o in self.db.mib_objects(mib_file_id, resolved_only=True)
+                  if not o["is_notification"]]
+        if not objects:
+            return []
+        instance_oids = [f"{o['oid']}.0" for o in objects]
+        metrics = []
+        try:
+            response = self._snmp_get(device, config, instance_oids)
+            values = {vb["oid"]: vb for vb in response.varbinds}
+            for obj, instance_oid in zip(objects, instance_oids):
+                vb = values.get(instance_oid)
+                if not vb or vb["type"] in ("noSuchObject", "noSuchInstance"):
+                    continue
+                if not isinstance(vb["value"], (int, float)):
+                    continue   # a string/OID-valued object isn't a chartable metric
+                # Always stored as "gauge": a Counter-typed object is
+                # charted at its raw, ever-increasing value rather than a
+                # computed per-second rate — the same deliberate scope
+                # limit as no table-walk support. Rate computation needs a
+                # previous-value/previous-ts baseline per metric (see
+                # counter_rate() above, used for interface octet/error
+                # counters), which isn't worth building for an arbitrary,
+                # admin-picked MIB object in this pass.
+                metrics.append((f"mib_{obj['name']}", obj["name"], "", "gauge", vb["value"]))
+        except SnmpError:
+            pass   # best-effort: this MIB's objects aren't answered by this device
+        return metrics
+
     def _poll_interfaces(self, device, config: dict) -> list[dict]:
         """Walks the ifIndex column to discover interfaces, then GETs the
-        needed columns for each index in one round trip per interface."""
-        indexes = self._walk_indexes(device, config, nodeoids.IF_TABLE["if_index"])
+        needed columns for each index in one round trip per interface.
+        The ifIndex walk itself opts into raise_on_timeout: this result
+        feeds directly into the device's own up/down status, so a genuine
+        mid-walk timeout must be reported as the failure it is rather
+        than silently returning however many interfaces were found before
+        the device stopped answering."""
+        indexes = self._walk_indexes(device, config, nodeoids.IF_TABLE["if_index"],
+                                     raise_on_timeout=True)
         if not indexes:
             return []
         rows = []
+        skipped_timeouts = 0
         for if_index in indexes[:512]:   # a sane ceiling; real devices rarely exceed this
             oids = [f"{oid}.{if_index}" for oid in nodeoids.IF_TABLE.values()]
             ifx_oids = [f"{oid}.{if_index}" for oid in nodeoids.IFX_TABLE.values()]
             try:
                 response = self._snmp_get(device, config, oids + ifx_oids)
+            except SnmpTimeout:
+                # Unlike the ifIndex walk above, one interface's own GET
+                # timing out doesn't invalidate the whole poll — the
+                # device answered enough to enumerate its interfaces, so
+                # the rest are still worth collecting. It's tracked and
+                # folded into snmp_error below, though, rather than
+                # disappearing the way it silently used to.
+                skipped_timeouts += 1
+                continue
             except SnmpError:
                 continue
             values = {vb["oid"]: vb for vb in response.varbinds}
@@ -793,18 +878,42 @@ class NodePoller:
                 "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
                 "_octet_bits": octet_bits,
             })
+        if skipped_timeouts:
+            self.log.add(NODES, f"{skipped_timeouts} of {len(indexes)} interface(s) on "
+                                f"{device['ip']} timed out this poll and were skipped",
+                        target=device["ip"])
         return rows
 
-    def _walk_column(self, device, config: dict, base_oid: str) -> dict[str, object]:
+    def _walk_column(self, device, config: dict, base_oid: str,
+                     raise_on_timeout: bool = False) -> dict[str, object]:
         """Repeated GETNEXT (works for v1/v2c/v3 alike, avoiding a separate
         GETBULK code path) over one table column: index suffix -> value.
         Stops when the walk leaves base_oid's subtree or hits a safety
-        cap."""
+        cap.
+
+        `noSuchObject`/`noSuchInstance`/`endOfMibView` and "left the
+        subtree" are all genuine, substantive "that's the end of the
+        table" signals — handled the same way regardless of
+        `raise_on_timeout`. A `SnmpTimeout` mid-walk is different: it
+        means the device stopped answering, not that the table ended, so
+        by default (every on-demand/best-effort caller — DOM/sensor
+        reads, a custom MIB poll) it's still swallowed the same way any
+        other `SnmpError` here always has been, but a caller whose result
+        actually drives the device's own up/down status
+        (`_poll_interfaces`, via `_walk_indexes`) opts in to
+        `raise_on_timeout=True` so a genuine mid-poll timeout is reported
+        as the real failure it is instead of masquerading as "this
+        device just doesn't have any more rows."""
         values: dict[str, object] = {}
         current = base_oid
         for _ in range(512):
             try:
                 response = self._snmp_get_next(device, config, current)
+            except SnmpTimeout as exc:
+                if raise_on_timeout:
+                    raise SnmpTimeout(
+                        f"{exc} (table walk cut short after {len(values)} row(s))") from exc
+                break
             except SnmpError:
                 break
             if not response.varbinds:
@@ -819,9 +928,11 @@ class NodePoller:
             current = oid
         return values
 
-    def _walk_indexes(self, device, config: dict, base_oid: str) -> list[int]:
+    def _walk_indexes(self, device, config: dict, base_oid: str,
+                      raise_on_timeout: bool = False) -> list[int]:
         indexes: list[int] = []
-        for suffix in self._walk_column(device, config, base_oid):
+        for suffix in self._walk_column(device, config, base_oid,
+                                        raise_on_timeout=raise_on_timeout):
             try:
                 indexes.append(int(suffix))
             except ValueError:
@@ -931,6 +1042,66 @@ class NodePoller:
             })
         sensors.sort(key=lambda s: s["entity"])
         return sensors
+
+    # BRIDGE-MIB (RFC 4188) columns used by read_mac_table() to map the
+    # forwarding-database entries learned on a switch port back to the
+    # ifIndex the rest of the app already keys interfaces by.
+    _DOT1D_BASE_PORT_IF_INDEX = "1.3.6.1.2.1.17.1.4.1.2"
+    _DOT1D_FDB_PORT = "1.3.6.1.2.1.17.4.3.1.2"
+
+    def read_mac_table(self, device_id: int, if_index: int) -> list[str] | None:
+        """Live on-demand read of the BRIDGE-MIB forwarding database
+        (dot1dTpFdbTable) entries learned on one switch port — same
+        on-demand-while-the-dialog-is-open shape as read_dom() above:
+        walked only when a human asks, never on the poll cycle.
+
+        dot1dTpFdbTable is INDEXed by dot1dTpFdbAddress itself, so each
+        dot1dTpFdbPort row's own OID suffix (six decimal sub-identifiers,
+        one per MAC byte) already *is* the learned MAC address — no
+        separate GET for the dot1dTpFdbAddress column is needed.
+
+        Returns None (not []) when the device doesn't answer BRIDGE-MIB
+        at all, so the dialog can say "no data" instead of "zero MACs
+        learned on this port" — those are different facts."""
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.db.effective_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+
+        # dot1dBasePortIfIndex: bridge port number -> ifIndex. Find which
+        # bridge port(s), if any, correspond to the requested ifIndex.
+        base_port_if_index = self._walk_column(device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+        if not base_port_if_index:
+            return None
+        target_ports = set()
+        for suffix, value in base_port_if_index.items():
+            try:
+                if int(value) == if_index:
+                    target_ports.add(int(suffix))
+            except (TypeError, ValueError):
+                continue
+        if not target_ports:
+            return []
+
+        fdb_port = self._walk_column(device, config, self._DOT1D_FDB_PORT)
+        macs = []
+        for suffix, port in fdb_port.items():
+            try:
+                if int(port) not in target_ports:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            parts = suffix.split(".")
+            if len(parts) != 6:
+                continue
+            try:
+                macs.append(":".join(f"{int(p):02x}" for p in parts))
+            except ValueError:
+                continue
+        macs.sort()
+        return macs
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
         version = int(config.get("snmp_version") or 1)

@@ -212,6 +212,17 @@ own subtabs.
 - **Resolved names also flow into the SNMP Trap page** — a trap from a
   device an uploaded MIB describes shows a name instead of a raw OID
   there too, without duplicating the name table.
+- **Assign a MIB to a device or group to have it actually polled.** By
+  itself, an uploaded MIB only feeds the browse view above — it has no
+  effect on polling. Picking one from a device or group's "Custom MIB"
+  override (alongside the other overrides, device beats group the same
+  way every other override does) makes that MIB's own resolved scalar
+  objects get GETed every poll cycle, alongside the fixed built-in set,
+  and stored/shown under their own names. Best-effort like every other
+  optional SNMP read here: an object this device doesn't answer is
+  silently skipped rather than failing the poll. Scalars only — a MIB's
+  own table objects (e.g. a vendor's per-sensor table) aren't walked by
+  this feature.
 
 ### Drill-down
 
@@ -251,8 +262,11 @@ history, and DOM/SFP sensor readings — voltage, current, light levels,
 temperature — read live over SNMP from devices that expose them via the
 standard ENTITY-SENSOR-MIB (values, units and scaling exactly as the
 device reports them; devices without it simply show "no DOM/sensor
-data"). Per-interface "show run" and MAC-address listings appear as
-placeholders until SSH integration lands.
+data"), and the MAC addresses currently learned on that port — read live
+over SNMP from the standard BRIDGE-MIB forwarding-database table
+(devices that don't answer it show "no MAC address data" instead of an
+empty table). Per-interface "show run" still appears as a placeholder
+until SSH integration lands.
 
 ---
 
@@ -928,8 +942,18 @@ Scheduled, read-only backups of a device's running configuration, pulled
 over SSH. **There is no device list of its own** — the searchable device
 list is Nodes' own device list; ConfigRX only adds its own per-device
 backup configuration (SSH port/username/password, whether backup is
-enabled, an optional vendor override) on top of it.
+enabled, an optional vendor override) on top of it. Each device's shown
+name follows the same SNMP-hostname-first precedence every other module
+already uses: its SNMP-reported name, unless it's been explicitly pinned
+to a manual name in Nodes.
 
+- **Bulk-edit SSH credentials and backup settings across many devices at
+  once**: Ctrl/Cmd-click rows (or "select all") to check several devices,
+  then set one shared SSH username/password/port and backup-enabled
+  setting for all of them in a single action — the same shared-value
+  bulk pattern Nodes' own bulk device operations already use. Leaving a
+  bulk field blank/unchecked never overwrites what a device already had;
+  only the fields you actually set are applied.
 - **Selecting a device shows its stored backups** — timestamp and size —
   and selecting a backup shows its raw config text in a read-only panel.
   There is no editable field and no save-back action anywhere in this
@@ -982,7 +1006,12 @@ disk.
 - **Event log** — every trace, reverse-DNS lookup, collector, and IPAM event.
   Select one to see its detail: the exact command line, the resolved address,
   the path, the stored trace id and the raw traceroute output as the OS
-  printed it.
+  printed it. Every Nodes poll now logs its own detail line too — ping/SNMP
+  outcome, interfaces found, elapsed time, and, on a genuine SNMP failure,
+  the exact error text — so "is this device really not answering, or is it
+  something else" has a concrete answer instead of a guess. Cumulative
+  poll counters (ok/timeout/auth-failed/unsupported/error) show in the
+  status strip alongside the trace/DNS/IPAM/Nodes summary line.
 - Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, SNMP
   Trap, Nodes, Alerts, IPAM, Wireless, ConfigRX, System, Errors) or by free
   text across both messages and details.

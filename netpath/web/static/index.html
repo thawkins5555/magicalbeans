@@ -676,6 +676,15 @@
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
     <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
     <button id="cx-apply" class="primary">Search</button>
+    <span class="grow"></span>
+    <span class="hint">Ctrl-click a row to select it</span>
+    <button id="cx-bulk-selectall">Select all</button>
+  </div>
+  <div class="bar wrap" id="cx-bulk-bar" hidden data-requires-write="configrx">
+    <span id="cx-bulk-count" class="hint"></span>
+    <button id="cx-bulk-credential">Set SSH credential</button>
+    <span class="grow"></span>
+    <button id="cx-bulk-clear">Clear selection</button>
   </div>
 
   <div class="cols" data-splitter="configrx-body">

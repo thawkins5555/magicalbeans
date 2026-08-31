@@ -385,6 +385,79 @@ the device's own `entPhySensorUnitsDisplay` string as the unit — no
 vendor unit tables. A device without ENTITY-MIB support returns `[]`,
 which the dialog reports as "no DOM/sensor data" rather than an error.
 
+**MAC address table** (`NodePoller.read_mac_table`): same on-demand shape
+as `read_dom` above — walked only while the interface dialog is open, via
+BRIDGE-MIB's `dot1dBasePortIfIndex` (bridge port → ifIndex, to find which
+bridge port(s) map to the requested ifIndex) and `dot1dTpFdbPort` (FDB
+entry → the bridge port that learned it). `dot1dTpFdbTable` is INDEXed by
+`dot1dTpFdbAddress` itself, so each `dot1dTpFdbPort` row's own OID suffix
+(six decimal sub-identifiers, one per MAC byte) already *is* the learned
+MAC address — no separate GET for the `dot1dTpFdbAddress` column is
+needed. Returns `None` (not `[]`) when the device doesn't answer
+BRIDGE-MIB at all (an empty `_walk_column` on `dot1dBasePortIfIndex`),
+which the dialog and the `/mac-table` API route's `"supported"` flag both
+key off, so "this device can't tell us" and "this port genuinely has zero
+MACs learned right now" render as different messages.
+
+**Custom-MIB-scoped polling** (`NodePoller._poll_custom_mib`): a
+device/group `mib_file_id` override (new `_OVERRIDE_COLUMNS` entry,
+resolved by `effective_config()` the same as every other override, zero
+extra code) selects one uploaded MIB whose resolved scalar objects
+(`db.mib_objects(mib_file_id, resolved_only=True)`, excluding
+notifications) get GETed every poll cycle and folded into the same
+`metrics` list `record_metric_sample()` already loops over — no new
+storage schema, `metrics`/`samples` are already generic per-device tables
+keyed by an arbitrary string. The one non-obvious part: `mibparse.py`'s
+stored OID for an `OBJECT-TYPE` clause is the object's *tree position*,
+not a GET-able instance — real SNMP requires the standard scalar-instance
+`.0` suffix (the same convention `nodeoids.SYSTEM_SCALARS`'s hand-written
+OIDs already bake in), so `_poll_custom_mib` appends it before GETting.
+This also naturally enforces the scalars-only scope without any explicit
+detection: a genuine table-column OID harmlessly returns `noSuchInstance`
+for its `.0` and is silently skipped, same as an object the device simply
+doesn't support. Failure is best-effort exactly like `UCD_SNMP`/
+`HOST_RESOURCES` elsewhere in this file — one `except SnmpError: pass`
+around the whole GET, never failing the rest of the poll. Stored kind is
+always `"gauge"`, deliberately never `"counter_rate"`: that string is
+schema-documented as valid but has zero actual rate-computation consumers
+anywhere in this codebase, so using it here would imply behavior that
+doesn't exist.
+
+**Timeout vs. end-of-table accuracy** (`_walk_column`,
+`_poll_interfaces`): `SnmpTimeout` is a *subclass* of `SnmpError`, so a
+bare `except SnmpError` at a table walk's loop-stop condition used to
+treat a genuine mid-walk timeout (device stopped answering) identically
+to `noSuchObject`/`noSuchInstance`/`endOfMibView`/leaving the subtree (the
+table's real, clean end) — a device that timed out partway through
+enumerating interfaces looked exactly like one with fewer interfaces, no
+error surfaced anywhere. `_walk_column` and `_walk_indexes` gained an
+opt-in `raise_on_timeout: bool = False` parameter instead of changing
+default behavior everywhere: every on-demand/best-effort caller (DOM
+reads, the MAC table, custom-MIB polling) still swallows a timeout the
+same as any other `SnmpError`, since a stale sensor reading is harmless.
+Only `_poll_interfaces`'s ifIndex-discovery walk — the one result that
+actually drives the device's own up/down status — opts in, so a genuine
+timeout there now raises and lands in `snmp_error` as "... table walk cut
+short after N row(s)" instead of vanishing. A timeout on one interface's
+own per-interface GET (not the ifIndex walk itself) is narrower still: it
+doesn't invalidate the whole poll — the device answered enough to
+enumerate interfaces — so it's counted (`skipped_timeouts`) and logged,
+not raised.
+
+**Per-poll debug logging**: `eventlog.NODES` had been imported into
+`nodepoll.py` since the Alerts build and never once used. `_poll_device`
+now logs one `NODES`-category event per poll with a structured `detail`
+(ping/SNMP outcome, interfaces found, metrics found or the exact
+`snmp_error` text on failure, elapsed time) — the same
+target-plus-structured-detail convention `monitor.py`'s traceroute
+logging already uses. `get_debug()`'s `events` list was already fully
+generic across every `eventlog` category via `service.log.since(since)`,
+so these appear on the Debug tab with no additional plumbing; the one
+addition there is `"node_counters": service.node_poller.counters` —
+`NodePoller.counters` (`polls`/`ok`/`timeout`/`auth_fail`/`unsupported`/
+`errors`/`overruns`) was already being incremented on every poll and
+never surfaced anywhere before.
+
 `counter_rate()` and `detect_reboot()` are pure functions, unit-tested in
 the module's own `__main__` block with no network needed. A 32-bit
 counter that decreased is assumed to have wrapped once; a 64-bit counter
@@ -1863,6 +1936,31 @@ presence of a row *is* the flag. `_clean_output()` strips ANSI escape
 sequences and pager prompts (`--More--` and similar) a device's shell
 may have echoed back even with paging disabled — best-effort display/
 storage hygiene, not a parser, so it never raises.
+
+**Device naming** (`_configrx_device_json`) matches `nodes.js`'s own
+`displayName()` precedence exactly: `sys_name` (SNMP hostname) unless
+`display_name_source == 'manual'`, then the stored manual `name`, then
+`ip` — previously it preferred the manual `name` first regardless of
+`display_name_source`, so a device Nodes had never been told to pin to a
+manual name showed a stale/blank one here instead of its live SNMP
+hostname.
+
+**Bulk edit** (`post_configrx_devices_bulk_config`/
+`post_configrx_devices_bulk_credential`): the same `_bulk_device_ids(body)`
+helper and Ctrl/Cmd-click-to-select UI shape Nodes' own bulk device
+operations already established, applied to ConfigRX's per-device config.
+The credential path encrypts the password exactly once (`dpapi.protect()`
+before the loop, never inside it) then calls `configrx_db.set_credential()`
+once per selected device with that same ciphertext — one encryption, not
+one per device, but still one full `set_credential()` write per device
+since that's an existing single-device method with no schema reason to
+grow a bulk variant of its own. The frontend's bulk-config request only
+ever includes `backup_enabled` in its body when the "also enable backup"
+checkbox is checked; omitting the key (rather than sending `false`) is
+what makes leaving it unchecked a no-op instead of silently disabling
+backup on every device that already had it on, matching the partial-
+update semantics `update_device_config()` already has for every other
+optional field.
 
 **Scheduling** (`ConfigRxWorker`) mirrors `fortipoll.WirelessPoller`'s
 shape (a small `ThreadPoolExecutor`, a scanning loop, a `_queued` set

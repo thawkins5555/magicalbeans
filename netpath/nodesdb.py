@@ -280,11 +280,13 @@ DEFAULTS = {
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
-                     "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
+                     "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
+                     "mib_file_id")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
-                   "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
+                   "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
+                   "mib_file_id")
 
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
                     "enabled") + _OVERRIDE_COLUMNS
@@ -328,12 +330,23 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN display_name_source TEXT"
                 " NOT NULL DEFAULT 'auto'")
+        if "mib_file_id" not in devices:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN mib_file_id INTEGER"
+                " REFERENCES mib_files(id) ON DELETE SET NULL")
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_device_group"
             " ON devices(device_group_id)")
+
+        groups = {row["name"] for row in
+                  self._conn.execute("PRAGMA table_info(groups)").fetchall()}
+        if "mib_file_id" not in groups:
+            self._conn.execute(
+                "ALTER TABLE groups ADD COLUMN mib_file_id INTEGER"
+                " REFERENCES mib_files(id) ON DELETE SET NULL")
 
         interfaces = {row["name"] for row in
                       self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}

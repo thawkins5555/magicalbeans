@@ -6,6 +6,50 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.23.0 — Custom-MIB polling, MAC address table, ConfigRX bulk edit, bug fixes
+
+- **Nodes: assign an uploaded MIB to a device or group to have it actually
+  polled.** Previously an uploaded MIB only fed the MIB browse view — it
+  had zero effect on what got polled. A device or group's "Custom MIB"
+  override (in its edit dialog, alongside the other overrides) now makes
+  that MIB's own scalar objects get polled every cycle and stored/shown
+  under their own names, the same way built-in metrics are. Best-effort
+  and scalars-only, matching every other optional SNMP read in this
+  codebase: an object the device doesn't answer is silently skipped
+  rather than failing the whole poll; table objects are out of scope for
+  this pass.
+- **Nodes: SNMP timeout accuracy + a real way to debug a polling
+  failure.** A genuine mid-poll timeout partway through an interface-
+  table walk was being silently treated the same as "that's the end of
+  the table, this device just has fewer interfaces" — a real failure
+  showed no error at all. It's now correctly reported as an SNMP error
+  ("... table walk cut short after N row(s)"), while an isolated timeout
+  on a single interface's own GET no longer aborts the rest of that
+  poll, just gets counted and logged. Every poll now also writes a
+  structured debug event (ping/SNMP outcome, interfaces found, elapsed
+  time, and the exact error on failure) visible on the Debug tab, plus
+  cumulative poll counters (ok/timeout/auth-failed/unsupported/error)
+  that were being tracked internally but never surfaced anywhere before.
+- **Nodes: per-switchport MAC address table.** Clicking an interface on a
+  device's detail page now shows the MAC addresses currently learned on
+  that port, read live over SNMP from the standard BRIDGE-MIB forwarding
+  database — no SSH required. Devices that don't answer BRIDGE-MIB show
+  "no MAC address data" rather than an empty table.
+- **ConfigRX: bulk-edit SSH credentials and backup settings.** Select
+  multiple devices (Ctrl/Cmd-click, or "select all") and set one shared
+  SSH username/password/port and backup-enabled setting across all of
+  them in a single action, instead of one device at a time. Matches
+  Nodes' existing bulk-device-operations pattern.
+- **ConfigRX: device names now follow the same SNMP-hostname-first
+  precedence as everywhere else** in the app (the device's SNMP-reported
+  name unless it's been explicitly pinned to a manual name), instead of
+  always preferring whatever manual name happened to be stored.
+- **Fixed:** the Alerts detail pane stayed showing a now-stale alert
+  after "Acknowledge all" or a bulk resolve, instead of clearing.
+- **Fixed:** the "Remove" button on the Settings → Users page did
+  nothing — the underlying DELETE request never actually carried which
+  account to remove.
+
 ### 4.22.0 — Per-module permissions, Wireless module, ConfigRX module, device status timeline
 
 - **User permissions.** Every account now has an explicit read/write

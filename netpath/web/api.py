@@ -743,6 +743,9 @@ def get_debug(service, params, body) -> dict:
         "dns_workers": dns_workers,
         "ipam_workers": ipam_workers,
         "node_workers": node_workers,
+        # polls/ok/timeout/auth_fail/unsupported/errors/overruns — already
+        # computed on every poll, previously never surfaced anywhere.
+        "node_counters": service.node_poller.counters,
         "discovery_scans": discovery_scans,
         "events": events,
         "last_seq": service.log.last_seq,
@@ -1475,7 +1478,7 @@ def _device_json(row) -> dict:
         "snmp_retries": row["snmp_retries"],
         "ping_enabled": _tri(row["ping_enabled"]),
         "snmp_enabled": _tri(row["snmp_enabled"]),
-        "oid_set": row["oid_set"],
+        "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
@@ -1498,7 +1501,8 @@ def _group_json(service, row) -> dict:
         "poll_interval_s": row["poll_interval_s"],
         "snmp_timeout_s": row["snmp_timeout_s"], "snmp_retries": row["snmp_retries"],
         "ping_enabled": bool(row["ping_enabled"]), "snmp_enabled": bool(row["snmp_enabled"]),
-        "oid_set": row["oid_set"], "is_default": bool(row["is_default"]),
+        "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
+        "is_default": bool(row["is_default"]),
         "created_ts": row["created_ts"],
         # The profile's own snmp_version/community/v3_* above are its
         # "primary" credential — always present, always tried first. This
@@ -1544,10 +1548,11 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_version", "community",
                          "v3_user", "v3_auth_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
-                         "snmp_enabled", "oid_set")
+                         "snmp_enabled", "oid_set", "mib_file_id")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
-                        "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
+                        "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
+                        "mib_file_id")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -1731,6 +1736,13 @@ def get_nodes_device_dom(service, params, body, device_id, if_index) -> dict:
         raise ValueError("No such device")
     sensors = service.node_poller.read_dom(int(device_id), int(if_index))
     return {"sensors": sensors}
+
+
+def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    macs = service.node_poller.read_mac_table(int(device_id), int(if_index))
+    return {"macs": macs, "supported": macs is not None}
 
 
 def post_nodes_device_test(service, params, body, device_id) -> dict:
@@ -2889,9 +2901,16 @@ def post_wireless_collector(service, params, body) -> dict:
 
 def _configrx_device_json(service, device_row) -> dict:
     config = service.configrx_db.device_config(device_row["id"])
+    # Same precedence as nodes.js's displayName(): the SNMP-reported
+    # hostname wins unless the device is explicitly pinned to its manual
+    # name, with the IP as the last resort. ConfigRX has no display of its
+    # own to compute this in, so it's done once here rather than trusting
+    # device_row["name"] (the manual name) outright.
+    name = ((device_row["name"] if device_row["display_name_source"] == "manual" else None)
+           or device_row["sys_name"] or device_row["name"] or device_row["ip"])
     return {
         "id": device_row["id"], "ip": device_row["ip"],
-        "name": device_row["name"] or device_row["sys_name"] or device_row["ip"],
+        "name": name,
         "vendor": device_row["vendor"],
         "backup_enabled": bool(config["backup_enabled"]) if config else False,
         "ssh_port": config["ssh_port"] if config else 22,
@@ -2954,6 +2973,54 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
              if k in ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")}
     service.configrx_db.update_device_config(device_id, **fields)
     return {"ok": True}
+
+
+def post_configrx_devices_bulk_config(service, params, body) -> dict:
+    """Same 'one shared value for every selected device' semantics as
+    Nodes' own bulk-update — a batch of switches sharing one local SSH
+    account is the common case this exists for, not a per-row grid edit."""
+    device_ids = _bulk_device_ids(body)
+    fields = {k: v for k, v in body.items()
+             if k in ("backup_enabled", "ssh_port", "vendor_override")}
+    if not fields:
+        raise ValueError("Nothing to update")
+    for device_id in device_ids:
+        if service.nodes_db.device(device_id):
+            service.configrx_db.update_device_config(device_id, **fields)
+    service.log.add(CONFIGRX_CATEGORY,
+                    f"Bulk-updated {len(device_ids)} device(s): {', '.join(fields)}")
+    return {"ok": True, "updated": len(device_ids)}
+
+
+def post_configrx_devices_bulk_credential(service, params, body) -> dict:
+    from .. import dpapi
+
+    device_ids = _bulk_device_ids(body)
+    username = str(body.get("ssh_username", "")).strip()
+    password = str(body.get("ssh_password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are both required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only, so ConfigRX refuses to store an SSH password "
+            "here rather than keep it in plain text.")
+    try:
+        # Encrypted once, not once per device: it is the same plaintext
+        # going to every selected device, so there is no reason to pay for
+        # (or add a second window of exposure from) a repeated DPAPI call.
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    updated = 0
+    for device_id in device_ids:
+        if service.nodes_db.device(device_id):
+            service.configrx_db.set_credential(device_id, username, encrypted)
+            updated += 1
+    service.log.add(CONFIGRX_CATEGORY, f"Bulk-stored an SSH credential for {updated} device(s)")
+    return {"ok": True, "updated": updated}
 
 
 def post_configrx_device_credential(service, params, body, device_id) -> dict:

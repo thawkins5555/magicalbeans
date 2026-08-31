@@ -8,6 +8,7 @@
   const view = {
     devices: [],
     selectedDeviceId: null,
+    devicesChecked: new Set(),
     backups: [],
     selectedBackupId: null,
     backupContent: '',
@@ -75,7 +76,9 @@
     const body = document.createElement('tbody');
     for (const row of view.devices) {
       const tr = document.createElement('tr');
-      tr.className = 'clickable' + (view.selectedDeviceId === row.id ? ' selected' : '');
+      tr.className = 'clickable'
+        + (view.selectedDeviceId === row.id ? ' selected' : '')
+        + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
       const status = row.last_backup_error
         ? `<span title="${escape(row.last_backup_error)}">error</span>`
         : escape(row.last_backup_status || (row.backup_enabled ? 'pending' : '—'));
@@ -85,11 +88,79 @@
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${status}</td>` +
         `<td>${ago(row.last_backup_ts)}</td>`;
-      tr.onclick = () => selectDevice(row.id);
+      // Ctrl/Cmd-click toggles bulk selection without touching the
+      // single-device detail selection below; a plain click keeps doing
+      // exactly what it always did — same convention as Nodes' own table.
+      tr.onclick = (event) => {
+        if (event.ctrlKey || event.metaKey) {
+          toggleChecked(row.id);
+        } else {
+          selectDevice(row.id);
+        }
+      };
       body.appendChild(tr);
     }
     table.appendChild(body);
     App.el('cx-device-count').textContent = `${view.devices.length} device(s)`;
+    drawBulkBar();
+  }
+
+  /* ------------------------------------------------------- bulk actions */
+
+  function toggleChecked(id) {
+    if (view.devicesChecked.has(id)) view.devicesChecked.delete(id);
+    else view.devicesChecked.add(id);
+    drawDevices();
+  }
+
+  function bulkSelectAll() {
+    view.devices.forEach((d) => view.devicesChecked.add(d.id));
+    drawDevices();
+  }
+
+  function bulkClearSelection() {
+    view.devicesChecked.clear();
+    drawDevices();
+  }
+
+  function drawBulkBar() {
+    const n = view.devicesChecked.size;
+    App.el('cx-bulk-bar').hidden = n === 0;
+    if (n) App.el('cx-bulk-count').textContent = `${n} selected`;
+  }
+
+  function bulkSetCredential() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    App.modal(`Set SSH credential for ${ids.length} device(s)`, `
+      <p class="hint">Applies the same username and password to every selected
+        device — the common case for a batch of switches sharing one local
+        SSH account.</p>
+      <fieldset><legend>SSH CREDENTIAL</legend>
+        <label>Port <input id="cx-bulk-port" type="number" min="1" max="65535" value="22"></label>
+        <label>Username <input id="cx-bulk-username"></label>
+        <label>Password <input id="cx-bulk-password" type="password"></label>
+        <label class="check"><input type="checkbox" id="cx-bulk-enabled" checked>
+          Also enable backup for these devices</label>
+      </fieldset>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async (m) => {
+        const username = m.querySelector('#cx-bulk-username').value.trim();
+        const password = m.querySelector('#cx-bulk-password').value;
+        if (!username || !password) { alert('A username and password are required'); return; }
+        await App.post('/api/configrx/devices/bulk-credential',
+          { device_ids: ids, ssh_username: username, ssh_password: password });
+        const configFields = { device_ids: ids, ssh_port: Number(m.querySelector('#cx-bulk-port').value) };
+        // Only touch backup_enabled when the box is checked — leaving it
+        // unchecked must not silently disable backup for devices that
+        // already had it on.
+        if (m.querySelector('#cx-bulk-enabled').checked) configFields.backup_enabled = true;
+        await App.post('/api/configrx/devices/bulk-config', configFields);
+        App.closeModal();
+        view.devicesChecked.clear();
+        await App.refreshNow('configrx');
+      } },
+    ]);
   }
 
   async function selectDevice(deviceId) {
@@ -243,6 +314,9 @@
       if (event.key === 'Enter') App.refreshNow('configrx');
     };
     App.el('cx-enabled-only').onchange = () => App.refreshNow('configrx');
+    App.el('cx-bulk-selectall').onclick = bulkSelectAll;
+    App.el('cx-bulk-clear').onclick = bulkClearSelection;
+    App.el('cx-bulk-credential').onclick = bulkSetCredential;
     App.el('cx-settings').onclick = settingsDialog;
     App.el('cx-device-settings').onclick = deviceSettingsModal;
     App.el('cx-backup-now').onclick = async () => {

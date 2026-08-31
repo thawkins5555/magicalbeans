@@ -116,7 +116,7 @@ const App = (() => {
   };
   const post = (path, body) => call(path, { method: 'POST', body });
   const put = (path, body) => call(path, { method: 'PUT', body });
-  const del = (path) => call(path, { method: 'DELETE' });
+  const del = (path, body) => call(path, { method: 'DELETE', body });
 
   function connected(ok, message) {
     const el = document.getElementById('conn');

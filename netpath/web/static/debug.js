@@ -331,6 +331,13 @@
         (summary.discovery_active ? `, ${summary.discovery_active} scan(s) sweeping` : ''),
       `${summary.buffered} events buffered`,
     ];
+    const nc = payload.node_counters;
+    if (nc) {
+      parts.push(`Nodes polls: ${nc.polls || 0} total, ${nc.ok || 0} ok, ` +
+        `${nc.timeout || 0} timeout, ${nc.auth_fail || 0} auth fail, ` +
+        `${nc.unsupported || 0} unsupported, ${nc.errors || 0} error(s), ` +
+        `${nc.overruns || 0} overrun(s)`);
+    }
     App.el('dbg-summary').textContent = parts.join('  ·  ');
 
     if (!view.paused && payload.events.length) {

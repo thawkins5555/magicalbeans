@@ -693,7 +693,7 @@
       <p class="section">SHOW RUN</p>
       <p class="hint">Available once SSH integration is added.</p>
       <p class="section">MAC ADDRESSES ON PORT</p>
-      <p class="hint">Available once SSH integration is added.</p>
+      <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`, [
       { label: 'Close', primary: true, onClick: () => {
@@ -754,6 +754,26 @@
       .catch(() => {
         const dom = box.querySelector('#ifd-dom');
         if (dom) dom.innerHTML = '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
+      });
+
+    App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`)
+      .then((r) => {
+        const mac = box.querySelector('#ifd-mac');
+        if (!mac) return;
+        if (!r.supported) {
+          mac.innerHTML = '<p class="hint">No MAC address data available — this device does not answer BRIDGE-MIB requests.</p>';
+          return;
+        }
+        if (!r.macs || !r.macs.length) {
+          mac.innerHTML = '<p class="hint">No MAC addresses currently learned on this port.</p>';
+          return;
+        }
+        mac.innerHTML = '<table><tr><th>MAC address</th></tr>' +
+          r.macs.map((m) => `<tr><td>${escape(m)}</td></tr>`).join('') + '</table>';
+      })
+      .catch(() => {
+        const mac = box.querySelector('#ifd-mac');
+        if (mac) mac.innerHTML = '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
       });
   }
 
@@ -821,8 +841,27 @@
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>
         <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>
+        <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
+        <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
+          shown under its own names — see Nodes → MIBs to upload one first. Leave as
+          "(profile)" to inherit whatever the polling profile has assigned, or "None"
+          to poll no custom MIB regardless of the profile.</p>
       </fieldset>
       <p id="nd-f-test-result" class="hint"></p>`;
+  }
+
+  // mib_file_id is a plain nullable override, same shape as poll_interval_s/
+  // snmp_timeout_s above it: NULL means "inherit from the profile" for a
+  // device, or "no custom MIB" for a profile (which has nothing to inherit
+  // from) — there's no separate "explicitly none despite the profile
+  // having one" state, matching how every other non-boolean override
+  // column here already works.
+  function mibOptionsHtml(selectedId, forGroup = false) {
+    const zero = `<option value="0" ${selectedId == null ? 'selected' : ''}>${forGroup ? 'None' : '(profile)'}</option>`;
+    const options = (view.mibFiles || []).map((f) =>
+      `<option value="${f.id}" ${f.id === selectedId ? 'selected' : ''}>${escape(f.module || f.filename)}</option>`
+    ).join('');
+    return zero + options;
   }
 
   /* A tri-state override select: "" means null (inherit from the profile),
@@ -851,6 +890,12 @@
     if (val('#nd-f-timeout')) overrides.snmp_timeout_s = Number(val('#nd-f-timeout'));
     overrides.ping_enabled = triValue(box, '#nd-f-ping');
     overrides.snmp_enabled = triValue(box, '#nd-f-snmp');
+    // Always sent, like the tri-states above: the select always has a
+    // real selected value ("0" for "inherit/none"), so — unlike the
+    // free-text override fields, which are genuinely optional — leaving
+    // it at "(profile)" has to actually clear a previously-set override,
+    // not just get skipped as "unspecified."
+    overrides.mib_file_id = Number(box.querySelector('#nd-f-mib').value) || null;
     return overrides;
   }
 
@@ -1174,6 +1219,9 @@
         <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>
         <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>
       </div>
+      <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
+      <p class="hint">Polls that MIB's own scalar objects for every device on this
+        profile (unless a device overrides it), shown under its own names.</p>
       ${credentialsSectionHtml(p)}`;
   }
 
@@ -1189,6 +1237,7 @@
       snmp_retries: Number(box.querySelector('#nd-p-retries').value),
       ping_enabled: box.querySelector('#nd-p-ping').checked,
       snmp_enabled: box.querySelector('#nd-p-snmp').checked,
+      mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
     };
   }
 
