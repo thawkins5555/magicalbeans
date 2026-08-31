@@ -18,19 +18,24 @@ from ..auth import (DEFAULT_PASSWORD, DEFAULT_USER, LoginThrottle,
                     SessionStore, hash_password)
 from ..appdb import AppDatabase, migrate_from
 from ..collector import Collector
+from ..configrx import ConfigRxWorker
+from ..configrxdb import ConfigRxDatabase
 from ..db import Database
 from ..eventlog import SYSTEM, EventLog
 from ..flowdb import FlowDatabase
+from ..fortipoll import WirelessPoller
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
 from ..mibparse import known_oids_for, load_into
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
+from .. import permissions
 from ..nodesdb import NodesDatabase
 from ..snmptrapd import TrapCollector
 from ..snmptrapdb import SnmpTrapDatabase
 from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
+from ..wirelessdb import WirelessDatabase
 
 MAINTENANCE_INTERVAL_S = 900
 
@@ -38,7 +43,8 @@ MAINTENANCE_INTERVAL_S = 900
 class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                  app_db_path: str, ipam_db_path: str, snmp_db_path: str,
-                 nodes_db_path: str, alerts_db_path: str):
+                 nodes_db_path: str, alerts_db_path: str,
+                 wireless_db_path: str, configrx_db_path: str):
         self.log = EventLog()
         self.app_db = AppDatabase(app_db_path)
         # Before the trace database is opened for normal use: on an install
@@ -53,6 +59,8 @@ class Service:
         self.snmp_db = SnmpTrapDatabase(snmp_db_path)
         self.nodes_db = NodesDatabase(nodes_db_path)
         self.alerts_db = AlertsDatabase(alerts_db_path)
+        self.wireless_db = WirelessDatabase(wireless_db_path)
+        self.configrx_db = ConfigRxDatabase(configrx_db_path)
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
@@ -62,6 +70,8 @@ class Service:
         self.snmp_settings = self.snmp_db.settings()
         self.nodes_settings = self.nodes_db.settings()
         self.alerts_settings = self.alerts_db.settings()
+        self.wireless_settings = self.wireless_db.settings()
+        self.configrx_settings = self.configrx_db.settings()
 
         self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
@@ -95,6 +105,9 @@ class Service:
         self.snmp = TrapCollector(self.snmp_db, log=self.log)
         self.ipam = IpamWorker(self.ipam_db, log=self.log)
         self.node_poller = NodePoller(self.nodes_db, log=self.log)
+        self.wireless = WirelessPoller(self.wireless_db, log=self.log)
+        # Reads Nodes' device list for IP/vendor, so constructed after nodes_db.
+        self.configrx = ConfigRxWorker(self.configrx_db, self.nodes_db, log=self.log)
         # Depends on nodes_db/snmp_db/syslog_db/ipam_db, so constructed last.
         self.alert_engine = AlertEngine(
             self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
@@ -121,6 +134,13 @@ class Service:
             return
         self.app_db.add_user(DEFAULT_USER, hash_password(DEFAULT_PASSWORD),
                              must_change=True)
+        # There's no one else yet to grant this account access — it has to
+        # start with everything, the same as an upgrading install's
+        # existing accounts get backfilled to (AppDatabase's own
+        # _backfill_full_permissions, for the different case of a table
+        # that didn't exist before this feature shipped).
+        self.app_db.set_permissions(
+            DEFAULT_USER, {m: permissions.WRITE for m in permissions.MODULES})
         self.log.add(SYSTEM, f"Created the default {DEFAULT_USER} account. "
                              f"Change its password before this is reachable "
                              f"by anyone else.")
@@ -148,6 +168,10 @@ class Service:
             self.node_poller.start(self.nodes_settings)
         if self.alerts_settings.get("enabled", True):
             self.alert_engine.start()
+        if self.wireless_settings.get("enabled", True):
+            self.wireless.start(self.wireless_settings)
+        if self.configrx_settings.get("enabled", True):
+            self.configrx.start(self.configrx_settings)
 
         # After the collectors are up: an index refill is background work and
         # must not delay the service being reachable.
@@ -180,6 +204,8 @@ class Service:
         # Alerts reads Nodes' own data, so stop the reader before the writer.
         self.alert_engine.stop()
         self.node_poller.stop()
+        self.wireless.stop()
+        self.configrx.stop()
         self.db.close()
         self.flow_db.close()
         self.syslog_db.close()
@@ -187,6 +213,8 @@ class Service:
         self.ipam_db.close()
         self.nodes_db.close()
         self.alerts_db.close()
+        self.wireless_db.close()
+        self.configrx_db.close()
         self.app_db.close()
 
     # ------------------------------------------------------------- settings
@@ -289,6 +317,24 @@ class Service:
         self.alert_engine.reconfigure(self.alerts_settings)
         self.log.add(SYSTEM, "Alerts settings applied")
         return self.alerts_settings
+
+    def apply_wireless_settings(self, values: dict) -> dict:
+        self.wireless_settings.update(values)
+        self.wireless_db.save_settings(self.wireless_settings)
+        self.wireless.stop()
+        if self.wireless_settings.get("enabled", True):
+            self.wireless.start(self.wireless_settings)
+        self.log.add(SYSTEM, "Wireless settings applied")
+        return self.wireless_settings
+
+    def apply_configrx_settings(self, values: dict) -> dict:
+        self.configrx_settings.update(values)
+        self.configrx_db.save_settings(self.configrx_settings)
+        self.configrx.stop()
+        if self.configrx_settings.get("enabled", True):
+            self.configrx.start(self.configrx_settings)
+        self.log.add(SYSTEM, "ConfigRX settings applied")
+        return self.configrx_settings
 
     def _seed_default_mibs(self) -> None:
         """Load the MIB files bundled under netpath/mibs/ through the same
@@ -547,6 +593,13 @@ class Service:
                 self.log.add(SYSTEM, f"SNMP trap database over its "
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest traps")
+
+        removed = self.configrx_db.prune(
+            float(self.configrx_settings.get("retention_days", 90)),
+            int(self.configrx_settings.get("retention_count_per_device", 30)))
+        if removed:
+            self.log.add(SYSTEM, f"ConfigRX: removed {removed} old backup(s) "
+                                 f"past retention")
 
         cap = int(self.settings.get("max_ipam_db_mb", 0)) * 1024 * 1024
         if cap:

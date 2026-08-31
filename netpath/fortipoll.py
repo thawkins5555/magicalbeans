@@ -1,0 +1,268 @@
+"""WirelessPoller: polls each configured FortiGate Wireless Controller for
+its managed APs over SNMP.
+
+Reuses the Nodes poller's low-level SNMP plumbing wholesale rather than
+reinventing it: `nodepoll._Session` (one UDP socket per poll, with
+retry), `nodepoll.EngineCache` (v3 engine discovery caching, keyed here
+by controller id instead of device id), `nodepoll.credential_for()`
+(decrypt-just-before-use, discard after), and `snmppoll`'s wire-format
+functions. Same v1/v2c/v3 noAuthNoPriv/authNoPriv-only limitation as
+Nodes (snmppoll raises SnmpUnsupported for v3 authPriv).
+
+Table walking is repeated GETNEXT, not GETBULK — the same choice
+nodepoll.py's own `_walk_column` already made ("avoiding a separate
+GETBULK code path"), matched here rather than introducing a second table-
+walking idiom for one small poller.
+"""
+
+from __future__ import annotations
+
+import random
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
+from . import fortinetoids as oids
+from .eventlog import ERROR, NullLog, WIRELESS
+from .nodepoll import EngineCache, _Session, credential_for
+from .snmppoll import (
+    PDU_GET, PDU_GETNEXT, PDU_REPORT, SnmpError, SnmpTimeout,
+    build_request, build_v3_request, discovery_probe,
+)
+from .trapdecode import localized_key
+from .wirelessdb import WirelessDatabase
+
+SNMP_PORT = 161
+
+
+class _AuthFailure(SnmpError):
+    pass
+
+
+class WirelessPoller:
+    def __init__(self, db: WirelessDatabase, log=None):
+        self.db = db
+        self.log = log or NullLog()
+        self._engines = EngineCache()
+        self._executor: ThreadPoolExecutor | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._queued: set[int] = set()
+        self._lock = threading.Lock()
+        self.counters = {"polls": 0, "ok": 0, "errors": 0}
+        self.error: str | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, settings: dict | None = None) -> None:
+        self.stop()
+        self._stop.clear()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._thread = threading.Thread(target=self._loop, name="wireless-poller", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        self._thread = None
+
+    def status_text(self) -> str:
+        if self.error:
+            return self.error
+        if not self.running:
+            return "Poller stopped"
+        return "Running"
+
+    def poll_now(self, controller_id: int) -> None:
+        with self._lock:
+            if controller_id in self._queued or not self._executor:
+                return
+            self._queued.add(controller_id)
+        try:
+            self._executor.submit(self._run_one, controller_id)
+        except RuntimeError:
+            with self._lock:
+                self._queued.discard(controller_id)
+
+    def _loop(self) -> None:
+        next_run: dict[int, float] = {}
+        while not self._stop.is_set():
+            settings = self.db.settings()
+            if settings.get("enabled", True):
+                interval = max(10, int(settings.get("poll_interval_s", 60)))
+                now = time.time()
+                for controller in self.db.controllers():
+                    if not controller["enabled"]:
+                        continue
+                    due = next_run.get(controller["id"], 0)
+                    if now >= due:
+                        next_run[controller["id"]] = now + interval
+                        self.poll_now(controller["id"])
+            self._stop.wait(1.0)
+
+    def _run_one(self, controller_id: int) -> None:
+        try:
+            controller = self.db.controller(controller_id)
+            if controller is None:
+                return
+            self.counters["polls"] += 1
+            self._poll_controller(controller)
+            self.counters["ok"] += 1
+        except Exception:
+            self.counters["errors"] += 1
+            traceback.print_exc()
+            self.log.add(ERROR, f"Wireless poll of controller {controller_id} failed",
+                        detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._queued.discard(controller_id)
+
+    # --------------------------------------------------------------- polling
+
+    def _poll_controller(self, controller) -> None:
+        config = dict(controller)
+        try:
+            names = self._walk_column(controller, config, oids.WTP_CONFIG_NAME)
+            macs = self._walk_column(controller, config, oids.WTP_SESSION_MAC)
+            states = self._walk_column(controller, config, oids.WTP_SESSION_CONNECTION_STATE)
+            models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL)
+            stations = self._walk_column(controller, config, oids.WTP_SESSION_STATION_COUNT)
+            channels = self._walk_column(controller, config, oids.WTP_RADIO_CHANNEL)
+            powers = self._walk_column(controller, config, oids.WTP_RADIO_OPERATING_POWER)
+            radio_stations = self._walk_column(controller, config, oids.WTP_RADIO_STATION_COUNT)
+        except SnmpError as exc:
+            self.db.record_poll(controller["id"], ok=False, error=str(exc))
+            self.log.add(ERROR, f"Wireless controller {controller['name']} unreachable",
+                        detail=str(exc))
+            return
+
+        # WTP_SESSION_* suffixes are "<vdomIndex>.<wtpIdLength>.<wtpId chars...>"
+        # (WtpId is a string-valued table index, encoded the same way any
+        # DisplayString index is in SNMP's OID-suffix convention); WTP_CONFIG_NAME
+        # shares that same (vdom, wtpId) key. WTP_RADIO_* adds one more
+        # trailing arc for the radio id.
+        seen: set[tuple[str, str]] = set()
+        for suffix, mac in macs.items():
+            vdom_wtp = _split_vdom_wtp(suffix)
+            if vdom_wtp is None:
+                continue
+            vdom, wtp_id = vdom_wtp
+            seen.add((vdom, wtp_id))
+            state_num = states.get(suffix)
+            status = oids.CONNECTION_STATE.get(
+                int(state_num) if state_num is not None else -1, "other")
+            ap_id = self.db.upsert_ap(
+                controller["id"], wtp_id, vdom,
+                name=names.get(suffix) or wtp_id,
+                status=status,
+                model=models.get(suffix) or "",
+                mac_address=_format_mac(mac),
+                station_count=_as_int(stations.get(suffix)))
+            radios = []
+            prefix = suffix + "."
+            for radio_suffix, channel in channels.items():
+                if not radio_suffix.startswith(prefix):
+                    continue
+                radio_id = radio_suffix[len(prefix):]
+                radios.append({
+                    "radio_id": radio_id,
+                    "channel": str(channel) if channel is not None else None,
+                    "operating_power_dbm": _as_int(powers.get(radio_suffix)),
+                    "station_count": _as_int(radio_stations.get(radio_suffix)),
+                })
+            self.db.replace_radios(ap_id, radios)
+
+        self.db.record_poll(controller["id"], ok=True)
+        self.db.prune_stale(controller["id"], seen)
+
+    # ------------------------------------------------------------ SNMP layer
+
+    def _walk_column(self, controller, config: dict, base_oid: str) -> dict[str, object]:
+        values: dict[str, object] = {}
+        current = base_oid
+        for _ in range(4096):
+            response = self._snmp_get_next(controller, config, current)
+            if not response.varbinds:
+                break
+            vb = response.varbinds[0]
+            oid = vb["oid"]
+            if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                break
+            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                break
+            values[oid[len(base_oid) + 1:]] = vb["value"]
+            current = oid
+        return values
+
+    def _snmp_get_next(self, controller, config: dict, oid: str):
+        version = int(config.get("snmp_version") or 1)
+        session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
+        try:
+            if version in (0, 1):
+                identity, _proto, _pw = credential_for(config)
+                packet = build_request(version, identity or "public", PDU_GETNEXT,
+                                       random.randint(1, 2**16), [oid])
+                return session.request(packet)
+            identity, auth_proto, password = credential_for(config)
+            engine = self._engines.get(controller["id"])
+            if engine is None:
+                probe = discovery_probe()
+                response = session.request(probe)
+                if not response.engine_id:
+                    raise SnmpError(f"{controller['ip']}: no engine id in discovery reply")
+                self._engines.set(controller["id"], response.engine_id,
+                                  response.engine_boots, response.engine_time)
+                engine = self._engines.get(controller["id"])
+            engine_id, boots, engine_time, _learned_at = engine
+            auth_key = localized_key(auth_proto, password, engine_id) \
+                if auth_proto and password else None
+            packet = build_v3_request(
+                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GETNEXT, [oid],
+                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
+            response = session.request(packet)
+            if response.pdu_tag == PDU_REPORT:
+                self._engines.invalidate(controller["id"])
+                raise _AuthFailure(f"{controller['ip']}: engine resync required")
+            return response
+        finally:
+            session.close()
+
+
+def _split_vdom_wtp(suffix: str) -> tuple[str, str] | None:
+    """'<vdomIndex>.<len>.<char> <len>.<char>...' -> (vdom, wtp_id). WtpId
+    is an ASN.1 OCTET STRING/DisplayString table index, so its OID-suffix
+    encoding is a length prefix followed by that many decimal char-code
+    arcs -- the same convention any string-indexed SNMP table uses."""
+    parts = suffix.split(".")
+    if len(parts) < 2:
+        return None
+    vdom = parts[0]
+    try:
+        length = int(parts[1])
+        chars = parts[2:2 + length]
+        if len(chars) != length:
+            return None
+        wtp_id = "".join(chr(int(c)) for c in chars)
+    except (ValueError, IndexError):
+        return None
+    return vdom, wtp_id
+
+
+def _as_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_mac(value) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return ":".join(f"{b:02x}" for b in value)
+    return str(value or "")

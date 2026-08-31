@@ -15,6 +15,8 @@ ways:
 | An optional DHCP polling credential | Encrypted in `ipam.db`, if you chose to store one | No — SappiWhere can decrypt it (that's the point), but it never leaves the process as plaintext, and a copy of the file on other hardware cannot decrypt it at all. |
 | An optional SNMPv3 authentication password (Nodes) | Encrypted in `nodes.db`, per device or per polling profile, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 | An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
+| An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
+| An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 
 Everything below explains why each row is true.
 
@@ -368,6 +370,15 @@ way — signed into that one test request in memory — and is never written
 to `nodes.db` unless the **Save** (not Test) path is used and a password
 was actually entered.
 
+**A Wireless Controller's SNMP credential uses this identical mechanism**,
+stored in `wireless.db` instead of `nodes.db` (`fortipoll.credential_for()`
+is a straight reuse of `nodepoll`'s own function, not a reimplementation):
+DPAPI-encrypted, `has_credential`-only in every API response, decrypted
+immediately before each poll and discarded after. The same community-
+string exception applies for the same reason — a v1/v2c community is
+shown in the clear, since the protocol itself sends it in the clear on
+every packet regardless of what SappiWhere does with its own storage.
+
 ## 5. The optional SMTP password (Alerts)
 
 Alerts' email notification (`netpath/alertmail.py`, `netpath/alertsdb.py`)
@@ -395,7 +406,63 @@ verification off is a real, logged configuration choice — an explicit
 opt-out visible in the settings dialog — never a silent downgrade a
 misconfiguration could trigger by accident.
 
-## 6. What this application deliberately never does
+## 6. The optional SSH config-backup password (ConfigRX)
+
+ConfigRX (`netpath/configrx.py`, `netpath/configrxdb.py`) needs an SSH
+username and password to pull a device's running configuration; a device
+with backup disabled, or one that hasn't had a credential entered for it
+yet, stores nothing. One credential per device — the same opt-in shape,
+and the same DPAPI mechanism, as every other stored credential in this
+document: encrypted before it's ever written to `configrx.db`, machine-
+scoped, never returned by any API response (only `has_credential:
+bool`), refused outright on any platform other than Windows. `POST
+.../credential` and `DELETE .../credential` are the only two operations
+exposed — store or clear, never reveal, identical to every other
+credential endpoint in this app.
+
+**Never touches a command line or a process list.** This is the specific,
+stated reason ConfigRX's SSH connectivity uses paramiko — the one
+deliberate exception to this application's otherwise stdlib-only
+dependency rule (`requirements.txt`) — rather than shelling out to a
+system `ssh` binary the way `ipam_scan.py` shells out to `ping`: an SSH
+password handed to a subprocess as a command-line argument is visible to
+anything that can list processes on the host (`ps`, Task Manager, an
+audit log with command-line capture turned on) for as long as that
+process runs. paramiko authenticates entirely in-process, so the
+password exists only as a Python string in this process's own memory —
+the same bar an environment-variable-based credential (the DHCP and SMTP
+paths) already clears, reached here by a different mechanism because
+this credential's destination is a raw SSH session, not a PowerShell
+child process with an environment block to put it in.
+
+**Plaintext exists only as long as one backup pull takes.**
+`ConfigRxWorker._backup_device()` decrypts the stored password into a
+local variable immediately before `paramiko.SSHClient.connect()`, and a
+`finally` block reassigns that variable to `None` the instant the
+connection attempt finishes — success or failure — before the function
+does anything else. There is no caching of a decrypted password anywhere
+in this module; every scheduled pull and every manual **Back up now**
+decrypts fresh from `configrx.db` and discards it again.
+
+**No free-form command execution exists anywhere in this module, and
+that boundary is load-bearing, not incidental.** The only function that
+ever writes to a device's SSH shell channel, `configrx._pull_config()`,
+sends exactly two things: a fixed, per-vendor pagination-disable command
+(session-scoped and itself read-only, e.g. `terminal length 0`) and one
+fixed, per-vendor "show config" command (`show running-config`, `show
+full-configuration`, and so on) — both sourced from
+`configrx_vendors.VENDORS`, a hardcoded dictionary, never from request
+text. A device's vendor-override field is free text, but it only ever
+*selects* which vendor's fixed commands to use; an unrecognized value
+fails to resolve to anything and the backup is skipped with a clear
+error rather than sent as literal input. There is no command parameter
+anywhere in ConfigRX's API, and no free-form input field anywhere in its
+UI — the credential this section protects can only ever be used to run
+one of a short, fixed, read-only list of commands, never anything an
+operator (or an attacker who somehow obtained write access to this
+module) could supply.
+
+## 7. What this application deliberately never does
 
 - Never stores a password in a form that can be turned back into the
   password — not the web login, not a DHCP, SNMPv3 or SMTP credential.
@@ -405,6 +472,10 @@ misconfiguration could trigger by accident.
   anything else user-supplied) into command text; every value that varies
   travels as an environment variable or a script parameter, never as string
   concatenation.
+- Never gives ConfigRX (or anything else) a way to run an arbitrary
+  command on a device over SSH — only a short, fixed, per-vendor
+  allow-list of read-only "show config" commands exists anywhere in that
+  module, and there is no free-form command field in its UI or API.
 - Never logs a password, on success or failure, in the event log or the
   access log.
 - Never falls back to weaker or absent protection silently — a DPAPI
@@ -417,20 +488,26 @@ misconfiguration could trigger by accident.
   `NETWORK-AND-STORAGE-REQUIREMENTS.md` for the complete, closed list of
   every outbound connection this application makes.
 
-## 7. What is still the administrator's job
+## 8. What is still the administrator's job
 
 Encryption and hashing close the gaps this application controls. A few
 things remain outside its reach entirely:
 
-- **Least privilege for a stored DHCP, SNMPv3 or SMTP credential.** Create
-  a dedicated read-only DHCP account — membership in the DHCP server's
-  local `DHCP Users` group is enough — rather than reusing a domain admin
-  account because it's convenient; give an SNMPv3 polling user read-only
-  access on the device side; give the SMTP account only send rights, not a
-  full mailbox. SappiWhere enforces that the calls it makes with a
-  credential are read-only (DHCP) or exactly what the credential is for
-  (an SNMP GET, an SMTP send); it cannot enforce what the account itself
-  is authorized to do beyond that.
+- **Least privilege for a stored DHCP, SNMPv3, SMTP, Wireless SNMP or
+  ConfigRX SSH credential.** Create a dedicated read-only DHCP account —
+  membership in the DHCP server's local `DHCP Users` group is enough —
+  rather than reusing a domain admin account because it's convenient;
+  give an SNMPv3 polling user read-only access on the device side; give
+  the SMTP account only send rights, not a full mailbox; give a
+  ConfigRX SSH account only enough privilege to run one read-only "show
+  config" command, not enable/configure access. SappiWhere enforces that
+  the calls it makes with a credential are read-only (DHCP, ConfigRX) or
+  exactly what the credential is for (an SNMP GET, an SMTP send); it
+  cannot enforce what the account itself is authorized to do beyond
+  that — a ConfigRX SSH account that happens to also have enable
+  privilege on the device is a risk the device's own account
+  configuration controls, not something SappiWhere can restrict from its
+  side of the connection.
 - **TLS in any deployment that matters.** `--cert`/`--key` turns on HTTPS and
   with it the `Secure` cookie flag; without it, session cookies (though still
   `HttpOnly` and `SameSite=Strict`) travel in the clear on the network.
@@ -439,6 +516,12 @@ things remain outside its reach entirely:
   — an attacker with that level of access could call the same decryption API
   SappiWhere does. Protecting the host itself is what makes that guarantee
   mean something.
-- **Who gets an account.** There are no roles yet — every account has full
-  access — so adding one is itself the access-control decision, not
-  something this application can soften.
+- **Who gets an account, and what it can do.** Every account has an
+  explicit read/write grant per module (see `FEATURES.md`'s Permissions
+  section and `INTERNALS.md`'s Permissions section for how it's
+  enforced) — deciding what a new account should actually be able to
+  touch is still the administrator's call to make, not something this
+  application can decide on its own. Granting Settings write access in
+  particular is granting the ability to change any other account's
+  permissions, including its own, so treat it the same way root or
+  domain-admin access would be treated.

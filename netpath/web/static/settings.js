@@ -242,8 +242,57 @@
     return ts ? new Date(ts * 1000).toLocaleString() : 'never';
   }
 
+  let modules = [];
+
+  /* One row per module, three radios each (none/read/write) — write
+     implies read, so picking write doesn't need a separate read tick. */
+  function permissionGridHtml(idPrefix, grants) {
+    const rows = modules.map((m) => {
+      const level = grants[m] || 'none';
+      const radio = (value, label) =>
+        `<label class="check"><input type="radio" name="${idPrefix}-${m}" value="${value}"
+          ${level === value ? 'checked' : ''}> ${label}</label>`;
+      return `<tr><td>${escape(m)}</td>` +
+        `<td>${radio('none', 'None')}</td>` +
+        `<td>${radio('read', 'Read')}</td>` +
+        `<td>${radio('write', 'Write')}</td></tr>`;
+    }).join('');
+    return `<table><thead><tr><th>Module</th><th></th><th></th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+
+  function readPermissionGrid(box, idPrefix) {
+    const grants = {};
+    for (const m of modules) {
+      const checked = box.querySelector(`input[name="${idPrefix}-${m}"]:checked`);
+      const value = checked ? checked.value : 'none';
+      if (value !== 'none') grants[m] = value;
+    }
+    return grants;
+  }
+
+  function editPermissions(user) {
+    const box = App.modal(`Permissions for ${user.username}`,
+      permissionGridHtml('ep', user.permissions || {}), [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async () => {
+        try {
+          await App.post('/api/users/permissions',
+            { username: user.username, grants: readPermissionGrid(box, 'ep') });
+          App.closeModal();
+          await loadUsers();
+          usersStatus(`Updated permissions for ${user.username}`, 'var(--ok)');
+        } catch (error) {
+          usersStatus(error.message, 'var(--fail)');
+        }
+      } },
+    ]);
+  }
+
   async function loadUsers() {
     const payload = await App.get('/api/users');
+    modules = payload.modules || [];
+    App.el('new-user-grid').innerHTML = permissionGridHtml('nu', {});
     const table = App.el('users-table');
     const me = (App.state.session || {}).username;
     table.innerHTML = '<thead><tr><th>User</th><th>Created</th>' +
@@ -259,6 +308,10 @@
         `<td>${when(user.last_login)}</td>` +
         `<td>${user.must_change ? 'must change password' : 'active'}</td>` +
         '<td></td>';
+      const edit = document.createElement('button');
+      edit.textContent = 'Permissions';
+      edit.onclick = () => editPermissions(user);
+      tr.lastElementChild.appendChild(edit);
       if (!isMe) {
         const remove = document.createElement('button');
         remove.textContent = 'Remove';
@@ -305,8 +358,10 @@
   async function addUser() {
     const username = App.el('new-username').value.trim();
     const password = App.el('new-password').value;
+    const grid = App.el('new-user-grid');
+    const grants = readPermissionGrid(grid, 'nu');
     try {
-      await App.post('/api/users', { username, password });
+      await App.post('/api/users', { username, password, grants });
       App.el('new-username').value = '';
       App.el('new-password').value = '';
       await loadUsers();
@@ -317,46 +372,11 @@
     }
   }
 
-  function pwStatus(message, colour) {
-    const el = App.el('pw-status');
-    el.textContent = message;
-    el.style.color = colour || 'var(--faint)';
-  }
-
-  async function changePassword() {
-    const current = App.el('pw-current').value;
-    const next = App.el('pw-new').value;
-    const repeat = App.el('pw-repeat').value;
-
-    if (next !== repeat) return pwStatus('The two new passwords differ', 'var(--fail)');
-    try {
-      await App.post('/api/password', {
-        current_password: current, new_password: next,
-      });
-      pwStatus('Changed. Signing you back in…', 'var(--ok)');
-      // The change ends every session for this account, this one included.
-      setTimeout(() => { window.location.href = '/login'; }, 1200);
-    } catch (error) {
-      pwStatus(error.message, 'var(--fail)');
-    }
-  }
-
   function forcePasswordChange() {
-    App.selectTab('settings');
-    App.modal('Change your password', `
-      <p>This account is still using the password it was created with. Choose a
-      new one before going any further.</p>
-      <p class="hint">At least 12 characters. A short phrase is easier to
-      remember and harder to guess than a mangled word.</p>`, [
-      { label: 'Take me there', primary: true, onClick: () => {
-        App.closeModal();
-        App.el('pw-current').focus();
-      } },
-    ]);
+    App.accountModal(true);
   }
 
   function init() {
-    App.el('pw-save').onclick = changePassword;
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     loadUsers().catch(() => {});

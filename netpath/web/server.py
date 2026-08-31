@@ -26,138 +26,189 @@ from urllib.parse import parse_qs, urlparse
 from collections import deque
 
 from . import api
+from .. import permissions
 from .service import Service
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-# (method, compiled path, handler). A trailing group is passed to the handler.
+R, W = permissions.READ, permissions.WRITE
+
+
+def _password_requirement(params, body):
+    """Changing your own password is always allowed (per-route None); only
+    resetting a *different* account's needs the same Settings-write gate
+    user management itself sits behind — mirrors post_password's own
+    `resetting = target.lower() != me.lower()` check, since the route
+    table can't see into the request body on its own."""
+    me = params.get("_username", "")
+    target = str(body.get("username", "") or me)
+    return ("settings", W) if target.lower() != me.lower() else None
+
+
+def _settings_requirement(params, body):
+    """post_settings is one generic dispatcher for every module's own
+    settings (body['scope']); the module that gates it is whichever one
+    the scope names, not a fixed tag — 'global' (or anything unrecognized)
+    falls to the Settings module itself."""
+    scope = str(body.get("scope", "global"))
+    module = scope if scope in permissions.MODULES else "settings"
+    return (module, W)
+
+
+# (method, compiled path, handler, permission). permission is one of:
+# None (no gate — auth alone is enough), a (module, level) pair, or a
+# `fn(params, body) -> (module, level) | None` for the handful of routes
+# whose requirement depends on the request itself. A trailing regex group
+# is passed to the handler.
 ROUTES = [
-    ("POST", r"^/api/login$", api.post_login),
-    ("POST", r"^/api/logout$", api.post_logout),
-    ("POST", r"^/api/heartbeat$", api.post_heartbeat),
-    ("GET", r"^/api/session$", api.get_session),
-    ("GET", r"^/api/users$", api.get_users),
-    ("POST", r"^/api/users$", api.post_user),
-    ("DELETE", r"^/api/users$", api.delete_user),
-    ("POST", r"^/api/password$", api.post_password),
-    ("GET", r"^/api/state$", api.get_state),
-    ("GET", r"^/api/netpath/targets$", api.get_targets),
-    ("POST", r"^/api/netpath/targets$", api.post_target),
-    ("PUT", r"^/api/netpath/targets/(\d+)$", api.put_target),
-    ("DELETE", r"^/api/netpath/targets/(\d+)$", api.delete_target),
-    ("POST", r"^/api/netpath/targets/(\d+)/trace$", api.trace_now),
-    ("GET", r"^/api/netpath/timeline$", api.get_timeline),
-    ("GET", r"^/api/netpath/topology$", api.get_topology),
-    ("GET", r"^/api/netflow/overview$", api.get_flow_overview),
-    ("GET", r"^/api/netflow/records$", api.get_flow_records),
-    ("POST", r"^/api/netflow/collector$", api.post_collector),
-    ("POST", r"^/api/netflow/testpacket$", api.post_test_packet),
-    ("GET", r"^/api/snmp/overview$", api.get_snmp_overview),
-    ("GET", r"^/api/snmp/traps$", api.get_snmp_traps),
-    ("POST", r"^/api/snmp/collector$", api.post_snmp_collector),
-    ("POST", r"^/api/snmp/test$", api.post_snmp_test),
-    ("GET", r"^/api/syslog/overview$", api.get_syslog_overview),
-    ("GET", r"^/api/syslog/search$", api.get_syslog_search),
-    ("POST", r"^/api/syslog/collector$", api.post_syslog_collector),
-    ("POST", r"^/api/syslog/test$", api.post_syslog_test),
-    ("GET", r"^/api/ipam/search$", api.get_ipam_search),
-    ("GET", r"^/api/ipam/subnets$", api.get_ipam_subnets),
-    ("POST", r"^/api/ipam/subnets$", api.post_ipam_subnet),
-    ("PUT", r"^/api/ipam/subnets/(\d+)$", api.put_ipam_subnet),
-    ("DELETE", r"^/api/ipam/subnets/(\d+)$", api.delete_ipam_subnet),
-    ("POST", r"^/api/ipam/subnets/(\d+)/scan$", api.post_ipam_subnet_scan),
-    ("POST", r"^/api/ipam/subnets/(\d+)/clear$", api.post_ipam_subnet_clear),
-    ("GET", r"^/api/ipam/hosts$", api.get_ipam_hosts),
-    ("GET", r"^/api/ipam/conflicts$", api.get_ipam_conflicts),
-    ("POST", r"^/api/ipam/conflicts/(\d+)/resolve$", api.post_ipam_conflict_resolve),
-    ("GET", r"^/api/ipam/dhcp/servers$", api.get_ipam_dhcp_servers),
-    ("POST", r"^/api/ipam/dhcp/servers$", api.post_ipam_dhcp_server),
-    ("PUT", r"^/api/ipam/dhcp/servers/(\d+)$", api.put_ipam_dhcp_server),
-    ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)$", api.delete_ipam_dhcp_server),
-    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/poll$", api.post_ipam_dhcp_server_poll),
-    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/test$", api.post_ipam_dhcp_server_test),
-    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/credential$", api.post_ipam_dhcp_server_credential),
-    ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)/credential$", api.delete_ipam_dhcp_server_credential),
-    ("GET", r"^/api/ipam/dhcp/scopes$", api.get_ipam_dhcp_scopes),
-    ("GET", r"^/api/ipam/dhcp/leases$", api.get_ipam_dhcp_leases),
-    ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history),
-    ("GET", r"^/api/nodes/overview$", api.get_nodes_overview),
-    ("GET", r"^/api/nodes/devices$", api.get_nodes_devices),
-    ("POST", r"^/api/nodes/devices$", api.post_nodes_device),
-    ("POST", r"^/api/nodes/devices/bulk-update$", api.post_nodes_devices_bulk_update),
-    ("POST", r"^/api/nodes/devices/bulk-delete$", api.post_nodes_devices_bulk_delete),
-    ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device),
-    ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device),
-    ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device),
-    ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll),
-    ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus),
-    ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom),
-    ("POST", r"^/api/nodes/devices/(\d+)/test$", api.post_nodes_device_test),
-    ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces),
-    ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics),
-    ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series),
-    ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events),
-    ("POST", r"^/api/nodes/devices/(\d+)/credential$", api.post_nodes_device_credential),
-    ("DELETE", r"^/api/nodes/devices/(\d+)/credential$", api.delete_nodes_device_credential),
-    ("GET", r"^/api/nodes/device-groups$", api.get_nodes_device_groups),
-    ("POST", r"^/api/nodes/device-groups$", api.post_nodes_device_group),
-    ("PUT", r"^/api/nodes/device-groups/(\d+)$", api.put_nodes_device_group),
-    ("DELETE", r"^/api/nodes/device-groups/(\d+)$", api.delete_nodes_device_group),
-    ("GET", r"^/api/nodes/groups$", api.get_nodes_groups),
-    ("POST", r"^/api/nodes/groups$", api.post_nodes_group),
-    ("PUT", r"^/api/nodes/groups/(\d+)$", api.put_nodes_group),
-    ("DELETE", r"^/api/nodes/groups/(\d+)$", api.delete_nodes_group),
-    ("POST", r"^/api/nodes/groups/(\d+)/default$", api.post_nodes_group_default),
-    ("POST", r"^/api/nodes/groups/(\d+)/credential$", api.post_nodes_group_credential),
-    ("DELETE", r"^/api/nodes/groups/(\d+)/credential$", api.delete_nodes_group_credential),
-    ("POST", r"^/api/nodes/groups/(\d+)/credentials$", api.post_nodes_group_credentials),
-    ("PUT", r"^/api/nodes/groups/(\d+)/credentials/(\d+)$", api.put_nodes_group_credential),
-    ("DELETE", r"^/api/nodes/groups/(\d+)/credentials/(\d+)$", api.delete_nodes_group_credential_row),
-    ("POST", r"^/api/nodes/groups/(\d+)/credentials/(\d+)/secret$", api.post_nodes_group_credential_secret),
-    ("DELETE", r"^/api/nodes/groups/(\d+)/credentials/(\d+)/secret$", api.delete_nodes_group_credential_secret),
-    ("POST", r"^/api/nodes/discovery$", api.post_nodes_discovery),
-    ("GET", r"^/api/nodes/discovery$", api.get_nodes_discovery),
-    ("GET", r"^/api/nodes/discovery/(\d+)$", api.get_nodes_discovery_job),
-    ("DELETE", r"^/api/nodes/discovery/(\d+)$", api.delete_nodes_discovery_job),
-    ("POST", r"^/api/nodes/discovery/(\d+)/promote$", api.post_nodes_discovery_promote),
-    ("POST", r"^/api/nodes/discovery/(\d+)/reviewed$", api.post_nodes_discovery_reviewed),
-    ("POST", r"^/api/nodes/collector$", api.post_nodes_collector),
-    ("GET", r"^/api/nodes/mibs$", api.get_nodes_mibs),
-    ("POST", r"^/api/nodes/mibs$", api.post_nodes_mib),
-    ("GET", r"^/api/nodes/mibs/(\d+)$", api.get_nodes_mib),
-    ("DELETE", r"^/api/nodes/mibs/(\d+)$", api.delete_nodes_mib),
-    ("POST", r"^/api/nodes/mibs/(\d+)/resolve$", api.post_nodes_mib_resolve),
-    ("PUT", r"^/api/nodes/mibs/(\d+)/objects/(\d+)$", api.put_nodes_mib_object),
-    ("GET", r"^/api/alerts/overview$", api.get_alerts_overview),
-    ("GET", r"^/api/alerts$", api.get_alerts),
-    ("GET", r"^/api/alerts/(\d+)$", api.get_alert),
-    ("POST", r"^/api/alerts/(\d+)/ack$", api.post_alert_ack),
-    ("POST", r"^/api/alerts/(\d+)/resolve$", api.post_alert_resolve),
-    ("POST", r"^/api/alerts/ack-all$", api.post_alerts_ack_all),
-    ("POST", r"^/api/alerts/bulk-resolve$", api.post_alerts_bulk_resolve),
-    ("GET", r"^/api/alerts/rules$", api.get_alerts_rules),
-    ("POST", r"^/api/alerts/rules$", api.post_alerts_rule),
-    ("PUT", r"^/api/alerts/rules/(\d+)$", api.put_alerts_rule),
-    ("DELETE", r"^/api/alerts/rules/(\d+)$", api.delete_alerts_rule),
-    ("GET", r"^/api/alerts/templates$", api.get_alerts_templates),
-    ("POST", r"^/api/alerts/templates$", api.post_alerts_template),
-    ("PUT", r"^/api/alerts/templates/(\d+)$", api.put_alerts_template),
-    ("POST", r"^/api/alerts/templates/(\d+)/reset$", api.post_alerts_template_reset),
-    ("POST", r"^/api/alerts/templates/(\d+)/preview$", api.post_alerts_template_preview),
-    ("DELETE", r"^/api/alerts/templates/(\d+)$", api.delete_alerts_template),
-    ("POST", r"^/api/alerts/smtp/credential$", api.post_alerts_smtp_credential),
-    ("DELETE", r"^/api/alerts/smtp/credential$", api.delete_alerts_smtp_credential),
-    ("POST", r"^/api/alerts/smtp/test$", api.post_alerts_smtp_test),
-    ("POST", r"^/api/alerts/engine$", api.post_alerts_engine),
-    ("GET", r"^/api/debug$", api.get_debug),
-    ("POST", r"^/api/debug/clear$", api.post_debug_clear),
-    ("POST", r"^/api/settings$", api.post_settings),
-    ("POST", r"^/api/maintenance$", api.post_maintenance),
-    ("POST", r"^/api/update$", api.post_update),
+    ("POST", r"^/api/login$", api.post_login, None),
+    ("POST", r"^/api/logout$", api.post_logout, None),
+    ("POST", r"^/api/heartbeat$", api.post_heartbeat, None),
+    ("GET", r"^/api/session$", api.get_session, None),
+    ("GET", r"^/api/users$", api.get_users, ("settings", W)),
+    ("POST", r"^/api/users$", api.post_user, ("settings", W)),
+    ("DELETE", r"^/api/users$", api.delete_user, ("settings", W)),
+    ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("settings", W)),
+    ("POST", r"^/api/password$", api.post_password, _password_requirement),
+    ("GET", r"^/api/state$", api.get_state, None),
+    ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
+    ("POST", r"^/api/netpath/targets$", api.post_target, ("netpath", W)),
+    ("PUT", r"^/api/netpath/targets/(\d+)$", api.put_target, ("netpath", W)),
+    ("DELETE", r"^/api/netpath/targets/(\d+)$", api.delete_target, ("netpath", W)),
+    ("POST", r"^/api/netpath/targets/(\d+)/trace$", api.trace_now, ("netpath", W)),
+    ("GET", r"^/api/netpath/timeline$", api.get_timeline, ("netpath", R)),
+    ("GET", r"^/api/netpath/topology$", api.get_topology, ("netpath", R)),
+    ("GET", r"^/api/netflow/overview$", api.get_flow_overview, ("netflow", R)),
+    ("GET", r"^/api/netflow/records$", api.get_flow_records, ("netflow", R)),
+    ("POST", r"^/api/netflow/collector$", api.post_collector, ("netflow", W)),
+    ("POST", r"^/api/netflow/testpacket$", api.post_test_packet, ("netflow", W)),
+    ("GET", r"^/api/snmp/overview$", api.get_snmp_overview, ("snmp", R)),
+    ("GET", r"^/api/snmp/traps$", api.get_snmp_traps, ("snmp", R)),
+    ("POST", r"^/api/snmp/collector$", api.post_snmp_collector, ("snmp", W)),
+    ("POST", r"^/api/snmp/test$", api.post_snmp_test, ("snmp", W)),
+    ("GET", r"^/api/syslog/overview$", api.get_syslog_overview, ("syslog", R)),
+    ("GET", r"^/api/syslog/search$", api.get_syslog_search, ("syslog", R)),
+    ("POST", r"^/api/syslog/collector$", api.post_syslog_collector, ("syslog", W)),
+    ("POST", r"^/api/syslog/test$", api.post_syslog_test, ("syslog", W)),
+    ("GET", r"^/api/ipam/search$", api.get_ipam_search, ("ipam", R)),
+    ("GET", r"^/api/ipam/subnets$", api.get_ipam_subnets, ("ipam", R)),
+    ("POST", r"^/api/ipam/subnets$", api.post_ipam_subnet, ("ipam", W)),
+    ("PUT", r"^/api/ipam/subnets/(\d+)$", api.put_ipam_subnet, ("ipam", W)),
+    ("DELETE", r"^/api/ipam/subnets/(\d+)$", api.delete_ipam_subnet, ("ipam", W)),
+    ("POST", r"^/api/ipam/subnets/(\d+)/scan$", api.post_ipam_subnet_scan, ("ipam", W)),
+    ("POST", r"^/api/ipam/subnets/(\d+)/clear$", api.post_ipam_subnet_clear, ("ipam", W)),
+    ("GET", r"^/api/ipam/hosts$", api.get_ipam_hosts, ("ipam", R)),
+    ("GET", r"^/api/ipam/conflicts$", api.get_ipam_conflicts, ("ipam", R)),
+    ("POST", r"^/api/ipam/conflicts/(\d+)/resolve$", api.post_ipam_conflict_resolve, ("ipam", W)),
+    ("GET", r"^/api/ipam/dhcp/servers$", api.get_ipam_dhcp_servers, ("ipam", R)),
+    ("POST", r"^/api/ipam/dhcp/servers$", api.post_ipam_dhcp_server, ("ipam", W)),
+    ("PUT", r"^/api/ipam/dhcp/servers/(\d+)$", api.put_ipam_dhcp_server, ("ipam", W)),
+    ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)$", api.delete_ipam_dhcp_server, ("ipam", W)),
+    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/poll$", api.post_ipam_dhcp_server_poll, ("ipam", W)),
+    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/test$", api.post_ipam_dhcp_server_test, ("ipam", W)),
+    ("POST", r"^/api/ipam/dhcp/servers/(\d+)/credential$", api.post_ipam_dhcp_server_credential, ("ipam", W)),
+    ("DELETE", r"^/api/ipam/dhcp/servers/(\d+)/credential$", api.delete_ipam_dhcp_server_credential, ("ipam", W)),
+    ("GET", r"^/api/ipam/dhcp/scopes$", api.get_ipam_dhcp_scopes, ("ipam", R)),
+    ("GET", r"^/api/ipam/dhcp/leases$", api.get_ipam_dhcp_leases, ("ipam", R)),
+    ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history, ("ipam", R)),
+    ("GET", r"^/api/nodes/overview$", api.get_nodes_overview, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices$", api.get_nodes_devices, ("nodes", R)),
+    ("POST", r"^/api/nodes/devices$", api.post_nodes_device, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/bulk-update$", api.post_nodes_devices_bulk_update, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/bulk-delete$", api.post_nodes_devices_bulk_delete, ("nodes", W)),
+    ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device, ("nodes", R)),
+    ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),
+    ("POST", r"^/api/nodes/devices/(\d+)/test$", api.post_nodes_device_test, ("nodes", W)),
+    ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/timeline$", api.get_nodes_device_timeline, ("nodes", R)),
+    ("POST", r"^/api/nodes/devices/(\d+)/credential$", api.post_nodes_device_credential, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/devices/(\d+)/credential$", api.delete_nodes_device_credential, ("nodes", W)),
+    ("GET", r"^/api/nodes/device-groups$", api.get_nodes_device_groups, ("nodes", R)),
+    ("POST", r"^/api/nodes/device-groups$", api.post_nodes_device_group, ("nodes", W)),
+    ("PUT", r"^/api/nodes/device-groups/(\d+)$", api.put_nodes_device_group, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/device-groups/(\d+)$", api.delete_nodes_device_group, ("nodes", W)),
+    ("GET", r"^/api/nodes/groups$", api.get_nodes_groups, ("nodes", R)),
+    ("POST", r"^/api/nodes/groups$", api.post_nodes_group, ("nodes", W)),
+    ("PUT", r"^/api/nodes/groups/(\d+)$", api.put_nodes_group, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/groups/(\d+)$", api.delete_nodes_group, ("nodes", W)),
+    ("POST", r"^/api/nodes/groups/(\d+)/default$", api.post_nodes_group_default, ("nodes", W)),
+    ("POST", r"^/api/nodes/groups/(\d+)/credential$", api.post_nodes_group_credential, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/groups/(\d+)/credential$", api.delete_nodes_group_credential, ("nodes", W)),
+    ("POST", r"^/api/nodes/groups/(\d+)/credentials$", api.post_nodes_group_credentials, ("nodes", W)),
+    ("PUT", r"^/api/nodes/groups/(\d+)/credentials/(\d+)$", api.put_nodes_group_credential, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/groups/(\d+)/credentials/(\d+)$", api.delete_nodes_group_credential_row, ("nodes", W)),
+    ("POST", r"^/api/nodes/groups/(\d+)/credentials/(\d+)/secret$", api.post_nodes_group_credential_secret, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/groups/(\d+)/credentials/(\d+)/secret$", api.delete_nodes_group_credential_secret, ("nodes", W)),
+    ("POST", r"^/api/nodes/discovery$", api.post_nodes_discovery, ("nodes", W)),
+    ("GET", r"^/api/nodes/discovery$", api.get_nodes_discovery, ("nodes", R)),
+    ("GET", r"^/api/nodes/discovery/(\d+)$", api.get_nodes_discovery_job, ("nodes", R)),
+    ("DELETE", r"^/api/nodes/discovery/(\d+)$", api.delete_nodes_discovery_job, ("nodes", W)),
+    ("POST", r"^/api/nodes/discovery/(\d+)/promote$", api.post_nodes_discovery_promote, ("nodes", W)),
+    ("POST", r"^/api/nodes/discovery/(\d+)/reviewed$", api.post_nodes_discovery_reviewed, ("nodes", W)),
+    ("POST", r"^/api/nodes/collector$", api.post_nodes_collector, ("nodes", W)),
+    ("GET", r"^/api/nodes/mibs$", api.get_nodes_mibs, ("nodes", R)),
+    ("POST", r"^/api/nodes/mibs$", api.post_nodes_mib, ("nodes", W)),
+    ("GET", r"^/api/nodes/mibs/(\d+)$", api.get_nodes_mib, ("nodes", R)),
+    ("DELETE", r"^/api/nodes/mibs/(\d+)$", api.delete_nodes_mib, ("nodes", W)),
+    ("POST", r"^/api/nodes/mibs/(\d+)/resolve$", api.post_nodes_mib_resolve, ("nodes", W)),
+    ("PUT", r"^/api/nodes/mibs/(\d+)/objects/(\d+)$", api.put_nodes_mib_object, ("nodes", W)),
+    ("GET", r"^/api/alerts/overview$", api.get_alerts_overview, ("alerts", R)),
+    ("GET", r"^/api/alerts$", api.get_alerts, ("alerts", R)),
+    ("GET", r"^/api/alerts/(\d+)$", api.get_alert, ("alerts", R)),
+    ("POST", r"^/api/alerts/(\d+)/ack$", api.post_alert_ack, ("alerts", W)),
+    ("POST", r"^/api/alerts/(\d+)/resolve$", api.post_alert_resolve, ("alerts", W)),
+    ("POST", r"^/api/alerts/ack-all$", api.post_alerts_ack_all, ("alerts", W)),
+    ("POST", r"^/api/alerts/bulk-resolve$", api.post_alerts_bulk_resolve, ("alerts", W)),
+    ("GET", r"^/api/alerts/rules$", api.get_alerts_rules, ("alerts", R)),
+    ("POST", r"^/api/alerts/rules$", api.post_alerts_rule, ("alerts", W)),
+    ("PUT", r"^/api/alerts/rules/(\d+)$", api.put_alerts_rule, ("alerts", W)),
+    ("DELETE", r"^/api/alerts/rules/(\d+)$", api.delete_alerts_rule, ("alerts", W)),
+    ("GET", r"^/api/alerts/templates$", api.get_alerts_templates, ("alerts", R)),
+    ("POST", r"^/api/alerts/templates$", api.post_alerts_template, ("alerts", W)),
+    ("PUT", r"^/api/alerts/templates/(\d+)$", api.put_alerts_template, ("alerts", W)),
+    ("POST", r"^/api/alerts/templates/(\d+)/reset$", api.post_alerts_template_reset, ("alerts", W)),
+    ("POST", r"^/api/alerts/templates/(\d+)/preview$", api.post_alerts_template_preview, ("alerts", R)),
+    ("DELETE", r"^/api/alerts/templates/(\d+)$", api.delete_alerts_template, ("alerts", W)),
+    ("POST", r"^/api/alerts/smtp/credential$", api.post_alerts_smtp_credential, ("alerts", W)),
+    ("DELETE", r"^/api/alerts/smtp/credential$", api.delete_alerts_smtp_credential, ("alerts", W)),
+    ("POST", r"^/api/alerts/smtp/test$", api.post_alerts_smtp_test, ("alerts", W)),
+    ("POST", r"^/api/alerts/engine$", api.post_alerts_engine, ("alerts", W)),
+    ("GET", r"^/api/wireless/overview$", api.get_wireless_overview, ("wireless", R)),
+    ("GET", r"^/api/wireless/controllers$", api.get_wireless_controllers, ("wireless", R)),
+    ("POST", r"^/api/wireless/controllers$", api.post_wireless_controller, ("wireless", W)),
+    ("PUT", r"^/api/wireless/controllers/(\d+)$", api.put_wireless_controller, ("wireless", W)),
+    ("DELETE", r"^/api/wireless/controllers/(\d+)$", api.delete_wireless_controller, ("wireless", W)),
+    ("POST", r"^/api/wireless/controllers/(\d+)/credential$", api.post_wireless_controller_credential, ("wireless", W)),
+    ("DELETE", r"^/api/wireless/controllers/(\d+)/credential$", api.delete_wireless_controller_credential, ("wireless", W)),
+    ("POST", r"^/api/wireless/controllers/(\d+)/poll$", api.post_wireless_controller_poll, ("wireless", W)),
+    ("GET", r"^/api/wireless/aps$", api.get_wireless_aps, ("wireless", R)),
+    ("POST", r"^/api/wireless/collector$", api.post_wireless_collector, ("wireless", W)),
+    ("GET", r"^/api/configrx/overview$", api.get_configrx_overview, ("configrx", R)),
+    ("GET", r"^/api/configrx/devices$", api.get_configrx_devices, ("configrx", R)),
+    ("GET", r"^/api/configrx/devices/(\d+)$", api.get_configrx_device, ("configrx", R)),
+    ("POST", r"^/api/configrx/devices/(\d+)/config$", api.post_configrx_device_config, ("configrx", W)),
+    ("POST", r"^/api/configrx/devices/(\d+)/credential$", api.post_configrx_device_credential, ("configrx", W)),
+    ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
+    ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
+    ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
+    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
+    ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
+    ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
+    ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
+    ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
+    ("POST", r"^/api/maintenance$", api.post_maintenance, ("settings", W)),
+    ("POST", r"^/api/update$", api.post_update, ("settings", W)),
 ]
 
-COMPILED = [(method, re.compile(pattern), handler)
-            for method, pattern, handler in ROUTES]
+COMPILED = [(method, re.compile(pattern), handler, requirement)
+            for method, pattern, handler, requirement in ROUTES]
 
 # Reachable without a session: the sign-in page and what it needs to render.
 PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css", "/favicon.ico"}
@@ -378,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "Requests must be application/json"}, 415)
                 return
 
-        for route_method, pattern, handler in COMPILED:
+        for route_method, pattern, handler, requirement in COMPILED:
             if route_method != method:
                 continue
             match = pattern.match(path)
@@ -386,6 +437,14 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 body = self._body() if method in ("POST", "PUT", "DELETE") else {}
+                need = requirement(params, body) if callable(requirement) else requirement
+                if need is not None:
+                    module, level = need
+                    granted = self.service.app_db.permissions_for(
+                        params.get("_username", "")).get(module)
+                    if not permissions.allows(granted, level):
+                        self._json({"error": f"No {level} access to {module}"}, 403)
+                        return
                 args = [int(group) for group in match.groups()]
                 result = handler(self.service, params, body, *args)
 

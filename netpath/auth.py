@@ -12,8 +12,12 @@ Sessions live in memory only. Restarting the service logs everyone out, which
 is the safe default and avoids a token surviving in a file that also holds
 network data.
 
-There are no roles yet. Every account has full access, which is why adding one
-is itself an administrative act.
+This module has no concept of roles or per-module access itself — an
+account here is just a username, a password hash, and a session. Per-
+module read/write permissions are a layer above it (see `permissions.py`
+and `appdb.py`'s `user_permissions` table); adding an account is still an
+administrative act, since it's the point at which those grants are
+decided.
 """
 
 from __future__ import annotations

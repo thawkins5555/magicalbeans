@@ -41,18 +41,23 @@ cookie travels in the clear, so on anything but a trusted segment, set one up.
 
 ### Accounts
 
-Managed on the Settings tab: add a user with an initial password they must
-change, remove one, change your own, and see who is signed in. There are no
-roles yet — every account has full access.
+Managed on the Settings tab (itself gated on Settings write access): add a
+user with an initial password they must change, remove one, and see who
+is signed in. Every account has an explicit read/write grant per module
+— write implies read, no grant means no access — set from the same Add
+User dialog or edited later per account. Changing your own password
+always works regardless of any of that, from an "Account" control in the
+top bar rather than the Settings tab.
 
 Passwords are stored as salted scrypt hashes at the parameters OWASP currently
 recommends, never in plain text and never recoverable. If the only account's
 password is lost, the way back is to stop the service and delete the `users`
-table from `app.db`; the default admin account is recreated on the next start.
-The exact mechanics — hashing parameters, login throttling, session cookie
-flags, and how IPAM's optional stored DHCP credential, Nodes' optional
-SNMPv3 credential and Alerts' optional SMTP credential are protected — are
-in `CREDENTIAL-SECURITY.md`.
+table from `app.db`; the default admin account is recreated on the next start
+with full access to every module. The exact mechanics — hashing parameters,
+login throttling, session cookie flags, the permission model, and how IPAM's
+optional stored DHCP credential, Nodes' optional SNMPv3 credential, Alerts'
+optional SMTP credential, Wireless' optional SNMP credential and ConfigRX's
+optional SSH credential are protected — are in `CREDENTIAL-SECURITY.md`.
 
 **Idle timeout** signs a session out after 10 minutes with no real mouse or
 keyboard activity in the browser — adjustable on the Settings tab, under

@@ -1,1 +1,6 @@
 PySide6>=6.5
+# The one deliberate exception to this app's stdlib-only dependency rule:
+# ConfigRX's SSH connectivity, chosen specifically because it keeps a
+# device's SSH password entirely in-process (never on a command line or
+# in a process list) — see CREDENTIAL-SECURITY.md.
+paramiko>=3.4

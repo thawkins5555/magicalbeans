@@ -14,6 +14,7 @@
     metrics: [],
     metricId: null,
     series: null,
+    timeline: null,
     chartRange: 3600,
     // Absolute [t0, t1] set by a wheel zoom, overriding chartRange until
     // the range dropdown resets it to null — same "frozen window" idea
@@ -333,6 +334,28 @@
     select.value = String(view.metricId);
   }
 
+  function chartWindow() {
+    return view.chartWindow || (() => {
+      const now = Date.now() / 1000;
+      return [now - view.chartRange, now];
+    })();
+  }
+
+  /* The status timeline shares the metric chart's own time window (the
+     range picker / wheel-zoom above), but not its metric selection — it
+     redraws whenever the window changes, not on every metric swap, so
+     it's fetched from loadSeries() (called on both) rather than wired to
+     the metric <select> directly. */
+  async function loadStatusTimeline() {
+    if (!view.selected) return;
+    const requestId = (view.timelineRequestId = (view.timelineRequestId || 0) + 1);
+    const [t0, t1] = chartWindow();
+    const result = await App.get(`/api/nodes/devices/${view.selected}/timeline`, { t0, t1 });
+    if (requestId !== view.timelineRequestId) return;   // superseded — drop it
+    view.timeline = result;
+    drawStatusTimeline();
+  }
+
   async function loadSeries() {
     // A quick run of wheel ticks fires loadSeries repeatedly; nothing
     // stops an earlier request's response landing after a later one's.
@@ -340,11 +363,9 @@
     // keeps a stale, out-of-order series from becoming the displayed
     // (and then zoomed-from) window.
     const requestId = (view.seriesRequestId = (view.seriesRequestId || 0) + 1);
+    loadStatusTimeline();
     if (!view.metricId) { view.series = null; drawChart(); return; }
-    const [t0, t1] = view.chartWindow || (() => {
-      const now = Date.now() / 1000;
-      return [now - view.chartRange, now];
-    })();
+    const [t0, t1] = chartWindow();
     const sel = String(view.metricId);
     const fetchOne = (id) => App.get(
       `/api/nodes/devices/${view.selected}/series`, { metric_id: id, t0, t1 });
@@ -543,6 +564,44 @@
       view.chartRange = nt1 - nt0;
       loadSeries();
     };
+  }
+
+  /* Colored segments, one per real status change, across the full window
+     width — modeled on NetPath's own status-lane rects (netpath.js), not
+     drawSeriesChart's continuous-line renderer, since a status timeline
+     is discrete state over time rather than a numeric series. */
+  function drawStatusTimeline() {
+    const el = App.el('nd-status-timeline');
+    if (!el) return;
+    const svg = App.el('nd-status-timeline-svg');
+    svg.innerHTML = '';
+    const data = view.timeline;
+    const width = el.clientWidth || 400;
+    const height = el.clientHeight || 24;
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    if (!data || !data.segments || !data.segments.length) {
+      svg.appendChild(App.svgNode('text', {
+        x: width / 2, y: height / 2 + 4, 'text-anchor': 'middle',
+        fill: 'var(--faint)', 'font-size': 11 }, 'No history in this window'));
+      return;
+    }
+    const { t0, t1, segments } = data;
+    const span = Math.max(t1 - t0, 1);
+    const x = (ts) => ((ts - t0) / span) * width;
+    for (const seg of segments) {
+      const x0 = x(seg.ts_start);
+      const w = Math.max(x(seg.ts_end) - x0, 1);
+      const rect = App.svgNode('rect', {
+        x: x0, y: 0, width: w, height, fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+      });
+      rect.addEventListener('mousemove', (event) => {
+        const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
+        App.tooltip(label, event);
+      });
+      rect.addEventListener('mouseleave', App.hideTooltip);
+      svg.appendChild(rect);
+    }
   }
 
   const IFACE_COLUMNS = [

@@ -1031,6 +1031,48 @@ class NodesDatabase:
                 f"SELECT * FROM device_events{where} ORDER BY ts DESC LIMIT ?",
                 (*params, limit)).fetchall()
 
+    # kind -> the small display-status vocabulary devices.status already
+    # uses (up|down|unsupported|auth|unknown). rebooted/poll_overrun are
+    # informational, not status transitions, so they don't start a new
+    # segment — a device that reboots while staying up shouldn't show a
+    # gap in an "up" segment.
+    _SEGMENT_STATUS = {"up": "up", "down": "down", "unsupported": "unsupported",
+                       "auth_fail": "auth"}
+
+    def device_status_segments(self, device_id: int, t0: float, t1: float) -> list[dict]:
+        """Turns the device's sparse up/down/etc. transition log into
+        [ts_start, ts_end) status segments covering [t0, t1] — one row per
+        real status change, not one row per poll the way NetPath's own
+        traces-based timeline is built from, since Nodes has no per-poll
+        sample log to bucket."""
+        kinds = tuple(self._SEGMENT_STATUS)
+        marks = ",".join("?" * len(kinds))
+        with self._lock:
+            prior = self._conn.execute(
+                f"SELECT kind FROM device_events WHERE device_id = ? AND ts < ?"
+                f" AND kind IN ({marks}) ORDER BY ts DESC LIMIT 1",
+                (device_id, t0, *kinds)).fetchone()
+            rows = self._conn.execute(
+                f"SELECT kind, ts FROM device_events WHERE device_id = ?"
+                f" AND ts >= ? AND ts <= ? AND kind IN ({marks}) ORDER BY ts ASC",
+                (device_id, t0, t1, *kinds)).fetchall()
+            current = self._conn.execute(
+                "SELECT status FROM devices WHERE id = ?", (device_id,)).fetchone()
+
+        status = self._SEGMENT_STATUS.get(prior["kind"], "unknown") if prior else "unknown"
+        segments = []
+        cursor = t0
+        for row in rows:
+            ts = max(t0, min(row["ts"], t1))
+            if ts > cursor:
+                segments.append({"ts_start": cursor, "ts_end": ts, "status": status})
+            status = self._SEGMENT_STATUS.get(row["kind"], status)
+            cursor = ts
+        end_status = current["status"] if current else status
+        if cursor < t1:
+            segments.append({"ts_start": cursor, "ts_end": t1, "status": end_status})
+        return segments
+
     def device_events_since(self, last_id: int, limit: int = 2000) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first — the same cursor-read
         contract SnmpTrapDatabase.traps_since/SyslogDatabase.rows_since

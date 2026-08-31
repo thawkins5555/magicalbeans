@@ -10,7 +10,81 @@ const App = (() => {
     refreshMs: 2000,
     timer: null,
     modalLocked: false,
+    permissions: {},   // {module: 'read'|'write'}, from /api/state
   };
+
+  /* write implies read; a module absent from state.permissions means no
+     access at all — mirrors permissions.allows() on the server, which is
+     the check that actually matters. This is UX only: hiding a tab or
+     button here is a courtesy, not a security boundary, since every
+     write-gated route enforces the same check server-side regardless of
+     what the client renders. */
+  function canRead(module) {
+    const level = state.permissions[module];
+    return level === 'read' || level === 'write';
+  }
+  function canWrite(module) {
+    return state.permissions[module] === 'write';
+  }
+
+  /* Changing your own password has to be reachable no matter what module
+     access you have (or don't) — it lives in the top bar, not gated
+     behind Settings, and is a small self-contained modal rather than
+     sharing DOM ids with anything in settings.js. `forced` is set for the
+     must-change-password prompt: Cancel is hidden, since there's nowhere
+     else useful to go until it's done. */
+  function accountModal(forced = false) {
+    const box = modal('Change your password', `
+      <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
+      <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
+      <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
+      <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
+        session using this account, including this one.</p>`,
+      [
+        ...(forced ? [] : [{ label: 'Cancel', onClick: closeModal }]),
+        { label: 'Change password', primary: true, onClick: async () => {
+          const status = document.getElementById('am-status');
+          const next = document.getElementById('am-new').value;
+          const repeat = document.getElementById('am-repeat').value;
+          if (next !== repeat) {
+            status.textContent = 'The two new passwords differ';
+            status.style.color = 'var(--fail)';
+            return;
+          }
+          try {
+            await post('/api/password', {
+              current_password: document.getElementById('am-current').value,
+              new_password: next,
+            });
+            status.textContent = 'Changed. Signing you back in…';
+            status.style.color = 'var(--ok)';
+            setTimeout(() => { window.location.href = '/login'; }, 1200);
+          } catch (error) {
+            status.textContent = error.message;
+            status.style.color = 'var(--fail)';
+          }
+        } },
+      ]);
+    return box;
+  }
+
+  function applyPermissions() {
+    // 'dashboard' is always shown — it aggregates whatever the user can
+    // already read, rather than being its own gated module.
+    for (const tab of document.querySelectorAll('.tab')) {
+      const module = tab.dataset.tab;
+      if (module === 'dashboard') continue;
+      tab.hidden = !canRead(module);
+    }
+    for (const el of document.querySelectorAll('[data-requires-write]')) {
+      el.hidden = !canWrite(el.dataset.requiresWrite);
+    }
+    const activeTab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
+    if (activeTab && activeTab.hidden) {
+      const firstVisible = document.querySelector('.tab:not([hidden])');
+      if (firstVisible) selectTab(firstVisible.dataset.tab);
+    }
+  }
 
   const pages = {};
 
@@ -582,11 +656,15 @@ const App = (() => {
     state.ipamSettings = payload.ipam_settings;
     state.nodesSettings = payload.nodes_settings;
     state.alertsSettings = payload.alerts_settings;
+    state.wirelessSettings = payload.wireless_settings;
+    state.configrxSettings = payload.configrx_settings;
     state.dimensions = payload.dimensions;
     state.categories = payload.categories;
     state.severities = payload.severities;
     state.facilities = payload.facilities;
+    state.permissions = payload.permissions || {};
     state.serverState = payload;
+    applyPermissions();
     const alertsBadge = document.getElementById('alerts-tab-badge');
     if (alertsBadge) {
       const openCount = (payload.alerts || {}).open_count || 0;
@@ -624,7 +702,8 @@ const App = (() => {
     const key = { netpath: 'netpath_refresh_s', netflow: 'netflow_refresh_s',
                   snmp: 'snmp_refresh_s', nodes: 'nodes_refresh_s',
                   alerts: 'alerts_refresh_s', syslog: 'syslog_refresh_s',
-                  ipam: 'ipam_refresh_s', debug: 'debug_refresh_s' }[page];
+                  ipam: 'ipam_refresh_s', wireless: 'wireless_refresh_s',
+                  configrx: 'configrx_refresh_s', debug: 'debug_refresh_s' }[page];
     const seconds = Number(state.settings[key]);
     return Math.max(seconds > 0 ? seconds : 2, 0.1) * 1000;
   }
@@ -685,6 +764,8 @@ const App = (() => {
         window.location.href = '/login';
       };
     }
+    const accountBtn = document.getElementById('account-btn');
+    if (accountBtn) accountBtn.onclick = accountModal;
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') closeModal();
     };
@@ -734,6 +815,6 @@ const App = (() => {
     get, post, put, del,
     clock, stamp, span, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, el, svgNode, tooltip, hideTooltip, resetLayout,
-    grid, sortRows,
+    grid, sortRows, canRead, canWrite, accountModal,
   };
 })();

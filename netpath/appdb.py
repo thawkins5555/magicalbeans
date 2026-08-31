@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS users (
     must_change  INTEGER NOT NULL DEFAULT 0
 );
 
+-- Absence of a row for (username, module) means no access at all. A
+-- fresh install has no rows and no users beyond the seeded default admin
+-- (see AppDatabase.__init__'s one-time backfill for the upgrade case,
+-- where existing accounts get full access rather than being silently
+-- locked out the moment this table starts being enforced).
+CREATE TABLE IF NOT EXISTS user_permissions (
+    username TEXT NOT NULL,
+    module   TEXT NOT NULL,
+    level    TEXT NOT NULL CHECK (level IN ('read','write')),
+    PRIMARY KEY (username, module)
+);
+
 CREATE TABLE IF NOT EXISTS hostnames (
     ip          TEXT PRIMARY KEY,
     hostname    TEXT,
@@ -99,6 +111,8 @@ GLOBAL_DEFAULTS = {
     "syslog_refresh_s": 10,
     "ipam_refresh_s": 30,          # was missing entirely; app.js's rateFor()
                                     # silently fell back to a hardcoded 2000ms
+    "wireless_refresh_s": 15,
+    "configrx_refresh_s": 15,
     "debug_refresh_s": 1,
     "web_host": "0.0.0.0",
     "web_port": 8443,
@@ -133,8 +147,31 @@ class AppDatabase:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            had_permissions_table = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name='user_permissions'").fetchone() is not None
             self._conn.executescript(SCHEMA)
+            if not had_permissions_table:
+                self._backfill_full_permissions()
             self._conn.commit()
+
+    def _backfill_full_permissions(self) -> None:
+        """user_permissions is new — an install upgrading from before this
+        feature existed already has accounts with (undifferentiated) full
+        access to everything; enforcing permissions from this point on
+        must not silently lock any of them out. Grant every existing
+        account write (which implies read) on every module. A fresh
+        install has no users yet at this point (the default admin account
+        is seeded later, in Service.__init__, once it already sees this
+        table), so this is a no-op there — nothing to backfill."""
+        from . import permissions
+        usernames = [row["username"] for row in
+                    self._conn.execute("SELECT username FROM users").fetchall()]
+        for username in usernames:
+            for module in permissions.MODULES:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions(username, module, level)"
+                    " VALUES (?,?,?)", (username, module, permissions.WRITE))
 
     def close(self) -> None:
         with self._lock:
@@ -232,6 +269,38 @@ class AppDatabase:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM users WHERE username = ? COLLATE NOCASE", (username,))
+            self._conn.execute(
+                "DELETE FROM user_permissions WHERE username = ? COLLATE NOCASE",
+                (username,))
+            self._conn.commit()
+
+    # --------------------------------------------------------- permissions
+
+    def permissions_for(self, username: str) -> dict[str, str]:
+        """{module: 'read'|'write'} for whatever the account has been
+        granted; a module absent from the dict means no access at all."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT module, level FROM user_permissions"
+                " WHERE username = ? COLLATE NOCASE", (username,)).fetchall()
+        return {row["module"]: row["level"] for row in rows}
+
+    def set_permissions(self, username: str, grants: dict[str, str]) -> None:
+        """Replaces this account's entire permission set with `grants`
+        ({module: 'read'|'write'} — a module simply omitted means none).
+        Called whole rather than per-module so the Users UI's one grid
+        submit is one atomic change, not a flicker of intermediate states."""
+        from . import permissions
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM user_permissions WHERE username = ? COLLATE NOCASE",
+                (username,))
+            for module, level in grants.items():
+                if module not in permissions.MODULES or level not in permissions.LEVELS:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO user_permissions(username, module, level)"
+                    " VALUES (?,?,?)", (username, module, level))
             self._conn.commit()
 
     # ------------------------------------------------------------- hostnames

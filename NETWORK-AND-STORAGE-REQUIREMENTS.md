@@ -7,8 +7,8 @@ Nothing outside this document is opened, contacted or written: there is no
 telemetry, no update check, no outbound connection and no file created anywhere
 other than the locations below. How the credentials that do exist — a web
 login password, an optional stored DHCP credential, an optional stored
-SNMPv3 or SMTP credential — are protected is covered in full in
-`CREDENTIAL-SECURITY.md`, not repeated here.
+SNMPv3, SMTP, Wireless SNMP or ConfigRX SSH credential — are protected is
+covered in full in `CREDENTIAL-SECURITY.md`, not repeated here.
 
 ---
 
@@ -84,6 +84,8 @@ reachable.
 | Nodes ping monitoring | ICMP Echo Request (type 8) | — | One ping per device with ping enabled, on its own poll interval |
 | Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers |
 | Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
+| Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
+| ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, never a push |
 
 Traceroute probes go to every destination you add, and to every router on the
 path to it. Firewalls between here and a destination need to permit the probe
@@ -122,7 +124,18 @@ Nodes polls port 161 always — it is the standard SNMP agent port and is not
 currently configurable per device or profile. An SNMPv3 device with only
 `authPriv` configured is rejected at session setup rather than polled: this
 app has no AES/DES implementation and takes no third-party dependency, the
-same deferral the SNMP Trap receiver made for inbound decryption.
+same deferral the SNMP Trap receiver made for inbound decryption. Wireless
+polling is the identical shape and the identical `authPriv` limitation,
+against a controller instead of a device.
+
+ConfigRX is the one place this application makes an outbound SSH
+connection, and the one place it depends on a third-party library
+(paramiko) rather than the standard library alone — a deliberate,
+documented exception, made specifically so an SSH password never has to
+travel on a command line or appear in a process list; see
+`CREDENTIAL-SECURITY.md`. It only ever runs one fixed, read-only "show
+config" command per connection, never anything that could change a
+device's configuration.
 
 ### Local
 
@@ -148,7 +161,7 @@ configured SMTP server.
 
 ## Storage
 
-Eight SQLite databases and nothing else. No registry keys, no temporary files
+Ten SQLite databases and nothing else. No registry keys, no temporary files
 left behind, no writes to the application folder at runtime — the code
 directory can be read-only.
 
@@ -164,8 +177,10 @@ directory can be read-only.
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential | Subnet sizes swept and DHCP scope sizes — bounded by the per-subnet address cap |
 | `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials | Device count × poll frequency × metrics per device |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
+| `wireless.db` | Controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials | Controller count × AP count per controller — normally small, a handful of controllers rather than hundreds |
+| `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
 
-The split is deliberate. The seven record files each hold one module's data
+The split is deliberate. The nine record files each hold one module's data
 and that module's own settings; nothing else goes in them. Configuration
 read by more than one module, and the accounts that guard all of it, are in
 `app.db`, which is not subject to any size cap and is never trimmed by
@@ -174,16 +189,17 @@ maintenance.
 For backups that means `app.db` is the file that matters. Losing a record file
 costs history; losing `app.db` costs the configuration and every account.
 
-One caveat specific to `ipam.db`, `nodes.db` and `alerts.db`: any stored
-credential in them — a DHCP server's password, a device or polling profile's
-SNMPv3 auth password, the SMTP password — is encrypted with Windows DPAPI,
-tied to the machine that encrypted it. Restoring one of these files onto
-different hardware brings the credential's existence back but not its
-usability — DPAPI will not decrypt it there, and the credential needs
-re-entering on the new machine. Everything else in each file restores
-normally.
+One caveat specific to `ipam.db`, `nodes.db`, `alerts.db`, `wireless.db`
+and `configrx.db`: any stored credential in them — a DHCP server's
+password, a device or polling profile's SNMPv3 auth password, the SMTP
+password, a Wireless controller's SNMP auth password, a ConfigRX SSH
+password — is encrypted with Windows DPAPI, tied to the machine that
+encrypted it. Restoring one of these files onto different hardware
+brings the credential's existence back but not its usability — DPAPI
+will not decrypt it there, and the credential needs re-entering on the
+new machine. Everything else in each file restores normally.
 
-All eight sit in one folder, chosen at first run:
+All ten sit in one folder, chosen at first run:
 
 | Platform | Default location |
 | --- | --- |
@@ -196,7 +212,8 @@ Override any of them individually:
 python -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db \
                   --syslog-db D:\data\syslog.db --app-db D:\data\app.db \
                   --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db \
-                  --nodes-db D:\data\nodes.db --alerts-db D:\data\alerts.db
+                  --nodes-db D:\data\nodes.db --alerts-db D:\data\alerts.db \
+                  --wireless-db D:\data\wireless.db --configrx-db D:\data\configrx.db
 ```
 
 Running as a service, set these explicitly. The default resolves against the
@@ -252,14 +269,18 @@ Rough shapes to start from:
 | Syslog | messages per second | ~150 bytes per message |
 | Nodes | devices × poll frequency × metrics per device | a few hundred bytes per device per poll; raw samples roll up into hourly min/avg/max after 3 days |
 | Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
+| Wireless | controller count × AP count | a few KB per AP; normally tiny, since a site has a handful of controllers, not hundreds |
+| ConfigRX | device count × how often configs actually change | a device's own config text, compressed, once per change — most devices add nothing between backups |
 
 ### What keeps it bounded
 
 Three limits, checked every 15 minutes, in this order:
 
-1. **Retention** — delete anything older than N days. Per module.
-2. **Row cap** — delete the oldest rows beyond a count. NetFlow, SNMP Trap and
-   Syslog.
+1. **Retention** — delete anything older than N days. Per module, including
+   ConfigRX's backups.
+2. **Row cap** — delete the oldest rows beyond a count. NetFlow, SNMP Trap
+   and Syslog; ConfigRX has the same idea per device instead of globally
+   (keep at most N backups per device).
 3. **Size cap** — delete oldest records in chunks until the file fits. Per
    database, defaulting to 512 MB for traces, 2 GB for flows, 256 MB for
    SNMP traps, 1 GB for syslog, 1 GB for Nodes and 128 MB for Alerts.
@@ -267,7 +288,13 @@ Three limits, checked every 15 minutes, in this order:
    samples and device/interface events for Nodes, resolved alerts and
    notification history for Alerts — never the current-state tables
    (devices, polling profiles, interfaces, MIB objects, rules, templates)
-   that describe things as they are configured now, not a log.
+   that describe things as they are configured now, not a log. Wireless
+   and ConfigRX have no absolute size cap of their own — Wireless because
+   its data volume is inherently small (a handful of controllers and their
+   APs, not per-poll samples), ConfigRX because retention (1) and the
+   per-device count cap (2) together already bound it, and its own
+   hash-dedup means an unchanging fleet of devices adds nothing between
+   backups regardless.
 
 The size cap wins over the other two: if retention says keep 30 days but the
 cap is reached at 9, the ninth day is where it stops. That is deliberate —

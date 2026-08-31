@@ -46,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to the Nodes SQLite file (defaults next to --db)")
     parser.add_argument("--alerts-db", default=None,
                         help="path to the Alerts SQLite file (defaults next to --db)")
+    parser.add_argument("--wireless-db", default=None,
+                        help="path to the Wireless SQLite file (defaults next to --db)")
+    parser.add_argument("--configrx-db", default=None,
+                        help="path to the ConfigRX SQLite file (defaults next to --db)")
     parser.add_argument("--add", action="append", default=[], metavar="HOST",
                         help="add a destination on startup (repeatable)")
 
@@ -105,6 +109,18 @@ def alerts_path_for(args) -> str:
     return os.path.join(os.path.dirname(args.db) or ".", "alerts.db")
 
 
+def wireless_path_for(args) -> str:
+    if args.wireless_db:
+        return args.wireless_db
+    return os.path.join(os.path.dirname(args.db) or ".", "wireless.db")
+
+
+def configrx_path_for(args) -> str:
+    if args.configrx_db:
+        return args.configrx_db
+    return os.path.join(os.path.dirname(args.db) or ".", "configrx.db")
+
+
 def build_service(args):
     """Open the databases, seed any destinations, and start the collectors."""
     from .web import Service
@@ -112,7 +128,8 @@ def build_service(args):
     service = Service(args.db, flow_path_for(args), syslog_path_for(args),
                       app_path_for(args), ipam_path_for(args),
                       snmp_path_for(args), nodes_path_for(args),
-                      alerts_path_for(args))
+                      alerts_path_for(args), wireless_path_for(args),
+                      configrx_path_for(args))
     existing = {row["host"] for row in service.db.targets()}
     for host in args.add:
         if host not in existing:

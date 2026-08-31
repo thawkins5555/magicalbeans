@@ -33,11 +33,14 @@
   <button class="tab" data-tab="snmp">SNMP TRAP</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="ipam">IPAM</button>
+  <button class="tab" data-tab="wireless">WIRELESS</button>
+  <button class="tab" data-tab="configrx">CONFIGRX</button>
   <button class="tab" data-tab="debug">DEBUG</button>
   <button class="tab" data-tab="settings">SETTINGS</button>
   <span class="grow"></span>
   <span id="version" class="conn"></span>
   <span id="whoami" class="conn user"></span>
+  <button id="account-btn" class="linkish">Account</button>
   <button id="signout" class="linkish">Sign out</button>
   <span id="conn" class="conn">connecting…</span>
 </nav>
@@ -58,10 +61,10 @@
     <span id="nd-status" class="stat">Poller stopped</span>
     <span id="nd-counters" class="hint"></span>
     <span class="grow"></span>
-    <button id="nd-add-device" class="primary">Add device</button>
-    <button id="nd-manage-devgroups">Manage groups</button>
-    <button id="nd-toggle">Stop poller</button>
-    <button id="nd-settings" class="module-settings">Settings</button>
+    <button id="nd-add-device" class="primary" data-requires-write="nodes">Add device</button>
+    <button id="nd-manage-devgroups" data-requires-write="nodes">Manage groups</button>
+    <button id="nd-toggle" data-requires-write="nodes">Stop poller</button>
+    <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
 
   <nav class="subtabs">
@@ -112,6 +115,9 @@
             <button id="nd-remove-device">Remove</button>
           </div>
           <div id="nd-d-summary" class="hint"></div>
+          <div id="nd-status-timeline" class="canvas chart small">
+            <svg id="nd-status-timeline-svg"></svg>
+          </div>
           <div class="bar">
             <label>Metric <select id="nd-d-metric"></select></label>
             <select id="nd-d-range"></select>
@@ -191,9 +197,9 @@
     <span id="alerts-status" class="stat">Engine stopped</span>
     <span id="alerts-counters" class="hint"></span>
     <span class="grow"></span>
-    <button id="alerts-ack-all">Acknowledge all</button>
-    <button id="alerts-toggle">Stop engine</button>
-    <button id="alerts-settings" class="module-settings">Settings</button>
+    <button id="alerts-ack-all" data-requires-write="alerts">Acknowledge all</button>
+    <button id="alerts-toggle" data-requires-write="alerts">Stop engine</button>
+    <button id="alerts-settings" class="module-settings" data-requires-write="alerts">Settings</button>
   </div>
 
   <nav class="subtabs">
@@ -302,7 +308,7 @@
       <button id="route-zoom-in" class="icon">+</button>
       <span id="route-zoom" class="hint zoom">100%</span>
       <button id="route-fit">Fit</button>
-      <button id="netpath-settings" class="module-settings">Settings</button>
+      <button id="netpath-settings" class="module-settings" data-requires-write="netpath">Settings</button>
     </header>
     <p id="target-terms" class="hint pad terms"></p>
     <div id="route-canvas" class="canvas"><svg id="route-svg"></svg></div>
@@ -339,9 +345,9 @@
     <span id="nf-status" class="stat">Collector stopped</span>
     <span id="nf-counters" class="hint"></span>
     <span class="grow"></span>
-    <button id="nf-test">Send test packet</button>
-    <button id="nf-toggle">Start collector</button>
-    <button id="nf-settings" class="module-settings">Settings</button>
+    <button id="nf-test" data-requires-write="netflow">Send test packet</button>
+    <button id="nf-toggle" data-requires-write="netflow">Start collector</button>
+    <button id="nf-settings" class="module-settings" data-requires-write="netflow">Settings</button>
   </div>
 
   <div class="bar wrap">
@@ -406,9 +412,9 @@
     <span id="sn-status" class="stat">Receiver stopped</span>
     <span id="sn-counters" class="hint"></span>
     <span class="grow"></span>
-    <button id="sn-test">Send test trap</button>
-    <button id="sn-toggle">Start receiver</button>
-    <button id="sn-settings" class="module-settings">Settings</button>
+    <button id="sn-test" data-requires-write="snmp">Send test trap</button>
+    <button id="sn-toggle" data-requires-write="snmp">Start receiver</button>
+    <button id="sn-settings" class="module-settings" data-requires-write="snmp">Settings</button>
   </div>
 
   <div class="bar wrap">
@@ -466,9 +472,9 @@
     <span id="sl-status" class="stat">Collector stopped</span>
     <span id="sl-counters" class="hint"></span>
     <span class="grow"></span>
-    <button id="sl-test">Send test message</button>
-    <button id="sl-toggle">Start collector</button>
-    <button id="sl-settings" class="module-settings">Settings</button>
+    <button id="sl-test" data-requires-write="syslog">Send test message</button>
+    <button id="sl-toggle" data-requires-write="syslog">Start collector</button>
+    <button id="sl-settings" class="module-settings" data-requires-write="syslog">Settings</button>
   </div>
 
   <div class="bar wrap">
@@ -528,7 +534,7 @@
     <label>Find <input id="ipam-search-q" size="30" placeholder="hostname, IP or MAC address"></label>
     <button id="ipam-search-btn">Search</button>
     <span class="grow"></span>
-    <button id="ipam-settings" class="module-settings">Settings</button>
+    <button id="ipam-settings" class="module-settings" data-requires-write="ipam">Settings</button>
   </div>
 
   <nav class="subtabs">
@@ -618,6 +624,82 @@
       <div id="ipam-scope-detail" class="subnet-detail"></div>
       <div class="table-wrap"><table id="ipam-dhcp-lease-table"></table></div>
     </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================ WIRELESS ============================ -->
+<section id="page-wireless" class="page">
+  <div class="card strip">
+    <span id="wl-dot" class="dot"></span>
+    <span id="wl-status" class="stat">Poller stopped</span>
+    <span id="wl-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="wl-controllers" data-requires-write="wireless">Controllers</button>
+    <button id="wl-toggle" data-requires-write="wireless">Start poller</button>
+    <button id="wl-settings" class="module-settings" data-requires-write="wireless">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Search <input id="wl-q" size="26" placeholder="AP name, MAC or model"></label>
+    <label>Controller <select id="wl-controller"><option value="">All controllers</option></select></label>
+    <button id="wl-apply" class="primary">Search</button>
+  </div>
+
+  <div class="cols" data-splitter="wireless-body">
+   <div class="pane pad-x pad-b" data-grow="3">
+    <header class="bar">
+      <span class="section">ACCESS POINTS</span>
+      <span id="wl-count" class="hint"></span>
+    </header>
+    <div class="table-wrap"><table id="wireless-table"></table></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="1">
+    <pre id="wl-detail" class="detail">Select an AP to see its per-radio detail.</pre>
+   </div>
+  </div>
+</section>
+
+<!-- ============================ CONFIGRX ============================= -->
+<section id="page-configrx" class="page">
+  <div class="card strip">
+    <span id="cx-dot" class="dot"></span>
+    <span id="cx-status" class="stat">Worker stopped</span>
+    <span id="cx-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="cx-toggle" data-requires-write="configrx">Start worker</button>
+    <button id="cx-settings" class="module-settings" data-requires-write="configrx">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
+    <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
+    <button id="cx-apply" class="primary">Search</button>
+  </div>
+
+  <div class="cols" data-splitter="configrx-body">
+   <div class="pane pad-x pad-b" data-grow="2">
+    <header class="bar">
+      <span class="section">DEVICES</span>
+      <span id="cx-device-count" class="hint"></span>
+    </header>
+    <div class="table-wrap"><table id="cx-devices"></table></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane" data-grow="1">
+    <header class="bar">
+      <span id="cx-backup-header" class="section">BACKUPS</span>
+      <span class="grow"></span>
+      <button id="cx-backup-now" data-requires-write="configrx" hidden>Back up now</button>
+      <button id="cx-device-settings" data-requires-write="configrx" hidden>Device settings</button>
+    </header>
+    <div id="cx-backup-list" style="overflow:auto;height:100%"></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="2">
+    <header class="bar"><span class="section">CONFIG</span></header>
+    <pre id="cx-viewer" class="detail">Select a device to see its stored backups.</pre>
    </div>
   </div>
 </section>
@@ -761,28 +843,21 @@
         regardless of activity. Changing either applies to every session at the next check, not
         only new ones.</p>
     </fieldset>
-    <fieldset>
-      <legend>YOUR PASSWORD</legend>
-      <label>Current <input type="password" id="pw-current" autocomplete="current-password"></label>
-      <label>New <input type="password" id="pw-new" autocomplete="new-password"></label>
-      <label>Repeat <input type="password" id="pw-repeat" autocomplete="new-password"></label>
-      <div class="row"><button id="pw-save" class="primary half">Change password</button></div>
-      <p class="hint" id="pw-status">At least 12 characters. A short phrase is easier to
-        remember and harder to guess than a mangled word. Changing it signs out every session
-        using this account, including this one.</p>
-    </fieldset>
-
-    <fieldset>
+    <fieldset data-requires-write="settings">
       <legend>USERS</legend>
+      <p class="hint">Your own password is changed from the <b>Account</b> button in the top
+        bar, reachable regardless of what you have access to here — everything below needs
+        write access to Settings.</p>
       <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
       <div class="row" style="margin-top:10px">
         <input id="new-username" placeholder="username" size="18">
         <input id="new-password" type="password" placeholder="initial password" size="22">
-        <button id="add-user">Add user</button>
       </div>
-      <p class="hint" id="users-status">Every account has full access; there are no roles yet,
-        so adding one is an administrative act. A new user must change the initial password when
-        they first sign in.</p>
+      <div id="new-user-grid"></div>
+      <div class="row"><button id="add-user">Add user</button></div>
+      <p class="hint" id="users-status">A new user must change the initial password when they
+        first sign in, and starts with whatever access is set above — write implies read, and
+        nothing checked means no access to that module at all.</p>
       <p class="hint" id="sessions-line"></p>
     </fieldset>
 
@@ -795,7 +870,7 @@
         in and restarts the service — which signs everyone out, this session
         included, so it lands you back on the sign-in page.</p>
       <div class="row">
-        <button id="update-now" class="primary half">Check for update &amp; restart</button>
+        <button id="update-now" class="primary half" data-requires-write="settings">Check for update &amp; restart</button>
       </div>
       <p class="hint" id="update-status"></p>
     </fieldset>
@@ -803,13 +878,13 @@
     <fieldset>
       <legend>MAINTENANCE</legend>
       <div class="row">
-        <button data-maint="redns">Re-run reverse DNS</button>
-        <button data-maint="prune_traces">Delete old traces</button>
-        <button data-maint="prune_flows">Delete stored flows</button>
-        <button data-maint="prune_snmp">Delete stored traps</button>
-        <button data-maint="prune_syslog">Delete stored syslog</button>
-        <button data-maint="prune_nodes">Delete stored samples</button>
-        <button data-maint="prune_alerts">Delete resolved alerts</button>
+        <button data-maint="redns" data-requires-write="settings">Re-run reverse DNS</button>
+        <button data-maint="prune_traces" data-requires-write="settings">Delete old traces</button>
+        <button data-maint="prune_flows" data-requires-write="settings">Delete stored flows</button>
+        <button data-maint="prune_snmp" data-requires-write="settings">Delete stored traps</button>
+        <button data-maint="prune_syslog" data-requires-write="settings">Delete stored syslog</button>
+        <button data-maint="prune_nodes" data-requires-write="settings">Delete stored samples</button>
+        <button data-maint="prune_alerts" data-requires-write="settings">Delete resolved alerts</button>
         <button id="reset-layout">Reset panel sizes</button>
       </div>
       <p class="hint">These act immediately and cannot be undone.</p>
@@ -819,7 +894,7 @@
     <span id="set-status" class="hint"></span>
     <span class="grow"></span>
     <button id="set-revert">Revert</button>
-    <button id="set-apply" class="primary">Apply changes</button>
+    <button id="set-apply" class="primary" data-requires-write="settings">Apply changes</button>
   </div>
 </section>
 
@@ -834,6 +909,8 @@
 <script src="/snmp.js"></script>
 <script src="/syslog.js"></script>
 <script src="/ipam.js"></script>
+<script src="/wireless.js"></script>
+<script src="/configrx.js"></script>
 <script src="/debug.js"></script>
 <script src="/settings.js"></script>
 </body>

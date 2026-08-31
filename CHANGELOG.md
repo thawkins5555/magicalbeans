@@ -6,6 +6,39 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.22.0 — Per-module permissions, Wireless module, ConfigRX module, device status timeline
+
+- **User permissions.** Every account now has an explicit read/write
+  grant per module (Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog,
+  IPAM, Wireless, ConfigRX, Settings, Debug) — write implies read, and no
+  grant at all means no access, closing a pre-existing gap where any
+  signed-in account could do anything, including reset any other
+  account's password with no check at all. Changing your own password
+  always works regardless of Settings access — it moved out of the
+  Settings tab into an always-reachable "Account" control in the top bar.
+  Existing accounts on an upgrading install keep full access to
+  everything automatically; only accounts created after this ships start
+  with whatever grants an admin assigns.
+- **New "Wireless" module**: an at-a-glance dashboard of Fortinet access
+  points behind a FortiGate Wireless Controller — status, name, clients,
+  model, MAC address, and tx power per AP, polled from the controller
+  alone over SNMP (never per-AP). Supports v1/v2c community or SNMPv3
+  noAuthNoPriv/authNoPriv credentials, matching Nodes' own SNMP support.
+- **New "ConfigRX" module**: scheduled, read-only CLI config backups
+  pulled from devices over SSH (Cisco IOS, FortiOS, Junos, MikroTik,
+  HP/Aruba), reusing Nodes' own device list rather than keeping a second
+  one. A backup is only stored when its content actually changed since
+  the last pull. SSH passwords are encrypted at rest, never returned by
+  any API response, and decrypted only immediately before connecting.
+  ConfigRX never enters a device's configuration mode and never sends
+  anything beyond one fixed, per-vendor, read-only "show config" command
+  — there is no free-form command box anywhere in this module, by
+  design.
+- **The Nodes device detail pane now shows a status timeline** (up/down/
+  unsupported/auth-failed history) above the interfaces list, visible
+  immediately on selecting a device rather than whichever metric chart
+  happened to sort first alphabetically.
+
 ### 4.21.0 — Hostname resolution fixes, IPAM reorder/chart, Ctrl+click bulk select, recipients list
 
 - **Fixed the Syslog Host column not showing a device's SNMP-polled

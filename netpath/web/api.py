@@ -19,11 +19,14 @@ from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
 from ..ipamdb import scope_size
 from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
+                        CONFIGRX as CONFIGRX_CATEGORY,
                         ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY,
-                        NODES as NODES_CATEGORY, SYSTEM as SYSTEM_CATEGORY)
+                        NODES as NODES_CATEGORY, SYSTEM as SYSTEM_CATEGORY,
+                        WIRELESS as WIRELESS_CATEGORY)
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
+from .. import permissions as _permissions
 
 MIN_BLOCK_PX = 3
 
@@ -48,6 +51,24 @@ def _window(params) -> tuple[float, float]:
 
 # ------------------------------------------------------------------ general
 
+# get_state is one omnibus endpoint every open tab polls regardless of
+# which module it's looking at, so it's never permission-gated as a whole
+# (the Dashboard it feeds is always reachable) — instead each per-module
+# section is dropped from the response below when the signed-in user
+# can't read that module, rather than the request being refused outright.
+_STATE_MODULE_KEYS = {
+    "netflow": ("flow_settings", "dimensions", "collector"),
+    "syslog": ("syslog_settings", "syslog"),
+    "snmp": ("snmp_settings", "trap_kinds", "snmp"),
+    "ipam": ("ipam_settings", "ipam"),
+    "nodes": ("nodes_settings", "nodes"),
+    "alerts": ("alerts_settings", "alerts"),
+    "wireless": ("wireless_settings", "wireless"),
+    "configrx": ("configrx_settings", "configrx"),
+    "settings": ("storage",),
+}
+
+
 def get_state(service, params, body) -> dict:
     from .. import __version__
     from ..selfupdate import INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY
@@ -56,8 +77,10 @@ def get_state(service, params, body) -> dict:
     session = service.sessions.get(params.get("_token", ""))
     idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
                       if session else None)
-    return {
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    result = {
         "version": __version__,
+        "permissions": granted,
         "update": {
             "installed_commit": service.app_db.meta(INSTALLED_COMMIT_KEY),
             "installed_at": service.app_db.meta(INSTALLED_AT_KEY),
@@ -83,6 +106,8 @@ def get_state(service, params, body) -> dict:
         "ipam_settings": service.ipam_settings,
         "nodes_settings": service.nodes_settings,
         "alerts_settings": service.alerts_settings,
+        "wireless_settings": service.wireless_settings,
+        "configrx_settings": service.configrx_settings,
         "uptime_s": time.time() - service.started_at,
         "collector": {
             "running": service.collector.running,
@@ -130,6 +155,18 @@ def get_state(service, params, body) -> dict:
             "counters": service.alert_engine.counters,
             "open_count": service.alerts_db.open_count(),
         },
+        "wireless": {
+            "running": service.wireless.running,
+            "status": service.wireless.status_text(),
+            "counters": service.wireless.counters,
+            "ap_counts": service.wireless_db.ap_counts(),
+            "controller_count": len(service.wireless_db.controllers()),
+        },
+        "configrx": {
+            "running": service.configrx.running,
+            "status": service.configrx.status_text(),
+            "counters": service.configrx.counters,
+        },
         "storage": {
             "app_path": service.app_db.path,
             "trace_path": service.db.path,
@@ -139,6 +176,8 @@ def get_state(service, params, body) -> dict:
             "ipam_path": service.ipam_db.path,
             "nodes_path": service.nodes_db.path,
             "alerts_path": service.alerts_db.path,
+            "wireless_path": service.wireless_db.path,
+            "configrx_path": service.configrx_db.path,
             "app_bytes": service.app_db.size_bytes(),
             "trace_bytes": service.db.size_bytes(),
             "flow_bytes": service.flow_db.size_bytes(),
@@ -147,8 +186,15 @@ def get_state(service, params, body) -> dict:
             "ipam_bytes": service.ipam_db.size_bytes(),
             "nodes_bytes": service.nodes_db.size_bytes(),
             "alerts_bytes": service.alerts_db.size_bytes(),
+            "wireless_bytes": service.wireless_db.size_bytes(),
+            "configrx_bytes": service.configrx_db.size_bytes(),
         },
     }
+    for module, keys in _STATE_MODULE_KEYS.items():
+        if not _permissions.allows(granted.get(module), _permissions.READ):
+            for key in keys:
+                result.pop(key, None)
+    return result
 
 
 # ------------------------------------------------------------------ netpath
@@ -733,6 +779,10 @@ def post_settings(service, params, body) -> dict:
         return {"nodes_settings": service.apply_nodes_settings(values)}
     if scope == "alerts":
         return {"alerts_settings": service.apply_alerts_settings(values)}
+    if scope == "wireless":
+        return {"wireless_settings": service.apply_wireless_settings(values)}
+    if scope == "configrx":
+        return {"configrx_settings": service.apply_configrx_settings(values)}
     return {"settings": service.apply_global_settings(values)}
 
 
@@ -778,6 +828,9 @@ def post_maintenance(service, params, body) -> dict:
     if action == "prune_alerts":
         removed = service.alerts_db.prune(0)
         return {"message": f"Deleted {removed} resolved alert(s)"}
+    if action == "prune_configrx":
+        removed = service.configrx_db.prune(0, 0)
+        return {"message": f"Deleted {removed} stored config backup(s)"}
     return {"message": "Unknown action"}
 
 
@@ -1600,6 +1653,7 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     if not row:
         raise ValueError("No such device")
     service.nodes_db.remove_device(device_id)
+    service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     return {"ok": True}
 
@@ -1635,6 +1689,8 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
     removed = service.nodes_db.bulk_remove_devices(device_ids)
+    for device_id in device_ids:
+        service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     return {"ok": True, "removed": removed}
 
@@ -1796,6 +1852,14 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
     t0, t1 = _window(params)
     points = service.nodes_db.series(device_id, int(metric_id), t0, t1)
     return {"t0": t0, "t1": t1, "points": points}
+
+
+def get_nodes_device_timeline(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    t0, t1 = _window(params)
+    segments = service.nodes_db.device_status_segments(device_id, t0, t1)
+    return {"t0": t0, "t1": t1, "segments": segments}
 
 
 def get_nodes_device_events(service, params, body, device_id) -> dict:
@@ -2646,6 +2710,318 @@ def post_alerts_engine(service, params, body) -> dict:
             "status": service.alert_engine.status_text()}
 
 
+# ---------------------------------------------------------------- wireless
+
+def _controller_json(row) -> dict:
+    return {
+        "id": row["id"], "name": row["name"], "ip": row["ip"],
+        "enabled": bool(row["enabled"]),
+        "snmp_version": row["snmp_version"], "community": row["community"],
+        "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
+        # Same has_credential convention as Nodes' device v3 password —
+        # the encrypted blob itself is never sent to the browser.
+        "has_credential": bool(row["v3_auth_pass_enc"]),
+        "last_poll_ts": row["last_poll_ts"],
+        "last_poll_ok": _tri(row["last_poll_ok"]),
+        "last_poll_error": row["last_poll_error"],
+        "created_ts": row["created_ts"],
+    }
+
+
+def _radio_json(row) -> dict:
+    return {
+        "radio_id": row["radio_id"], "channel": row["channel"],
+        "operating_power_dbm": row["operating_power_dbm"],
+        "station_count": row["station_count"],
+    }
+
+
+def _ap_json(service, row) -> dict:
+    radios = [_radio_json(r) for r in service.wireless_db.radios_for(row["id"])]
+    # The at-a-glance table shows one tx-power figure per AP; a real AP
+    # has one radio per band, so this is the strongest of them rather
+    # than an arbitrary "first" pick.
+    powers = [r["operating_power_dbm"] for r in radios if r["operating_power_dbm"] is not None]
+    return {
+        "id": row["id"], "controller_id": row["controller_id"],
+        "wtp_id": row["wtp_id"], "vdom": row["vdom"], "name": row["name"],
+        "status": row["status"], "model": row["model"],
+        "mac_address": row["mac_address"], "station_count": row["station_count"],
+        "tx_power_dbm": max(powers) if powers else None,
+        "radios": radios,
+        "last_seen_ts": row["last_seen_ts"],
+    }
+
+
+def get_wireless_overview(service, params, body) -> dict:
+    return {
+        "controllers": [_controller_json(r) for r in service.wireless_db.controllers()],
+        "ap_counts": service.wireless_db.ap_counts(),
+        "poller": {
+            "running": service.wireless.running,
+            "status": service.wireless.status_text(),
+            "counters": service.wireless.counters,
+        },
+    }
+
+
+def get_wireless_controllers(service, params, body) -> dict:
+    return {"controllers": [_controller_json(r) for r in service.wireless_db.controllers()]}
+
+
+_CONTROLLER_EDITABLE_BODY = ("name", "ip", "enabled", "snmp_version",
+                             "community", "v3_user", "v3_auth_proto")
+
+
+def post_wireless_controller(service, params, body) -> dict:
+    name = str(body.get("name", "")).strip()
+    ip = str(body.get("ip", "")).strip()
+    if not name or not ip:
+        raise ValueError("A name and IP address are required")
+    overrides = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY
+                and k not in ("name", "ip", "enabled")}
+    controller_id = service.wireless_db.add_controller(name, ip, **overrides)
+    service.log.add(WIRELESS_CATEGORY, f"Added wireless controller {name} ({ip})")
+    return {"id": controller_id}
+
+
+def put_wireless_controller(service, params, body, controller_id) -> dict:
+    if not service.wireless_db.controller(controller_id):
+        raise ValueError("No such controller")
+    fields = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY}
+    service.wireless_db.update_controller(controller_id, **fields)
+    return {"ok": True}
+
+
+def delete_wireless_controller(service, params, body, controller_id) -> dict:
+    row = service.wireless_db.controller(controller_id)
+    if not row:
+        raise ValueError("No such controller")
+    service.wireless_db.remove_controller(controller_id)
+    service.log.add(WIRELESS_CATEGORY, f"Removed wireless controller {row['name']}")
+    return {"ok": True}
+
+
+def post_wireless_controller_credential(service, params, body, controller_id) -> dict:
+    from .. import dpapi
+
+    row = service.wireless_db.controller(controller_id)
+    if not row:
+        raise ValueError("No such controller")
+    user = str(body.get("v3_user", "")).strip()
+    password = str(body.get("v3_auth_pass", ""))
+    auth_proto = str(body.get("v3_auth_proto", "")).strip()
+    if not user or not password or not auth_proto:
+        raise ValueError("A username, auth protocol, and password are all required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only. Use a v1/v2c community, or SNMPv3 "
+            "noAuthNoPriv, instead.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.wireless_db.update_controller(controller_id, v3_user=user, v3_auth_proto=auth_proto)
+    service.wireless_db.set_credential(controller_id, encrypted)
+    service.log.add(WIRELESS_CATEGORY, f"Stored an SNMPv3 credential for {row['name']}")
+    return {"ok": True}
+
+
+def delete_wireless_controller_credential(service, params, body, controller_id) -> dict:
+    row = service.wireless_db.controller(controller_id)
+    if not row:
+        raise ValueError("No such controller")
+    service.wireless_db.set_credential(controller_id, None)
+    service.log.add(WIRELESS_CATEGORY, f"Cleared the stored SNMPv3 credential for {row['name']}")
+    return {"ok": True}
+
+
+def post_wireless_controller_poll(service, params, body, controller_id) -> dict:
+    if not service.wireless_db.controller(controller_id):
+        raise ValueError("No such controller")
+    service.wireless.poll_now(controller_id)
+    return {"ok": True}
+
+
+def get_wireless_aps(service, params, body) -> dict:
+    controller_id = params.get("controller_id")
+    aps = service.wireless_db.access_points(
+        controller_id=int(controller_id) if controller_id else None)
+    text = (params.get("q") or "").strip().lower()
+    result = [_ap_json(service, r) for r in aps]
+    if text:
+        result = [ap for ap in result if text in (ap["name"] or "").lower()
+                 or text in (ap["mac_address"] or "").lower()
+                 or text in (ap["model"] or "").lower()]
+    return {"aps": result}
+
+
+def post_wireless_collector(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.wireless_settings["enabled"] = True
+        service.wireless_db.save_settings({"enabled": True})
+        service.wireless.start(service.wireless_settings)
+    elif action == "stop":
+        service.wireless_settings["enabled"] = False
+        service.wireless_db.save_settings({"enabled": False})
+        service.wireless.stop()
+    return {"running": service.wireless.running,
+            "status": service.wireless.status_text()}
+
+
+# ----------------------------------------------------------------- configrx
+
+def _configrx_device_json(service, device_row) -> dict:
+    config = service.configrx_db.device_config(device_row["id"])
+    return {
+        "id": device_row["id"], "ip": device_row["ip"],
+        "name": device_row["name"] or device_row["sys_name"] or device_row["ip"],
+        "vendor": device_row["vendor"],
+        "backup_enabled": bool(config["backup_enabled"]) if config else False,
+        "ssh_port": config["ssh_port"] if config else 22,
+        "ssh_username": (config["ssh_username"] if config else "") or "",
+        # Same has_credential convention as every other stored password in
+        # this app — the encrypted blob itself never reaches the browser.
+        "has_credential": bool(config["ssh_password_enc"]) if config else False,
+        "vendor_override": (config["vendor_override"] if config else "") or "",
+        "last_backup_ts": config["last_backup_ts"] if config else None,
+        "last_backup_status": config["last_backup_status"] if config else None,
+        "last_backup_error": config["last_backup_error"] if config else None,
+    }
+
+
+def _configrx_backup_json(row) -> dict:
+    return {"id": row["id"], "device_id": row["device_id"], "ts": row["ts"],
+            "sha256": row["sha256"], "size_bytes": row["size_bytes"]}
+
+
+def get_configrx_overview(service, params, body) -> dict:
+    configs = service.configrx_db.all_device_configs()
+    enabled = sum(1 for c in configs if c["backup_enabled"])
+    errors = sum(1 for c in configs
+                if c["backup_enabled"] and c["last_backup_status"] == "error")
+    return {
+        "worker": {
+            "running": service.configrx.running,
+            "status": service.configrx.status_text(),
+            "counters": service.configrx.counters,
+        },
+        "devices_configured": len(configs),
+        "devices_enabled": enabled,
+        "devices_with_errors": errors,
+    }
+
+
+def get_configrx_devices(service, params, body) -> dict:
+    """The device list is Nodes' own — ConfigRX has no device table of its
+    own, per the product decision to reuse it wholesale rather than keep
+    a second, parallel list in sync."""
+    text = params.get("q") or None
+    rows = service.nodes_db.devices(text=text)
+    devices = [_configrx_device_json(service, r) for r in rows]
+    if params.get("enabled_only") is not None:
+        devices = [d for d in devices if d["backup_enabled"]]
+    return {"devices": devices}
+
+
+def get_configrx_device(service, params, body, device_id) -> dict:
+    device = service.nodes_db.device(device_id)
+    if not device:
+        raise ValueError("No such device")
+    return {"device": _configrx_device_json(service, device)}
+
+
+def post_configrx_device_config(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    fields = {k: v for k, v in body.items()
+             if k in ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")}
+    service.configrx_db.update_device_config(device_id, **fields)
+    return {"ok": True}
+
+
+def post_configrx_device_credential(service, params, body, device_id) -> dict:
+    from .. import dpapi
+
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    username = str(body.get("ssh_username", "")).strip()
+    password = str(body.get("ssh_password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are both required")
+    if not dpapi.available():
+        raise ValueError(
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only, so ConfigRX refuses to store an SSH password "
+            "here rather than keep it in plain text.")
+    try:
+        encrypted = dpapi.protect(password.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        password = None
+    service.configrx_db.set_credential(device_id, username, encrypted)
+    service.log.add(CONFIGRX_CATEGORY, f"Stored an SSH credential for {row['ip']}")
+    return {"ok": True}
+
+
+def delete_configrx_device_credential(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    service.configrx_db.clear_credential(device_id)
+    service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored SSH credential for {row['ip']}")
+    return {"ok": True}
+
+
+def get_configrx_device_backups(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    # No "changed since previous" flag to compute here: ConfigRxDatabase.
+    # add_backup only ever inserts a row when the hash differs from the
+    # device's prior backup, so every stored row already IS a change —
+    # an unchanged poll updates last_backup_ts/status and stores nothing.
+    rows = service.configrx_db.backups_for(device_id)
+    return {"backups": [_configrx_backup_json(r) for r in rows]}
+
+
+def get_configrx_backup(service, params, body, backup_id) -> dict:
+    row = service.configrx_db.backup(backup_id)
+    if not row:
+        raise ValueError("No such backup")
+    content = service.configrx_db.backup_content(backup_id)
+    return {"backup": _configrx_backup_json(row), "content": content}
+
+
+def post_configrx_device_backup(service, params, body, device_id) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    config = service.configrx_db.device_config(device_id)
+    if not config or not config["backup_enabled"]:
+        raise ValueError("Backup is not enabled for this device")
+    service.configrx.backup_now(device_id)
+    return {"ok": True}
+
+
+def post_configrx_worker(service, params, body) -> dict:
+    action = str(body.get("action", "")).lower()
+    if action == "start":
+        service.configrx_settings["enabled"] = True
+        service.configrx_db.save_settings({"enabled": True})
+        service.configrx.start(service.configrx_settings)
+    elif action == "stop":
+        service.configrx_settings["enabled"] = False
+        service.configrx_db.save_settings({"enabled": False})
+        service.configrx.stop()
+    return {"running": service.configrx.running,
+            "status": service.configrx.status_text()}
+
+
 # --------------------------------------------------------------------- auth
 
 def _client(params) -> str:
@@ -2733,10 +3109,12 @@ def get_users(service, params, body) -> dict:
         "users": [
             {"username": row["username"], "created": row["created_ts"],
              "updated": row["updated_ts"], "last_login": row["last_login"],
-             "must_change": bool(row["must_change"])}
+             "must_change": bool(row["must_change"]),
+             "permissions": service.app_db.permissions_for(row["username"])}
             for row in service.app_db.users()
         ],
         "sessions": service.sessions.active(),
+        "modules": list(_permissions.MODULES),
     }
 
 
@@ -2754,10 +3132,27 @@ def post_user(service, params, body) -> dict:
         raise ValueError(f"There is already an account called {username}")
 
     service.app_db.add_user(username, hash_password(password), must_change=True)
+    grants = body.get("grants") or {}
+    if grants:
+        service.app_db.set_permissions(username, grants)
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {username} created by "
                     f"{params.get('_username', 'someone')}")
     return {"username": username}
+
+
+def post_user_permissions(service, params, body) -> dict:
+    username = str(body.get("username", "")).strip()
+    if not username:
+        raise ValueError("Which account?")
+    if not service.app_db.user(username):
+        raise ValueError(f"No account called {username}")
+    grants = body.get("grants") or {}
+    service.app_db.set_permissions(username, grants)
+    service.log.add(SYSTEM_CATEGORY,
+                    f"Permissions for {username} changed by "
+                    f"{params.get('_username', 'someone')}")
+    return {"username": username, "permissions": service.app_db.permissions_for(username)}
 
 
 def delete_user(service, params, body, username: str = "") -> dict:

@@ -70,7 +70,7 @@ measurement.
 
 ## Data layer
 
-Five SQLite files, each opened with `PRAGMA journal_mode=WAL` and (for
+Ten SQLite files, each opened with `PRAGMA journal_mode=WAL` and (for
 files with foreign keys) `PRAGMA foreign_keys=ON`. Every `*Database`
 class follows the same shape: a `SCHEMA` string of `CREATE TABLE IF NOT
 EXISTS` statements run at connect time, followed by a `_migrate()` method
@@ -99,13 +99,15 @@ each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 
 | File | Owner class | Holds |
 | --- | --- | --- |
-| `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
+| `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `user_permissions` (per-account per-module read/write grants), `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
 | `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
 | `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, Alerts' own settings |
+| `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, Wireless' own settings |
+| `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings and SSH credential, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
 
 ---
 
@@ -559,6 +561,40 @@ ever confused with "never seeded". Newly seeded names are merged into the
 setting and saved in the same pass, then `_snmp_settings_with_mibs()` is
 re-run so the bundled vendor names reach the SNMP Trap decoder on first
 start, exactly as any other upload would.
+
+### Device status timeline (`nodesdb.device_status_segments`)
+
+`device_events` is a sparse *transition* log (one row per up/down/
+unsupported/auth-failed change), not a dense per-poll sample log like
+NetPath's `traces` table — a device polled every 60s that's been up for
+a week can have zero `device_events` rows in that window. That's why
+`analysis.build_timeline()` (NetPath's own status-lane builder, which
+buckets dense per-poll rows into fixed-width slices) can't be reused
+here: it has no concept of "no events in this window means nothing
+changed," only of empty buckets.
+
+`device_status_segments(device_id, t0, t1)` instead: reads the latest
+relevant event strictly before `t0` (to know the state active when the
+window opens — absent that, the window opens as `"unknown"`), every
+relevant event inside `[t0, t1]`, and the device's *current* live
+`status` column; then walks them pairwise into `{ts_start, ts_end,
+status}` segments, extending the final one to `t1` using that current
+status. `device_events.kind` values (`up`/`down`/`unsupported`/
+`auth_fail`/`rebooted`/`poll_overrun`) collapse onto the same small
+display-status vocabulary `devices.status` already uses
+(`up`/`down`/`unsupported`/`auth`) — `rebooted` and `poll_overrun` are
+ignored for segment purposes, since neither changes which of those four
+states the device is in.
+
+The frontend (`nodes.js`'s `drawStatusTimeline()`) renders this as one
+`<rect>` per segment across the full window width, using the same
+`STATUS_COLOR` map the device table's own status dot already uses —
+modeled on NetPath's status-lane segment drawing
+(`netpath.js`'s `<rect>`-per-segment loop), not `drawSeriesChart`'s
+continuous-line renderer, which has no notion of a discrete state. It's
+fetched alongside the rest of `loadDetail()`'s `Promise.all`, using the
+same `t0`/`t1` window the metric chart's range picker already drives, so
+switching the range re-fetches both together.
 
 ---
 
@@ -1664,19 +1700,197 @@ once past the threshold (`2 ** (failures - threshold)`, capped at 30s) —
 
 ---
 
+## Permissions (`permissions.py`, `appdb.py`'s `user_permissions`)
+
+Its own small module rather than folded into `appdb.py` or `eventlog.py`:
+`eventlog.CATEGORIES` is a different, non-matching taxonomy (built for
+the Debug page's log filter — missing Syslog/Dashboard/Settings/Debug,
+including non-module `system`/`error` categories) and was never meant to
+double as an authorization module list. `permissions.MODULES` is the
+exhaustive, deliberately explicit list — one entry per gate-able tab.
+`dashboard` is not in it: it's an aggregate view of whatever other
+modules the signed-in account can already read (see `api.get_state`
+below), not a module with its own data to gate. `allows(granted,
+required)` is the one comparison every check in this app makes: `None`
+satisfies nothing, `read` satisfies `read`, and only `write` satisfies
+`write` — write implies read by construction (`granted in (READ, WRITE)`
+for a `read` requirement).
+
+**Storage**: `user_permissions(username, module, level)`, a plain
+`CREATE TABLE IF NOT EXISTS` — no `_migrate()` needed, since this is a
+new table rather than a new column on an existing one. Its one piece of
+migration-shaped logic lives in `AppDatabase.__init__`: if the table did
+not exist before this run *and* `users` already has rows in it (an
+existing install upgrading), every existing account is backfilled to
+`write` on every module, so nobody who already had full access loses any
+of it silently. This deliberately does **not** cover the bootstrap
+default admin account on a brand-new install: `users` is empty at the
+point the backfill would run (the default admin is seeded later, in
+`web/service.py`'s `_ensure_default_user()`), so that seeding explicitly
+calls `set_permissions(DEFAULT_USER, {m: WRITE for m in MODULES})` itself
+right after creating the account — otherwise a fresh install's own
+default admin would start with zero access to everything it just
+installed.
+
+**Enforcement** is one check, in `server.py`'s `_route()`: after
+resolving the caller's username, look up
+`service.app_db.permissions_for(username)` and evaluate the matched
+route's `requirement` (see `web/server.py` above) against it before
+calling the handler at all — a route with no matching or insufficient
+grant never reaches its handler, returning 403 with `{"error": "No
+{level} access to {module}"}`. This is the check that actually matters;
+everything client-side (hiding a tab, hiding a write-gated button) is
+strictly a courtesy on top of it, never a substitute.
+
+**`/api/state` is the one deliberate exception** to "a route either
+passes or is refused outright." It's an omnibus endpoint every open tab
+polls regardless of which module it's actually looking at — Dashboard,
+which is always visible, depends on it — so blocking it for anyone
+without a specific module's access would break Dashboard for everyone
+but a full admin. Instead `api.get_state()` always succeeds and its
+`_STATE_MODULE_KEYS` mapping strips the module-specific top-level keys
+(e.g. `nodes_settings`/`nodes` for Nodes, `wireless_settings`/`wireless`
+for Wireless) the requesting account can't read, after building the full
+response — a filter on the way out, not a gate on the way in.
+
+**Always-reachable password change**: `/api/password` is one of the
+routes whose requirement is a callable rather than a static pair,
+because "self change" and "reset someone else's password" need
+different rules from the same route — changing your own password is
+`None` (no permission needed at all, by explicit product requirement),
+while resetting a different account's requires `("settings", WRITE)`.
+Before this shipped, `api.py`'s `post_password` had no authorization
+check on the reset path at all — `resetting = target.lower() !=
+me.lower()` only decided whether to skip the *current-password*
+check, not whether the caller was allowed to act on someone else's
+account — so any signed-in user could silently reset any other user's
+password. Fixed as a direct consequence of building this system
+properly, not a separate patch. On the frontend, changing your own
+password lives in `app.js`'s `accountModal()` — a small, self-contained
+modal reachable from an always-visible "Account" control in the top bar,
+deliberately outside `settings.js` and sharing no DOM ids with it, so it
+works identically whether or not the signed-in account can read Settings
+at all.
+
+---
+
+## Wireless (`fortinetoids.py`, `wirelessdb.py`, `fortipoll.py`)
+
+**OIDs** (`fortinetoids.py`) are hand-listed constants, not parsed from
+a MIB at runtime — the same "not a MIB compiler" convention `trapoids.py`
+and `nodeoids.py` already use for other fixed, known vendor tables (see
+Nodes above). Three tables under `fgWc` (`1.3.6.1.4.1.12356.101.14`),
+all indexed by `(fgVdEntIndex, WtpId[, RadioId])`: `fgWcWtpConfigTable`
+(the AP's configured name), `fgWcWtpSessionTable` (live status/MAC/
+model/client count) and `fgWcWtpSessionRadioTable` (per-radio channel/tx
+power/client count, one additional `RadioId` index arc). `WtpId` is a
+string-valued (OCTET STRING) table index, so its OID-suffix encoding is
+a length prefix followed by that many decimal char-code arcs —
+`fortipoll._split_vdom_wtp()` is the one place that decoding happens,
+shared by every table walk since all three share the same `(vdom,
+wtp_id)` key.
+
+**Polling** (`fortipoll.WirelessPoller`) reuses Nodes' own low-level SNMP
+plumbing wholesale — `nodepoll._Session` (one UDP socket per poll, with
+retry), `nodepoll.EngineCache` (v3 engine discovery caching, keyed here
+by controller id instead of device id), `nodepoll.credential_for()`
+(decrypt-just-before-use, discard after) — rather than reimplementing
+any of it. Table walking is repeated GETNEXT (`_walk_column`), not
+GETBULK: the same choice `nodepoll.py`'s own table walker already made
+("avoiding a separate GETBULK code path"), matched here rather than
+introducing a second table-walking idiom for one small poller. Same v3
+limitation as Nodes: authPriv raises `SnmpUnsupported` at session setup,
+since there is no AES/DES in the standard library and this app takes no
+third-party dependency for it — v1/v2c community or v3 noAuthNoPriv/
+authNoPriv only.
+
+**Storage** (`wirelessdb.WirelessDatabase`): `controllers` (one row per
+configured controller, carrying its own SNMP credential columns —
+there's no group/profile system here, since a handful of controllers
+doesn't need one), `access_points` and `radios` (child rows, replaced
+wholesale on each successful poll of that controller via
+`replace_radios()`). `prune_stale()` only ever runs after a controller's
+own poll *succeeded* — a transient controller outage never wipes its AP
+list, only a poll that genuinely completed but no longer sees a
+particular AP does.
+
+## ConfigRX (`configrxdb.py`, `configrx.py`, `configrx_vendors.py`)
+
+**No device table of its own.** Per the explicit product decision,
+ConfigRX operates entirely on Nodes' existing device list — the device
+picker in the UI calls `GET /api/nodes/devices` exactly as Nodes' own
+table does. `configrxdb.device_config` stores only ConfigRX's own
+per-device backup configuration, keyed by the Nodes device id with no
+real foreign key (SQLite cannot enforce one across separate database
+files) — the same pattern Alerts already established for its own
+`entity_id` columns.
+
+**The safety boundary** (hard requirement, stated explicitly so a later
+change can't erode it by accident): `configrx._pull_config()` is the
+*only* function in the entire module that writes to a device's shell
+channel, and it sends exactly `vendor.pager_off`'s fixed lines followed
+by `vendor.show_config` — both sourced from `configrx_vendors.VENDORS`,
+a hardcoded dict, never from anything the API or UI accepts as free
+text. A device's `vendor_override` field is free text, but it only ever
+selects *which* vendor's fixed commands to use (`configrx_vendors.
+resolve()` does a dict lookup); an unrecognized value simply fails to
+resolve and the backup is skipped with a clear error, never used as
+literal command text. There is no exec-command endpoint, no command
+parameter anywhere in `api.py`'s ConfigRX handlers, and no free-form
+input field anywhere in `configrx.js` — grep for `channel.send` in
+`configrx.py` to confirm this hasn't grown a second call site.
+
+**The SSH credential** follows the identical discipline every other
+stored secret in this app does (see `CREDENTIAL-SECURITY.md`):
+`_backup_device()` decrypts the DPAPI blob into a local `password`
+variable immediately before `paramiko.SSHClient.connect()`, and
+reassigns it to `None` in a `finally` block the moment the connection
+attempt finishes, success or failure. `_AcceptAndRecordPolicy` (a
+`paramiko.MissingHostKeyPolicy` subclass) never blocks on an
+unrecognized host key — network gear rarely carries a stable
+`known_hosts` entry — but, unlike `AutoAddPolicy`, flags that it
+happened so `_backup_device()` can note it in the backup's own
+`last_backup_status` rather than silently accepting an unknown key with
+no record of it.
+
+**Backup dedup**: `ConfigRxDatabase.add_backup()` hashes the cleaned
+output (SHA-256) and compares it against `latest_backup_hash()` for that
+device — a match stores nothing, an unchanged poll only updates
+`last_backup_ts`/`last_backup_status`. This is why there is no
+"changed since previous" flag anywhere in the API: every row that exists
+in `backups` already represents a change, by construction, so the mere
+presence of a row *is* the flag. `_clean_output()` strips ANSI escape
+sequences and pager prompts (`--More--` and similar) a device's shell
+may have echoed back even with paging disabled — best-effort display/
+storage hygiene, not a parser, so it never raises.
+
+**Scheduling** (`ConfigRxWorker`) mirrors `fortipoll.WirelessPoller`'s
+shape (a small `ThreadPoolExecutor`, a scanning loop, a `_queued` set
+for de-duplicating concurrent triggers of the same device) rather than
+`nodepoll.py`'s larger multi-candidate-credential machinery, since a
+device here has exactly one fixed SSH credential rather than a
+group/profile fallback chain.
+
+---
+
 ## Web layer
 
 ### `web/server.py`
 
 Stdlib-only: `http.server.ThreadingHTTPServer` plus `ssl` when a
 certificate is configured. `ROUTES` is a flat list of
-`(method, compiled regex, handler)` tuples matched in order; a route's
-captured groups (e.g. a numeric ID) are passed as positional arguments to
-the handler after `(service, params, body)`. `PUBLIC_PATHS`/`PUBLIC_API`
-are the only things reachable without a session — the login page and what
-it needs to render, plus `/api/login` and `/api/session` itself (the
-latter needed by `waitForRestart()`'s post-restart polling, which by
-definition has no valid session yet).
+`(method, compiled regex, handler, requirement)` tuples matched in
+order; a route's captured groups (e.g. a numeric ID) are passed as
+positional arguments to the handler after `(service, params, body)`.
+`requirement` is the permission check for that route — see Permissions
+below — and is `None`, a static `(module, level)` pair, or (for the
+handful of routes whose actual requirement depends on the request body,
+e.g. `/api/password`'s self-change-vs-reset distinction) a
+`fn(params, body) -> (module, level) | None` callable. `PUBLIC_PATHS`/
+`PUBLIC_API` are the only things reachable without a session — the login
+page and what it needs to render, plus `/api/login` and `/api/session`
+itself (the latter needed by `waitForRestart()`'s post-restart polling,
+which by definition has no valid session yet).
 
 Every write method (POST/PUT/DELETE) is rejected with 415 unless its
 `Content-Type` is exactly `application/json` — a cross-site form can send
@@ -1741,10 +1955,11 @@ landing on a dead tab.
 That `start()`-driven restore alone still flashes NetPath on every
 reload, because it runs late: `start()` is called from a `DOMContentLoaded`
 listener, which fires only after every `<script src>` tag in `index.html`
-has been fetched and executed (eight of them, each its own blocking
-network round trip since `server.py` serves scripts `no-cache` with an
-`ETag`), and even then `start()` itself `await`s `loadState()` — a ninth
-round trip, to `/api/state` — before it reaches `selectTab()`. The static
+has been fetched and executed (over a dozen of them, each its own
+blocking network round trip since `server.py` serves scripts `no-cache`
+with an `ETag`), and even then `start()` itself `await`s `loadState()`
+— one more round trip, to `/api/state` — before it reaches
+`selectTab()`. The static
 markup's own default (`class="tab active"` on the NetPath button,
 `class="page active"` on `#page-netpath`) is what paints during that
 entire window, on every single reload, regardless of which tab was
@@ -1755,7 +1970,7 @@ A first attempt closed most of that window with a second inline
 `localStorage` lookup and class toggle before the external scripts even
 started loading. That narrowed the flash a great deal but didn't remove
 it: the script still sat after the *entire* rest of the page's markup —
-all seven `.page` sections, hundreds of lines — so on a slow enough
+every `.page` section, well over a thousand lines by now — so on a slow enough
 connection the browser could still paint a frame or two of the static
 default before the parser physically reached it.
 

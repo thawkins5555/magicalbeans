@@ -7,10 +7,13 @@ rules are in `README.md` and `NETWORK-AND-STORAGE-REQUIREMENTS.md`; the
 build history is in `CHANGELOG.md`; exactly how passwords and credentials
 are protected is in `CREDENTIAL-SECURITY.md`.
 
-Seven tabs: **Dashboard**, **NetPath**, **NetFlow**, **Syslog**, **IPAM**,
-then **Debug** and **Settings**, which stay rightmost so adding a module
-never moves them. Dashboard is currently a placeholder — reserved space for
-a future cross-module overview, not yet holding anything of its own.
+**Dashboard**, **Nodes**, **Alerts**, **NetPath**, **NetFlow**, **SNMP
+Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
+and **Settings**, which stay rightmost so adding a module never moves
+them. Dashboard aggregates a summary of whatever other modules the
+signed-in account can read — see Permissions, under Settings — rather
+than being its own tab with data of its own. A tab the signed-in account
+has no read access to is hidden from the tab bar entirely.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -212,12 +215,23 @@ own subtabs.
 
 ### Drill-down
 
-Selecting a device opens its identity, live status, a metric picker with
-a zoomable chart (recent points plotted directly; a wide window reads an
-hourly min/avg/max rollup instead of scanning months of raw samples), its
-current interface table, and a combined device/interface event history —
-the interface and event lists scroll independently of the chart and
-header above them once they outgrow the panel, and a draggable divider
+Selecting a device opens its identity, live status, a status timeline, a
+metric picker with a zoomable chart, its current interface table, and a
+combined device/interface event history.
+
+**The status timeline is always the first thing shown**, above the metric
+picker — a colored bar of up/down/unsupported/auth-failed segments across
+the selected time window, visible immediately on selecting a device
+rather than only after picking a metric. It's built from `device_events`
+(a sparse transition log, not a dense per-poll sample table), so a device
+that's been up for a week with zero events still renders as one solid
+"up" segment rather than appearing to have no data.
+
+Below it, the metric chart (recent points plotted directly; a wide window
+reads an hourly min/avg/max rollup instead of scanning months of raw
+samples), the interface table, and the event history — the interface and
+event lists scroll independently of the chart and header above them once
+they outgrow the panel, and a draggable divider
 between chart and lists sets the split (remembered per browser). An
 interface's in/out directions share one picker entry and one chart, drawn
 as two colored lines; axis labels are unit-formatted ("1.6 Mbps", "40%").
@@ -882,6 +896,71 @@ server, which it almost always already is.
 
 ---
 
+## Wireless — Fortinet AP dashboard
+
+An at-a-glance table of every access point behind a FortiGate Wireless
+Controller, without polling each AP individually — the controller
+reports on all of them in one SNMP walk.
+
+- **Add a controller** with its IP and an SNMP credential (v1/v2c
+  community, or SNMPv3 noAuthNoPriv/authNoPriv — the same limitation
+  Nodes has, since this app has no AES/DES implementation to speak
+  authPriv with; the controller-add form says so directly). Managed from
+  **Controllers**, next to the module's Settings button.
+- **Per AP: status, name, client count, model, MAC address, and tx
+  power** — the last shown per-radio, since a real AP has more than one
+  (2.4/5/6 GHz). Selecting a row shows the full per-radio breakdown:
+  channel, tx power and client count for each.
+- **Polled on a fixed interval** (default 60 s) via repeated SNMP
+  GETNEXT walks of the FortiGate Wireless Controller MIB's
+  `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable` —
+  the exact same table-walking approach Nodes' own SNMP poller uses,
+  rather than a second, separate GETBULK code path. An AP the controller
+  stops reporting on is removed from the list; a controller that's
+  briefly unreachable does not wipe its AP list, only a poll that
+  genuinely succeeded but no longer sees that AP does.
+- **Search** filters by AP name, MAC address, or model; a **Controller**
+  dropdown narrows the list to one controller.
+
+## ConfigRX — SSH config backups
+
+Scheduled, read-only backups of a device's running configuration, pulled
+over SSH. **There is no device list of its own** — the searchable device
+list is Nodes' own device list; ConfigRX only adds its own per-device
+backup configuration (SSH port/username/password, whether backup is
+enabled, an optional vendor override) on top of it.
+
+- **Selecting a device shows its stored backups** — timestamp and size —
+  and selecting a backup shows its raw config text in a read-only panel.
+  There is no editable field and no save-back action anywhere in this
+  module: it only ever pulls a config, never pushes one, and there is no
+  free-form command box anywhere in its UI or API.
+- **A backup is only stored when it differs from the device's previous
+  one** (compared by SHA-256 hash) — an unchanged config updates that
+  device's last-checked time without growing the database. **Back up
+  now** forces an immediate pull for one device, the same "do it now"
+  convention Nodes' own **Poll now** uses.
+- **Exactly one fixed, read-only command per vendor**, matched against
+  the device's vendor as Nodes already detected it over SNMP (or an
+  explicit override, for a vendor Nodes didn't identify): Cisco IOS
+  `show running-config`, FortiOS `show full-configuration`, Junos `show
+  configuration`, MikroTik RouterOS `/export`, HP/Aruba `show
+  running-config` — plus, for vendors that need it, a session-scoped
+  pagination-disable command (e.g. `terminal length 0`) sent first. An
+  unrecognized vendor is skipped with a clear error rather than guessed
+  at. ConfigRX never enters a device's configuration/enable-write mode
+  and never sends anything beyond that one fixed command.
+- **The SSH password is encrypted at rest** (see `CREDENTIAL-SECURITY.md`)
+  and is never returned by any API response — only whether one is stored.
+  It is decrypted only in memory, immediately before connecting, and
+  discarded the moment the connection attempt finishes.
+- **Retention**: keep for N days, and/or keep at most N per device —
+  either can be set to 0 to disable that particular cap. A device whose
+  config never changes stays at one stored backup regardless of either
+  cap, since an unchanged pull never creates a new row to begin with.
+
+---
+
 ## Debug
 
 What the background threads are doing, right now. Nothing here is written to
@@ -904,8 +983,9 @@ disk.
   Select one to see its detail: the exact command line, the resolved address,
   the path, the stored trace id and the raw traceroute output as the OS
   printed it.
-- Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, IPAM,
-  System, Errors) or by free text across both messages and details.
+- Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, SNMP
+  Trap, Nodes, Alerts, IPAM, Wireless, ConfigRX, System, Errors) or by free
+  text across both messages and details.
 - **Follow**, **Pause**, **Clear** and **Export** — the last writes the
   filtered view to a text file, which is the thing to attach to a ticket.
 
@@ -926,6 +1006,8 @@ Configuration sits at the level it belongs to.
 | **Settings** button, top right of Nodes | Poll worker pool, default interval/timeout/retries, down-after-failures, discovery, storage retention |
 | **Settings** button, top right of Alerts | Engine on/off, evaluation severity floor, SMTP server and credential, volume limits |
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
+| **Settings** button, top right of Wireless | Poller on/off, poll interval — controllers themselves are managed from **Controllers**, next to it |
+| **Settings** button, top right of ConfigRX | Worker on/off, backup interval, retention (days and per-device count) |
 | **Add** / **Edit** on a destination | That destination's own probe settings, and — Edit only — continuous per-hop probing |
 
 The Settings tab holds only what crosses module boundaries. Reverse DNS is the
@@ -959,20 +1041,49 @@ swaps it into the running install, and restarts the service so the new
 code takes effect immediately; if not, it says so and stops there. The
 screen grays out with a status dialog for the duration, since restarting
 signs everyone out — sessions are in memory — and it lands you back on the
-sign-in page once the service answers again. **Change password**,
-elsewhere on this page, is the only other place a full page reload
-follows a button press for the same reason: changing your own password
-ends every session on that account, this one included.
+sign-in page once the service answers again. **Change password**, an
+always-reachable "Account" control in the top bar rather than anything on
+this page (see Permissions below), is the only other place a full page
+reload follows a button press for the same reason: changing your own
+password ends every session on that account, this one included.
+
+### Permissions
+
+Every account has an explicit **read** or **write** grant per module —
+Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
+ConfigRX, Settings, Debug — set from **Settings → Users** (itself gated
+on Settings write access). Write implies read; no grant at all means no
+access. A tab the signed-in account can't read is hidden from the tab
+bar, and a write-gated control (add/edit/delete buttons, a module's
+Settings gear) is hidden within a tab the account can only read — both
+purely client-side conveniences, since the server enforces the identical
+check on every route regardless of what the browser shows. The Dashboard
+tab is the one exception: it's always visible and simply omits whatever
+sections the signed-in account can't read, rather than being gated as a
+whole.
+
+**Changing your own password always works**, even with zero access to
+Settings — it lives in an "Account" control in the top bar, independent
+of the Settings tab, rather than being gated like everything else there.
+Resetting a *different* account's password still requires Settings write
+access, same as adding, editing or removing an account.
+
+An install upgrading from a version before this shipped keeps every
+existing account's access exactly as it was — the first time the
+permissions table is created, every account already on file is granted
+full write access to every module, so nobody loses anything on upgrade.
+Only accounts created after that point start with whatever grants an
+admin explicitly assigns in the Add User dialog.
 
 ---
 
 ## Data
 
-Eight SQLite files, in WAL mode. One for the application, seven for records.
+Ten SQLite files, in WAL mode. One for the application, nine for records.
 
 | File | Holds |
 | --- | --- |
-| `app.db` | Global settings, user accounts, the shared reverse-DNS cache |
+| `app.db` | Global settings, user accounts, per-account per-module permissions, the shared reverse-DNS cache |
 | `netpath.db` | Destinations, traces, per-hop samples, NetPath settings |
 | `flows.db` | Flow records, exporters, interface names, NetFlow settings |
 | `snmptraps.db` | Traps, an OID name table, SNMP Trap settings |
@@ -980,6 +1091,8 @@ Eight SQLite files, in WAL mode. One for the application, seven for records.
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential |
 | `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |
+| `wireless.db` | Wireless controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials |
+| `configrx.db` | Per-device backup configuration (keyed by a Nodes device id, no real foreign key — see ConfigRX below), stored config backups, ConfigRX settings, optional SSH credentials |
 
 Each record file holds its own module's data and its own module's settings, and
 nothing else. Anything read by more than one module — the reverse-DNS settings
@@ -992,10 +1105,10 @@ again.
 
 Default location is `%APPDATA%\netpath-monitor\` on Windows and
 `~/.local/share/netpath-monitor/` elsewhere; override with `--db`, `--flow-db`,
-`--snmp-db`, `--syslog-db`, `--app-db`, `--ipam-db`, `--nodes-db` and
-`--alerts-db`. All eight upgrade their schema automatically on launch, and an
-install that predates `app.db` moves its settings, accounts and name cache
-into it on the first start.
+`--snmp-db`, `--syslog-db`, `--app-db`, `--ipam-db`, `--nodes-db`,
+`--alerts-db`, `--wireless-db` and `--configrx-db`. All ten upgrade their
+schema automatically on launch, and an install that predates `app.db`
+moves its settings, accounts and name cache into it on the first start.
 
 **Data > Export window to CSV** writes the current window's traces.
 
@@ -1014,8 +1127,9 @@ into it on the first start.
 - **Closing the service console stops collection**, leaving gaps in the
   timeline that show as dark blocks. Run `--headless` under a service manager
   for anything that should keep collecting unattended.
-- **There are no roles.** Every account has full access, so adding one is an
-  administrative act.
+- **Permissions are per-module, not per-object.** An account with Nodes
+  write access can edit or delete any device, not a subset of them —
+  there is no per-device or per-group access control within a module.
 - **Sessions do not survive a restart.** They are held in memory deliberately;
   restarting the service signs everyone out.
 - **IPAM discovery is ARP-based, so MAC addresses and conflict detection only
@@ -1035,3 +1149,16 @@ into it on the first start.
   re-entering there. Windows Credential Manager, the other way to authenticate
   a DHCP server, has no such restriction — it is configured per machine
   anyway, not shipped inside the database.
+- **ConfigRX can only back up a device whose vendor it recognizes.** A
+  fixed, deliberately short allow-list — Cisco, FortiOS, Junos, MikroTik,
+  HP/Aruba — is the entire set of "show config" commands this app knows
+  how to run; a device Nodes couldn't identify, or one from a vendor not
+  in that list, needs a vendor override set to a value on the list before
+  it can be backed up, or it's skipped with a clear error. This is
+  deliberate: adding a new vendor means adding its fixed, read-only show-
+  command to `configrx_vendors.py`, never accepting one typed into a
+  field.
+- **ConfigRX never pushes a configuration change, to any device, ever.**
+  There is no code path in this module capable of it — no free-form
+  command box, no "push config" action, nowhere in its UI or API. It only
+  ever pulls a read-only snapshot.
