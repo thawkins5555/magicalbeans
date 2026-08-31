@@ -6,6 +6,33 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.16.0 — Discovery scan controls, cancel/discard flow, debug visibility
+
+- **The Debug page now shows discovery scans in progress** — a new
+  DISCOVERY SCANS RUNNING section (below NODE POLLS) with each running
+  sweep's target, probed-of-total progress, how many devices answered
+  ping and SNMP so far, and a live elapsed timer; the summary line
+  reports active scan count next to the Nodes poller state.
+- **Starting a discovery scan now opens a timing dialog** — ping timeout,
+  ping retries, SNMP timeout, and SNMP retries (extra attempts per
+  credential), pre-filled from the module defaults. The values apply to
+  that one scan only and are never written back to any profile or
+  setting. Retries genuinely retry now: extra ping passes revisit only
+  the addresses that haven't answered, and SNMP identification re-attempts
+  each credential the chosen number of times.
+- **Cancelling a scan now ends in the same approve/deny dialog** as a
+  finished one, listing whatever it had found up to that point — add the
+  devices you want, or **Discard scan**, which removes the scan and its
+  results from the list entirely. Finished/cancelled/errored scans also
+  get a Remove button in the jobs list (previously a cancelled scan sat
+  there forever with no way to clear it). Fixed along the way: a cancel
+  arriving while the last address was being probed used to land the scan
+  in state "done" instead of "cancelled".
+- **Table column resize grips are now visible** — the draggable handles
+  between column headers (Flow Records' Time/Source/Port columns, the
+  device list, and every other resizable table) show a light tick mark
+  instead of appearing only on hover.
+
 ### 4.15.0 — Selected-device fast poll, interface drill-down dialog, visible splitters
 
 - **The device selected in the Nodes module now polls every 3 seconds**

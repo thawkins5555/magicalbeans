@@ -664,11 +664,27 @@ def get_debug(service, params, body) -> dict:
                                      "elapsed": now - (work.get("queued") or now)})
         node_workers.sort(key=lambda row: row["elapsed"], reverse=True)
 
+    # One row per discovery scan currently sweeping, with its live
+    # progress counters — same shape as the worker tables above plus the
+    # probed/found columns a bounded sweep naturally has.
+    discovery_scans = []
+    for job in service.nodes_db.discovery_jobs(20):
+        if job["state"] != "running":
+            continue
+        discovery_scans.append({
+            "label": f"{job['target']} ({job['kind']})",
+            "probed": job["probed"], "total": job["total"],
+            "responded": job["responded"], "identified": job["identified"],
+            "elapsed": now - job["started_ts"],
+        })
+    discovery_scans.sort(key=lambda row: row["elapsed"], reverse=True)
+
     return {
         "workers": workers,
         "dns_workers": dns_workers,
         "ipam_workers": ipam_workers,
         "node_workers": node_workers,
+        "discovery_scans": discovery_scans,
         "events": events,
         "last_seq": service.log.last_seq,
         "targets": sorted({e["target"] for e in events if e["target"]}),
@@ -686,6 +702,7 @@ def get_debug(service, params, body) -> dict:
             "ipam_active": len(ipam_workers),
             "nodes": service.node_poller.running,
             "nodes_active": len(node_workers),
+            "discovery_active": len(discovery_scans),
             "buffered": len(service.log.all()),
         },
     }
@@ -2029,6 +2046,19 @@ def post_nodes_discovery(service, params, body) -> dict:
             "This profile has no v1/v2c communities for discovery to try. "
             "Pick a profile with one, or allow ping-only devices.")
     overrides = {"discovery_communities": communities}
+    # Per-scan timing overrides from the Start-discovery dialog — they
+    # live only in this job's settings, never in stored settings.
+    for body_key, override_key, cast in (
+            ("snmp_timeout_s", "discovery_snmp_timeout_s", float),
+            ("ping_timeout_s", "discovery_ping_timeout_s", float),
+            ("snmp_retries", "discovery_snmp_retries", int),
+            ("ping_retries", "discovery_ping_retries", int)):
+        value = body.get(body_key)
+        if value is not None and str(value) != "":
+            value = cast(value)
+            if value < 0:
+                raise ValueError(f"{body_key} cannot be negative")
+            overrides[override_key] = value
     job_id = service.node_poller.start_discovery(
         kind, target, overrides=overrides, allow_ping_only=allow_ping_only)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
@@ -2050,10 +2080,16 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
+    """DELETE on a running scan cancels it (the row stays, so its partial
+    results can still be reviewed); DELETE on any finished/cancelled/
+    errored scan removes it — and its results — from the list for good."""
     if not service.nodes_db.discovery_job(job_id):
         raise ValueError("No such discovery job")
-    service.node_poller.cancel_discovery(job_id)
-    return {"ok": True}
+    if service.node_poller.discovery_running(job_id):
+        service.node_poller.cancel_discovery(job_id)
+        return {"ok": True, "cancelled": True}
+    service.nodes_db.remove_discovery_job(job_id)
+    return {"ok": True, "removed": True}
 
 
 def post_nodes_discovery_promote(service, params, body, job_id) -> dict:

@@ -119,12 +119,32 @@ class DiscoveryJob:
         self.db.update_discovery_job(self.job_id, total=len(addresses))
 
         communities = _candidate_communities(self.settings.get("discovery_communities"))
-        timeout_s = float(self.settings.get("default_snmp_timeout_s", 3.0))
+        # Per-scan overrides (the Start-discovery dialog) fall back to the
+        # module defaults; they exist only in this job's settings dict and
+        # never touch stored settings.
+        default_timeout = float(self.settings.get("default_snmp_timeout_s", 3.0))
+        snmp_timeout_s = float(
+            self.settings.get("discovery_snmp_timeout_s") or default_timeout)
+        ping_timeout_s = float(
+            self.settings.get("discovery_ping_timeout_s") or default_timeout)
+        snmp_retries = max(0, int(self.settings.get("discovery_snmp_retries") or 0))
+        ping_retries = max(0, int(self.settings.get("discovery_ping_retries") or 0))
         groups = self.db.groups()
 
         # One bulk ping pass first, then SNMP per address — mirrors
-        # ipam_scan.scan_subnet's own shape rather than interleaving.
-        alive = sweep(addresses, timeout_ms=int(timeout_s * 1000))
+        # ipam_scan.scan_subnet's own shape rather than interleaving. Extra
+        # ping passes (per-scan retries) only revisit the addresses that
+        # have not answered yet.
+        alive = sweep(addresses, timeout_ms=int(ping_timeout_s * 1000))
+        for _ in range(ping_retries):
+            if self._stop.is_set():
+                break
+            silent = [ip for ip in addresses if not alive.get(ip)]
+            if not silent:
+                break
+            alive.update({ip: ok for ip, ok in
+                          sweep(silent, timeout_ms=int(ping_timeout_s * 1000)).items()
+                          if ok})
 
         probed = responded = identified = 0
         for ip in addresses:
@@ -144,7 +164,8 @@ class DiscoveryJob:
             # probing SNMP against hundreds of genuinely dead addresses.
             result = {"ip": ip, "ping_ok": 1 if ping_ok else 0, "snmp_ok": 0}
             if ping_ok or self.kind == "device":
-                identity = self._try_snmp(ip, communities, timeout_s)
+                identity = self._try_snmp(ip, communities, snmp_timeout_s,
+                                          snmp_retries)
                 if identity is not None:
                     identified += 1
                     result.update(identity)
@@ -156,15 +177,33 @@ class DiscoveryJob:
             self.db.update_discovery_job(self.job_id, probed=probed,
                                          responded=responded, identified=identified)
 
-        self.db.update_discovery_job(self.job_id, state="done", finished_ts=time.time())
+        # A cancel that lands while the final (or only) address is being
+        # probed exits the loop normally — the top-of-loop check never
+        # sees it — so the flag decides the terminal state, not the loop.
+        state = "cancelled" if self._stop.is_set() else "done"
+        self.db.update_discovery_job(self.job_id, state=state,
+                                     finished_ts=time.time())
 
-    def _try_snmp(self, ip: str, communities: list[str], timeout_s: float):
+    def _try_snmp(self, ip: str, communities: list[str], timeout_s: float,
+                  retries: int = 0):
+        """Default is still one shot per version/community combination (a
+        retry per guess makes a subnet sweep crawl); extra attempts happen
+        only when the Start-discovery dialog asked for them for this one
+        scan."""
         oids = list(nodeoids.SYSTEM_SCALARS.values())
         for version in (V2C, 0):   # try v2c first, fall back to v1
             for community in communities:
-                try:
-                    response = _snmp_identify(ip, version, community, timeout_s, oids)
-                except SnmpError:
+                response = None
+                for _attempt in range(1 + retries):
+                    if self._stop.is_set():
+                        return None
+                    try:
+                        response = _snmp_identify(ip, version, community,
+                                                  timeout_s, oids)
+                        break
+                    except SnmpError:
+                        continue
+                if response is None:
                     continue
                 values = {vb["oid"]: vb["value"] for vb in response.varbinds
                          if vb["type"] not in ("noSuchObject", "noSuchInstance")}

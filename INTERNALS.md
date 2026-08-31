@@ -359,9 +359,28 @@ profile) now simply means the sweep runs ping-only, a combination
 `post_nodes_discovery` refuses up front unless the job was started with
 `allow_ping_only`.
 
+Per-scan timing: the Start-discovery dialog's ping/SNMP timeout and
+retry values travel as `discovery_*` keys in the job's own settings
+dict (the same override channel the profile's community list already
+uses) — they exist only for that job and never touch stored settings.
+Ping retries re-sweep only the not-yet-answered addresses;
+`_try_snmp`'s default stays one shot per version/community combination
+(a retry per guess makes a subnet sweep crawl) with extra attempts only
+when this scan asked for them.
+
+Cancel/remove: DELETE on a discovery job cancels it while it is running
+(the row stays so partial results remain reviewable) and deletes it —
+results cascading via the FK — once it is not, which is also what the
+jobs list's Remove button and the cancelled-scan dialog's "Discard scan"
+button call. The job's terminal state is decided by the stop flag after
+the address loop, not only by the top-of-loop check: a cancel landing
+while the final (or only) address was mid-probe used to fall through to
+`done`.
+
 Approval flow: `discovery_jobs` carries `allow_ping_only` (a start-time
 choice, not a promote-time one) and `reviewed`. The browser pops the
-approve/deny dialog for any job that is `done` with `reviewed = 0` and
+approve/deny dialog for any job that is `done` — or `cancelled`, where
+it offers Discard instead of Dismiss — with `reviewed = 0` and
 marks it reviewed via `POST .../reviewed` whichever button answers it —
 on upgrade, `_migrate()` adds `reviewed` with DEFAULT 1 (unlike the
 schema's DEFAULT 0) precisely so every pre-upgrade finished job counts

@@ -494,6 +494,17 @@ th .grip {
   cursor: col-resize;
   z-index: 1;
 }
+/* A visible resting tick between column headers — same reasoning as the
+   pane dividers: a resize handle nobody can see might as well not exist. */
+th .grip::after {
+  content: '';
+  position: absolute;
+  top: 20%;
+  bottom: 20%;
+  right: 3px;
+  width: 1px;
+  background: var(--faint);
+}
 th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 
 /* --------------------------------------------------------------- syslog */

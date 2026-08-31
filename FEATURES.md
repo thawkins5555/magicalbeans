@@ -145,6 +145,11 @@ own subtabs.
 - **A subnet sweep refuses anything over the configured address-count
   limit** before sending a single packet, the same guard IPAM's own
   subnet scan uses.
+- **Each scan sets its own timing.** Starting a scan opens a small dialog
+  for ping/SNMP timeouts and retries, pre-filled from the module
+  defaults — the values apply to that one sweep only. Extra ping passes
+  revisit only the addresses that haven't answered; SNMP retries re-attempt
+  each credential.
 - **A finished scan ends in an approve/deny dialog** — every discovered
   device listed with a checkbox, SNMP-identified ones pre-checked, and
   nothing added until "Add approved" is clicked. Dismissing adds nothing,
@@ -154,6 +159,11 @@ own subtabs.
   "Also offer ping-only devices" option — enforced server-side, not just
   in the dialog — and an approved ping-only device is created with SNMP
   polling switched off so it doesn't sit failing SNMP forever.
+- **A cancelled scan gets the same dialog for whatever it found** before
+  it stopped — add those devices, or Discard the scan and its results
+  entirely. Any scan that is no longer running can be removed from the
+  jobs list with its Remove button. Running scans are visible on the
+  Debug page (DISCOVERY SCANS RUNNING) with live progress.
 - **Promotion is idempotent**: a result already promoted is a no-op to
   promote again, not a duplicate-IP error. Discovery suggests a polling
   profile from the device's vendor OID root where one matches, falling

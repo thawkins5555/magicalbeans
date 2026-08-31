@@ -15,6 +15,7 @@
     dnsWorkers: [], dnsCells: [], dnsFetchedAt: 0,
     ipamWorkers: [], ipamCells: [], ipamFetchedAt: 0,
     nodeWorkers: [], nodeCells: [], nodeFetchedAt: 0,
+    discScans: [], discCells: [], discFetchedAt: 0,
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -91,6 +92,13 @@
       view.nodeCells.forEach((cell, index) => {
         const worker = view.nodeWorkers[index];
         if (worker) cell.textContent = `${(worker.elapsed + extra).toFixed(1)}s`;
+      });
+    }
+    if (view.discCells.length) {
+      const extra = (Date.now() - view.discFetchedAt) / 1000;
+      view.discCells.forEach((cell, index) => {
+        const scan = view.discScans[index];
+        if (scan) cell.textContent = `${(scan.elapsed + extra).toFixed(1)}s`;
       });
     }
   }
@@ -196,6 +204,33 @@
     }
   }
 
+  const DISC_COLUMNS = ['Scan', 'Progress', 'Found', 'Elapsed'];
+
+  function drawDiscScans(scans) {
+    view.discScans = scans;
+    view.discFetchedAt = Date.now();
+    view.discCells = [];
+    const table = App.el('dbg-disc');
+    table.innerHTML =
+      `<thead><tr>${DISC_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+    const body = document.createElement('tbody');
+    if (!scans.length) {
+      body.innerHTML = '<tr><td colspan="4" class="hint">No discovery scan running right now</td></tr>';
+    }
+    for (const scan of scans) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${escape(scan.label)}</td>` +
+        `<td>${scan.probed} of ${scan.total} probed</td>` +
+        `<td>${scan.identified} SNMP · ${scan.responded} ping</td>` +
+        `<td>${scan.elapsed.toFixed(1)}s</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    for (const row of body.children) {
+      if (row.children.length > 3) view.discCells.push(row.children[3]);
+    }
+  }
+
   function categoriesOn() {
     const out = new Set();
     for (const input of App.el('dbg-categories').querySelectorAll('input')) {
@@ -275,6 +310,7 @@
     drawDnsWorkers(payload.dns_workers || []);
     drawIpamWorkers(payload.ipam_workers || []);
     drawNodeWorkers(payload.node_workers || []);
+    drawDiscScans(payload.discovery_scans || []);
 
     const summary = payload.summary;
     const dns = (App.state.serverState || {}).dns || {};
@@ -291,7 +327,8 @@
       `IPAM ${summary.ipam ? 'running' : 'stopped'}` +
         (summary.ipam_active ? `, ${summary.ipam_active} agent(s) active` : ''),
       `Nodes ${summary.nodes ? 'running' : 'stopped'}` +
-        (summary.nodes_active ? `, ${summary.nodes_active} polling now` : ''),
+        (summary.nodes_active ? `, ${summary.nodes_active} polling now` : '') +
+        (summary.discovery_active ? `, ${summary.discovery_active} scan(s) sweeping` : ''),
       `${summary.buffered} events buffered`,
     ];
     App.el('dbg-summary').textContent = parts.join('  ·  ');

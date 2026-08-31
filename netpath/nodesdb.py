@@ -1198,6 +1198,15 @@ class NodesDatabase:
                 "UPDATE discovery_jobs SET reviewed = 1 WHERE id = ?", (job_id,))
             self._conn.commit()
 
+    def remove_discovery_job(self, job_id: int) -> None:
+        """Deletes the job and (via the FK cascade) its results. Devices
+        already promoted from those results are untouched — promotion
+        copies what it needs onto the devices row."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM discovery_jobs WHERE id = ?", (job_id,))
+            self._conn.commit()
+
     def update_discovery_job(self, job_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in
                   ("state", "total", "probed", "responded", "identified",

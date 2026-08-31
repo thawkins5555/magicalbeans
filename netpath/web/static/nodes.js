@@ -989,13 +989,24 @@
     for (const job of view.discJobs) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.discSelected === job.id ? ' selected' : '');
+      const action = job.state === 'running'
+        ? '<button class="cancel-disc">Cancel</button>'
+        : '<button class="cancel-disc">Remove</button>';
       tr.innerHTML = `<td>${escape(job.target)} <span class="hint">(${job.kind})</span></td>` +
         `<td>${escape(job.state)}</td>` +
         `<td>${job.identified}/${job.probed} of ${job.total}</td>` +
-        `<td>${job.state === 'running' ? '<button class="cancel-disc">Cancel</button>' : ''}</td>`;
+        `<td>${action}</td>`;
       tr.onclick = (e) => {
         if (e.target.classList.contains('cancel-disc')) {
-          App.del(`/api/nodes/discovery/${job.id}`).then(() => App.refreshNow('nodes'));
+          // Cancels a running scan; removes a finished/cancelled one.
+          App.del(`/api/nodes/discovery/${job.id}`).then(() => {
+            if (view.discSelected === job.id && job.state !== 'running') {
+              view.discSelected = null;
+              view.discResults = [];
+              drawDiscResultsTable();
+            }
+            App.refreshNow('nodes');
+          });
           return;
         }
         view.discSelected = job.id;
@@ -1052,25 +1063,51 @@
     }
   }
 
-  async function startDiscovery() {
+  function startDiscovery() {
     const target = App.el('disc-target').value.trim();
     if (!target) return;
     const group_id = Number(App.el('disc-group').value);
     if (!group_id) { discStatus('Pick a polling profile first.', true); return; }
     const allow_ping_only = App.el('disc-pingonly').checked;
-    let result;
-    try {
-      result = await App.post('/api/nodes/discovery',
-        { target, group_id, allow_ping_only });
-    } catch (error) {
-      discStatus(error.message, true);
-      return;
-    }
-    discStatus('');
-    view.discSelected = result.id;
-    view.discChecked = new Set();
-    view.discCheckedJob = result.id;
-    App.refreshNow('nodes');
+    const s = App.state.nodesSettings || {};
+    const timeout = s.default_snmp_timeout_s || 3;
+    const number = (id, label, value, attrs = '') =>
+      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    // Per-scan timing only — the values apply to this one sweep and are
+    // never written back to any profile or setting.
+    App.modal(`Start discovery of ${escape(target)}`, `
+      <p class="hint">Timing for this scan only. Retries are extra
+        attempts on an address that hasn't answered; more retries or a
+        longer timeout makes a large sweep noticeably slower.</p>
+      ${number('disc-o-pingto', 'Ping timeout', timeout, 'min=0.2 step=0.1')} s
+      ${number('disc-o-pingretry', 'Ping retries', 0, 'min=0 max=5')}
+      ${number('disc-o-snmpto', 'SNMP timeout', timeout, 'min=0.2 step=0.1')} s
+      ${number('disc-o-snmpretry', 'SNMP retries (per credential)', 0, 'min=0 max=5')}`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Start scan', primary: true, onClick: async (box) => {
+        const num = (id) => Number(box.querySelector(id).value);
+        let result;
+        try {
+          result = await App.post('/api/nodes/discovery', {
+            target, group_id, allow_ping_only,
+            ping_timeout_s: num('#disc-o-pingto'),
+            ping_retries: num('#disc-o-pingretry'),
+            snmp_timeout_s: num('#disc-o-snmpto'),
+            snmp_retries: num('#disc-o-snmpretry'),
+          });
+        } catch (error) {
+          App.closeModal();
+          discStatus(error.message, true);
+          return;
+        }
+        App.closeModal();
+        discStatus('');
+        view.discSelected = result.id;
+        view.discChecked = new Set();
+        view.discCheckedJob = result.id;
+        App.refreshNow('nodes');
+      } },
+    ]);
   }
 
   function discStatus(text, isError) {
@@ -1088,8 +1125,10 @@
   async function maybeShowApproval() {
     if (view.approvalOpenFor !== null) return;
     if (!App.el('modal').hidden) return;   // never clobber an open dialog
-    const job = view.discJobs.find((j) => j.state === 'done' && !j.reviewed);
+    const job = view.discJobs.find(
+      (j) => (j.state === 'done' || j.state === 'cancelled') && !j.reviewed);
     if (!job) return;
+    const cancelled = job.state === 'cancelled';
     view.approvalOpenFor = job.id;
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
@@ -1102,14 +1141,46 @@
       App.closeModal();
       App.refreshNow('nodes');
     };
+    const discard = async () => {
+      // The job is no longer running, so DELETE removes it and its
+      // results outright rather than cancelling.
+      await App.del(`/api/nodes/discovery/${job.id}`).catch(() => {});
+      view.approvalOpenFor = null;
+      if (view.discSelected === job.id) {
+        view.discSelected = null;
+        view.discResults = [];
+        drawDiscResultsTable();
+      }
+      App.closeModal();
+      App.refreshNow('nodes');
+    };
     if (!found.length) {   // nothing to approve — don't pop an empty dialog
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
       view.approvalOpenFor = null;
       return;
     }
     const checked = new Set(seed);
-    const box = App.modal(`Discovery of ${escape(job.target)} finished`, `
-      <p class="hint">Approve the devices to add. ${job.allow_ping_only
+    const title = cancelled
+      ? `Discovery of ${escape(job.target)} cancelled`
+      : `Discovery of ${escape(job.target)} finished`;
+    const lead = cancelled
+      ? `The scan stopped after probing ${job.probed} of ${job.total}
+         address(es) but had already found the devices below. Add the
+         ones you want, or discard the scan and everything it found.`
+      : 'Approve the devices to add.';
+    const buttons = [
+      cancelled ? { label: 'Discard scan', onClick: discard }
+                : { label: 'Dismiss', onClick: finish },
+      { label: 'Add approved', primary: true, onClick: async () => {
+        if (checked.size) {
+          await App.post(`/api/nodes/discovery/${job.id}/promote`,
+            { result_ids: [...checked] }).catch(() => {});
+        }
+        await finish();
+      } },
+    ];
+    const box = App.modal(title, `
+      <p class="hint">${lead} ${job.allow_ping_only
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
       <div class="table-wrap" style="max-height:50vh">
@@ -1119,16 +1190,7 @@
           const html = discResultRowsHtml(found, job, 'disc-approve');
           view.discChecked = saved; return html;
         })()}</tbody></table>
-      </div>`, [
-      { label: 'Dismiss', onClick: finish },
-      { label: 'Add approved', primary: true, onClick: async () => {
-        if (checked.size) {
-          await App.post(`/api/nodes/discovery/${job.id}/promote`,
-            { result_ids: [...checked] }).catch(() => {});
-        }
-        await finish();
-      } },
-    ]);
+      </div>`, buttons);
     for (const cb of box.querySelectorAll('.disc-approve')) {
       cb.onchange = () => {
         const id = Number(cb.dataset.result);
