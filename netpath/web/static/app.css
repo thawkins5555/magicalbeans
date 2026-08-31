@@ -107,6 +107,17 @@ body {
 .subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .subpage.active { display: flex; }
 
+/* #nd-detail (the Nodes device drill-down) has no class of its own, so
+   without this it's a plain block element — its .subpage children's
+   flex:1 has nothing to flex against, so the interfaces/events tables
+   grow to their full content height instead of being bounded and
+   scrollable, and the outer [data-splitter] > .pane's overflow:hidden
+   then silently clips the overflow instead of scrolling it. This app's
+   own [hidden] { display: none !important; } rule above always wins
+   regardless of rule order, so this coexists safely with the existing
+   .hidden toggle in nodes.js. */
+#nd-detail { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+
 .badge {
   background: var(--warn);
   color: #1a1a1a;

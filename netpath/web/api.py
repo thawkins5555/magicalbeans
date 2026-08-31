@@ -643,10 +643,31 @@ def get_debug(service, params, body) -> dict:
             })
         ipam_workers.sort(key=lambda row: row["elapsed"], reverse=True)
 
+    # One row per device currently being polled or queued to be — the
+    # same "join worker_state against the entity list for a label" shape
+    # the NetPath `workers` table above already uses, just without that
+    # table's per-target budget/schedule columns, since a device's poll
+    # has no fixed budget the way a trace's hop/probe counts imply one.
+    node_state = service.node_poller.worker_state()
+    node_workers = []
+    if node_state:
+        devices_by_id = {d["id"]: d for d in service.nodes_db.devices()}
+        for device_id, work in node_state.items():
+            device = devices_by_id.get(device_id)
+            label = (device["name"] or device["ip"]) if device else f"device #{device_id}"
+            if work.get("started"):
+                node_workers.append({"kind": "polling", "label": label,
+                                     "elapsed": now - work["started"]})
+            else:
+                node_workers.append({"kind": "queued", "label": label,
+                                     "elapsed": now - (work.get("queued") or now)})
+        node_workers.sort(key=lambda row: row["elapsed"], reverse=True)
+
     return {
         "workers": workers,
         "dns_workers": dns_workers,
         "ipam_workers": ipam_workers,
+        "node_workers": node_workers,
         "events": events,
         "last_seq": service.log.last_seq,
         "targets": sorted({e["target"] for e in events if e["target"]}),
@@ -662,6 +683,8 @@ def get_debug(service, params, body) -> dict:
             "packets": service.collector.counters["packets"],
             "ipam": service.ipam.running,
             "ipam_active": len(ipam_workers),
+            "nodes": service.node_poller.running,
+            "nodes_active": len(node_workers),
             "buffered": len(service.log.all()),
         },
     }
@@ -1336,7 +1359,8 @@ def _tri(value):
 def _device_json(row) -> dict:
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
-        "group_id": row["group_id"], "enabled": bool(row["enabled"]),
+        "group_id": row["group_id"], "device_group_id": row["device_group_id"],
+        "enabled": bool(row["enabled"]),
         "snmp_version": row["snmp_version"], "community": row["community"],
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         # The community string is not a secret — it travels in the clear in
@@ -1410,7 +1434,8 @@ def _discovery_result_json(row) -> dict:
             "promoted_device_id": row["promoted_device_id"]}
 
 
-_DEVICE_EDITABLE_BODY = ("name", "group_id", "enabled", "snmp_version", "community",
+_DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id", "enabled",
+                         "snmp_version", "community",
                          "v3_user", "v3_auth_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
                          "snmp_enabled", "oid_set")
@@ -1451,10 +1476,13 @@ def get_nodes_overview(service, params, body) -> dict:
 
 def get_nodes_devices(service, params, body) -> dict:
     group_id = params.get("group_id")
+    device_group_id = params.get("device_group_id")
     status = params.get("status") or None
     text = params.get("q") or None
     rows = service.nodes_db.devices(
-        group_id=int(group_id) if group_id else None, status=status, text=text)
+        group_id=int(group_id) if group_id else None,
+        device_group_id=int(device_group_id) if device_group_id else None,
+        status=status, text=text)
     worker_state = service.node_poller.worker_state()
     devices = []
     for row in rows:
@@ -1471,11 +1499,14 @@ def post_nodes_device(service, params, body) -> dict:
     if service.nodes_db.device_by_ip(ip):
         raise ValueError(f"{ip} is already a device")
     group_id = body.get("group_id")
+    device_group_id = body.get("device_group_id")
     overrides = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY
-                and k not in ("name", "group_id", "enabled")}
+                and k not in ("name", "group_id", "device_group_id", "enabled")}
     device_id = service.nodes_db.add_device(
         ip, name=body.get("name") or None,
-        group_id=int(group_id) if group_id else None, **overrides)
+        group_id=int(group_id) if group_id else None,
+        device_group_id=int(device_group_id) if device_group_id else None,
+        **overrides)
     service.log.add(NODES_CATEGORY, f"Added device {ip}")
     return {"id": device_id}
 
@@ -1709,6 +1740,42 @@ def delete_nodes_device_credential(service, params, body, device_id) -> dict:
     return {"ok": True}
 
 
+def _device_group_json(row) -> dict:
+    return {"id": row["id"], "name": row["name"], "created_ts": row["created_ts"]}
+
+
+def get_nodes_device_groups(service, params, body) -> dict:
+    return {"groups": [_device_group_json(r) for r in service.nodes_db.device_groups()]}
+
+
+def post_nodes_device_group(service, params, body) -> dict:
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("A name is required")
+    device_group_id = service.nodes_db.add_device_group(name)
+    service.log.add(NODES_CATEGORY, f"Added device group {name}")
+    return {"id": device_group_id}
+
+
+def put_nodes_device_group(service, params, body, device_group_id) -> dict:
+    if not service.nodes_db.device_group(device_group_id):
+        raise ValueError("No such device group")
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("A name is required")
+    service.nodes_db.rename_device_group(device_group_id, name)
+    return {"ok": True}
+
+
+def delete_nodes_device_group(service, params, body, device_group_id) -> dict:
+    row = service.nodes_db.device_group(device_group_id)
+    if not row:
+        raise ValueError("No such device group")
+    service.nodes_db.remove_device_group(device_group_id)
+    service.log.add(NODES_CATEGORY, f"Removed device group {row['name']}")
+    return {"ok": True}
+
+
 def get_nodes_groups(service, params, body) -> dict:
     return {"groups": [_group_json(service, r) for r in service.nodes_db.groups()]}
 
@@ -1736,10 +1803,21 @@ def delete_nodes_group(service, params, body, group_id) -> dict:
     row = service.nodes_db.group(group_id)
     if not row:
         raise ValueError("No such polling profile")
-    if row["is_default"]:
-        raise ValueError("The Default polling profile cannot be removed")
+    in_use = service.nodes_db.device_count_for_group(group_id)
+    if in_use:
+        raise ValueError(f"{in_use} device(s) still use this profile — "
+                         "move them to another profile first")
     service.nodes_db.remove_group(group_id)
     service.log.add(NODES_CATEGORY, f"Removed polling profile {row['name']}")
+    return {"ok": True}
+
+
+def post_nodes_group_default(service, params, body, group_id) -> dict:
+    row = service.nodes_db.group(group_id)
+    if not row:
+        raise ValueError("No such polling profile")
+    service.nodes_db.set_default_group(group_id)
+    service.log.add(NODES_CATEGORY, f"{row['name']} is now the default polling profile")
     return {"ok": True}
 
 
@@ -1856,6 +1934,25 @@ def delete_nodes_group_credential_secret(service, params, body, group_id, creden
     return {"ok": True}
 
 
+def _discovery_communities_for_group(service, group_id: int) -> str:
+    """Every v1/v2c community from this profile's credentials — its own
+    primary one plus every group_credentials alternate — joined the same
+    way the old free-text field was, so nodediscover.py itself needs no
+    changes. A v3-only profile contributes nothing here (v3 identification
+    was never in scope for a blind discovery sweep — see nodediscover.py's
+    own docstring); _candidate_communities("") already falls back to
+    "public" in that case, same as it always has."""
+    group_row = service.nodes_db.group(group_id)
+    if group_row is None:
+        return ""
+    rows = [group_row] + list(service.nodes_db.group_credentials(group_id))
+    communities = []
+    for row in rows:
+        if row["snmp_version"] in (0, 1) and row["community"] and row["community"] not in communities:
+            communities.append(row["community"])
+    return ",".join(communities)
+
+
 def post_nodes_discovery(service, params, body) -> dict:
     kind = str(body.get("kind", "")).strip()
     target = str(body.get("target", "")).strip()
@@ -1863,10 +1960,13 @@ def post_nodes_discovery(service, params, body) -> dict:
         raise ValueError("kind must be 'device' or 'subnet'")
     if not target:
         raise ValueError("A target is required")
-    overrides = {}
-    if body.get("communities"):
-        overrides["discovery_communities"] = body["communities"]
-    job_id = service.node_poller.start_discovery(kind, target, overrides=overrides or None)
+    group_id = body.get("group_id")
+    if not group_id:
+        raise ValueError("A polling profile is required")
+    if not service.nodes_db.group(group_id):
+        raise ValueError("No such polling profile")
+    overrides = {"discovery_communities": _discovery_communities_for_group(service, group_id)}
+    job_id = service.node_poller.start_discovery(kind, target, overrides=overrides)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
     return {"id": job_id}
 
@@ -1939,15 +2039,8 @@ def _object_to_dict(obj) -> dict:
 
 
 def _known_oids_for_resolve(service) -> dict:
-    """WELL_KNOWN_ROOTS plus every OID this app has already resolved from
-    a previously uploaded MIB — the only "IMPORTS resolution" this parser
-    does: never by fetching the imported module itself, only against
-    what's already known (mibparse.py's own stated non-goal)."""
     from .. import mibparse
-
-    known = dict(mibparse.WELL_KNOWN_ROOTS)
-    known.update(service.nodes_db.all_known_oids())
-    return known
+    return mibparse.known_oids_for(service.nodes_db)
 
 
 def get_nodes_mibs(service, params, body) -> dict:
@@ -1976,22 +2069,13 @@ def post_nodes_mib(service, params, body) -> dict:
         raise ValueError(f"File exceeds the {max_bytes:,} byte limit")
     text = raw.decode("utf-8", "replace")
 
-    result = mibparse.parse(text, max_bytes=max_bytes)
-    resolved_count, unresolved = mibparse.resolve(
-        result.objects, _known_oids_for_resolve(service))
-
-    mib_file_id = service.nodes_db.add_mib_file(
-        filename, result.module, len(result.objects), unresolved,
-        "; ".join(result.notes), content=text)
-    service.nodes_db.replace_mib_objects(
-        mib_file_id, [_object_to_dict(obj) for obj in result.objects])
+    result = mibparse.load_into(service.nodes_db, filename, text,
+                                _known_oids_for_resolve(service), max_bytes)
     service._snmp_settings_with_mibs()
     service.log.add(NODES_CATEGORY,
-                    f"Uploaded MIB {filename} ({result.module or 'unknown module'}): "
-                    f"{resolved_count}/{len(result.objects)} object(s) resolved")
-    return {"id": mib_file_id, "module": result.module,
-            "object_count": len(result.objects), "resolved_count": resolved_count,
-            "unresolved": unresolved, "notes": result.notes}
+                    f"Uploaded MIB {filename} ({result['module'] or 'unknown module'}): "
+                    f"{result['resolved_count']}/{result['object_count']} object(s) resolved")
+    return result
 
 
 def get_nodes_mib(service, params, body, mib_file_id) -> dict:

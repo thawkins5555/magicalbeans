@@ -84,6 +84,17 @@ own subtabs.
   credential override still uses exactly that one, unchanged — the
   profile's list only comes into play for a device relying on the
   profile.
+- **A profile can be deleted as long as no device currently uses it** —
+  including the default profile. Deleting an in-use profile is refused
+  with a message naming how many devices still reference it; deleting the
+  default profile (once unused) promotes the next remaining profile
+  automatically. Any profile can be made the default from a "Set default"
+  button on the Profiles tab.
+- **Devices can be organized into groups**, independent of which polling
+  profile they use — purely organizational, a device belongs to at most
+  one group at a time (or none). Groups are managed from a small dialog
+  next to the Devices filter bar; removing a group leaves its devices
+  ungrouped rather than erroring.
 - **The scheduler is shaped like NetPath's own trace `Monitor`**, not
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
   due-time seeding from each device's own last poll time, so a restart
@@ -109,11 +120,15 @@ own subtabs.
 
 - **Per-device or per-subnet.** A subnet sweep pings every address first
   (reusing IPAM's own sweep code, not a second implementation), then
-  attempts an SNMP v1/v2c identity probe — trying each configured
-  candidate community — against whichever addresses answered; a
-  single-device job always attempts SNMP even without a ping reply, since
-  a real device can have ICMP filtered. SNMPv3 is not auto-discovered: it
-  needs a username a blind sweep does not have.
+  attempts an SNMP v1/v2c identity probe against whichever addresses
+  answered; a single-device job always attempts SNMP even without a ping
+  reply, since a real device can have ICMP filtered. SNMPv3 is not
+  auto-discovered: it needs a username a blind sweep does not have.
+- **A polling profile is chosen before a scan runs, not typed communities.**
+  Discovery's form offers a dropdown of every existing polling profile;
+  every SNMP v1/v2c community that profile knows — its primary community
+  plus any additional credentials — is tried during the probe, the same
+  set a device on that profile would try when polling.
 - **A subnet sweep refuses anything over the configured address-count
   limit** before sending a single packet, the same guard IPAM's own
   subnet scan uses.
@@ -124,6 +139,14 @@ own subtabs.
 
 ### Vendor MIBs
 
+- **A handful of MIBs ship with the app and load automatically on first
+  start** — an IF-MIB core subset covering the interface columns Nodes
+  already polls, and enterprise-number roots for around twenty common
+  vendors — through the exact same upload/parse path described below, so
+  they're indistinguishable from an upload afterward. A real vendor MIB
+  uploaded later resolves its parent enterprise arc immediately instead of
+  reporting it unresolved until a second file arrives. Deleting a bundled
+  MIB is respected; it does not come back on the next restart.
 - **Uploaded and parsed by a hand-rolled, stdlib-only best-effort
   reader** — not a MIB compiler, the same framing the SNMP Trap
   receiver's own OID name table already used. It finds every
@@ -144,7 +167,9 @@ own subtabs.
 Selecting a device opens its identity, live status, a metric picker with
 a zoomable chart (recent points plotted directly; a wide window reads an
 hourly min/avg/max rollup instead of scanning months of raw samples), its
-current interface table, and a combined device/interface event history.
+current interface table, and a combined device/interface event history —
+the interface and event lists scroll independently of the chart and
+header above them once they outgrow the panel.
 
 ---
 

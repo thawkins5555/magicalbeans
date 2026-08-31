@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 from ..alertengine import AlertEngine
 from ..alertsdb import AlertsDatabase
@@ -22,6 +23,7 @@ from ..eventlog import SYSTEM, EventLog
 from ..flowdb import FlowDatabase
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
+from ..mibparse import known_oids_for, load_into
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
 from ..nodesdb import NodesDatabase
@@ -138,6 +140,7 @@ class Service:
             self.syslog.start(self.syslog_settings)
         if self.snmp_settings.get("enabled", True):
             self.snmp.start(self.snmp_settings)
+        self._seed_default_mibs()
         self._snmp_settings_with_mibs()
         if self.ipam_settings.get("enabled", True):
             self.ipam.start()
@@ -286,6 +289,37 @@ class Service:
         self.alert_engine.reconfigure(self.alerts_settings)
         self.log.add(SYSTEM, "Alerts settings applied")
         return self.alerts_settings
+
+    def _seed_default_mibs(self) -> None:
+        """Load the MIB files bundled under netpath/mibs/ through the same
+        parse/resolve/store path a real upload uses, so a fresh install
+        starts with a browsable IF-MIB and enterprise-root arcs instead of
+        an empty MIB list. Tracked by filename in the "seeded_mib_files"
+        setting rather than by checking mib_files() for that name: an
+        admin who deletes a bundled MIB removes its mib_files() row, so
+        presence there can't tell "never seeded" from "deleted on purpose"
+        — only the persistent seeded-list can, and only it must, or the
+        next restart would silently bring a deleted MIB back."""
+        mibs_dir = Path(__file__).resolve().parent.parent / "mibs"
+        if not mibs_dir.is_dir():
+            return
+        already = {name for name in
+                   str(self.nodes_settings.get("seeded_mib_files", "")).split(",")
+                   if name}
+        max_bytes = int(self.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+        seeded = False
+        for path in sorted(mibs_dir.glob("*.mib")):
+            if path.name in already:
+                continue
+            text = path.read_text(encoding="utf-8")
+            known = known_oids_for(self.nodes_db)
+            load_into(self.nodes_db, path.name, text, known, max_bytes)
+            already.add(path.name)
+            seeded = True
+        if seeded:
+            self.nodes_settings["seeded_mib_files"] = ",".join(sorted(already))
+            self.nodes_db.save_settings(self.nodes_settings)
+            self._snmp_settings_with_mibs()
 
     def _snmp_settings_with_mibs(self) -> None:
         """MIB-derived OID names apply to both what Nodes polls and what the

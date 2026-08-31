@@ -7,6 +7,7 @@
   const view = {
     devices: [],
     groups: [],
+    deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
     detail: null,           // full device detail payload
     metrics: [],
@@ -63,6 +64,7 @@
     { key: 'status', label: 'Status', width: 90 },
     { key: 'name', label: 'Name / IP', width: 200 },
     { key: 'group', label: 'Profile', width: 130 },
+    { key: 'devgroup', label: 'Group', width: 120 },
     { key: 'vendor', label: 'Vendor', width: 120 },
     { key: 'response', label: 'Response', width: 90, numeric: true },
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true,
@@ -74,6 +76,8 @@
     const body = document.createElement('tbody');
     const groupsById = {};
     for (const g of view.groups) groupsById[g.id] = g.name;
+    const devGroupsById = {};
+    for (const g of view.deviceGroups) devGroupsById[g.id] = g.name;
     for (const row of view.devices) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
@@ -84,6 +88,7 @@
         `<td>${dot}${escape(row.status)}</td>` +
         `<td>${escape(row.name || row.ip)}<div class="hint">${escape(row.ip)}</div></td>` +
         `<td>${escape(groupsById[row.group_id] || '—')}</td>` +
+        `<td>${escape(devGroupsById[row.device_group_id] || '—')}</td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${escape(rtt)}</td>` +
         `<td>${ago(row.last_poll_ts)}</td>`;
@@ -297,6 +302,13 @@
     ).join('');
   }
 
+  function deviceGroupOptionsHtml(selectedId) {
+    const options = (view.deviceGroups || []).map((g) =>
+      `<option value="${g.id}" ${g.id === selectedId ? 'selected' : ''}>${escape(g.name)}</option>`
+    ).join('');
+    return `<option value="" ${!selectedId ? 'selected' : ''}>(none)</option>${options}`;
+  }
+
   function deviceForm(device) {
     const d = device || {};
     const cfg = d.id ? d : {};
@@ -304,6 +316,7 @@
       <label>IP address <input id="nd-f-ip" value="${escape(d.ip || '')}" ${d.id ? 'readonly' : ''}></label>
       <label>Name <input id="nd-f-name" value="${escape(d.name || '')}"></label>
       <label>Polling profile <select id="nd-f-group">${groupOptionsHtml(d.group_id)}</select></label>
+      <label>Group <select id="nd-f-devgroup">${deviceGroupOptionsHtml(d.device_group_id)}</select></label>
       <fieldset><legend>OVERRIDES (blank = use the profile's value)</legend>
         <label>SNMP version <select id="nd-f-version">
           <option value="">(profile)</option>
@@ -365,11 +378,12 @@
         const ip = box.querySelector('#nd-f-ip').value.trim();
         if (!ip) return;
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
+        const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
         const authPass = box.querySelector('#nd-f-authpass').value;
         const name = box.querySelector('#nd-f-name').value.trim();
         const result = await App.post('/api/nodes/devices',
-          { ip, name, group_id, ...overrides });
+          { ip, name, group_id, device_group_id, ...overrides });
         if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
           await App.post(`/api/nodes/devices/${result.id}/credential`,
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -395,10 +409,12 @@
       { label: 'Test', onClick: () => testDevice(box, d.id) },
       { label: 'Save', primary: true, onClick: async (box) => {
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
+        const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
         const authPass = box.querySelector('#nd-f-authpass').value;
         const name = box.querySelector('#nd-f-name').value.trim();
-        await App.put(`/api/nodes/devices/${d.id}`, { name, group_id, ...overrides });
+        await App.put(`/api/nodes/devices/${d.id}`,
+          { name, group_id, device_group_id, ...overrides });
         if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
           await App.post(`/api/nodes/devices/${d.id}/credential`,
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -409,6 +425,66 @@
         App.refreshNow('nodes');
       } },
     ]);
+  }
+
+  /* ---------------------------------------------------------- device groups
+     Purely organizational folders, unrelated to polling profiles — managed
+     from one small modal rather than a subtab, given how little there is
+     to manage (a list, add, rename, remove). */
+
+  function deviceGroupListHtml() {
+    if (!view.deviceGroups.length) return '<p class="hint">No groups yet.</p>';
+    const rows = view.deviceGroups.map((g) => `
+      <tr data-devgroup-id="${g.id}">
+        <td><input type="text" class="devgroup-name" value="${escape(g.name)}"></td>
+        <td><button type="button" class="devgroup-save">Save</button></td>
+        <td><button type="button" class="devgroup-remove">Remove</button></td>
+      </tr>`).join('');
+    return `<table><thead><tr><th>Name</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  function wireDeviceGroupRows(box) {
+    for (const tr of box.querySelectorAll('[data-devgroup-id]')) {
+      const id = Number(tr.dataset.devgroupId);
+      tr.querySelector('.devgroup-save').onclick = async () => {
+        const name = tr.querySelector('.devgroup-name').value.trim();
+        if (!name) return;
+        await App.put(`/api/nodes/device-groups/${id}`, { name });
+        await refreshDeviceGroupsList(box);
+        App.refreshNow('nodes');
+      };
+      tr.querySelector('.devgroup-remove').onclick = async () => {
+        await App.del(`/api/nodes/device-groups/${id}`);
+        await refreshDeviceGroupsList(box);
+        App.refreshNow('nodes');
+      };
+    }
+  }
+
+  async function refreshDeviceGroupsList(box) {
+    const payload = await App.get('/api/nodes/device-groups');
+    view.deviceGroups = payload.groups;
+    box.querySelector('#nd-devgroups-list').innerHTML = deviceGroupListHtml();
+    wireDeviceGroupRows(box);
+  }
+
+  function manageDeviceGroups() {
+    const box = App.modal('Manage device groups', `
+      <div id="nd-devgroups-list">${deviceGroupListHtml()}</div>
+      <label>New group <input id="nd-devgroup-new" placeholder="e.g. Core Switches"></label>
+      <button type="button" id="nd-devgroup-add">Add</button>`, [
+      { label: 'Close', primary: true, onClick: App.closeModal },
+    ]);
+    wireDeviceGroupRows(box);
+    box.querySelector('#nd-devgroup-add').onclick = async () => {
+      const input = box.querySelector('#nd-devgroup-new');
+      const name = input.value.trim();
+      if (!name) return;
+      await App.post('/api/nodes/device-groups', { name });
+      input.value = '';
+      await refreshDeviceGroupsList(box);
+      App.refreshNow('nodes');
+    };
   }
 
   async function testDevice(box, deviceId) {
@@ -666,18 +742,45 @@
     wireCredentialsSection(box, g.id);
   }
 
+  function profileStatus(message, isError) {
+    const el = App.el('nd-profile-status');
+    el.innerHTML = isError ? `<span class="err">${escape(message)}</span>` : escape(message || '');
+  }
+
   function removeProfile() {
     const g = view.groups.find((x) => x.id === view.groupSelected);
-    if (!g || g.is_default) return;
-    App.modal('Remove profile', `<p>Remove <b>${escape(g.name)}</b>? Devices using it fall back to the Default profile.</p>`, [
+    if (!g) return;
+    App.modal('Remove profile', `<p>Remove <b>${escape(g.name)}</b>?${g.is_default
+      ? ' It is currently the default profile — another remaining profile becomes default in its place.'
+      : ' Devices using it fall back to the Default profile.'}</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Remove', primary: true, onClick: async () => {
-        await App.del(`/api/nodes/groups/${g.id}`);
+        try {
+          await App.del(`/api/nodes/groups/${g.id}`);
+        } catch (error) {
+          App.closeModal();
+          profileStatus(error.message, true);
+          return;
+        }
         App.closeModal();
+        profileStatus('');
         view.groupSelected = null;
         App.refreshNow('nodes');
       } },
     ]);
+  }
+
+  async function setDefaultProfile() {
+    const g = view.groups.find((x) => x.id === view.groupSelected);
+    if (!g || g.is_default) return;
+    try {
+      await App.post(`/api/nodes/groups/${g.id}/default`, {});
+    } catch (error) {
+      profileStatus(error.message, true);
+      return;
+    }
+    profileStatus(`${g.name} is now the default profile.`);
+    App.refreshNow('nodes');
   }
 
   /* ---------------------------------------------------------- discovery */
@@ -739,11 +842,19 @@
     const kind = App.el('disc-kind').value;
     const target = App.el('disc-target').value.trim();
     if (!target) return;
-    const communities = App.el('disc-communities').value.trim();
-    const result = await App.post('/api/nodes/discovery', { kind, target, communities });
+    const group_id = Number(App.el('disc-group').value);
+    if (!group_id) return;
+    const result = await App.post('/api/nodes/discovery', { kind, target, group_id });
     view.discSelected = result.id;
     view.discChecked = new Set();
     App.refreshNow('nodes');
+  }
+
+  function fillDiscGroups() {
+    const select = App.el('disc-group');
+    const previous = select.value;
+    select.innerHTML = groupOptionsHtml(previous ? Number(previous) : undefined);
+    if (!select.value && view.groups.length) select.value = String(view.groups[0].id);
   }
 
   async function promoteSelected() {
@@ -831,7 +942,9 @@
         ${check('np-pingonly', 'Ping alone can mark a device up when SNMP fails', s.unreachable_ping_only)}
       </fieldset>
       <fieldset><legend>DISCOVERY</legend>
-        <label>Default communities <input id="np-communities" value="${escape(s.discovery_communities || 'public')}"></label>
+        <p class="hint">Every discovery sweep now uses a chosen polling
+          profile's own credentials — see the Profile picker on the
+          Discovery subtab.</p>
         ${number('np-maxscan', 'Max addresses per subnet sweep', s.max_scan_addresses, 'min=1')}
       </fieldset>
       <fieldset><legend>STORAGE</legend>
@@ -848,7 +961,6 @@
           default_interval_s: num('#np-interval'), default_snmp_timeout_s: num('#np-timeout'),
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
           unreachable_ping_only: on('#np-pingonly'),
-          discovery_communities: box.querySelector('#np-communities').value.trim(),
           max_scan_addresses: num('#np-maxscan'),
           sample_retention_days: num('#np-sampledays'), event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
@@ -867,21 +979,26 @@
     drawStatus();
     const q = App.el('nd-q').value.trim();
     const group_id = App.el('nd-filter-group').value;
+    const device_group_id = App.el('nd-filter-devgroup').value;
     const status = App.el('nd-filter-status').value;
-    const [devices, groups, mibs] = await Promise.all([
-      App.get('/api/nodes/devices', { q, group_id, status }),
+    const [devices, groups, deviceGroups, mibs] = await Promise.all([
+      App.get('/api/nodes/devices', { q, group_id, device_group_id, status }),
       App.get('/api/nodes/groups'),
+      App.get('/api/nodes/device-groups'),
       App.get('/api/nodes/mibs'),
       loadDiscJobsIfNeeded(),
     ]);
     view.devices = devices.devices;
     view.groups = groups.groups;
+    view.deviceGroups = deviceGroups.groups;
     view.mibFiles = mibs.files;
     if (view.selected && !view.devices.some((d) => d.id === view.selected)) {
       view.selected = null;
     }
     if (!view.selected && view.devices.length) view.selected = view.devices[0].id;
     fillGroupFilter();
+    fillDevGroupFilter();
+    fillDiscGroups();
     drawTable();
     drawProfilesTable();
     drawMibsTable();
@@ -903,6 +1020,14 @@
     select.value = current;
   }
 
+  function fillDevGroupFilter() {
+    const select = App.el('nd-filter-devgroup');
+    const current = select.value;
+    select.innerHTML = '<option value="">any group</option>' +
+      view.deviceGroups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
+    select.value = current;
+  }
+
   function init() {
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => selectSub(btn.dataset.subtab);
@@ -920,13 +1045,16 @@
     App.el('nd-apply').onclick = () => App.refreshNow('nodes');
     App.el('nd-q').onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('nodes'); };
     App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
+    App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
+    App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-d-metric').onchange = (e) => { view.metricId = Number(e.target.value); loadSeries(); };
     App.el('nd-d-range').onchange = (e) => { view.chartRange = Number(e.target.value); loadSeries(); };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
     App.el('nd-remove-profile').onclick = removeProfile;
+    App.el('nd-default-profile').onclick = setDefaultProfile;
     App.el('nd-upload-mib').onclick = uploadMib;
     App.el('nd-settings').onclick = settingsDialog;
     App.el('nd-toggle').onclick = async () => {

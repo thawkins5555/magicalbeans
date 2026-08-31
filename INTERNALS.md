@@ -104,7 +104,7 @@ each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, Alerts' own settings |
 
 ---
@@ -203,6 +203,46 @@ every candidate has failed; the caller's existing status/counter
 classification in `_poll_device` is unaffected; it just sees the same
 exception type a single-credential poll would have raised.
 
+**Device groups vs. polling profiles.** `device_groups` is a separate
+table from `groups` (polling profiles), deliberately — conflating "which
+credentials/interval a device uses" with "which folder it's organized
+under" would make every future profile change also have to reason about
+an unrelated grouping concept, and vice versa. `devices.device_group_id`
+is a nullable FK with `ON DELETE SET NULL`, the same nullable-FK shape
+`devices.group_id` already used, so removing a group only ungroups its
+devices rather than requiring an in-use guard — unlike losing a polling
+profile, losing an organizational folder is harmless.
+
+**Default profile deletion and reassignment.** `remove_group()` no longer
+special-cases `is_default` — every profile, default or not, is refused
+deletion while `device_count_for_group()` is nonzero (a plain `COUNT(*)`,
+not a full `devices()` fetch, to avoid paying for full rows just to
+count). This tightens what was previously an inconsistency: a
+*non*-default profile could always be deleted before, silently orphaning
+its devices via the same `ON DELETE SET NULL`, while only the default one
+was ever blocked. If the profile being removed is currently the default
+(already confirmed unused), the same transaction promotes the next
+remaining profile — lowest `id` — to default before deleting; if none
+remain, no profile is left flagged default, which the existing
+`ensure_default_group()` lazy-reseed already handles transparently the
+next time one is needed, the same path a brand-new install already goes
+through. `set_default_group()` is a two-statement transaction (clear the
+old default, set the new one) with no in-use check, since making a
+profile default moves no devices.
+
+### Debug page node pollers
+
+`get_debug`'s `node_workers` list is built the same way its existing
+`ipam_workers` list is: `NodePoller.worker_state()` (already consumed
+elsewhere to set each device's per-row `"polling"` flag) joined against
+`nodes_db.devices()` for display labels, split into `"queued"` vs.
+`"started"` states so the frontend's existing `elapsedText()` amber/queued
+styling applies without any new CSS. `debug.js`'s `nodeWorkers`/
+`nodeCells`/`nodeFetchedAt` triplet and `drawNodeWorkers()` are copies of
+the pre-existing `ipam*`/`drawIpamWorkers()` shape, including the
+`fastTick()` branch that advances displayed elapsed time between fetches
+without re-polling.
+
 `counter_rate()` and `detect_reboot()` are pure functions, unit-tested in
 the module's own `__main__` block with no network needed. A 32-bit
 counter that decreased is assumed to have wrapped once; a 64-bit counter
@@ -241,8 +281,18 @@ for the ping half rather than reimplementing it, then attempts an
 unauthenticated v1/v2c SNMP identity GET (its own minimal single-shot UDP
 helper, not `nodepoll._Session`, to keep this module free of a
 module-level dependency on the poller and avoid a real import cycle)
-against whichever addresses answered, trying each configured candidate
-community in turn. `NodePoller` owns the dict of active jobs and exposes
+against whichever addresses answered, trying every v1/v2c community drawn
+from a caller-chosen polling profile (`api.py`'s `post_nodes_discovery`
+resolves the profile's primary credential plus its `group_credentials`
+alternates into a comma-separated community list before calling in,
+reusing the same `[primary] + group_credentials(...)` shape
+`credential_candidates()` already assembles for polling — v3-only
+credentials contribute nothing to the list, since discovery was already
+v1/v2c-only). `nodediscover.py` itself still knows nothing about
+profiles or credential storage — it only ever sees a plain community
+string via the pre-existing `discovery_communities` override key, the
+same one a hand-typed list used before profiles existed. `NodePoller`
+owns the dict of active jobs and exposes
 `start_discovery`/`cancel_discovery`/`promote`; `promote()` treats an
 already-promoted result as a no-op rather than a duplicate-IP error, so a
 partially-overlapping re-selection is always safe to retry.
@@ -282,6 +332,37 @@ table keeps the original uploaded text (`content` column) specifically
 so a later Resolve can re-parse from scratch — `mib_objects` only ever
 stores the final `oid` or `NULL`, never the `parent`/`last_arc` an
 unresolved object would need to retry.
+
+`load_into()`/`known_oids_for()` extract the exact parse → resolve →
+store sequence `post_nodes_mib` runs, as module-level functions taking a
+`NodesDatabase` directly, so a bundled MIB loaded at startup and a real
+upload go through provably identical code — same review UI afterward,
+same re-resolve behavior, same admin-edit-survives-re-resolve guarantee.
+
+### Bundled default MIBs (`netpath/mibs/`, `Service._seed_default_mibs`)
+
+Two hand-authored files ship under `netpath/mibs/`: `enterprise-roots.mib`
+(public IANA Private Enterprise Number arcs for ~20 common vendors,
+matching `trapoids.WELL_KNOWN`'s own number-to-name table) and
+`if-mib-core.mib` (an OBJECT-TYPE subset of RFC 2863's IF-MIB covering
+exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE` already poll). Both
+are original text describing public IANA/IETF facts, not copied vendor
+MIB material.
+
+`Service._seed_default_mibs()` runs once from `start()`, before
+`_snmp_settings_with_mibs()`. It cannot use "does a `mib_files` row with
+this filename already exist" as its skip condition, because that row is
+exactly what disappears when an admin deletes a bundled MIB on purpose —
+checking presence there would silently recreate it on the next restart.
+Instead, every filename ever successfully seeded is recorded in the
+`seeded_mib_files` setting (a CSV string, alongside Nodes' other settings
+in `nodes.db`) the first time it loads; each start checks a bundled
+file's name against that list, not against `mib_files()`, so "already
+seeded" and "deleted on purpose" are both skip conditions and neither is
+ever confused with "never seeded". Newly seeded names are merged into the
+setting and saved in the same pass, then `_snmp_settings_with_mibs()` is
+re-run so the bundled vendor names reach the SNMP Trap decoder on first
+start, exactly as any other upload would.
 
 ---
 

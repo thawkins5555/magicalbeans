@@ -6,6 +6,45 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.13.0 — Discovery profiles, node groups, debug visibility, bundled MIBs
+
+- **Discovery now requires picking a polling profile instead of typing SNMP
+  communities by hand.** The Discovery form's free-text Communities field is
+  gone; in its place is a Profile dropdown listing every existing polling
+  profile. Every credential on that profile — its primary community/version
+  plus any additional credentials — is tried during the scan, the same set
+  a device on that profile would try when polling.
+- **The Debug page now shows Node polls in progress**, alongside the
+  existing trace worker, DNS, and IPAM sections — a new NODE POLLS IN
+  PROGRESS table lists each device currently being polled with its
+  elapsed time, and the summary line at the top now reports whether the
+  Nodes poller is running and how many polls are active.
+- **A handful of default MIBs now ship with the app**, loaded automatically
+  on first start through the same parse/upload path a manually uploaded
+  MIB goes through: an IF-MIB core subset covering the interface columns
+  Nodes already polls (with real DESCRIPTION text and status/enum tables),
+  and a set of enterprise-number roots for ~20 common vendors, so a real
+  vendor MIB uploaded afterward resolves cleanly against its parent arc on
+  the first try. Deleting a bundled MIB is respected — it is not silently
+  recreated on the next restart.
+- **Devices can now be organized into groups**, independent of which
+  polling profile they use — a device belongs to at most one group at a
+  time (or none). A "Manage groups" button next to the Devices filter bar
+  opens a simple add/rename/remove dialog; the device list gets a Group
+  column and filter, and the Add/Edit device form gets a Group picker.
+  Removing a group leaves its devices ungrouped rather than erroring.
+- **A polling profile can now be deleted even if it's the default one**,
+  as long as no device currently uses it — attempting to delete an in-use
+  profile (default or not) now shows a clear "N device(s) still use this
+  profile" message instead of either silently orphaning devices or being
+  unconditionally blocked. Deleting the default profile promotes the next
+  remaining one automatically. Any profile can now be made the default via
+  a new "Set default" button on the Profiles tab.
+- **The Interfaces and Events lists on a device's Statistics drill-down now
+  scroll independently** of the chart and header above them, instead of
+  silently overflowing and getting clipped once a device has more rows
+  than fit on screen.
+
 ### 4.12.0 — Multiple SNMP credentials per polling profile
 
 - **A Nodes polling profile can now hold more than one SNMP credential**,

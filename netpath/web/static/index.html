@@ -72,13 +72,15 @@
   <div id="nodes-sub-devices" class="subpage active">
     <div class="bar wrap">
       <label>Find <input id="nd-q" size="20"></label>
-      <label>Group <select id="nd-filter-group"></select></label>
+      <label>Profile <select id="nd-filter-group"></select></label>
+      <label>Group <select id="nd-filter-devgroup"></select></label>
       <label>Status <select id="nd-filter-status">
         <option value="">any status</option><option value="up">up</option>
         <option value="down">down</option><option value="unsupported">unsupported</option>
         <option value="auth">auth failed</option><option value="unknown">unknown</option>
       </select></label>
       <button id="nd-apply">Apply</button>
+      <button id="nd-manage-devgroups">Manage groups</button>
       <span class="grow"></span>
       <span id="nd-count" class="hint"></span>
     </div>
@@ -123,7 +125,7 @@
       <label>Kind <select id="disc-kind"><option value="device">Single device</option>
         <option value="subnet">Subnet</option></select></label>
       <label>Target <input id="disc-target" size="20" placeholder="10.20.3.0/24"></label>
-      <label>Communities <input id="disc-communities" size="16" value="public"></label>
+      <label>Profile <select id="disc-group"></select></label>
       <button id="disc-start" class="primary">Start</button>
     </div>
     <div class="cols" data-splitter="nodes-discovery">
@@ -144,10 +146,12 @@
       <div class="pane pad-x pad-b" data-grow="1">
         <div class="bar"><span class="section">POLLING PROFILES</span>
           <span class="grow"></span>
+          <button id="nd-default-profile">Set default</button>
           <button id="nd-edit-profile">Edit</button>
           <button id="nd-remove-profile">Remove</button>
           <button id="nd-add-profile" class="primary">Add</button></div>
         <div class="table-wrap"><table id="nd-profiles-table"></table></div>
+        <p class="hint" id="nd-profile-status"></p>
       </div>
       <div class="divider"></div>
       <div class="pane pad-x pad-b" data-grow="2">
@@ -601,6 +605,8 @@
     <div id="dbg-dns-wrap" class="table-wrap workers-small"><table id="dbg-dns"></table></div>
     <header class="bar"><span class="section">IPAM AGENTS RUNNING</span></header>
     <div id="dbg-ipam-wrap" class="table-wrap workers-small"><table id="dbg-ipam"></table></div>
+    <header class="bar"><span class="section">NODE POLLS IN PROGRESS</span></header>
+    <div id="dbg-nodes-wrap" class="table-wrap workers-small"><table id="dbg-nodes"></table></div>
    </div>
    <div class="divider"></div>
    <div class="pane" data-grow="35">

@@ -1,0 +1,33 @@
+SAPPIWHERE-ENTERPRISE-ROOTS DEFINITIONS ::= BEGIN
+
+-- Bundled with SappiWhere so a real vendor MIB uploaded afterward resolves
+-- on the first try instead of reporting its parent enterprise arc as
+-- unresolved until a second file is uploaded. Every arc below is a public
+-- IANA-assigned Private Enterprise Number under 1.3.6.1.4.1 (`enterprises`)
+-- -- see https://www.iana.org/assignments/enterprise-numbers -- named
+-- here only as "this number belongs to this vendor", not as any part of
+-- that vendor's own MIB text. mibparse.py's own WELL_KNOWN_ROOTS already
+-- knows `enterprises`, so every entry below resolves immediately.
+
+cisco          OBJECT IDENTIFIER ::= { enterprises 9 }
+hpCompaq       OBJECT IDENTIFIER ::= { enterprises 232 }
+microsoft      OBJECT IDENTIFIER ::= { enterprises 311 }
+apc            OBJECT IDENTIFIER ::= { enterprises 318 }
+dell           OBJECT IDENTIFIER ::= { enterprises 674 }
+netApp         OBJECT IDENTIFIER ::= { enterprises 789 }
+extremeNetworks OBJECT IDENTIFIER ::= { enterprises 1916 }
+brocade        OBJECT IDENTIFIER ::= { enterprises 1991 }
+huawei         OBJECT IDENTIFIER ::= { enterprises 2011 }
+ucdavis        OBJECT IDENTIFIER ::= { enterprises 2021 }
+juniper        OBJECT IDENTIFIER ::= { enterprises 2636 }
+f5             OBJECT IDENTIFIER ::= { enterprises 3375 }
+netgear        OBJECT IDENTIFIER ::= { enterprises 4526 }
+vmware         OBJECT IDENTIFIER ::= { enterprises 6876 }
+netSnmp        OBJECT IDENTIFIER ::= { enterprises 8072 }
+fortinet       OBJECT IDENTIFIER ::= { enterprises 12356 }
+mikrotik       OBJECT IDENTIFIER ::= { enterprises 14988 }
+paloAlto       OBJECT IDENTIFIER ::= { enterprises 25461 }
+h3c            OBJECT IDENTIFIER ::= { enterprises 25506 }
+arista         OBJECT IDENTIFIER ::= { enterprises 30065 }
+
+END

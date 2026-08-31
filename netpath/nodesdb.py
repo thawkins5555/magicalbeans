@@ -64,11 +64,24 @@ CREATE TABLE IF NOT EXISTS group_credentials (
 );
 CREATE INDEX IF NOT EXISTS ix_group_credentials_group ON group_credentials(group_id, id);
 
+-- Purely organizational — "which folder is this device in" (e.g. "Core
+-- Switches", "Branch A"), completely unrelated to a polling profile
+-- (which controls credentials/interval/etc). Deliberately a separate
+-- table rather than another column on `groups`: conflating "which
+-- credentials" with "which folder" would make every future profile
+-- change also have to think about an unrelated organizational concept.
+CREATE TABLE IF NOT EXISTS device_groups (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    created_ts  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS devices (
     id              INTEGER PRIMARY KEY,
     ip              TEXT NOT NULL UNIQUE,
     name            TEXT,                          -- display name, defaults to ip
     group_id        INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+    device_group_id INTEGER REFERENCES device_groups(id) ON DELETE SET NULL,
     enabled         INTEGER NOT NULL DEFAULT 1,
     -- per-device overrides; NULL means "use the group's value"
     snmp_version    INTEGER,
@@ -104,6 +117,7 @@ CREATE TABLE IF NOT EXISTS devices (
     created_ts      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_devices_group ON devices(group_id);
+CREATE INDEX IF NOT EXISTS ix_devices_device_group ON devices(device_group_id);
 CREATE INDEX IF NOT EXISTS ix_devices_status ON devices(status);
 
 CREATE TABLE IF NOT EXISTS interfaces (
@@ -253,6 +267,9 @@ DEFAULTS = {
     "max_scan_addresses": 1024,
     "discovery_communities": "public",
     "rollup_enabled": True,
+    "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
+                              # auto-loaded, so a deliberate delete is never
+                              # silently redone on the next restart
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -263,7 +280,7 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
 
-_DEVICE_EDITABLE = ("name", "group_id", "enabled") + _OVERRIDE_COLUMNS
+_DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "enabled") + _OVERRIDE_COLUMNS
 
 
 class NodesDatabase:
@@ -389,9 +406,42 @@ class NodesDatabase:
                 "UPDATE groups SET v3_auth_pass_enc=NULL WHERE id=?", (group_id,))
             self._conn.commit()
 
-    def remove_group(self, group_id: int) -> None:
+    def device_count_for_group(self, group_id: int) -> int:
         with self._lock:
-            self._conn.execute("DELETE FROM groups WHERE id = ? AND is_default = 0",
+            return self._conn.execute(
+                "SELECT COUNT(*) AS n FROM devices WHERE group_id = ?",
+                (group_id,)).fetchone()["n"]
+
+    def remove_group(self, group_id: int) -> None:
+        """Deletes a profile unconditionally — callers (api.py) are
+        expected to have already refused this via device_count_for_group()
+        if the profile is still in use, the same "read state, validate,
+        then mutate" split every other delete endpoint in this app
+        follows. If the profile being removed is the current default,
+        promotes the next remaining profile (lowest id, i.e. oldest) to
+        default in the same transaction, so "exactly one profile is
+        default, or zero if none remain" never breaks even for a moment.
+        A caller with zero profiles left falls back to
+        ensure_default_group()'s existing lazy reseed the next time one
+        is actually needed — the same behavior a brand-new install
+        already relies on."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT is_default FROM groups WHERE id = ?", (group_id,)).fetchone()
+            self._conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+            if row and row["is_default"]:
+                successor = self._conn.execute(
+                    "SELECT id FROM groups ORDER BY id LIMIT 1").fetchone()
+                if successor:
+                    self._conn.execute(
+                        "UPDATE groups SET is_default = 1 WHERE id = ?",
+                        (successor["id"],))
+            self._conn.commit()
+
+    def set_default_group(self, group_id: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE groups SET is_default = 0 WHERE is_default = 1")
+            self._conn.execute("UPDATE groups SET is_default = 1 WHERE id = ?",
                                (group_id,))
             self._conn.commit()
 
@@ -457,14 +507,57 @@ class NodesDatabase:
                 "DELETE FROM group_credentials WHERE id = ?", (credential_id,))
             self._conn.commit()
 
+    # ---------------------------------------------------------- device groups
+    #
+    # Purely organizational folders a device can optionally belong to —
+    # unrelated to `groups` (polling profiles) above. No in-use guard on
+    # removal: unlike deleting a polling profile (which would leave a
+    # device without credentials to poll with), losing an organizational
+    # folder is harmless — a device just becomes ungrouped, the same
+    # nullable-FK shape `devices.group_id` already uses.
+
+    def device_groups(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_groups ORDER BY name COLLATE NOCASE").fetchall()
+
+    def device_group(self, device_group_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_groups WHERE id = ?", (device_group_id,)).fetchone()
+
+    def add_device_group(self, name: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO device_groups(name, created_ts) VALUES (?,?)",
+                (name, time.time()))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def rename_device_group(self, device_group_id: int, name: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE device_groups SET name = ? WHERE id = ?", (name, device_group_id))
+            self._conn.commit()
+
+    def remove_device_group(self, device_group_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM device_groups WHERE id = ?", (device_group_id,))
+            self._conn.commit()
+
     # ---------------------------------------------------------------- devices
 
     def devices(self, group_id: int | None = None, status: str | None = None,
-               text: str | None = None) -> list[sqlite3.Row]:
+               text: str | None = None, device_group_id: int | None = None
+               ) -> list[sqlite3.Row]:
         clauses, params = [], []
         if group_id is not None:
             clauses.append("group_id = ?")
             params.append(group_id)
+        if device_group_id is not None:
+            clauses.append("device_group_id = ?")
+            params.append(device_group_id)
         if status:
             clauses.append("status = ?")
             params.append(status)
@@ -504,9 +597,10 @@ class NodesDatabase:
         return counts
 
     def add_device(self, ip: str, name: str | None = None,
-                   group_id: int | None = None, **overrides) -> int:
-        cols = ["ip", "name", "group_id", "created_ts"]
-        vals = [ip, name or ip, group_id, time.time()]
+                   group_id: int | None = None, device_group_id: int | None = None,
+                   **overrides) -> int:
+        cols = ["ip", "name", "group_id", "device_group_id", "created_ts"]
+        vals = [ip, name or ip, group_id, device_group_id, time.time()]
         for key in _OVERRIDE_COLUMNS:
             if key in overrides:
                 cols.append(key)

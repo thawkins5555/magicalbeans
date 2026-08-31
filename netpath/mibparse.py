@@ -271,6 +271,42 @@ def resolve(objects: list[ParsedObject], known: dict[str, str]) -> tuple[int, li
     return resolved, unresolved
 
 
+def known_oids_for(nodes_db) -> dict[str, str]:
+    """WELL_KNOWN_ROOTS plus every OID `nodes_db` has already resolved
+    from a previously stored MIB — the only "IMPORTS resolution" this
+    parser ever does, never by fetching the imported module itself, only
+    against what's already known (see this module's own non-goals
+    above). Shared by both the upload endpoint and the default-MIB
+    seeding step in service.py, so the two can never define this
+    differently."""
+    known = dict(WELL_KNOWN_ROOTS)
+    known.update(nodes_db.all_known_oids())
+    return known
+
+
+def load_into(nodes_db, filename: str, text: str, known_oids: dict[str, str],
+              max_bytes: int) -> dict:
+    """Parses, resolves against `known_oids`, and stores into `nodes_db`
+    — the exact three-step sequence a real upload runs, so a bundled
+    default MIB and an admin's own upload are provably the same code
+    path and indistinguishable afterward (same review UI, same
+    re-resolve button, same edit-survives-reresolve behavior). Returns
+    the same summary shape the upload endpoint returns to the browser."""
+    result = parse(text, max_bytes=max_bytes)
+    resolved_count, unresolved = resolve(result.objects, known_oids)
+    mib_file_id = nodes_db.add_mib_file(
+        filename, result.module, len(result.objects), unresolved,
+        "; ".join(result.notes), content=text)
+    nodes_db.replace_mib_objects(mib_file_id, [
+        {"name": obj.name, "oid": obj.oid, "description": obj.description,
+         "syntax": obj.syntax, "enums": obj.enums,
+         "is_notification": obj.is_notification}
+        for obj in result.objects])
+    return {"id": mib_file_id, "module": result.module,
+            "object_count": len(result.objects), "resolved_count": resolved_count,
+            "unresolved": unresolved, "notes": result.notes}
+
+
 if __name__ == "__main__":
     sample_if_mib = """
     IF-MIB DEFINITIONS ::= BEGIN
