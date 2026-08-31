@@ -6,6 +6,17 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.19.0 — Syslog Host column cross-referenced from Nodes/DNS
+
+- **The Syslog Host column now falls back to a cross-referenced name**
+  when a message doesn't supply a usable one of its own (blank, or just
+  the source IP repeated). It checks the Nodes module's SNMP-polled
+  device identity first, then the same reverse-DNS cache the Source
+  column's "Hostname" toggle already uses, and gates on that same
+  **Resolve sending addresses to names** setting. A device's own
+  self-reported hostname is always left untouched — this only fills
+  gaps, never overrides.
+
 ### 4.18.0 — Bulk device operations, offline filter, chart smoothing, IPAM tooltip fix
 
 - **Devices can now be selected and operated on in bulk.** A checkbox

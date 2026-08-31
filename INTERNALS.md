@@ -1132,6 +1132,24 @@ stored table SQL for `trigram` and `source`) gets the index dropped and
 rebuilt once in the background, in chunks, without blocking search in the
 meantime — it just scans until the backfill catches up.
 
+### Host cross-referencing (`api.py get_syslog_search`)
+
+The `host` column stored in `logs` is exactly what `syslogparse.parse()`
+found in the message — often empty, or just the sending device's own IP
+repeated, since not every device bothers to self-report a real hostname.
+Rather than rewrite that stored value, `get_syslog_search` fills the gap
+at read time, the same place and the same `resolve_sources` setting gate
+already used to resolve the Source column's `source_name`: for every row
+whose `host` is falsy or equal to its own `source`, it looks up
+`service.nodes_db.device_by_ip(source)` first (using `name` when it
+differs from the device's own `ip` — `add_device` seeds `name` to the IP
+itself when nothing else is given, so an unrenamed device falls through
+to `sys_name` instead of surfacing its own address as a "name"), then
+`service.app_db.hostnames()` — the same reverse-DNS cache — as a second
+pass over just the IPs still missing a name. A message that already
+carries its own real hostname is never touched; this only ever fills
+what the device left blank.
+
 ---
 
 ## IPAM

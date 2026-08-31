@@ -823,10 +823,33 @@ def get_syslog_search(service, params, body) -> dict:
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
+    resolved_hosts = {}
     if service.syslog_settings.get("resolve_sources"):
         names = {ip: name for ip, name in
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
+
+        # The message itself only supplies a host when the device bothers
+        # to self-report one; fill the gap (blank, or just the source IP
+        # repeated) from whichever of the Nodes SNMP identity or the DNS
+        # cache knows a real name for that address — Nodes first, since
+        # it's a locally-managed, polled identity rather than a PTR record.
+        need = {row["source"] for row in rows
+                if not row["host"] or row["host"] == row["source"]}
+        if need:
+            device_names = {}
+            for ip in need:
+                device = service.nodes_db.device_by_ip(ip)
+                if device:
+                    name = (device["name"] if device["name"] != device["ip"]
+                            else device["sys_name"])
+                    if name:
+                        device_names[ip] = name
+            dns_names = {ip: n for ip, n in
+                         service.app_db.hostnames(need).items() if n}
+            resolved_hosts = {ip: device_names.get(ip) or dns_names.get(ip)
+                               for ip in need}
+            resolved_hosts = {ip: n for ip, n in resolved_hosts.items() if n}
 
     return {
         "took_ms": round(elapsed_ms, 1),
@@ -835,7 +858,9 @@ def get_syslog_search(service, params, body) -> dict:
             {
                 "id": row["id"], "ts": row["ts"], "source": row["source"],
                 "source_name": names.get(row["source"], ""),
-                "host": row["host"] or "", "app": row["app"] or "",
+                "host": (row["host"] or "") if row["host"] and row["host"] != row["source"]
+                        else (resolved_hosts.get(row["source"], "") or row["host"] or ""),
+                "app": row["app"] or "",
                 "procid": row["procid"] or "", "msgid": row["msgid"] or "",
                 "severity": row["severity"],
                 "severity_name": severity_name(row["severity"]),

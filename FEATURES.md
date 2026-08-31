@@ -636,6 +636,15 @@ A collector, a search, and an hourly histogram.
 - **Hostname**, next to the message count above the table, switches the
   Source column between the resolved name and the raw address — on by
   default. The detail panel for a selected message always shows both.
+- **The Host column fills itself in when a device doesn't say.** Most
+  devices put their own hostname in the message; when one doesn't (or
+  just repeats its own IP there), the Host column falls back to a name
+  cross-referenced from elsewhere in the app for that same source
+  address — the Nodes module's SNMP-polled device identity first, then
+  the same reverse-DNS cache the Source column uses. A device's own
+  self-reported hostname is never overridden, only filled in when
+  missing, and this only happens while **Resolve sending addresses to
+  names** is on.
 - **The message table resizes**, the same way NetFlow's flow record table
   does. Drag the edge of a heading to widen or narrow the column; the
   widths are remembered per browser, and **Reset layout** on the Settings
