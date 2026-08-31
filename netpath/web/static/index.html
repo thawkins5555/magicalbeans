@@ -122,11 +122,11 @@
 
   <div id="nodes-sub-discovery" class="subpage">
     <div class="bar wrap">
-      <label>Kind <select id="disc-kind"><option value="device">Single device</option>
-        <option value="subnet">Subnet</option></select></label>
-      <label>Target <input id="disc-target" size="20" placeholder="10.20.3.0/24"></label>
+      <label>Target <input id="disc-target" size="22" placeholder="10.20.3.0/24 or 10.20.3.7"></label>
       <label>Profile <select id="disc-group"></select></label>
+      <label class="check"><input type="checkbox" id="disc-pingonly"> Also offer ping-only devices (no SNMP)</label>
       <button id="disc-start" class="primary">Start</button>
+      <span id="disc-status" class="hint"></span>
     </div>
     <div class="cols" data-splitter="nodes-discovery">
       <div class="pane" data-grow="1">
@@ -601,12 +601,12 @@
    <div class="pane" data-grow="65">
     <header class="bar"><span class="section">TRACE WORKERS</span></header>
     <div id="dbg-workers-wrap" class="table-wrap workers"><table id="dbg-workers"></table></div>
+    <header class="bar"><span class="section">NODE POLLS IN PROGRESS</span></header>
+    <div id="dbg-nodes-wrap" class="table-wrap workers-small"><table id="dbg-nodes"></table></div>
     <header class="bar"><span class="section">DNS LOOKUPS IN PROGRESS</span></header>
     <div id="dbg-dns-wrap" class="table-wrap workers-small"><table id="dbg-dns"></table></div>
     <header class="bar"><span class="section">IPAM AGENTS RUNNING</span></header>
     <div id="dbg-ipam-wrap" class="table-wrap workers-small"><table id="dbg-ipam"></table></div>
-    <header class="bar"><span class="section">NODE POLLS IN PROGRESS</span></header>
-    <div id="dbg-nodes-wrap" class="table-wrap workers-small"><table id="dbg-nodes"></table></div>
    </div>
    <div class="divider"></div>
    <div class="pane" data-grow="35">

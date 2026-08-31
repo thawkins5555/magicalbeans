@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS devices (
     name            TEXT,                          -- display name, defaults to ip
     group_id        INTEGER REFERENCES groups(id) ON DELETE SET NULL,
     device_group_id INTEGER REFERENCES device_groups(id) ON DELETE SET NULL,
+    display_name_source TEXT NOT NULL DEFAULT 'auto', -- 'auto' (sysName first) | 'manual'
     enabled         INTEGER NOT NULL DEFAULT 1,
     -- per-device overrides; NULL means "use the group's value"
     snmp_version    INTEGER,
@@ -222,6 +223,8 @@ CREATE TABLE IF NOT EXISTS discovery_jobs (
     probed          INTEGER NOT NULL DEFAULT 0,
     responded       INTEGER NOT NULL DEFAULT 0,
     identified      INTEGER NOT NULL DEFAULT 0,
+    allow_ping_only INTEGER NOT NULL DEFAULT 0, -- ping-only results may be approved
+    reviewed        INTEGER NOT NULL DEFAULT 0, -- the approve/deny dialog was answered
     started_ts      REAL NOT NULL,
     finished_ts     REAL,
     error           TEXT
@@ -264,8 +267,9 @@ DEFAULTS = {
     "max_mib_bytes": 8 * 1024 * 1024,
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
-    "discovery_communities": "public",
     "rollup_enabled": True,
+    "detail_fields": "sys_descr,vendor,snmp_version",  # identity fields shown in
+                                                       # the device detail header
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
                               # auto-loaded, so a deliberate delete is never
                               # silently redone on the next restart
@@ -279,7 +283,8 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set")
 
-_DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "enabled") + _OVERRIDE_COLUMNS
+_DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
+                    "enabled") + _OVERRIDE_COLUMNS
 
 
 class NodesDatabase:
@@ -316,12 +321,29 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN device_group_id INTEGER"
                 " REFERENCES device_groups(id) ON DELETE SET NULL")
+        if "display_name_source" not in devices:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN display_name_source TEXT"
+                " NOT NULL DEFAULT 'auto'")
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_device_group"
             " ON devices(device_group_id)")
+
+        jobs = {row["name"] for row in
+                self._conn.execute("PRAGMA table_info(discovery_jobs)").fetchall()}
+        if "allow_ping_only" not in jobs:
+            self._conn.execute(
+                "ALTER TABLE discovery_jobs ADD COLUMN allow_ping_only INTEGER"
+                " NOT NULL DEFAULT 0")
+        if "reviewed" not in jobs:
+            # Pre-upgrade jobs count as already reviewed, or every old
+            # finished job would pop an approval dialog on first open.
+            self._conn.execute(
+                "ALTER TABLE discovery_jobs ADD COLUMN reviewed INTEGER"
+                " NOT NULL DEFAULT 1")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -633,6 +655,20 @@ class NodesDatabase:
                 f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
             return cur.lastrowid
+
+    def seed_identity(self, device_id: int, *, sys_descr: str = "",
+                      sys_name: str = "", sys_object_id: str = "",
+                      vendor: str = "") -> None:
+        """Pre-fills the identity columns from a discovery result so a
+        just-promoted device shows its sysName immediately instead of a
+        bare IP until its first poll (which overwrites these with the same
+        values anyway)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET sys_descr = ?, sys_name = ?,"
+                " sys_object_id = ?, vendor = ? WHERE id = ?",
+                (sys_descr, sys_name, sys_object_id, vendor, device_id))
+            self._conn.commit()
 
     def update_device(self, device_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
@@ -1133,13 +1169,21 @@ class NodesDatabase:
 
     # ------------------------------------------------------------- discovery
 
-    def add_discovery_job(self, kind: str, target: str) -> int:
+    def add_discovery_job(self, kind: str, target: str,
+                          allow_ping_only: bool = False) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO discovery_jobs(kind, target, started_ts)"
-                " VALUES (?,?,?)", (kind, target, time.time()))
+                "INSERT INTO discovery_jobs(kind, target, allow_ping_only,"
+                " started_ts) VALUES (?,?,?,?)",
+                (kind, target, 1 if allow_ping_only else 0, time.time()))
             self._conn.commit()
             return cur.lastrowid
+
+    def mark_job_reviewed(self, job_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE discovery_jobs SET reviewed = 1 WHERE id = ?", (job_id,))
+            self._conn.commit()
 
     def update_discovery_job(self, job_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in

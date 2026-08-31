@@ -116,6 +116,7 @@ ROUTES = [
     ("GET", r"^/api/nodes/discovery/(\d+)$", api.get_nodes_discovery_job),
     ("DELETE", r"^/api/nodes/discovery/(\d+)$", api.delete_nodes_discovery_job),
     ("POST", r"^/api/nodes/discovery/(\d+)/promote$", api.post_nodes_discovery_promote),
+    ("POST", r"^/api/nodes/discovery/(\d+)/reviewed$", api.post_nodes_discovery_reviewed),
     ("POST", r"^/api/nodes/collector$", api.post_nodes_collector),
     ("GET", r"^/api/nodes/mibs$", api.get_nodes_mibs),
     ("POST", r"^/api/nodes/mibs$", api.post_nodes_mib),

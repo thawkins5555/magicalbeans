@@ -276,11 +276,13 @@ class NodePoller:
     # ------------------------------------------------------------ discovery
 
     def start_discovery(self, kind: str, target: str,
-                        overrides: dict | None = None) -> int:
+                        overrides: dict | None = None,
+                        allow_ping_only: bool = False) -> int:
         settings = dict(self.db.settings())
         if overrides:
             settings.update(overrides)
-        job_id = self.db.add_discovery_job(kind, target)
+        job_id = self.db.add_discovery_job(kind, target,
+                                           allow_ping_only=allow_ping_only)
         job = DiscoveryJob(self.db, job_id, kind, target, settings, log=self.log)
         self._discovery_jobs[job_id] = job
         job.start()
@@ -305,11 +307,17 @@ class NodePoller:
         profile) instead of being pinned to one override. Already-promoted
         result ids are a no-op rather than a duplicate-IP error, so a
         second promote call with an overlapping selection is always safe
-        to retry."""
+        to retry. A ping-only result (no SNMP answer) is skipped outright
+        unless its job was started with the allow-ping-only option — the
+        checkbox state in the browser is a convenience, this is the rule."""
+        job = self.db.discovery_job(job_id)
+        allow_ping_only = bool(job and job["allow_ping_only"])
         device_ids = []
         for result_id in result_ids:
             result = self.db.discovery_result(result_id)
             if result is None or result["job_id"] != job_id:
+                continue
+            if not result["snmp_ok"] and not allow_ping_only:
                 continue
             if result["promoted_device_id"]:
                 device_ids.append(result["promoted_device_id"])
@@ -331,9 +339,24 @@ class NodePoller:
                 if not matches_known:
                     overrides["community"] = result["community_or_user"]
                     overrides["snmp_version"] = result["snmp_version"]
+            elif not result["snmp_ok"]:
+                # A ping-only device would otherwise sit failing SNMP on
+                # every poll; it can be switched back on in its Edit form
+                # once real credentials are known.
+                overrides["snmp_enabled"] = 0
+                overrides["ping_enabled"] = 1
+            # The manual name is left as the IP (add_device's default):
+            # the displayed name prefers sys_name on its own, so copying
+            # sysName into the manual field would only shadow later
+            # renames on the device.
             device_id = self.db.add_device(
-                result["ip"], result["sys_name"] or result["ip"],
-                group_id=group_id, **overrides)
+                result["ip"], group_id=group_id, **overrides)
+            if result["snmp_ok"]:
+                self.db.seed_identity(
+                    device_id, sys_descr=result["sys_descr"] or "",
+                    sys_name=result["sys_name"] or "",
+                    sys_object_id=result["sys_object_id"] or "",
+                    vendor=result["vendor"] or "")
             self.db.mark_promoted(result_id, device_id)
             device_ids.append(device_id)
         return device_ids

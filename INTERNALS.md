@@ -203,6 +203,16 @@ every candidate has failed; the caller's existing status/counter
 classification in `_poll_device` is unaffected; it just sees the same
 exception type a single-credential poll would have raised.
 
+**Display name** (`devices.display_name_source`, `'auto'|'manual'`): the
+precedence lives in exactly one place, `nodes.js`'s `displayName()` —
+`'auto'` is `sys_name || name || ip`, `'manual'` pins `name || ip`. The
+`name` column itself stays the *manual* name (defaulting to the IP on
+insert); promotion from discovery deliberately stopped copying `sys_name`
+into it, seeding the identity columns via `nodesdb.seed_identity()`
+instead, so a later manual rename is never shadowed by a stale copy of
+the hostname, while the just-promoted device still shows its sysName
+before its first poll.
+
 **Device groups vs. polling profiles.** `device_groups` is a separate
 table from `groups` (polling profiles), deliberately — conflating "which
 credentials/interval a device uses" with "which folder it's organized
@@ -296,6 +306,28 @@ owns the dict of active jobs and exposes
 `start_discovery`/`cancel_discovery`/`promote`; `promote()` treats an
 already-promoted result as a no-op rather than a duplicate-IP error, so a
 partially-overlapping re-selection is always safe to retry.
+
+The `device`/`subnet` kind still exists internally (it decides "try SNMP
+even without a ping reply") but is derived server-side by
+`api.py`'s `_discovery_kind_for()` from the target string alone — a bare
+address or /32 is a device probe, any other valid CIDR a subnet sweep —
+so the UI no longer offers a kind picker. `_candidate_communities()`
+lost its `["public"]` fallback: an empty community list (a v3-only
+profile) now simply means the sweep runs ping-only, a combination
+`post_nodes_discovery` refuses up front unless the job was started with
+`allow_ping_only`.
+
+Approval flow: `discovery_jobs` carries `allow_ping_only` (a start-time
+choice, not a promote-time one) and `reviewed`. The browser pops the
+approve/deny dialog for any job that is `done` with `reviewed = 0` and
+marks it reviewed via `POST .../reviewed` whichever button answers it —
+on upgrade, `_migrate()` adds `reviewed` with DEFAULT 1 (unlike the
+schema's DEFAULT 0) precisely so every pre-upgrade finished job counts
+as already answered instead of popping a dialog apiece on first open.
+`promote()` itself skips any `snmp_ok = 0` result on a job without
+`allow_ping_only` — the dialog's checkbox rules are a convenience, the
+poller's check is the rule — and creates an approved ping-only device
+with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
 
 ### MIB parser (`mibparse.py`)
 

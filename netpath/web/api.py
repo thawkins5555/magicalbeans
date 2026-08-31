@@ -7,6 +7,7 @@ this file stays about the data.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import time
@@ -1360,6 +1361,7 @@ def _device_json(row) -> dict:
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
         "group_id": row["group_id"], "device_group_id": row["device_group_id"],
+        "display_name_source": row["display_name_source"],
         "enabled": bool(row["enabled"]),
         "snmp_version": row["snmp_version"], "community": row["community"],
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
@@ -1420,6 +1422,8 @@ def _discovery_job_json(row) -> dict:
     return {"id": row["id"], "kind": row["kind"], "target": row["target"],
             "state": row["state"], "total": row["total"], "probed": row["probed"],
             "responded": row["responded"], "identified": row["identified"],
+            "allow_ping_only": bool(row["allow_ping_only"]),
+            "reviewed": bool(row["reviewed"]),
             "started_ts": row["started_ts"], "finished_ts": row["finished_ts"],
             "error": row["error"]}
 
@@ -1434,7 +1438,8 @@ def _discovery_result_json(row) -> dict:
             "promoted_device_id": row["promoted_device_id"]}
 
 
-_DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id", "enabled",
+_DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
+                         "display_name_source", "enabled",
                          "snmp_version", "community",
                          "v3_user", "v3_auth_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
@@ -1500,13 +1505,21 @@ def post_nodes_device(service, params, body) -> dict:
         raise ValueError(f"{ip} is already a device")
     group_id = body.get("group_id")
     device_group_id = body.get("device_group_id")
+    _check_display_name_source(body)
     overrides = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY
-                and k not in ("name", "group_id", "device_group_id", "enabled")}
+                and k not in ("name", "group_id", "device_group_id",
+                              "display_name_source", "enabled")}
     device_id = service.nodes_db.add_device(
         ip, name=body.get("name") or None,
         group_id=int(group_id) if group_id else None,
         device_group_id=int(device_group_id) if device_group_id else None,
         **overrides)
+    # Not an add_device parameter: like device_group_id before it,
+    # add_device's **overrides filter only knows credential/polling
+    # columns and would silently drop it.
+    if body.get("display_name_source"):
+        service.nodes_db.update_device(
+            device_id, display_name_source=body["display_name_source"])
     service.log.add(NODES_CATEGORY, f"Added device {ip}")
     return {"id": device_id}
 
@@ -1527,9 +1540,16 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     return {"device": device}
 
 
+def _check_display_name_source(body) -> None:
+    value = body.get("display_name_source")
+    if value is not None and value not in ("auto", "manual"):
+        raise ValueError("display_name_source must be 'auto' or 'manual'")
+
+
 def put_nodes_device(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
+    _check_display_name_source(body)
     fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
     service.nodes_db.update_device(device_id, **fields)
     return {"ok": True}
@@ -1940,8 +1960,9 @@ def _discovery_communities_for_group(service, group_id: int) -> str:
     way the old free-text field was, so nodediscover.py itself needs no
     changes. A v3-only profile contributes nothing here (v3 identification
     was never in scope for a blind discovery sweep — see nodediscover.py's
-    own docstring); _candidate_communities("") already falls back to
-    "public" in that case, same as it always has."""
+    own docstring); an empty result means no SNMP is attempted at all,
+    which post_nodes_discovery refuses up front unless the job allows
+    ping-only devices."""
     group_row = service.nodes_db.group(group_id)
     if group_row is None:
         return ""
@@ -1953,20 +1974,42 @@ def _discovery_communities_for_group(service, group_id: int) -> str:
     return ",".join(communities)
 
 
+def _discovery_kind_for(target: str) -> tuple[str, str]:
+    """A bare address or a /32 is a single-device job (which still tries
+    SNMP without a ping reply — see nodediscover.py); anything else is a
+    subnet sweep. There is no separate kind field to choose any more: the
+    CIDR itself says which one was meant."""
+    try:
+        if "/" not in target:
+            return "device", str(ipaddress.ip_address(target))
+        network = ipaddress.ip_network(target, strict=False)
+        if network.prefixlen == network.max_prefixlen:
+            return "device", str(network.network_address)
+        return "subnet", str(network)
+    except ValueError as exc:
+        raise ValueError(
+            f"'{target}' is not an IP address or CIDR subnet") from exc
+
+
 def post_nodes_discovery(service, params, body) -> dict:
-    kind = str(body.get("kind", "")).strip()
     target = str(body.get("target", "")).strip()
-    if kind not in ("device", "subnet"):
-        raise ValueError("kind must be 'device' or 'subnet'")
     if not target:
         raise ValueError("A target is required")
+    kind, target = _discovery_kind_for(target)
     group_id = body.get("group_id")
     if not group_id:
         raise ValueError("A polling profile is required")
     if not service.nodes_db.group(group_id):
         raise ValueError("No such polling profile")
-    overrides = {"discovery_communities": _discovery_communities_for_group(service, group_id)}
-    job_id = service.node_poller.start_discovery(kind, target, overrides=overrides)
+    allow_ping_only = bool(body.get("allow_ping_only"))
+    communities = _discovery_communities_for_group(service, group_id)
+    if not communities and not allow_ping_only:
+        raise ValueError(
+            "This profile has no v1/v2c communities for discovery to try. "
+            "Pick a profile with one, or allow ping-only devices.")
+    overrides = {"discovery_communities": communities}
+    job_id = service.node_poller.start_discovery(
+        kind, target, overrides=overrides, allow_ping_only=allow_ping_only)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
     return {"id": job_id}
 
@@ -2002,6 +2045,15 @@ def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
     service.log.add(NODES_CATEGORY,
                     f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
     return {"device_ids": device_ids}
+
+
+def post_nodes_discovery_reviewed(service, params, body, job_id) -> dict:
+    """The approve/deny dialog for this job was answered (or dismissed) —
+    either way it must never pop again, whatever was or wasn't added."""
+    if not service.nodes_db.discovery_job(job_id):
+        raise ValueError("No such discovery job")
+    service.nodes_db.mark_job_reviewed(job_id)
+    return {"ok": True}
 
 
 def post_nodes_collector(service, params, body) -> dict:

@@ -71,6 +71,11 @@ own subtabs.
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled — and can override any of it individually. One profile,
   `Default`, always exists.
+- **The displayed name prefers the SNMP hostname** (`sysName`), falling
+  back to the manually entered name, then the IP — so a discovered device
+  names itself. Each device's Edit form has a "Displayed name" choice
+  (Auto, or pin the manual name), letting a hand-picked label win where
+  wanted; the manual name can be added or changed at any time.
 - **A profile can hold more than one SNMP credential**, of the same
   version or different ones — useful when one profile covers a mix of
   vendors or SNMP versions on the same subnet. Its own version/community/
@@ -118,24 +123,38 @@ own subtabs.
 
 ### Discovery
 
-- **Per-device or per-subnet.** A subnet sweep pings every address first
-  (reusing IPAM's own sweep code, not a second implementation), then
-  attempts an SNMP v1/v2c identity probe against whichever addresses
-  answered; a single-device job always attempts SNMP even without a ping
-  reply, since a real device can have ICMP filtered. SNMPv3 is not
-  auto-discovered: it needs a username a blind sweep does not have.
+- **The target decides the scope — there is no device/subnet picker.** A
+  bare IP or a /32 probes that one device (attempting SNMP even without a
+  ping reply, since a real device can have ICMP filtered); any other CIDR
+  sweeps the subnet: a ping pass first (reusing IPAM's own sweep code,
+  not a second implementation), then an SNMP v1/v2c identity probe
+  against whichever addresses answered. SNMPv3 is not auto-discovered:
+  it needs a username a blind sweep does not have.
 - **A polling profile is chosen before a scan runs, not typed communities.**
   Discovery's form offers a dropdown of every existing polling profile;
   every SNMP v1/v2c community that profile knows — its primary community
   plus any additional credentials — is tried during the probe, the same
-  set a device on that profile would try when polling.
+  set a device on that profile would try when polling. A profile with no
+  v1/v2c community at all is refused up front (unless ping-only devices
+  are allowed, below) rather than silently guessing "public".
 - **A subnet sweep refuses anything over the configured address-count
   limit** before sending a single packet, the same guard IPAM's own
   subnet scan uses.
-- **Results can be reviewed and selectively promoted** into real devices;
-  a result already promoted is a no-op to promote again, not a
-  duplicate-IP error. Discovery suggests a polling profile from the
-  device's vendor OID root where one matches, falling back to `Default`.
+- **A finished scan ends in an approve/deny dialog** — every discovered
+  device listed with a checkbox, SNMP-identified ones pre-checked, and
+  nothing added until "Add approved" is clicked. Dismissing adds nothing,
+  and either answer is final for that scan's dialog (the RESULTS pane
+  remains for promoting later, with the same defaults). Devices that only
+  answered ping are excluded unless the scan was started with the
+  "Also offer ping-only devices" option — enforced server-side, not just
+  in the dialog — and an approved ping-only device is created with SNMP
+  polling switched off so it doesn't sit failing SNMP forever.
+- **Promotion is idempotent**: a result already promoted is a no-op to
+  promote again, not a duplicate-IP error. Discovery suggests a polling
+  profile from the device's vendor OID root where one matches, falling
+  back to `Default`, and pre-fills the discovered identity so the new
+  device shows its sysName immediately instead of waiting for the first
+  poll.
 
 ### Vendor MIBs
 
@@ -169,7 +188,10 @@ a zoomable chart (recent points plotted directly; a wide window reads an
 hourly min/avg/max rollup instead of scanning months of raw samples), its
 current interface table, and a combined device/interface event history —
 the interface and event lists scroll independently of the chart and
-header above them once they outgrow the panel.
+header above them once they outgrow the panel. Which SNMP identity
+fields the header shows (sysDescr, sysName, sysObjectID, contact,
+location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
+status and any SNMP error always show.
 
 ---
 

@@ -20,6 +20,8 @@
     discSelected: null,
     discResults: [],
     discChecked: new Set(),
+    discCheckedJob: null,   // which job discChecked's defaults were seeded for
+    approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
     mibFiles: [],
     mibSelected: null,
   };
@@ -38,6 +40,14 @@
 
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--faint)' };
+
+  /* The one place display-name precedence lives: 'auto' prefers the SNMP
+     hostname (sysName) and falls back to the manually entered name, then
+     the IP; 'manual' pins the manually entered name. */
+  function displayName(d) {
+    if (d.display_name_source === 'manual') return d.name || d.ip;
+    return d.sys_name || d.name || d.ip;
+  }
 
   /* ------------------------------------------------------------ status */
 
@@ -86,7 +96,7 @@
         : (row.ping_ok ? `${(row.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '—');
       tr.innerHTML =
         `<td>${dot}${escape(row.status)}</td>` +
-        `<td>${escape(row.name || row.ip)}<div class="hint">${escape(row.ip)}</div></td>` +
+        `<td>${escape(displayName(row))}<div class="hint">${escape(row.ip)}</div></td>` +
         `<td>${escape(groupsById[row.group_id] || '—')}</td>` +
         `<td>${escape(devGroupsById[row.device_group_id] || '—')}</td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
@@ -135,10 +145,25 @@
 
   function drawDetailHeader() {
     const d = view.detail;
-    App.el('nd-d-name').textContent = d.name || d.ip;
+    App.el('nd-d-name').textContent = displayName(d);
+    const s = App.state.nodesSettings || {};
+    // ?? not ||: an admin who unchecks every field means "just IP·status",
+    // which arrives as '' and must not fall back to the defaults.
+    const fields = String(s.detail_fields ?? 'sys_descr,vendor,snmp_version')
+      .split(',').map((f) => f.trim()).filter(Boolean);
+    // IP · status always leads and any SNMP error always trails; the
+    // fields between them are the admin's Settings choice.
+    const optional = {
+      sys_descr: () => d.sys_descr || '',
+      sys_name: () => d.sys_name ? `sysName: ${d.sys_name}` : '',
+      sys_object_id: () => d.sys_object_id ? `sysObjectID: ${d.sys_object_id}` : '',
+      sys_contact: () => d.sys_contact ? `contact: ${d.sys_contact}` : '',
+      sys_location: () => d.sys_location ? `location: ${d.sys_location}` : '',
+      vendor: () => d.vendor ? `vendor: ${d.vendor}` : '',
+      snmp_version: () => `SNMP v${{0:'1',1:'2c',3:'3'}[d.effective_config.snmp_version] || d.effective_config.snmp_version}`,
+    };
     const lines = [`${d.ip} · ${d.status}`,
-      d.sys_descr ? d.sys_descr : '', d.vendor ? `vendor: ${d.vendor}` : '',
-      `SNMP v${{0:'1',1:'2c',3:'3'}[d.effective_config.snmp_version] || d.effective_config.snmp_version}`,
+      ...fields.map((f) => optional[f] ? optional[f]() : ''),
       d.snmp_error ? `error: ${d.snmp_error}` : ''].filter(Boolean);
     App.el('nd-d-summary').textContent = lines.join('  ·  ');
   }
@@ -314,7 +339,11 @@
     const cfg = d.id ? d : {};
     return `
       <label>IP address <input id="nd-f-ip" value="${escape(d.ip || '')}" ${d.id ? 'readonly' : ''}></label>
-      <label>Name <input id="nd-f-name" value="${escape(d.name || '')}"></label>
+      <label>Manual name <input id="nd-f-name" value="${escape(d.name || '')}"></label>
+      <label>Displayed name <select id="nd-f-namesource">
+        <option value="auto" ${d.display_name_source !== 'manual' ? 'selected' : ''}>Auto — SNMP hostname, else manual name</option>
+        <option value="manual" ${d.display_name_source === 'manual' ? 'selected' : ''}>Manual name</option>
+      </select></label>
       <label>Polling profile <select id="nd-f-group">${groupOptionsHtml(d.group_id)}</select></label>
       <label>Group <select id="nd-f-devgroup">${deviceGroupOptionsHtml(d.device_group_id)}</select></label>
       <fieldset><legend>OVERRIDES (blank = use the profile's value)</legend>
@@ -382,8 +411,9 @@
         const overrides = deviceOverrides(box);
         const authPass = box.querySelector('#nd-f-authpass').value;
         const name = box.querySelector('#nd-f-name').value.trim();
+        const display_name_source = box.querySelector('#nd-f-namesource').value;
         const result = await App.post('/api/nodes/devices',
-          { ip, name, group_id, device_group_id, ...overrides });
+          { ip, name, group_id, device_group_id, display_name_source, ...overrides });
         if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
           await App.post(`/api/nodes/devices/${result.id}/credential`,
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -399,7 +429,7 @@
   function editDevice() {
     if (!view.detail) return;
     const d = view.detail;
-    const box = App.modal(`Edit ${d.name || d.ip}`, deviceForm(d), [
+    const box = App.modal(`Edit ${displayName(d)}`, deviceForm(d), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Clear credential', onClick: async () => {
         await App.del(`/api/nodes/devices/${d.id}/credential`);
@@ -413,8 +443,9 @@
         const overrides = deviceOverrides(box);
         const authPass = box.querySelector('#nd-f-authpass').value;
         const name = box.querySelector('#nd-f-name').value.trim();
+        const display_name_source = box.querySelector('#nd-f-namesource').value;
         await App.put(`/api/nodes/devices/${d.id}`,
-          { name, group_id, device_group_id, ...overrides });
+          { name, group_id, device_group_id, display_name_source, ...overrides });
         if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
           await App.post(`/api/nodes/devices/${d.id}/credential`,
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -508,7 +539,7 @@
   function removeDevice() {
     if (!view.detail) return;
     const d = view.detail;
-    App.modal('Remove device', `<p>Remove <b>${escape(d.name || d.ip)}</b>? This deletes its interfaces, metric history and events.</p>`, [
+    App.modal('Remove device', `<p>Remove <b>${escape(displayName(d))}</b>? This deletes its interfaces, metric history and events.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Remove', primary: true, onClick: async () => {
         await App.del(`/api/nodes/devices/${d.id}`);
@@ -813,41 +844,131 @@
     if (!view.discSelected) { view.discResults = []; drawDiscResultsTable(); return; }
     const r = await App.get(`/api/nodes/discovery/${view.discSelected}`);
     view.discResults = r.results;
+    if (view.discCheckedJob !== view.discSelected) {
+      // First look at this job's results: pre-approve what the policy
+      // says — SNMP-identified devices only; a manual uncheck afterwards
+      // sticks because this only reseeds when the selected job changes.
+      view.discChecked = new Set(
+        view.discResults.filter((x) => x.snmp_ok && !x.promoted_device_id)
+          .map((x) => x.id));
+      view.discCheckedJob = view.discSelected;
+    }
     drawDiscJobsTable();
     drawDiscResultsTable();
   }
 
-  function drawDiscResultsTable() {
-    const table = App.el('disc-results-table');
-    table.innerHTML = '<thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>';
-    const body = document.createElement('tbody');
-    for (const r of view.discResults) {
-      const tr = document.createElement('tr');
-      const checked = view.discChecked.has(r.id);
+  function discResultRowsHtml(results, job, cls) {
+    const allowPingOnly = !!(job && job.allow_ping_only);
+    return results.map((r) => {
       const promoted = !!r.promoted_device_id;
-      tr.innerHTML = `<td><input type="checkbox" class="disc-check" ${checked ? 'checked' : ''} ${promoted ? 'disabled' : ''}></td>` +
+      const selectable = !promoted && (r.snmp_ok || allowPingOnly);
+      const checked = view.discChecked.has(r.id);
+      const box = selectable
+        ? `<input type="checkbox" class="${cls}" data-result="${r.id}" ${checked ? 'checked' : ''}>`
+        : (promoted ? '' : '<span class="hint" title="Only devices identified over SNMP can be added from this scan">—</span>');
+      return `<tr><td>${box}</td>` +
         `<td>${escape(r.ip)}</td><td>${r.ping_ok ? 'yes' : 'no'}</td>` +
         `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
-        `<td>${escape(r.sys_name || '—')}</td><td>${escape(r.vendor || '—')}${promoted ? ' <span class="hint">(added)</span>' : ''}</td>`;
-      const box = tr.querySelector('.disc-check');
+        `<td>${escape(r.sys_name || '—')}</td><td>${escape(r.vendor || '—')}${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
+    }).join('');
+  }
+
+  function drawDiscResultsTable() {
+    const table = App.el('disc-results-table');
+    const job = view.discJobs.find((j) => j.id === view.discSelected);
+    table.innerHTML = '<thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>' +
+      `<tbody>${discResultRowsHtml(view.discResults, job, 'disc-check')}</tbody>`;
+    for (const box of table.querySelectorAll('.disc-check')) {
       box.onchange = () => {
-        if (box.checked) view.discChecked.add(r.id); else view.discChecked.delete(r.id);
+        const id = Number(box.dataset.result);
+        if (box.checked) view.discChecked.add(id); else view.discChecked.delete(id);
       };
-      body.appendChild(tr);
     }
-    table.appendChild(body);
   }
 
   async function startDiscovery() {
-    const kind = App.el('disc-kind').value;
     const target = App.el('disc-target').value.trim();
     if (!target) return;
     const group_id = Number(App.el('disc-group').value);
-    if (!group_id) return;
-    const result = await App.post('/api/nodes/discovery', { kind, target, group_id });
+    if (!group_id) { discStatus('Pick a polling profile first.', true); return; }
+    const allow_ping_only = App.el('disc-pingonly').checked;
+    let result;
+    try {
+      result = await App.post('/api/nodes/discovery',
+        { target, group_id, allow_ping_only });
+    } catch (error) {
+      discStatus(error.message, true);
+      return;
+    }
+    discStatus('');
     view.discSelected = result.id;
     view.discChecked = new Set();
+    view.discCheckedJob = result.id;
     App.refreshNow('nodes');
+  }
+
+  function discStatus(text, isError) {
+    const el = App.el('disc-status');
+    el.textContent = text;
+    el.className = isError ? 'err' : 'hint';
+  }
+
+  /* The approve/deny dialog: pops once per finished scan, listing every
+     discovered device with a checkbox (SNMP-identified ones pre-checked,
+     ping-only ones per the job's own option). Approving promotes the
+     checked ones; dismissing adds nothing. Either answer marks the job
+     reviewed so it never pops again — the RESULTS pane remains for
+     changing one's mind later. */
+  async function maybeShowApproval() {
+    if (view.approvalOpenFor !== null) return;
+    if (!App.el('modal').hidden) return;   // never clobber an open dialog
+    const job = view.discJobs.find((j) => j.state === 'done' && !j.reviewed);
+    if (!job) return;
+    view.approvalOpenFor = job.id;
+    const r = await App.get(`/api/nodes/discovery/${job.id}`);
+    const results = r.results;
+    const found = results.filter((x) => x.ping_ok || x.snmp_ok);
+    const seed = new Set(results.filter((x) => x.snmp_ok && !x.promoted_device_id)
+      .map((x) => x.id));
+    const finish = async () => {
+      await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
+      view.approvalOpenFor = null;
+      App.closeModal();
+      App.refreshNow('nodes');
+    };
+    if (!found.length) {   // nothing to approve — don't pop an empty dialog
+      await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
+      view.approvalOpenFor = null;
+      return;
+    }
+    const checked = new Set(seed);
+    const box = App.modal(`Discovery of ${escape(job.target)} finished`, `
+      <p class="hint">Approve the devices to add. ${job.allow_ping_only
+        ? 'Ping-only devices can be approved too, but start unchecked.'
+        : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
+      <div class="table-wrap" style="max-height:50vh">
+        <table><thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>
+        <tbody>${(() => {
+          const saved = view.discChecked; view.discChecked = checked;
+          const html = discResultRowsHtml(found, job, 'disc-approve');
+          view.discChecked = saved; return html;
+        })()}</tbody></table>
+      </div>`, [
+      { label: 'Dismiss', onClick: finish },
+      { label: 'Add approved', primary: true, onClick: async () => {
+        if (checked.size) {
+          await App.post(`/api/nodes/discovery/${job.id}/promote`,
+            { result_ids: [...checked] }).catch(() => {});
+        }
+        await finish();
+      } },
+    ]);
+    for (const cb of box.querySelectorAll('.disc-approve')) {
+      cb.onchange = () => {
+        const id = Number(cb.dataset.result);
+        if (cb.checked) checked.add(id); else checked.delete(id);
+      };
+    }
   }
 
   function fillDiscGroups() {
@@ -925,12 +1046,26 @@
 
   /* ---------------------------------------------------------- settings */
 
+  // The identity fields the device detail header can show, in display
+  // order; the detail_fields setting is a comma-separated subset of these.
+  const DETAIL_FIELDS = [
+    ['sys_descr', 'System description (sysDescr)'],
+    ['sys_name', 'SNMP hostname (sysName)'],
+    ['sys_object_id', 'sysObjectID'],
+    ['sys_contact', 'Contact (sysContact)'],
+    ['sys_location', 'Location (sysLocation)'],
+    ['vendor', 'Vendor'],
+    ['snmp_version', 'SNMP version in use'],
+  ];
+
   function settingsDialog() {
     const s = App.state.nodesSettings || {};
     const check = (id, label, on) =>
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const detailChosen = new Set(String(s.detail_fields || '')
+      .split(',').map((f) => f.trim()).filter(Boolean));
     App.modal('Nodes settings', `
       <fieldset><legend>POLLING</legend>
         ${check('np-enabled', 'Run the poller', s.enabled)}
@@ -947,6 +1082,12 @@
           Discovery subtab.</p>
         ${number('np-maxscan', 'Max addresses per subnet sweep', s.max_scan_addresses, 'min=1')}
       </fieldset>
+      <fieldset><legend>DEVICE DETAILS</legend>
+        <p class="hint">Identity fields shown in a device's detail header.
+          IP, status and any SNMP error always show.</p>
+        ${DETAIL_FIELDS.map(([key, label]) =>
+          check(`np-df-${key}`, label, detailChosen.has(key))).join('')}
+      </fieldset>
       <fieldset><legend>STORAGE</legend>
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
@@ -962,6 +1103,8 @@
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
           unreachable_ping_only: on('#np-pingonly'),
           max_scan_addresses: num('#np-maxscan'),
+          detail_fields: DETAIL_FIELDS.map(([key]) => key)
+            .filter((key) => on(`#np-df-${key}`)).join(','),
           sample_retention_days: num('#np-sampledays'), event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
         } });
@@ -1010,6 +1153,7 @@
     const jobs = await App.get('/api/nodes/discovery');
     view.discJobs = jobs.jobs;
     drawDiscJobsTable();
+    maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
   }
 
   function fillGroupFilter() {

@@ -6,6 +6,44 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.14.0 — Device naming, discovery approval flow, detail-field settings
+
+- **A device's displayed name now prefers its SNMP hostname (sysName)**,
+  falling back to the manually entered name, then the IP. Each device's
+  Edit form gains a "Displayed name" choice — Auto (SNMP hostname first)
+  or Manual name — so a hand-picked label can win per device. The form's
+  Name field is relabeled "Manual name" to match. A device added from
+  discovery starts with no manual name; its sysName shows immediately
+  (the discovered identity is pre-filled at promotion rather than waiting
+  for the first poll).
+- **Discovery's "Single device / Subnet" dropdown is gone** — the target
+  itself decides: a bare IP or a /32 is a single-device probe (which
+  still tries SNMP even without a ping reply), anything else is a subnet
+  sweep. Invalid input gets a clear error instead of a guess.
+- **A finished scan now ends in an approve/deny dialog**: every
+  discovered device is listed with a checkbox — SNMP-identified ones
+  pre-checked — and nothing is added until "Add approved" is clicked.
+  Dismissing adds nothing; either answer is remembered, so the dialog
+  never re-pops for the same scan. The RESULTS pane remains for
+  reviewing or promoting later, with the same pre-checked defaults.
+- **Ping-only devices (no SNMP answer) are excluded by default.** A new
+  discovery option — "Also offer ping-only devices" — must be set when
+  the scan starts for such devices to be approvable at all, and the rule
+  is enforced server-side, not just in the dialog. A ping-only device
+  that is approved is created with SNMP polling switched off so it
+  doesn't sit failing SNMP forever.
+- **The leftover "default communities" discovery setting is gone.** A
+  scan's communities come entirely from its chosen polling profile (a
+  scan cannot start without one); a profile with no v1/v2c community is
+  refused up front — with a clear message — unless ping-only devices are
+  allowed. The old silent fallback to "public" is removed.
+- **Nodes → Settings now chooses which SNMP identity fields the device
+  detail header shows** — sysDescr, sysName, sysObjectID, contact,
+  location, vendor, and the SNMP version each get a checkbox; IP, status
+  and any SNMP error always show.
+- **The Debug page's NODE POLLS IN PROGRESS section moved up** to sit
+  directly below TRACE WORKERS, since those two are the busiest.
+
 ### 4.13.0 — Discovery profiles, node groups, debug visibility, bundled MIBs
 
 - **Discovery now requires picking a polling profile instead of typing SNMP

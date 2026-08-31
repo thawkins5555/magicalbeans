@@ -34,8 +34,12 @@ MAX_UDP = 65535
 
 
 def _candidate_communities(text: str | None) -> list[str]:
-    parts = [c.strip() for c in (text or "").split(",") if c.strip()]
-    return parts or ["public"]
+    """No fallback guess: the list comes from the chosen polling profile's
+    own v1/v2c credentials, and an empty list (a v3-only profile) simply
+    means no SNMP identification is attempted — the sweep still runs and
+    reports ping-only results. The API layer refuses that combination up
+    front unless the job explicitly allows ping-only devices."""
+    return [c.strip() for c in (text or "").split(",") if c.strip()]
 
 
 def _snmp_identify(ip: str, version: int, community: str, timeout_s: float,
