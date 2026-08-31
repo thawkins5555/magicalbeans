@@ -194,6 +194,18 @@ def get_state(service, params, body) -> dict:
         if not _permissions.allows(granted.get(module), _permissions.READ):
             for key in keys:
                 result.pop(key, None)
+    if not _permissions.allows(granted.get("settings"), _permissions.READ):
+        # "settings" itself stays present even without Settings access —
+        # every module's own refresh cadence (nodes_refresh_s and so on)
+        # and cross-cutting config (DNS/ASN) live in it, and every tab
+        # needs to read those regardless of its own module's grant. Only
+        # the web-listener detail (bind address, port, and — in
+        # particular — the TLS cert/key file paths) is Settings-specific
+        # server internals with no reason to reach a user without
+        # Settings access, so it alone is stripped out here rather than
+        # the whole key.
+        result["settings"] = {k: v for k, v in result["settings"].items()
+                              if k not in ("web_host", "web_port", "web_cert", "web_key")}
     return result
 
 

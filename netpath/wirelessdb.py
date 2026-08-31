@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS access_points (
     mac_address     TEXT,
     station_count   INTEGER,
     last_seen_ts    REAL NOT NULL,
+    missed_polls    INTEGER NOT NULL DEFAULT 0,
     UNIQUE(controller_id, vdom, wtp_id)
 );
 CREATE INDEX IF NOT EXISTS ix_aps_controller ON access_points(controller_id);
@@ -180,12 +181,16 @@ class WirelessDatabase:
     # ---------------------------------------------------------- access points
 
     def upsert_ap(self, controller_id: int, wtp_id: str, vdom: str, **fields) -> int:
+        # A poll that sees this AP is exactly the "not stale" signal
+        # prune_stale's missed-poll counter needs, so upsert_ap is the
+        # one place that resets it back to 0 — every AP passed here comes
+        # from this poll's own seen set.
         now = time.time()
-        cols = ["controller_id", "wtp_id", "vdom", "last_seen_ts"] + list(fields)
-        vals = [controller_id, wtp_id, vdom, now] + list(fields.values())
+        cols = ["controller_id", "wtp_id", "vdom", "last_seen_ts", "missed_polls"] + list(fields)
+        vals = [controller_id, wtp_id, vdom, now, 0] + list(fields.values())
         marks = ",".join("?" * len(vals))
         update_clause = ", ".join(f"{k} = excluded.{k}" for k in
-                                  ("last_seen_ts", *fields))
+                                  ("last_seen_ts", "missed_polls", *fields))
         with self._lock:
             cur = self._conn.execute(
                 f"INSERT INTO access_points({','.join(cols)}) VALUES ({marks})"
@@ -233,18 +238,33 @@ class WirelessDatabase:
             counts[row["status"]] = row["n"]
         return counts
 
-    def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]]) -> None:
-        """Removes APs this poll didn't see for a controller that itself
-        polled successfully — a real "this AP is gone", not "the
-        controller was briefly unreachable" (record_poll's ok=False case
-        never calls this, so a transient controller outage doesn't wipe
-        its whole AP list)."""
+    def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
+                    stale_after_polls: int = 5) -> None:
+        """Ages an AP out only after `stale_after_polls` consecutive polls
+        that didn't see it, for a controller whose own poll otherwise
+        succeeded — a real "this AP is gone", not "the controller was
+        briefly unreachable" (record_poll's ok=False case never calls
+        this, so a transient controller outage doesn't wipe its whole AP
+        list) or "one GETNEXT reply got lost on an otherwise-fine poll"
+        (a single miss on lossy SNMP-over-UDP just increments the
+        counter; upsert_ap resets it back to 0 the moment the AP is seen
+        again)."""
+        threshold = max(1, stale_after_polls)
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, vdom, wtp_id FROM access_points WHERE controller_id = ?",
-                (controller_id,)).fetchall()
-            stale_ids = [row["id"] for row in rows
-                        if (row["vdom"], row["wtp_id"]) not in seen_wtp_ids]
+                "SELECT id, vdom, wtp_id, missed_polls FROM access_points"
+                " WHERE controller_id = ?", (controller_id,)).fetchall()
+            stale_ids = []
+            for row in rows:
+                if (row["vdom"], row["wtp_id"]) in seen_wtp_ids:
+                    continue
+                missed = row["missed_polls"] + 1
+                if missed >= threshold:
+                    stale_ids.append(row["id"])
+                else:
+                    self._conn.execute(
+                        "UPDATE access_points SET missed_polls = ? WHERE id = ?",
+                        (missed, row["id"]))
             if stale_ids:
                 marks = ",".join("?" * len(stale_ids))
                 self._conn.execute(

@@ -179,7 +179,8 @@ class WirelessPoller:
             self.db.replace_radios(ap_id, radios)
 
         self.db.record_poll(controller["id"], ok=True)
-        self.db.prune_stale(controller["id"], seen)
+        stale_after_polls = int(self.db.settings().get("stale_after_polls", 5))
+        self.db.prune_stale(controller["id"], seen, stale_after_polls)
 
     # ------------------------------------------------------------ SNMP layer
 
