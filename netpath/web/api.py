@@ -13,6 +13,7 @@ import math
 import time
 
 from ..analysis import availability, build_timeline, build_topology
+from .. import hostresolve
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
@@ -823,33 +824,26 @@ def get_syslog_search(service, params, body) -> dict:
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
-    resolved_hosts = {}
     if service.syslog_settings.get("resolve_sources"):
         names = {ip: name for ip, name in
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
 
-        # The message itself only supplies a host when the device bothers
-        # to self-report one; fill the gap (blank, or just the source IP
-        # repeated) from whichever of the Nodes SNMP identity or the DNS
-        # cache knows a real name for that address — Nodes first, since
-        # it's a locally-managed, polled identity rather than a PTR record.
-        need = {row["source"] for row in rows
-                if not row["host"] or row["host"] == row["source"]}
-        if need:
-            device_names = {}
-            for ip in need:
-                device = service.nodes_db.device_by_ip(ip)
-                if device:
-                    name = (device["name"] if device["name"] != device["ip"]
-                            else device["sys_name"])
-                    if name:
-                        device_names[ip] = name
-            dns_names = {ip: n for ip, n in
-                         service.app_db.hostnames(need).items() if n}
-            resolved_hosts = {ip: device_names.get(ip) or dns_names.get(ip)
-                               for ip in need}
-            resolved_hosts = {ip: n for ip, n in resolved_hosts.items() if n}
+    # The message itself only supplies a host when the device bothers to
+    # self-report one; fill the gap (blank, or just the source IP
+    # repeated) from whichever of the Nodes SNMP identity or the DNS
+    # cache knows a real name for that address — Nodes first, since it's
+    # a locally-managed, polled identity rather than a PTR record. Unlike
+    # the Source column's resolved name above, this always runs — it's
+    # filling in what the Host column is supposed to mean, not an opt-in
+    # display toggle.
+    resolved_hosts = {}
+    need = {row["source"] for row in rows
+            if not row["host"] or row["host"] == row["source"]}
+    for ip in need:
+        name = hostresolve.resolve_name(service.nodes_db, service.app_db, ip)
+        if name:
+            resolved_hosts[ip] = name
 
     return {
         "took_ms": round(elapsed_ms, 1),

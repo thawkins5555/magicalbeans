@@ -123,7 +123,7 @@ DEFAULTS = {
     "smtp_username": "",
     "smtp_from": "",
     "smtp_from_name": "SappiWhere",
-    "smtp_to_default": "",          # comma-separated fallback recipients
+    "smtp_to_default": [],          # fallback recipients
     "smtp_timeout_s": 15.0,
     # volume control
     "renotify_minutes": 0,          # 0 = notify once per open alert, never again while open

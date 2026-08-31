@@ -83,6 +83,8 @@
       <label class="check"><input type="checkbox" id="nd-filter-offline"> Only offline</label>
       <button id="nd-apply">Apply</button>
       <span class="grow"></span>
+      <span class="hint">Ctrl-click a row to select it</span>
+      <button id="nd-bulk-selectall">Select all</button>
       <span id="nd-count" class="hint"></span>
     </div>
     <div class="bar wrap" id="nd-bulk-bar" hidden>
@@ -214,6 +216,8 @@
       <select id="alerts-range"></select>
       <button id="alerts-apply">Apply</button>
       <span class="grow"></span>
+      <span class="hint">Ctrl-click a row to select it</span>
+      <button id="alerts-bulk-selectall">Select all</button>
       <span id="alerts-count" class="hint"></span>
     </div>
     <div class="bar wrap" id="alerts-bulk-bar" hidden>
@@ -528,12 +532,12 @@
   </div>
 
   <nav class="subtabs">
-    <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
+    <button class="subtab active" data-subtab="dhcp">DHCP</button>
     <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
-    <button class="subtab" data-subtab="dhcp">DHCP</button>
+    <button class="subtab" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
   </nav>
 
-  <div id="ipam-sub-subnets" class="subpage active">
+  <div id="ipam-sub-subnets" class="subpage">
    <div class="cols" data-splitter="ipam-subnets">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
@@ -578,7 +582,7 @@
     <div class="table-wrap pad-x pad-b" style="flex:1"><table id="ipam-conflicts-table"></table></div>
   </div>
 
-  <div id="ipam-sub-dhcp" class="subpage">
+  <div id="ipam-sub-dhcp" class="subpage active">
     <div class="bar">
       <span class="section">DHCP SERVER</span>
       <select id="ipam-dhcp-server-select"></select>

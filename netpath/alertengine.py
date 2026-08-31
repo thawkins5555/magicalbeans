@@ -18,6 +18,7 @@ import time
 import traceback
 
 from . import alertmail
+from . import hostresolve
 from .alertrules import CLEARS, Occurrence, dedup_key, evaluate_flapping, \
     evaluate_threshold, match_device
 from .eventlog import ERROR, NullLog
@@ -136,7 +137,8 @@ class AlertEngine:
             device = self.nodes_db.device(row["device_id"])
             if device is None:
                 continue
-            label = device["name"] or device["ip"]
+            label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
             occurrence = Occurrence(
                 kind="device_event", source_kind=row["kind"], entity_kind="device",
                 entity_id=str(device["id"]), entity_label=label, ts=row["ts"],
@@ -174,7 +176,9 @@ class AlertEngine:
             device = self.nodes_db.device(interface["device_id"])
             if device is None:
                 continue
-            label = f"{device['name'] or device['ip']} / {interface['descr'] or interface['if_index']}"
+            device_label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
+            label = f"{device_label} / {interface['descr'] or interface['if_index']}"
             occurrences.append(Occurrence(
                 kind="interface_event", source_kind=row["kind"], entity_kind="interface",
                 entity_id=f"{device['id']}:{interface['if_index']}", entity_label=label,
@@ -199,7 +203,9 @@ class AlertEngine:
             device = self.nodes_db.device(interface["device_id"])
             if device is None:
                 continue
-            label = f"{device['name'] or device['ip']} / {interface['descr'] or interface['if_index']}"
+            device_label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
+            label = f"{device_label} / {interface['descr'] or interface['if_index']}"
             occurrences.append(Occurrence(
                 kind="interface_event", source_kind="flapping", entity_kind="interface",
                 entity_id=f"{device['id']}:{interface['if_index']}", entity_label=label,
@@ -242,9 +248,17 @@ class AlertEngine:
             max_id = max(max_id, row["id"])
             if row["severity"] > min_severity:
                 continue
+            # Same "don't override a real self-reported host" rule as the
+            # Syslog page's own Host column, so an alert opened from a
+            # message shows the same name the Syslog page shows for it.
+            if row["host"] and row["host"] != row["source"]:
+                label = row["host"]
+            else:
+                label = hostresolve.resolve_name(
+                    self.nodes_db, self.app_db, row["source"]) or row["source"]
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
-                entity_id=row["source"], entity_label=row["host"] or row["source"],
+                entity_id=row["source"], entity_label=label,
                 ts=row["ts"], message=row["message"] or "", device_ip=row["source"],
                 severity=row["severity"]))
         if max_id > cursor:
@@ -263,9 +277,11 @@ class AlertEngine:
         max_id = cursor
         for row in rows:
             max_id = max(max_id, row["id"])
+            label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, row["ip"]) or row["ip"]
             occurrences.append(Occurrence(
                 kind="ipam", source_kind="", entity_kind="ipam",
-                entity_id=str(row["id"]), entity_label=row["ip"],
+                entity_id=str(row["id"]), entity_label=label,
                 ts=row["detected_ts"],
                 message=f"{row['ip']}: conflicting MAC addresses "
                         f"{row['mac_a']} and {row['mac_b']}",
@@ -294,7 +310,8 @@ class AlertEngine:
                     streak = 0
                 self._breach_streaks[streak_key] = streak
                 result = evaluate_threshold(rule, value, streak)
-                label = device["name"] or device["ip"]
+                label = hostresolve.resolve_name(
+                    self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
                 if result == "breach":
                     occurrences.append(Occurrence(
                         kind="threshold", source_kind=rule["source_kind"],
@@ -389,8 +406,15 @@ class AlertEngine:
         subject = alertmail.render(template["subject"], context)
         body = alertmail.render(template["body"], context)
 
-        to_addrs = [a.strip() for a in str(settings.get("smtp_to_default", "")).split(",")
-                   if a.strip()]
+        # Stored as a list since the recipients-list UI shipped; a plain
+        # comma-separated string is still handled here so a deployment
+        # upgrading from before that change doesn't lose its setting on
+        # the first tick after upgrade, before it's ever re-saved.
+        raw_to = settings.get("smtp_to_default", [])
+        if isinstance(raw_to, str):
+            to_addrs = [a.strip() for a in raw_to.split(",") if a.strip()]
+        else:
+            to_addrs = [str(a).strip() for a in raw_to if str(a).strip()]
         if not to_addrs:
             return
 

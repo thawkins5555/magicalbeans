@@ -4,7 +4,7 @@
    separate top-level tabs — none of them is a whole module on its own. */
 (() => {
   const view = {
-    sub: 'subnets',
+    sub: 'dhcp',
     subnets: [], subnetId: null,
     hosts: [], hostSort: { key: 'ip', descending: false },
     conflicts: [],
@@ -745,9 +745,20 @@
     const t0 = points[0].ts;
     const t1 = points[points.length - 1].ts;
     const span = Math.max(t1 - t0, 1);
-    const maxLeased = Math.max(1, ...points.map((p) => p.leased));
+    // Scaled to the data's own range rather than a 0 floor (unlike
+    // nodes.js/netflow.js's charts, which deliberately do anchor at 0) —
+    // this is a small sparkline meant to show day-to-day movement, and a
+    // scope oscillating in a narrow band (e.g. 40-45 leased) would
+    // otherwise get squashed into a sliver at the bottom of it. A small
+    // pad keeps the line off the top/bottom edge.
+    const rawMin = Math.min(...points.map((p) => p.leased));
+    const rawMax = Math.max(...points.map((p) => p.leased));
+    const pad = Math.max((rawMax - rawMin) * 0.1, 0.5);
+    const minLeased = Math.max(rawMin - pad, 0);
+    const maxLeased = rawMax + pad;
+    const domainSpan = Math.max(maxLeased - minLeased, 1);
     const x = (ts) => padX + ((ts - t0) / span) * (width - padX * 2);
-    const y = (v) => height - padY - (v / maxLeased) * (height - padY * 2);
+    const y = (v) => height - padY - ((v - minLeased) / domainSpan) * (height - padY * 2);
 
     const line = points.map((p) => `${x(p.ts).toFixed(1)},${y(p.leased).toFixed(1)}`).join(' ');
     const area = `${x(t0).toFixed(1)},${height - padY} ${line} ${x(t1).toFixed(1)},${height - padY}`;

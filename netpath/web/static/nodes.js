@@ -90,28 +90,6 @@
 
   function drawTable() {
     const table = App.grid(App.el('nodes-table'), { name: 'nodes-devices', columns: COLUMNS });
-    // A checkbox column, prepended after App.grid builds its own
-    // colgroup/thead — App.grid's columns are a display/sort spec only,
-    // so a selection column that isn't sortable or width-persisted
-    // doesn't belong in COLUMNS itself.
-    const col = document.createElement('col');
-    col.style.width = '28px';
-    table.querySelector('colgroup').prepend(col);
-    const headRow = table.querySelector('thead tr');
-    const headCheck = document.createElement('th');
-    const selectAll = document.createElement('input');
-    selectAll.type = 'checkbox';
-    selectAll.title = 'Select all visible';
-    selectAll.checked = view.devices.length > 0
-      && view.devices.every((d) => view.devicesChecked.has(d.id));
-    selectAll.onchange = () => {
-      if (selectAll.checked) view.devices.forEach((d) => view.devicesChecked.add(d.id));
-      else view.devices.forEach((d) => view.devicesChecked.delete(d.id));
-      drawTable();
-    };
-    headCheck.appendChild(selectAll);
-    headRow.prepend(headCheck);
-
     const body = document.createElement('tbody');
     const groupsById = {};
     for (const g of view.groups) groupsById[g.id] = g.name;
@@ -119,31 +97,30 @@
     for (const g of view.deviceGroups) devGroupsById[g.id] = g.name;
     for (const row of view.devices) {
       const tr = document.createElement('tr');
-      tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
+      tr.className = 'clickable'
+        + (view.selected === row.id ? ' selected' : '')
+        + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
       const dot = `<span class="dot" style="background:${STATUS_COLOR[row.status] || 'var(--faint)'};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px"></span>`;
       const rtt = row.snmp_ok ? (row.ping_rtt_ms != null ? `${row.ping_rtt_ms.toFixed(0)} ms` : 'ok')
         : (row.ping_ok ? `${(row.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '—');
-      const checkTd = document.createElement('td');
-      const check = document.createElement('input');
-      check.type = 'checkbox';
-      check.checked = view.devicesChecked.has(row.id);
-      check.onclick = (e) => e.stopPropagation();   // don't also selectDevice()
-      check.onchange = () => {
-        if (check.checked) view.devicesChecked.add(row.id);
-        else view.devicesChecked.delete(row.id);
-        drawBulkBar();
-      };
-      checkTd.appendChild(check);
-      tr.appendChild(checkTd);
-      tr.insertAdjacentHTML('beforeend',
+      tr.innerHTML =
         `<td>${dot}${escape(row.status)}</td>` +
         `<td>${escape(displayName(row))}<div class="hint">${escape(row.ip)}</div></td>` +
         `<td>${escape(groupsById[row.group_id] || '—')}</td>` +
         `<td>${escape(devGroupsById[row.device_group_id] || '—')}</td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${escape(rtt)}</td>` +
-        `<td>${ago(row.last_poll_ts)}</td>`);
-      tr.onclick = () => selectDevice(row.id);
+        `<td>${ago(row.last_poll_ts)}</td>`;
+      // Ctrl/Cmd-click toggles bulk selection without touching the
+      // single-row detail-pane selection below; a plain click keeps
+      // doing exactly what it always did.
+      tr.onclick = (event) => {
+        if (event.ctrlKey || event.metaKey) {
+          toggleChecked(row.id);
+        } else {
+          selectDevice(row.id);
+        }
+      };
       body.appendChild(tr);
     }
     table.appendChild(body);
@@ -152,6 +129,17 @@
   }
 
   /* ------------------------------------------------------- bulk actions */
+
+  function toggleChecked(id) {
+    if (view.devicesChecked.has(id)) view.devicesChecked.delete(id);
+    else view.devicesChecked.add(id);
+    drawTable();
+  }
+
+  function bulkSelectAll() {
+    view.devices.forEach((d) => view.devicesChecked.add(d.id));
+    drawTable();
+  }
 
   function drawBulkBar() {
     const n = view.devicesChecked.size;
@@ -1682,6 +1670,7 @@
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
+    App.el('nd-bulk-selectall').onclick = bulkSelectAll;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
     App.el('nd-d-metric').onchange = (e) => { view.metricId = e.target.value; loadSeries(); };
     App.el('nd-d-range').onchange = (e) => {

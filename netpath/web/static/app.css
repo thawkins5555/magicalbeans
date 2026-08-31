@@ -456,6 +456,10 @@ td { padding: 4px 8px; border-bottom: 1px solid var(--grid); color: var(--text);
 tr:nth-child(even) td { background: var(--raised); }
 tr.clickable { cursor: pointer; }
 tr.selected td { background: var(--hairline); }
+/* Ctrl/Cmd-click bulk selection — an inset accent border, distinct from
+   .selected's background tint, since a row can be both at once (checked
+   for a bulk action while also being the open detail-pane row). */
+tr.bulk-checked td { box-shadow: inset 3px 0 0 var(--accent); }
 td.num { text-align: right; }
 
 /* Sortable, resizable tables. Fixed layout so the colgroup widths are obeyed

@@ -126,46 +126,13 @@
 
   function drawTable() {
     const table = App.grid(App.el('alerts-table'), { name: 'alerts', columns: COLUMNS });
-    // A checkbox column, prepended after App.grid builds its own
-    // colgroup/thead — same pattern as the Nodes device table's bulk
-    // selection (App.grid's columns are a display/sort spec only, so a
-    // selection column that isn't sortable or width-persisted doesn't
-    // belong in COLUMNS itself).
-    const col = document.createElement('col');
-    col.style.width = '28px';
-    table.querySelector('colgroup').prepend(col);
-    const headRow = table.querySelector('thead tr');
-    const headCheck = document.createElement('th');
-    const selectAll = document.createElement('input');
-    selectAll.type = 'checkbox';
-    selectAll.title = 'Select all visible';
-    selectAll.checked = view.alerts.length > 0
-      && view.alerts.every((a) => view.checked.has(a.id));
-    selectAll.onchange = () => {
-      if (selectAll.checked) view.alerts.forEach((a) => view.checked.add(a.id));
-      else view.alerts.forEach((a) => view.checked.delete(a.id));
-      drawTable();
-    };
-    headCheck.appendChild(selectAll);
-    headRow.prepend(headCheck);
-
     const body = document.createElement('tbody');
     for (const row of view.alerts) {
       const tr = document.createElement('tr');
-      tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      const checkTd = document.createElement('td');
-      const check = document.createElement('input');
-      check.type = 'checkbox';
-      check.checked = view.checked.has(row.id);
-      check.onclick = (e) => e.stopPropagation();   // don't also select the row
-      check.onchange = () => {
-        if (check.checked) view.checked.add(row.id);
-        else view.checked.delete(row.id);
-        drawBulkBar();
-      };
-      checkTd.appendChild(check);
-      tr.appendChild(checkTd);
-      tr.insertAdjacentHTML('beforeend',
+      tr.className = 'clickable'
+        + (view.selected === row.id ? ' selected' : '')
+        + (view.checked.has(row.id) ? ' bulk-checked' : '');
+      tr.innerHTML =
         `<td><span class="sev sev-${row.severity}">${row.severity}</span></td>` +
         `<td>${escape(row.state)}</td>` +
         `<td>${escape(row.entity_label)}</td>` +
@@ -173,8 +140,19 @@
         `<td class="msg">${escape(row.message)}</td>` +
         `<td>${row.count > 1 ? row.count : ''}</td>` +
         `<td>${ago(row.opened_ts)}</td>` +
-        `<td>${ago(row.last_ts)}</td>`);
-      tr.onclick = () => { view.selected = row.id; drawTable(); showDetail(row); };
+        `<td>${ago(row.last_ts)}</td>`;
+      // Ctrl/Cmd-click toggles bulk selection without touching the
+      // single-row detail-pane selection; a plain click keeps doing
+      // exactly what it always did.
+      tr.onclick = (event) => {
+        if (event.ctrlKey || event.metaKey) {
+          toggleChecked(row.id);
+        } else {
+          view.selected = row.id;
+          drawTable();
+          showDetail(row);
+        }
+      };
       body.appendChild(tr);
     }
     table.appendChild(body);
@@ -183,6 +161,17 @@
   }
 
   /* ------------------------------------------------------- bulk actions */
+
+  function toggleChecked(id) {
+    if (view.checked.has(id)) view.checked.delete(id);
+    else view.checked.add(id);
+    drawTable();
+  }
+
+  function bulkSelectAll() {
+    view.alerts.forEach((a) => view.checked.add(a.id));
+    drawTable();
+  }
 
   function drawBulkBar() {
     const n = view.checked.size;
@@ -454,8 +443,24 @@
 
   /* ---------------------------------------------------------- settings */
 
+  function normalizeRecipients(raw) {
+    if (Array.isArray(raw)) return raw.slice();
+    return String(raw || '').split(',').map((a) => a.trim()).filter(Boolean);
+  }
+
+  function recipientsListHtml(list) {
+    if (!list.length) return '<p class="hint">No recipients yet.</p>';
+    const rows = list.map((addr, index) => `
+      <tr>
+        <td>${escape(addr)}</td>
+        <td><button type="button" class="as-to-remove" data-index="${index}">Remove</button></td>
+      </tr>`).join('');
+    return `<table><tbody>${rows}</tbody></table>`;
+  }
+
   function settingsDialog() {
     const s = App.state.alertsSettings || {};
+    const recipients = normalizeRecipients(s.smtp_to_default);
     const check = (id, label, on) =>
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
@@ -484,7 +489,10 @@
       <fieldset><legend>IDENTITY &amp; RECIPIENTS</legend>
         <label>From address <input id="as-from" value="${escape(s.smtp_from || '')}"></label>
         <label>From name <input id="as-fromname" value="${escape(s.smtp_from_name || '')}"></label>
-        <label>Default recipients (comma-separated) <input id="as-to" value="${escape(s.smtp_to_default || '')}"></label>
+        <p class="hint">Default recipients</p>
+        <div id="as-to-list">${recipientsListHtml(recipients)}</div>
+        <label>Add recipient <input id="as-to-add" placeholder="name@example.com"></label>
+        <button type="button" id="as-to-add-btn">Add</button>
       </fieldset>
       <fieldset><legend>VOLUME</legend>
         ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
@@ -528,7 +536,7 @@
           smtp_security: box.querySelector('#as-security').value,
           smtp_verify_cert: on('#as-verify'), smtp_username: text('#as-user'),
           smtp_from: text('#as-from'), smtp_from_name: text('#as-fromname'),
-          smtp_to_default: text('#as-to'), renotify_minutes: num('#as-renotify'),
+          smtp_to_default: recipients, renotify_minutes: num('#as-renotify'),
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
         } });
         await App.loadState();
@@ -544,6 +552,25 @@
       select.appendChild(option);
     });
     select.value = String(s.min_severity ?? 7);
+
+    function renderRecipients() {
+      box.querySelector('#as-to-list').innerHTML = recipientsListHtml(recipients);
+      for (const btn of box.querySelectorAll('.as-to-remove')) {
+        btn.onclick = () => {
+          recipients.splice(Number(btn.dataset.index), 1);
+          renderRecipients();
+        };
+      }
+    }
+    renderRecipients();
+    box.querySelector('#as-to-add-btn').onclick = () => {
+      const input = box.querySelector('#as-to-add');
+      const addr = input.value.trim();
+      if (!addr || !addr.includes('@')) return;
+      recipients.push(addr);
+      input.value = '';
+      renderRecipients();
+    };
   }
 
   /* ----------------------------------------------------------- refresh */
@@ -612,6 +639,7 @@
       App.refreshNow('alerts');
     };
     App.el('alerts-bulk-resolve').onclick = bulkResolve;
+    App.el('alerts-bulk-selectall').onclick = bulkSelectAll;
     App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
     App.el('alerts-toggle').onclick = async () => {
       const running = (App.state.serverState.alerts || {}).running;

@@ -6,6 +6,36 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.21.0 — Hostname resolution fixes, IPAM reorder/chart, Ctrl+click bulk select, recipients list
+
+- **Fixed the Syslog Host column not showing a device's SNMP-polled
+  name.** The lookup logic was already correct, but it was wired behind
+  the "Resolve sending addresses to names" setting, which defaults off —
+  so on most installs it silently never ran. It now always fills a
+  missing/self-reported-IP host with the Nodes SNMP name (or, failing
+  that, DNS), never overriding a host the device actually supplied.
+  Fixed the name precedence at the same time: SNMP's `sysName` now wins
+  over a manually-set device name, matching how the Nodes page itself
+  already displays a device.
+- **The Alerts "Object" column now resolves to a device hostname** the
+  same way — SNMP name, then DNS, then the bare IP — instead of the
+  weaker `name or ip` it used before (and, for syslog-triggered alerts,
+  instead of showing an unresolved IP even when the Syslog page itself
+  shows a resolved name for that exact message).
+- **IPAM's DHCP and Subnets & Hosts sub-tabs swapped positions, and DHCP
+  is now the default view** when the IPAM tab is opened.
+- **The IPAM leased-IP sparkline now scales to its own data range**
+  instead of always anchoring at zero, so a scope oscillating in a
+  narrow band is no longer squashed into a sliver at the bottom of the
+  chart.
+- **Bulk selection (Nodes → Devices, Alerts) is now Ctrl/Cmd-click +
+  an explicit "Select all" button**, replacing the checkbox column —
+  plain click still opens the detail pane exactly as before; Discovery's
+  approve/deny checklist keeps its checkboxes, since it's a pre-seeded
+  checklist rather than a bulk-select-existing-rows table.
+- **Alert email recipients are now an add/remove list** in Alerts
+  settings instead of one comma-separated text field.
+
 ### 4.20.0 — Bulk resolve alerts, poll-on-add, false recovery fix, syslog severity fix
 
 - **Alerts can be resolved in bulk.** A checkbox column on the alert

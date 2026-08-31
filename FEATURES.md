@@ -100,11 +100,12 @@ own subtabs.
   one group at a time (or none). Groups are managed from a small dialog
   next to the Devices filter bar; removing a group leaves its devices
   ungrouped rather than erroring.
-- **Devices can be selected and operated on in bulk.** A checkbox
-  column on the device list (with select-all-visible) reveals a bulk
-  actions bar: Set profile, Set group, Remove from group, and Delete —
-  each applied to every selected device in one request rather than one
-  per device.
+- **Devices can be selected and operated on in bulk.** Ctrl/Cmd-click a
+  row to add or remove it from the selection (a plain click still opens
+  its detail pane, unchanged), or use **Select all**; either reveals a
+  bulk actions bar: Set profile, Set group, Remove from group, and
+  Delete — each applied to every selected device in one request rather
+  than one per device.
 - **A "Only offline" checkbox** on the Devices filter bar shows devices
   whose status isn't `up` (down, unknown, unsupported, or auth-failed) —
   combinable with the Profile/Group/Status filters alongside it.
@@ -250,11 +251,17 @@ alerts and optionally emailing about them.
 
 ### Working the alert list
 
-- **Alerts can be resolved individually or in bulk.** A checkbox column
-  on the alert list (with select-all-visible) reveals a bulk actions bar
-  with a single **Resolve selected**, applied to every checked alert in
-  one request — alongside the existing single-alert Resolve button in
-  the detail pane and the all-open **Acknowledge all** button.
+- **Alerts can be resolved individually or in bulk.** Ctrl/Cmd-click a
+  row to add or remove it from the selection (a plain click still opens
+  the detail pane, unchanged), or use **Select all**; either reveals a
+  bulk actions bar with a single **Resolve selected**, applied to every
+  checked alert in one request — alongside the existing single-alert
+  Resolve button in the detail pane and the all-open **Acknowledge all**
+  button.
+- **The Object column always shows a hostname when one is known** — the
+  same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
+  then DNS, then the bare IP as a last resort) — rather than the raw IP
+  or a bare manually-set device name it showed before.
 
 ### Rules
 
@@ -304,6 +311,9 @@ alerts and optionally emailing about them.
 - **Test sends a real email** to an address typed in, using whatever SMTP
   settings are currently in the form before they are saved — the same
   "test what's typed" idiom as IPAM's DHCP test.
+- **Default recipients are a list**, in Alerts settings — add an address
+  or remove one from the visible list rather than editing a single
+  comma-separated field.
 
 ### Templates
 
@@ -660,11 +670,11 @@ A collector, a search, and an hourly histogram.
   devices put their own hostname in the message; when one doesn't (or
   just repeats its own IP there), the Host column falls back to a name
   cross-referenced from elsewhere in the app for that same source
-  address — the Nodes module's SNMP-polled device identity first, then
-  the same reverse-DNS cache the Source column uses. A device's own
+  address — the Nodes module's SNMP-polled `sysName` first, then the
+  same reverse-DNS cache the Source column uses. A device's own
   self-reported hostname is never overridden, only filled in when
-  missing, and this only happens while **Resolve sending addresses to
-  names** is on.
+  missing, and this always runs — unlike the Source column's resolved
+  name, it isn't gated by **Resolve sending addresses to names**.
 - **The message table resizes**, the same way NetFlow's flow record table
   does. Drag the edge of a heading to widen or narrow the column; the
   widths are remembered per browser, and **Reset layout** on the Settings
@@ -721,8 +731,8 @@ arrival time** in the settings.
 
 ## IPAM — address inventory, conflicts, DHCP visibility
 
-Three views inside one tab, switched locally: Subnets & Hosts, Conflicts, and
-DHCP.
+Three views inside one tab, switched locally: DHCP (the default view when
+the tab opens), Conflicts, and Subnets & Hosts.
 
 ### Find
 
@@ -819,6 +829,11 @@ known, the percentage of the scope) at any point along it. This is
 separate history from the live figures beside the donut: a poll's usage is
 snapshotted every time regardless of whether anything changed, so the
 chart still shows a flat line for a quiet scope rather than no data.
+Unlike Nodes' and NetFlow's charts, the Y-axis is scaled to the window's
+own min/max rather than anchored at zero, since this is a small sparkline
+meant to show day-to-day movement — a scope oscillating in a narrow band
+(say 40-45 leased) reads as real movement instead of a flat line pinned
+to the bottom of the chart.
 
 **Two ways to authenticate, per server.**
 

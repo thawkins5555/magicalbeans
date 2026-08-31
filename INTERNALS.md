@@ -232,11 +232,28 @@ ids from one request" shape `post_nodes_discovery_promote`'s
 per device. `bulk_update_devices` reuses `update_device`'s
 `_DEVICE_EDITABLE` allow-list unchanged, so a bulk "remove from group"
 is exactly `device_group_id: null` through the same code path a
-single-device edit already uses — no separate "clear" endpoint. The
-frontend's checkbox column is layered onto `App.grid`'s output
-(prepending a `<col>`/`<th>`/`<td>` after the grid builds its own
-colgroup/thead) rather than added to `App.grid` itself, since
-selection isn't sortable or width-persisted the way real columns are.
+single-device edit already uses — no separate "clear" endpoint.
+
+**Bulk selection is Ctrl/Cmd-click, not a checkbox column** (`nodes.js`
+Devices table, `alerts.js` Alerts table — identical shape in both). Each
+row's `tr.onclick` branches on `event.ctrlKey || event.metaKey`: a plain
+click still does exactly what it always did (open the single-row detail
+pane, `view.selected`), a modifier-key click toggles that row's id in
+the bulk `Set` (`view.devicesChecked` / `view.checked`) instead. These
+two selection concepts were already fully decoupled before this change
+— a checkbox's own `onclick` used to call `e.stopPropagation()`
+specifically so it never reached `tr.onclick` — which is what made
+swapping the *input mechanism* (checkbox click → modifier-key click) a
+pure interaction change with no effect on `drawBulkBar()`/the `bulk*()`
+action functions, which still just read `[...view.devicesChecked]` /
+`[...view.checked]` unaware of how the Set was populated. A row can
+still be simultaneously selected (detail pane) and checked (bulk set);
+`tr.bulk-checked` (an inset `box-shadow`, `app.css`) and `tr.selected`
+(a background tint) are visually independent for exactly that reason.
+Because the bulk bar itself is `hidden` while nothing is checked, the
+**Select all** button lives in the always-visible filter bar instead of
+inside it — otherwise there'd be no way to reach it before checking at
+least one row by hand.
 
 **"Only offline" filter.** `devices(exclude_up=True)` appends
 `status != 'up'` — deliberately not `status = 'down'`: down, unknown,
@@ -639,6 +656,32 @@ carry `AND state IN ('open','acked')`, so resolving an already-resolved
 alert a second time (e.g. a stale checkbox from a previous filter view)
 is a harmless no-op rather than an error.
 
+### Object column resolution (`alertengine.py`)
+
+Each drain that produces a device- or IP-backed `Occurrence`
+(`_drain_device_events`, both `_drain_interface_events` label sites,
+`_drain_syslog`, `_drain_ipam_conflicts`, `_evaluate_thresholds`) builds
+its `entity_label` through `hostresolve.resolve_name()` (see Syslog's
+"Host cross-referencing," below) rather than the `device["name"] or
+device["ip"]` every one of them used independently before — falling
+back to the bare IP as the final resort, since the Object column should
+always show *something*. `_drain_syslog` follows the same "don't
+override a real self-reported host" rule Syslog's own Host column uses,
+so an alert opened from a syslog line matches whatever the Syslog page
+itself would show for that exact message rather than falling back to a
+raw, unresolved IP the way it used to (that drain reads `syslog_db`
+rows directly, bypassing `get_syslog_search`'s resolution entirely, so
+this had silently drifted out of sync with the page it was reporting
+on). `trap` occurrences are deliberately left alone — `entity_label`
+there is the trap's *name/OID* (what kind of trap), not a device label,
+and resolving it to a hostname would erase that information for no
+benefit. Because `alerts.entity_label` is stored on the row and only
+refreshed on each repeat occurrence (`open_or_increment`, above), a
+resolved-name improvement like this reaches already-open/recurring
+alerts automatically on their next occurrence — no backfill needed —
+but a one-shot alert that never repeats keeps whatever label it opened
+with.
+
 ### Notifications (`alertmail.py`, `alertengine.py`)
 
 `{{token}}` substitution (`_TOKEN = re.compile(r"\{\{(\w+)\}\}")`) is
@@ -672,6 +715,19 @@ read backwards on an email announcing that the problem is over.
 `device_up` doubles as that generic "recovered" template for
 `interface_up` and every threshold clear too, the same reasoning that
 justified shipping only 5 built-in templates instead of one per rule.
+
+`smtp_to_default` is a JSON array now (an add/remove list in the
+settings UI, `alerts.js`), not the comma-separated string it used to be
+— a change in what one settings value's JSON blob holds, not a schema
+change, since `alertsdb.py`'s settings table stores each value as
+`json.dumps(value)` under its key with no column type to migrate.
+`_notify()` still accepts either shape on read (`isinstance(raw, str)`
+→ split on commas, else treat it as already a list) purely so a
+deployment upgrading mid-flight doesn't lose its configured recipients
+on the first tick after the upgrade, before anyone has re-opened Alerts
+settings and hit Save; the frontend does the same normalization
+(`normalizeRecipients()`) when it loads whatever's currently stored, so
+either representation renders correctly as a list either way.
 
 Rate limiting (`max_emails_per_hour`) prunes a rolling
 `self._sent_this_hour` list to the trailing 60 minutes and logs the
@@ -1179,27 +1235,77 @@ stored table SQL for `trigram` and `source`) gets the index dropped and
 rebuilt once in the background, in chunks, without blocking search in the
 meantime — it just scans until the backfill catches up.
 
-### Host cross-referencing (`api.py get_syslog_search`)
+### Host cross-referencing (`hostresolve.py`, `api.py get_syslog_search`)
 
 The `host` column stored in `logs` is exactly what `syslogparse.parse()`
 found in the message — often empty, or just the sending device's own IP
 repeated, since not every device bothers to self-report a real hostname.
 Rather than rewrite that stored value, `get_syslog_search` fills the gap
-at read time, the same place and the same `resolve_sources` setting gate
-already used to resolve the Source column's `source_name`: for every row
-whose `host` is falsy or equal to its own `source`, it looks up
-`service.nodes_db.device_by_ip(source)` first (using `name` when it
-differs from the device's own `ip` — `add_device` seeds `name` to the IP
-itself when nothing else is given, so an unrenamed device falls through
-to `sys_name` instead of surfacing its own address as a "name"), then
-`service.app_db.hostnames()` — the same reverse-DNS cache — as a second
-pass over just the IPs still missing a name. A message that already
-carries its own real hostname is never touched; this only ever fills
-what the device left blank.
+at read time: for every row whose `host` is falsy or equal to its own
+`source`, it calls `hostresolve.resolve_name(nodes_db, app_db, ip)`. A
+message that already carries its own real hostname is never touched;
+this only ever fills what the device left blank.
+
+`hostresolve.resolve_name()` is a small shared module (not folded into
+`nodesdb.py` or `appdb.py`, to avoid making either database module
+depend on the other) used by both this and Alerts' `entity_label`
+computation (`alertengine.py`, below). It replaced three previously
+independent and disagreeing precedences that all existed at once before
+this: `nodes.js`'s own device-list display (`sys_name || name || ip`),
+this function's own earlier inline logic (`name` unless it equaled the
+device's `ip`, else `sys_name` — the *opposite* order), and
+`alertengine.py`'s (`name or ip`, no `sys_name` at all, no DNS at all).
+`resolve_name()` now matches `nodes.js`'s own convention — `sys_name`
+first, since it's what Nodes itself considers a device's canonical
+display name — then a manually-set `name` that isn't just the bare IP,
+then the DNS reverse-lookup cache, else `None`. Callers decide their own
+last resort (Syslog's Host column leaves a true gap as `""`; Alerts
+falls back to the bare IP, per its "always show something" requirement).
+
+This lookup is **not** gated by the `resolve_sources` setting the way
+the Source column's separate `source_name` resolution still is — that
+setting predates this fix and was found to be silently disabling the
+entire Nodes/DNS lookup (including the Nodes half, not just DNS) on any
+install where nobody had opened Syslog settings and turned it on, which
+was the original report this fix addresses. Filling in what the Host
+column already claims to mean isn't an opt-in display toggle the way
+choosing between a raw address and a resolved name for the Source column
+is.
 
 ---
 
 ## IPAM
+
+### Sub-tab default (`index.html`, `ipam.js`)
+
+Which of the three IPAM sub-tabs is active on first load is decided
+purely by which button/panel pair carries the `active` CSS class in the
+markup — `ipam.js`'s generic `selectSub()` (the same DOM-driven-default
+convention Nodes' own sub-tabs use) is never called on init, only wired
+to each button's `onclick`. Making DHCP the default was therefore a
+markup change (moving `active` off `subnets`'s button/panel and onto
+`dhcp`'s) plus updating `view.sub`'s initial value to match, not a
+scheduling or state-loading change — sub-tabs aren't `localStorage`-
+persisted the way the top-level module tabs are, so there was no stored
+preference to account for either.
+
+### Leased-IP sparkline scale (`ipam.js drawScopeTrend`)
+
+The Y-axis domain is computed from the window's own `min`/`max` leased
+count (plus a small pad) rather than always running from `0` to the
+data's max, unlike every other chart in this codebase (`nodes.js`,
+`netflow.js` both deliberately anchor at `0`) — a deliberate, scoped
+exception for this one sparkline, not a bug those charts should also be
+fixed to match. It exists specifically because a scope oscillating in a
+narrow band (say 40-45 leased out of a much larger scope) used to get
+visually squashed into a few pixels at the very bottom of the chart when
+the domain ran all the way down to zero; scaling to the data's own range
+makes that same real movement fill most of the sparkline's height
+instead. The area-fill polygon shares the same `y()` function as the
+line, so it's now shaded between the line and the *local minimum*,
+not true zero — a secondary, expected consequence of the non-zero floor
+worth knowing if the fill ever looks like it's covering less than it
+used to.
 
 ### Subnet sweep (`ipam_scan.py`)
 
