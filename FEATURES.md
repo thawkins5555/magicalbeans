@@ -104,6 +104,11 @@ own subtabs.
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
   due-time seeding from each device's own last poll time, so a restart
   with hundreds of devices configured does not fire all of them at once.
+- **The selected device polls fast while you watch it** — selecting a
+  device drops its SNMP poll cadence to a configurable few seconds
+  (Nodes → Settings, "Selected-device poll interval"; default 3 s, 0
+  disables) so the drill-down moves live; the profile interval resumes
+  on its own moments after the device is deselected or the tab is left.
 - **Status becomes "down" only after several consecutive failed polls**
   (configurable), not the first one, and a device that was only ever
   ping-reachable is distinguished from one that answered SNMP.
@@ -192,6 +197,16 @@ header above them once they outgrow the panel. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
+
+Clicking a port in the interface list opens that port's own dialog: a
+live up/down bandwidth graph of the last hour, its statistics and
+error counters (cumulative and per-second), its link up/down event
+history, and DOM/SFP sensor readings — voltage, current, light levels,
+temperature — read live over SNMP from devices that expose them via the
+standard ENTITY-SENSOR-MIB (values, units and scaling exactly as the
+device reports them; devices without it simply show "no DOM/sensor
+data"). Per-interface "show run" and MAC-address listings appear as
+placeholders until SSH integration lands.
 
 ---
 

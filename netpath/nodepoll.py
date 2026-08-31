@@ -206,6 +206,11 @@ class NodePoller:
         # not on every poll thereafter. In-memory and process-lifetime only,
         # the same tradeoff EngineCache above already makes.
         self._credentials: dict[int, int] = {}
+        # (device_id, expires_ts, interval_s): the device currently selected
+        # in a browser polls at interval_s until expires_ts. Renewed by the
+        # frontend every refresh tick while selected, so it self-expires
+        # when the tab is left or the browser closes — no cleanup path.
+        self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
                          "unsupported": 0, "errors": 0, "overruns": 0}
         self.error: str | None = None
@@ -272,6 +277,20 @@ class NodePoller:
 
     def poll_now(self, device_id: int) -> None:
         self._submit(device_id)
+
+    def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
+        """The device a browser has selected polls at interval_s until the
+        TTL lapses. interval_s <= 0 (the setting's off switch) clears any
+        focus instead. Pulls the device's next run forward so the first
+        fast poll lands promptly rather than after the profile interval."""
+        if interval_s <= 0:
+            self._focus = None
+            return
+        now = time.time()
+        self._focus = (device_id, now + ttl_s, interval_s)
+        due = self._next_run.get(device_id)
+        if due is not None and due > now + interval_s:
+            self._next_run[device_id] = now + interval_s
 
     # ------------------------------------------------------------ discovery
 
@@ -366,11 +385,19 @@ class NodePoller:
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = time.time()
+            focus = self._focus
             for device in self.db.devices():
                 if not device["enabled"]:
                     continue
                 config = self.db.effective_config(device)
                 interval = config["poll_interval_s"]
+                # The device selected in a browser polls faster (SNMP
+                # devices only — a fast ping-only cadence shows nothing
+                # new) until its focus TTL lapses.
+                focused = (focus is not None and device["id"] == focus[0]
+                           and now < focus[1] and config.get("snmp_enabled", True))
+                if focused:
+                    interval = min(interval, focus[2])
                 due = self._next_run.get(device["id"])
                 if due is None:
                     due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
@@ -378,7 +405,11 @@ class NodePoller:
                 if now >= due:
                     self._next_run[device["id"]] = now + interval
                     if device["id"] in self._started or device["id"] in self._queued:
-                        self._record_overrun(device, now)
+                        # A poll slower than the fast focus cadence is
+                        # expected, not an overrun worth logging — only
+                        # blowing the device's own profile interval is.
+                        if not (focused and interval < config["poll_interval_s"]):
+                            self._record_overrun(device, now)
                     else:
                         self._submit(device["id"])
             self._stop.wait(1.0)
@@ -554,9 +585,19 @@ class NodePoller:
                         prior["last_out_octets"], prior["last_sample_ts"] or 0,
                         row.get("out_octets"), now, row.get("_octet_bits", 32),
                         speed_bps=row.get("speed_bps"))
+                    # ifInErrors/ifOutErrors are 32-bit counters; the rate
+                    # is errors per second between polls.
+                    in_err_rate = counter_rate(
+                        prior["last_in_errors"], prior["last_sample_ts"] or 0,
+                        row.get("in_errors"), now, 32)
+                    out_err_rate = counter_rate(
+                        prior["last_out_errors"], prior["last_sample_ts"] or 0,
+                        row.get("out_errors"), now, 32)
                 self.db.update_interface_rate(
                     device_id, if_index, in_octets=row.get("in_octets"),
-                    out_octets=row.get("out_octets"), in_bps=in_bps, out_bps=out_bps,
+                    out_octets=row.get("out_octets"),
+                    in_errors=row.get("in_errors"), out_errors=row.get("out_errors"),
+                    in_bps=in_bps, out_bps=out_bps,
                     in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=now)
                 interface_id = self.db.interface_id_for(device_id, if_index)
                 if interface_id is not None and prior is not None:
@@ -570,6 +611,8 @@ class NodePoller:
                     label = row.get("descr") or f"if{if_index}"
                     for suffix, unit, value in (
                         ("in_bps", "bps", in_bps), ("out_bps", "bps", out_bps),
+                        ("in_err", "err/s", in_err_rate),
+                        ("out_err", "err/s", out_err_rate),
                     ):
                         if value is not None:
                             self.db.record_metric_sample(
@@ -730,6 +773,8 @@ class NodePoller:
 
             admin_raw = _val(nodeoids.IF_TABLE, "if_admin_status")
             oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
+            in_errors = _val(nodeoids.IF_TABLE, "if_in_errors")
+            out_errors = _val(nodeoids.IF_TABLE, "if_out_errors")
             rows.append({
                 "if_index": if_index,
                 "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
@@ -743,15 +788,18 @@ class NodePoller:
                     int(oper_raw), "") if oper_raw is not None else "",
                 "in_octets": int(in_octets) if isinstance(in_octets, (int, float)) else None,
                 "out_octets": int(out_octets) if isinstance(out_octets, (int, float)) else None,
+                "in_errors": int(in_errors) if isinstance(in_errors, (int, float)) else None,
+                "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
                 "_octet_bits": octet_bits,
             })
         return rows
 
-    def _walk_indexes(self, device, config: dict, base_oid: str) -> list[int]:
+    def _walk_column(self, device, config: dict, base_oid: str) -> dict[str, object]:
         """Repeated GETNEXT (works for v1/v2c/v3 alike, avoiding a separate
-        GETBULK code path) to enumerate a column's index suffixes. Stops
-        when the walk leaves base_oid's subtree or hits a safety cap."""
-        indexes: list[int] = []
+        GETBULK code path) over one table column: index suffix -> value.
+        Stops when the walk leaves base_oid's subtree or hits a safety
+        cap."""
+        values: dict[str, object] = {}
         current = base_oid
         for _ in range(512):
             try:
@@ -766,13 +814,122 @@ class NodePoller:
                 break
             if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
                 break
-            suffix = oid[len(base_oid) + 1:]
+            values[oid[len(base_oid) + 1:]] = vb["value"]
+            current = oid
+        return values
+
+    def _walk_indexes(self, device, config: dict, base_oid: str) -> list[int]:
+        indexes: list[int] = []
+        for suffix in self._walk_column(device, config, base_oid):
             try:
                 indexes.append(int(suffix))
             except ValueError:
                 break
-            current = oid
         return indexes
+
+    # ENTITY-MIB (RFC 6933) and ENTITY-SENSOR-MIB (RFC 3433) columns used
+    # by read_dom() to find a port's transceiver sensors.
+    _ENT_PHYSICAL_DESCR = "1.3.6.1.2.1.47.1.1.1.1.2"
+    _ENT_PHYSICAL_CONTAINED_IN = "1.3.6.1.2.1.47.1.1.1.1.4"
+    _ENT_ALIAS_MAPPING = "1.3.6.1.2.1.47.1.3.2.1.2"
+    _ENT_SENSOR_TYPE = "1.3.6.1.2.1.99.1.1.1.1"
+    _ENT_SENSOR_SCALE = "1.3.6.1.2.1.99.1.1.1.2"
+    _ENT_SENSOR_PRECISION = "1.3.6.1.2.1.99.1.1.1.3"
+    _ENT_SENSOR_VALUE = "1.3.6.1.2.1.99.1.1.1.4"
+    _ENT_SENSOR_STATUS = "1.3.6.1.2.1.99.1.1.1.5"
+    _ENT_SENSOR_UNITS = "1.3.6.1.2.1.99.1.1.1.6"
+    _IF_INDEX_COLUMN = "1.3.6.1.2.1.2.2.1.1"
+
+    _SENSOR_TYPE_UNITS = {3: "V AC", 4: "V DC", 5: "A", 6: "W", 7: "Hz",
+                          8: "°C", 9: "%RH", 10: "RPM", 11: "m³/min",
+                          12: ""}
+    _SENSOR_STATUS = {1: "ok", 2: "unavailable", 3: "nonoperational"}
+
+    def read_dom(self, device_id: int, if_index: int) -> list[dict]:
+        """Live on-demand read of ENTITY-SENSOR-MIB sensors belonging to one
+        interface — DOM/DDM data on an SFP port (light levels, bias
+        current, supply voltage, temperature) on devices that expose it
+        the standard way. Walked only while a human has the interface
+        dialog open, never on the poll cycle: several table walks per
+        call is fine once in a while and wasteful every interval.
+
+        Returns [] when the device lacks ENTITY-MIB/sensor support or maps
+        no physical entity to this ifIndex — the dialog says so."""
+        device = self.db.device(device_id)
+        if device is None:
+            return []
+        config = self.db.effective_config(device)
+        if not config.get("snmp_enabled", True):
+            return []
+
+        # entAliasMappingIdentifier maps entPhysicalIndex -> the ifIndex
+        # arc it corresponds to; keep the entities mapped to this port.
+        alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
+        port_entities = set()
+        for suffix, value in alias.items():
+            target = str(value)
+            if target.startswith(self._IF_INDEX_COLUMN + ".") and \
+               target.rsplit(".", 1)[-1] == str(if_index):
+                try:
+                    port_entities.add(int(suffix.split(".")[0]))
+                except ValueError:
+                    continue
+        if not port_entities:
+            return []
+
+        contained_in = {}
+        for suffix, value in self._walk_column(
+                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
+            try:
+                contained_in[int(suffix)] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+        def belongs_to_port(entity: int) -> bool:
+            seen = 0
+            while entity and seen < 16:   # a real containment tree is shallow
+                if entity in port_entities:
+                    return True
+                entity = contained_in.get(entity, 0)
+                seen += 1
+            return False
+
+        sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+        if not sensor_values:
+            return []
+        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
+        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
+        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
+        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
+        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
+        descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+
+        sensors = []
+        for suffix, raw in sensor_values.items():
+            try:
+                entity = int(suffix)
+            except ValueError:
+                continue
+            if not belongs_to_port(entity) or not isinstance(raw, (int, float)):
+                continue
+            sensor_type = int(types.get(suffix) or 0)
+            scale = int(scales.get(suffix) or 9)       # 9 = units (10^0)
+            precision = int(precisions.get(suffix) or 0)
+            # RFC 3433: the reading is value x 10^(3*(scale-9)) with
+            # `precision` decimal places already folded into the integer.
+            value = raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+            unit = str(units.get(suffix) or "").strip() or \
+                self._SENSOR_TYPE_UNITS.get(sensor_type, "")
+            sensors.append({
+                "entity": entity,
+                "label": str(descrs.get(suffix) or f"sensor {entity}"),
+                "value": round(value, max(precision, 4)),
+                "unit": unit,
+                "status": self._SENSOR_STATUS.get(
+                    int(statuses.get(suffix) or 0), "unknown"),
+            })
+        sensors.sort(key=lambda s: s["entity"])
+        return sensors
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
         version = int(config.get("snmp_version") or 1)

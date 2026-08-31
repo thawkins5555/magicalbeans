@@ -6,6 +6,35 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.15.0 — Selected-device fast poll, interface drill-down dialog, visible splitters
+
+- **The device selected in the Nodes module now polls every 3 seconds**
+  instead of at its profile interval (SNMP-polled devices only), so the
+  drill-down shows live movement while you're looking at it. The cadence
+  returns to the profile interval seconds after the device is deselected
+  or the tab is left — the browser holds a short server-side lease it
+  renews while the device stays selected, so a closed browser never
+  leaves a device fast-polling. The fast interval is configurable in
+  Nodes → Settings ("Selected-device poll interval", 0 disables), and a
+  device slower to answer than the fast cadence is simply skipped that
+  round rather than flooding the event log with poll-overrun noise.
+- **Clicking a port in a device's INTERFACES list opens a per-port
+  dialog**: an up/down bandwidth graph of the last hour (fed by the
+  fast-poll above, so it visibly moves while open), the port's
+  statistics and error counters, its link up/down event history, and —
+  where the device exposes them the standard way (ENTITY-SENSOR-MIB) —
+  live DOM/SFP sensor readings such as supply voltage, bias current,
+  light levels and temperature, with units and scaling as the device
+  itself reports them. "Show run" and MAC-addresses-on-port sections are
+  present as placeholders until SSH integration is added.
+- **Interface error counters are now actually collected.** ifInErrors/
+  ifOutErrors were fetched-but-dropped before; each poll now stores the
+  cumulative counts, computes an errors-per-second rate, and records it
+  as a per-interface metric alongside the existing bandwidth ones.
+- **The draggable pane dividers are lighter** across every module — they
+  were nearly invisible against the panel background unless you already
+  knew they were there.
+
 ### 4.14.0 — Device naming, discovery approval flow, detail-field settings
 
 - **A device's displayed name now prefers its SNMP hostname (sysName)**,

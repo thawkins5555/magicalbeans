@@ -132,6 +132,8 @@ CREATE TABLE IF NOT EXISTS interfaces (
     oper_status     TEXT,
     last_in_octets  INTEGER,
     last_out_octets INTEGER,
+    last_in_errors  INTEGER,
+    last_out_errors INTEGER,
     last_sample_ts  REAL,
     in_bps          REAL,
     out_bps         REAL,
@@ -256,6 +258,7 @@ DEFAULTS = {
     "enabled": True,
     "poll_workers": 16,
     "default_interval_s": 120,
+    "focus_poll_interval_s": 3,     # selected-device fast poll; 0 disables
     "default_snmp_timeout_s": 3.0,
     "default_snmp_retries": 2,
     "down_after_failures": 3,        # consecutive poll failures before status -> down
@@ -331,6 +334,13 @@ class NodesDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_device_group"
             " ON devices(device_group_id)")
+
+        interfaces = {row["name"] for row in
+                      self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
+        for column in ("last_in_errors", "last_out_errors"):
+            if column not in interfaces:
+                self._conn.execute(
+                    f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
 
         jobs = {row["name"] for row in
                 self._conn.execute("PRAGMA table_info(discovery_jobs)").fetchall()}
@@ -866,16 +876,19 @@ class NodesDatabase:
 
     def update_interface_rate(self, device_id: int, if_index: int, *,
                               in_octets: int | None, out_octets: int | None,
+                              in_errors: int | None = None,
+                              out_errors: int | None = None,
                               in_bps: float | None, out_bps: float | None,
                               in_error_rate: float | None, out_error_rate: float | None,
                               ts: float) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE interfaces SET last_in_octets=?, last_out_octets=?,"
+                " last_in_errors=?, last_out_errors=?,"
                 " last_sample_ts=?, in_bps=?, out_bps=?, in_error_rate=?,"
                 " out_error_rate=? WHERE device_id=? AND if_index=?",
-                (in_octets, out_octets, ts, in_bps, out_bps, in_error_rate,
-                 out_error_rate, device_id, if_index))
+                (in_octets, out_octets, in_errors, out_errors, ts, in_bps,
+                 out_bps, in_error_rate, out_error_rate, device_id, if_index))
             self._conn.commit()
 
     # ---------------------------------------------------------------- metrics

@@ -121,6 +121,9 @@
       App.el('nd-detail').hidden = true;
       return;
     }
+    // Renew the fast-poll focus for the selected device on every refresh
+    // tick; the short server-side TTL ends it when the tab is left.
+    App.post(`/api/nodes/devices/${view.selected}/focus`, {}).catch(() => {});
     const [detail, metrics, ifaces, events] = await Promise.all([
       App.get(`/api/nodes/devices/${view.selected}`),
       App.get(`/api/nodes/devices/${view.selected}/metrics`),
@@ -290,6 +293,7 @@
     const body = document.createElement('tbody');
     for (const r of view.ifaces) {
       const tr = document.createElement('tr');
+      tr.className = 'clickable';
       tr.innerHTML =
         `<td>${r.if_index}</td><td>${escape(r.descr || r.alias || '')}</td>` +
         `<td>${escape(r.admin_status || '—')}</td>` +
@@ -297,9 +301,171 @@
         `<td>${r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'}</td>` +
         `<td>${r.in_bps != null ? App.rate(r.in_bps, 1) : '—'}</td>` +
         `<td>${r.out_bps != null ? App.rate(r.out_bps, 1) : '—'}</td>`;
+      tr.onclick = () => interfaceDialog(r);
       body.appendChild(tr);
     }
     table.appendChild(body);
+  }
+
+  /* ------------------------------------------- interface drill-down */
+
+  function drawIfaceChart(svg, wrap, series) {
+    svg.innerHTML = '';
+    const box = wrap.getBoundingClientRect();
+    const width = Math.max(box.width, 300);
+    const height = Math.max(box.height, 120);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const all = [...series.inPts, ...series.outPts];
+    if (!all.length) {
+      svg.appendChild(App.svgNode('text', {
+        x: width / 2, y: height / 2, 'text-anchor': 'middle',
+        fill: 'var(--faint)', 'font-size': 13,
+      }, 'No samples yet — they arrive with each poll'));
+      return;
+    }
+    const padLeft = 70;   // wider than PAD.left: "800.0 Kbps" must fit
+    const plot = { x: padLeft, y: PAD.top,
+      w: Math.max(width - padLeft - PAD.right, 10),
+      h: Math.max(height - PAD.top - PAD.bottom, 10) };
+    const value = (p) => p.avg !== undefined ? p.avg : p.value;
+    const peak = niceCeiling(Math.max(...all.map((p) => value(p) || 0), 0.001));
+    const { t0, t1 } = series;
+    const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
+    const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
+    for (let step = 0; step <= 2; step += 1) {
+      const frac = step / 2;
+      const y = plot.y + plot.h - plot.h * frac;
+      svg.appendChild(App.svgNode('line', {
+        x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)' }));
+      svg.appendChild(App.svgNode('text', {
+        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
+        'font-family': 'var(--mono)', 'font-size': 10 }, App.rate(peak * frac, 1)));
+    }
+    for (const [pts, color] of [[series.inPts, 'var(--ok)'],
+                                [series.outPts, 'var(--accent)']]) {
+      const line = pts.filter((p) => value(p) != null)
+        .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
+      if (line) {
+        svg.appendChild(App.svgNode('polyline', {
+          points: line, fill: 'none', stroke: color, 'stroke-width': 1.5 }));
+      }
+    }
+    // Time labels at fixed window fractions, not sample positions —
+    // samples often cluster in a corner of the hour and would overlap.
+    for (const frac of [0, 0.5, 1]) {
+      const ts = t0 + (t1 - t0) * frac;
+      svg.appendChild(App.svgNode('text', {
+        x: xFor(ts), y: height - 6,
+        'text-anchor': frac === 0 ? 'start' : frac === 1 ? 'end' : 'middle',
+        fill: 'var(--faint)',
+        'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
+    }
+  }
+
+  function ifaceStatsHtml(r) {
+    const row = (label, val) =>
+      `<tr><td class="hint" style="padding-right:14px">${label}</td><td>${val}</td></tr>`;
+    const num = (v) => v != null ? Number(v).toLocaleString() : '—';
+    return `<table>${[
+      row('Admin / Oper', `${escape(r.admin_status || '—')} / ${escape(r.oper_status || '—')}`),
+      row('Speed', r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'),
+      row('MAC address', escape(r.phys_addr || '—')),
+      row('Alias', escape(r.alias || '—')),
+      row('In / Out now', `${r.in_bps != null ? App.rate(r.in_bps, 1) : '—'} / ${r.out_bps != null ? App.rate(r.out_bps, 1) : '—'}`),
+      row('Error rate in / out', `${r.in_error_rate != null ? r.in_error_rate.toFixed(3) + ' err/s' : '—'} / ${r.out_error_rate != null ? r.out_error_rate.toFixed(3) + ' err/s' : '—'}`),
+      row('Errors in / out (total)', `${num(r.last_in_errors)} / ${num(r.last_out_errors)}`),
+      row('Octets in / out (counter)', `${num(r.last_in_octets)} / ${num(r.last_out_octets)}`),
+      row('Last seen', ago(r.last_seen_ts)),
+    ].join('')}</table>`;
+  }
+
+  function ifaceEventsHtml(ifIndex) {
+    const events = ((view.events || {}).interface_events || [])
+      .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
+    if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
+    return `<div class="table-wrap" style="max-height:120px"><table>` +
+      events.map((e) => `<tr><td>${App.clock(e.ts)}</td><td>${escape(e.kind)}</td>` +
+        `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
+      '</table></div>';
+  }
+
+  function interfaceDialog(iface) {
+    const deviceId = view.selected;
+    const ifIndex = iface.if_index;
+    const title = `${escape(iface.descr || `Interface ${ifIndex}`)}` +
+      (iface.alias ? ` <span class="hint">${escape(iface.alias)}</span>` : '');
+    const box = App.modal(title, `
+      <p class="section">BANDWIDTH — LAST HOUR
+        <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
+        <span style="color:var(--accent)">▬</span> out)</span></p>
+      <div id="ifd-chart" class="canvas chart" style="height:150px"><svg id="ifd-chart-svg"></svg></div>
+      <p class="section">STATISTICS &amp; ERRORS</p>
+      <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
+      <p class="section">EVENTS</p>
+      ${ifaceEventsHtml(ifIndex)}
+      <p class="section">SHOW RUN</p>
+      <p class="hint">Available once SSH integration is added.</p>
+      <p class="section">MAC ADDRESSES ON PORT</p>
+      <p class="hint">Available once SSH integration is added.</p>
+      <p class="section">DOM / SFP SENSORS</p>
+      <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`, [
+      { label: 'Close', primary: true, onClick: () => {
+        clearInterval(refreshTimer);
+        App.closeModal();
+      } },
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+
+    async function refreshChartAndStats() {
+      // The dialog outlives modal reuse only while its own chart node is
+      // still in the box — any other dialog replacing it stops the timer.
+      if (App.el('modal').hidden || !box.querySelector('#ifd-chart-svg')) {
+        clearInterval(refreshTimer);
+        return;
+      }
+      const t1 = Date.now() / 1000;
+      const t0 = t1 - 3600;
+      const inM = view.metrics.find((m) => m.key === `if_in_bps.${ifIndex}`);
+      const outM = view.metrics.find((m) => m.key === `if_out_bps.${ifIndex}`);
+      const [inS, outS, ifaces] = await Promise.all([
+        inM ? App.get(`/api/nodes/devices/${deviceId}/series`,
+          { metric_id: inM.id, t0, t1 }) : null,
+        outM ? App.get(`/api/nodes/devices/${deviceId}/series`,
+          { metric_id: outM.id, t0, t1 }) : null,
+        App.get(`/api/nodes/devices/${deviceId}/interfaces`),
+      ]);
+      const svg = box.querySelector('#ifd-chart-svg');
+      const wrap = box.querySelector('#ifd-chart');
+      if (!svg) { clearInterval(refreshTimer); return; }
+      drawIfaceChart(svg, wrap, { t0, t1,
+        inPts: (inS && inS.points) || [], outPts: (outS && outS.points) || [] });
+      const fresh = (ifaces.interfaces || []).find((r) => r.if_index === ifIndex);
+      if (fresh) box.querySelector('#ifd-stats').innerHTML = ifaceStatsHtml(fresh);
+    }
+
+    // Fast-poll focus (feature above) keeps new samples landing every few
+    // seconds while this dialog is open; redraw on the same cadence.
+    const refreshTimer = setInterval(
+      () => { refreshChartAndStats().catch(() => {}); }, 5000);
+    refreshChartAndStats().catch(() => {});
+
+    App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/dom`)
+      .then((r) => {
+        const dom = box.querySelector('#ifd-dom');
+        if (!dom) return;
+        if (!r.sensors || !r.sensors.length) {
+          dom.innerHTML = '<p class="hint">No DOM/sensor data available from this device for this port.</p>';
+          return;
+        }
+        dom.innerHTML = '<table><tr><th>Sensor</th><th>Value</th><th>Status</th></tr>' +
+          r.sensors.map((s) =>
+            `<tr><td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
+            `<td>${escape(s.status)}</td></tr>`).join('') + '</table>';
+      })
+      .catch(() => {
+        const dom = box.querySelector('#ifd-dom');
+        if (dom) dom.innerHTML = '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
+      });
   }
 
   function drawEventTable() {
@@ -1071,6 +1237,7 @@
         ${check('np-enabled', 'Run the poller', s.enabled)}
         ${number('np-workers', 'Poll worker threads', s.poll_workers, 'min=1 max=256')}
         ${number('np-interval', 'Default poll interval', s.default_interval_s, 'min=10')} s
+        ${number('np-focus', 'Selected-device poll interval (0 = off)', s.focus_poll_interval_s, 'min=0')} s
         ${number('np-timeout', 'Default SNMP timeout', s.default_snmp_timeout_s, 'min=0.5 step=0.5')} s
         ${number('np-retries', 'Default SNMP retries', s.default_snmp_retries, 'min=0')}
         ${number('np-downafter', 'Consecutive failures before "down"', s.down_after_failures, 'min=1')}
@@ -1099,7 +1266,8 @@
         const num = (id) => Number(box.querySelector(id).value);
         await App.post('/api/settings', { scope: 'nodes', values: {
           enabled: on('#np-enabled'), poll_workers: num('#np-workers'),
-          default_interval_s: num('#np-interval'), default_snmp_timeout_s: num('#np-timeout'),
+          default_interval_s: num('#np-interval'), focus_poll_interval_s: num('#np-focus'),
+          default_snmp_timeout_s: num('#np-timeout'),
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
           unreachable_ping_only: on('#np-pingonly'),
           max_scan_addresses: num('#np-maxscan'),

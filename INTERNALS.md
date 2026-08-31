@@ -253,6 +253,48 @@ the pre-existing `ipam*`/`drawIpamWorkers()` shape, including the
 `fastTick()` branch that advances displayed elapsed time between fetches
 without re-polling.
 
+**Selected-device fast poll** (`NodePoller.set_focus`): the browser
+POSTs `/api/nodes/devices/{id}/focus` on every Nodes-tab refresh tick
+while a device is selected; each call stores `(device_id, now + 15s,
+focus_poll_interval_s)` and the 1 s scheduler loop takes
+`min(profile interval, focus interval)` for that one device while the
+lease is live (SNMP-enabled devices only — a fast ping-only cadence
+shows nothing new). A short renewed lease, not an on/off switch,
+because the off edge has no reliable messenger: a closed tab or crashed
+browser sends nothing, and a TTL turns "no longer being watched" into
+the absence of renewals. Overrun logging is suppressed only while the
+focus interval is the governing one — a device that takes 5 s to answer
+a 3 s cadence is expected, not an incident; blowing its own profile
+interval still logs exactly as before. `set_focus` also pulls the
+device's `_next_run` forward so the first fast poll lands within
+seconds of selection rather than after the profile interval. Setting
+`focus_poll_interval_s` to 0 makes `set_focus` a no-op that clears any
+live lease.
+
+**Interface error counters**: `_poll_interfaces` now keeps
+`ifInErrors`/`ifOutErrors` (their OIDs were always in the GET — the
+values were previously dropped on the floor and the `in_error_rate`/
+`out_error_rate` columns written as permanent NULLs). `_run_one` feeds
+them through the same `counter_rate()` as the octet counters (32-bit),
+stores raw counts in the new `interfaces.last_in_errors`/
+`last_out_errors` columns (added via `_migrate()`), and records
+`if_in_err.{if_index}`/`if_out_err.{if_index}` metric samples next to
+the existing bps ones — which is what the interface dialog's graph and
+stats read.
+
+**DOM/SFP sensors** (`NodePoller.read_dom`): a live, on-demand
+three-table GETNEXT walk (via `_walk_column`, the generalization
+`_walk_indexes` now wraps) run only when the interface dialog opens —
+never on the poll cycle, since several table walks per interval would
+be pure waste when nobody is looking. `entAliasMappingIdentifier` finds
+the physical entity mapped to the ifIndex, `entPhysicalContainedIn`
+gives the containment tree, and every `entPhySensorTable` row whose
+ancestor chain reaches the port's entity is reported with the RFC 3433
+scaling applied (value x 10^(3*(scale-9)), `precision` decimals) and
+the device's own `entPhySensorUnitsDisplay` string as the unit — no
+vendor unit tables. A device without ENTITY-MIB support returns `[]`,
+which the dialog reports as "no DOM/sensor data" rather than an error.
+
 `counter_rate()` and `detect_reboot()` are pure functions, unit-tested in
 the module's own `__main__` block with no network needed. A 32-bit
 counter that decreased is assumed to have wrapped once; a 64-bit counter

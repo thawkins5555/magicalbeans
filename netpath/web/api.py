@@ -1571,6 +1571,25 @@ def post_nodes_device_poll(service, params, body, device_id) -> dict:
     return {"ok": True}
 
 
+def post_nodes_device_focus(service, params, body, device_id) -> dict:
+    """The browser renews this every refresh tick while the device is
+    selected on the Nodes tab; the short TTL means fast polling lapses on
+    its own when the tab is left or the browser closes — deselection
+    never needs its own request."""
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    interval = float(service.nodes_settings.get("focus_poll_interval_s", 3))
+    service.node_poller.set_focus(device_id, ttl_s=15, interval_s=interval)
+    return {"ok": True, "interval_s": interval}
+
+
+def get_nodes_device_dom(service, params, body, device_id, if_index) -> dict:
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    sensors = service.node_poller.read_dom(int(device_id), int(if_index))
+    return {"sensors": sensors}
+
+
 def post_nodes_device_test(service, params, body, device_id) -> dict:
     """Ping + SNMP against the in-progress-edit config carried in the
     body, falling back to the saved one for anything not overridden — the
@@ -1677,6 +1696,8 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "admin_status": r["admin_status"], "oper_status": r["oper_status"],
          "in_bps": r["in_bps"], "out_bps": r["out_bps"],
          "in_error_rate": r["in_error_rate"], "out_error_rate": r["out_error_rate"],
+         "last_in_errors": r["last_in_errors"], "last_out_errors": r["last_out_errors"],
+         "last_in_octets": r["last_in_octets"], "last_out_octets": r["last_out_octets"],
          "last_seen_ts": r["last_seen_ts"]}
         for r in rows]}
 

@@ -603,11 +603,13 @@ fieldset .hint { margin: 8px 0 0; }
 }
 .rows > .divider { height: 8px; cursor: row-resize; }
 .cols > .divider { width: 8px; cursor: col-resize; }
-/* The grab area is wider than the visible line, so it is easy to hit. */
+/* The grab area is wider than the visible line, so it is easy to hit.
+   --faint, not --hairline: a resize handle nobody can see might as well
+   not exist. */
 .divider::after {
   content: '';
   position: absolute;
-  background: var(--hairline);
+  background: var(--faint);
   border-radius: 2px;
   transition: background 120ms;
 }
