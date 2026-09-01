@@ -98,7 +98,16 @@ def evaluate_threshold(rule, current_value: float | None, streak: int) -> str:
 CLEARS = {
     ("device_event", "up"): "device_down",
     ("device_event", "auth_ok"): "device_auth_fail",
+    # mib_present is recorded when a device's vendor-MIB coverage flips
+    # from missing to present (a MIB got uploaded), pairing with
+    # mib_missing exactly the way up pairs with down.
+    ("device_event", "mib_present"): "mib_missing",
     ("interface_event", "link_up"): "interface_down",
+    # ap_returned is recorded whenever upsert_ap inserts a brand-new AP
+    # row — including one that was previously aged out and reappeared. A
+    # genuinely new AP resolves nothing (no matching open alert), so the
+    # pairing is noise-free.
+    ("wireless_event", "ap_returned"): "wireless_ap_removed",
     # threshold clears are handled by evaluate_threshold's 'clear' return,
     # not this map, since they're keyed by (rule, entity) not a fixed pair
 }

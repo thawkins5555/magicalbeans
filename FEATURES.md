@@ -215,8 +215,11 @@ own subtabs.
 - **A device whose vendor MIB isn't here says so.** Every poll already
   identifies a device's vendor from its sysObjectID; when that vendor is
   identified but no uploaded MIB actually describes its objects, the
-  device records it once — naming the vendor and the OID — and a
-  low-severity built-in alert rule surfaces it. The bundled
+  device records it — naming the vendor and the OID — and a low-severity
+  built-in alert rule surfaces it. Recorded on the change, not every
+  poll: once when a device is first found uncovered, again if a covering
+  MIB is later deleted, and uploading the missing MIB records the
+  matching all-clear and auto-resolves the alert. The bundled
   enterprise-number roots deliberately don't count as coverage: a root
   arc names a vendor, it doesn't decode anything, so a device only looks
   covered once a MIB with real objects under that arc is uploaded.
@@ -948,7 +951,8 @@ reports on all of them in one SNMP walk.
   and that removal opens an alert ("Access point removed from its
   controller") and writes an event to the log, so a decommissioned or
   unplugged AP is something you are told about rather than something you
-  notice missing later.
+  notice missing later. An AP that comes back auto-resolves its own
+  removal alert, the same way a device coming back resolves device-down.
 - **Mark an AP Out Of Service** when its absence is expected. That
   exempts it from both halves of the above: it is never aged out of the
   list (so the marking, and the AP, survive the controller dropping it —

@@ -310,28 +310,6 @@
     return 10 * base;
   }
 
-  /* Centered moving average over raw {ts, value} points, for the
-     Smoothed checkbox — window scales with point count so a handful of
-     samples isn't over-smoothed and a few thousand isn't under-smoothed,
-     and shrinks at the edges rather than reaching past the data. Applied
-     only to raw series (see the caller); rollup avg/min/max points never
-     pass through here. */
-  function movingAverage(points) {
-    const n = points.length;
-    if (n < 3) return points;
-    const window = Math.max(3, Math.min(9, Math.round(n / 20)));
-    const half = Math.floor(window / 2);
-    return points.map((p, i) => {
-      const lo = Math.max(0, i - half);
-      const hi = Math.min(n - 1, i + half);
-      let sum = 0, count = 0;
-      for (let j = lo; j <= hi; j += 1) {
-        if (points[j].value != null) { sum += points[j].value; count += 1; }
-      }
-      return { ts: p.ts, value: count ? sum / count : null };
-    });
-  }
-
   /* Axis-label formatting by metric unit — the raw number a metric
      stores is not what a human reads on a gridline. */
   function formatMetricValue(unit, v) {
@@ -366,14 +344,7 @@
     // (data.t0/t1) is still known, so the caller can keep zooming out of
     // an empty view instead of the wheel going dead — see below.
     if (!data) return null;
-    const seriesList = (data.series || []).map((s) => {
-      const points = s.points || [];
-      // Smoothing only makes sense on raw per-poll points — an hourly
-      // rollup's avg/min/max is already an aggregate, and averaging an
-      // average would misrepresent it rather than clarify it.
-      const isRaw = points.length && points[0].avg === undefined;
-      return { ...s, points: opts.smooth && isRaw ? movingAverage(points) : points };
-    });
+    const seriesList = (data.series || []).map((s) => ({ ...s, points: s.points || [] }));
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
       p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)

@@ -2900,11 +2900,14 @@ def get_wireless_aps(service, params, body) -> dict:
         result = [ap for ap in result if not ap["out_of_service"] and ap["status"] != "online"]
     # One "last reported" figure for the page as a whole: the most recent
     # successful poll across the controllers actually in view, which is
-    # what makes every AP row's own age redundant.
+    # what makes every AP row's own age redundant. last_poll_ok matters:
+    # record_poll stamps last_poll_ts on failed polls too, and without the
+    # filter this read "just now" through an hours-long controller outage.
     controllers = service.wireless_db.controllers()
     if controller_id:
         controllers = [c for c in controllers if c["id"] == int(controller_id)]
-    stamps = [c["last_poll_ts"] for c in controllers if c["last_poll_ts"]]
+    stamps = [c["last_poll_ts"] for c in controllers
+              if c["last_poll_ts"] and c["last_poll_ok"]]
     return {"aps": result, "last_reported_ts": max(stamps) if stamps else None}
 
 

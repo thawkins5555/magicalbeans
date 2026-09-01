@@ -100,25 +100,19 @@
       cell: (r) => ago(r.last_seen_ts), value: (r) => r.last_seen_ts || 0 },
   ];
 
-  const COLUMN_PREF_KEY = 'sappiwhere.wireless.columns';
-
+  /* The chosen-column set lives in the wireless settings scope
+     (table_columns, comma-joined keys), not in a private localStorage
+     key: it is saved by the same dialog as the rest of the module's
+     settings, and Reset layout — which clears the shared per-browser
+     column-width store — must not silently keep or eat it. */
   function chosenColumnKeys() {
-    try {
-      const stored = JSON.parse(localStorage.getItem(COLUMN_PREF_KEY) || 'null');
-      // An admin who unchecks everything gets the defaults back rather
-      // than a table with no columns at all.
-      if (Array.isArray(stored) && stored.length) {
-        const known = stored.filter((k) => ALL_COLUMNS.some((c) => c.key === k));
-        if (known.length) return known;
-      }
-    } catch (error) { /* private browsing, or corrupt value: use defaults */ }
+    const stored = String((App.state.wirelessSettings || {}).table_columns || '')
+      .split(',').map((k) => k.trim()).filter(Boolean)
+      .filter((k) => ALL_COLUMNS.some((c) => c.key === k));
+    // An admin who unchecks everything gets the defaults back rather
+    // than a table with no columns at all.
+    if (stored.length) return stored;
     return ALL_COLUMNS.filter((c) => c.on).map((c) => c.key);
-  }
-
-  function saveColumnKeys(keys) {
-    try {
-      localStorage.setItem(COLUMN_PREF_KEY, JSON.stringify(keys));
-    } catch (error) { /* not worth failing a column choice over */ }
   }
 
   function activeColumns() {
@@ -163,10 +157,10 @@
     const ap = selectedAp();
     const oos = App.el('wl-oos');
     const remove = App.el('wl-remove-ap');
-    // Both conditions are tested here, in one place, because .hidden can
-    // only have one owner: these buttons deliberately carry no
-    // data-requires-write, since applyPermissions() would then un-hide
-    // them on every state reload regardless of whether an AP is selected.
+    // This function owns these buttons' .hidden — selection and
+    // permission together. They carry no data-requires-write:
+    // applyPermissions() only ever hides, so it can't gate a control
+    // that is deliberately shown later per selection.
     if (!ap || !App.canWrite('wireless')) {
       oos.hidden = true;
       remove.hidden = true;
@@ -340,11 +334,11 @@
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
-        saveColumnKeys([...m.querySelectorAll('[data-column]')]
-          .filter((cb) => cb.checked).map((cb) => cb.dataset.column));
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
+          table_columns: [...m.querySelectorAll('[data-column]')]
+            .filter((cb) => cb.checked).map((cb) => cb.dataset.column).join(','),
         } });
         await App.loadState();
         App.closeModal();
@@ -377,10 +371,17 @@
     view.lastReportedTs = search.last_reported_ts;
     // The selected AP can have been filtered out (or removed) by this
     // refresh; a stale id would leave the detail pane showing an AP no
-    // longer in the list, with its action buttons still live.
-    if (view.selected && !view.aps.some((a) => a.id === view.selected)) {
+    // longer in the list, with its action buttons still live. A selection
+    // that IS still present re-renders from the fresh row — without this,
+    // toggling out-of-service updated the table row and button but left
+    // the detail pane showing the pre-toggle status until the next click.
+    const fresh = view.selected == null
+      ? null : view.aps.find((a) => a.id === view.selected);
+    if (view.selected != null && !fresh) {
       view.selected = null;
       App.el('wl-detail').textContent = 'Select an AP to see its per-radio detail.';
+    } else if (fresh) {
+      showDetail(fresh);
     }
     drawTable();
     drawStatus();

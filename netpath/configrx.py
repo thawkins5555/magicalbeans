@@ -48,13 +48,25 @@ _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
 PARAMIKO_MISSING = ("paramiko is not installed on this server — ConfigRX needs it"
                     " for SSH. Install it with: pip install paramiko")
 
+_paramiko_ok: bool | None = None
 
-def paramiko_available() -> bool:
-    try:
-        import paramiko  # noqa: F401
-    except ImportError:
-        return False
-    return True
+
+def paramiko_available(recheck: bool = False) -> bool:
+    """Cached: status_text() sits on the frontend's 2-second /api/state
+    poll, and an *uncached* probe would re-run the import machinery on
+    every call forever when paramiko is missing (failed imports are not
+    cached in sys.modules), or pay the full paramiko+cryptography import
+    inside the first web request thread when it is present. Worker start
+    passes recheck=True, so 'install it, then restart the worker' still
+    picks the new install up without an app restart."""
+    global _paramiko_ok
+    if _paramiko_ok is None or recheck:
+        try:
+            import paramiko  # noqa: F401
+            _paramiko_ok = True
+        except ImportError:
+            _paramiko_ok = False
+    return _paramiko_ok
 
 
 def _clean_output(raw: str) -> str:
@@ -138,6 +150,9 @@ class ConfigRxWorker:
     def start(self, settings: dict | None = None) -> None:
         self.stop()
         self._stop.clear()
+        # Re-probe here so a paramiko installed since the last start is
+        # seen; every other caller gets the cached verdict.
+        paramiko_available(recheck=True)
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
         self._thread.start()
@@ -153,8 +168,9 @@ class ConfigRxWorker:
     def status_text(self) -> str:
         if self.error:
             return self.error
-        # Checked here rather than at construction so installing paramiko
-        # and restarting the worker is enough — no app restart needed.
+        # Cached probe (see paramiko_available); start() re-checks, so
+        # installing paramiko and restarting the worker is enough — no
+        # app restart needed.
         if not paramiko_available():
             return PARAMIKO_MISSING
         if not self.running:

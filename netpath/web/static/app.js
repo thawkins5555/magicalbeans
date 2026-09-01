@@ -76,8 +76,17 @@ const App = (() => {
       if (module === 'dashboard') continue;
       tab.hidden = !canRead(module);
     }
+    // One-way on purpose: permission gating only ever HIDES. Writing
+    // hidden=false here made this function a second owner of .hidden for
+    // any element whose visibility also depends on app state (a bulk bar
+    // shown by selection, say), and every loadState() un-hid what feature
+    // code had hidden — the flicker bug. The page reloads on login, so
+    // there is nothing this would ever need to un-hide; a permission
+    // granted mid-session takes effect on the next reload, which is the
+    // safer direction to be lazy in. Feature code that dynamically shows
+    // a write-gated control must still check canWrite itself.
     for (const el of document.querySelectorAll('[data-requires-write]')) {
-      el.hidden = !canWrite(el.dataset.requiresWrite);
+      if (!canWrite(el.dataset.requiresWrite)) el.hidden = true;
     }
     const activeTab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
     if (activeTab && activeTab.hidden) {

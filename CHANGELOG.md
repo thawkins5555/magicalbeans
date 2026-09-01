@@ -38,9 +38,11 @@ Listed newest first. Version numbers are build order, not dates.
 - **Nodes: a device whose vendor MIB is missing now says so.** The poller
   already identifies a device's vendor from its sysObjectID; if no
   uploaded MIB actually describes that vendor's objects, it records the
-  fact once (with the vendor and OID) and a new low-severity built-in
-  rule surfaces it — so an unfamiliar device's missing data has an
-  explanation instead of just being absent.
+  fact (with the vendor and OID) and a new low-severity built-in rule
+  surfaces it — so an unfamiliar device's missing data has an explanation
+  instead of just being absent. Recorded on coverage changes, not every
+  poll; uploading the missing MIB auto-resolves the alert, and deleting a
+  covering MIB raises it.
 - **Fixed:** ConfigRX failed with a raw `ModuleNotFoundError` traceback
   in the Errors log when paramiko was not installed. It now reports the
   missing dependency, and how to install it, as a plain status on the

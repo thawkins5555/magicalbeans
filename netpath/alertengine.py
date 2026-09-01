@@ -310,9 +310,13 @@ class AlertEngine:
         rows = self.wireless_db.ap_events_since(cursor)
         occurrences = []
         max_id = cursor
+        # One controllers query per drain, not one per event row: a burst
+        # (a mass decommission) can hand back up to 2000 rows that mostly
+        # share the same handful of controllers.
+        controllers = {c["id"]: c for c in self.wireless_db.controllers()} if rows else {}
         for row in rows:
             max_id = max(max_id, row["id"])
-            controller = self.wireless_db.controller(row["controller_id"])
+            controller = controllers.get(row["controller_id"])
             label = row["name"] or row["wtp_id"]
             occurrences.append(Occurrence(
                 kind="wireless_event", source_kind=row["kind"], entity_kind="ap",
@@ -321,6 +325,18 @@ class AlertEngine:
                 message=row["detail"] or f"{label}: {row['kind']}",
                 device_name=controller["name"] if controller else "",
                 device_ip=controller["ip"] if controller else ""))
+            # ap_returned resolves a standing removed-alert for the same
+            # AP, the way device up resolves device_down.
+            clears_key = ("wireless_event", row["kind"])
+            if clears_key in CLEARS:
+                cleared_rule = self.db.rule_by_key(CLEARS[clears_key])
+                if cleared_rule:
+                    paired_dedup = (f"{cleared_rule['key']}:ap:"
+                                    f"{row['controller_id']}:{row['vdom']}:{row['wtp_id']}")
+                    resolved = self.db.resolve_by_dedup(paired_dedup, by="")
+                    if resolved:
+                        self.counters["resolved"] += 1
+                        self._notify_clear(resolved, cleared_rule, settings)
         if max_id > cursor:
             self.db.set_cursor("ap_events", max_id)
         return occurrences
@@ -373,7 +389,8 @@ class AlertEngine:
         for rule in rules:
             if rule["kind"] != occurrence.kind:
                 continue
-            if rule["kind"] in ("device_event", "interface_event", "trap"):
+            if rule["kind"] in ("device_event", "interface_event", "trap",
+                                "wireless_event"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "syslog" and occurrence.severity is not None:
@@ -492,6 +509,16 @@ class AlertEngine:
                 device_id = int(alert_row["entity_id"])
             elif alert_row["entity_kind"] == "interface":
                 device_id = int(str(alert_row["entity_id"]).split(":")[0])
+            elif alert_row["entity_kind"] == "ap":
+                # An AP alert's entity_id is "controller_id:vdom:wtp_id";
+                # the nearest meaningful address is the controller's own.
+                # Without this branch the template's {{device_ip}} fell
+                # back to the raw entity_id string.
+                if self.wireless_db is None:
+                    return ""
+                controller = self.wireless_db.controller(
+                    int(str(alert_row["entity_id"]).split(":")[0]))
+                return controller["ip"] if controller else ""
             else:
                 return ""
         except (TypeError, ValueError):

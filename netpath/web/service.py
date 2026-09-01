@@ -595,6 +595,8 @@ class Service:
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest traps")
 
+        self.wireless_db.prune_ap_events()
+
         removed = self.configrx_db.prune(
             float(self.configrx_settings.get("retention_days", 90)),
             int(self.configrx_settings.get("retention_count_per_device", 30)))

@@ -88,6 +88,11 @@ DEFAULTS = {
     # controller itself unreachable) is aged out rather than kept forever
     # showing a stale "online" status from its last successful poll.
     "stale_after_polls": 5,
+    # Comma-joined column keys the AP table shows; "" means the frontend's
+    # defaults. Lives here (not in the browser's localStorage) so it sits
+    # beside the rest of the dialog's settings and survives Reset layout,
+    # which clears per-browser widths but must not eat a settings choice.
+    "table_columns": "",
 }
 
 CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
@@ -221,12 +226,25 @@ class WirelessDatabase:
         update_clause = ", ".join(f"{k} = excluded.{k}" for k in
                                   ("last_seen_ts", "missed_polls", *fields))
         with self._lock:
-            cur = self._conn.execute(
+            existed = self._conn.execute(
+                "SELECT 1 FROM access_points WHERE controller_id = ? AND vdom = ?"
+                " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
+            self._conn.execute(
                 f"INSERT INTO access_points({','.join(cols)}) VALUES ({marks})"
                 f" ON CONFLICT(controller_id, vdom, wtp_id)"
                 f" DO UPDATE SET {update_clause}",
                 vals)
             self._conn.commit()
+            if existed is None:
+                # A brand-new row is either a newly discovered AP or one
+                # that was previously aged out and came back. Recording
+                # ap_returned for both is deliberate: the Alerts engine
+                # pairs it with wireless_ap_removed (alertrules.CLEARS) to
+                # auto-resolve a standing "removed" alert, and a genuinely
+                # new AP has no such alert, so for it this row is inert.
+                name = str(fields.get("name") or wtp_id)
+                self.add_ap_event(controller_id, wtp_id, vdom, name, "ap_returned",
+                                  f"{name} is reported by its controller again")
             row = self._conn.execute(
                 "SELECT id FROM access_points WHERE controller_id = ? AND vdom = ?"
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
@@ -268,10 +286,18 @@ class WirelessDatabase:
         and the AP — survives the controller no longer reporting it, which
         is exactly what happens when someone unracks it), and its
         disappearance raises no ap_removed event, since a human already
-        said they know about it."""
+        said they know about it.
+
+        missed_polls resets on either flip: prune_stale skips this AP
+        entirely while the flag is set, freezing whatever count it had, so
+        without the reset an AP returned to service would carry its stale
+        pre-marking misses and could be aged out (and alerted on) by a
+        single lost reply instead of getting the full consecutive-miss
+        grace window back."""
         with self._lock:
             self._conn.execute(
-                "UPDATE access_points SET out_of_service = ? WHERE id = ?",
+                "UPDATE access_points SET out_of_service = ?, missed_polls = 0"
+                " WHERE id = ?",
                 (1 if out_of_service else 0, ap_id))
             self._conn.commit()
 
@@ -281,9 +307,16 @@ class WirelessDatabase:
             self._conn.commit()
 
     def ap_counts(self) -> dict:
+        """Tallies that agree with the AP list's Show filter, by
+        construction: an out-of-service AP is counted only under
+        out_of_service (its last reported status is an admin-acknowledged
+        stale fact, not a live one), and "offline" means every in-service
+        AP that is not online — standby, downloading_image, other included
+        — exactly the set the filter's Offline choice lists."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT status, COUNT(*) AS n FROM access_points GROUP BY status").fetchall()
+                "SELECT status, COUNT(*) AS n FROM access_points"
+                " WHERE out_of_service = 0 GROUP BY status").fetchall()
             oos = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM access_points"
                 " WHERE out_of_service = 1").fetchone()["n"]
@@ -291,10 +324,9 @@ class WirelessDatabase:
         for row in rows:
             counts["total"] += row["n"]
             counts[row["status"]] = row["n"]
-        # Orthogonal to status (an out-of-service AP still has whatever
-        # status it last reported), so it is counted separately rather
-        # than folded into the status tally above.
+        counts["offline"] = counts["total"] - counts.get("online", 0)
         counts["out_of_service"] = oos
+        counts["total"] += oos
         return counts
 
     # -------------------------------------------------------------- ap events
@@ -319,10 +351,15 @@ class WirelessDatabase:
             row = self._conn.execute("SELECT MAX(id) AS m FROM ap_events").fetchone()
         return row["m"] or 0
 
-    def ap_events(self, limit: int = 200) -> list[sqlite3.Row]:
+    def prune_ap_events(self, retention_days: float = 90) -> None:
+        """Same shape as nodesdb's device_events retention: lifecycle
+        events are a log, not an archive. Called from the service
+        maintenance loop."""
         with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM ap_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            self._conn.execute(
+                "DELETE FROM ap_events WHERE ts < ?",
+                (time.time() - retention_days * 86400,))
+            self._conn.commit()
 
     def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
                     stale_after_polls: int = 5) -> list[dict]:
@@ -370,15 +407,14 @@ class WirelessDatabase:
                 marks = ",".join("?" * len(stale_ids))
                 self._conn.execute(
                     f"DELETE FROM access_points WHERE id IN ({marks})", stale_ids)
-            for ap in removed:
-                self._conn.execute(
-                    "INSERT INTO ap_events(ts, controller_id, wtp_id, vdom, name,"
-                    " kind, detail) VALUES (?,?,?,?,?,?,?)",
-                    (time.time(), controller_id, ap["wtp_id"], ap["vdom"], ap["name"],
-                     "ap_removed",
-                     f"{ap['name']} is no longer reported by its controller"
-                     f" (missing from {ap['missed_polls']} consecutive polls)"))
             self._conn.commit()
+            # add_ap_event is the one owner of the ap_events INSERT; the
+            # RLock makes calling it from inside this lock safe.
+            for ap in removed:
+                self.add_ap_event(
+                    controller_id, ap["wtp_id"], ap["vdom"], ap["name"], "ap_removed",
+                    f"{ap['name']} is no longer reported by its controller"
+                    f" (missing from {ap['missed_polls']} consecutive polls)")
         return removed
 
     # ------------------------------------------------------------- maintenance

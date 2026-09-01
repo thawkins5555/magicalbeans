@@ -657,11 +657,11 @@
     <header class="bar">
       <span id="wl-detail-name" class="section">AP DETAIL</span>
       <span class="grow"></span>
-      <!-- No data-requires-write here on purpose: drawApActions() owns
-           these buttons' .hidden (selection AND permission together).
-           Adding the attribute would let applyPermissions() un-hide them
-           whenever it runs — the same two-owners bug the ConfigRX bulk
-           bar had. -->
+      <!-- No data-requires-write here: these are shown dynamically per
+           selection, so drawApActions() owns their .hidden and checks
+           canWrite itself (applyPermissions only ever hides, and a
+           one-shot hide can't gate a control that feature code shows
+           later). -->
       <button id="wl-oos" hidden>Mark out of service</button>
       <button id="wl-remove-ap" hidden>Remove</button>
     </header>
@@ -689,11 +689,13 @@
     <span class="hint">Ctrl-click a row to select it</span>
     <button id="cx-bulk-selectall">Select all</button>
   </div>
-  <!-- data-requires-write sits on the buttons, never on this bar:
-       applyPermissions() writes .hidden on every [data-requires-write]
-       element, and drawBulkBar() writes .hidden on the bar itself — both
-       on the same element made the bar (and "Set SSH credential") flicker
-       in and out and shift the page. Same shape as the Nodes bulk bar. -->
+  <!-- data-requires-write sits on the buttons, not the bar:
+       drawBulkBar() owns the bar's .hidden (selection), the attribute
+       gates the actions. applyPermissions() is one-way (hide only), so
+       these no longer fight even on the same element — but a
+       selection-shown container still must not carry the attribute, or a
+       read-only account's bar would be hidden once and never legitimately
+       shown. Same shape as the Nodes bulk bar. -->
   <div class="bar wrap" id="cx-bulk-bar" hidden>
     <span id="cx-bulk-count" class="hint"></span>
     <button id="cx-bulk-credential" data-requires-write="configrx">Set SSH credential</button>

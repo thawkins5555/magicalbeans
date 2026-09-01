@@ -455,15 +455,21 @@ match every common vendor out of the box and could never report anything
 missing. A root-only entry names a vendor; an object beneath it decodes
 something, and only the latter counts.
 
-Two guards keep this quiet rather than noisy. It fires only when the
-stored `sys_object_id` actually changes, so the condition — which
-persists until someone uploads a MIB — is recorded once per device rather
-than every interval. And it returns early unless
-`nodeoids.enterprise_root()` is non-empty: that check exists specifically
-because `vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`,
-which names standard-tree nodes too ("system" for 1.3.6.1.2.1.1), so a
-device with a standard-tree sysObjectID would otherwise be reported as
-missing a "system MIB" that does not exist.
+Coverage is re-evaluated on every poll and diffed against a persisted
+per-device verdict (`devices.mib_covered`, NULL/0/1 via `_migrate()`),
+with events recorded only on transitions — `mib_missing` on the first
+uncovered verdict or when a covering MIB is deleted, `mib_present` when
+one arrives (paired in `alertrules.CLEARS`, so the upload auto-resolves
+the standing alert). The first cut instead keyed off sysObjectID
+*changes*, which made the feature inert for every device whose identity
+was already stored — the whole existing fleet on an upgrade, and every
+device promoted from Discovery, whose sysObjectID `seed_identity`
+pre-fills. One guard remains: the check returns early unless
+`nodeoids.enterprise_root()` is non-empty, specifically because
+`vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`, which names
+standard-tree nodes too ("system" for 1.3.6.1.2.1.1), so a device with a
+standard-tree sysObjectID would otherwise be reported as missing a
+"system MIB" that does not exist.
 
 **Per-poll debug logging**: `eventlog.NODES` had been imported into
 `nodepoll.py` since the Alerts build and never once used. `_poll_device`
@@ -1908,15 +1914,23 @@ after a controller's own poll *succeeded* — a transient controller
 outage never wipes its AP list, only a poll that genuinely completed but
 no longer sees a particular AP does.
 
-**AP removal is an event, not a silent delete.** `prune_stale()` writes
-an `ap_removed` row into `ap_events` for every AP it ages out and returns
-the removed list, so `fortipoll` can log it and `alertengine`'s new
-`_drain_ap_events()` can raise a real alert (built-in rule
-`wireless_ap_removed`, kind `wireless_event`). The drain uses the same
-cursor contract as every other source — first tick seeds
-`max_ap_event_id()`, later ticks read `ap_events_since()` — and
+**AP removal is an event, not a silent delete.** `prune_stale()` records
+an `ap_removed` row (via `add_ap_event`, the one owner of that INSERT)
+for every AP it ages out and returns the removed list, so `fortipoll` can
+log it and `alertengine`'s `_drain_ap_events()` can raise a real alert
+(built-in rule `wireless_ap_removed`, kind `wireless_event`). The reverse
+transition pairs the same way its device siblings do: `upsert_ap` records
+`ap_returned` whenever it inserts a brand-new row, and
+`alertrules.CLEARS` maps it to `wireless_ap_removed`, so an AP that comes
+back auto-resolves its own removal alert (a genuinely new AP has no such
+alert, making the event inert for it). The drain uses the same cursor
+contract as every other source — first tick seeds `max_ap_event_id()`,
+later ticks read `ap_events_since()` — prefetches the handful of
+controllers once per drain rather than once per row, and
 `AlertEngine`'s `wireless_db` is an optional keyword argument, so an
 engine constructed without it simply raises no wireless occurrences.
+`ap_events` rows age out after 90 days via `prune_ap_events()` in the
+service maintenance loop, same as Nodes' own event tables.
 
 **`out_of_service`** (added to `access_points` by a new
 `wirelessdb._migrate()`, the same PRAGMA-diff/ALTER pattern nodesdb uses)
@@ -2008,16 +2022,20 @@ storage hygiene, not a parser, so it never raises.
 manual name showed a stale/blank one here instead of its live SNMP
 hostname.
 
-**One owner per `.hidden`.** `applyPermissions()` in `app.js` writes
-`el.hidden = !canWrite(...)` on every `[data-requires-write]` element, and
-`drawBulkBar()` writes `.hidden` on the bulk bar from the selection count.
-Putting `data-requires-write` on the bar itself made both write the same
-property: for an account *with* write access `applyPermissions` un-hid the
-bar whenever it ran (every `loadState()`), the next `drawDevices()` hid it
-again, and the result was "Set SSH credential" flickering in and out with
-the page shifting under it. The attribute belongs on the buttons inside,
-never on a container something else already shows and hides — which is how
-the Nodes and Alerts bulk bars were already built.
+**One owner per `.hidden`.** `applyPermissions()` in `app.js` originally
+wrote `el.hidden = !canWrite(...)` — bidirectionally — on every
+`[data-requires-write]` element, so for an account *with* write access it
+un-hid the ConfigRX bulk bar on every `loadState()` while `drawBulkBar()`
+hid it again from the selection count: "Set SSH credential" flickered in
+and out with the page shifting under it. It now only ever *hides* (the
+page reloads on login, so there is nothing it needs to un-hide; a grant
+mid-session waits for the next reload). Two conventions still stand:
+`data-requires-write` goes on the buttons, not on a container something
+else shows and hides (a read-only account's one-shot hide would otherwise
+stick to a bar the selection should later show), and feature code that
+dynamically shows a write-gated control — the wireless AP action buttons —
+checks `canWrite` itself, since a hide applied once at load can't gate a
+later show.
 
 **Bulk edit** (`post_configrx_devices_bulk_config`/
 `post_configrx_devices_bulk_credential`): the same `_bulk_device_ids(body)`

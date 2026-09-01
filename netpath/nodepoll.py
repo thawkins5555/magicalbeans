@@ -772,40 +772,58 @@ class NodePoller:
         """Vendor autodetection already happens on every poll
         (nodeoids.vendor_for on the device's sysObjectID). This is the
         other half the user asked for: if the vendor is identified but no
-        uploaded MIB actually describes that vendor's objects, say so —
-        once — so an admin knows there is a MIB to go and add rather than
-        wondering why a device's own metrics never appear.
+        uploaded MIB actually describes that vendor's objects, say so, so
+        an admin knows there is a MIB to go and add rather than wondering
+        why a device's own metrics never appear.
 
-        Raised only when the sysObjectID is newly learned or has changed,
-        not on every poll: the condition persists until someone uploads a
-        MIB, and re-recording it every interval would bury the event log.
-        The paired alert rule dedups per device on top of that."""
+        Coverage is re-evaluated on every poll and compared against the
+        persisted per-device verdict (devices.mib_covered), with events
+        recorded only on transitions — the same stored-previous-state
+        shape every status transition above uses. Keying off sysObjectID
+        changes instead (as the first cut did) made the whole feature
+        inert for any device whose identity was already stored — every
+        pre-existing device on an upgrade, and every device promoted from
+        Discovery (seed_identity pre-fills sysObjectID) — and could
+        neither clear when the MIB was later uploaded nor re-fire when a
+        covering MIB was deleted. mib_present pairs with mib_missing in
+        alertrules.CLEARS, so the upload auto-resolves the alert."""
         if not identity:
             return
         sys_object_id = identity.get("sys_object_id") or ""
-        if not sys_object_id:
-            return
-        # Only on a change, so this fires once per device per identity.
-        if previous["sys_object_id"] == sys_object_id:
-            return
         # Only devices whose sysObjectID sits under enterprises have a
         # vendor MIB at all. This is checked before consulting vendor_for:
         # that function longest-prefix-matches trapoids.WELL_KNOWN, which
         # also names standard-tree nodes ("system" for 1.3.6.1.2.1.1), so a
         # device reporting a standard-tree sysObjectID would otherwise be
         # reported as missing a "system MIB" that does not exist.
-        if not nodeoids.enterprise_root(sys_object_id):
-            return
         vendor = identity.get("vendor") or nodeoids.vendor_for(sys_object_id)
-        if not vendor:
-            return          # unknown vendor: no specific MIB to ask for
-        if self.db.has_mib_covering(sys_object_id):
+        applicable = bool(sys_object_id) and \
+            bool(nodeoids.enterprise_root(sys_object_id)) and bool(vendor)
+        was_covered = previous["mib_covered"]      # None / 0 / 1
+        if not applicable:
+            # The coverage question doesn't apply (no identity yet, a
+            # standard-tree sysObjectID, or no recognizable vendor); make
+            # sure no stale verdict lingers from a previous identity.
+            if was_covered is not None:
+                self.db.set_mib_covered(device_id, None)
             return
-        self.db.record_device_event(
-            device_id, "mib_missing",
-            f"No uploaded MIB describes {vendor} objects ({sys_object_id}). "
-            f"Upload the {vendor} MIB under Nodes → Profiles & MIBs to decode "
-            f"this device's vendor-specific data.")
+        covered = self.db.has_mib_covering(sys_object_id)
+        if covered and not (was_covered is None or was_covered):
+            # uncovered -> covered: the MIB arrived. CLEARS resolves the
+            # standing mib_missing alert off this event.
+            self.db.record_device_event(
+                device_id, "mib_present",
+                f"An uploaded MIB now describes {vendor} objects "
+                f"({sys_object_id}); vendor-specific data can be decoded.")
+        elif not covered and (was_covered is None or was_covered):
+            # first verdict, or covered -> uncovered (a MIB was deleted).
+            self.db.record_device_event(
+                device_id, "mib_missing",
+                f"No uploaded MIB describes {vendor} objects ({sys_object_id}). "
+                f"Upload the {vendor} MIB under Nodes → Profiles & MIBs to decode "
+                f"this device's vendor-specific data.")
+        if was_covered is None or bool(was_covered) != covered:
+            self.db.set_mib_covered(device_id, covered)
 
     def _poll_custom_mib(self, device, config: dict, mib_file_id: int) -> list[tuple]:
         """A device or its polling profile can be assigned one uploaded

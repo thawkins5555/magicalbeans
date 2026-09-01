@@ -333,6 +333,14 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN mib_file_id INTEGER"
                 " REFERENCES mib_files(id) ON DELETE SET NULL")
+        if "mib_covered" not in devices:
+            # Last vendor-MIB coverage verdict for this device: NULL =
+            # never evaluated (or not applicable), 0/1 = uncovered/covered.
+            # Persisted so the poller records mib_missing/mib_present on
+            # *transitions* only, however coverage changed (a MIB uploaded
+            # or deleted), rather than keying off sysObjectID changes.
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN mib_covered INTEGER")
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
@@ -1227,6 +1235,13 @@ class NodesDatabase:
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM mib_objects{where} ORDER BY name", params).fetchall()
+
+    def set_mib_covered(self, device_id: int, covered: bool | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET mib_covered = ? WHERE id = ?",
+                (None if covered is None else (1 if covered else 0), device_id))
+            self._conn.commit()
 
     def has_mib_covering(self, sys_object_id: str) -> bool:
         """Whether any uploaded MIB actually describes objects belonging to
