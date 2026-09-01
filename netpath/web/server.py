@@ -337,10 +337,21 @@ class Handler(BaseHTTPRequestHandler):
         headers.update(extra_headers or {})
         self._send(code, body, "application/json; charset=utf-8", headers)
 
+    # Every request body this app takes is JSON, and the largest legitimate
+    # one by far is a base64-encoded MIB zip (max_mib_bundle_bytes, 64 MB by
+    # default, ~85 MB once encoded). Anything past this is refused before a
+    # byte is read, rather than being pulled into memory first — otherwise a
+    # single mistyped Content-Length is an out-of-memory kill.
+    MAX_BODY_BYTES = 128 * 1024 * 1024
+
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
+        if length > self.MAX_BODY_BYTES:
+            raise ValueError(
+                f"Request body of {length:,} bytes exceeds the "
+                f"{self.MAX_BODY_BYTES:,} byte limit")
         raw = self.rfile.read(length)
         try:
             return json.loads(raw.decode("utf-8"))

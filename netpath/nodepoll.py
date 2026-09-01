@@ -495,10 +495,13 @@ class NodePoller:
                 ping_loss_pct = 100.0 * (sent - received) / sent if sent else None
             else:
                 # Not this device's turn to be pinged. The last known result
-                # still stands for reachability: skipping a probe must not
-                # read as a failed one.
+                # still stands: skipping a probe must not read as a failed
+                # one, and record_poll overwrites both columns every time, so
+                # the previous RTT has to be carried forward too or the device
+                # row would blank it on every poll between pings.
                 previous_ok = device["ping_ok"]
                 ping_ok = None if previous_ok is None else bool(previous_ok)
+                ping_rtt_ms = device["ping_rtt_ms"]
 
         snmp_ok = None
         snmp_error = ""

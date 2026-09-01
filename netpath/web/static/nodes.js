@@ -795,9 +795,9 @@
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>
         <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>
-        <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="0"
+        <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="1" max="20"
           placeholder="inherit" value="${d.ping_count ?? ''}"></label>
-        <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="0" step="100"
+        <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="100" step="100"
           placeholder="inherit" value="${d.ping_timeout_ms ?? ''}"> ms</label>
         <label>Down needs both ping and SNMP to fail <select id="nd-f-pingonly">
           <option value="" ${d.unreachable_ping_only == null ? 'selected' : ''}>Inherit</option>
@@ -1207,9 +1207,9 @@
         <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>
         <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>
       </div>
-      <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="0"
+      <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="1" max="20"
         placeholder="inherit" value="${p.ping_count ?? ''}"></label>
-      <label>Ping timeout <input id="nd-p-pingtimeout" type="number" min="0" step="100"
+      <label>Ping timeout <input id="nd-p-pingtimeout" type="number" min="100" step="100"
         placeholder="inherit" value="${p.ping_timeout_ms ?? ''}"> ms</label>
       <label>Down needs both ping and SNMP to fail <select id="nd-p-pingonly">
         <option value="" ${p.unreachable_ping_only == null ? 'selected' : ''}>Inherit the Nodes setting</option>

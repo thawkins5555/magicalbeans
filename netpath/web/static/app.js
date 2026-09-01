@@ -382,15 +382,25 @@ const App = (() => {
       closeModal();
       if (afterClose) afterClose(confirmed);
     };
-    return modal(title, bodyHtml, [
+    return modal(title, `${bodyHtml}<p id="confirm-error" hidden></p>`, [
       { label: 'Cancel', onClick: () => done(false) },
       { label: confirmLabel, primary: true, onClick: async (box, button) => {
+        const failed = box.querySelector('#confirm-error');
+        failed.hidden = true;
         button.disabled = true;          // a slow delete must not run twice
         try {
           await onConfirm();
-        } finally {
-          done(true);
+        } catch (error) {
+          // A refused or failed delete leaves the dialog open saying why.
+          // Closing it regardless would report success for something that
+          // did not happen — the one outcome a confirmation must never do.
+          failed.textContent = `Failed: ${error.message}`;
+          failed.style.color = 'var(--fail)';
+          failed.hidden = false;
+          button.disabled = false;
+          return;
         }
+        done(true);
       } },
     ]);
   }

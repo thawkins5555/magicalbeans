@@ -70,8 +70,11 @@ class Service:
         self.snmp_settings = self.snmp_db.settings()
         self.nodes_settings = self.nodes_db.settings()
         # The one in-flight MIB catalog install, if any (see
-        # install_mib_bundle); the UI polls its status.
+        # install_mib_bundle); the UI polls its status. The lock makes
+        # "is one already running?" and "claim it" one step — the web server
+        # is threaded, so two clicks land on two threads.
         self._mib_job = None
+        self._mib_lock = threading.Lock()
         self.alerts_settings = self.alerts_db.settings()
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
@@ -359,11 +362,12 @@ class Service:
         bundle = mibcatalog.bundle(key)
         if bundle is None:
             raise ValueError(f"No such MIB bundle: {key}")
-        job = self._mib_job
-        if job is not None and job.state == "running":
-            raise ValueError(f"An install of {job.key} is still running")
-        job = mibcatalog.InstallJob(key, len(bundle.files))
-        self._mib_job = job
+        with self._mib_lock:
+            running = self._mib_job
+            if running is not None and running.state == "running":
+                raise ValueError(f"An install of {running.key} is still running")
+            job = mibcatalog.InstallJob(key, len(bundle.files))
+            self._mib_job = job
         thread = threading.Thread(target=self._run_mib_install,
                                   args=(bundle, job), daemon=True,
                                   name=f"mib-install-{key}")
