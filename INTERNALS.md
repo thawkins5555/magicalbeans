@@ -2543,9 +2543,14 @@ device erases its own with backspaces.
 **A truncated capture is never stored.** `_capture_problem(cleaned, ended)`
 returns the reason a capture must be refused or `""`: an empty body, an
 `ended` of `timeout` / `pager-loop` / `closed`, a last line matching
-`_STILL_WORKING_RE` ("Building configuration…"), or a body under
-`MIN_CONFIG_CHARS` (200 — comfortably above the ~45-character failure it
-exists to catch and below the smallest plausible real config). `_backup_device`
+`_STILL_WORKING_RE` ("Building configuration…"), or a body under the length
+floor. That floor has two values on purpose: when the read ended on the
+device's prompt the command demonstrably ran to completion, so a short result
+is a genuinely short config — a stripped-down MikroTik `/export` really is
+only a few lines — and `MIN_PROMPT_TERMINATED_CHARS` (80) only has to reject
+a capture that is nothing but an error line. Any other ending carries no such
+evidence, so `MIN_CONFIG_CHARS` (200) applies: a real running-config is
+hundreds of lines. `_backup_device`
 records a failed attempt naming it and returns before `add_backup`, because
 storing a partial as a good version is worse than storing nothing: it becomes
 the newest version, the next real backup reads as an enormous change, and a

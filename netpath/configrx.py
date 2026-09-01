@@ -414,11 +414,20 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
         channel.close()
 
 
-# A real "show running-config" is hundreds of lines. This floor only has to
-# be above the failure it exists to catch — the ~45 characters of echoed
-# command plus "Building configuration..." that used to be stored as a whole
-# backup — while staying under the smallest plausible real config.
+# Two floors, because "too short to be a config" means different things
+# depending on how the read ended.
+#
+# When the device gave its prompt back, the command demonstrably ran to
+# completion, so a short result is genuinely a short config — a stripped-down
+# MikroTik /export really is only a few lines. The floor there only has to
+# reject a capture that is nothing but an error line ("% Invalid input
+# detected...", "Permission denied") or the ~45-character banner failure this
+# release exists to stop.
+#
+# When the read ended any other way there is no such evidence, so the floor is
+# the one that says "a real running-config is hundreds of lines".
 MIN_CONFIG_CHARS = 200
+MIN_PROMPT_TERMINATED_CHARS = 80
 
 
 def _capture_problem(cleaned: str, ended: str) -> str:
@@ -440,7 +449,8 @@ def _capture_problem(cleaned: str, ended: str) -> str:
     if _STILL_WORKING_RE.search(last):
         return ("The device was still building its config when the read "
                 "ended, so only the banner was captured")
-    if len(body) < MIN_CONFIG_CHARS:
+    floor = MIN_PROMPT_TERMINATED_CHARS if ended == "prompt" else MIN_CONFIG_CHARS
+    if len(body) < floor:
         return (f"The device returned only {len(body)} characters, which is too "
                 f"short to be a config — the command may not be right for this "
                 f"vendor, or the account may lack the privilege to run it")

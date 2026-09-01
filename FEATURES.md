@@ -1277,7 +1277,9 @@ to a manual name in Nodes.
   device are the vendor's fixed pager-off lines and its show-config command.
 - **A truncated capture is refused rather than stored.** A read that hit the
   capture timeout, that could not get past the device's pager, that ends on
-  "Building configuration...", or that is too short to be a config is
+  "Building configuration...", or that is too short to be a config (judged
+  against a lower bar when the device gave its prompt back, since a small
+  MikroTik export really is only a few lines) is
   recorded as a **failed attempt naming the reason**, and nothing is written
   to the backup history. A partial capture stored as a good version is worse
   than no backup at all: it becomes the newest version, the next real backup
