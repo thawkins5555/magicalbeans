@@ -2534,6 +2534,14 @@ poll that still finds the AP unhealthy. It runs with the database lock held,
 which is safe because the lock is an `RLock` and `add_ap_event` takes it
 again — the same thing the existing `ap_returned` call in `upsert_ap` does.
 
+`_OFFLINE_STATE` is deliberately the single string `"offline"` rather than
+"anything that is not online". `fortinetoids.CONNECTION_STATE` also contains
+`downloading_image` and `connected_image` — which every AP passes through on
+a routine firmware upgrade — plus `standby` (held in reserve on purpose) and
+`other` (the controller did not say). Alerting on "not online" would raise and
+then clear one alert per AP on every fleet upgrade, which is the noise 4.29.0's
+rollup work existed to remove.
+
 The gap it closes is worth stating plainly, because it is not obvious from
 either side: `upsert_ap` resets `missed_polls` to 0, correctly, since the poll
 *did* see the AP; `prune_stale` therefore skips it, correctly; so `ap_removed`

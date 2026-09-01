@@ -496,12 +496,15 @@ alerts and optionally emailing about them.
   the device stays closed. **Alerts → Settings → Roll implied alerts up**
   turns the whole behaviour off.
 - **An access point that stops working raises an alert, not just a red dot.**
-  *Access point offline* fires when an AP's connection state leaves online and
-  clears when it comes back — distinct from *Access point removed from its
+  *Access point offline* fires when an AP's connection state becomes offline
+  and clears when it leaves that state — distinct from *Access point removed from its
   controller*, which is the controller no longer listing it at all. The two
   are different facts with different remedies, so neither rolls up under the
   other. An AP marked out of service raises neither, the same exemption that
-  keeps it from being aged out. Note that **Device not responding does not
+  keeps it from being aged out. Only the controller's own *offline* state
+  counts: the image-download states an AP passes through during a firmware
+  upgrade, and a deliberately-held standby AP, are not outages, and treating
+  them as ones would raise an alert per AP on every fleet upgrade. Note that **Device not responding does not
   cover access points**: that alert comes from Nodes' own device polling, and
   an AP lives in the Wireless module unless it has also been added to Nodes by
   IP in its own right.

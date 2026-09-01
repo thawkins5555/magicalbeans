@@ -73,7 +73,10 @@ Listed newest first. Version numbers are build order, not dates.
   say so. **Access point offline** is a new built-in rule, raised on the
   online→offline transition and cleared when it comes back, mirroring the
   existing removed/returned pair exactly. An AP marked out of service raises
-  neither, as before.
+  neither, as before. It fires only on the controller's unambiguous *offline*
+  state — not on the image-download states an AP passes through during a
+  routine firmware upgrade, nor on standby — so upgrading a fleet does not
+  raise and clear one alert per AP.
 - **NetPath hops that are managed devices show their names.** A hop with no
   PTR record showed the literal "no PTR record" even when it was a device this
   app polls every minute and names correctly everywhere else. Hops with no

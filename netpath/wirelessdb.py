@@ -271,20 +271,25 @@ class WirelessDatabase:
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
             return row["id"]
 
-    # Connection states that mean "the controller has this AP and it is
-    # working". Everything else (offline, and the transient image states) is
-    # an AP the controller can see but cannot use.
-    _ONLINE_STATES = ("online",)
+    # The one connection state that unambiguously means "this AP is not
+    # working" (fortinetoids.CONNECTION_STATE). Deliberately narrow: the
+    # states around it are `downloading_image` and `connected_image`, which an
+    # AP passes through during a routine firmware upgrade, plus `standby` (an
+    # AP held in reserve on purpose) and `other`, which means the controller
+    # did not say. Alerting on "not online" rather than "offline" would raise
+    # — and then clear — one alert per AP on every fleet upgrade, which is
+    # exactly the kind of noise the 4.29.0 rollup work existed to remove.
+    _OFFLINE_STATE = "offline"
 
     def _record_status_change(self, controller_id, wtp_id, vdom, previous,
                               fields) -> None:
         """Records ap_offline / ap_online on a connection-state transition.
 
         The gap this closes: an AP that stops working while its controller
-        still lists it was a silent UPDATE here. missed_polls is reset by this
-        very method (the poll *did* see it), so prune_stale correctly skips it
-        and ap_removed never fires — meaning an AP could be dead for a week
-        with nothing but a red dot on the Wireless tab to say so.
+        still lists it was a silent UPDATE here. upsert_ap resets missed_polls
+        on every poll that sees the AP — correctly, since the poll did see it —
+        so prune_stale skips it and ap_removed never fires. An AP could be
+        dead for a week with nothing but a red dot on the Wireless tab.
 
         Mirrors ap_removed/ap_returned exactly, including the exemption: an AP
         deliberately marked out of service raises neither, for the same reason
@@ -294,19 +299,19 @@ class WirelessDatabase:
             return
         if previous["out_of_service"]:
             return
-        was_online = (previous["status"] or "") in self._ONLINE_STATES
-        now_online = str(fields.get("status") or "") in self._ONLINE_STATES
-        if was_online == now_online:
+        was_offline = (previous["status"] or "") == self._OFFLINE_STATE
+        now_offline = str(fields.get("status") or "") == self._OFFLINE_STATE
+        if was_offline == now_offline:
             return
         name = str(fields.get("name") or wtp_id)
-        if now_online:
-            self.add_ap_event(controller_id, wtp_id, vdom, name, "ap_online",
-                              f"{name} is online again")
-        else:
+        if now_offline:
             self.add_ap_event(
                 controller_id, wtp_id, vdom, name, "ap_offline",
-                f"{name} is {fields.get('status') or 'not online'} — its "
-                f"controller still lists it")
+                f"{name} is offline — its controller still lists it")
+        else:
+            self.add_ap_event(
+                controller_id, wtp_id, vdom, name, "ap_online",
+                f"{name} is {fields.get('status') or 'reachable'} again")
 
     def replace_radios(self, ap_id: int, radios: list[dict]) -> None:
         with self._lock:
