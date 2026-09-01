@@ -1219,19 +1219,25 @@ class NodePoller:
                 continue
         return ports, True
 
-    def _cisco_vlan_fdb(self, device, config: dict, target_ports: set) -> list[dict]:
+    def _cisco_vlan_fdb(self, device, config: dict, if_index: int,
+                        target_ports: set):
         """Classic Cisco IOS exposes its forwarding database only inside
         per-VLAN SNMP contexts, reached by suffixing the community with
         `@<vlan>`. There is no community to suffix under v3, so that is
         skipped rather than pretended at; and the walk is bounded in both
         VLAN count and wall-clock, because this runs while a human waits on
         an interface dialog and a trunk switch can carry hundreds of VLANs.
+
+        Returns (entries, answered). `answered` reports whether any VLAN
+        context produced a bridge-port table, which is how the caller tells
+        "this switch cannot tell us" from "it can, and this port has learned
+        nothing" on a device whose global context answers neither.
         """
         if int(config.get("snmp_version") or 1) == 3:
-            return []
+            return [], False
         community = config.get("community")
         if not community:
-            return []
+            return [], False
         vlan_states = self._walk_column(device, config, self._VTP_VLAN_STATE)
         vlans = []
         for suffix, state in vlan_states.items():
@@ -1246,14 +1252,26 @@ class NodePoller:
             if vlan.isdigit() and not (1002 <= int(vlan) <= 1005):
                 vlans.append(vlan)
         entries = []
+        answered = False
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
             if time.time() > deadline:
                 break
             scoped = {**config, "community": f"{community}@{vlan}"}
+            ports = target_ports
+            if not ports:
+                # On these switches dot1dBasePortIfIndex lives in the same
+                # per-VLAN context as the forwarding table, so the global
+                # read the caller tried first comes back empty on exactly
+                # the devices this path exists for.
+                ports, port_answered = self._bridge_ports_for(
+                    device, scoped, if_index)
+                answered = answered or port_answered
+                if not ports:
+                    continue
             fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
-            entries.extend(self._fdb_entries(fdb_port, target_ports, vlan, False))
-        return entries
+            entries.extend(self._fdb_entries(fdb_port, ports, vlan, False))
+        return entries, answered
 
     def read_mac_table(self, device_id: int, if_index: int) -> list[dict] | None:
         """Live on-demand read of the MAC addresses learned on one switch
@@ -1283,20 +1301,28 @@ class NodePoller:
             return None
 
         target_ports, answered = self._bridge_ports_for(device, config, if_index)
+        is_cisco = (device["vendor"] or "").lower() == "cisco"
+
+        entries = []
+        if target_ports:
+            entries = self._fdb_entries(
+                self._walk_column(device, config, self._DOT1Q_FDB_PORT),
+                target_ports, None, True)
+            if not entries:
+                entries = self._fdb_entries(
+                    self._walk_column(device, config, self._DOT1D_FDB_PORT),
+                    target_ports, None, False)
+        # Deliberately also reached when the global context answered nothing
+        # at all: a classic IOS switch hides dot1dBasePortIfIndex in the same
+        # per-VLAN contexts as the forwarding table, so bailing out on an
+        # empty global read would skip this path on the very devices it is
+        # here for.
+        if not entries and is_cisco:
+            entries, cisco_answered = self._cisco_vlan_fdb(
+                device, config, if_index, target_ports)
+            answered = answered or cisco_answered
         if not answered:
             return None
-        if not target_ports:
-            return []
-
-        entries = self._fdb_entries(
-            self._walk_column(device, config, self._DOT1Q_FDB_PORT),
-            target_ports, None, True)
-        if not entries:
-            entries = self._fdb_entries(
-                self._walk_column(device, config, self._DOT1D_FDB_PORT),
-                target_ports, None, False)
-        if not entries and (device["vendor"] or "").lower() == "cisco":
-            entries = self._cisco_vlan_fdb(device, config, target_ports)
 
         # One MAC can legitimately appear in several VLANs; dedupe on the
         # pair rather than the address so that stays visible.

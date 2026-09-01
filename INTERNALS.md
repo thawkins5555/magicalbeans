@@ -431,7 +431,13 @@ that yields anything winning:
    before 4.27.0, and still the fallback.
 3. **Cisco per-VLAN community indexing** — classic IOS exposes its
    forwarding table only inside per-VLAN SNMP contexts, reached by
-   re-querying with `community@<vlan>`. The VLAN list comes from
+   re-querying with `community@<vlan>`. `dot1dBasePortIfIndex` lives in
+   those same contexts on these switches, so this path re-reads it per
+   VLAN when the global read came back empty — bailing out on an
+   unanswered global bridge table would skip the Cisco path on exactly
+   the devices it exists for. It reports back whether any VLAN context
+   answered a bridge table, which is what keeps `None` ("cannot tell
+   us") distinct from `[]` ("nothing learned here") on such a device. The VLAN list comes from
    CISCO-VTP-MIB `vtpVlanState` (`1.3.6.1.4.1.9.9.46.1.3.1.1.2`, state
    `1` only, 1002–1005 excluded), then source 2 is repeated per VLAN. It
    is **v1/v2c only** — there is no community to suffix under v3 — and
@@ -979,6 +985,10 @@ convention, adding two nullable `rules` columns — `flap_window_s` and
 `flap_min_transitions` — both added to `_RULE_EDITABLE` so the builtin
 rule can be edited. NULL means "as shipped", so an existing install
 behaves identically until someone changes it.
+
+`flap_min_transitions` is floored at 2 where it is read: the editor's
+field will not produce less, but `PUT /api/alerts/rules/:id` accepts any
+integer, and 1 would open an alert on every single link event.
 
 The coupling worth knowing about: `_tick()` fetches the events to judge
 with `nodes_db.recent_interface_events_for()`, whose defaults are

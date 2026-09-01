@@ -207,7 +207,11 @@ class AlertEngine:
         # never touched them behaves exactly as it did before they existed.
         flap_rule = self.db.rule_by_key("interface_flapping")
         flap_window = float((flap_rule and flap_rule["flap_window_s"]) or 600)
-        flap_min = int((flap_rule and flap_rule["flap_min_transitions"]) or 3)
+        # Floored at 2: one transition is not a flap, and a 0 or negative
+        # written straight to the API (the editor's field will not produce
+        # one) would otherwise open an alert on every single link event.
+        flap_min = max(2, int((flap_rule and flap_rule["flap_min_transitions"])
+                              or 3))
         for interface_id in touched_interfaces:
             # since_s must follow the configured window: the default lookback
             # is 15 minutes, so a longer window would silently see nothing to
