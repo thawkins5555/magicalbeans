@@ -153,18 +153,12 @@
       // highlight, which would make one click mean two different things.
       tr.querySelector('.alerts-check').onclick = (event) => {
         event.stopPropagation();
-        toggleChecked(row.id);
+        toggleChecked(row.id, tr);
       };
-      // Ctrl/Cmd-click still toggles selection anywhere in the row, so the
-      // habit this page shipped with keeps working alongside the boxes.
-      tr.onclick = (event) => {
-        if (event.ctrlKey || event.metaKey) {
-          toggleChecked(row.id);
-        } else {
-          view.selected = row.id;
-          drawTable();
-          showDetail(row);
-        }
+      tr.onclick = () => {
+        view.selected = row.id;
+        drawTable();
+        showDetail(row);
       };
       body.appendChild(tr);
     }
@@ -175,9 +169,20 @@
 
   /* ------------------------------------------------------- bulk actions */
 
-  function toggleChecked(id) {
-    if (view.checked.has(id)) view.checked.delete(id);
-    else view.checked.add(id);
+  /* Given the row, only that row is touched: redrawing every row to change
+     one checkbox is what made ticking several alerts feel slow on a long
+     list — the boxes themselves cost nothing. */
+  function toggleChecked(id, tr) {
+    const on = !view.checked.has(id);
+    if (on) view.checked.add(id);
+    else view.checked.delete(id);
+    if (tr) {
+      tr.classList.toggle('bulk-checked', on);
+      const box = tr.querySelector('.alerts-check');
+      if (box) box.checked = on;
+      drawBulkBar();
+      return;
+    }
     drawTable();
   }
 
@@ -567,6 +572,14 @@
         ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
         ${check('as-clear', 'Send an email when an alert clears', s.notify_on_clear)}
         ${number('as-maxhour', 'Max emails per hour', s.max_emails_per_hour, 'min=1')}
+        ${number('as-grace', 'Hold alerts on a newly added device for',
+                 Math.round((s.new_device_grace_s ?? 300) / 60), 'min=0')} min
+        <p class="hint">A device added a moment ago is usually still being set
+          up — wrong community, not cabled yet, still booting — so its alerts
+          are held this long and then raised only if the condition is still
+          true. One that settles inside the window never alerts at all. A
+          one-off event that cannot still be true later (rebooted, recovered)
+          is dropped rather than raised late. 0 turns the hold off.</p>
       </fieldset>
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
@@ -607,6 +620,7 @@
           smtp_from: text('#as-from'), smtp_from_name: text('#as-fromname'),
           smtp_to_default: recipients, renotify_minutes: num('#as-renotify'),
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
+          new_device_grace_s: num('#as-grace') * 60,
         } });
         await App.loadState();
         App.closeModal();

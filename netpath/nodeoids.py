@@ -11,6 +11,12 @@ from __future__ import annotations
 
 DEFAULT_SNMP_PORT = 161   # shared by nodepoll.py and nodediscover.py
 
+# Subtree roots the OID browser opens on. Every SNMP agent answers both:
+# system is six scalars, and interfaces is the ifTable this app already polls,
+# so neither is an expensive walk on any device.
+SYSTEM_BASE = "1.3.6.1.2.1.1"
+INTERFACES_BASE = "1.3.6.1.2.1.2"
+
 # Always attempted — standard SNMPv2-MIB scalars every agent implements.
 SYSTEM_SCALARS = {
     "sys_descr":     "1.3.6.1.2.1.1.1.0",
@@ -112,6 +118,112 @@ def vendor_for(sys_object_id: str) -> str:
         if name:
             return name
     return ""
+
+
+# Substring -> vendor, tried in order against a lowercased sysDescr, first
+# match winning. Only consulted when sysObjectID identified nothing: plenty of
+# gear answers a generic or net-snmp sysObjectID while describing itself
+# perfectly well in text, and a device this app cannot name gets neither a
+# profile suggestion nor a vendor MIB.
+#
+# Ordered so a longer, more specific string is tested before anything it
+# contains. Deliberately conservative — a wrong guess here is worse than a
+# blank, and identify_vendor() labels these as guesses so nothing downstream
+# mistakes one for an authoritative arc match.
+SYSDESCR_VENDORS: tuple[tuple[str, str], ...] = (
+    ("phoenix contact", "phoenixContact"),
+    ("phoenixcontact", "phoenixContact"),
+    ("allied telesis", "alliedTelesis"),
+    ("check point", "checkPoint"),
+    ("palo alto", "paloAlto"),
+    ("tp-link", "tpLink"),
+    ("d-link", "dlink"),
+    ("hewlett packard", "hp"),
+    ("hewlett-packard", "hp"),
+    ("procurve", "hp"),
+    ("aruba", "aruba"),
+    ("ubiquiti", "ubiquiti"),
+    ("mikrotik", "mikrotik"),
+    ("routeros", "mikrotik"),
+    ("fortigate", "fortinet"),
+    ("fortiswitch", "fortinet"),
+    ("fortinet", "fortinet"),
+    ("hirschmann", "hirschmann"),
+    ("westermo", "westermo"),
+    ("sonicwall", "sonicwall"),
+    ("watchguard", "watchguard"),
+    ("juniper", "juniper"),
+    ("arista", "arista"),
+    ("extreme", "extremeNetworks"),
+    ("brocade", "brocade"),
+    ("synology", "synology"),
+    ("ruckus", "ruckus"),
+    ("cambium", "cambium"),
+    ("aerohive", "aerohive"),
+    ("netgear", "netgear"),
+    ("zyxel", "zyxel"),
+    ("sophos", "sophos"),
+    ("citrix", "citrix"),
+    ("raritan", "raritan"),
+    ("liebert", "vertiv"),
+    ("vertiv", "vertiv"),
+    ("eaton", "eaton"),
+    ("rittal", "rittal"),
+    ("moxa", "moxa"),
+    ("adtran", "adtran"),
+    ("huawei", "huawei"),
+    ("cisco", "cisco"),
+    ("dell", "dell"),
+    ("apc ", "apc"),
+)
+
+
+def vendor_from_descr(sys_descr: str) -> str:
+    """Best-effort vendor from the sysDescr string. Empty when nothing
+    matches — never a partial or fuzzy guess."""
+    text = (sys_descr or "").lower()
+    if not text:
+        return ""
+    for needle, vendor in SYSDESCR_VENDORS:
+        if needle in text:
+            return vendor
+    return ""
+
+
+# Arcs that name the SNMP *agent* rather than whoever made the device. A
+# Phoenix Contact radio, a Moxa switch and a Linux server all answer
+# 1.3.6.1.4.1.8072.x because they all run net-snmp, so treating that as the
+# vendor is what left this whole class of device unidentifiable — and it is
+# the class the sysDescr fallback exists for. Still used as a last resort,
+# since "net-snmp" beats nothing at all.
+GENERIC_AGENT_VENDORS = frozenset({"netSnmp", "ucdavis"})
+
+
+def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:
+    """(vendor, how) — 'sysObjectID', 'sysDescr' or '' when unidentified.
+
+    Two sources with genuinely different standing, so the caller can say which
+    one spoke. A sysObjectID prefix is an assignment from IANA and is as close
+    to authoritative as this gets; a sysDescr keyword is text a vendor chose to
+    write, matched by substring, and can be wrong. Collapsing them into one
+    string would make a guess indistinguishable from a fact.
+    """
+    # Only an arc under `enterprises` names a vendor. WELL_KNOWN also names
+    # standard-tree nodes, so an unadorned vendor_for() call reports a device
+    # with a standard-tree sysObjectID as vendor "system" — which is what it
+    # used to store, and it is not a vendor.
+    vendor = vendor_for(sys_object_id) if enterprise_root(sys_object_id) else ""
+    if vendor and vendor not in GENERIC_AGENT_VENDORS:
+        return vendor, "sysObjectID"
+    # An agent arc identifies the software, not the maker: prefer what the
+    # device says about itself, and keep the agent name only if it says
+    # nothing useful.
+    from_descr = vendor_from_descr(sys_descr)
+    if from_descr:
+        return from_descr, "sysDescr"
+    if vendor:
+        return vendor, "sysObjectID"
+    return "", ""
 
 
 def suggest_group(sys_descr: str, sys_object_id: str, groups: list) -> int | None:

@@ -57,12 +57,22 @@
     const c = worker.counters || {};
     const parts = [`${c.backups || 0} backup(s) run`, `${c.changed || 0} changed`,
       `${c.unchanged || 0} unchanged`, `${c.errors || 0} errors`];
+    // Which paramiko this process actually loaded belongs on the strip, not
+    // only in a failed connection's error text: "I installed 3.4 and it still
+    // says 5.0" is a question the status line should answer at a glance.
+    const ssh = worker.ssh || {};
+    if (ssh.paramiko) {
+      parts.push(`paramiko ${ssh.paramiko.split(' (')[0]}`);
+      if (ssh.legacy_implemented === false) parts.push('no SHA-1 key exchange');
+      else if (ssh.legacy_offered === false) parts.push('legacy SSH off');
+    }
     App.el('cx-counters').textContent = parts.join(' · ');
   }
 
   /* ------------------------------------------------------------- devices */
 
   const COLUMNS = [
+    { key: 'check', label: '', sortable: false, width: 34 },
     { key: 'backup_enabled', label: '', width: 28 },
     { key: 'name', label: 'Device', width: 220 },
     { key: 'vendor', label: 'Vendor', width: 110 },
@@ -83,21 +93,20 @@
         ? `<span title="${escape(row.last_backup_error)}">error</span>`
         : escape(row.last_backup_status || (row.backup_enabled ? 'pending' : '—'));
       tr.innerHTML =
+        `<td><input type="checkbox" class="cx-check"${
+          view.devicesChecked.has(row.id) ? ' checked' : ''}></td>` +
         `<td>${row.backup_enabled ? statusDot(row.last_backup_status) : ''}</td>` +
         `<td>${escape(row.name)}<div class="hint">${escape(row.ip)}</div></td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${status}</td>` +
         `<td>${ago(row.last_backup_ts)}</td>`;
-      // Ctrl/Cmd-click toggles bulk selection without touching the
-      // single-device detail selection below; a plain click keeps doing
-      // exactly what it always did — same convention as Nodes' own table.
-      tr.onclick = (event) => {
-        if (event.ctrlKey || event.metaKey) {
-          toggleChecked(row.id);
-        } else {
-          selectDevice(row.id);
-        }
+      // The checkbox owns selection; the rest of the row owns the detail
+      // pane — same convention as Nodes' and Alerts' own tables.
+      tr.querySelector('.cx-check').onclick = (event) => {
+        event.stopPropagation();
+        toggleChecked(row.id, tr);
       };
+      tr.onclick = () => selectDevice(row.id);
       body.appendChild(tr);
     }
     table.appendChild(body);
@@ -107,9 +116,19 @@
 
   /* ------------------------------------------------------- bulk actions */
 
-  function toggleChecked(id) {
-    if (view.devicesChecked.has(id)) view.devicesChecked.delete(id);
-    else view.devicesChecked.add(id);
+  /* Given the row, only that row is touched: redrawing the whole table to
+     change one checkbox is what made picking several devices feel slow. */
+  function toggleChecked(id, tr) {
+    const on = !view.devicesChecked.has(id);
+    if (on) view.devicesChecked.add(id);
+    else view.devicesChecked.delete(id);
+    if (tr) {
+      tr.classList.toggle('bulk-checked', on);
+      const box = tr.querySelector('.cx-check');
+      if (box) box.checked = on;
+      drawBulkBar();
+      return;
+    }
     drawDevices();
   }
 
@@ -263,6 +282,34 @@
 
   /* ---------------------------------------------------------- settings */
 
+  /* The two facts that decide whether a SHA-1-only device can be reached at
+     all, stated up front rather than discovered from a failed backup: which
+     paramiko is loaded (pip installs into whichever interpreter it was run
+     from, and a downgrade needs a process restart) and whether the legacy
+     algorithms are implemented by it and offered by us. */
+  function sshReport() {
+    const ssh = (App.state.serverState || {}).configrx?.ssh;
+    if (!ssh || !ssh.paramiko) return '';
+    if (!ssh.available) {
+      return `<p class="hint">paramiko is ${escape(ssh.paramiko)}.</p>`;
+    }
+    let verdict;
+    if (ssh.legacy_implemented === false) {
+      verdict = '<b class="err">does not implement SHA-1 key exchange</b>, so ' +
+        'a device that offers nothing newer cannot be reached whatever this ' +
+        'checkbox says. Installing an older paramiko only helps if it goes to ' +
+        'this same interpreter, and the app is restarted afterwards — a ' +
+        'module already imported cannot be swapped underneath a running process.';
+    } else if (ssh.legacy_implemented === true) {
+      verdict = `implements SHA-1 key exchange, currently ` +
+        `<b>${ssh.legacy_offered ? 'offered' : 'not offered'}</b>.`;
+    } else {
+      verdict = 'has not been probed yet — start the worker.';
+    }
+    return `<p class="hint">Loaded paramiko: <b>${escape(ssh.paramiko)}</b>. ` +
+      `It ${verdict}</p>`;
+  }
+
   function settingsDialog() {
     const s = App.state.configrxSettings || {};
     App.modal('ConfigRX settings', `
@@ -281,6 +328,7 @@
           device that never changes stays at one row regardless of these caps.</p>
       </fieldset>
       <fieldset><legend>SSH</legend>
+        ${sshReport()}
         <label class="check"><input type="checkbox" id="cxs-legacy"
           ${s.allow_legacy_ssh !== false ? 'checked' : ''}> Allow legacy SSH
           algorithms</label>

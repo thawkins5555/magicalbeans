@@ -792,7 +792,12 @@ class NodePoller:
             "sys_contact": values.get(nodeoids.SYSTEM_SCALARS["sys_contact"]) or "",
             "sys_location": values.get(nodeoids.SYSTEM_SCALARS["sys_location"]) or "",
         }
-        identity["vendor"] = nodeoids.vendor_for(identity["sys_object_id"])
+        # sysObjectID first, sysDescr only where that named nothing — a
+        # device this app cannot name gets neither a profile suggestion nor a
+        # vendor MIB, and plenty of gear answers a generic sysObjectID while
+        # describing itself perfectly well in text.
+        identity["vendor"], identity["vendor_source"] = nodeoids.identify_vendor(
+            identity["sys_object_id"], identity["sys_descr"])
         uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
         uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
 
@@ -842,7 +847,8 @@ class NodePoller:
         # also names standard-tree nodes ("system" for 1.3.6.1.2.1.1), so a
         # device reporting a standard-tree sysObjectID would otherwise be
         # reported as missing a "system MIB" that does not exist.
-        vendor = identity.get("vendor") or nodeoids.vendor_for(sys_object_id)
+        vendor = identity.get("vendor") or nodeoids.identify_vendor(
+            sys_object_id, identity.get("sys_descr") or "")[0]
         applicable = bool(sys_object_id) and \
             bool(nodeoids.enterprise_root(sys_object_id)) and bool(vendor)
         was_covered = previous["mib_covered"]      # None / 0 / 1
@@ -854,6 +860,8 @@ class NodePoller:
                 self.db.set_mib_covered(device_id, None)
             return
         covered = self.db.has_mib_covering(sys_object_id)
+        if covered:
+            self._auto_assign_mib(device_id, sys_object_id, vendor)
         if covered and not (was_covered is None or was_covered):
             # uncovered -> covered: the MIB arrived. CLEARS resolves the
             # standing mib_missing alert off this event.
@@ -870,6 +878,39 @@ class NodePoller:
                 f"this device's vendor-specific data.")
         if was_covered is None or bool(was_covered) != covered:
             self.db.set_mib_covered(device_id, covered)
+
+    def _auto_assign_mib(self, device_id: int, sys_object_id: str,
+                         vendor: str) -> None:
+        """Point a device at its own vendor's MIB once one is present.
+
+        Uploading a MIB used to do nothing for polling until somebody went
+        to each device and set the Custom MIB override by hand, so the
+        common case — install the bundle for the vendor you actually run —
+        left every device still undecoded. Assignment happens only where the
+        operator has expressed no preference: a device with any mib_file_id
+        already set, including one deliberately set to a different MIB, is
+        never touched. It is an ordinary override afterwards and can be
+        cleared or changed from the device like any other.
+        """
+        device = self.db.device(device_id)
+        if device is None or device["mib_file_id"] is not None:
+            return
+        mib_file_id = self.db.mib_file_covering(sys_object_id)
+        if mib_file_id is None:
+            return
+        self.db.update_device(device_id, mib_file_id=mib_file_id)
+        mib = self.db.mib_file(mib_file_id)
+        name = (mib["module"] if mib and mib["module"] else
+                (mib["filename"] if mib else str(mib_file_id)))
+        # Recorded, not silent: this changes what gets polled every cycle, so
+        # it belongs in the device's own event history where it can be seen
+        # and undone rather than being discovered from new metric names.
+        self.db.record_device_event(
+            device_id, "mib_assigned",
+            f"Assigned the {name} MIB to this device automatically: it "
+            f"describes {vendor} objects ({sys_object_id}) and no MIB had "
+            f"been chosen. Change or clear it under this device's Custom MIB "
+            f"override.")
 
     def _poll_custom_mib(self, device, config: dict, mib_file_id: int) -> list[tuple]:
         """A device or its polling profile can be assigned one uploaded
@@ -1335,6 +1376,93 @@ class NodePoller:
             seen.add(key)
             unique.append(entry)
         return unique
+
+    # Bounds for the OID browser. Generous enough to be useful on a switch,
+    # small enough that a dialog someone is sitting in front of cannot hang:
+    # a full walk of a large device is tens of thousands of objects and
+    # minutes of GETNEXTs, which is why this browses subtrees rather than
+    # offering "walk everything".
+    _BROWSE_MAX_ROWS = 600
+    _BROWSE_BUDGET_S = 20.0
+
+    def walk_subtree(self, device_id: int, base_oid: str,
+                     max_rows: int | None = None,
+                     budget_s: float | None = None) -> dict | None:
+        """Live on-demand GETNEXT walk of one subtree, for the OID browser.
+
+        Same on-demand shape as read_dom()/read_mac_table(): run only while a
+        human is looking at the dialog, never on the poll cycle.
+
+        Deliberately not _walk_column(): that returns index-suffix -> value
+        for one table column and caps at 512 rows, which is right for its
+        callers and wrong here. A browser needs the whole OID, the SNMP type
+        and the raw value of every object it passed, and it needs to say why
+        it stopped — silently truncating at a cap would make a partial walk
+        look like the device's complete answer.
+
+        Returns None when the device is unknown or has SNMP disabled.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.db.effective_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+        base = (base_oid or "").strip().strip(".")
+        if not base or not all(part.isdigit() for part in base.split(".")):
+            raise ValueError("An OID must be numeric, like 1.3.6.1.2.1.1")
+
+        max_rows = int(max_rows or self._BROWSE_MAX_ROWS)
+        deadline = time.time() + float(budget_s or self._BROWSE_BUDGET_S)
+        rows: list[dict] = []
+        stopped = "end of subtree"
+        current = base
+        while True:
+            if len(rows) >= max_rows:
+                stopped = f"stopped at the {max_rows}-row limit"
+                break
+            if time.time() > deadline:
+                stopped = f"stopped after {self._BROWSE_BUDGET_S:.0f}s"
+                break
+            try:
+                response = self._snmp_get_next(device, config, current)
+            except SnmpTimeout:
+                stopped = "the device stopped answering"
+                break
+            except SnmpError as exc:
+                stopped = f"SNMP error: {exc}"
+                break
+            if not response.varbinds:
+                stopped = "the device returned nothing"
+                break
+            vb = response.varbinds[0]
+            oid = vb["oid"]
+            if not oid or not (oid == base or oid.startswith(base + ".")):
+                break                      # walked out of the subtree: done
+            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                break
+            rows.append({"oid": oid, "type": vb["type"],
+                         "value": vb["value"], "text": vb.get("text")})
+            current = oid
+        return {"base": base, "rows": rows, "stopped": stopped,
+                "complete": stopped == "end of subtree"}
+
+    def browse_bases(self, device_id: int) -> list[dict]:
+        """The subtrees the browser opens on: the two every SNMP agent
+        answers, plus this device's own vendor arc where its sysObjectID
+        names one. Enough to be immediately useful without walking a whole
+        switch."""
+        bases = [
+            {"oid": nodeoids.SYSTEM_BASE, "label": "system"},
+            {"oid": nodeoids.INTERFACES_BASE, "label": "interfaces"},
+        ]
+        device = self.db.device(device_id)
+        if device is not None:
+            root = nodeoids.enterprise_root(device["sys_object_id"] or "")
+            if root:
+                vendor = device["vendor"] or "vendor"
+                bases.append({"oid": root, "label": f"{vendor} ({root})"})
+        return bases
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
         version = int(config.get("snmp_version") or 1)

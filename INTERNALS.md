@@ -463,6 +463,54 @@ all, which the dialog and the `/mac-table` API route's `"supported"` flag
 both key off, so "this device can't tell us" and "this port genuinely has
 zero MACs learned right now" render as different messages.
 
+**Vendor identification** (`nodeoids.identify_vendor`): two sources with
+different standing, reported separately so a guess is never mistaken for a
+fact. `vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`, which the
+Trap page's own decoding already uses — one table, not two — and 4.28.0 widened
+its enterprise arcs from 19 to cover every vendor `mibcatalog.py` ships a
+bundle for, plus industrial and wireless names. **Every added arc was read out
+of that vendor's own MIB text** (`::= { enterprises N }`), not recalled: a
+wrong arc silently mislabels every device beneath it, which is worse than a
+blank column. Two consequences of doing it that way are worth knowing: `4413`
+is Broadcom's, not NETGEAR's (NETGEAR's managed switches run OEM'd FASTPATH
+and report there, as do other FASTPATH OEMs), and `161` is Motorola's, which
+Cambium's Canopy line still registers under — both are named for the arc's
+owner.
+
+Two guards sit on top of the raw lookup. `WELL_KNOWN` also names standard-tree
+nodes, so an unadorned `vendor_for()` reports a device with a standard-tree
+sysObjectID as vendor `"system"` — which is what used to be stored;
+`identify_vendor` gates the arc branch on `enterprise_root()` being non-empty.
+And `GENERIC_AGENT_VENDORS` (net-snmp, ucdavis) names the *agent* rather than
+the maker: a Phoenix Contact radio, a Moxa switch and a Linux server all answer
+net-snmp's arc, so for those the `SYSDESCR_VENDORS` substring table is
+consulted first and the agent name kept only as a last resort. This is the
+class of device the fallback exists for; matching the agent arc first is what
+stopped it ever running.
+
+**Automatic MIB assignment** (`NodePoller._auto_assign_mib`): `has_mib_covering`
+answers "is there a MIB for this vendor"; `nodesdb.mib_file_covering` answers
+"which one", picking the file with the most resolved objects under the vendor's
+arc — a bundle is usually several files of which one carries the real objects
+and the rest are type or registration modules that would poll nothing. It sets
+`mib_file_id` only where it is NULL, so a hand-picked MIB (including one
+deliberately pointed elsewhere) is never replaced, and records a
+`mib_assigned` device event, since this changes what is polled every cycle and
+should be visible rather than discovered from new metric names.
+
+**OID browser** (`NodePoller.walk_subtree` / `browse_bases`, `api.get_nodes_device_oids`):
+deliberately a sibling of `_walk_column` rather than a widening of it —
+`_walk_column` returns index-suffix → value for one table column and caps at
+512 rows, which is right for its callers and wrong for a browser that needs
+the whole OID, the SNMP type and a reason for stopping. `walk_subtree` carries
+its own row cap and wall-clock budget and reports which one it hit, so a
+truncated walk cannot be mistaken for a device's complete answer. Names come
+from `_oid_name_table()` — `nodesdb.all_known_oids()` inverted (it stores
+name → OID, for `mibparse.resolve`'s `known` dict) merged over
+`trapoids.WELL_KNOWN` — matched longest-prefix, so an object's own OID matches
+exactly while an instance or table row matches its column and keeps the rest as
+the index. An OID nothing describes stays a number.
+
 **Custom-MIB-scoped polling** (`NodePoller._poll_custom_mib`): a
 device/group `mib_file_id` override (new `_OVERRIDE_COLUMNS` entry,
 resolved by `effective_config()` the same as every other override, zero
@@ -974,6 +1022,38 @@ one row. `alerts.js`'s first column is now a real checkbox whose
 the row owns the detail pane, and Ctrl-click still toggles so the old
 habit keeps working. The `UPDATE ... WHERE id IN` statements themselves
 were never at fault and are unchanged.
+
+### Newly added device hold (`alertengine.py`, `alertsdb.py`)
+
+`_apply()` is the single choke point where an occurrence becomes an alert, so
+the hold sits just before it, in `_tick`. `_occurrence_device()` resolves the
+device an occurrence is about — a `device` entity's id *is* the device id, an
+`interface` entity's is `<device_id>:<if_index>` — and returns None for
+anything else. That is what makes syslog, traps, IPAM conflicts, DHCP scopes
+and wireless AP events structurally un-holdable: they never resolve to a row
+in Nodes' device table, so they are exempt by construction rather than by a
+list somebody has to remember to extend.
+
+Three different shapes of condition, handled three different ways, because
+"still true five minutes later" means something different to each:
+
+- **Steady states** — `down`, `mib_missing`, `link_down` — are recorded on a
+  *transition*, so suppressing one would lose it forever. These are parked in
+  `pending_alerts` (a table, not memory, so a restart inside the window does
+  not drop them) with `fire_after_ts = created_ts + grace`, and `_drain_pending`
+  re-asks current state via `_still_true()` when the time comes: the device's
+  `status`, its `mib_covered`, the interface's `oper_status`. Still true →
+  replayed through the normal path with `replayed` set so the hold cannot
+  catch it twice. Cleared → dropped, with a line in the event log saying so.
+- **Momentary events** — `rebooted`, `up`, `poll_overrun`, `auth_fail` — cannot
+  be "still true" later; by definition they already happened. They are dropped
+  rather than parked, which is what "don't alert on a device I just added"
+  means for them. Parking one would fire it five minutes late, describing
+  something that is over.
+- **Thresholds** are not parked at all, on purpose. `_evaluate_thresholds`
+  re-derives them from current values on *every* tick, so one suppressed
+  inside the window simply reappears on the first tick after it. Parking them
+  as well would open the same alert twice.
 
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
@@ -2281,6 +2361,29 @@ from the same walk). The extra selectable columns (`radio_count`,
 `channels`, `radio_station_count`) are derived in `_ap_json` from radio
 rows the poller already walks, so adding one costs no extra SNMP.
 
+### Per-AP response time (`fortipoll.py`, `fortinetoids.py`)
+
+The module's stated design is that it talks to the controller and never to an
+AP, so a per-AP latency figure had nowhere to come from — `access_points` had
+no address, because nothing needed one. `fgWcWtpSessionWtpIpAddress`
+(`fgWcWtpSessionEntry 3`, read off the vendor's own MIB) is another column of
+the session table the poller already walks, so learning each AP's address costs
+no extra SNMP; only the ping is new traffic.
+
+`_format_ip` is where the subtlety is. The value never arrives as bytes: by the
+time `_walk_column` returns it, `snmppoll` has already run the OCTET STRING
+through `_octets_text`, which renders a non-printable string as space-separated
+hex ("7F 00 00 01"). So the hex form is the normal case, the dotted form (some
+FortiOS builds, and the IpAddress type) is accepted too, and anything of the
+wrong length becomes blank — notably a six-byte MAC, which must never be stored
+as an address and pinged.
+
+`_ping_ap` returns `None`, not `0`, when nothing answers: 0 would sort to the
+top of the fastest APs and read as instant. An AP the controller already
+reports as offline is not probed at all, and `PING_BUDGET_S` bounds the whole
+controller's sweep so a rack of unreachable APs cannot each add a timeout to
+the poll cycle.
+
 ## ConfigRX (`configrxdb.py`, `configrx.py`, `configrx_vendors.py`)
 
 **No device table of its own.** Per the explicit product decision,
@@ -2457,6 +2560,43 @@ exceptions rather than building HTTP responses themselves. A handful of
 `selfupdate.apply()`) instead return `{"ok": False, "error": ...}` on an
 *expected* failure — a DHCP server not answering, no update available —
 reserving raised exceptions for genuinely unexpected conditions.
+
+### Which paramiko is loaded (`configrx.py`)
+
+`_connect_error_text` appends "the installed paramiko removed SHA-1 key
+exchange" only when `_legacy_kex_offered is False` *and* `_legacy_kex_implemented`
+is falsy, and `_apply_legacy_algorithms` sets the latter by intersecting
+`_LEGACY_KEX` against `Transport._kex_info` — a capability check, not a version
+test. So that branch is reachable only when the paramiko this **process**
+loaded genuinely lacks those algorithms, and reports of it appearing after
+installing 3.4 are reports of a process running something else: pip installs
+into whichever interpreter it was run from, and a downgrade cannot take effect
+until the process restarts, since `sys.modules` caches an imported module for
+the life of the process.
+
+The logic was correct, so none of it changed. What changed is that it now says
+*which* paramiko: `paramiko_identity()` reports version and `__file__`,
+`ssh_algorithm_status()` exposes both flags plus the live `_preferred_kex` /
+`_preferred_keys` to the status line and the settings dialog, and
+`_offered_algorithms_detail()` writes what was actually offered into a failed
+connection's Debug event. A diagnosis nobody can check is not much better than
+no diagnosis.
+
+### Bulk selection (`nodes.js`, `alerts.js`, `configrx.js`)
+
+All three selectable tables use one shape: a checkbox first column whose
+`onclick` calls `stopPropagation()`, so the box owns selection and the rest of
+the row owns the detail pane. Ctrl-click no longer toggles anything — it was
+the only affordance before 4.27.0, and an invisible one, which is what made
+"bulk resolve only cleared one row" look like a backend bug.
+
+The performance change is separate from the checkboxes and worth not
+conflating: `toggleChecked(id, tr)` takes the row and mutates that row's
+`checked` property and `bulk-checked` class in place. Every module used to call
+its full `drawTable()`, rebuilding every row to change one box, which is what
+made ticking several rows on a long list feel slow. The full redraw is still
+the path when no row is passed (Select all, Clear selection) and when the data
+itself changes.
 
 ### Frontend (`web/static/app.js` + per-tab modules)
 

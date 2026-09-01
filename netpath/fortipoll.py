@@ -18,6 +18,7 @@ walking idiom for one small poller.
 from __future__ import annotations
 
 import random
+import re
 import threading
 import time
 import traceback
@@ -32,6 +33,17 @@ from .snmppoll import (
 )
 from .trapdecode import localized_key
 from .wirelessdb import WirelessDatabase
+
+# Only decides whether a string is already in dotted form; it is not a
+# validator for whether the address is routable.
+_DOTTED_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+# Bounds on the per-AP ping sweep. The module's whole design is "talk to the
+# controller, not to every AP", so measuring per-AP latency is the one place
+# that reaches further — and it must not be able to stretch a poll cycle on a
+# controller carrying a hundred radios.
+PING_TIMEOUT_MS = 700
+PING_BUDGET_S = 20.0
 
 SNMP_PORT = 161
 
@@ -50,6 +62,9 @@ class WirelessPoller:
         self._thread: threading.Thread | None = None
         self._queued: set[int] = set()
         self._lock = threading.Lock()
+        # Reset per controller in _poll_controller; defined here so the
+        # helper is safe to call before a poll has started.
+        self._ping_deadline = 0.0
         self.counters = {"polls": 0, "ok": 0, "errors": 0}
         self.error: str | None = None
 
@@ -125,11 +140,36 @@ class WirelessPoller:
 
     # --------------------------------------------------------------- polling
 
+    def _ping_ap(self, ip: str, status: str) -> float | None:
+        """Round-trip to one AP, or None.
+
+        None means "no reading", which the column shows as blank: an AP that
+        does not answer ICMP is not an AP with a 0 ms response, and storing 0
+        would sort it to the top of the fastest devices. An offline AP is not
+        probed at all — the controller has already said it is gone, and
+        waiting out a timeout per absent AP is what would make the sweep slow.
+        """
+        if not ip or status != "online":
+            return None
+        if time.time() > self._ping_deadline:
+            return None
+        started = time.time()
+        try:
+            from .ipam_scan import ping_once
+            ok = ping_once(ip, timeout_ms=PING_TIMEOUT_MS)
+        except Exception:
+            return None
+        return (time.time() - started) * 1000.0 if ok else None
+
     def _poll_controller(self, controller) -> None:
         config = dict(controller)
+        # One budget for the whole controller's sweep, so a rack of
+        # unreachable APs cannot add a timeout each to the cycle.
+        self._ping_deadline = time.time() + PING_BUDGET_S
         try:
             names = self._walk_column(controller, config, oids.WTP_CONFIG_NAME)
             macs = self._walk_column(controller, config, oids.WTP_SESSION_MAC)
+            ips = self._walk_column(controller, config, oids.WTP_SESSION_IP)
             states = self._walk_column(controller, config, oids.WTP_SESSION_CONNECTION_STATE)
             models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL)
             stations = self._walk_column(controller, config, oids.WTP_SESSION_STATION_COUNT)
@@ -158,12 +198,15 @@ class WirelessPoller:
             state_num = states.get(suffix)
             status = oids.CONNECTION_STATE.get(
                 int(state_num) if state_num is not None else -1, "other")
+            ip = _format_ip(ips.get(suffix))
             ap_id = self.db.upsert_ap(
                 controller["id"], wtp_id, vdom,
                 name=names.get(suffix) or wtp_id,
                 status=status,
                 model=models.get(suffix) or "",
                 mac_address=_format_mac(mac),
+                ip=ip,
+                response_ms=self._ping_ap(ip, status),
                 station_count=_as_int(stations.get(suffix)))
             radios = []
             prefix = suffix + "."
@@ -282,6 +325,39 @@ def _as_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_ip(value) -> str:
+    """fgWcWtpSessionWtpIpAddress is an InetAddress — four raw bytes for IPv4,
+    sixteen for IPv6 — but by the time it reaches here snmppoll has already
+    turned the octets into text: a non-printable string comes back as
+    space-separated hex ("7F 00 00 01"), not as bytes. So the hex form is the
+    normal case, and the dotted form (which some FortiOS builds send, and
+    which the IpAddress type decodes to directly) is accepted as well.
+
+    Anything that is neither becomes blank rather than a mangled address — a
+    six-byte MAC, for instance, must not be stored as an IP and pinged.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if _DOTTED_RE.match(text):
+            return text
+        groups = text.replace(":", " ").split()
+        try:
+            raw = bytes(int(g, 16) for g in groups if len(g) <= 2)
+        except ValueError:
+            return ""
+        if len(raw) != len(groups):
+            return ""
+    if len(raw) == 4:
+        return ".".join(str(b) for b in raw)
+    if len(raw) == 16:
+        return ":".join(f"{raw[i]:02x}{raw[i + 1]:02x}" for i in range(0, 16, 2))
+    return ""
 
 
 def _format_mac(value) -> str:

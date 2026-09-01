@@ -49,6 +49,30 @@ PARAMIKO_MISSING = ("paramiko is not installed on this server — ConfigRX needs
                     " for SSH. Install it with: pip install paramiko")
 
 _paramiko_ok: bool | None = None
+_paramiko_identity: str | None = None
+
+
+def paramiko_identity() -> str:
+    """Which paramiko this *process* actually loaded, as "5.0.0 (/path/…)".
+
+    The whole point is that "the installed paramiko" and "the paramiko this
+    process is running" are different things, and only the second one decides
+    anything. pip installs into whichever interpreter it was run from, and a
+    downgrade of an already-imported module cannot take effect until the
+    process restarts, because Python caches modules in sys.modules. Reporting
+    a bare "the installed paramiko has removed it" left an operator who had
+    just installed 3.4 with no way to see that 5.0 was still what was running.
+    """
+    global _paramiko_identity
+    if _paramiko_identity is None:
+        try:
+            import paramiko
+            version = getattr(paramiko, "__version__", "unknown version")
+            path = getattr(paramiko, "__file__", None)
+            _paramiko_identity = f"{version} ({path})" if path else str(version)
+        except ImportError:
+            _paramiko_identity = "not installed"
+    return _paramiko_identity
 
 
 def paramiko_available(recheck: bool = False) -> bool:
@@ -92,10 +116,15 @@ _legacy_kex_offered: bool | None = None
 _pristine_algorithms: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
 LEGACY_KEX_UNAVAILABLE = (
-    "This device offers only SHA-1 key exchange, which the installed paramiko "
-    "has removed entirely — there is no setting that re-enables it. Either "
-    "install a version that still implements it (pip install \"paramiko<5\") "
-    "and restart, or enable a modern key exchange on the device "
+    "This device offers only SHA-1 key exchange, which the paramiko this "
+    "process actually loaded ({identity}) has removed entirely — there is no "
+    "setting that re-enables it. If you have already installed an older "
+    "paramiko, check that version above: pip may have installed it for a "
+    "different interpreter, and a downgrade of an already-imported module "
+    "cannot take effect until the process restarts, because Python caches "
+    "modules in sys.modules. Either install a version that still implements "
+    "it (pip install \"paramiko<5\") for this interpreter and restart the "
+    "app, or enable a modern key exchange on the device "
     "(diffie-hellman-group14-sha256 or better).")
 
 LEGACY_KEX_DISABLED = (
@@ -165,7 +194,52 @@ def _connect_error_text(exc: Exception) -> str:
         return text
     if _legacy_kex_implemented:
         return f"{text}. {LEGACY_KEX_DISABLED}"
-    return f"{text}. {LEGACY_KEX_UNAVAILABLE}"
+    return f"{text}. {LEGACY_KEX_UNAVAILABLE.format(identity=paramiko_identity())}"
+
+
+def ssh_algorithm_status() -> dict:
+    """What this process is actually able to, and currently does, offer.
+
+    Surfaced before anything fails — in ConfigRX settings and the module's
+    status line — rather than only in the error text of a connection that
+    already went wrong. `implemented` and `offered` are the two facts
+    _apply_legacy_algorithms already computes and nothing used to show.
+    """
+    status = {
+        "paramiko": paramiko_identity(),
+        "available": paramiko_available(),
+        "legacy_implemented": _legacy_kex_implemented,
+        "legacy_offered": _legacy_kex_offered,
+        "preferred_kex": [],
+        "preferred_keys": [],
+    }
+    if status["available"]:
+        try:
+            import paramiko
+            status["preferred_kex"] = list(paramiko.Transport._preferred_kex)
+            status["preferred_keys"] = list(paramiko.Transport._preferred_keys)
+        except Exception:      # pragma: no cover - a paramiko we don't know
+            pass
+    return status
+
+
+def _offered_algorithms_detail() -> str:
+    """The lists actually in force, for the Debug log line of a failed
+    connect. "We offered these and the device refused" is then checkable
+    rather than something an operator has to take on faith."""
+    status = ssh_algorithm_status()
+    lines = [f"paramiko: {status['paramiko']}"]
+    if status["legacy_implemented"] is not None:
+        lines.append(
+            f"legacy SHA-1 key exchange: "
+            f"{'implemented' if status['legacy_implemented'] else 'not implemented'}"
+            f" by this paramiko, "
+            f"{'offered' if status['legacy_offered'] else 'not offered'} by ConfigRX")
+    if status["preferred_kex"]:
+        lines.append("key exchange offered: " + ", ".join(status["preferred_kex"]))
+    if status["preferred_keys"]:
+        lines.append("host key types offered: " + ", ".join(status["preferred_keys"]))
+    return "\n".join(lines)
 
 
 def _clean_output(raw: str) -> str:
@@ -381,7 +455,12 @@ class ConfigRxWorker:
         except Exception as exc:
             detail = _connect_error_text(exc)
             self.db.record_backup_attempt(device_id, ok=False, status="error", error=detail)
-            self.log.add(ERROR, f"ConfigRX could not reach {device['ip']}", detail=detail)
+            # The event's detail carries what we actually offered, so a
+            # handshake failure can be read against the device's own logs
+            # instead of guessed at. Kept out of the stored per-device error,
+            # which is a one-line status.
+            self.log.add(ERROR, f"ConfigRX could not reach {device['ip']}",
+                         detail=f"{detail}\n\n{_offered_algorithms_detail()}")
             return
         finally:
             password = None

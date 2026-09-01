@@ -123,6 +123,7 @@ ROUTES = [
     ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/mac-table$", api.get_nodes_device_mac_table, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/oids$", api.get_nodes_device_oids, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/(\d+)/test$", api.post_nodes_device_test, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),

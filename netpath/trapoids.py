@@ -82,6 +82,47 @@ WELL_KNOWN = {
     "1.3.6.1.4.1.25461":       "paloAlto",
     "1.3.6.1.4.1.25506":       "h3c",
     "1.3.6.1.4.1.30065":       "arista",
+    # --- added 4.28.0. Every arc below was read out of that vendor's own MIB
+    # text (the "::= { enterprises N }" line), not from memory: a wrong arc
+    # silently mislabels every device under it, which is worse than a blank
+    # Vendor column. The MIB catalog shipped bundles for vendors this table
+    # could not even name, so a device could have its MIB installed and still
+    # show no vendor at all.
+    "1.3.6.1.4.1.11":          "hp",             # HP-ICF-OID
+    "1.3.6.1.4.1.161":         "motorola",       # Cambium's Canopy/PMP line
+                                                 # still registers under
+                                                 # Motorola's arc, so this is
+                                                 # named for the arc's owner
+                                                 # rather than for Cambium.
+    "1.3.6.1.4.1.171":         "dlink",
+    "1.3.6.1.4.1.248":         "hirschmann",
+    "1.3.6.1.4.1.476":         "vertiv",         # Liebert / Emerson
+    "1.3.6.1.4.1.534":         "eaton",
+    "1.3.6.1.4.1.664":         "adtran",
+    "1.3.6.1.4.1.890":         "zyxel",
+    "1.3.6.1.4.1.2604":        "sophos",
+    "1.3.6.1.4.1.2606":        "rittal",
+    "1.3.6.1.4.1.2620":        "checkPoint",
+    "1.3.6.1.4.1.3097":        "watchguard",
+    "1.3.6.1.4.1.4413":        "broadcom",       # NETGEAR's managed switches
+                                                 # run OEM'd Broadcom FASTPATH
+                                                 # and report here; so do other
+                                                 # FASTPATH OEMs, hence the
+                                                 # arc's real owner, not
+                                                 # "netgear".
+    "1.3.6.1.4.1.5951":        "citrix",         # NetScaler
+    "1.3.6.1.4.1.6027":        "dellNetworking", # Force10 line; 674 is the
+                                                 # separate Dell/OpenManage arc
+    "1.3.6.1.4.1.6574":        "synology",
+    "1.3.6.1.4.1.8741":        "sonicwall",
+    "1.3.6.1.4.1.11863":       "tpLink",
+    "1.3.6.1.4.1.12276":       "f5Networks",     # 3375 is F5's other arc
+    "1.3.6.1.4.1.13742":       "raritan",
+    "1.3.6.1.4.1.14823":       "aruba",
+    "1.3.6.1.4.1.25053":       "ruckus",
+    "1.3.6.1.4.1.26928":       "aerohive",
+    "1.3.6.1.4.1.41112":       "ubiquiti",
+    "1.3.6.1.4.1.47196":       "arubaCx",        # HPE's ArubaOS-CX line
 }
 
 # The short label the table column and the kind filter show.

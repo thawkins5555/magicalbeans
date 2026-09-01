@@ -107,6 +107,13 @@
       // whose only radios scan has nothing to show rather than a "Scan" that
       // would imply the whole AP is one.
       cell: (r) => powerText(r.tx_power_dbm, r.power_unit, false) },
+    { key: 'response_ms', label: 'Response', width: 90, numeric: true,
+      // Blank, not zero, where no reading was taken: an AP that does not
+      // answer ICMP must not sort in among the fastest ones.
+      cell: (r) => (r.response_ms == null ? '—' : `${r.response_ms.toFixed(0)} ms`),
+      value: (r) => (r.response_ms == null ? null : r.response_ms) },
+    { key: 'ip', label: 'IP', width: 130,
+      cell: (r) => escape(r.ip || '—'), value: (r) => r.ip || '' },
     { key: 'controller_id', label: 'Controller', width: 140,
       cell: (r) => escape(controllerName(r.controller_id)),
       value: (r) => controllerName(r.controller_id).toLowerCase() },

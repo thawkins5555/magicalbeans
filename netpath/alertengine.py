@@ -13,15 +13,17 @@ cadence rather than Monitor's per-target scheduling.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import traceback
+from dataclasses import asdict
 
 from . import alertmail
 from . import hostresolve
 from .alertrules import CLEARS, Occurrence, dedup_key, evaluate_flapping, \
     evaluate_threshold, match_device
-from .eventlog import ERROR, NullLog
+from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
 
@@ -128,9 +130,117 @@ class AlertEngine:
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
+        occurrences += self._drain_pending(settings, rules)
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
+            if self._hold_for_new_device(occurrence, settings):
+                continue
             self._apply(rules, occurrence, settings)
+
+    # ------------------------------------------- newly added device hold
+
+    # Source kinds whose condition is a STATE that can still be true five
+    # minutes later, paired with how to ask the current data whether it is.
+    # Everything else that is device-scoped is a momentary event — "rebooted",
+    # "recovered", "poll took too long" — which cannot be re-checked, because
+    # by definition it already happened; those are dropped rather than
+    # replayed, which is what "don't alert on a device I just added" means for
+    # them.
+    #
+    # Threshold occurrences are absent on purpose: _evaluate_thresholds re-derives
+    # them from current values on every tick, so one suppressed inside the
+    # window simply comes back on the next tick after it. Parking those too
+    # would fire the same alert twice.
+    _STATEFUL_SOURCES = ("down", "mib_missing", "link_down")
+
+    def _occurrence_device(self, occurrence: Occurrence):
+        """The device an occurrence is about, or None when it is not about one.
+
+        Traps from unpolled devices, syslog from an unknown host, IPAM
+        conflicts, DHCP scopes and wireless AP events are all structurally
+        outside this — they never resolve to a row in Nodes' device table, so
+        they can never be held back. That is a property of the lookup rather
+        than a list of exemptions somebody has to remember to update.
+        """
+        try:
+            if occurrence.entity_kind == "device":
+                return self.nodes_db.device(int(occurrence.entity_id))
+            if occurrence.entity_kind == "interface":
+                # "<device_id>:<if_index>"
+                return self.nodes_db.device(
+                    int(str(occurrence.entity_id).split(":")[0]))
+        except (TypeError, ValueError):
+            return None
+        return None
+
+    def _hold_for_new_device(self, occurrence: Occurrence, settings) -> bool:
+        """True when this occurrence was held back rather than applied.
+
+        A device added moments ago is usually still being set up — wrong
+        community, not cabled, still booting — and the alerts that produces
+        are noise about the setup, not about the network. Held for
+        new_device_grace_s and then re-checked, so a device that really is
+        down is reported late rather than never.
+        """
+        grace = float(settings.get("new_device_grace_s", 300) or 0)
+        if grace <= 0 or getattr(occurrence, "replayed", False):
+            return False
+        device = self._occurrence_device(occurrence)
+        if device is None:
+            return False
+        created = device["created_ts"] or 0
+        if not created or time.time() - created >= grace:
+            return False
+        if occurrence.source_kind in self._STATEFUL_SOURCES:
+            self.db.park_occurrence(
+                device["id"], created + grace, json.dumps(asdict(occurrence)))
+        self.counters["held"] = self.counters.get("held", 0) + 1
+        return True
+
+    def _drain_pending(self, settings, rules) -> list[Occurrence]:
+        """Occurrences whose hold has expired and whose condition is still
+        true. One that has cleared in the meantime is dropped: the whole
+        point of holding is that a device settling in should not alert."""
+        out = []
+        for row in self.db.due_occurrences(time.time()):
+            self.db.drop_occurrence(row["id"])
+            try:
+                occurrence = Occurrence(**json.loads(row["payload"]))
+            except (TypeError, ValueError):
+                continue
+            if not self._still_true(occurrence):
+                self.log.add(ALERTS,
+                            f"Held alert for {occurrence.entity_label} dropped: "
+                            f"the condition cleared during the new-device "
+                            f"grace period")
+                continue
+            # Marked so the hold does not catch it a second time — the device
+            # is still younger than the grace period at this exact moment.
+            occurrence.replayed = True
+            out.append(occurrence)
+        return out
+
+    def _still_true(self, occurrence: Occurrence) -> bool:
+        """Whether a held condition still holds, asked of current state
+        rather than of the event that first reported it."""
+        device = self._occurrence_device(occurrence)
+        if device is None:
+            return False
+        if occurrence.source_kind == "down":
+            return device["status"] == "down"
+        if occurrence.source_kind == "mib_missing":
+            return device["mib_covered"] == 0
+        if occurrence.source_kind == "link_down":
+            try:
+                if_index = int(str(occurrence.entity_id).split(":")[1])
+            except (IndexError, ValueError):
+                return False
+            interface_id = self.nodes_db.interface_id_for(device["id"], if_index)
+            if interface_id is None:
+                return False
+            interface = self.nodes_db.interface_by_id(interface_id)
+            return interface is not None and interface["oper_status"] == "down"
+        return False
 
     # --------------------------------------------------------------- drains
 

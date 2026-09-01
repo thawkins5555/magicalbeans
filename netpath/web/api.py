@@ -26,6 +26,7 @@ from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
+from .. import configrx
 from .. import permissions as _permissions
 
 MIN_BLOCK_PX = 3
@@ -166,6 +167,10 @@ def get_state(service, params, body) -> dict:
             "running": service.configrx.running,
             "status": service.configrx.status_text(),
             "counters": service.configrx.counters,
+            # Which paramiko this process actually loaded, and what it can and
+            # does offer — visible before a handshake fails rather than only
+            # in the error text of one that already did.
+            "ssh": configrx.ssh_algorithm_status(),
         },
         "storage": {
             "app_path": service.app_db.path,
@@ -1783,6 +1788,68 @@ def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> di
     return {"macs": macs, "supported": macs is not None}
 
 
+def _oid_name_table(service) -> dict:
+    """OID -> name, from every uploaded MIB plus the built-in well-known
+    table the Trap page already decodes with. One table, so uploading a MIB
+    improves the OID browser the same moment it improves trap decoding."""
+    names = dict(trapoids.WELL_KNOWN)
+    # all_known_oids() is name -> OID (it feeds mibparse.resolve's `known`
+    # dict); the browser needs the inverse.
+    for name, oid in service.nodes_db.all_known_oids().items():
+        if oid:
+            names[oid] = name
+    return names
+
+
+def _decode_oid(names: dict, oid: str) -> tuple[str, str]:
+    """(name, suffix) for one OID, by longest prefix. An object's own OID
+    matches exactly; an instance ('...1.5.0') or a table row ('...1.1.4.7')
+    matches its column and keeps the rest as the index, which is what makes
+    a walked table readable. Unknown OIDs return ('', '') rather than a
+    guess — a number is honest, an invented name is not."""
+    parts = oid.split(".")
+    for cut in range(len(parts), 0, -1):
+        name = names.get(".".join(parts[:cut]))
+        if name:
+            return name, ".".join(parts[cut:])
+    return "", ""
+
+
+def get_nodes_device_oids(service, params, body, device_id) -> dict:
+    """One subtree of a device's SNMP tree, walked live and decoded against
+    every MIB this app knows. `oid` picks the subtree; without it the
+    device's default set is reported so the dialog knows what to offer."""
+    device = service.nodes_db.device(device_id)
+    if not device:
+        raise ValueError("No such device")
+    bases = service.node_poller.browse_bases(int(device_id))
+    base = (params.get("oid") or "").strip()
+    if not base:
+        return {"bases": bases, "rows": [], "base": "", "stopped": "",
+                "complete": True, "walked": False}
+    result = service.node_poller.walk_subtree(int(device_id), base)
+    if result is None:
+        return {"bases": bases, "rows": [], "base": base, "walked": False,
+                "complete": False,
+                "stopped": "SNMP is disabled for this device"}
+    names = _oid_name_table(service)
+    rows = []
+    for row in result["rows"]:
+        name, suffix = _decode_oid(names, row["oid"])
+        value = row["value"]
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        rows.append({
+            "oid": row["oid"], "name": name, "suffix": suffix,
+            "type": row["type"],
+            "value": row["text"] if row["text"] is not None else
+                     ("" if value is None else str(value)),
+        })
+    return {"bases": bases, "base": result["base"], "rows": rows,
+            "stopped": result["stopped"], "complete": result["complete"],
+            "walked": True}
+
+
 def post_nodes_device_test(service, params, body, device_id) -> dict:
     """Ping + SNMP against the in-progress-edit config carried in the
     body, falling back to the saved one for anything not overridden — the
@@ -2950,6 +3017,11 @@ def _ap_json(service, row) -> dict:
         "wtp_id": row["wtp_id"], "vdom": row["vdom"], "name": row["name"],
         "status": row["status"], "model": row["model"],
         "mac_address": row["mac_address"], "station_count": row["station_count"],
+        # The AP's own address as the controller reports it, and the
+        # round-trip to it. None where it was not measured — an AP that does
+        # not answer ICMP is not an AP with a 0 ms response.
+        "ip": row["ip"] or "",
+        "response_ms": row["response_ms"],
         "tx_power_dbm": max(powers) if powers else None,
         # How to label that number — see _power_unit. A per-AP field rather
         # than a global one so a site with a mix of controllers still gets

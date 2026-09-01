@@ -125,12 +125,20 @@ own subtabs.
   one group at a time (or none). Groups are managed from a small dialog
   next to the Devices filter bar; removing a group leaves its devices
   ungrouped rather than erroring.
-- **Devices can be selected and operated on in bulk.** Ctrl/Cmd-click a
-  row to add or remove it from the selection (a plain click still opens
-  its detail pane, unchanged), or use **Select all**; either reveals a
-  bulk actions bar: Set profile, Set group, Remove from group, and
-  Delete — each applied to every selected device in one request rather
-  than one per device.
+- **Devices can be selected and operated on in bulk.** Every row carries
+  a **checkbox** in its first column: tick the rows you want, or use
+  **Select all**; either reveals a bulk actions bar: Set profile, Set
+  group, Remove from group, and Delete — each applied to every selected
+  device in one request rather than one per device. A plain click still
+  opens the device's detail pane, unchanged. (Ctrl-click no longer
+  selects — the checkboxes replaced it.)
+- **Sort the device list by any column** — click its heading, the same
+  way every other table in the app sorts. Status, Name, Profile, Group,
+  Vendor, Response and Last poll all sort on what the column actually
+  shows, so Profile sorts by profile name rather than by its internal id
+  and Response sorts by the number of milliseconds rather than by the
+  text around it. A device with no reading sorts to the bottom in both
+  directions instead of leaping to the top when the order is reversed.
 - **A "Only offline" checkbox** on the Devices filter bar shows devices
   whose status isn't `up` (down, unknown, unsupported, or auth-failed) —
   combinable with the Profile/Group/Status filters alongside it.
@@ -262,6 +270,26 @@ own subtabs.
 - **Resolved names also flow into the SNMP Trap page** — a trap from a
   device an uploaded MIB describes shows a name instead of a raw OID
   there too, without duplicating the name table.
+- **Vendors are identified from the sysObjectID, and from the sysDescr
+  where that says nothing.** The enterprise-arc table now covers every
+  vendor the MIB catalog ships a bundle for, plus a range of industrial
+  and wireless names — every arc read out of that vendor's own MIB text
+  rather than from memory, since a wrong arc mislabels every device under
+  it. Where the sysObjectID names only the SNMP *agent* (a Phoenix
+  Contact radio, a Moxa switch and a Linux server all answer net-snmp's
+  own arc), the sysDescr is consulted instead, so a device that used to
+  show a blank Vendor now shows the right one. The two are not treated as
+  equal: an arc match is an IANA assignment, a sysDescr match is a
+  substring of text the vendor chose to write, and only the former is
+  used where being wrong would matter.
+- **The matching MIB is assigned to the device automatically.** Once a
+  vendor is identified and an uploaded MIB describes objects under that
+  vendor's arc, the device's Custom MIB override is set for it, so
+  installing a bundle actually starts decoding that vendor's data instead
+  of waiting for someone to visit every device. It never overrides a MIB
+  chosen by hand — including one deliberately pointed elsewhere — it is
+  recorded in the device's own event history, and it can be changed or
+  cleared from the same override afterwards.
 - **A device whose vendor MIB isn't here says so.** Every poll already
   identifies a device's vendor from its sysObjectID; when that vendor is
   identified but no uploaded MIB actually describes its objects, the
@@ -311,6 +339,19 @@ fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
 
+**Browse OIDs** opens a live view of what the device actually answers,
+decoded against every MIB the app knows. It opens on `system`,
+`interfaces` and the device's own vendor arc — a few hundred objects,
+back in seconds — and an OID box with **Walk from here** reads any other
+subtree on demand. Deliberately not a walk of the whole tree: a switch is
+tens of thousands of objects and minutes of SNMP, and nobody reads that.
+Each row shows the OID, its name where a MIB describes it, the row index,
+the SNMP type and the value; an OID nothing describes is shown as its
+number rather than guessed at, and uploading its MIB names it
+immediately. A walk that hits its row or time limit says so rather than
+looking complete. This is also how to read a device's sysObjectID
+straight off it, which is what identifies its vendor.
+
 Clicking a port in the interface list opens that port's own dialog: a
 live up/down bandwidth graph of the last hour with **Smoothed** on by
 default (a centred moving average, unticked to see the raw per-poll
@@ -345,13 +386,26 @@ alerts and optionally emailing about them.
 
 - **Alerts can be acknowledged or resolved individually or in bulk.**
   Every row carries a **checkbox** in its first column: tick the rows you
-  want, or use **Select all**. Ctrl/Cmd-click anywhere in a row still
-  toggles it too, and a plain click still opens the detail pane,
-  unchanged. Any selection reveals a bulk actions bar with **Acknowledge
+  want, or use **Select all**. A plain click still opens the detail pane,
+  unchanged. (Ctrl-click no longer selects — the checkboxes replaced it.)
+  Any selection reveals a bulk actions bar with **Acknowledge
   selected** and **Resolve selected**, each applied to exactly the ticked
   alerts in one request — alongside the single-alert buttons in the
   detail pane and the server-wide **Acknowledge all**, which
   deliberately ignores the selection and its confirmation says so.
+- **A newly added device is given five minutes before it can raise an
+  alert.** A device added a moment ago is usually still being set up —
+  wrong community, not cabled yet, still booting — and the alerts that
+  produces are about the setup, not about the network. Its alerts are
+  held and then raised only if the condition is **still true** when the
+  window ends, so a device that really is down is reported a little late
+  rather than not at all, and one that settles in never alerts. A one-off
+  event that cannot still be true later (rebooted, recovered, a poll
+  overrun) is dropped rather than raised late. Held alerts survive a
+  restart. The window is **Alerts → Settings → Hold alerts on a newly
+  added device**; 0 turns it off. Nothing outside Nodes' device inventory
+  is ever held — syslog, traps, IPAM conflicts, DHCP scopes and wireless
+  AP events have no device to be new.
 - **The Object column always shows a hostname when one is known** — the
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
@@ -1046,8 +1100,8 @@ reports on all of them in one SNMP walk.
   Nodes has, since this app has no AES/DES implementation to speak
   authPriv with; the controller-add form says so directly). Managed from
   **Controllers**, next to the module's Settings button.
-- **Per AP: status, name, client count, model, MAC address, and tx
-  power** — the last shown per-radio, since a real AP has more than one
+- **Per AP: status, name, client count, model, MAC address, response
+  time, and tx power** — the last shown per-radio, since a real AP has more than one
   (2.4/5/6 GHz). Selecting a row shows the full per-radio breakdown:
   mode, channel, tx power and client count for each.
 - **Radio mode is shown, which explains an odd extra radio.** A FortiAP
@@ -1076,6 +1130,14 @@ reports on all of them in one SNMP walk.
   force dBm or percent instead, and the AP detail pane always shows the
   raw number alongside, so the reading can be checked against the
   controller's own display.
+- **Response time is a real per-AP round-trip.** The controller reports
+  each AP's own IP in the session table this module already walks, so
+  finding it costs no extra SNMP; the AP is then pinged once per poll
+  cycle. This is the one place the module reaches past the controller —
+  everything else it knows comes from that single walk — and the sweep is
+  bounded so a controller carrying a rack of APs cannot stretch a cycle.
+  An AP that does not answer ICMP shows blank rather than 0 ms, and an
+  offline AP is not probed at all. **IP** is available as a column too.
 - **Sort by any column** — click its heading, the same way every other
   table in the app sorts.
 - **Settings → Radio tx power** forces dBm or the percentage reading where
@@ -1084,7 +1146,7 @@ reports on all of them in one SNMP walk.
   are the defaults; Controller, VDOM, WTP id, Radios, Radio modes,
   Channels, Radio clients and Last seen can be added. The list is the fields the
   controller's own SNMP tables report, so adding one costs no extra
-  polling.
+  polling; Response and IP are there too.
 - **Polled on a fixed interval** (default 60 s) via repeated SNMP
   GETNEXT walks of the FortiGate Wireless Controller MIB's
   `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable` —
@@ -1125,7 +1187,8 @@ already uses: its SNMP-reported name, unless it's been explicitly pinned
 to a manual name in Nodes.
 
 - **Bulk-edit SSH credentials and backup settings across many devices at
-  once**: Ctrl/Cmd-click rows (or "select all") to check several devices,
+  once**: tick the checkbox on each row (or "select all") to pick several
+  devices,
   then set one shared SSH username/password/port and backup-enabled
   setting for all of them in a single action — the same shared-value
   bulk pattern Nodes' own bulk device operations already use. Leaving a
@@ -1172,6 +1235,19 @@ to a manual name in Nodes.
   `paramiko>=3.4,<5`. On a version that cannot, the failure says so and
   names the fix rather than reporting only paramiko's own
   "no acceptable kex algorithm".
+- **It names the paramiko this process is actually running.** "I installed
+  3.4 and it still says the algorithms were removed" has one answer, and
+  it is worth being able to see rather than deduce: pip installs into
+  whichever interpreter it was run from, and a *downgrade* cannot take
+  effect until the app restarts, because Python caches imported modules
+  for the life of the process. ConfigRX → Settings and the module's own
+  status line therefore report the loaded version **and the file it was
+  loaded from**, and whether legacy key exchange is implemented by it and
+  currently offered — before anything fails, not only in the error text
+  of a backup that already failed. A failed connection also logs the key
+  exchanges and host-key types actually offered into its Debug event
+  detail, so "we offered these and the device refused" can be checked
+  against the device's own logs.
 - **Retention**: keep for N days, and/or keep at most N per device —
   either can be set to 0 to disable that particular cap. A device whose
   config never changes stays at one stored backup regardless of either

@@ -6,6 +6,96 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.28.0 — Which paramiko, vendor identification, an OID browser, per-AP latency, checkboxes
+
+- **ConfigRX now names the paramiko it is actually running.** Reported as
+  "paramiko 3.4 is installed but I still get *no acceptable kex
+  algorithm*". The message was not wrong — it was describing a different
+  paramiko. That branch is reachable only when the **loaded** paramiko
+  genuinely lacks SHA-1 key exchange (it is a capability check against
+  `Transport._kex_info`, not a version test, and I verified both halves
+  against a live interpreter), so the process was running 5.0 whatever
+  was installed: pip installs into whichever interpreter it was run
+  from, and a *downgrade* cannot take effect until the app restarts,
+  because Python caches imported modules for the life of the process.
+  The algorithm logic is unchanged and correct. What is new is that the
+  error, ConfigRX → Settings and the module status line all name the
+  loaded version **and the file it came from**, and say whether legacy
+  key exchange is implemented and offered — before a backup fails rather
+  than only after. A failed connection also logs the key exchanges and
+  host-key types actually offered into its Debug event detail.
+- **Vendors are identified far more often.** The enterprise-arc table
+  covered 19 vendors while the MIB catalog shipped bundles for 30, so a
+  device could have its MIB installed and still show a blank Vendor.
+  It now covers every catalog vendor plus a range of industrial and
+  wireless names — **every arc read out of that vendor's own MIB text**
+  rather than from memory, which turned up two that are easy to get
+  wrong: `4413` is Broadcom's (NETGEAR's managed switches run OEM'd
+  FASTPATH and report there, as do other OEMs) and `161` is Motorola's,
+  which Cambium's Canopy line still uses. Both are named for the arc's
+  owner. Where the sysObjectID names only the SNMP *agent* — a Phoenix
+  Contact radio, a Moxa switch and a Linux server all answer net-snmp's
+  arc — the **sysDescr** is consulted instead. Two bugs fell out of
+  writing the tests: a device with a standard-tree sysObjectID was being
+  stored with vendor `"system"`, and matching the agent arc first meant
+  the new fallback could never run for exactly the gear it was for.
+- **A vendor's MIB is assigned to its devices automatically.** Installing
+  a bundle used to change nothing about polling until someone visited
+  every device and set the Custom MIB override by hand. Now, when a
+  device's vendor is identified and an uploaded MIB describes objects
+  under that vendor's arc, the override is set for it — never over a MIB
+  chosen by hand, recorded in the device's event history, and changed or
+  cleared from the same override afterwards.
+- **Browse OIDs**, a new button on the device pane, shows what a device
+  actually answers, decoded against every MIB the app knows. It opens on
+  `system`, `interfaces` and the device's own vendor arc, with an OID box
+  and **Walk from here** for anything else — subtree at a time on
+  purpose, since a switch is tens of thousands of objects. An OID no MIB
+  describes shows as its number rather than a guess, and uploading its
+  MIB names it immediately. A walk that hits its row or time limit says
+  so instead of looking complete.
+- **Wireless: a real per-AP response time.** The controller reports each
+  AP's own IP in the session table the module already walks, so finding
+  it costs no extra SNMP; the AP is then pinged once per cycle. An AP
+  that does not answer ICMP shows blank rather than 0 ms, an offline one
+  is not probed at all, and the sweep is bounded so a large controller
+  cannot stretch a cycle. **IP** is available as a column too. This is
+  the one place the module reaches past the controller.
+- **A newly added device gets five minutes before it can alert.** A
+  device added a moment ago is usually still being set up, and its alerts
+  are about the setup rather than the network. They are held and then
+  raised only if the condition is **still true** at the end of the window,
+  so a device that really is down is reported late rather than never, and
+  one that settles never alerts. A one-off event that cannot still be
+  true later (rebooted, recovered, poll overrun) is dropped rather than
+  raised late; a threshold needs no holding at all, since it is
+  re-derived every tick. Held alerts survive a restart. Configurable in
+  Alerts → Settings, 0 to disable. Nothing outside Nodes' device
+  inventory can be held — syslog, traps, IPAM conflicts, DHCP scopes and
+  wireless AP events have no device to be new.
+- **The Nodes device list sorts by any column.** Status, Name, Profile,
+  Group, Vendor, Response and Last poll each sort on what the column
+  actually shows — Profile by profile name rather than by its internal
+  id, Response by milliseconds rather than by the text around them. A
+  device with no reading stays at the bottom in both directions rather
+  than leaping to the top when the order reverses.
+- **Every bulk selection is checkboxes now**, on Nodes, Alerts and
+  ConfigRX alike, and Ctrl-click no longer selects. Separately — and this
+  is the part that is actually faster — ticking a box no longer redraws
+  the whole table. Each module rebuilt every row to change one checkbox;
+  it now touches the single row. The checkboxes made selection visible;
+  the redraw is what made it slow.
+
+**Not done in this release:** a Phoenix Contact MIB bundle. Phoenix
+Contact radios are identified by sysDescr and work as ordinary Nodes
+devices, but the catalog's upstream ships no Phoenix Contact MIBs and
+IANA's enterprise registry was unreachable from the build environment, so
+neither the enterprise arc nor a download URL could be verified. A
+guessed arc would mislabel every device beneath it and a guessed URL
+would fail at Install — both worse than leaving it out. One sysObjectID
+from a real unit (the new OID browser shows it) or the MIB file itself is
+all that is needed to finish it.
+
 ### 4.27.0 — Alert checkboxes, MAC tables that answer, per-destination windows, NetFlow speed
 
 - **Alerts: real checkboxes, and an "Acknowledge selected" that respects

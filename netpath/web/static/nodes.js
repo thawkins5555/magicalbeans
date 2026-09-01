@@ -7,6 +7,8 @@
   const view = {
     devices: [],
     devicesChecked: new Set(),
+    // Server order (name) until the operator clicks a heading.
+    deviceSort: { key: 'name', descending: false },
     groups: [],
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
@@ -75,25 +77,50 @@
 
   /* ----------------------------------------------------------- devices */
 
+  /* Four of these show something other than the row field of the same name —
+     a profile name looked up from group_id, a formatted RTT — so each needs a
+     `value` accessor or App.sortRows would sort by a field that does not
+     exist and the header click would look broken. The lookups are filled in
+     by drawTable() before sorting, since the id->name maps live there. */
   const COLUMNS = [
-    { key: 'status', label: 'Status', width: 90 },
-    { key: 'name', label: 'Name / IP', width: 200 },
-    { key: 'group', label: 'Profile', width: 130 },
-    { key: 'devgroup', label: 'Group', width: 120 },
-    { key: 'vendor', label: 'Vendor', width: 120 },
-    { key: 'response', label: 'Response', width: 90, numeric: true },
+    { key: 'check', label: '', sortable: false, width: 34 },
+    { key: 'status', label: 'Status', width: 90, value: (r) => r.status || '' },
+    { key: 'name', label: 'Name / IP', width: 200,
+      value: (r) => displayName(r) || r.ip || '' },
+    { key: 'group', label: 'Profile', width: 130, value: (r) => r._groupName || '' },
+    { key: 'devgroup', label: 'Group', width: 120, value: (r) => r._devGroupName || '' },
+    { key: 'vendor', label: 'Vendor', width: 120, value: (r) => r.vendor || '' },
+    { key: 'response', label: 'Response', width: 90, numeric: true,
+      // Sorted on the number, not on the "12 ms (ping only)" text, and a
+      // device with no reading sorts as blank rather than as zero.
+      value: (r) => (r.ping_rtt_ms == null ? null : r.ping_rtt_ms) },
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true,
       value: (r) => r.last_poll_ts || 0 },
   ];
 
+  function onDeviceSort(key, descending) {
+    view.deviceSort = { key, descending };
+    drawTable();
+  }
+
   function drawTable() {
-    const table = App.grid(App.el('nodes-table'), { name: 'nodes-devices', columns: COLUMNS });
+    const table = App.grid(App.el('nodes-table'), {
+      name: 'nodes-devices', columns: COLUMNS,
+      sort: view.deviceSort, onSort: onDeviceSort });
     const body = document.createElement('tbody');
     const groupsById = {};
     for (const g of view.groups) groupsById[g.id] = g.name;
     const devGroupsById = {};
     for (const g of view.deviceGroups) devGroupsById[g.id] = g.name;
+    // Resolved once per draw so the Profile and Group columns can sort on
+    // what they actually display rather than on a raw foreign key.
     for (const row of view.devices) {
+      row._groupName = groupsById[row.group_id] || '';
+      row._devGroupName = devGroupsById[row.device_group_id] || '';
+    }
+    const rows = App.sortRows(view.devices, view.deviceSort.key,
+                              view.deviceSort.descending, COLUMNS);
+    for (const row of rows) {
       const tr = document.createElement('tr');
       tr.className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
@@ -102,23 +129,23 @@
       const rtt = row.snmp_ok ? (row.ping_rtt_ms != null ? `${row.ping_rtt_ms.toFixed(0)} ms` : 'ok')
         : (row.ping_ok ? `${(row.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '—');
       tr.innerHTML =
+        `<td><input type="checkbox" class="nd-check"${
+          view.devicesChecked.has(row.id) ? ' checked' : ''}></td>` +
         `<td>${dot}${escape(row.status)}</td>` +
         `<td>${escape(displayName(row))}<div class="hint">${escape(row.ip)}</div></td>` +
-        `<td>${escape(groupsById[row.group_id] || '—')}</td>` +
-        `<td>${escape(devGroupsById[row.device_group_id] || '—')}</td>` +
+        `<td>${escape(row._groupName || '—')}</td>` +
+        `<td>${escape(row._devGroupName || '—')}</td>` +
         `<td>${escape(row.vendor || '—')}</td>` +
         `<td>${escape(rtt)}</td>` +
         `<td>${ago(row.last_poll_ts)}</td>`;
-      // Ctrl/Cmd-click toggles bulk selection without touching the
-      // single-row detail-pane selection below; a plain click keeps
-      // doing exactly what it always did.
-      tr.onclick = (event) => {
-        if (event.ctrlKey || event.metaKey) {
-          toggleChecked(row.id);
-        } else {
-          selectDevice(row.id);
-        }
+      // The checkbox owns selection; the rest of the row owns the detail
+      // pane. stopPropagation keeps ticking a box from also moving the
+      // highlight, which would make one click mean two different things.
+      tr.querySelector('.nd-check').onclick = (event) => {
+        event.stopPropagation();
+        toggleChecked(row.id, tr);
       };
+      tr.onclick = () => selectDevice(row.id);
       body.appendChild(tr);
     }
     table.appendChild(body);
@@ -128,9 +155,20 @@
 
   /* ------------------------------------------------------- bulk actions */
 
-  function toggleChecked(id) {
-    if (view.devicesChecked.has(id)) view.devicesChecked.delete(id);
-    else view.devicesChecked.add(id);
+  /* Redrawing the whole table to change one checkbox is what made picking
+     several rows on a long list feel slow — the checkboxes themselves cost
+     nothing. Given the row, only that row is touched. */
+  function toggleChecked(id, tr) {
+    const on = !view.devicesChecked.has(id);
+    if (on) view.devicesChecked.add(id);
+    else view.devicesChecked.delete(id);
+    if (tr) {
+      tr.classList.toggle('bulk-checked', on);
+      const box = tr.querySelector('.nd-check');
+      if (box) box.checked = on;
+      drawBulkBar();
+      return;
+    }
     drawTable();
   }
 
@@ -578,6 +616,130 @@
   function ifaceTitle(row, ifIndex) {
     return `${escape(row.descr || `Interface ${ifIndex}`)}` +
       (row.alias ? ` <span class="hint">${escape(row.alias)}</span>` : '');
+  }
+
+  /* ------------------------------------------------------ OID browser */
+
+  /* What a device actually answers, decoded against every MIB this app
+     knows. Deliberately subtree-at-a-time rather than a walk of the whole
+     tree: a switch is tens of thousands of objects and minutes of GETNEXTs,
+     and nobody reads that. The three offered subtrees cover "what is this
+     box" and "what are its ports"; anything else is one box and one click. */
+  function oidBrowser() {
+    const deviceId = view.selected;
+    if (!deviceId) return;
+    const device = view.devices.find((d) => d.id === deviceId);
+    // Same ticket idiom the interface dialog uses: App.modal reuses one
+    // #modal-box, so a slow walk must not paint into whatever dialog is
+    // open by the time it lands.
+    const token = (view.oidDialogSeq = (view.oidDialogSeq || 0) + 1);
+    const current = () => token === view.oidDialogSeq && !App.el('modal').hidden;
+
+    const box = App.modal(`Browse OIDs — ${displayName(device || {})}`, `
+      <div class="bar wrap">
+        <label>Start at <input id="oid-base" size="24" value="1.3.6.1.2.1.1"></label>
+        <button id="oid-walk">Walk from here</button>
+        <span id="oid-quick" class="hint"></span>
+      </div>
+      <p class="hint">Each walk reads the device live over SNMP. Names come
+        from the MIBs uploaded under Profiles &amp; MIBs — an OID no MIB
+        describes is shown as its number rather than guessed at.</p>
+      <div id="oid-status" class="hint"></div>
+      <div class="table-wrap" style="max-height:52vh"><table id="oid-table"></table></div>`, [
+      { label: 'Close', primary: true, onClick: App.closeModal },
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+
+    const COLS = [
+      { key: 'oid', label: 'OID', width: 210 },
+      { key: 'name', label: 'Name', width: 200 },
+      { key: 'suffix', label: 'Index', width: 70 },
+      { key: 'type', label: 'Type', width: 90 },
+      { key: 'value', label: 'Value', width: 320 },
+    ];
+    let rows = [];
+    let sort = { key: 'oid', descending: false };
+
+    function draw() {
+      const table = App.grid(box.querySelector('#oid-table'),
+        { name: 'nodes-oids', columns: COLS, sort, onSort: (key, descending) => {
+          sort = { key, descending }; draw();
+        } });
+      const body = document.createElement('tbody');
+      // Sorted numerically by arc, not as text: "1.3.6.1.2.1.1.10" must not
+      // sort between ".1" and ".2".
+      const ordered = sort.key === 'oid'
+        ? rows.slice().sort((a, b) => (sort.descending ? -1 : 1) * oidCompare(a.oid, b.oid))
+        : App.sortRows(rows, sort.key, sort.descending, COLS);
+      for (const row of ordered) {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          `<td>${escape(row.oid)}</td>` +
+          `<td>${row.name ? escape(row.name) : '<span class="hint">—</span>'}</td>` +
+          `<td>${escape(row.suffix || '')}</td>` +
+          `<td>${escape(row.type)}</td>` +
+          `<td>${escape(row.value)}</td>`;
+        body.appendChild(tr);
+      }
+      table.appendChild(body);
+    }
+
+    async function walk(base) {
+      box.querySelector('#oid-base').value = base;
+      box.querySelector('#oid-status').textContent = `Walking ${base}…`;
+      rows = [];
+      draw();
+      let payload;
+      try {
+        payload = await App.get(`/api/nodes/devices/${deviceId}/oids`, { oid: base });
+      } catch (error) {
+        if (!current()) return;
+        box.querySelector('#oid-status').innerHTML =
+          `<span class="err">${escape(error.message)}</span>`;
+        return;
+      }
+      if (!current()) return;
+      rows = payload.rows || [];
+      // A walk that stopped early says so: a truncated list that looks
+      // complete is worse than no list.
+      const named = rows.filter((r) => r.name).length;
+      box.querySelector('#oid-status').innerHTML = rows.length
+        ? `${rows.length} object(s), ${named} named` +
+          (payload.complete ? '' :
+            ` · <span class="err">${escape(payload.stopped)}</span>`)
+        : `<span class="hint">Nothing under ${escape(base)}` +
+          (payload.complete ? '' : ` — ${escape(payload.stopped)}`) + '</span>';
+      draw();
+    }
+
+    App.get(`/api/nodes/devices/${deviceId}/oids`, {}).then((payload) => {
+      if (!current()) return;
+      const quick = box.querySelector('#oid-quick');
+      quick.textContent = '';
+      for (const base of payload.bases || []) {
+        const button = document.createElement('button');
+        button.textContent = base.label;
+        button.onclick = () => walk(base.oid);
+        quick.appendChild(button);
+      }
+    }).catch(() => {});
+
+    box.querySelector('#oid-walk').onclick =
+      () => walk(box.querySelector('#oid-base').value.trim());
+    draw();
+    walk('1.3.6.1.2.1.1');
+  }
+
+  /* Numeric arc-by-arc, so 1.3.6.1.2.1.1.10 sorts after .9 rather than
+     between .1 and .2 the way string order would put it. */
+  function oidCompare(a, b) {
+    const x = String(a).split('.').map(Number);
+    const y = String(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
+      const d = (x[i] || 0) - (y[i] || 0);
+      if (d) return d;
+    }
+    return 0;
   }
 
   function interfaceDialog(iface) {
@@ -1948,6 +2110,7 @@
     App.el('nd-add-device').onclick = addDevice;
     App.el('nd-edit-device').onclick = editDevice;
     App.el('nd-remove-device').onclick = removeDevice;
+    App.el('nd-browse-oids').onclick = oidBrowser;
     App.el('nd-poll-now').onclick = async () => {
       if (!view.selected) return;
       await App.post(`/api/nodes/devices/${view.selected}/poll`, {});

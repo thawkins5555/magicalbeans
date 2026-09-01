@@ -32,6 +32,11 @@ WTP_SESSION_RADIO_ENTRY = f"{WTP_TABLES}.5.1"
 WTP_CONFIG_NAME = f"{WTP_CONFIG_ENTRY}.3"          # DisplayString
 
 # fgWcWtpSessionEntry (live status)
+# fgWcWtpSessionWtpIpAddress: the AP's own address as the controller sees it,
+# read from the session table this module already walks — so it costs no extra
+# SNMP. It is what makes a per-AP response time possible at all: the module
+# never talks to an AP directly, only to the controller.
+WTP_SESSION_IP = f"{WTP_SESSION_ENTRY}.3"           # InetAddress
 WTP_SESSION_MAC = f"{WTP_SESSION_ENTRY}.6"          # PhysAddress
 WTP_SESSION_CONNECTION_STATE = f"{WTP_SESSION_ENTRY}.7"   # INTEGER, see below
 WTP_SESSION_MODEL = f"{WTP_SESSION_ENTRY}.12"       # DisplayString

@@ -1319,6 +1319,28 @@ class NodesDatabase:
                 " AND oid LIKE ? LIMIT 1", (prefix + ".%",)).fetchone()
         return row is not None
 
+    def mib_file_covering(self, sys_object_id: str) -> int | None:
+        """Which uploaded MIB describes this vendor's objects, for the
+        auto-assignment in nodepoll._check_vendor_mib.
+
+        has_mib_covering() answers "is there one"; this answers "which one",
+        and picks the file with the most resolved objects under the vendor's
+        arc when several qualify — a vendor bundle is usually several files,
+        of which one carries the bulk of the real objects and the rest are
+        type or registration modules that would poll nothing.
+        """
+        from . import nodeoids
+        prefix = nodeoids.enterprise_root(sys_object_id)
+        if not prefix:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT mib_file_id, COUNT(*) AS n FROM mib_objects"
+                " WHERE oid IS NOT NULL AND oid LIKE ?"
+                " GROUP BY mib_file_id ORDER BY n DESC LIMIT 1",
+                (prefix + ".%",)).fetchone()
+        return row["mib_file_id"] if row else None
+
     def all_known_oids(self) -> dict[str, str]:
         """Every resolved mib_objects name -> OID, across every uploaded
         file — fed into mibparse.resolve()'s `known` dict so a later

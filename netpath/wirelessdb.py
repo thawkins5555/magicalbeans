@@ -125,6 +125,10 @@ class WirelessDatabase:
         missing, never rewrite the CREATE TABLE above."""
         aps = {row["name"] for row in
                self._conn.execute("PRAGMA table_info(access_points)").fetchall()}
+        for column, decl in (("ip", "TEXT"), ("response_ms", "REAL")):
+            if column not in aps:
+                self._conn.execute(
+                    f"ALTER TABLE access_points ADD COLUMN {column} {decl}")
         if "out_of_service" not in aps:
             self._conn.execute(
                 "ALTER TABLE access_points ADD COLUMN"

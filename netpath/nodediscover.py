@@ -218,6 +218,7 @@ class DiscoveryJob:
                     "sys_descr": sys_descr,
                     "sys_name": sys_name,
                     "sys_object_id": sys_object_id,
-                    "vendor": nodeoids.vendor_for(sys_object_id),
+                    "vendor": nodeoids.identify_vendor(
+                        sys_object_id, sys_descr)[0],
                 }
         return None

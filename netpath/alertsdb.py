@@ -134,7 +134,27 @@ DEFAULTS = {
     "renotify_minutes": 0,          # 0 = notify once per open alert, never again while open
     "notify_on_clear": True,
     "max_emails_per_hour": 60,
+    # A device added a moment ago is usually mid-setup: wrong community, not
+    # cabled yet, still booting. Alerts for it are held this long and then
+    # fired only if the condition is still true. 0 disables the hold.
+    "new_device_grace_s": 300,
 }
+
+PENDING_SCHEMA = """
+-- Occurrences held back because their device was added less than
+-- new_device_grace_s ago. Held in the database rather than in memory so a
+-- restart inside the window does not silently drop them, and so an operator
+-- can see what is waiting. Each row is one occurrence, replayed and
+-- re-checked once its time comes.
+CREATE TABLE IF NOT EXISTS pending_alerts (
+    id            INTEGER PRIMARY KEY,
+    device_id     INTEGER NOT NULL,
+    fire_after_ts REAL    NOT NULL,
+    created_ts    REAL    NOT NULL,
+    payload       TEXT    NOT NULL      -- the Occurrence, as JSON
+);
+CREATE INDEX IF NOT EXISTS ix_pending_due ON pending_alerts(fire_after_ts);
+"""
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "template_id",
@@ -202,6 +222,7 @@ class AlertsDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._conn.executescript(PENDING_SCHEMA)
             self._migrate()
             self._conn.commit()
         self._seed_templates()
@@ -547,6 +568,36 @@ class AlertsDatabase:
                 (time.time(), by, *alert_ids))
             self._conn.commit()
             return cursor.rowcount or 0
+
+    # ------------------------------------------------- held occurrences
+
+    def park_occurrence(self, device_id: int, fire_after_ts: float,
+                        payload: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO pending_alerts(device_id, fire_after_ts,"
+                " created_ts, payload) VALUES (?,?,?,?)",
+                (device_id, fire_after_ts, time.time(), payload))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def due_occurrences(self, now: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM pending_alerts WHERE fire_after_ts <= ?"
+                " ORDER BY fire_after_ts", (now,)).fetchall()
+
+    def drop_occurrence(self, pending_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM pending_alerts WHERE id = ?",
+                               (pending_id,))
+            self._conn.commit()
+
+    def pending_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM pending_alerts").fetchone()
+        return row["n"] if row else 0
 
     def acknowledge_many(self, alert_ids: list[int], by: str = "") -> int:
         """Acknowledge exactly the given alerts — the selection-respecting
