@@ -51,6 +51,11 @@ Listed newest first. Version numbers are build order, not dates.
 - **Fixed:** ConfigRX's "Set SSH credential" button appeared and
   disappeared on its own, shifting the page — the bulk bar's visibility
   was being written both by the selection and by the permission check.
+- **Fixed:** the page briefly flashed the NetPath tab before switching to
+  the one you were last on. Reloading always landed on the right tab, but
+  the small script that paints it immediately was written inline, which
+  the app's own Content-Security-Policy refuses to run; it now loads as
+  `boot.js` and does its job.
 
 ### 4.23.0 — Custom-MIB polling, MAC address table, ConfigRX bulk edit, bug fixes
 

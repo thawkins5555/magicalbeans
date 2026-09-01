@@ -6,21 +6,13 @@
 <title>SappiWhere</title>
 <link rel="stylesheet" href="/app.css">
 <!-- Marks which tab should paint first, before <body> has a single byte of
-     content to render — see app.css's html[data-tab] rules. Nothing else
-     in <head> depends on network or on the DOM below it, so this runs and
-     finishes before the browser has anything to paint at all: there is no
-     "wrong page" moment to flash, because the attribute is already set by
-     the time any .tab/.page element exists. Kept as a raw inline script
-     (not deferred, not a module) specifically so it blocks parsing here,
-     that split second before <body>, rather than racing it. -->
-<script>
-(function () {
-  try {
-    var stored = localStorage.getItem('sappiwhere.tab');
-    document.documentElement.dataset.tab = stored || 'netpath';
-  } catch (error) { document.documentElement.dataset.tab = 'netpath'; }
-})();
-</script>
+     content to render — see app.css's html[data-tab] rules and boot.js.
+     A plain <script src> (no defer, no module) so it still blocks parsing
+     right here, that split second before <body>, rather than racing it.
+     It is a separate file rather than an inline block because the server
+     sends `default-src 'self'`, under which an inline <script> is refused
+     outright and this never ran at all. -->
+<script src="/boot.js"></script>
 </head>
 <body>
 

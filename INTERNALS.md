@@ -2147,9 +2147,9 @@ connection the browser could still paint a frame or two of the static
 default before the parser physically reached it.
 
 **The actual fix moves the decision into `<head>`, before `<body>` has a
-single byte of content to mis-paint in the first place.** A tiny inline
-script there sets `document.documentElement.dataset.tab` (defaulting to
-`'netpath'` if nothing is stored or `localStorage` throws) — reading
+single byte of content to mis-paint in the first place.** A tiny script
+there (`boot.js`) sets `document.documentElement.dataset.tab` (defaulting
+to `'netpath'` if nothing is stored or `localStorage` throws) — reading
 `localStorage` is all it does, and `<html>` already exists the moment any
 `<head>` script runs, so this has nothing to wait on. `app.css` — loaded
 by the `<link>` just above it, and render-blocking by the same browser
@@ -2163,6 +2163,25 @@ default left to flash, only whichever `html[data-tab]` rule matches. By
 the time `<body>` has anything to paint, the attribute the CSS keys off
 is already sitting on `<html>`, set in `<head>`, before that paint could
 possibly have happened.
+
+It is `<script src="/boot.js">` rather than an inline block, and that is
+load-bearing rather than stylistic: `server.py` sends `default-src
+'self'`, under which the browser refuses an inline `<script>` outright.
+As an inline block this whole anti-flash pass silently never ran — the
+console said so on every page load — and the flash it exists to prevent
+was back. A plain `<script src>` with no `defer` and no `type="module"`
+still blocks parsing at that point in `<head>`, so the ordering the
+paragraph above depends on is unchanged; it costs one extra same-origin
+request, already in flight alongside `app.css`. Note that *restoring* the
+tab was never affected either way — `start()` in `app.js` reads the same
+`TAB_KEY` on load regardless — so the symptom was purely a flash of the
+default tab, which is exactly why it went unnoticed. Keep `boot.js`'s key
+and `'netpath'` fallback in step with `app.js`'s `TAB_KEY` and default.
+
+Any future `<head>` bootstrapping belongs in `boot.js` for the same
+reason; an inline `<script>` anywhere in this app is dead code unless the
+CSP in `server.py` changes to allow it (which it should not — the point of
+`default-src 'self'` is that injected markup cannot execute).
 
 `selectTab(name)` in `app.js` sets the same `dataset.tab` on every call,
 not just once — required, not cosmetic: without it, the attribute stays
