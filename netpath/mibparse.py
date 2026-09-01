@@ -2,8 +2,9 @@
 
 Not a compliant ASN.1/SMI compiler — a real vendor MIB is parsed the way a
 person skimming it would: find every `NAME OBJECT-TYPE ... ::= { PARENT
-NUMBER }` (or `OBJECT IDENTIFIER`, or `NOTIFICATION-TYPE`) clause with a
-regex anchored on the literal `::=` token, and resolve `PARENT` against
+NUMBER }` (or `OBJECT IDENTIFIER`, `MODULE-IDENTITY`, `OBJECT-IDENTITY`,
+or `NOTIFICATION-TYPE`) clause with a regex anchored on the literal
+`::=` token, and resolve `PARENT` against
 whatever OIDs are already known — this file's own siblings resolved so
 far, plus everything the app already knows from nodeoids.py/trapoids.py/
 previously uploaded MIBs.
@@ -109,6 +110,17 @@ _OBJECT_ID_RE = re.compile(
     r"\b([a-zA-Z][\w-]*)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{([^{}]*)\}")
 _NOTIFICATION_RE = re.compile(
     r"\b([a-zA-Z][\w-]*)\s+NOTIFICATION-TYPE\b(.*?)::=\s*\{([^{}]*)\}", re.DOTALL)
+# The two other macros that define a real branch node rather than describing
+# one. Nearly every RFC MIB names its own root with MODULE-IDENTITY
+# (`dot1dBridge MODULE-IDENTITY ... ::= { mib-2 17 }`) and hangs the whole
+# module beneath it, so without these two a file like BRIDGE-MIB or LLDP-MIB
+# parsed to a list of objects none of which could resolve. The conformance
+# macros (OBJECT-GROUP, NOTIFICATION-GROUP, MODULE-COMPLIANCE) are
+# deliberately still ignored: they are agent-capability paperwork, never
+# polled, and nothing hangs off them.
+_MODULE_IDENTITY_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b(.*?)"
+    r"::=\s*\{([^{}]*)\}", re.DOTALL)
 
 _SYNTAX_RE = re.compile(r"\bSYNTAX\s+([A-Za-z][\w-]*)")
 _SYNTAX_ENUM_RE = re.compile(r"\bSYNTAX\s+INTEGER\s*\{([^{}]*)\}")
@@ -193,6 +205,14 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
                      "the module name is left blank.")
 
     imports = _parse_imports(masked)
+    # An IMPORTS list names macros as bare symbols ("IMPORTS MODULE-IDENTITY,
+    # OBJECT-TYPE ... FROM SNMPv2-SMI"), which reads to a regex exactly like a
+    # definition whose name is IMPORTS. Blank the block out — keeping its
+    # length and newlines so offsets into the original text still line up —
+    # once its symbols have been recorded.
+    masked = _IMPORTS_BLOCK_RE.sub(
+        lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)),
+        masked, count=1)
 
     objects: dict[str, ParsedObject] = {}
 
@@ -218,6 +238,17 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
             syntax=(syntax_match.group(1) if syntax_match else ""),
             enums=_extract_enums(body_original))
 
+    for match in _MODULE_IDENTITY_RE.finditer(masked):
+        name, braces = match.group(1), match.group(3)
+        if name in objects:
+            continue
+        parent, last_arc, literal = _parse_oid_tail(braces)
+        body_original = text[match.start(2):match.end(2)]
+        desc_match = _DESCRIPTION_RE.search(body_original)
+        objects[name] = ParsedObject(
+            name=name, parent=parent, last_arc=last_arc, oid=literal,
+            description=(desc_match.group(1).strip() if desc_match else ""))
+
     for match in _NOTIFICATION_RE.finditer(masked):
         name, braces = match.group(1), match.group(3)
         if name in objects:
@@ -231,8 +262,8 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
             is_notification=True)
 
     if not objects:
-        notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, or "
-                     "NOTIFICATION-TYPE definitions were recognized in "
+        notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, MODULE-IDENTITY, "
+                     "or NOTIFICATION-TYPE definitions were recognized in "
                      "this file.")
 
     return ParseResult(module=module, objects=list(objects.values()),
@@ -282,6 +313,71 @@ def known_oids_for(nodes_db) -> dict[str, str]:
     known = dict(WELL_KNOWN_ROOTS)
     known.update(nodes_db.all_known_oids())
     return known
+
+
+def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
+    """Re-resolve every stored MIB against every other, to a fixpoint.
+
+    `resolve()` already loops within one file; what it cannot do is see a
+    parent that lives in a file parsed later. That is the whole reason MIB
+    upload order used to matter: CISCO-PROCESS-MIB uploaded before CISCO-SMI
+    resolved nothing, and only a manual Resolve on each file afterwards
+    finished the chain. This walks every file repeatedly, feeding each pass's
+    newly-resolved names into the next, until a pass gains nothing — after
+    which order is irrelevant and a bundle can be installed as a heap.
+
+    Only files whose object set actually changed are written back, so calling
+    this when everything is already resolved is a read-only no-op rather than
+    a rewrite of every row.
+    """
+    rows = [row for row in nodes_db.mib_files() if row["content"]]
+    parsed: dict[int, ParseResult] = {}
+    for row in rows:
+        try:
+            parsed[row["id"]] = parse(row["content"], max_bytes=max_bytes)
+        except ValueError:
+            continue          # oversized now that the cap is lower: leave as-is
+
+    known = dict(WELL_KNOWN_ROOTS)
+    known.update(nodes_db.all_known_oids())
+    passes = 0
+    for passes in range(1, max_passes + 1):
+        gained = 0
+        for result in parsed.values():
+            count, _ = resolve(result.objects, known)
+            for obj in result.objects:
+                if obj.oid:
+                    known.setdefault(obj.name, obj.oid)
+            gained += count
+        if not gained:
+            break
+
+    changed = 0
+    resolved_total = 0
+    object_total = 0
+    for row in rows:
+        result = parsed.get(row["id"])
+        if result is None:
+            continue
+        object_total += len(result.objects)
+        resolved_total += sum(1 for obj in result.objects if obj.oid)
+        before = {r["name"]: r["oid"] for r in nodes_db.mib_objects(row["id"])}
+        after = {obj.name: obj.oid for obj in result.objects}
+        if before == after:
+            continue
+        unresolved = sorted({obj.parent for obj in result.objects
+                             if obj.oid is None and obj.parent})
+        nodes_db.update_mib_file(
+            row["id"], module=result.module, object_count=len(result.objects),
+            unresolved=unresolved, parse_notes="; ".join(result.notes))
+        nodes_db.replace_mib_objects(row["id"], [
+            {"name": obj.name, "oid": obj.oid, "description": obj.description,
+             "syntax": obj.syntax, "enums": obj.enums,
+             "is_notification": obj.is_notification}
+            for obj in result.objects])
+        changed += 1
+    return {"files": len(parsed), "files_changed": changed, "passes": passes,
+            "object_count": object_total, "resolved_count": resolved_total}
 
 
 def load_into(nodes_db, filename: str, text: str, known_oids: dict[str, str],

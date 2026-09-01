@@ -55,6 +55,10 @@ class AlertEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._breach_streaks: dict[tuple, int] = {}
+        # DHCP scopes keep (last polled_ts, streak) rather than a bare
+        # count: the engine ticks every few seconds but DHCP is polled
+        # every few minutes, so for_polls must count polls, not ticks.
+        self._dhcp_streaks: dict[tuple, tuple[float | None, int]] = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
@@ -122,6 +126,7 @@ class AlertEngine:
         occurrences += self._drain_ipam_conflicts(settings)
         occurrences += self._drain_ap_events(settings)
         occurrences += self._evaluate_thresholds(settings)
+        occurrences += self._evaluate_dhcp_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
@@ -383,6 +388,96 @@ class AlertEngine:
                         self._notify_clear(resolved, rule, settings)
         return occurrences
 
+    def _evaluate_dhcp_thresholds(self, settings) -> list[Occurrence]:
+        """DHCP scope utilization, evaluated the same way as a device
+        threshold but against IPAM rather than Nodes.
+
+        This cannot reuse _evaluate_thresholds: that one iterates
+        nodes_db.devices(), reads values out of the Nodes metrics table and
+        stamps entity_kind="device". A DHCP scope is none of those, so it
+        gets its own evaluator and its own rule kind.
+
+        Utilization is (leased + reserved) / range size, computed exactly
+        the way the DHCP page computes it (api.get_ipam_dhcp_scopes), so
+        the number in an alert is the number on screen.
+
+        The streak subtlety: for_polls is documented as "N consecutive
+        polls", and everywhere else in this engine a poll is a Nodes poll.
+        DHCP is polled every 15 minutes while this engine ticks every 5
+        seconds, so counting ticks would make for_polls=2 mean "10 seconds"
+        rather than "two polls". The streak therefore only advances when a
+        scope's polled_ts actually moves.
+        """
+        if self.ipam_db is None:
+            return []
+        rules = [r for r in self.db.rules()
+                 if r["enabled"] and r["kind"] == "dhcp_threshold"]
+        if not rules:
+            return []
+
+        from .ipamdb import scope_size
+
+        leases_by_scope: dict[tuple, list] = {}
+        for lease in self.ipam_db.dhcp_leases():
+            leases_by_scope.setdefault(
+                (lease["server_id"], lease["scope_id"]), []).append(lease)
+        servers = {row["id"]: row for row in self.ipam_db.dhcp_servers()}
+
+        occurrences = []
+        for scope in self.ipam_db.dhcp_scopes():
+            total = scope_size(scope["start_ip"], scope["end_ip"])
+            if not total:
+                # A scope with no usable range (or one this build cannot
+                # size) has no utilization to speak of; skipping is honest,
+                # whereas 0% would read as "plenty of room".
+                continue
+            leases = leases_by_scope.get((scope["server_id"], scope["scope_id"]), [])
+            reserved = sum(1 for row in leases if row["is_reservation"])
+            used = len(leases)          # reservations occupy addresses too
+            value = 100.0 * used / total
+            server = servers.get(scope["server_id"])
+            label = (f"{scope['name'] or scope['scope_id']} on "
+                     f"{scope['server_label'] or (server['address'] if server else '')}")
+            entity_id = f"{scope['server_id']}:{scope['scope_id']}"
+
+            for rule in rules:
+                streak_key = (rule["id"], entity_id)
+                previous_ts, streak = self._dhcp_streaks.get(streak_key, (None, 0))
+                polled_ts = scope["polled_ts"]
+                threshold = rule["threshold"]
+                over = threshold is not None and value >= threshold
+                if not over:
+                    streak = 0
+                elif polled_ts != previous_ts:
+                    streak += 1
+                self._dhcp_streaks[streak_key] = (polled_ts, streak)
+
+                result = evaluate_threshold(rule, value, streak)
+                occurrence = Occurrence(
+                    kind="dhcp_threshold", source_kind=rule["source_kind"],
+                    entity_kind="dhcp_scope", entity_id=entity_id,
+                    entity_label=label, ts=time.time(),
+                    message=f"{label}: {used}/{total} addresses in use "
+                            f"({value:.1f}%)",
+                    device_name=scope["server_label"] or "",
+                    device_ip=(server["address"] if server else ""),
+                    extra={"metric_label": "scope utilization",
+                           "value": f"{value:.1f}",
+                           "threshold": str(rule["threshold"]),
+                           "leased": str(used - reserved),
+                           "reserved": str(reserved),
+                           "total": str(total),
+                           "available": str(max(0, total - used))})
+                if result == "breach":
+                    occurrences.append(occurrence)
+                elif result == "clear":
+                    resolved = self.db.resolve_by_dedup(
+                        dedup_key(rule, occurrence), by="")
+                    if resolved:
+                        self.counters["resolved"] += 1
+                        self._notify_clear(resolved, rule, settings)
+        return occurrences
+
     # ---------------------------------------------------------------- apply
 
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
@@ -390,7 +485,7 @@ class AlertEngine:
             if rule["kind"] != occurrence.kind:
                 continue
             if rule["kind"] in ("device_event", "interface_event", "trap",
-                                "wireless_event"):
+                                "wireless_event", "dhcp_threshold"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "syslog" and occurrence.severity is not None:
@@ -509,6 +604,14 @@ class AlertEngine:
                 device_id = int(alert_row["entity_id"])
             elif alert_row["entity_kind"] == "interface":
                 device_id = int(str(alert_row["entity_id"]).split(":")[0])
+            elif alert_row["entity_kind"] == "dhcp_scope":
+                # "<server_id>:<scope_id>"; the nearest real address is the
+                # DHCP server's, which is what an operator would connect to.
+                if self.ipam_db is None:
+                    return ""
+                server = self.ipam_db.dhcp_server(
+                    int(str(alert_row["entity_id"]).split(":")[0]))
+                return server["address"] if server else ""
             elif alert_row["entity_kind"] == "ap":
                 # An AP alert's entity_id is "controller_id:vdom:wtp_id";
                 # the nearest meaningful address is the controller's own.

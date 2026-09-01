@@ -246,6 +246,13 @@
         <label>Keep traces for <input id="s-retention" type="number" min="1" max="3650" value="${s.trace_retention_days}"> days</label>
         <p class="hint">Traces wait on a subprocess rather than the CPU, so extra workers are
           cheap. Raise this if the Debug page shows destinations sitting in queued.</p>
+        <label>Drop hops unseen for <input id="s-stale" type="number" min="0" step="1"
+          value="${s.topology_stale_hours}"> hours</label>
+        <p class="hint">A router that leaves the path stops being drawn once it has been
+          absent this long, so the diagram shows the current path rather than every
+          address ever seen. Measured against the end of the window you are looking at,
+          so scrolling back through history still draws the path as it was then. 0 keeps
+          every hop the window covers.</p>
       </fieldset>
       <fieldset><legend>DEFAULTS FOR NEW DESTINATIONS</legend>
         <label>Trace every <input id="s-interval" type="number" min="15" value="${s.default_interval_s}"> s</label>
@@ -263,6 +270,7 @@
         await App.post('/api/settings', { scope: 'netpath', values: {
           trace_workers: n('#s-workers'),
           trace_retention_days: n('#s-retention'),
+          topology_stale_hours: n('#s-stale'),
           default_interval_s: n('#s-interval'),
           default_max_hops: n('#s-hops'),
           default_probes: n('#s-probes'),

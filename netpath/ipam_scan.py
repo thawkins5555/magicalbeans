@@ -124,6 +124,45 @@ def ping_once(ip: str, timeout_ms: int = 800) -> bool:
     return completed.returncode == 0
 
 
+def ping_many(ip: str, count: int = 3,
+              timeout_ms: int = 1000) -> tuple[int, int, float | None]:
+    """(sent, received, average RTT in ms) for `count` echo probes.
+
+    Sent one at a time rather than as a single `ping -c N`: Windows and the
+    BSDs disagree on how to ask for a burst and on how they summarise it,
+    and one probe per subprocess is the only form already known to work
+    everywhere here. It costs a process per probe, which at a default of
+    three probes per poll interval is not worth trading correctness for.
+
+    The RTT comes from the ping output's own "time=" figure, parsed with
+    tracer.py's existing regexes, not from wall-clock timing around the
+    subprocess — that measured process spawn as latency and reported a
+    sub-millisecond LAN device at 20 ms or worse. Returns None for the RTT
+    when nothing came back.
+    """
+    from .tracer import _UNIX_PING_TIME, _WIN_PING_TIME
+
+    pattern = _WIN_PING_TIME if IS_WINDOWS else _UNIX_PING_TIME
+    count = max(1, int(count))
+    received = 0
+    rtts: list[float] = []
+    for _ in range(count):
+        try:
+            completed = subprocess.run(
+                _ping_command(ip, timeout_ms), capture_output=True, text=True,
+                timeout=(timeout_ms / 1000) + 2, **hidden())
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if completed.returncode != 0:
+            continue
+        received += 1
+        match = pattern.search((completed.stdout or "") + "\n" +
+                               (completed.stderr or ""))
+        if match:
+            rtts.append(float(match.group(1)))
+    return count, received, (sum(rtts) / len(rtts)) if rtts else None
+
+
 def read_arp_table() -> dict[str, str]:
     """The local ARP/neighbor cache as {ip: mac}, best-effort.
 

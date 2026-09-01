@@ -68,6 +68,16 @@
     return c ? c.name : `#${id}`;
   }
 
+  /* fgWcWtpSessionRadioOperatingPower is documented as dBm but FortiOS is
+     observed to report its own 0-100 tx-power level in it — a FortiAP
+     reporting "51" is reporting a level, since 51 dBm would be ~126 W. The
+     server decides which reading applies per controller (see api._power_unit)
+     and says so here, rather than stamping "dBm" on a number that isn't. */
+  function powerText(value, unit) {
+    if (value == null) return '—';
+    return unit === 'percent' ? `${value}% level` : `${value} dBm`;
+  }
+
   /* Every column the controller's own SNMP tables can fill, whether or not
      it is currently shown. `on` is the default set — the columns this page
      shipped with — and an admin's choice (Settings → Columns) overrides it
@@ -86,14 +96,15 @@
     { key: 'station_count', label: 'Clients', width: 70, numeric: true, on: true },
     { key: 'model', label: 'Model', width: 120, on: true },
     { key: 'mac_address', label: 'MAC address', width: 140, on: true },
-    { key: 'tx_power_dbm', label: 'Tx power', width: 90, numeric: true, on: true,
-      cell: (r) => (r.tx_power_dbm != null ? `${r.tx_power_dbm} dBm` : '—') },
+    { key: 'tx_power_dbm', label: 'Tx power', width: 100, numeric: true, on: true,
+      cell: (r) => powerText(r.tx_power_dbm, r.power_unit) },
     { key: 'controller_id', label: 'Controller', width: 140,
       cell: (r) => escape(controllerName(r.controller_id)),
       value: (r) => controllerName(r.controller_id).toLowerCase() },
     { key: 'vdom', label: 'VDOM', width: 100 },
     { key: 'wtp_id', label: 'WTP id', width: 150 },
     { key: 'radio_count', label: 'Radios', width: 70, numeric: true },
+    { key: 'radio_modes', label: 'Radio modes', width: 150 },
     { key: 'channels', label: 'Channels', width: 110 },
     { key: 'radio_station_count', label: 'Radio clients', width: 100, numeric: true },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true, align: 'left',
@@ -187,10 +198,21 @@
       '', `radios (${row.radios.length})`, '-'.repeat(40),
     ];
     for (const radio of row.radios) {
+      const raw = radio.operating_power_dbm;
       lines.push(`radio ${radio.radio_id}`,
+        `  mode         ${radio.mode || '—'}`,
         `  channel      ${radio.channel ?? '—'}`,
-        `  tx power     ${radio.operating_power_dbm != null ? `${radio.operating_power_dbm} dBm` : '—'}`,
+        // Both the reading and the number it was read from, so an operator
+        // can check the guess against the controller's own display.
+        `  tx power     ${powerText(raw, row.power_unit)}` +
+          (raw != null ? `  (raw ${raw})` : ''),
         `  clients      ${radio.station_count ?? '—'}`, '');
+    }
+    if (row.radios.some((radio) => radio.mode === 'monitor'
+                                || radio.mode === 'sniffer')) {
+      lines.push('A monitor or sniffer radio scans rather than serving',
+                 'clients, so its power and client count describe a',
+                 'receiver and are not comparable to an AP radio.', '');
     }
     App.el('wl-detail').textContent = lines.join('\n');
   }
@@ -327,6 +349,21 @@
           polls is removed from the list and raises an alert — unless it has been
           marked out of service, which exempts it from both.</p>
       </fieldset>
+      <fieldset><legend>RADIO TX POWER</legend>
+        <label>Read fgWcWtpSessionRadioOperatingPower as
+          <select id="wl-power-unit">
+            <option value="auto" ${s.radio_power_unit !== 'dbm' && s.radio_power_unit !== 'percent' ? 'selected' : ''}>Auto-detect</option>
+            <option value="dbm" ${s.radio_power_unit === 'dbm' ? 'selected' : ''}>dBm</option>
+            <option value="percent" ${s.radio_power_unit === 'percent' ? 'selected' : ''}>Power level (0–100%)</option>
+          </select></label>
+        <p class="hint">Fortinet's MIB documents this column as dBm, but FortiOS is
+          observed to report its own 0–100 tx-power level in it instead — which is why
+          a FortiAP can show 51, a value that as dBm would be about 126 W and is not
+          physically possible (a FortiAP's conducted output tops out near 20 dBm).
+          Auto-detect treats a controller's whole column as a percentage as soon as any
+          radio reports above 30 dBm. The raw number is always shown in the AP detail
+          pane either way.</p>
+      </fieldset>
       <fieldset><legend>COLUMNS</legend>
         ${columnBoxes}
         <p class="hint">Which of the controller's SNMP-reported fields the access
@@ -337,6 +374,7 @@
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
+          radio_power_unit: m.querySelector('#wl-power-unit').value,
           table_columns: [...m.querySelectorAll('[data-column]')]
             .filter((cb) => cb.checked).map((cb) => cb.dataset.column).join(','),
         } });

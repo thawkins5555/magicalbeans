@@ -168,6 +168,36 @@ and records a `poll_overrun` device event rather than queuing a second
 concurrent poll of the same device) are all copied from `Monitor`'s own
 algorithm.
 
+**Ping probing and the down rule.** Every device with `ping_enabled` is
+pinged as well as polled, via `ipam_scan.ping_many(ip, count,
+timeout_ms)`. That sends `count` probes one subprocess at a time rather
+than one `ping -c N`: Windows and the BSDs disagree both on how to ask
+for a burst and on how they summarise one, and a single probe per process
+is the only form already known to work everywhere here. RTT is parsed out
+of ping's own `time=` output using `tracer.py`'s existing
+`_UNIX_PING_TIME`/`_WIN_PING_TIME` regexes, **not** measured as
+wall-clock around the subprocess — the old single-ping path did that and
+counted process spawn as network latency, reporting a sub-millisecond LAN
+device at tens of milliseconds. Loss and RTT are written through the
+ordinary `record_metric_sample()` sink as `ping_loss_pct` and
+`ping_rtt_ms`, which is what finally gives the shipped
+`response_time_high` rule a metric to read and lets `packet_loss_high`
+exist at all. `ping_interval_s` (0 = every poll) decouples probing from
+the poll cadence via a `_last_ping` map; on a skipped tick the device's
+*previous* `ping_ok` stands, because "not probed" must never read as
+"probe failed".
+
+Reachability: with SNMP disabled, ping alone decides (unchanged, a
+first-class configuration); with ping disabled, SNMP alone decides; with
+both enabled, `reachable = snmp_ok or (unreachable_ping_only and
+ping_ok)`. That flag now defaults to **True** — a device answering ICMP
+with a broken community string is reachable and misconfigured, and
+calling it down buries the SNMP error under an outage that is not
+happening. It is resolved through `effective_config()` like every other
+override, so a device or profile can restore the old behaviour;
+`consecutive_fail`/`down_after_failures` are untouched, since they
+already key off `reachable` rather than the status label.
+
 `EngineCache` holds one `(engine_id, boots, engine_time, learned_at)`
 tuple per device needing v3, kept for the process lifetime — engine
 parameters only need refreshing if the target actually reboots or its
@@ -599,9 +629,23 @@ with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
 
 Not a MIB compiler, the same framing `trapoids.py` uses for its own OID
 name table. The whole strategy is one regex anchored on the literal
-`::=` token: `_OBJECT_TYPE_RE`/`_OBJECT_ID_RE`/`_NOTIFICATION_RE` find
-`NAME (OBJECT-TYPE|OBJECT IDENTIFIER|NOTIFICATION-TYPE) ... ::= { ... }`
+`::=` token: `_OBJECT_TYPE_RE`/`_OBJECT_ID_RE`/`_MODULE_IDENTITY_RE`/
+`_NOTIFICATION_RE` find `NAME (OBJECT-TYPE|OBJECT IDENTIFIER|
+MODULE-IDENTITY|OBJECT-IDENTITY|NOTIFICATION-TYPE) ... ::= { ... }`
 without needing to parse anything about the macro body in between.
+`MODULE-IDENTITY` matters more than it looks: nearly every RFC MIB names
+its own root that way (`dot1dBridge MODULE-IDENTITY ... ::= { mib-2 17 }`)
+and hangs the entire module beneath it, so without it BRIDGE-MIB,
+LLDP-MIB, ENTITY-MIB, P/Q-BRIDGE-MIB and POWER-ETHERNET-MIB parsed to a
+list of objects not one of which could resolve. The conformance macros
+(`OBJECT-GROUP`, `NOTIFICATION-GROUP`, `MODULE-COMPLIANCE`) are still
+ignored deliberately — they are agent-capability paperwork, nothing hangs
+off them, and parsing them would roughly double `mib_objects` for no
+polling value. The `IMPORTS` block is blanked (same length, newlines
+preserved, so every later offset still lines up) once its symbols have
+been recorded, because an import list names macros as bare symbols —
+`IMPORTS MODULE-IDENTITY, OBJECT-TYPE ... FROM SNMPv2-SMI` reads to a
+regex exactly like a definition whose name is `IMPORTS`.
 `_strip_comments_and_strings()` masks `-- comments` and `"quoted
 strings"` with spaces of the *same length*, preserving every other
 byte's offset — the structural regexes run against this masked text (so
@@ -637,15 +681,73 @@ store sequence `post_nodes_mib` runs, as module-level functions taking a
 upload go through provably identical code — same review UI afterward,
 same re-resolve behavior, same admin-edit-survives-re-resolve guarantee.
 
+`resolve_all()` is what makes upload order stop mattering. `resolve()`
+reaches a fixpoint *within one file*; what it cannot see is a parent
+defined in a file parsed later. `resolve_all()` re-parses every stored
+MIB that kept its `content`, then walks the whole set repeatedly, feeding
+each pass's newly-resolved names into the next, until a pass gains
+nothing (capped at `max_passes`, 8). Only files whose name→oid map
+actually changed are written back, so calling it when everything already
+resolves is a read-only no-op rather than a rewrite of every row. It runs
+after a zip upload, after a catalog install, after bundled-MIB seeding,
+and behind the **Resolve all** button. In practice the bundled IETF set
+needs three passes and finishes at 100% resolved.
+
+### MIB catalog (`mibcatalog.py`)
+
+A static list of `Bundle(key, vendor, name, description, source, files)`
+where `files` is `[(filename, url)]`. Static because the catalog has to
+be browsable on a server with no outbound access — `GET
+/api/nodes/mib-catalog` never touches the network, it only annotates each
+bundle with how many of its filenames are already in `mib_files`. Nothing
+is mirrored into this repository: the URLs point at Cisco's own
+`cisco-mibs` repository and at LibreNMS's aggregated vendor tree, and are
+fetched only when an operator presses Install.
+
+`POST /api/nodes/mib-catalog/{key}/install` starts one background thread
+holding an `InstallJob` the UI polls at `/status`, shaped like the
+discovery jobs in `nodediscover.py` — a plain object with single-assignment
+fields, no locking beyond the GIL, because only the worker writes and only
+the API reads. One install at a time by design: two racing installs would
+interleave their fixpoint resolves over the same tables for no benefit.
+Each file is capped at `max_mib_bytes` and the bundle as a whole at
+`max_mib_bundle_bytes`; a filename already present is skipped rather than
+loaded twice, since a second copy would define every name twice in
+`all_known_oids()` and would discard the operator's edits on the first.
+Every file is stored first and `resolve_all()` runs once at the end,
+which is what lets a bundle be installed as an unordered heap.
+`fetch_file()` reads one byte past the cap so an oversized file is refused
+rather than silently truncated into a MIB that parses to nonsense, and
+turns a `URLError` into a message naming outbound HTTPS and the
+upload-by-hand alternative — a server with no internet must get an
+explanation, not a traceback.
+
+`unpack_zip()` backs the zip branch of `post_nodes_mib`. It enforces the
+count and total-size caps against the archive's *declared* uncompressed
+sizes before reading anything, so a zip bomb is refused without being
+expanded, skips non-MIB members (vendors ship readmes and PDFs beside
+their MIBs, and refusing the whole archive over those would be useless),
+and flattens paths — a MIB's identity is its module name, not its folder.
+
+`server.py`'s dispatcher coerces a captured route group to `int` only when
+it is all digits; the catalog's `([\w-]+)` bundle key is the one route
+group that is a name rather than a row id.
+
 ### Bundled default MIBs (`netpath/mibs/`, `Service._seed_default_mibs`)
 
-Two hand-authored files ship under `netpath/mibs/`: `enterprise-roots.mib`
-(public IANA Private Enterprise Number arcs for ~20 common vendors,
-matching `trapoids.WELL_KNOWN`'s own number-to-name table) and
-`if-mib-core.mib` (an OBJECT-TYPE subset of RFC 2863's IF-MIB covering
-exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE` already poll). Both
-are original text describing public IANA/IETF facts, not copied vendor
-MIB material.
+Twenty files ship under `netpath/mibs/`, about 900 KB in total. Two are
+hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
+Number arcs for ~20 common vendors, matching `trapoids.WELL_KNOWN`'s own
+number-to-name table) and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
+2863's IF-MIB covering exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE`
+already poll — kept although the full IF-MIB now ships too, because a
+device may be pinned to it by `mib_file_id`). The other eighteen are the
+standard IETF modules verbatim: SNMPv2-SMI/TC/MIB, IANAifType-MIB,
+INET-ADDRESS-MIB, IF-MIB, IP-MIB, TCP-MIB, UDP-MIB, HOST-RESOURCES-MIB,
+UCD-SNMP-MIB, ENTITY-MIB, ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB,
+Q-BRIDGE-MIB, LLDP-MIB and POWER-ETHERNET-MIB. These are RFC text, freely
+redistributable, and no vendor-proprietary MIB is bundled — vendor MIBs
+are fetched on demand by the catalog above.
 
 `Service._seed_default_mibs()` runs once from `start()`, before
 `_snmp_settings_with_mibs()`. It cannot use "does a `mib_files` row with
@@ -658,9 +760,14 @@ in `nodes.db`) the first time it loads; each start checks a bundled
 file's name against that list, not against `mib_files()`, so "already
 seeded" and "deleted on purpose" are both skip conditions and neither is
 ever confused with "never seeded". Newly seeded names are merged into the
-setting and saved in the same pass, then `_snmp_settings_with_mibs()` is
-re-run so the bundled vendor names reach the SNMP Trap decoder on first
-start, exactly as any other upload would.
+setting and saved in the same pass, then `resolve_all()` runs over the
+whole set and `_snmp_settings_with_mibs()` is re-run so the bundled
+vendor names reach the SNMP Trap decoder on first start, exactly as any
+other upload would. The fixpoint pass is not optional here: the bundled
+set is a dependency graph (Q-BRIDGE-MIB hangs off P-BRIDGE-MIB,
+ENTITY-SENSOR-MIB off ENTITY-MIB), and although one sweep in filename
+order happens to work today, a file added later would otherwise land
+half-resolved with nothing to say so.
 
 ### Device status timeline (`nodesdb.device_status_segments`)
 
@@ -759,6 +866,29 @@ hit independently, and fixed the same way: an earlier version only
 incremented the streak once a breach had already been detected, which
 meant it could never actually reach `for_polls` and the alert could never
 fire.
+
+### DHCP scope thresholds (`alertengine._evaluate_dhcp_thresholds`)
+
+`_evaluate_thresholds` is hard-wired to Nodes in three ways: it iterates
+`nodes_db.devices()`, reads values out of the Nodes `metrics` table, and
+stamps `entity_kind="device"`. A DHCP scope is none of those, so
+`dhcp_scope_exhaustion` is a sibling evaluator and its own rule kind
+(`dhcp_threshold`) rather than a new metric key. Utilization is
+`(leases + reservations) / scope_size(start_ip, end_ip) * 100`, computed
+the same way `api.get_ipam_dhcp_scopes` computes it so the number in the
+alert is the number on screen; a scope whose range cannot be sized is
+skipped rather than reported as 0%, which would read as "plenty of room".
+Entity is `entity_kind="dhcp_scope"`, `entity_id="{server_id}:{scope_id}"`,
+and `_device_ip_for` resolves that to the DHCP server's address for
+`{{device_ip}}`.
+
+The streak is the subtle part. Everywhere else `for_polls` counts engine
+ticks, which are Nodes polls in all but name; DHCP is polled every 15
+minutes while the engine ticks every `TICK_S` (5 s), so counting ticks
+would make `for_polls=3` mean 15 seconds. `_dhcp_streaks` therefore holds
+`(last polled_ts, streak)` and only advances the streak when the scope's
+`polled_ts` actually moves — so `for_polls` means DHCP polls, which is
+what an operator reading the label assumes.
 
 ### Syslog severity matching (`alertrules.py`, `alertengine.py`)
 
@@ -1070,6 +1200,21 @@ carries `hostname_known` separately from `hostname`, so the UI can print
 `resolving…` for "not looked up yet" and `no PTR record` for "looked up,
 found nothing" — collapsing those into a single `None` would make them
 indistinguishable.
+
+**Hop aging** (`stale_after_s` / `window_end`) drops a `(ttl, ip)` pair
+that stopped appearing. `hops` has no timestamp of its own, but
+`db.hop_rows_between()` already selects `t.started_ts` on every row, so
+`PathNode.last_seen`/`PathEdge.last_seen` are derived from the trace join
+with no schema change. The cutoff is `window_end - stale_after_s`, where
+`window_end` is the `t1` of the window the rows came from — **not**
+wall-clock now. That distinction is the whole point: aging against the
+clock would empty the graph the moment anyone panned the timeline back
+past the cutoff, which is exactly when the old path is what they want to
+see. An edge is dropped whenever either endpoint was, so no edge is ever
+left pointing at a hop that is no longer drawn. `api.get_topology` passes
+`topology_stale_hours` (NetPath settings, default 24, 0 disables) only on
+the windowed branch; the pinned-snapshot branch deliberately never ages,
+since one trace is one instant and every hop in it was seen at it.
 
 **Silent-hop collapsing** (`Topology.silent_runs()`) walks TTLs in order
 and finds maximal runs where every TTL in the run has exactly one node,
@@ -1882,8 +2027,33 @@ and `nodeoids.py` already use for other fixed, known vendor tables (see
 Nodes above). Three tables under `fgWc` (`1.3.6.1.4.1.12356.101.14`),
 all indexed by `(fgVdEntIndex, WtpId[, RadioId])`: `fgWcWtpConfigTable`
 (the AP's configured name), `fgWcWtpSessionTable` (live status/MAC/
-model/client count) and `fgWcWtpSessionRadioTable` (per-radio channel/tx
-power/client count, one additional `RadioId` index arc). `WtpId` is a
+model/client count) and `fgWcWtpSessionRadioTable` (per-radio mode/
+channel/tx power/client count, one additional `RadioId` index arc).
+
+**The tx-power unit is a decision, not a constant.**
+`fgWcWtpSessionRadioOperatingPower` (column 8) has the DESCRIPTION
+"Represents the current operating power of this radio, in dBm." Observed
+FortiOS does not honour that: a FAP-231F reports values like 51, and
+51 dBm is ~126 W EIRP, about a thousand times a FortiAP's ~20 dBm
+conducted ceiling. It is reporting FortiOS's own 0–100 power *level*.
+`api._power_unit()` therefore decides per controller rather than
+hard-coding either reading: if any of that controller's radios reports
+above `fortinetoids.MAX_PLAUSIBLE_DBM` (30 dBm = 1 W, already above every
+indoor regulatory limit), the whole column is read as a percentage, since
+no radio in one chassis switches units. `wireless_settings
+["radio_power_unit"]` (`auto`/`dbm`/`percent`) forces it. The raw integer
+is always carried through to the AP detail pane so the guess is
+auditable, and the JSON field keeps its MIB name
+(`operating_power_dbm`) rather than being renamed to match a guess.
+
+**Radio mode** (`fgWcWtpSessionRadioMode`, column 3, `FgWcWtpRadioMode` =
+other/notExist/disabled/ap/monitor/sniffer) is walked and stored decoded
+in `radios.mode`, added by `wirelessdb._migrate()`. It is what explains a
+FAP-231F's puzzling third radio: it is a dedicated scanner, so its
+"power" describes a receiver. The radio loop keys off the union of every
+walked column rather than off the channel column alone — a monitor or
+disabled radio reports a mode but often no channel, and keying on channel
+dropped it from the list entirely. `WtpId` is a
 string-valued (OCTET STRING) table index, so its OID-suffix encoding is
 a length prefix followed by that many decimal char-code arcs —
 `fortipoll._split_vdom_wtp()` is the one place that decoding happens,
@@ -2127,10 +2297,43 @@ dismissed by accident — every other modal in the app ignores the second
 `button` argument and the lock entirely, so this was additive rather than
 a rewrite.
 
+`App.confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
+afterClose)` is the one confirmation shape, matching the eight
+hand-written confirms that already existed — Cancel first, the
+destructive verb as the primary button, a body naming the collateral
+damage. Because there is only one `#modal-box`, a confirm raised from
+inside another dialog *replaces* it; such callers pass `afterClose
+(confirmed)` to reopen their parent, and are told whether the action ran
+so they can reopen on cancel only rather than rebuilding from data the
+action just invalidated. The primary button disables itself for the
+duration so a slow delete cannot run twice.
+
+`closeModal()` dispatches a `modal-closed` window event. Anything a
+dialog starts and must stop — a refresh interval, a poll of an install
+job — hangs off that rather than off its own Close button, because
+Escape and a backdrop click close the modal without that button ever
+being pressed. The interface dialog additionally holds a monotonic token
+(`view.ifaceDialogSeq`) that every timer tick and every one-shot `.then`
+checks before touching the DOM: `App.modal` returns the same singleton
+box and each dialog rebuilds the same element ids inside it, so "is my
+chart still in the box?" cannot distinguish this dialog's chart from the
+next port's — only a token can. That, plus a request-id guard on the
+refresh and resolving metric ids from a fresh per-device fetch instead of
+the device pane's shared `view.metrics`, is what stopped one port's
+traffic being painted into another's.
+
 Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+Because a stored splitter width beats the shipped `data-grow` on every
+load, changing a shipped default is invisible to anyone who ever dragged
+that divider. `LAYOUT_VERSION` plus `LAYOUT_RESET_ON_UPGRADE` handles
+that: on load, if the stored version differs, the named splitters (and
+only those) are dropped from the stored layout and the version is
+recorded. Version 2 drops `alerts-main`, whose default moved from 60/40
+to 70/30. Every other splitter the user has tuned is left alone.
 
 **Which tab is active persists the same way** (`TAB_KEY =
 'sappiwhere.tab'`). `selectTab(name)` writes the tab name to

@@ -225,6 +225,45 @@
            `idle timeout ${values.session_idle_minutes}min`, 'var(--ok)');
   }
 
+  /* What each maintenance action actually destroys. Several of these are
+     not "prune old rows" despite the name — they delete the entire table,
+     so the wording has to say so plainly before anyone clicks through. */
+  const MAINTENANCE_WARNINGS = {
+    redns: ['Re-run reverse DNS',
+      'Discard every cached hostname and look them all up again?',
+      'Names will be blank until each lookup completes.'],
+    prune_traces: ['Delete old traces',
+      'Delete stored traceroutes older than the trace retention period?',
+      'Recent traces are kept. This cannot be undone.'],
+    prune_flows: ['Delete stored flows',
+      'Delete <b>every</b> stored NetFlow record?',
+      'This is not a prune of old rows — it empties the flow database entirely, '
+      + 'including today\'s. This cannot be undone.'],
+    prune_snmp: ['Delete stored traps',
+      'Delete <b>every</b> stored SNMP trap?',
+      'This empties the trap database entirely, not just old rows. This cannot be undone.'],
+    prune_syslog: ['Delete stored syslog',
+      'Delete <b>every</b> stored syslog message?',
+      'This empties the syslog database entirely, not just old rows. This cannot be undone.'],
+    prune_nodes: ['Delete stored samples',
+      'Delete <b>every</b> stored Nodes metric sample and device event?',
+      'All history behind the device charts and timelines goes with it. The devices '
+      + 'themselves stay. This cannot be undone.'],
+    prune_alerts: ['Delete resolved alerts',
+      'Delete every alert that has been resolved?',
+      'Open and acknowledged alerts are kept. This cannot be undone.'],
+    prune_configrx: ['Delete stored config backups',
+      'Delete <b>every</b> stored device configuration backup?',
+      'Every version of every device\'s config goes. This cannot be undone.'],
+  };
+
+  function confirmMaintenance(action) {
+    const [title, question, note] = MAINTENANCE_WARNINGS[action]
+      || ['Run maintenance', `Run "${escape(action)}"?`, 'This cannot be undone.'];
+    App.confirmDestructive(title, `<p>${question}</p><p class="hint">${note}</p>`,
+      'Continue', () => maintenance(action));
+  }
+
   async function maintenance(action) {
     status('Working…', 'var(--muted)');
     const payload = await App.post('/api/maintenance', { action });
@@ -389,7 +428,7 @@
     App.el('set-revert').onclick = load;
     App.el('update-now').onclick = checkForUpdate;
     for (const button of document.querySelectorAll('[data-maint]')) {
-      button.onclick = () => maintenance(button.dataset.maint);
+      button.onclick = () => confirmMaintenance(button.dataset.maint);
     }
     App.el('reset-layout').onclick = () => {
       App.resetLayout();

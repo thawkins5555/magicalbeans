@@ -133,6 +133,7 @@ class WirelessPoller:
             states = self._walk_column(controller, config, oids.WTP_SESSION_CONNECTION_STATE)
             models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL)
             stations = self._walk_column(controller, config, oids.WTP_SESSION_STATION_COUNT)
+            modes = self._walk_column(controller, config, oids.WTP_RADIO_MODE)
             channels = self._walk_column(controller, config, oids.WTP_RADIO_CHANNEL)
             powers = self._walk_column(controller, config, oids.WTP_RADIO_OPERATING_POWER)
             radio_stations = self._walk_column(controller, config, oids.WTP_RADIO_STATION_COUNT)
@@ -166,13 +167,23 @@ class WirelessPoller:
                 station_count=_as_int(stations.get(suffix)))
             radios = []
             prefix = suffix + "."
-            for radio_suffix, channel in channels.items():
+            # Keyed off the mode column rather than the channel column: a
+            # disabled or monitor-mode radio reports a mode but may report no
+            # channel at all, and dropping it entirely is what made a
+            # FAP-231F look like it had two radios when it has three.
+            radio_suffixes = sorted(
+                set(modes) | set(channels) | set(powers) | set(radio_stations))
+            for radio_suffix in radio_suffixes:
                 if not radio_suffix.startswith(prefix):
                     continue
                 radio_id = radio_suffix[len(prefix):]
+                channel = channels.get(radio_suffix)
+                mode_num = modes.get(radio_suffix)
                 radios.append({
                     "radio_id": radio_id,
                     "channel": str(channel) if channel is not None else None,
+                    "mode": oids.RADIO_MODE.get(
+                        int(mode_num) if mode_num is not None else -1, "other"),
                     "operating_power_dbm": _as_int(powers.get(radio_suffix)),
                     "station_count": _as_int(radio_stations.get(radio_suffix)),
                 })

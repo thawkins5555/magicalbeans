@@ -244,24 +244,26 @@
       `<label class="check"><input type="checkbox" id="sn-enabled" ${subnet.enabled ? 'checked' : ''}> Enabled</label>`,
       [
         { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove subnet', onClick: async () => {
-          await App.del(`/api/ipam/subnets/${subnet.id}`);
-          view.subnetId = null;
-          App.closeModal();
-          await loadSubnets();
+        { label: 'Remove subnet', onClick: () => {
+          App.confirmDestructive('Remove subnet',
+            `<p>Remove <b>${escape(subnet.cidr)}</b>?</p>` +
+            '<p class="hint">Every host record and scan history for this subnet ' +
+            'goes with it. This cannot be undone.</p>', 'Remove', async () => {
+              await App.del(`/api/ipam/subnets/${subnet.id}`);
+              view.subnetId = null;
+              await loadSubnets();
+            }, (confirmed) => { if (!confirmed) editSubnet(); });
         } },
-        { label: 'Clear stats', onClick: async (b) => {
-          try {
-            const result = await App.post(`/api/ipam/subnets/${subnet.id}/clear`, {});
-            b.querySelector('#sn-error').innerHTML =
-              `<span style="color:var(--ok)">Cleared ${result.hosts} host(s) and ` +
-              `${result.scans} scan record(s). The subnet itself is unchanged ` +
-              `and its conflict history is kept — the next scan starts fresh.</span>`;
-            await loadSubnets();
-          } catch (error) {
-            b.querySelector('#sn-error').innerHTML =
-              `<span class="err">${escape(error.message)}</span>`;
-          }
+        { label: 'Clear stats', onClick: () => {
+          App.confirmDestructive('Clear subnet stats',
+            `<p>Discard every host record and scan record for ` +
+            `<b>${escape(subnet.cidr)}</b>?</p>` +
+            '<p class="hint">The subnet itself and its conflict history are kept — ' +
+            'the next scan starts fresh. This cannot be undone.</p>',
+            'Clear', async () => {
+              await App.post(`/api/ipam/subnets/${subnet.id}/clear`, {});
+              await loadSubnets();
+            }, (confirmed) => { if (!confirmed) editSubnet(); });
         } },
         { label: 'Save', primary: true, onClick: async (b) => {
           await App.put(`/api/ipam/subnets/${subnet.id}`, {
@@ -486,18 +488,27 @@
       `<label class="check"><input type="checkbox" id="dh-enabled" ${server.enabled ? 'checked' : ''}> Enabled</label>`,
       [
         { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove server', onClick: async () => {
-          await App.del(`/api/ipam/dhcp/servers/${server.id}`);
-          view.dhcpServerId = null;
-          App.closeModal();
-          await loadDhcpServers();
+        { label: 'Remove server', onClick: () => {
+          App.confirmDestructive('Remove DHCP server',
+            `<p>Remove <b>${escape(server.label || server.address)}</b>?</p>` +
+            '<p class="hint">Its scopes, leases and usage history are deleted, and ' +
+            'its stored credential with them. This cannot be undone.</p>',
+            'Remove', async () => {
+              await App.del(`/api/ipam/dhcp/servers/${server.id}`);
+              view.dhcpServerId = null;
+              await loadDhcpServers();
+            }, (confirmed) => { if (!confirmed) editDhcpServer(); });
         } },
-        { label: 'Clear credential', onClick: async (b) => {
-          await App.del(`/api/ipam/dhcp/servers/${server.id}/credential`);
-          b.querySelector('#dh-username').value = '';
-          b.querySelector('#dh-password').value = '';
-          b.querySelector('#dh-error').innerHTML =
-            '<span style="color:var(--ok)">Stored credential cleared.</span>';
+        { label: 'Clear credential', onClick: () => {
+          App.confirmDestructive('Clear credential',
+            `<p>Clear the stored credential for ` +
+            `<b>${escape(server.label || server.address)}</b>?</p>` +
+            '<p class="hint">Polling falls back to the service account the app ' +
+            'runs as. The stored password cannot be recovered.</p>',
+            'Clear', async () => {
+              await App.del(`/api/ipam/dhcp/servers/${server.id}/credential`);
+              await loadDhcpServers();
+            }, (confirmed) => { if (!confirmed) editDhcpServer(); });
         } },
         { label: 'Test connection', onClick: async (b, button) => {
           const fields = readDhcpForm(b);

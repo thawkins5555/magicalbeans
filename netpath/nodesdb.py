@@ -262,12 +262,32 @@ DEFAULTS = {
     "default_snmp_timeout_s": 3.0,
     "default_snmp_retries": 2,
     "down_after_failures": 3,        # consecutive poll failures before status -> down
-    "unreachable_ping_only": False,  # if true, ping alone can mark a device up even with snmp_ok false
+    # A device is DOWN only when ping AND SNMP both fail. Defaults to True
+    # since 4.25: a switch answering ICMP with a broken community string is
+    # reachable and misconfigured, not down, and calling it down buries the
+    # SNMP error under an outage. Overridable per device and per profile for
+    # the case where SNMP failing genuinely is an outage.
+    "unreachable_ping_only": True,
+    # Ping probing, used both for reachability and for the packet-loss
+    # metric. ping_count > 1 is what makes loss measurable at all: one probe
+    # can only ever say 0% or 100%.
+    "ping_count": 3,
+    "ping_timeout_ms": 1000,
+    # Seconds between ping probes; 0 pings on every SNMP poll. Raise it to
+    # keep loss sampling steady on a device polled rarely, or to ping less
+    # often than a fast focus poll would.
+    "ping_interval_s": 0,
     "sample_retention_days": 400,    # raw samples; hourly rollups are never pruned by age
     "sample_row_cap_per_metric": 50_000,
     "event_retention_days": 180,
     "discovery_retention_days": 30,
     "max_mib_bytes": 8 * 1024 * 1024,
+    # Installing a MIB bundle from the catalog. The per-file cap is
+    # max_mib_bytes above; these bound the rest of the operation so a bad
+    # upstream cannot fill the disk or hang a worker thread indefinitely.
+    "mib_download_timeout_s": 30.0,
+    "max_mib_zip_files": 400,
+    "max_mib_bundle_bytes": 64 * 1024 * 1024,
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
     "rollup_enabled": True,
@@ -281,12 +301,14 @@ DEFAULTS = {
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
-                     "mib_file_id")
+                     "mib_file_id", "ping_count", "ping_timeout_ms",
+                     "unreachable_ping_only")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
-                   "mib_file_id")
+                   "mib_file_id", "ping_count", "ping_timeout_ms",
+                   "unreachable_ping_only")
 
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
                     "enabled") + _OVERRIDE_COLUMNS
@@ -333,6 +355,12 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN mib_file_id INTEGER"
                 " REFERENCES mib_files(id) ON DELETE SET NULL")
+        # Per-device ping tuning and down-logic override, all nullable so
+        # NULL keeps meaning "inherit the profile, then the global setting".
+        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only"):
+            if column not in devices:
+                self._conn.execute(
+                    f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
         if "mib_covered" not in devices:
             # Last vendor-MIB coverage verdict for this device: NULL =
             # never evaluated (or not applicable), 0/1 = uncovered/covered.
@@ -354,6 +382,10 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE groups ADD COLUMN mib_file_id INTEGER"
                 " REFERENCES mib_files(id) ON DELETE SET NULL")
+        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only"):
+            if column not in groups:
+                self._conn.execute(
+                    f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
 
         interfaces = {row["name"] for row in
                       self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
@@ -788,6 +820,14 @@ class NodesDatabase:
             config["snmp_enabled"] = 1
         if config.get("oid_set") is None:
             config["oid_set"] = "auto"
+        settings = self.settings()
+        if config.get("ping_count") is None:
+            config["ping_count"] = settings.get("ping_count", 3)
+        if config.get("ping_timeout_ms") is None:
+            config["ping_timeout_ms"] = settings.get("ping_timeout_ms", 1000)
+        if config.get("unreachable_ping_only") is None:
+            config["unreachable_ping_only"] = \
+                1 if settings.get("unreachable_ping_only", True) else 0
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -983,8 +1023,20 @@ class NodesDatabase:
 
     def series(self, device_id: int, metric_id: int, t0: float, t1: float) -> list[dict]:
         """Raw-vs-hourly selection: a wide window reads the rollup table
-        instead of scanning months of raw points."""
+        instead of scanning months of raw points.
+
+        `device_id` is enforced, not decorative. Metric ids are global, so
+        without the join a caller passing another device's metric id got that
+        device's data back under this device's name — which is exactly what a
+        stale dialog does when the selected device changes underneath it. A
+        mismatch now returns nothing, which reads as "no samples" rather than
+        as somebody else's traffic.
+        """
         with self._lock:
+            if not self._conn.execute(
+                    "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
+                    (metric_id, device_id)).fetchone():
+                return []
             if (t1 - t0) <= 86400 * 3:
                 rows = self._conn.execute(
                     "SELECT ts, value FROM samples WHERE metric_id = ?"

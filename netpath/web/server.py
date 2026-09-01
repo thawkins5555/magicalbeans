@@ -156,6 +156,10 @@ ROUTES = [
     ("POST", r"^/api/nodes/collector$", api.post_nodes_collector, ("nodes", W)),
     ("GET", r"^/api/nodes/mibs$", api.get_nodes_mibs, ("nodes", R)),
     ("POST", r"^/api/nodes/mibs$", api.post_nodes_mib, ("nodes", W)),
+    ("POST", r"^/api/nodes/mibs/resolve-all$", api.post_nodes_mibs_resolve_all, ("nodes", W)),
+    ("GET", r"^/api/nodes/mib-catalog$", api.get_nodes_mib_catalog, ("nodes", R)),
+    ("GET", r"^/api/nodes/mib-catalog/status$", api.get_nodes_mib_catalog_status, ("nodes", R)),
+    ("POST", r"^/api/nodes/mib-catalog/([\w-]+)/install$", api.post_nodes_mib_catalog_install, ("nodes", W)),
     ("GET", r"^/api/nodes/mibs/(\d+)$", api.get_nodes_mib, ("nodes", R)),
     ("DELETE", r"^/api/nodes/mibs/(\d+)$", api.delete_nodes_mib, ("nodes", W)),
     ("POST", r"^/api/nodes/mibs/(\d+)/resolve$", api.post_nodes_mib_resolve, ("nodes", W)),
@@ -450,7 +454,11 @@ class Handler(BaseHTTPRequestHandler):
                     if not permissions.allows(granted, level):
                         self._json({"error": f"No {level} access to {module}"}, 403)
                         return
-                args = [int(group) for group in match.groups()]
+                # Every route but one captures a row id; the MIB catalog
+                # captures a bundle key, which is a name. Digits still
+                # arrive as ints so no handler signature changes.
+                args = [int(group) if group.isdigit() else group
+                        for group in match.groups()]
                 result = handler(self.service, params, body, *args)
 
                 headers = None

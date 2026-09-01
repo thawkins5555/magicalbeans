@@ -162,12 +162,23 @@ _BUILTIN_RULES = [
     ("if_out_discards_high", "Interface outbound discard rate high", "threshold", "if_out_discard_rate", 4, "threshold_breach", 10.0, 1.0, 2),
     ("disk_high", "Storage utilization high", "threshold", "disk_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("response_time_high", "Ping response time high", "threshold", "ping_rtt_ms", 5, "threshold_breach", 500.0, 300.0, 2),
+    # Live from 4.25, when the poller started sending several probes per
+    # poll and recording ping_loss_pct/ping_rtt_ms as real metrics; before
+    # that both this and response_time_high above had no metric to read.
+    ("packet_loss_high", "Packet loss to device high", "threshold", "ping_loss_pct", 4, "threshold_breach", 20.0, 5.0, 2),
     ("trap_critical", "Critical SNMP trap received", "trap", "", 2, "trap_forwarded", None, None, 1),
     ("trap_cold_start", "Device cold start trap", "trap", "coldStart", 4, "trap_forwarded", None, None, 1),
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
     ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "device_down", None, None, 1),
+    # DHCP scope utilization, as a percentage of the scope's address range
+    # that is leased or reserved. Its own kind rather than a "threshold"
+    # rule because the threshold evaluator reads Nodes' metrics table for a
+    # Nodes device; a scope is neither. for_polls counts DHCP polls (every
+    # 15 minutes by default), not engine ticks -- see
+    # alertengine._evaluate_dhcp_thresholds.
+    ("dhcp_scope_exhaustion", "DHCP scope running out of leases", "dhcp_threshold", "scope_utilization_pct", 3, "threshold_breach", 85.0, 75.0, 1),
 ]
 
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",

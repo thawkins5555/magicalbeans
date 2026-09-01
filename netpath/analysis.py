@@ -41,6 +41,10 @@ class PathNode:
     hostname_known: bool = False
     asn: int | None = None
     asn_org: str | None = None
+    # Newest trace this hop appeared in. Derived, not stored: `hops` has no
+    # timestamp of its own, but every row is joined to its trace's
+    # started_ts, so the graph can age a hop out without a schema change.
+    last_seen: float = 0.0
 
     @property
     def key(self) -> tuple[int, str | None]:
@@ -91,6 +95,7 @@ class PathEdge:
     src: tuple[int, str | None]
     dst: tuple[int, str | None]
     traces: int = 0
+    last_seen: float = 0.0
 
 
 @dataclass
@@ -131,20 +136,33 @@ class Topology:
 
 def build_topology(hop_rows, dest_ip: str | None = None,
                    hostnames: dict[str, str | None] | None = None,
-                   asn_data: dict[str, tuple[int | None, str | None]] | None = None
+                   asn_data: dict[str, tuple[int | None, str | None]] | None = None,
+                   stale_after_s: float = 0.0,
+                   window_end: float | None = None,
                    ) -> Topology:
     """Collapse many traces into one graph.
 
     A node is a (TTL, address) pair. Two nodes in the same TTL column means the
     path diverged: either between runs, or between probes within a single run.
+
+    `stale_after_s` drops hops that stopped appearing: a router that was
+    renumbered out of the path a month ago should not sit in the diagram
+    forever just because the window still reaches back far enough to include
+    one old trace. Staleness is measured from `window_end` (the end of the
+    window these rows came from) and not from wall-clock now, so panning the
+    timeline back a week still shows what the path looked like then instead of
+    an empty graph. With no `window_end` the newest trace in `hop_rows` stands
+    in for it. Zero disables the filter.
     """
     per_trace: dict[int, dict[int, set[str | None]]] = defaultdict(lambda: defaultdict(set))
+    trace_ts: dict[int, float] = {}
     rtts: dict[tuple[int, str | None], list[float]] = defaultdict(list)
     losses: dict[tuple[int, str | None], list[float]] = defaultdict(list)
 
     for row in hop_rows:
         key = (row["ttl"], row["ip"])
         per_trace[row["trace_id"]][row["ttl"]].add(row["ip"])
+        trace_ts[row["trace_id"]] = float(row["started_ts"])
         if row["rtt_ms"] is not None:
             rtts[key].append(float(row["rtt_ms"]))
         if row["loss_pct"] is not None:
@@ -153,28 +171,48 @@ def build_topology(hop_rows, dest_ip: str | None = None,
     node_counts: Counter = Counter()
     edge_counts: Counter = Counter()
     signatures: Counter = Counter()
+    node_seen: dict[tuple[int, str | None], float] = {}
+    edge_seen: dict[tuple[tuple[int, str | None], tuple[int, str | None]], float] = {}
 
-    for ttl_map in per_trace.values():
+    for trace_id, ttl_map in per_trace.items():
+        started = trace_ts.get(trace_id, 0.0)
         for ttl, ips in ttl_map.items():
             for ip in ips:
                 node_counts[(ttl, ip)] += 1
+                if started > node_seen.get((ttl, ip), 0.0):
+                    node_seen[(ttl, ip)] = started
         for ttl in ttl_map:
             if ttl + 1 not in ttl_map:
                 continue
             for src in ttl_map[ttl]:
                 for dst in ttl_map[ttl + 1]:
-                    edge_counts[((ttl, src), (ttl + 1, dst))] += 1
+                    edge = ((ttl, src), (ttl + 1, dst))
+                    edge_counts[edge] += 1
+                    if started > edge_seen.get(edge, 0.0):
+                        edge_seen[edge] = started
         sig = tuple(
             sorted(ttl_map[t])[0] if ttl_map[t] else None
             for t in sorted(ttl_map)
         )
         signatures[sig] += 1
 
+    # A hop is stale relative to the end of the window it was read from. When
+    # the caller did not say where that is, the newest trace present is the
+    # best available stand-in: it is the same value for a live window and it
+    # keeps a historical window self-consistent.
+    cutoff = 0.0
+    if stale_after_s > 0 and trace_ts:
+        end = window_end if window_end is not None else max(trace_ts.values())
+        cutoff = end - stale_after_s
+
     hostnames = hostnames or {}
     asn_data = asn_data or {}
     topo = Topology(total_traces=len(per_trace), distinct_paths=len(signatures))
     for key, count in node_counts.items():
         ttl, ip = key
+        seen = node_seen.get(key, 0.0)
+        if seen < cutoff:
+            continue
         asn, asn_org = asn_data.get(ip, (None, None))
         topo.nodes[key] = PathNode(
             ttl=ttl,
@@ -187,9 +225,15 @@ def build_topology(hop_rows, dest_ip: str | None = None,
             hostname_known=ip in hostnames,
             asn=asn,
             asn_org=asn_org,
+            last_seen=seen,
         )
     for (src, dst), count in edge_counts.items():
-        topo.edges.append(PathEdge(src=src, dst=dst, traces=count))
+        # An edge to a hop that aged out has nothing left to point at, so it
+        # goes with it even if the edge itself was seen recently.
+        if src not in topo.nodes or dst not in topo.nodes:
+            continue
+        topo.edges.append(PathEdge(src=src, dst=dst, traces=count,
+                                   last_seen=edge_seen.get((src, dst), 0.0)))
 
     columns: dict[int, list[PathNode]] = defaultdict(list)
     for node in topo.nodes.values():

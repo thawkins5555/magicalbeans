@@ -38,9 +38,32 @@ WTP_SESSION_MODEL = f"{WTP_SESSION_ENTRY}.12"       # DisplayString
 WTP_SESSION_STATION_COUNT = f"{WTP_SESSION_ENTRY}.17"      # Gauge32
 
 # fgWcWtpSessionRadioEntry (per-radio, indexed by an additional RadioId)
+WTP_RADIO_MODE = f"{WTP_SESSION_RADIO_ENTRY}.3"             # FgWcWtpRadioMode
 WTP_RADIO_CHANNEL = f"{WTP_SESSION_RADIO_ENTRY}.7"          # FgWcWtpRadioChannelNumber
-WTP_RADIO_OPERATING_POWER = f"{WTP_SESSION_RADIO_ENTRY}.8"  # Integer32, dBm
+# fgWcWtpSessionRadioOperatingPower. The MIB's DESCRIPTION reads, verbatim:
+# "Represents the current operating power of this radio, in dBm." Observed
+# FortiOS does not do that: a FAP-231F reports values like 51 here, and
+# 51 dBm is ~126 W EIRP, roughly a thousand times what any indoor AP can
+# emit (a FortiAP's conducted output tops out near 20 dBm). What it is
+# actually reporting is FortiOS's own 0-100 tx-power *level* percentage.
+# Hence the auto-detection in fortipoll.py rather than a blanket "dBm"
+# label: values above a plausible dBm ceiling are read as a percentage,
+# and the raw number is always shown so the guess can be checked.
+WTP_RADIO_OPERATING_POWER = f"{WTP_SESSION_RADIO_ENTRY}.8"  # Integer32
 WTP_RADIO_STATION_COUNT = f"{WTP_SESSION_RADIO_ENTRY}.9"    # Gauge32
+
+# The highest conducted output any Wi-Fi radio plausibly reports in dBm.
+# 30 dBm is 1 W, already above every regulatory domain's indoor limit, so a
+# value above it did not come from a dBm-reporting agent.
+MAX_PLAUSIBLE_DBM = 30
+
+# FgWcWtpRadioMode, quoted from the MIB's own TEXTUAL-CONVENTION. Worth
+# polling because it explains an otherwise baffling radio: a FAP-231F's
+# third radio is a dedicated scanner, so its "power" describes a receiver.
+RADIO_MODE = {
+    0: "other", 1: "not present", 2: "disabled", 3: "ap",
+    4: "monitor", 5: "sniffer",
+}
 
 CONNECTION_STATE = {
     0: "other", 1: "offline", 2: "online",

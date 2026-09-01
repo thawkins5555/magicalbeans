@@ -263,19 +263,32 @@
       .split(',').map((f) => f.trim()).filter(Boolean);
     // IP · status always leads and any SNMP error always trails; the
     // fields between them are the admin's Settings choice.
+    // Each field is a dim label plus a bright value rather than one flat
+    // dim string, so the identity line can actually be read at a glance
+    // and a failing device reads as failing. Every value is escaped —
+    // this is the only place in this header that emits markup.
+    const field = (label, value, cls = 'nd-v') => value
+      ? `<span class="nd-f"><span class="hint">${label}</span> ` +
+        `<span class="${cls}">${escape(value)}</span></span>`
+      : '';
     const optional = {
-      sys_descr: () => d.sys_descr || '',
-      sys_name: () => d.sys_name ? `sysName: ${d.sys_name}` : '',
-      sys_object_id: () => d.sys_object_id ? `sysObjectID: ${d.sys_object_id}` : '',
-      sys_contact: () => d.sys_contact ? `contact: ${d.sys_contact}` : '',
-      sys_location: () => d.sys_location ? `location: ${d.sys_location}` : '',
-      vendor: () => d.vendor ? `vendor: ${d.vendor}` : '',
-      snmp_version: () => `SNMP v${{0:'1',1:'2c',3:'3'}[d.effective_config.snmp_version] || d.effective_config.snmp_version}`,
+      sys_descr: () => field('descr', d.sys_descr),
+      sys_name: () => field('sysName', d.sys_name),
+      sys_object_id: () => field('sysObjectID', d.sys_object_id),
+      sys_contact: () => field('contact', d.sys_contact),
+      sys_location: () => field('location', d.sys_location),
+      vendor: () => field('vendor', d.vendor),
+      snmp_version: () => field('SNMP',
+        `v${{ 0: '1', 1: '2c', 3: '3' }[d.effective_config.snmp_version]
+            || d.effective_config.snmp_version}`),
     };
-    const lines = [`${d.ip} · ${d.status}`,
-      ...fields.map((f) => optional[f] ? optional[f]() : ''),
-      d.snmp_error ? `error: ${d.snmp_error}` : ''].filter(Boolean);
-    App.el('nd-d-summary').textContent = lines.join('  ·  ');
+    const parts = [
+      field('IP', d.ip),
+      field('status', d.status),
+      ...fields.map((f) => (optional[f] ? optional[f]() : '')),
+      field('error', d.snmp_error, 'nd-err'),
+    ].filter(Boolean);
+    App.el('nd-d-summary').innerHTML = parts.join('');
   }
 
   function timelineWindow() {
@@ -308,6 +321,28 @@
       if (value <= step * base) return step * base;
     }
     return 10 * base;
+  }
+
+  /* Centered moving average over raw {ts, value} points, for the
+     Smoothed checkbox — window scales with point count so a handful of
+     samples isn't over-smoothed and a few thousand isn't under-smoothed,
+     and shrinks at the edges rather than reaching past the data. Applied
+     only to raw series (see the caller); rollup avg/min/max points never
+     pass through here. */
+  function movingAverage(points) {
+    const n = points.length;
+    if (n < 3) return points;
+    const window = Math.max(3, Math.min(9, Math.round(n / 20)));
+    const half = Math.floor(window / 2);
+    return points.map((p, i) => {
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(n - 1, i + half);
+      let sum = 0, count = 0;
+      for (let j = lo; j <= hi; j += 1) {
+        if (points[j].value != null) { sum += points[j].value; count += 1; }
+      }
+      return { ts: p.ts, value: count ? sum / count : null };
+    });
   }
 
   /* Axis-label formatting by metric unit — the raw number a metric
@@ -344,7 +379,14 @@
     // (data.t0/t1) is still known, so the caller can keep zooming out of
     // an empty view instead of the wheel going dead — see below.
     if (!data) return null;
-    const seriesList = (data.series || []).map((s) => ({ ...s, points: s.points || [] }));
+    const seriesList = (data.series || []).map((s) => {
+      const points = s.points || [];
+      // Smoothing only makes sense on raw per-poll points — an hourly
+      // rollup's avg/min/max is already an aggregate, and averaging an
+      // average would misrepresent it rather than clarify it.
+      const isRaw = points.length && points[0].avg === undefined;
+      return { ...s, points: opts.smooth && isRaw ? movingAverage(points) : points };
+    });
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
       p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
@@ -523,8 +565,8 @@
     ].join('')}</table>`;
   }
 
-  function ifaceEventsHtml(ifIndex) {
-    const events = ((view.events || {}).interface_events || [])
+  function ifaceEventsHtml(ifIndex, payload) {
+    const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
     return `<div class="table-wrap" style="max-height:120px"><table>` +
@@ -533,60 +575,115 @@
       '</table></div>';
   }
 
+  function ifaceTitle(row, ifIndex) {
+    return `${escape(row.descr || `Interface ${ifIndex}`)}` +
+      (row.alias ? ` <span class="hint">${escape(row.alias)}</span>` : '');
+  }
+
   function interfaceDialog(iface) {
     const deviceId = view.selected;
     const ifIndex = iface.if_index;
-    const title = `${escape(iface.descr || `Interface ${ifIndex}`)}` +
-      (iface.alias ? ` <span class="hint">${escape(iface.alias)}</span>` : '');
-    const box = App.modal(title, `
+    // One ticket per opened dialog, checked by everything asynchronous this
+    // dialog starts: the 5s timer, the MAC read, the DOM read. App.modal
+    // reuses a single #modal-box and each dialog rebuilds the same element
+    // ids inside it, so "is my chart still in the box?" cannot tell this
+    // dialog's chart from the next port's — only a ticket can. Without it a
+    // superseded dialog's timer kept painting one port's traffic into
+    // another port's chart.
+    const token = (view.ifaceDialogSeq = (view.ifaceDialogSeq || 0) + 1);
+    const current = () => token === view.ifaceDialogSeq &&
+      !App.el('modal').hidden;
+
+    let smooth = true;
+    let lastChart = null;   // last data drawn, so the checkbox can redraw it
+
+    const box = App.modal(ifaceTitle(iface, ifIndex), `
       <p class="section">BANDWIDTH — LAST HOUR
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
-        <span style="color:var(--accent)">▬</span> out)</span></p>
+        <span style="color:var(--accent)">▬</span> out)</span>
+        <label class="check" style="float:right;font-weight:400">
+          <input type="checkbox" id="ifd-smooth" checked> Smoothed</label></p>
       <div id="ifd-chart" class="canvas chart" style="height:150px"><svg id="ifd-chart-svg"></svg></div>
       <p class="section">STATISTICS &amp; ERRORS</p>
       <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
       <p class="section">EVENTS</p>
-      ${ifaceEventsHtml(ifIndex)}
+      <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
       <p class="section">SHOW RUN</p>
       <p class="hint">Available once SSH integration is added.</p>
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`, [
-      { label: 'Close', primary: true, onClick: () => {
-        clearInterval(refreshTimer);
-        App.closeModal();
-      } },
+      { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
     box.classList.add('wide');
 
+    // Escape and a backdrop click close the modal without the Close button
+    // ever being pressed, so the timer hangs off the close event rather than
+    // off that button — otherwise every dismissed dialog left a timer running.
+    const stop = () => {
+      clearInterval(refreshTimer);
+      window.removeEventListener('modal-closed', onClosed);
+    };
+    const onClosed = () => stop();
+    window.addEventListener('modal-closed', onClosed);
+
+    function drawChart() {
+      const svg = box.querySelector('#ifd-chart-svg');
+      const wrap = box.querySelector('#ifd-chart');
+      if (!svg || !wrap || !lastChart) return;
+      drawSeriesChart(svg, wrap, lastChart, {
+        emptyText: 'No samples yet — they arrive with each poll',
+        smooth,
+      });
+    }
+
+    box.querySelector('#ifd-smooth').onchange = (event) => {
+      smooth = event.target.checked;
+      drawChart();
+    };
+
     async function refreshChartAndStats() {
-      // The dialog outlives modal reuse only while its own chart node is
-      // still in the box — any other dialog replacing it stops the timer.
-      if (App.el('modal').hidden || !box.querySelector('#ifd-chart-svg')) {
-        clearInterval(refreshTimer);
-        return;
-      }
+      if (!current()) { stop(); return; }
+      // A slow tick must not repaint over a newer one, the same way the
+      // status timeline guards its own range changes.
+      const requestId = (view.ifaceRequestId = (view.ifaceRequestId || 0) + 1);
+      // Metric ids are read fresh for THIS device rather than from
+      // view.metrics: loadDetail() replaces that wholesale on every refresh
+      // and can even switch the selected device underneath an open dialog,
+      // which is how this chart ended up requesting another device's series.
+      const [metrics, ifaces, events] = await Promise.all([
+        App.get(`/api/nodes/devices/${deviceId}/metrics`),
+        App.get(`/api/nodes/devices/${deviceId}/interfaces`),
+        App.get(`/api/nodes/devices/${deviceId}/events`),
+      ]);
+      if (!current() || requestId !== view.ifaceRequestId) return;
+      const list = metrics.metrics || [];
+      const inM = list.find((m) => m.key === `if_in_bps.${ifIndex}`);
+      const outM = list.find((m) => m.key === `if_out_bps.${ifIndex}`);
       const t1 = Date.now() / 1000;
       const t0 = t1 - 3600;
-      const inM = view.metrics.find((m) => m.key === `if_in_bps.${ifIndex}`);
-      const outM = view.metrics.find((m) => m.key === `if_out_bps.${ifIndex}`);
-      const [inS, outS, ifaces] = await Promise.all([
+      const [inS, outS] = await Promise.all([
         inM ? App.get(`/api/nodes/devices/${deviceId}/series`,
           { metric_id: inM.id, t0, t1 }) : null,
         outM ? App.get(`/api/nodes/devices/${deviceId}/series`,
           { metric_id: outM.id, t0, t1 }) : null,
-        App.get(`/api/nodes/devices/${deviceId}/interfaces`),
       ]);
-      const svg = box.querySelector('#ifd-chart-svg');
-      const wrap = box.querySelector('#ifd-chart');
-      if (!svg) { clearInterval(refreshTimer); return; }
-      drawSeriesChart(svg, wrap, { t0, t1, unit: 'bps', series: [
+      if (!current() || requestId !== view.ifaceRequestId) return;
+      lastChart = { t0, t1, unit: 'bps', series: [
         { label: 'in', color: 'var(--ok)', points: (inS && inS.points) || [] },
         { label: 'out', color: 'var(--accent)', points: (outS && outS.points) || [] },
-      ] }, { emptyText: 'No samples yet — they arrive with each poll' });
+      ] };
+      drawChart();
+      // The title, the stats and the events all come from the same fetch, so
+      // a renamed or newly-flapping port cannot show one section's truth
+      // beside another section's five-minute-old snapshot.
       const fresh = (ifaces.interfaces || []).find((r) => r.if_index === ifIndex);
-      if (fresh) box.querySelector('#ifd-stats').innerHTML = ifaceStatsHtml(fresh);
+      if (fresh) {
+        box.querySelector('h2').innerHTML = ifaceTitle(fresh, ifIndex);
+        box.querySelector('#ifd-stats').innerHTML = ifaceStatsHtml(fresh);
+      }
+      box.querySelector('#ifd-events').innerHTML = ifaceEventsHtml(ifIndex, events);
     }
 
     // Fast-poll focus (feature above) keeps new samples landing every few
@@ -598,7 +695,7 @@
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/dom`)
       .then((r) => {
         const dom = box.querySelector('#ifd-dom');
-        if (!dom) return;
+        if (!dom || !current()) return;
         if (!r.sensors || !r.sensors.length) {
           dom.innerHTML = '<p class="hint">No DOM/sensor data available from this device for this port.</p>';
           return;
@@ -610,13 +707,13 @@
       })
       .catch(() => {
         const dom = box.querySelector('#ifd-dom');
-        if (dom) dom.innerHTML = '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
+        if (dom && current()) dom.innerHTML = '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
       });
 
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`)
       .then((r) => {
         const mac = box.querySelector('#ifd-mac');
-        if (!mac) return;
+        if (!mac || !current()) return;
         if (!r.supported) {
           mac.innerHTML = '<p class="hint">No MAC address data available — this device does not answer BRIDGE-MIB requests.</p>';
           return;
@@ -630,7 +727,7 @@
       })
       .catch(() => {
         const mac = box.querySelector('#ifd-mac');
-        if (mac) mac.innerHTML = '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
+        if (mac && current()) mac.innerHTML = '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
       });
   }
 
@@ -698,6 +795,15 @@
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>
         <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>
+        <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="0"
+          placeholder="inherit" value="${d.ping_count ?? ''}"></label>
+        <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="0" step="100"
+          placeholder="inherit" value="${d.ping_timeout_ms ?? ''}"> ms</label>
+        <label>Down needs both ping and SNMP to fail <select id="nd-f-pingonly">
+          <option value="" ${d.unreachable_ping_only == null ? 'selected' : ''}>Inherit</option>
+          <option value="1" ${d.unreachable_ping_only === 1 ? 'selected' : ''}>Yes — SNMP failing alone is not down</option>
+          <option value="0" ${d.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
+        </select></label>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. Leave as
@@ -753,6 +859,10 @@
     // it at "(profile)" has to actually clear a previously-set override,
     // not just get skipped as "unspecified."
     overrides.mib_file_id = Number(box.querySelector('#nd-f-mib').value) || null;
+    // Blank is NULL ("inherit"), not 0 — 0 probes would mean never ping.
+    overrides.ping_count = blankToNull(box.querySelector('#nd-f-pingcount').value);
+    overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
+    overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
     return overrides;
   }
 
@@ -792,10 +902,15 @@
     const d = view.detail;
     const box = App.modal(`Edit ${displayName(d)}`, deviceForm(d), [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Clear credential', onClick: async () => {
-        await App.del(`/api/nodes/devices/${d.id}/credential`);
-        App.closeModal();
-        loadDetail();
+      { label: 'Clear credential', onClick: () => {
+        App.confirmDestructive('Clear credential',
+          `<p>Clear the SNMP credential stored on <b>${escape(displayName(d))}</b>?</p>` +
+          '<p class="hint">The device falls back to its profile\'s credentials on ' +
+          'the next poll. The stored password cannot be recovered.</p>',
+          'Clear', async () => {
+            await App.del(`/api/nodes/devices/${d.id}/credential`);
+            loadDetail();
+          }, (confirmed) => { if (!confirmed) editDevice(); });
       } },
       { label: 'Test', onClick: () => testDevice(box, d.id) },
       { label: 'Save', primary: true, onClick: async (box) => {
@@ -845,10 +960,18 @@
         await refreshDeviceGroupsList(box);
         App.refreshNow('nodes');
       };
-      tr.querySelector('.devgroup-remove').onclick = async () => {
-        await App.del(`/api/nodes/device-groups/${id}`);
-        await refreshDeviceGroupsList(box);
-        App.refreshNow('nodes');
+      tr.querySelector('.devgroup-remove').onclick = () => {
+        const name = tr.querySelector('.devgroup-name').value.trim();
+        // The confirm reuses the one modal box, so this list closes either
+        // way — manageDeviceGroups reopens it, as removing a wireless
+        // controller already reopens its own list.
+        App.confirmDestructive('Remove device group',
+          `<p>Remove <b>${escape(name)}</b>?</p>` +
+          '<p class="hint">Devices in this group are not deleted — they become ' +
+          'ungrouped.</p>', 'Remove', async () => {
+            await App.del(`/api/nodes/device-groups/${id}`);
+            App.refreshNow('nodes');
+          }, manageDeviceGroups);  // reopen either way: the list is refetched
       };
     }
   }
@@ -1001,9 +1124,17 @@
 
   function wireCredentialRemoveButtons(box, groupId) {
     for (const btn of box.querySelectorAll('.cred-remove')) {
-      btn.onclick = async () => {
-        await App.del(`/api/nodes/groups/${groupId}/credentials/${btn.dataset.credId}`);
-        await refreshCredentialsList(box, groupId);
+      btn.onclick = () => {
+        // Nested in the profile dialog, so reopen that on the way out —
+        // unsaved edits to the profile's own fields are lost, which is the
+        // same trade the wireless controller list already makes.
+        App.confirmDestructive('Remove credential',
+          '<p>Remove this stored SNMP credential from the profile?</p>' +
+          '<p class="hint">Devices in this profile stop trying it on their next ' +
+          'poll. Any device already using it falls back to the profile\'s other ' +
+          'credentials.</p>', 'Remove', async () => {
+            await App.del(`/api/nodes/groups/${groupId}/credentials/${btn.dataset.credId}`);
+          }, (confirmed) => { if (!confirmed) editProfile(); });
       };
     }
   }
@@ -1076,11 +1207,24 @@
         <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>
         <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>
       </div>
+      <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="0"
+        placeholder="inherit" value="${p.ping_count ?? ''}"></label>
+      <label>Ping timeout <input id="nd-p-pingtimeout" type="number" min="0" step="100"
+        placeholder="inherit" value="${p.ping_timeout_ms ?? ''}"> ms</label>
+      <label>Down needs both ping and SNMP to fail <select id="nd-p-pingonly">
+        <option value="" ${p.unreachable_ping_only == null ? 'selected' : ''}>Inherit the Nodes setting</option>
+        <option value="1" ${p.unreachable_ping_only === 1 ? 'selected' : ''}>Yes — SNMP failing alone is not down</option>
+        <option value="0" ${p.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
+      </select></label>
+      <p class="hint">Blank ping fields inherit the Nodes settings.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
       ${credentialsSectionHtml(p)}`;
   }
+
+  const blankToNull = (text) =>
+    (String(text).trim() === '' ? null : Number(text));
 
   function profileFields(box) {
     return {
@@ -1094,6 +1238,11 @@
       snmp_retries: Number(box.querySelector('#nd-p-retries').value),
       ping_enabled: box.querySelector('#nd-p-ping').checked,
       snmp_enabled: box.querySelector('#nd-p-snmp').checked,
+      // Blank means "inherit", which is NULL in the column, not 0 — a
+      // Number('') of 0 would read as "never ping".
+      ping_count: blankToNull(box.querySelector('#nd-p-pingcount').value),
+      ping_timeout_ms: blankToNull(box.querySelector('#nd-p-pingtimeout').value),
+      unreachable_ping_only: blankToNull(box.querySelector('#nd-p-pingonly').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
     };
   }
@@ -1197,15 +1346,25 @@
         `<td>${action}</td>`;
       tr.onclick = (e) => {
         if (e.target.classList.contains('cancel-disc')) {
-          // Cancels a running scan; removes a finished/cancelled one.
-          App.del(`/api/nodes/discovery/${job.id}`).then(() => {
-            if (view.discSelected === job.id && job.state !== 'running') {
+          // Cancels a running scan; removes a finished/cancelled one —
+          // only the second destroys anything, so only it needs a confirm.
+          const running = job.state === 'running';
+          const remove = () => App.del(`/api/nodes/discovery/${job.id}`).then(() => {
+            if (view.discSelected === job.id && !running) {
               view.discSelected = null;
               view.discResults = [];
               drawDiscResultsTable();
             }
             App.refreshNow('nodes');
           });
+          if (running) {
+            remove();
+          } else {
+            App.confirmDestructive('Remove scan',
+              `<p>Remove the scan of <b>${escape(job.target || '')}</b>?</p>` +
+              '<p class="hint">Its results are discarded. Devices already promoted ' +
+              'from it are not affected.</p>', 'Remove', remove);
+          }
           return;
         }
         view.discSelected = job.id;
@@ -1340,18 +1499,33 @@
       App.closeModal();
       App.refreshNow('nodes');
     };
-    const discard = async () => {
+    const discard = () => {
       // The job is no longer running, so DELETE removes it and its
-      // results outright rather than cancelling.
-      await App.del(`/api/nodes/discovery/${job.id}`).catch(() => {});
-      view.approvalOpenFor = null;
-      if (view.discSelected === job.id) {
-        view.discSelected = null;
-        view.discResults = [];
-        drawDiscResultsTable();
-      }
-      App.closeModal();
-      App.refreshNow('nodes');
+      // results outright rather than cancelling — every device it found
+      // and that nobody has approved yet goes with it, so confirm first.
+      // The confirm replaces this dialog; cancelling reopens it.
+      App.confirmDestructive('Discard scan',
+        `<p>Discard this scan and all <b>${found.length}</b> device(s) it found?</p>` +
+        '<p class="hint">Nothing found by this scan is added to Nodes. Devices you ' +
+        'already approved from an earlier scan are not affected.</p>',
+        'Discard', async () => {
+          await App.del(`/api/nodes/discovery/${job.id}`).catch(() => {});
+          view.approvalOpenFor = null;
+          if (view.discSelected === job.id) {
+            view.discSelected = null;
+            view.discResults = [];
+            drawDiscResultsTable();
+          }
+          App.refreshNow('nodes');
+        }, () => {
+          // Reopen only if the discard did not happen — its onConfirm
+          // clears approvalOpenFor, so a still-set value means "cancelled".
+          // maybeShowApproval bails while that flag is set, so clear it
+          // first and let it re-pick the same unreviewed job.
+          if (view.approvalOpenFor !== job.id) return;
+          view.approvalOpenFor = null;
+          maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
+        });
     };
     if (!found.length) {   // nothing to approve — don't pop an empty dialog
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -1430,18 +1604,142 @@
         await App.post(`/api/nodes/mibs/${f.id}/resolve`, {});
         App.refreshNow('nodes');
       };
-      tr.querySelector('.mib-remove').onclick = async () => {
-        await App.del(`/api/nodes/mibs/${f.id}`);
-        App.refreshNow('nodes');
+      tr.querySelector('.mib-remove').onclick = () => {
+        App.confirmDestructive('Remove MIB',
+          `<p>Remove <b>${escape(f.module || f.filename)}</b> and every object ` +
+          'parsed from it?</p>' +
+          '<p class="hint">Any device or profile polling this MIB stops collecting ' +
+          'its objects, and names it resolved elsewhere revert to raw OIDs. A ' +
+          'bundled MIB removed here is not re-added on the next restart.</p>',
+          'Remove', async () => {
+            await App.del(`/api/nodes/mibs/${f.id}`);
+            App.refreshNow('nodes');
+          });
       };
       body.appendChild(tr);
     }
     table.appendChild(body);
   }
 
+  /* --------------------------------------------------------- MIB catalog */
+
+  /* The bundles are static data on the server, so the list itself is
+     browsable with no internet access — only Install reaches out, and says
+     so plainly when it can't. One install runs at a time; the dialog polls
+     its progress and stops the moment it is closed. */
+  async function mibCatalog() {
+    const payload = await App.get('/api/nodes/mib-catalog');
+    const token = (view.catalogSeq = (view.catalogSeq || 0) + 1);
+    const current = () => token === view.catalogSeq && !App.el('modal').hidden;
+
+    const rows = payload.bundles.map((b) => `
+      <tr data-key="${escape(b.key)}">
+        <td><b>${escape(b.name)}</b><br><span class="hint">${escape(b.description)}</span>
+          <br><span class="hint">${b.file_count} file(s) · ${escape(b.source)}</span></td>
+        <td class="cat-state">${b.installed ? 'Installed'
+          : b.present ? `${b.present}/${b.file_count} present` : '—'}</td>
+        <td><button class="cat-install" data-done="${b.installed ? '1' : ''}"
+          ${b.installed ? 'disabled' : ''}>${
+          b.installed ? 'Complete' : b.present ? 'Finish' : 'Install'}</button></td>
+      </tr>`).join('');
+
+    const box = App.modal('MIB catalog', `
+      <p class="hint">Every MIB here is fetched from the vendor's or the
+        distribution's own public repository when you press Install — nothing is
+        mirrored by this app, and nothing is downloaded until you ask. Installing
+        a large bundle grows nodes.db by roughly the size of the MIB text.
+        A server with no outbound HTTPS will say so rather than hang; on a closed
+        network, download the files yourself and use Upload MIB, which accepts a
+        zip.</p>
+      <p id="nd-cat-status" class="hint"></p>
+      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table">
+        <thead><tr><th>Bundle</th><th>State</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`, [
+      { label: 'Close', primary: true, onClick: App.closeModal },
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+
+    const status = box.querySelector('#nd-cat-status');
+    let poll = null;
+    const stop = () => {
+      clearInterval(poll);
+      window.removeEventListener('modal-closed', stop);
+    };
+    window.addEventListener('modal-closed', stop);
+
+    function paint(job) {
+      if (!job) return;
+      const row = box.querySelector(`tr[data-key="${job.key}"]`);
+      if (job.state === 'running') {
+        status.textContent = `Installing ${job.key}: ${job.completed}/${job.total}` +
+          (job.current ? ` — ${job.current}` : '');
+        if (row) row.querySelector('.cat-state').textContent =
+          `${job.completed}/${job.total}`;
+        return;
+      }
+      stop();
+      if (job.state === 'error') {
+        status.innerHTML = `<span style="color:var(--fail)">${escape(job.error)}</span>`;
+      } else {
+        status.textContent = `${job.key}: ${job.installed.length} file(s) added, ` +
+          `${job.skipped.length} already present — ${job.resolved_count}/` +
+          `${job.object_count} object(s) resolved across every stored MIB.`;
+      }
+      if (row) {
+        row.querySelector('.cat-state').textContent =
+          job.state === 'error' ? 'Failed' : 'Installed';
+        const button = row.querySelector('.cat-install');
+        button.textContent = job.state === 'error' ? 'Retry' : 'Complete';
+        button.dataset.done = job.state === 'error' ? '' : '1';
+      }
+      // The whole list was disabled while one install ran, since only one
+      // runs at a time; releasing it here is what lets a second bundle be
+      // installed without closing and reopening the dialog.
+      for (const other of box.querySelectorAll('.cat-install')) {
+        other.disabled = other.dataset.done === '1';
+      }
+      App.refreshNow('nodes');
+    }
+
+    for (const button of box.querySelectorAll('.cat-install')) {
+      button.onclick = async () => {
+        const key = button.closest('tr').dataset.key;
+        for (const other of box.querySelectorAll('.cat-install')) other.disabled = true;
+        status.textContent = `Starting ${key}…`;
+        try {
+          paint((await App.post(`/api/nodes/mib-catalog/${key}/install`, {})).job);
+        } catch (error) {
+          status.innerHTML = `<span style="color:var(--fail)">${escape(error.message)}</span>`;
+          for (const other of box.querySelectorAll('.cat-install')) other.disabled = false;
+          return;
+        }
+        poll = setInterval(async () => {
+          if (!current()) { stop(); return; }
+          try {
+            paint((await App.get('/api/nodes/mib-catalog/status')).job);
+          } catch (error) { /* transient; the next tick retries */ }
+        }, 1000);
+      };
+    }
+    // An install started before this dialog was opened keeps reporting here.
+    if (payload.job && payload.job.state === 'running') {
+      paint(payload.job);
+      poll = setInterval(async () => {
+        if (!current()) { stop(); return; }
+        try {
+          paint((await App.get('/api/nodes/mib-catalog/status')).job);
+        } catch (error) { /* transient */ }
+      }, 1000);
+    }
+    return box;
+  }
+
   function uploadMib() {
     const box = App.modal('Upload MIB', `
-      <label>File <input type="file" id="nd-mib-file" accept=".mib,.my,.txt"></label>
+      <label>File <input type="file" id="nd-mib-file" accept=".mib,.my,.txt,.smi,.zip"></label>
+      <p class="hint">A zip of MIBs is accepted too: the whole archive is stored
+        first and resolved afterwards, so the order files appear in does not
+        matter.</p>
       <p id="nd-mib-status" class="hint"></p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Upload', primary: true, onClick: async (box) => {
@@ -1458,7 +1756,13 @@
           const content = btoa(binary);
           const result = await App.post('/api/nodes/mibs', { filename: file.name, content });
           App.closeModal();
-          App.modal('MIB uploaded', `<p>${escape(result.module || file.name)}: ` +
+          App.modal('MIB uploaded', result.zip
+            ? `<p>${result.loaded.length} MIB(s) imported from ${escape(file.name)}` +
+              (result.skipped.length ? `, ${result.skipped.length} already present` : '') +
+              `.</p><p class="hint">${result.resolved_count}/${result.object_count} ` +
+              `object(s) now resolved across every stored MIB, after ` +
+              `${result.passes} pass(es).</p>`
+            : `<p>${escape(result.module || file.name)}: ` +
             `${result.resolved_count}/${result.object_count} object(s) resolved.</p>` +
             (result.unresolved.length ? `<p class="hint">Unresolved parents: ${escape(result.unresolved.join(', '))} — upload the MIB that defines them, then hit Resolve.</p>` : ''), [
             { label: 'Close', primary: true, onClick: App.closeModal },
@@ -1502,7 +1806,21 @@
         ${number('np-timeout', 'Default SNMP timeout', s.default_snmp_timeout_s, 'min=0.5 step=0.5')} s
         ${number('np-retries', 'Default SNMP retries', s.default_snmp_retries, 'min=0')}
         ${number('np-downafter', 'Consecutive failures before "down"', s.down_after_failures, 'min=1')}
-        ${check('np-pingonly', 'Ping alone can mark a device up when SNMP fails', s.unreachable_ping_only)}
+        ${check('np-pingonly', 'A device is DOWN only when ping and SNMP both fail', s.unreachable_ping_only)}
+        <p class="hint">With this on (the default), a device that still answers ping
+          but whose SNMP is failing stays UP and shows its SNMP error, rather than
+          being reported as an outage it isn't having. Turn it off to treat SNMP
+          failing as down on its own. Overridable per device and per profile.</p>
+      </fieldset>
+      <fieldset><legend>PING</legend>
+        ${number('np-pingcount', 'Probes per ping', s.ping_count, 'min=1 max=20')}
+        ${number('np-pingtimeout', 'Ping timeout', s.ping_timeout_ms, 'min=100 step=100')} ms
+        ${number('np-pinginterval', 'Ping every (0 = with every poll)', s.ping_interval_s, 'min=0')} s
+        <p class="hint">Every SNMP-polled device is pinged as well, and the results
+          become the <code>ping_loss_pct</code> and <code>ping_rtt_ms</code> metrics
+          the packet-loss and response-time alert rules watch. More than one probe per
+          poll is what makes loss measurable at all — a single probe can only ever say
+          0% or 100%. Both are overridable per device and per profile.</p>
       </fieldset>
       <fieldset><legend>DISCOVERY</legend>
         <p class="hint">Every discovery sweep now uses a chosen polling
@@ -1531,6 +1849,9 @@
           default_snmp_timeout_s: num('#np-timeout'),
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
           unreachable_ping_only: on('#np-pingonly'),
+          ping_count: num('#np-pingcount'),
+          ping_timeout_ms: num('#np-pingtimeout'),
+          ping_interval_s: num('#np-pinginterval'),
           max_scan_addresses: num('#np-maxscan'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
@@ -1647,6 +1968,19 @@
     App.el('nd-remove-profile').onclick = removeProfile;
     App.el('nd-default-profile').onclick = setDefaultProfile;
     App.el('nd-upload-mib').onclick = uploadMib;
+    App.el('nd-mib-catalog').onclick = () => { mibCatalog().catch(() => {}); };
+    App.el('nd-resolve-all').onclick = async () => {
+      const result = await App.post('/api/nodes/mibs/resolve-all', {});
+      App.modal('Resolve all', `<p>${result.resolved_count}/${result.object_count} ` +
+        `object(s) resolved across ${result.files} stored MIB(s) after ` +
+        `${result.passes} pass(es); ${result.files_changed} file(s) changed.</p>` +
+        '<p class="hint">Every stored MIB is re-parsed and resolved against every ' +
+        'other, so a file uploaded before the one defining its parent branch ' +
+        'finishes resolving here.</p>', [
+        { label: 'Close', primary: true, onClick: App.closeModal },
+      ]);
+      App.refreshNow('nodes');
+    };
     App.el('nd-settings').onclick = settingsDialog;
     App.el('nd-toggle').onclick = async () => {
       const running = (App.state.serverState.nodes || {}).running;

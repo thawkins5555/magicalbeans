@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import nodeoids
 from .eventlog import ERROR, NODES, NullLog
-from .ipam_scan import ping_once
+from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
@@ -196,6 +196,9 @@ class NodePoller:
         self._queued: dict[int, float] = {}
         self._started: dict[int, float] = {}
         self._next_run: dict[int, float] = {}
+        # device_id -> when it was last pinged, so ping_interval_s can
+        # decouple ICMP probing from the SNMP poll cadence.
+        self._last_ping: dict[int, float] = {}
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
         self._last_completed: float = 0.0
@@ -467,14 +470,35 @@ class NodePoller:
         ip = device["ip"]
         now = time.time()
 
+        settings = self.db.settings()
         ping_ok = None
         ping_rtt_ms = None
+        ping_loss_pct = None
         if config.get("ping_enabled"):
-            timeout_ms = int(float(config.get("snmp_timeout_s", 3.0)) * 1000)
-            started = time.time()
-            ping_ok = ping_once(ip, timeout_ms=timeout_ms)
-            if ping_ok:
-                ping_rtt_ms = (time.time() - started) * 1000.0
+            # Several probes, not one: a single probe can only ever report
+            # 0% or 100% loss, which is no use for spotting a link that is
+            # up but dropping a fifth of its traffic. The timeout is its own
+            # setting rather than snmp_timeout_s borrowed — ICMP round trips
+            # and SNMP round trips have nothing to do with each other, and
+            # tying them meant raising an SNMP timeout silently slowed every
+            # ping.
+            interval = float(settings.get("ping_interval_s", 0) or 0)
+            due = (interval <= 0
+                   or (now - self._last_ping.get(device_id, 0.0)) >= interval)
+            if due:
+                self._last_ping[device_id] = now
+                sent, received, rtt = ping_many(
+                    ip, count=int(config.get("ping_count", 3) or 1),
+                    timeout_ms=int(config.get("ping_timeout_ms", 1000) or 1000))
+                ping_ok = received > 0
+                ping_rtt_ms = rtt
+                ping_loss_pct = 100.0 * (sent - received) / sent if sent else None
+            else:
+                # Not this device's turn to be pinged. The last known result
+                # still stands for reachability: skipping a probe must not
+                # read as a failed one.
+                previous_ok = device["ping_ok"]
+                ping_ok = None if previous_ok is None else bool(previous_ok)
 
         snmp_ok = None
         snmp_error = ""
@@ -511,7 +535,7 @@ class NodePoller:
 
         # -------------------------------------------------------- status
 
-        down_after = int(self.db.settings().get("down_after_failures", 3))
+        down_after = int(settings.get("down_after_failures", 3))
         if not config.get("snmp_enabled"):
             # A ping-only device by design (SNMP off entirely) is reachable
             # by ping alone, regardless of the "degrade gracefully when
@@ -519,8 +543,16 @@ class NodePoller:
             # device that normally has SNMP on, not one configured without
             # it. Ping-only is documented as a first-class configuration.
             reachable = bool(ping_ok)
+        elif not config.get("ping_enabled"):
+            # Nothing is pinging it, so SNMP is the only evidence there is.
+            reachable = bool(snmp_ok)
         else:
-            ping_only_ok = bool(self.db.settings().get("unreachable_ping_only", False))
+            # Both probes run, so DOWN means both failed. A device answering
+            # ICMP with a broken community string is reachable and
+            # misconfigured; reporting it down hides the SNMP error behind
+            # an outage that isn't happening. Per device and per profile,
+            # because occasionally SNMP failing really is the outage.
+            ping_only_ok = bool(config.get("unreachable_ping_only", True))
             reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
 
         if snmp_ok is False and snmp_error and "unsupported" in snmp_error.lower():
@@ -531,6 +563,17 @@ class NodePoller:
             status = "down"
         else:
             status = device["status"] if device["status"] in ("up", "down") else "unknown"
+
+        # Recorded before record_poll so a device that goes on to be marked
+        # down still leaves the loss sample that explains why.
+        if ping_loss_pct is not None:
+            self.db.record_metric_sample(
+                device_id, "ping_loss_pct", "Packet loss", "%", "gauge",
+                now, ping_loss_pct)
+        if ping_rtt_ms is not None:
+            self.db.record_metric_sample(
+                device_id, "ping_rtt_ms", "Ping response time", "ms", "gauge",
+                now, ping_rtt_ms)
 
         previous = self.db.record_poll(
             device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,

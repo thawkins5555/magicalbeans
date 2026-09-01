@@ -72,8 +72,30 @@ own subtabs.
   present) all come from the same poll.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
-  enabled — and can override any of it individually. One profile,
-  `Default`, always exists.
+  enabled, how many ping probes to send and how long to wait for them,
+  and whether SNMP failing on its own counts as down — and can override
+  any of it individually. One profile, `Default`, always exists.
+- **Every SNMP-polled device is pinged as well**, several probes per poll
+  rather than one, so packet loss to the device is measurable at all — a
+  single probe can only ever report 0% or 100%. Probe count (3 by
+  default), timeout (1000 ms) and how often to ping (with every poll, by
+  default) are set in Nodes settings and overridable per device and per
+  profile. The results are recorded as ordinary metrics,
+  `ping_loss_pct` and `ping_rtt_ms`, so they chart and so the built-in
+  "Packet loss to device high" and "Ping response time high" alert rules
+  have something to read. Round-trip time comes from ping's own reported
+  figure, not from timing the subprocess, which counted process startup
+  as network latency.
+- **A device is DOWN only when ping and SNMP have both failed.** A switch
+  that still answers ICMP but whose community string is wrong is
+  reachable and misconfigured, not down, and reporting it as an outage
+  hides the SNMP error that is the actual problem — so it stays UP with
+  its error displayed. A device with SNMP switched off entirely is
+  unaffected (ping alone has always decided there), as is one with ping
+  switched off (SNMP alone decides). If you would rather treat SNMP
+  failing as down on its own, the setting is in Nodes settings and can be
+  overridden per device and per profile. Either way, the "consecutive
+  failures before down" grace window is unchanged.
 - **The displayed name prefers the SNMP hostname** (`sysName`), falling
   back to the manually entered name, then the IP — so a discovered device
   names itself. Each device's Edit form has a "Displayed name" choice
@@ -190,23 +212,49 @@ own subtabs.
 
 ### Vendor MIBs
 
-- **A handful of MIBs ship with the app and load automatically on first
-  start** — an IF-MIB core subset covering the interface columns Nodes
-  already polls, and enterprise-number roots for around twenty common
-  vendors — through the exact same upload/parse path described below, so
-  they're indistinguishable from an upload afterward. A real vendor MIB
-  uploaded later resolves its parent enterprise arc immediately instead of
-  reporting it unresolved until a second file arrives. Deleting a bundled
-  MIB is respected; it does not come back on the next restart.
+- **The standard IETF MIBs ship with the app and load automatically on
+  first start** — the full IF-MIB, IP-MIB, TCP-MIB, UDP-MIB, ENTITY-MIB,
+  ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB, Q-BRIDGE-MIB, LLDP-MIB,
+  POWER-ETHERNET-MIB, HOST-RESOURCES-MIB, UCD-SNMP-MIB, SNMPv2-MIB and
+  the SMI/TC/IANA type modules they import — plus a hand-written IF-MIB
+  core subset kept from earlier releases and enterprise-number roots for
+  around twenty common vendors. They load through the exact same
+  upload/parse path described below, so they're indistinguishable from an
+  upload afterward, and a real vendor MIB uploaded later resolves its
+  parent enterprise arc immediately instead of reporting it unresolved
+  until a second file arrives. Deleting a bundled MIB is respected; it
+  does not come back on the next restart.
+- **A catalog of vendor MIB bundles installs on demand.** Nodes →
+  Profiles & MIBs → **MIB catalog** lists curated bundles for Cisco (IOS
+  and wireless), Fortinet, Juniper, Aruba (ArubaOS and CX), HP ProCurve,
+  Arista, MikroTik, Ubiquiti, Extreme, Dell, NETGEAR, SonicWall, APC,
+  Synology and VMware. The catalog itself is static data compiled into
+  the app, so the list is browsable with no internet access at all; only
+  pressing Install fetches anything, and it fetches from the vendor's or
+  the distribution's own public repository rather than from a copy held
+  here. A server with no outbound HTTPS gets a clear message saying so,
+  and the same files can be downloaded by hand and uploaded instead.
+  Installing a large bundle grows `nodes.db` by roughly the size of the
+  MIB text it holds. This is deliberately not "every MIB in existence":
+  the Cisco MIB repository alone is 2,921 files and around 350MB, which
+  would multiply this app's database size by two orders of magnitude to
+  supply the handful of MIBs an operator actually polls.
 - **Uploaded and parsed by a hand-rolled, stdlib-only best-effort
   reader** — not a MIB compiler, the same framing the SNMP Trap
   receiver's own OID name table already used. It finds every
-  `OBJECT-TYPE`/`OBJECT IDENTIFIER`/`NOTIFICATION-TYPE` clause and
-  resolves its OID against whatever this app already knows (its own
-  built-in roots, or a previously uploaded MIB's objects) — never by
-  fetching an imported module automatically. Uploading a dependent MIB
-  before the one defining its parent branch leaves it partially resolved
-  until the parent is uploaded and Resolve is run again.
+  `OBJECT-TYPE`/`OBJECT IDENTIFIER`/`MODULE-IDENTITY`/`OBJECT-IDENTITY`/
+  `NOTIFICATION-TYPE` clause and resolves its OID against whatever this
+  app already knows (its own built-in roots, or a previously uploaded
+  MIB's objects) — never by fetching an imported module automatically.
+- **A zip of MIBs can be uploaded whole, and upload order no longer
+  matters.** Every MIB member of the archive is stored first and resolved
+  afterwards, repeatedly, until a pass resolves nothing new — so a file
+  that arrives before the one defining its parent branch still ends up
+  fully resolved. The same pass runs after a catalog install, and on
+  demand behind a **Resolve all** button for MIBs uploaded one at a time.
+  Non-MIB members of an archive (readmes, PDFs) are skipped rather than
+  refused, and per-file and total size caps are enforced against the
+  archive's declared sizes before anything is expanded.
 - **Extracted objects can be reviewed and hand-corrected**; an
   admin-edited object survives a later re-resolve of the same file.
 - **Resolved names also flow into the SNMP Trap page** — a trap from a
@@ -262,7 +310,9 @@ location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
 
 Clicking a port in the interface list opens that port's own dialog: a
-live up/down bandwidth graph of the last hour, its statistics and
+live up/down bandwidth graph of the last hour with **Smoothed** on by
+default (a centred moving average, unticked to see the raw per-poll
+points), its statistics and
 error counters (cumulative and per-second), its link up/down event
 history, and DOM/SFP sensor readings — voltage, current, light levels,
 temperature — read live over SNMP from devices that expose them via the
@@ -299,14 +349,16 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **24 built-in rules** ship enabled: a device not responding, a device
+- **27 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
-  interval, an interface going down/up/flapping, ten CPU/memory/
-  interface-utilization/error-and-discard-rate/disk/ping-latency
-  thresholds, a critical or cold-start SNMP trap, a linkDown trap from a
-  device Nodes is not itself polling, a critical syslog line, and a new
-  IPAM address conflict.
+  interval, a device whose vendor MIB is missing, an interface going
+  down/up/flapping, eleven CPU/memory/interface-utilization/
+  error-and-discard-rate/disk/ping-latency/packet-loss thresholds, a
+  critical or cold-start SNMP trap, a linkDown trap from a device Nodes
+  is not itself polling, a critical syslog line, a new IPAM address
+  conflict, an access point removed from its controller, and a DHCP
+  scope running out of leases.
 - **A built-in rule can be edited** (severity, enabled, which devices it
   applies to by a substring filter, its threshold/clear-threshold/
   consecutive-polls-before-firing where relevant, which template it
@@ -323,6 +375,14 @@ alerts and optionally emailing about them.
   `clear_threshold`, plus a consecutive-polls-before-firing count, so a
   value oscillating right at the edge does not open and close the same
   alert every poll.
+- **"DHCP scope running out of leases" watches IPAM, not Nodes.** Its
+  utilization is leases plus reservations against the scope's own address
+  range — counted exactly the way the DHCP page counts them, so the
+  figure in the alert is the figure on screen — and it fires at 85% and
+  clears at 75% by default, both adjustable like any other threshold.
+  Its consecutive-polls count means DHCP polls: on the default
+  15-minute DHCP cycle, 3 means three quarters of an hour, not the 15
+  seconds three alert-engine ticks would take.
 - **Repeated occurrences increment one open alert** rather than opening a
   duplicate — enforced by the database itself (an alert's dedup key can
   only be open or acknowledged once at a time), not by application logic
@@ -394,6 +454,16 @@ traces it appeared in.
 - **ASN and owner**, when known, appear in a hop's tooltip beneath its name —
   `AS15169 (GOOGLE, US)` — so you can see which network a route is on and
   where it leaves your own provider.
+- **A hop that stops appearing drops out.** A router that left the path
+  weeks ago would otherwise sit in the diagram forever, since a wide
+  window still contains the old traces it appeared in. Anything unseen
+  for longer than the cutoff — 24 hours by default, set in NetPath
+  settings, 0 to disable — is dropped, along with any edge that pointed
+  at it. The cutoff is measured against the **end of the window being
+  displayed**, not against the clock, so panning the timeline back into
+  last month draws the path exactly as it stood then rather than emptying
+  the graph. A pinned point-in-time snapshot is never aged: one trace is
+  one instant, and every hop in it was seen at that instant.
 - **A hop with no PTR record shows its ASN's org name instead**, when one is
   known — `GOOGLE, US` in place of "no PTR record". Since ASNs are only ever
   looked up for public addresses, this only ever applies to external hops;
@@ -930,12 +1000,31 @@ reports on all of them in one SNMP walk.
 - **Per AP: status, name, client count, model, MAC address, and tx
   power** — the last shown per-radio, since a real AP has more than one
   (2.4/5/6 GHz). Selecting a row shows the full per-radio breakdown:
-  channel, tx power and client count for each.
+  mode, channel, tx power and client count for each.
+- **Radio mode is shown, which explains an odd extra radio.** A FortiAP
+  reports each radio as ap, monitor, sniffer, disabled or not present; a
+  monitor radio is a dedicated rogue-AP scanner, so its "power" and
+  client count describe a receiver and are not comparable to a serving
+  radio's. The detail pane says so when one is present, and mode is
+  available as a table column. A radio that reports a mode but no channel
+  (which is exactly what a monitor radio does) is listed rather than
+  dropped, so an AP shows all of its radios.
+- **Transmit power is labelled with the unit it is actually in.**
+  Fortinet's MIB documents `fgWcWtpSessionRadioOperatingPower` as dBm,
+  but FortiOS reports its own 0–100 power *level* in that object — which
+  is why an AP can report 51, a figure that as dBm would be about 126
+  watts, roughly a thousand times what a FortiAP can emit (its conducted
+  output tops out near 20 dBm). The reading is auto-detected per
+  controller: if any radio on it reports above 30 dBm, that controller's
+  whole column is read as a percentage. Settings → Radio tx power can
+  force dBm or percent instead, and the AP detail pane always shows the
+  raw number alongside, so the reading can be checked against the
+  controller's own display.
 - **Sort by any column** — click its heading, the same way every other
   table in the app sorts.
 - **Choose which columns to show** in Settings → Columns. The six above
-  are the defaults; Controller, VDOM, WTP id, Radios, Channels, Radio
-  clients and Last seen can be added. The list is the fields the
+  are the defaults; Controller, VDOM, WTP id, Radios, Radio modes,
+  Channels, Radio clients and Last seen can be added. The list is the fields the
   controller's own SNMP tables report, so adding one costs no extra
   polling.
 - **Polled on a fixed interval** (default 60 s) via repeated SNMP
@@ -1095,6 +1184,17 @@ is configured now and are never trimmed by a cap, only samples/events
 
 Nothing needs a restart: both thread pools resize live and the collector
 rebinds its socket.
+
+**Anything that destroys stored data asks first.** Every maintenance
+action here, the Debug page's log **Clear**, and every Remove/Clear/Reset
+across Nodes, IPAM and Alerts raises a confirmation naming what is about
+to be lost. The wording is specific where it matters: five of the
+maintenance actions empty a whole table rather than pruning old rows, and
+their dialogs say so rather than saying "prune". Alerts'
+**Acknowledge all** and bulk **Resolve** confirm too — they delete
+nothing, but neither can be undone one row at a time. Buttons that clear
+a filter or a selection, which destroy nothing, are deliberately left
+unconfirmed.
 
 ### Software update
 

@@ -349,11 +349,13 @@ def _topology_json(service, topo, refusal, target_id: int | None = None) -> dict
             "probe_rtt_min": stats["rtt_min"] if stats else None,
             "probe_rtt_avg": (stats["rtt_sum"] / answered) if stats and answered else None,
             "probe_rtt_max": stats["rtt_max"] if stats else None,
+            "last_seen": node.last_seen,
         })
     edges = [
         {"src": f"{e.src[0]}|{e.src[1] or ''}",
          "dst": f"{e.dst[0]}|{e.dst[1] or ''}",
-         "share": topo.share(e.traces)}
+         "share": topo.share(e.traces),
+         "last_seen": e.last_seen}
         for e in topo.edges
     ]
     return {
@@ -410,8 +412,15 @@ def get_topology(service, params, body) -> dict:
     ips = {r["ip"] for r in rows}
     names = service.app_db.hostnames(ips)
     asn_data = service.app_db.asn_info(ips)
+    # Aged against t1, the end of the window being drawn, so panning back into
+    # last month still shows the path as it stood then. The pinned-snapshot
+    # branch above deliberately skips this: one trace is one instant, and every
+    # hop in it was by definition seen at that instant.
+    stale_hours = float(service.settings.get("topology_stale_hours", 24.0) or 0)
     topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
-                          hostnames=names, asn_data=asn_data)
+                          hostnames=names, asn_data=asn_data,
+                          stale_after_s=max(stale_hours, 0.0) * 3600.0,
+                          window_end=t1)
 
     code = address = None
     for trace in reversed(service.db.traces_between(target_id, t0, t1)):
@@ -1479,6 +1488,8 @@ def _device_json(row) -> dict:
         "ping_enabled": _tri(row["ping_enabled"]),
         "snmp_enabled": _tri(row["snmp_enabled"]),
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
+        "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
+        "unreachable_ping_only": row["unreachable_ping_only"],
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
@@ -1502,6 +1513,8 @@ def _group_json(service, row) -> dict:
         "snmp_timeout_s": row["snmp_timeout_s"], "snmp_retries": row["snmp_retries"],
         "ping_enabled": bool(row["ping_enabled"]), "snmp_enabled": bool(row["snmp_enabled"]),
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
+        "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
+        "unreachable_ping_only": row["unreachable_ping_only"],
         "is_default": bool(row["is_default"]),
         "created_ts": row["created_ts"],
         # The profile's own snmp_version/community/v3_* above are its
@@ -1548,11 +1561,13 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_version", "community",
                          "v3_user", "v3_auth_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
-                         "snmp_enabled", "oid_set", "mib_file_id")
+                         "snmp_enabled", "oid_set", "mib_file_id",
+                         "ping_count", "ping_timeout_ms", "unreachable_ping_only")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
-                        "mib_file_id")
+                        "mib_file_id", "ping_count", "ping_timeout_ms",
+                        "unreachable_ping_only")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -2307,9 +2322,15 @@ def post_nodes_mib(service, params, body) -> dict:
     than multipart/form-data — server.py's body parser only accepts
     application/json for POST/PUT/DELETE, and touching that gate for one
     route is a bigger change than the ~33% base64 overhead is worth for a
-    file capped at a few MB (max_mib_bytes)."""
+    file capped at a few MB (max_mib_bytes).
+
+    A zip is accepted too, and is the point of the feature: a vendor ships
+    its MIBs as one archive whose members import each other in no particular
+    order, so the whole set is stored first and resolved to a fixpoint
+    afterwards. That makes upload order irrelevant, which is the single thing
+    that used to make importing a real vendor bundle painful."""
     import base64
-    from .. import mibparse
+    from .. import mibcatalog, mibparse
 
     filename = str(body.get("filename", "")).strip() or "uploaded.mib"
     content_b64 = body.get("content")
@@ -2320,6 +2341,35 @@ def post_nodes_mib(service, params, body) -> dict:
     except Exception:
         raise ValueError("content is not valid base64")
     max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+
+    if mibcatalog.looks_like_zip(raw):
+        members = mibcatalog.unpack_zip(
+            raw, int(service.nodes_settings.get("max_mib_zip_files", 400)),
+            max_bytes,
+            int(service.nodes_settings.get("max_mib_bundle_bytes",
+                                           64 * 1024 * 1024)))
+        existing = {row["filename"] for row in service.nodes_db.mib_files()}
+        loaded, skipped = [], []
+        for name, text in members:
+            if name in existing:
+                skipped.append(name)
+                continue
+            mibparse.load_into(service.nodes_db, name, text,
+                               _known_oids_for_resolve(service), max_bytes)
+            existing.add(name)
+            loaded.append(name)
+        summary = mibparse.resolve_all(service.nodes_db, max_bytes)
+        service._snmp_settings_with_mibs()
+        service.log.add(NODES_CATEGORY,
+                        f"Imported {len(loaded)} MIB(s) from {filename} "
+                        f"({len(skipped)} already present); "
+                        f"{summary['resolved_count']}/{summary['object_count']} "
+                        f"object(s) resolved overall")
+        return {"zip": True, "loaded": loaded, "skipped": skipped,
+                "object_count": summary["object_count"],
+                "resolved_count": summary["resolved_count"],
+                "passes": summary["passes"]}
+
     if len(raw) > max_bytes:
         raise ValueError(f"File exceeds the {max_bytes:,} byte limit")
     text = raw.decode("utf-8", "replace")
@@ -2331,6 +2381,51 @@ def post_nodes_mib(service, params, body) -> dict:
                     f"Uploaded MIB {filename} ({result['module'] or 'unknown module'}): "
                     f"{result['resolved_count']}/{result['object_count']} object(s) resolved")
     return result
+
+
+def post_nodes_mibs_resolve_all(service, params, body) -> dict:
+    """Re-resolve every stored MIB against every other, to a fixpoint —
+    the one button that fixes a list of files uploaded in the wrong order
+    without an admin having to guess which one to press Resolve on."""
+    from .. import mibparse
+
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    summary = mibparse.resolve_all(service.nodes_db, max_bytes)
+    service._snmp_settings_with_mibs()
+    service.log.add(NODES_CATEGORY,
+                    f"Re-resolved all MIBs: {summary['resolved_count']}/"
+                    f"{summary['object_count']} object(s) resolved across "
+                    f"{summary['files']} file(s)")
+    return summary
+
+
+def get_nodes_mib_catalog(service, params, body) -> dict:
+    """The static catalog plus which bundles are already fully present.
+
+    Reading this never touches the network, so the list is browsable on a
+    server with no outbound access — only installing reaches out."""
+    from .. import mibcatalog
+
+    have = {row["filename"] for row in service.nodes_db.mib_files()}
+    bundles = []
+    for bundle in mibcatalog.CATALOG:
+        present = sum(1 for filename, _ in bundle.files if filename in have)
+        bundles.append({
+            "key": bundle.key, "vendor": bundle.vendor, "name": bundle.name,
+            "description": bundle.description, "source": bundle.source,
+            "file_count": bundle.file_count, "present": present,
+            "installed": present == bundle.file_count,
+            "files": [filename for filename, _ in bundle.files],
+        })
+    return {"bundles": bundles, "job": service.mib_install_status()}
+
+
+def post_nodes_mib_catalog_install(service, params, body, key) -> dict:
+    return {"job": service.install_mib_bundle(str(key))}
+
+
+def get_nodes_mib_catalog_status(service, params, body) -> dict:
+    return {"job": service.mib_install_status()}
 
 
 def get_nodes_mib(service, params, body, mib_file_id) -> dict:
@@ -2535,8 +2630,9 @@ def post_alerts_rule(service, params, body) -> dict:
     source_kind = str(body.get("source_kind", "") or "")
     if not key or not name or not kind:
         raise ValueError("key, name and kind are all required")
-    if kind not in ("device_event", "interface_event", "threshold", "trap",
-                    "syslog", "ipam"):
+    if kind not in ("device_event", "interface_event", "threshold",
+                    "dhcp_threshold", "trap", "syslog", "ipam",
+                    "wireless_event"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
@@ -2753,11 +2849,36 @@ def _controller_json(row) -> dict:
 
 
 def _radio_json(row) -> dict:
+    keys = row.keys()
     return {
         "radio_id": row["radio_id"], "channel": row["channel"],
+        # Kept named for the MIB's own column, and always raw: whatever unit
+        # the reader decides on, the number the agent sent stays visible so
+        # the decision can be checked against the controller.
         "operating_power_dbm": row["operating_power_dbm"],
+        "mode": (row["mode"] if "mode" in keys else None) or "",
         "station_count": row["station_count"],
     }
+
+
+def _power_unit(service, powers) -> str:
+    """How to read fgWcWtpSessionRadioOperatingPower for one controller.
+
+    The MIB documents the column as dBm, but FortiOS is observed to put its
+    0-100 tx-power *level* there instead — which is why a FortiAP reports 51
+    for a radio that cannot physically exceed about 20 dBm. Rather than
+    hard-coding either reading, this looks at what the controller actually
+    returns: any value above a plausible dBm ceiling means the whole column
+    is a percentage, since no radio in the same chassis switches units.
+    Decided per controller, not per radio, so one AP cannot flip the label
+    on its neighbours.
+    """
+    from ..fortinetoids import MAX_PLAUSIBLE_DBM
+
+    configured = str(service.wireless_settings.get("radio_power_unit", "auto"))
+    if configured in ("dbm", "percent"):
+        return configured
+    return "percent" if any(p > MAX_PLAUSIBLE_DBM for p in powers) else "dbm"
 
 
 def _ap_json(service, row) -> dict:
@@ -2774,9 +2895,14 @@ def _ap_json(service, row) -> dict:
         "status": row["status"], "model": row["model"],
         "mac_address": row["mac_address"], "station_count": row["station_count"],
         "tx_power_dbm": max(powers) if powers else None,
+        # How to label that number — see _power_unit. A per-AP field rather
+        # than a global one so a site with a mix of controllers still gets
+        # each one's own reading.
+        "power_unit": _power_unit(service, powers),
         # Derived from the radio rows the poller already walks, so these
         # are selectable table columns without polling anything new.
         "radio_count": len(radios),
+        "radio_modes": ", ".join(r["mode"] for r in radios if r["mode"]),
         "channels": ", ".join(channels),
         "radio_station_count": sum(radio_stations) if radio_stations else None,
         "out_of_service": bool(row["out_of_service"]),

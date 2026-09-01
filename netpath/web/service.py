@@ -21,12 +21,12 @@ from ..collector import Collector
 from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
 from ..db import Database
-from ..eventlog import SYSTEM, EventLog
+from ..eventlog import NODES, SYSTEM, EventLog
 from ..flowdb import FlowDatabase
 from ..fortipoll import WirelessPoller
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
-from ..mibparse import known_oids_for, load_into
+from ..mibparse import known_oids_for, load_into, resolve_all
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
 from .. import permissions
@@ -69,6 +69,9 @@ class Service:
         self.ipam_settings = self.ipam_db.settings()
         self.snmp_settings = self.snmp_db.settings()
         self.nodes_settings = self.nodes_db.settings()
+        # The one in-flight MIB catalog install, if any (see
+        # install_mib_bundle); the UI polls its status.
+        self._mib_job = None
         self.alerts_settings = self.alerts_db.settings()
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
@@ -337,6 +340,89 @@ class Service:
         self.log.add(SYSTEM, "ConfigRX settings applied")
         return self.configrx_settings
 
+    # -------------------------------------------------------- MIB catalog
+
+    def mib_install_status(self) -> dict | None:
+        """The most recent bundle install, or None if none has been started.
+
+        One job at a time by design: two installs racing would interleave
+        their fixpoint resolves over the same tables for no benefit, and an
+        operator installing two bundles back to back is better served by the
+        second one being refused with a clear reason than by both half-landing.
+        """
+        job = self._mib_job
+        return job.json() if job else None
+
+    def install_mib_bundle(self, key: str) -> dict:
+        from .. import mibcatalog
+
+        bundle = mibcatalog.bundle(key)
+        if bundle is None:
+            raise ValueError(f"No such MIB bundle: {key}")
+        job = self._mib_job
+        if job is not None and job.state == "running":
+            raise ValueError(f"An install of {job.key} is still running")
+        job = mibcatalog.InstallJob(key, len(bundle.files))
+        self._mib_job = job
+        thread = threading.Thread(target=self._run_mib_install,
+                                  args=(bundle, job), daemon=True,
+                                  name=f"mib-install-{key}")
+        thread.start()
+        return job.json()
+
+    def _run_mib_install(self, bundle, job) -> None:
+        from .. import mibcatalog
+
+        max_bytes = int(self.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+        budget = int(self.nodes_settings.get("max_mib_bundle_bytes",
+                                             64 * 1024 * 1024))
+        timeout = float(self.nodes_settings.get("mib_download_timeout_s", 30.0))
+        existing = {row["filename"] for row in self.nodes_db.mib_files()}
+        spent = 0
+        try:
+            for filename, url in bundle.files:
+                job.current = filename
+                if filename in existing:
+                    # Re-installing must not double a file: the operator's
+                    # own edits live on those rows, and a second copy would
+                    # define every name twice in all_known_oids().
+                    job.skipped.append(filename)
+                    job.completed += 1
+                    continue
+                text = mibcatalog.fetch_file(url, timeout, max_bytes)
+                spent += len(text)
+                if spent > budget:
+                    raise mibcatalog.DownloadError(
+                        f"This bundle exceeds the {budget:,} byte total limit "
+                        f"after {len(job.installed)} file(s)")
+                # Resolve properly at the end; getting each file merely stored
+                # first is what lets the fixpoint see the whole bundle at once.
+                load_into(self.nodes_db, filename, text,
+                          known_oids_for(self.nodes_db), max_bytes)
+                existing.add(filename)
+                job.installed.append(filename)
+                job.completed += 1
+            summary = resolve_all(self.nodes_db, max_bytes)
+            job.resolved_count = summary["resolved_count"]
+            job.object_count = summary["object_count"]
+            self._snmp_settings_with_mibs()
+            job.state = "done"
+            job.current = ""
+            self.log.add(NODES,
+                         f"Installed MIB bundle {bundle.name}: "
+                         f"{len(job.installed)} file(s) added, "
+                         f"{len(job.skipped)} already present; "
+                         f"{summary['resolved_count']}/{summary['object_count']} "
+                         f"object(s) resolved overall")
+        except Exception as error:               # noqa: BLE001 - shown verbatim
+            job.state = "error"
+            job.error = str(error) or type(error).__name__
+            self.log.add(NODES,
+                         f"MIB bundle {bundle.name} failed at "
+                         f"{job.current or 'startup'}: {job.error}")
+        finally:
+            job.finished_ts = time.time()
+
     def _seed_default_mibs(self) -> None:
         """Load the MIB files bundled under netpath/mibs/ through the same
         parse/resolve/store path a real upload uses, so a fresh install
@@ -364,9 +450,19 @@ class Service:
             already.add(path.name)
             seeded = True
         if seeded:
+            # The bundled set is a dependency graph, not a list: Q-BRIDGE-MIB
+            # hangs off P-BRIDGE-MIB, ENTITY-SENSOR-MIB off ENTITY-MIB. One
+            # sweep in filename order happens to work today, but a file added
+            # later would silently land half-resolved, so finish the job the
+            # way the catalog installer does.
+            summary = resolve_all(self.nodes_db, max_bytes)
             self.nodes_settings["seeded_mib_files"] = ",".join(sorted(already))
             self.nodes_db.save_settings(self.nodes_settings)
             self._snmp_settings_with_mibs()
+            self.log.add(SYSTEM,
+                         f"Seeded bundled MIBs: {summary['resolved_count']}/"
+                         f"{summary['object_count']} object(s) resolved across "
+                         f"{summary['files']} file(s)")
 
     def _snmp_settings_with_mibs(self) -> None:
         """MIB-derived OID names apply to both what Nodes polls and what the

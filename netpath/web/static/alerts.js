@@ -268,7 +268,10 @@
   function editRule() {
     const r = view.rules.find((x) => x.id === view.rulesSelected);
     if (!r) return;
-    const isThreshold = r.kind === 'threshold';
+    // dhcp_threshold is a threshold rule in every respect the editor cares
+    // about — it just measures a DHCP scope rather than a device metric.
+    const isThreshold = r.kind === 'threshold' || r.kind === 'dhcp_threshold';
+    const pollNoun = r.kind === 'dhcp_threshold' ? 'DHCP polls' : 'polls';
     App.modal(`Edit ${r.name}`, `
       <label>Name <input id="ar-name" value="${escape(r.name)}"></label>
       <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
@@ -279,7 +282,11 @@
       ${isThreshold ? `
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
-      <label>Consecutive polls before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>` : ''}
+      <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>
+      ${r.kind === 'dhcp_threshold' ? `<p class="hint">Percentage of a scope's
+        address range that is leased or reserved. Counted the same way the DHCP
+        page counts it, and evaluated once per DHCP poll rather than once per
+        alert-engine tick, so "consecutive polls" means what it says.</p>` : ''}` : ''}
       `, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
@@ -310,6 +317,7 @@
         <option value="device_event">device_event</option>
         <option value="interface_event">interface_event</option>
         <option value="threshold">threshold</option>
+        <option value="dhcp_threshold">dhcp_threshold</option>
         <option value="trap">trap</option>
         <option value="syslog">syslog</option>
         <option value="ipam">ipam</option>
@@ -393,10 +401,14 @@
         // Preview requires the template already saved; save first then preview.
         await saveTemplate(box, t, true);
       } },
-      ...(t.is_builtin ? [{ label: 'Reset to default', onClick: async () => {
-        await App.post(`/api/alerts/templates/${t.id}/reset`, {});
-        App.closeModal();
-        App.refreshNow('alerts');
+      ...(t.is_builtin ? [{ label: 'Reset to default', onClick: () => {
+        App.confirmDestructive('Reset template',
+          `<p>Reset <b>${escape(t.name)}</b> to the text it shipped with?</p>` +
+          '<p class="hint">Your edits to this template\'s subject and body are ' +
+          'discarded and cannot be recovered.</p>', 'Reset', async () => {
+            await App.post(`/api/alerts/templates/${t.id}/reset`, {});
+            App.refreshNow('alerts');
+          }, (confirmed) => { if (!confirmed) editTemplate(t); });
       } }] : []),
       { label: 'Save', primary: true, onClick: (box) => saveTemplate(box, t, false) },
     ], { buttonsTop: true });
@@ -647,12 +659,29 @@
     for (const id of ['alerts-filter-sev', 'alerts-filter-state', 'alerts-filter-rule', 'alerts-range']) {
       App.el(id).onchange = () => App.refreshNow('alerts');
     }
-    App.el('alerts-ack-all').onclick = async () => {
-      await App.post('/api/alerts/ack-all', {});
-      clearSelection();
-      App.refreshNow('alerts');
+    // Acknowledge-all and bulk-resolve don't delete rows, but they change
+    // state for everything on screen in one click and there is no undo, so
+    // they get the same guard as a delete.
+    App.el('alerts-ack-all').onclick = () => {
+      const open = view.alerts.filter((a) => a.state === 'open').length;
+      App.confirmDestructive('Acknowledge all',
+        `<p>Acknowledge every open alert${open ? ` (${open} shown)` : ''}?</p>` +
+        '<p class="hint">This applies to every open alert on the server, not just ' +
+        'the ones matching the current filter. They cannot be un-acknowledged in ' +
+        'bulk.</p>', 'Acknowledge', async () => {
+          await App.post('/api/alerts/ack-all', {});
+          clearSelection();
+          App.refreshNow('alerts');
+        });
     };
-    App.el('alerts-bulk-resolve').onclick = bulkResolve;
+    App.el('alerts-bulk-resolve').onclick = () => {
+      const n = view.checked.size;
+      if (!n) return;
+      App.confirmDestructive('Resolve alerts',
+        `<p>Resolve the <b>${n}</b> selected alert(s)?</p>` +
+        '<p class="hint">Resolved alerts are what "Delete resolved alerts" in ' +
+        'Settings later removes.</p>', 'Resolve', bulkResolve);
+    };
     App.el('alerts-bulk-selectall').onclick = bulkSelectAll;
     App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
     App.el('alerts-toggle').onclick = async () => {

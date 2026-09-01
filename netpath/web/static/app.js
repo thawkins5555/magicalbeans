@@ -358,7 +358,42 @@ const App = (() => {
   const closeModal = () => {
     if (state.modalLocked) return;
     document.getElementById('modal').hidden = true;
+    // Anything a dialog started and must stop — a refresh interval, a
+    // pending fetch it should stop painting from — hangs off this rather
+    // than off its own Close button, because Escape and a backdrop click
+    // close the modal without that button ever being pressed.
+    window.dispatchEvent(new Event('modal-closed'));
   };
+
+  /* One confirmation shape for everything that destroys stored data, so
+     no button deletes on a single click. Body should name the collateral
+     damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
+     "Clear"). Matches the eight hand-written confirms this app already
+     had — Cancel first, the destructive action as the primary button.
+
+     There is only one modal box, so a confirm raised from inside another
+     dialog replaces it. Such callers pass `afterClose(confirmed)` to
+     reopen their parent — which is how removing a wireless controller
+     already behaves. It is told whether the action ran, since a parent
+     rebuilt from now-stale data is usually only wanted on cancel. */
+  function confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
+                              afterClose = null) {
+    const done = (confirmed) => {
+      closeModal();
+      if (afterClose) afterClose(confirmed);
+    };
+    return modal(title, bodyHtml, [
+      { label: 'Cancel', onClick: () => done(false) },
+      { label: confirmLabel, primary: true, onClick: async (box, button) => {
+        button.disabled = true;          // a slow delete must not run twice
+        try {
+          await onConfirm();
+        } finally {
+          done(true);
+        }
+      } },
+    ]);
+  }
 
   function el(id) { return document.getElementById(id); }
 
@@ -377,10 +412,32 @@ const App = (() => {
      either side of it. Sizes are remembered per splitter, so a layout tuned
      for one screen survives a reload. */
   const SPLIT_KEY = 'sappiwhere.layout';
+  const LAYOUT_VERSION_KEY = 'sappiwhere.layout.version';
+  /* Bump when a shipped data-grow default changes and the new split should
+     win over what a browser already stored. Only the named splitters are
+     dropped — every other pane the user has deliberately sized is left
+     alone, which a blanket reset would not respect.
+       2 — Alerts list/detail moved from 60/40 to 70/30. */
+  const LAYOUT_VERSION = 2;
+  const LAYOUT_RESET_ON_UPGRADE = ['alerts-main'];
+
+  function migrateLayout(layout) {
+    let stored = 0;
+    try {
+      stored = Number(localStorage.getItem(LAYOUT_VERSION_KEY) || 0);
+    } catch (error) { /* storage unreadable: treat as never-migrated */ }
+    if (stored === LAYOUT_VERSION) return layout;
+    for (const name of LAYOUT_RESET_ON_UPGRADE) delete layout[name];
+    saveLayout(layout);
+    try {
+      localStorage.setItem(LAYOUT_VERSION_KEY, String(LAYOUT_VERSION));
+    } catch (error) { /* can't record it; worst case we re-drop next load */ }
+    return layout;
+  }
 
   function loadLayout() {
     try {
-      return JSON.parse(localStorage.getItem(SPLIT_KEY) || '{}');
+      return migrateLayout(JSON.parse(localStorage.getItem(SPLIT_KEY) || '{}'));
     } catch (error) {
       return {};
     }
@@ -823,7 +880,8 @@ const App = (() => {
     state, pages, start, selectTab, loadState, refreshNow, rateFor,
     get, post, put, del,
     clock, stamp, span, bytes, rate, fillRanges, RANGES, wheelWindow,
-    modal, closeModal, el, svgNode, tooltip, hideTooltip, resetLayout,
+    modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    resetLayout,
     grid, sortRows, canRead, canWrite, accountModal,
   };
 })();

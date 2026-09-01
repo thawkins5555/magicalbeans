@@ -88,6 +88,10 @@ NETPATH_DEFAULTS = {
     "default_timeout_s": 2.0,
     "default_warn_rtt_ms": 150.0,
     "default_warn_loss": 10.0,
+    # Hours a hop may go unseen before it drops out of the path diagram. Aged
+    # against the end of the displayed window rather than the clock, so panning
+    # back through history still draws the path as it was then.
+    "topology_stale_hours": 24.0,
 }
 
 # Kept as a name because settings dicts are passed around merged: this module

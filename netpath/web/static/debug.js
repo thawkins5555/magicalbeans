@@ -376,13 +376,19 @@
       view.paused = !view.paused;
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
     };
-    App.el('dbg-clear').onclick = async () => {
-      const payload = await App.post('/api/debug/clear', {});
-      view.seq = payload.last_seq;
-      view.events = [];
-      view.selected = null;
-      App.el('dbg-detail').textContent = '';
-      drawEvents();
+    App.el('dbg-clear').onclick = () => {
+      App.confirmDestructive('Clear event log',
+        '<p>Discard every event currently in the log?</p>' +
+        '<p class="hint">The log lives in memory on the server, so this clears ' +
+        'it for everyone viewing it, not just this browser, and it cannot be ' +
+        'undone. Export first if you need a copy.</p>', 'Clear', async () => {
+          const payload = await App.post('/api/debug/clear', {});
+          view.seq = payload.last_seq;
+          view.events = [];
+          view.selected = null;
+          App.el('dbg-detail').textContent = '';
+          drawEvents();
+        });
     };
     App.el('dbg-export').onclick = exportLog;
   }

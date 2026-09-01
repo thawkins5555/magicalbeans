@@ -171,6 +171,8 @@
       <div class="pane pad-x pad-b" data-grow="2">
         <div class="bar"><span class="section">VENDOR MIBS</span>
           <span class="grow"></span>
+          <button id="nd-mib-catalog">MIB catalog</button>
+          <button id="nd-resolve-all">Resolve all</button>
           <button id="nd-upload-mib" class="primary">Upload MIB</button></div>
         <div class="table-wrap"><table id="nd-mibs-table"></table></div>
       </div>
@@ -222,11 +224,11 @@
     </div>
     <div id="alerts-hist" class="canvas chart small"><svg id="alerts-hist-svg"></svg></div>
     <div class="cols" data-splitter="alerts-main">
-      <div class="pane" data-grow="3">
+      <div class="pane" data-grow="7">
         <div class="table-wrap"><table id="alerts-table"></table></div>
       </div>
       <div class="divider"></div>
-      <aside class="pane pad-x pad-b" data-grow="2">
+      <aside class="pane pad-x pad-b" data-grow="3">
         <div id="alerts-detail-empty" class="hint">Select an alert to see its detail.</div>
         <div id="alerts-detail" hidden></div>
       </aside>

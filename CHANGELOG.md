@@ -6,6 +6,118 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.25.0 — Confirmations everywhere, a MIB catalog, ping-measured packet loss
+
+- **Nothing destroys data on a single click any more.** The Debug page's
+  **Clear** button — which wipes the server-side event log for everyone
+  looking at it, not just the browser that pressed it — now asks first,
+  as do all eight Settings → Maintenance actions (five of which empty a
+  whole table rather than pruning old rows, and now say so), removing a
+  device group, a stored credential, a MIB, a discovery scan or its
+  discovered devices, removing an IPAM subnet or DHCP server, clearing
+  subnet statistics or a stored DHCP credential, and resetting an alert
+  template to its shipped text. Alerts' **Acknowledge all** and bulk
+  **Resolve** confirm as well: they do not delete rows, but they are not
+  undoable one by one either. Filter-clear and selection-clear buttons,
+  which destroy nothing, are deliberately left alone.
+- **Alerts: the list gets 70% of the width and the detail pane 30%**,
+  instead of 60/40. Existing installs are migrated: a stored pane layout
+  from before this release is dropped for that one splitter (and only
+  that one) on first load, so the new proportions actually apply rather
+  than being overridden by a width dragged months ago.
+- **Nodes: the device detail header is readable.** The device name and
+  its identity line were both drawn in the dimmest colour in the palette,
+  at 11px, with every field run together into one flat string. The name
+  is now full-size body text, each field is a dim label with a bright
+  value, and a device's SNMP error is shown in the failure colour.
+- **NetPath: a hop that stops appearing drops out of the diagram.** A
+  router that left the path a month ago no longer sits in the graph
+  forever just because the window reaches back far enough to catch one
+  old trace. The cutoff (24 hours by default, in NetPath settings; 0
+  disables it) is measured against the end of the window being displayed
+  rather than the clock, so scrolling the timeline back into last month
+  still draws the path exactly as it stood then.
+- **Nodes: the interface dialog stops showing another port's data.** Four
+  separate bugs conspired here. The dialog's 5-second refresh was only
+  ever stopped by its Close button, so dismissing it with Escape or a
+  backdrop click left the timer running forever; because every dialog
+  rebuilds the same element ids inside one shared modal, that orphaned
+  timer then painted the old port's traffic into the new port's chart.
+  The refresh had no request-id guard, so a slow response could repaint
+  over a newer one. It resolved metric ids from a cached list that the
+  device pane replaces wholesale on every refresh — and could belong to a
+  different device entirely. And the `/series` endpoint accepted a
+  device id and then ignored it, so a metric id belonging to another
+  device returned *that device's* traffic rather than nothing. All four
+  are fixed, the title and events refresh with the rest of the dialog,
+  and **Smoothed** is back as a checkbox, on by default.
+- **Nodes: eighteen standard MIBs now ship with the app**, seeded on
+  first start: the full IF-MIB, IP-MIB, TCP-MIB, UDP-MIB, ENTITY-MIB,
+  ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB, Q-BRIDGE-MIB, LLDP-MIB,
+  POWER-ETHERNET-MIB, HOST-RESOURCES-MIB, UCD-SNMP-MIB and the SNMPv2
+  and IANA type modules they depend on. Previously there were two, one of
+  them a hand-written IF-MIB subset (which is kept, so a device pinned to
+  it keeps working).
+- **Nodes: a MIB catalog installs vendor MIBs on demand.** Seventeen
+  curated bundles — Cisco IOS and wireless, Fortinet, Juniper, Aruba
+  (ArubaOS and CX), HP ProCurve, Arista, MikroTik, Ubiquiti, Extreme,
+  Dell, NETGEAR, SonicWall, APC, Synology and VMware — are listed in
+  Nodes → Profiles & MIBs → **MIB catalog**. The list is static data, so
+  it is browsable with no internet access at all; only pressing Install
+  fetches anything, from the vendor's or the distribution's own public
+  repository, and a server with no outbound HTTPS gets a clear message
+  saying so rather than a traceback. This is deliberately *not* "every
+  Cisco MIB": that repository is 2,921 files and roughly 350MB of text,
+  which would multiply the size of nodes.db by two orders of magnitude to
+  supply a handful of MIBs anyone actually polls.
+- **Nodes: MIB upload accepts a zip, and order no longer matters.** A
+  vendor archive can be uploaded whole; its MIB members are stored first
+  and resolved afterwards, repeatedly, until nothing new resolves. The
+  same pass runs after a catalog install and behind a new **Resolve all**
+  button, so a file uploaded before the one defining its parent branch no
+  longer has to be resolved by hand. The parser also learned
+  MODULE-IDENTITY and OBJECT-IDENTITY, which is how nearly every RFC MIB
+  names its own root — without them, files like BRIDGE-MIB and LLDP-MIB
+  parsed to a list of objects not one of which could resolve.
+- **Wireless: a FortiAP radio reporting "51 dBm" is no longer taken
+  literally.** Fortinet's MIB documents
+  fgWcWtpSessionRadioOperatingPower as dBm, but FortiOS reports its own
+  0–100 transmit-power level in it; 51 dBm would be about 126 watts,
+  roughly a thousand times what a FortiAP can emit. The reading is now
+  auto-detected per controller (any value above 30 dBm means the whole
+  column is a percentage) and can be forced either way in Wireless
+  settings; the raw number is always shown in the AP detail pane.
+- **Wireless: radio mode is polled and displayed.** fgWcWtpRadioMode
+  (ap, monitor, sniffer, disabled, not present) is now read, shown in the
+  AP detail pane and available as a table column — which is what explains
+  an odd third radio on a FAP-231F: it is a dedicated scanner. A radio
+  that reports a mode but no channel is also no longer dropped from the
+  list entirely, so such an AP finally shows all of its radios.
+- **Alerts: a new built-in rule for a DHCP scope running out of
+  leases**, with adjustable thresholds (85% to fire, 75% to clear by
+  default). Utilization counts leases and reservations against the
+  scope's address range, exactly as the DHCP page counts them, and the
+  "consecutive polls before firing" setting counts DHCP polls rather than
+  alert-engine ticks — so on a 15-minute DHCP poll, 3 means 45 minutes,
+  not 15 seconds.
+- **Nodes: every SNMP-polled device is now pinged as well**, several
+  probes per poll, and the result is recorded as real `ping_loss_pct` and
+  `ping_rtt_ms` metrics. Probe count, timeout and how often to ping are
+  configurable globally and per device or profile. This also brings the
+  shipped **Ping response time high** rule to life — it had no metric to
+  read before — and adds a **Packet loss to device high** rule alongside
+  it. Round-trip time is taken from ping's own reported figure rather
+  than by timing the subprocess, which used to count process startup as
+  network latency.
+- **Nodes: a device is DOWN only when ping *and* SNMP have both failed.**
+  This is a behaviour change on upgrade: a device currently shown DOWN
+  because its SNMP is broken, but which still answers ping, will flip to
+  UP with its SNMP error displayed. That is the more accurate report —
+  the device is reachable and misconfigured, not off the network — but if
+  you would rather treat SNMP failing as an outage on its own, the
+  setting is in Nodes settings and can be overridden per device and per
+  polling profile.
+
 ### 4.24.0 — Wireless AP lifecycle and table controls, leaner Nodes detail, ConfigRX fixes
 
 - **Wireless: an AP that disappears from its controller now raises an

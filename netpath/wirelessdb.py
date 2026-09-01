@@ -93,6 +93,12 @@ DEFAULTS = {
     # beside the rest of the dialog's settings and survives Reset layout,
     # which clears per-browser widths but must not eat a settings choice.
     "table_columns": "",
+    # How to read fgWcWtpSessionRadioOperatingPower. The MIB says dBm;
+    # observed FortiOS reports its own 0-100 tx-power level in the same
+    # object (see fortinetoids.WTP_RADIO_OPERATING_POWER). "auto" decides
+    # per controller from the values that controller actually returns;
+    # "dbm" and "percent" force one reading when an operator knows better.
+    "radio_power_unit": "auto",
 }
 
 CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
@@ -123,6 +129,13 @@ class WirelessDatabase:
             self._conn.execute(
                 "ALTER TABLE access_points ADD COLUMN"
                 " out_of_service INTEGER NOT NULL DEFAULT 0")
+        radios = {row["name"] for row in
+                  self._conn.execute("PRAGMA table_info(radios)").fetchall()}
+        if "mode" not in radios:
+            # fgWcWtpSessionRadioMode. Stored as the decoded text, not the
+            # raw enum, because that is what every reader of this row wants
+            # and the mapping lives in one place (fortinetoids.RADIO_MODE).
+            self._conn.execute("ALTER TABLE radios ADD COLUMN mode TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -256,9 +269,11 @@ class WirelessDatabase:
             for radio in radios:
                 self._conn.execute(
                     "INSERT INTO radios(ap_id, radio_id, channel,"
-                    " operating_power_dbm, station_count) VALUES (?,?,?,?,?)",
+                    " operating_power_dbm, station_count, mode)"
+                    " VALUES (?,?,?,?,?,?)",
                     (ap_id, radio["radio_id"], radio.get("channel"),
-                     radio.get("operating_power_dbm"), radio.get("station_count")))
+                     radio.get("operating_power_dbm"),
+                     radio.get("station_count"), radio.get("mode")))
             self._conn.commit()
 
     def access_points(self, controller_id: int | None = None) -> list[sqlite3.Row]:
