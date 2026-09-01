@@ -78,10 +78,18 @@ _LEGACY_KEX = ("diffie-hellman-group-exchange-sha1",
                "diffie-hellman-group1-sha1")
 _LEGACY_KEYS = ("ssh-rsa", "ssh-dss")
 
-# Set once _apply_legacy_algorithms has run, so the error path can tell
-# "this paramiko cannot speak SHA-1 key exchange at all" from "it can, and
-# the device still refused" — two different problems with different fixes.
-_legacy_kex_available: bool | None = None
+# Two separate facts, because a key-exchange failure has a different remedy
+# depending on which one is false: does the installed paramiko implement SHA-1
+# key exchange at all, and are we currently offering it? Telling an operator to
+# reinstall paramiko when the real fix is a checkbox wastes their afternoon.
+_legacy_kex_implemented: bool | None = None
+_legacy_kex_offered: bool | None = None
+
+# paramiko's preference lists exactly as the installed version shipped them,
+# captured before anything is appended. Turning the setting back off restores
+# this rather than subtracting our own names from the live list: it puts back
+# the real original, in its original order, without assuming what was added.
+_pristine_algorithms: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
 LEGACY_KEX_UNAVAILABLE = (
     "This device offers only SHA-1 key exchange, which the installed paramiko "
@@ -90,9 +98,15 @@ LEGACY_KEX_UNAVAILABLE = (
     "and restart, or enable a modern key exchange on the device "
     "(diffie-hellman-group14-sha256 or better).")
 
+LEGACY_KEX_DISABLED = (
+    "This device offers only SHA-1 key exchange, and \"Allow legacy SSH "
+    "algorithms\" is switched off in ConfigRX settings. Turn it back on to "
+    "reach this device, or enable a modern key exchange on the device "
+    "(diffie-hellman-group14-sha256 or better).")
 
-def _apply_legacy_algorithms(paramiko) -> bool:
-    """Offer SHA-1 key exchange and ssh-rsa host keys as a last resort.
+
+def _apply_legacy_algorithms(paramiko, enabled: bool = True) -> bool:
+    """Offer — or stop offering — SHA-1 key exchange and ssh-rsa host keys.
 
     Feature-detected rather than version-checked: paramiko 3.x still ships
     these classes and merely leaves them out of the preferred lists, while
@@ -103,41 +117,55 @@ def _apply_legacy_algorithms(paramiko) -> bool:
     either crash or silently do nothing.
 
     Appended, never prepended: a device that can do curve25519 still does, and
-    only one offering nothing better falls back this far. Idempotent, so
-    restarting the worker does not grow the lists.
+    only one offering nothing better falls back this far.
 
-    Returns whether any legacy key exchange is actually available, which is
-    what the connect-error path needs to explain a failure honestly.
+    Both directions, deliberately. These are class-level attributes on
+    `Transport`, so an "apply only" function could never revoke: switching the
+    setting off used to leave the algorithms offered until the whole app
+    restarted, with the checkbox unticked and no way to tell. Rebuilding from
+    the pristine lists each time makes it symmetric and idempotent at once.
+
+    Returns whether legacy key exchange is now being offered.
     """
-    global _legacy_kex_available
+    global _legacy_kex_implemented, _legacy_kex_offered, _pristine_algorithms
     transport = paramiko.Transport
-    added_kex = [name for name in _LEGACY_KEX
-                 if name in transport._kex_info
-                 and name not in transport._preferred_kex]
-    if added_kex:
-        transport._preferred_kex = tuple(transport._preferred_kex) + tuple(added_kex)
-    added_keys = [name for name in _LEGACY_KEYS
-                  if name in transport._key_info
-                  and name not in transport._preferred_keys]
-    if added_keys:
-        transport._preferred_keys = tuple(transport._preferred_keys) + tuple(added_keys)
-    _legacy_kex_available = any(name in transport._kex_info for name in _LEGACY_KEX)
-    return _legacy_kex_available
+    if _pristine_algorithms is None:
+        _pristine_algorithms = (tuple(transport._preferred_kex),
+                                tuple(transport._preferred_keys))
+    base_kex, base_keys = _pristine_algorithms
+
+    _legacy_kex_implemented = any(name in transport._kex_info
+                                  for name in _LEGACY_KEX)
+    if enabled:
+        transport._preferred_kex = base_kex + tuple(
+            name for name in _LEGACY_KEX
+            if name in transport._kex_info and name not in base_kex)
+        transport._preferred_keys = base_keys + tuple(
+            name for name in _LEGACY_KEYS
+            if name in transport._key_info and name not in base_keys)
+    else:
+        transport._preferred_kex = base_kex
+        transport._preferred_keys = base_keys
+    _legacy_kex_offered = bool(enabled and _legacy_kex_implemented)
+    return _legacy_kex_offered
 
 
 def _connect_error_text(exc: Exception) -> str:
     """The message an operator sees in the Errors log for a failed connect.
 
     paramiko's own "Incompatible ssh peer (no acceptable kex algorithm)" names
-    the symptom and none of the cause, and the cause here is usually the
-    installed paramiko rather than the device. Only rewritten when the failure
-    really is key exchange and this paramiko has no SHA-1 exchange to offer —
-    otherwise the original text is the more useful one and is left alone.
+    the symptom and none of the cause, and the cause is usually this end
+    rather than the device. Three cases, three different fixes: the installed
+    paramiko cannot do SHA-1 key exchange at all; it can but the setting is
+    off; or we are offering it and the device still refused — which is the one
+    case where paramiko's own text is the whole truth and is left alone.
     """
     text = str(exc)
-    if "kex" in text.lower() and _legacy_kex_available is False:
-        return f"{text}. {LEGACY_KEX_UNAVAILABLE}"
-    return text
+    if "kex" not in text.lower() or _legacy_kex_offered is not False:
+        return text
+    if _legacy_kex_implemented:
+        return f"{text}. {LEGACY_KEX_DISABLED}"
+    return f"{text}. {LEGACY_KEX_UNAVAILABLE}"
 
 
 def _clean_output(raw: str) -> str:
@@ -230,11 +258,14 @@ class ConfigRxWorker:
         if settings is not None:
             self.settings = dict(settings)
         # Applied at start rather than per connection: it edits paramiko's
-        # class-level preference lists, so doing it once is both enough and
-        # the only way to keep it idempotent.
-        if paramiko_available() and self.settings.get("allow_legacy_ssh", True):
+        # class-level preference lists, so doing it once is enough. Called
+        # unconditionally and told which way to go — guarding the call site
+        # instead was the bug that made the setting one-way, since skipping
+        # the call cannot undo a previous one.
+        if paramiko_available():
             import paramiko
-            _apply_legacy_algorithms(paramiko)
+            _apply_legacy_algorithms(
+                paramiko, bool(self.settings.get("allow_legacy_ssh", True)))
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
         self._thread.start()

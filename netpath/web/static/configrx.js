@@ -289,9 +289,10 @@
           older switches, routers and firewalls can do — and backing those up is
           what this module is for. A device that speaks something modern still
           negotiates it; these are only ever offered after the modern ones. Turn
-          this off where policy forbids SHA-1. It has no effect unless the
-          installed paramiko still implements those algorithms: paramiko 5 removed
-          them, so this app pins paramiko below 5.</p>
+          this off where policy forbids SHA-1 — it takes effect on save, like
+          every other setting here. Enabling it can only help where the installed
+          paramiko still implements those algorithms: paramiko 5 removed them
+          outright, which is why this app pins paramiko below 5.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
