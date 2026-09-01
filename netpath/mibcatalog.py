@@ -207,6 +207,7 @@ CATALOG: list[Bundle] = [
         files=_libre(
             "ubnt", "UBNT-MIB", "UBNT-UniFi-MIB", "UBNT-EdgeMAX-MIB",
             "UBNT-AirMAX-MIB", "UBNT-AirFIBER-MIB", "UBNT-UFIBER-MIB",
+            "UBNT-AFLTU-MIB", "UI-AF60-MIB",
         ),
     ),
     Bundle(
@@ -291,6 +292,197 @@ CATALOG: list[Bundle] = [
             "vmware", "VMWARE-ROOT-MIB", "VMWARE-TC-MIB", "VMWARE-PRODUCTS-MIB",
             "VMWARE-SYSTEM-MIB", "VMWARE-RESOURCES-MIB", "VMWARE-ENV-MIB",
             "VMWARE-VMINFO-MIB",
+        ),
+    ),
+    Bundle(
+        key="paloalto",
+        vendor="Palo Alto Networks",
+        name="Palo Alto PAN-OS",
+        description="PAN-OS firewalls and Panorama: system state, sessions, "
+                    "chassis entities and the trap definitions.",
+        source="librenms/librenms (mibs/paloaltonetworks)",
+        files=_libre(
+            "paloaltonetworks", "PAN-GLOBAL-REG", "PAN-GLOBAL-TC",
+            "PAN-COMMON-MIB", "PAN-PRODUCTS-MIB", "PAN-ENTITY-EXT-MIB",
+            "PAN-LC-MIB", "PAN-TRAPS",
+        ),
+    ),
+    Bundle(
+        key="checkpoint",
+        vendor="Check Point",
+        name="Check Point firewalls",
+        description="Check Point's enterprise tree: firewall, VPN, cluster "
+                    "and appliance health objects.",
+        source="librenms/librenms (mibs/checkpoint)",
+        files=_libre("checkpoint", "CHECKPOINT-MIB"),
+    ),
+    Bundle(
+        key="watchguard",
+        vendor="WatchGuard",
+        name="WatchGuard Firebox",
+        description="Firebox system statistics, policies, high availability "
+                    "and IPsec tunnels.",
+        source="librenms/librenms (mibs/watchguard)",
+        files=_libre(
+            "watchguard", "WATCHGUARD-SMI", "WATCHGUARD-MIB",
+            "WATCHGUARD-PRODUCTS-MIB", "WATCHGUARD-INFO-SYSTEM-MIB",
+            "WATCHGUARD-SYSTEM-CONFIG-MIB", "WATCHGUARD-SYSTEM-STATISTICS-MIB",
+            "WATCHGUARD-POLICY-MIB", "WATCHGUARD-HA-MIB",
+            "WATCHGUARD-IPSEC-TUNNEL-MIB", "WATCHGUARD-CLIENT-MIB",
+        ),
+    ),
+    Bundle(
+        key="sophos",
+        vendor="Sophos",
+        name="Sophos XG / SFOS firewalls",
+        description="SFOS firewall system health, licensing and service "
+                    "status.",
+        source="librenms/librenms (mibs/sophos)",
+        files=_libre("sophos", "SFOS-FIREWALL-MIB"),
+    ),
+    Bundle(
+        key="f5",
+        vendor="F5",
+        name="F5 BIG-IP",
+        description="BIG-IP system, local traffic (virtual servers, pools, "
+                    "nodes), platform statistics and APM.",
+        source="librenms/librenms (mibs/f5)",
+        files=_libre(
+            "f5", "F5-COMMON-SMI-MIB", "F5-BIGIP-COMMON-MIB",
+            "F5-BIGIP-SYSTEM-MIB", "F5-BIGIP-LOCAL-MIB",
+            "F5-BIGIP-GLOBAL-MIB", "F5-PLATFORM-STATS-MIB",
+            "F5-BIGIP-APM-MIB",
+        ),
+    ),
+    Bundle(
+        key="citrix",
+        vendor="Citrix",
+        name="Citrix NetScaler / ADC",
+        description="NetScaler ADC virtual servers, services and system "
+                    "counters, plus SD-WAN.",
+        source="librenms/librenms (mibs/citrix)",
+        files=_libre(
+            "citrix", "NS-ROOT-MIB", "CITRIX-NetScaler-SD-WAN-MIB",
+        ),
+    ),
+    Bundle(
+        key="ruckus",
+        vendor="Ruckus / CommScope",
+        name="Ruckus wireless (ZoneDirector, SmartZone, Unleashed)",
+        description="Ruckus controllers and access points across all three "
+                    "platforms: APs, WLANs, system health and events.",
+        source="librenms/librenms (mibs/ruckus)",
+        files=_libre(
+            "ruckus", "RUCKUS-ROOT-MIB", "RUCKUS-TC-MIB", "RUCKUS-PRODUCTS-MIB",
+            "RUCKUS-SYSTEM-MIB", "RUCKUS-DEVICE-MIB", "RUCKUS-HWINFO-MIB",
+            "RUCKUS-SWINFO-MIB", "RUCKUS-ZD-SYSTEM-MIB", "RUCKUS-ZD-AP-MIB",
+            "RUCKUS-ZD-WLAN-MIB", "RUCKUS-SZ-SYSTEM-MIB", "RUCKUS-SZ-WLAN-MIB",
+            "RUCKUS-UNLEASHED-SYSTEM-MIB", "RUCKUS-UNLEASHED-WLAN-MIB",
+        ),
+    ),
+    Bundle(
+        key="cambium",
+        vendor="Cambium Networks",
+        name="Cambium PMP / PTP / cnPilot",
+        description="Point-to-multipoint access points and subscriber "
+                    "modules, PTP backhaul links and cnMatrix switches.",
+        source="librenms/librenms (mibs/cambium)",
+        files=_libre(
+            "cambium", "WHISP-GLOBAL-REG-MIB", "WHISP-TCV2-MIB",
+            "WHISP-BOX-MIBV2-MIB", "WHISP-APS-MIB", "WHISP-SM-MIB",
+            "CAMBIUM-PTP650-MIB", "CAMBIUM-PTP670-MIB",
+            "CAMBIUM-PMP80211-MIB",
+        ),
+    ),
+    Bundle(
+        key="aerohive",
+        vendor="Aerohive / Extreme",
+        name="Aerohive HiveOS access points",
+        description="HiveOS access point system, interface and mesh "
+                    "objects.",
+        source="librenms/librenms (mibs/aerohive)",
+        files=_libre(
+            "aerohive", "AH-SMI-MIB", "AH-SYSTEM-MIB", "AH-INTERFACE-MIB",
+            "AH-MRP-MIB",
+        ),
+    ),
+    Bundle(
+        key="zyxel",
+        vendor="Zyxel",
+        name="Zyxel switches and firewalls",
+        description="Zyxel managed switches (hardware monitor, stacking, "
+                    "transceivers) and ZyWALL / USG firewalls.",
+        source="librenms/librenms (mibs/zyxel)",
+        files=_libre(
+            "zyxel", "ZYXEL-MIB", "ZYXEL-ES-SMI", "ZYXEL-ES-COMMON",
+            "ZYXEL-HW-MONITOR-MIB", "ZYXEL-STACKING-MIB",
+            "ZYXEL-TRANSCEIVER-MIB", "ZYXEL-ZYWALL-MIB",
+            "ZYXEL-ZYWALL-ZLD-COMMON-MIB",
+        ),
+    ),
+    Bundle(
+        key="tplink",
+        vendor="TP-Link",
+        name="TP-Link JetStream switches",
+        description="System information and monitoring, PoE, VLANs, LLDP "
+                    "and DDM transceiver diagnostics.",
+        source="librenms/librenms (mibs/tplink)",
+        files=_libre(
+            "tplink", "TPLINK-MIB", "TPLINK-TC-MIB", "TPLINK-PRODUCTS-MIB",
+            "TPLINK-SYSINFO-MIB", "TPLINK-SYSMONITOR-MIB",
+            "TPLINK-POWER-OVER-ETHERNET-MIB", "TPLINK-DOT1Q-VLAN-MIB",
+            "TPLINK-LLDP-MIB", "TPLINK-LLDPINFO-MIB", "TPLINK-DDMSTATUS-MIB",
+            "TPLINK-DDMMANAGE-MIB",
+        ),
+    ),
+    Bundle(
+        key="eaton",
+        vendor="Eaton",
+        name="Eaton UPS and rack PDU",
+        description="Eaton and MGE UPS battery, load and alarm objects, "
+                    "managed ePDU outlets and environmental sensors.",
+        source="librenms/librenms (mibs/eaton)",
+        files=_libre(
+            "eaton", "EATON-OIDS", "XUPS-MIB", "MG-SNMP-UPS-MIB",
+            "EATON-EPDU-MIB", "EATON-EMP-MIB", "EATON-SENSOR-MIB",
+            "EATON-ATS2-MIB",
+        ),
+    ),
+    Bundle(
+        key="liebert",
+        vendor="Vertiv / Liebert",
+        name="Vertiv Liebert UPS and cooling",
+        description="Liebert GP agent objects: UPS power, PDU, environmental "
+                    "(CRAC/cooling) readings and condition alarms.",
+        source="librenms/librenms (mibs/liebert)",
+        files=_libre(
+            "liebert", "LIEBERT-GP-REGISTRATION-MIB", "LIEBERT-GP-AGENT-MIB",
+            "LIEBERT-GP-SYSTEM-MIB", "LIEBERT-GP-POWER-MIB",
+            "LIEBERT-GP-PDU-MIB", "LIEBERT-GP-ENVIRONMENTAL-MIB",
+            "LIEBERT-GP-CONDITIONS-MIB", "LIEBERT-GP-NOTIFICATIONS-MIB",
+        ),
+    ),
+    Bundle(
+        key="raritan",
+        vendor="Raritan / Legrand",
+        name="Raritan PX rack PDU",
+        description="Raritan PDU inlets, outlets, sensors and the KVM "
+                    "device MIB.",
+        source="librenms/librenms (mibs/raritan)",
+        files=_libre(
+            "raritan", "PDU-MIB", "PDU2-MIB", "RemoteKVMDevice-MIB",
+        ),
+    ),
+    Bundle(
+        key="rittal",
+        vendor="Rittal",
+        name="Rittal CMC III",
+        description="CMC III rack monitoring: temperature, humidity, access "
+                    "and power sensors.",
+        source="librenms/librenms (mibs/rittal)",
+        files=_libre(
+            "rittal", "RITTAL-SMI-MIB", "RITTAL-CMC-III-MIB",
+            "RITTAL-CMC-III-PRODUCTS-MIB", "RITTAL-CMC-TC-MIB",
         ),
     ),
 ]

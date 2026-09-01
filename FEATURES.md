@@ -228,7 +228,9 @@ own subtabs.
   Profiles & MIBs → **MIB catalog** lists curated bundles for Cisco (IOS
   and wireless), Fortinet, Juniper, Aruba (ArubaOS and CX), HP ProCurve,
   Arista, MikroTik, Ubiquiti, Extreme, Dell, NETGEAR, SonicWall, APC,
-  Synology and VMware. The catalog itself is static data compiled into
+  Synology, VMware, Palo Alto, Check Point, WatchGuard, Sophos, F5 BIG-IP,
+  Citrix NetScaler, Ruckus, Cambium, Aerohive, Zyxel, TP-Link, Eaton,
+  Vertiv/Liebert, Raritan and Rittal — 32 bundles in all. The catalog itself is static data compiled into
   the app, so the list is browsable with no internet access at all; only
   pressing Install fetches anything, and it fetches from the vendor's or
   the distribution's own public repository rather than from a copy held
@@ -590,6 +592,11 @@ record table, all re-sliced together by **Group by**:
 application (service port), protocol, source, destination, conversation,
 exporter, ingress or egress interface, source or destination AS, or ToS.
 
+**Hovering the traffic chart names what is under the cursor**, with a small
+block in each line's own colour so a name in the tooltip can be matched to its
+band in the stack without counting layers. The top-talkers bars are swatched to
+match, so the same application is the same colour in both.
+
 **The flow record table sorts and resizes.** Click a column heading to order by
 it, click again to reverse. Drag the edge of a heading to widen or narrow the
 column; the widths are remembered per browser, and **Reset layout** clears them
@@ -638,6 +645,18 @@ identified from here, so declaring them is the only honest option:
 Declared names win over everything else.
 
 ### Names in the flow table
+
+**The Exporter column names the device**, not just its address, and sits
+immediately after Time — which box reported a flow is context for reading the
+rest of the row. The name comes from the Nodes inventory, by the same
+precedence Syslog's Host column and the Alerts Object column use: the
+SNMP-polled `sysName`, then a manually entered device name, then the
+reverse-DNS cache. An exporter that matches no known device keeps showing its
+address. Hovering a row shows both the name and the address, since the address
+is what the collector actually received the flow from, and the chart legend and
+the top-talkers bars name the exporter the same way when grouping by Exporter.
+Filtering still keys off the address, so a renamed device does not change what
+a saved filter matches.
 
 **Resolve names** on the controls row swaps addresses for their reverse-DNS
 names everywhere they appear — the flow table's source and destination columns,
@@ -1009,19 +1028,28 @@ reports on all of them in one SNMP walk.
   available as a table column. A radio that reports a mode but no channel
   (which is exactly what a monitor radio does) is listed rather than
   dropped, so an AP shows all of its radios.
+- **A scanning radio reads "Scan", not a converted number.** A monitor or
+  sniffer radio is a receiver, so whatever the controller reports for its
+  "operating power" is neither a transmit power in dBm nor a percentage of
+  one. It is named rather than converted, left out of the AP's headline
+  transmit power, and left out of the dBm-or-percentage decision below —
+  a single scanner reporting an impossible figure must not change how its
+  neighbours are read.
 - **Transmit power is labelled with the unit it is actually in.**
   Fortinet's MIB documents `fgWcWtpSessionRadioOperatingPower` as dBm,
   but FortiOS reports its own 0–100 power *level* in that object — which
   is why an AP can report 51, a figure that as dBm would be about 126
   watts, roughly a thousand times what a FortiAP can emit (its conducted
   output tops out near 20 dBm). The reading is auto-detected per
-  controller: if any radio on it reports above 30 dBm, that controller's
-  whole column is read as a percentage. Settings → Radio tx power can
+  controller, counting only its serving radios: if any of them reports above
+  30 dBm, that controller's whole column is read as a percentage. Settings → Radio tx power can
   force dBm or percent instead, and the AP detail pane always shows the
   raw number alongside, so the reading can be checked against the
   controller's own display.
 - **Sort by any column** — click its heading, the same way every other
   table in the app sorts.
+- **Settings → Radio tx power** forces dBm or the percentage reading where
+  auto-detection gets it wrong.
 - **Choose which columns to show** in Settings → Columns. The six above
   are the defaults; Controller, VDOM, WTP id, Radios, Radio modes,
   Channels, Radio clients and Last seen can be added. The list is the fields the
@@ -1102,6 +1130,18 @@ to a manual name in Nodes.
   runs normally and ConfigRX alone stands down, saying so plainly — in
   the worker's status line and on each affected device — with the install
   command, rather than failing with a traceback.
+- **Older devices are reachable, deliberately.** Plenty of switches,
+  routers and firewalls offer nothing better than SHA-1 key exchange
+  (`diffie-hellman-group14-sha1` and older) and `ssh-rsa` host keys, and
+  backing those up is precisely what this module is for — so ConfigRX
+  offers those algorithms too, always *after* the modern ones, so anything
+  capable of a current key exchange still negotiates one. **Allow legacy
+  SSH algorithms** in ConfigRX settings turns this off where policy
+  forbids SHA-1. It depends on the installed `paramiko` still implementing
+  them: version 5.0 removed the code entirely, which is why this app pins
+  `paramiko>=3.4,<5`. On a version that cannot, the failure says so and
+  names the fix rather than reporting only paramiko's own
+  "no acceptable kex algorithm".
 - **Retention**: keep for N days, and/or keep at most N per device —
   either can be set to 0 to disable that particular cap. A device whose
   config never changes stays at one stored backup regardless of either

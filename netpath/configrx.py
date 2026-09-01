@@ -69,6 +69,77 @@ def paramiko_available(recheck: bool = False) -> bool:
     return _paramiko_ok
 
 
+# Key exchanges and host-key types that modern paramiko no longer prefers,
+# most-preferred first within the group. Every one of them is SHA-1 based and
+# every one of them is what an older switch, router or firewall offers as its
+# best option — which is exactly the gear ConfigRX exists to back up.
+_LEGACY_KEX = ("diffie-hellman-group-exchange-sha1",
+               "diffie-hellman-group14-sha1",
+               "diffie-hellman-group1-sha1")
+_LEGACY_KEYS = ("ssh-rsa", "ssh-dss")
+
+# Set once _apply_legacy_algorithms has run, so the error path can tell
+# "this paramiko cannot speak SHA-1 key exchange at all" from "it can, and
+# the device still refused" — two different problems with different fixes.
+_legacy_kex_available: bool | None = None
+
+LEGACY_KEX_UNAVAILABLE = (
+    "This device offers only SHA-1 key exchange, which the installed paramiko "
+    "has removed entirely — there is no setting that re-enables it. Either "
+    "install a version that still implements it (pip install \"paramiko<5\") "
+    "and restart, or enable a modern key exchange on the device "
+    "(diffie-hellman-group14-sha256 or better).")
+
+
+def _apply_legacy_algorithms(paramiko) -> bool:
+    """Offer SHA-1 key exchange and ssh-rsa host keys as a last resort.
+
+    Feature-detected rather than version-checked: paramiko 3.x still ships
+    these classes and merely leaves them out of the preferred lists, while
+    paramiko 5.0 deleted them outright (`paramiko.kex_group1` is gone,
+    `kex_gex` keeps only `KexGexSHA256`, `_key_info` has no plain `ssh-rsa`).
+    Intersecting against what `Transport` actually implements is therefore
+    correct on both, and on whatever comes next, where a version test would
+    either crash or silently do nothing.
+
+    Appended, never prepended: a device that can do curve25519 still does, and
+    only one offering nothing better falls back this far. Idempotent, so
+    restarting the worker does not grow the lists.
+
+    Returns whether any legacy key exchange is actually available, which is
+    what the connect-error path needs to explain a failure honestly.
+    """
+    global _legacy_kex_available
+    transport = paramiko.Transport
+    added_kex = [name for name in _LEGACY_KEX
+                 if name in transport._kex_info
+                 and name not in transport._preferred_kex]
+    if added_kex:
+        transport._preferred_kex = tuple(transport._preferred_kex) + tuple(added_kex)
+    added_keys = [name for name in _LEGACY_KEYS
+                  if name in transport._key_info
+                  and name not in transport._preferred_keys]
+    if added_keys:
+        transport._preferred_keys = tuple(transport._preferred_keys) + tuple(added_keys)
+    _legacy_kex_available = any(name in transport._kex_info for name in _LEGACY_KEX)
+    return _legacy_kex_available
+
+
+def _connect_error_text(exc: Exception) -> str:
+    """The message an operator sees in the Errors log for a failed connect.
+
+    paramiko's own "Incompatible ssh peer (no acceptable kex algorithm)" names
+    the symptom and none of the cause, and the cause here is usually the
+    installed paramiko rather than the device. Only rewritten when the failure
+    really is key exchange and this paramiko has no SHA-1 exchange to offer —
+    otherwise the original text is the more useful one and is left alone.
+    """
+    text = str(exc)
+    if "kex" in text.lower() and _legacy_kex_available is False:
+        return f"{text}. {LEGACY_KEX_UNAVAILABLE}"
+    return text
+
+
 def _clean_output(raw: str) -> str:
     """Strips ANSI escape sequences and pager prompts a device's shell may
     have echoed back even with paging disabled. Best-effort — this is
@@ -142,6 +213,9 @@ class ConfigRxWorker:
         self._lock = threading.Lock()
         self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0}
         self.error: str | None = None
+        # Last settings start() was handed; only allow_legacy_ssh is read from
+        # here (the loop reads the rest from the database each pass).
+        self.settings: dict = {}
 
     @property
     def running(self) -> bool:
@@ -153,6 +227,14 @@ class ConfigRxWorker:
         # Re-probe here so a paramiko installed since the last start is
         # seen; every other caller gets the cached verdict.
         paramiko_available(recheck=True)
+        if settings is not None:
+            self.settings = dict(settings)
+        # Applied at start rather than per connection: it edits paramiko's
+        # class-level preference lists, so doing it once is both enough and
+        # the only way to keep it idempotent.
+        if paramiko_available() and self.settings.get("allow_legacy_ssh", True):
+            import paramiko
+            _apply_legacy_algorithms(paramiko)
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
         self._thread.start()
@@ -266,8 +348,9 @@ class ConfigRxWorker:
                 password=password, timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
                 auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False)
         except Exception as exc:
-            self.db.record_backup_attempt(device_id, ok=False, status="error", error=str(exc))
-            self.log.add(ERROR, f"ConfigRX could not reach {device['ip']}", detail=str(exc))
+            detail = _connect_error_text(exc)
+            self.db.record_backup_attempt(device_id, ok=False, status="error", error=detail)
+            self.log.add(ERROR, f"ConfigRX could not reach {device['ip']}", detail=detail)
             return
         finally:
             password = None

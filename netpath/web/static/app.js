@@ -306,14 +306,43 @@ const App = (() => {
      that reads like the desktop's hover panel, so this is drawn instead. */
   let tipElement = null;
 
-  function tooltip(text, event) {
-    if (!text) return hideTooltip();
+  /* `content` is either a string — every caller that has one, unchanged —
+     or an array of {text, color} rows, where a row with a colour draws a
+     small swatch before its text. Rows are built as DOM nodes with
+     textContent rather than markup, so a hostname or a MIB object name can
+     never become HTML on its way into a tooltip; the colour is the only
+     thing that reaches a style, and it always comes from a palette
+     constant, never from data. */
+  function tooltip(content, event) {
+    if (!content || (Array.isArray(content) && !content.length)) {
+      return hideTooltip();
+    }
     if (!tipElement) {
       tipElement = document.createElement('div');
       tipElement.className = 'tooltip';
       document.body.appendChild(tipElement);
     }
-    tipElement.textContent = text;
+    if (Array.isArray(content)) {
+      tipElement.textContent = '';
+      for (const row of content) {
+        const line = document.createElement('div');
+        line.className = 'tip-row';
+        if (row.color) {
+          const swatch = document.createElement('span');
+          swatch.className = 'tip-swatch';
+          swatch.style.background = row.color;
+          line.appendChild(swatch);
+        } else {
+          // Keeps unswatched lines (a heading, a total) aligned with the
+          // text of the swatched ones instead of hanging left of them.
+          line.classList.add('tip-row-plain');
+        }
+        line.appendChild(document.createTextNode(row.text));
+        tipElement.appendChild(line);
+      }
+    } else {
+      tipElement.textContent = content;
+    }
     tipElement.hidden = false;
 
     // Flip to the other side of the cursor rather than running off the edge.

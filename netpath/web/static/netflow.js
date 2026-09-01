@@ -4,6 +4,13 @@
   const SERIES = ['#7AA2F7', '#7DCFB6', '#E5A3C4', '#F2B880', '#A9A0F0',
                   '#69B3D6', '#C3D06A', '#E0868A', '#8FB8A0', '#C9A227'];
   const OTHER = '#4C5561';
+
+  /* One place decides a series' colour. The stacked bands, the legend and
+     the tooltip all read it from here, so a swatch always names the band
+     the cursor is actually over. `index` is the series' position in
+     data.series — never its position after any sorting the caller does. */
+  const seriesColor = (name, index) =>
+    (String(name).startsWith('\u2014') ? OTHER : SERIES[index % SERIES.length]);
   const PROTOCOLS = [['Any protocol', ''], ['TCP', 6], ['UDP', 17], ['ICMP', 1],
                      ['GRE', 47], ['ESP', 50], ['OSPF', 89]];
   const PAD = { left: 62, right: 12, top: 14, bottom: 26 };
@@ -157,7 +164,7 @@
       const name = data.series[index].name;
       svg.appendChild(App.svgNode('polygon', {
         points: points.join(' '),
-        fill: name.startsWith('\u2014') ? OTHER : SERIES[index % SERIES.length],
+        fill: seriesColor(name, index),
         'fill-opacity': 0.85,
       }));
     }
@@ -179,7 +186,7 @@
       if (legendX + width_ > plot.x + plot.w) return;
       svg.appendChild(App.svgNode('rect', {
         x: legendX, y: height - legendH + 6, width: 9, height: 9, rx: 2,
-        fill: label.startsWith('\u2014') ? OTHER : SERIES[index % SERIES.length],
+        fill: seriesColor(label, index),
       }));
       svg.appendChild(App.svgNode('text', {
         x: legendX + 14, y: height - legendH + 14, fill: 'var(--muted)',
@@ -258,18 +265,25 @@
 
   function slotTip(data, slot) {
     const bucket = data.bucket_s;
-    const lines = [App.stamp(data.times[slot], data.times[data.times.length - 1]
-      - data.times[0])];
+    const rows = [{ text: App.stamp(data.times[slot],
+      data.times[data.times.length - 1] - data.times[0]) }];
+    // The index has to survive the sort: it is what maps a series to the
+    // colour of its band, and sorting by volume reorders the rows.
     const pairs = data.series
-      .map((series) => [series.name, series.values[slot] || 0])
-      .filter(([, value]) => value > 0)
-      .sort((a, b) => b[1] - a[1]);
-    for (const [name, value] of pairs.slice(0, 8)) {
-      lines.push(`${name}: ${App.rate(value, bucket)}`);
+      .map((series, index) => ({
+        name: series.name, value: series.values[slot] || 0, index,
+      }))
+      .filter((entry) => entry.value > 0)
+      .sort((a, b) => b.value - a.value);
+    for (const entry of pairs.slice(0, 8)) {
+      rows.push({
+        text: `${entry.name}: ${App.rate(entry.value, bucket)}`,
+        color: seriesColor(entry.name, entry.index),
+      });
     }
     const total = data.series.reduce((sum, s) => sum + (s.values[slot] || 0), 0);
-    lines.push(`total: ${App.rate(total, bucket)}`);
-    return lines.join('\n');
+    rows.push({ text: `total: ${App.rate(total, bucket)}` });
+    return rows;
   }
 
   /* -------------------------------------------------------------- bars */
@@ -293,8 +307,13 @@
         `<span class="bar-value">${row.bytes_text} · ${row.rate_text}</span>`;
       div.onclick = () => filterByBar(row);
       div.style.cursor = 'pointer';
-      const tip = `${row.label}\n${row.bytes_text} · ${row.rate_text}\n` +
-                  `${row.flows} flow records`;
+      // Swatched to match its own bar, and to match the band of the same
+      // name in the chart above it.
+      const tip = [
+        { text: row.label, color: seriesColor(row.label, index) },
+        { text: `${row.bytes_text} · ${row.rate_text}` },
+        { text: `${row.flows} flow records` },
+      ];
       div.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       div.addEventListener('mouseleave', App.hideTooltip);
       wrap.appendChild(div);
@@ -325,6 +344,11 @@
   const COLUMNS = [
     { key: 'ts', label: 'Time', numeric: true, descendingFirst: true,
       width: 92, value: (r) => r.ts },
+    // Second, immediately after Time: which device reported a flow is
+    // context for reading the rest of the row, not a footnote to it. Sorts
+    // on the name where there is one, the way Source and Destination do.
+    { key: 'exporter', label: 'Exporter', width: 150,
+      value: (r) => (r.exporter_name || r.exporter || '').toLowerCase() },
     { key: 'src', label: 'Source', width: 190, value: (r) => r.src_name || r.src_ip },
     { key: 'src_port', label: 'Src port', numeric: true,
       width: 96, value: (r) => r.src_port_num },
@@ -338,7 +362,6 @@
       width: 84, value: (r) => r.packets },
     { key: 'interfaces', label: 'In/Out', sortable: false, width: 96,
       value: (r) => `${r.in_if} / ${r.out_if}` },
-    { key: 'exporter', label: 'Exporter', width: 120 },
     { key: 'route', label: '', sortable: false, width: 84, value: () => '' },
   ];
 
@@ -361,10 +384,16 @@
       const tr = document.createElement('tr');
       const src = record.src_name || record.src_ip || '';
       const dst = record.dst_name || record.dst_ip || '';
+      // Positional: this array and COLUMNS are zipped below, so the two
+      // orders have to move together.
       const cells = [
-        App.clock(record.ts), escape(src), record.src_port, escape(dst),
+        App.clock(record.ts),
+        // Escaped, unlike the bare address it replaces — a device name is
+        // typed by an admin, and this is interpolated into innerHTML.
+        escape(record.exporter_name || record.exporter || ''),
+        escape(src), record.src_port, escape(dst),
         record.dst_port, record.protocol, record.bytes_text, record.packets_text,
-        `${record.in_if} / ${record.out_if}`, record.exporter,
+        `${record.in_if} / ${record.out_if}`,
       ];
       tr.innerHTML = cells.map((value, index) =>
         `<td class="${COLUMNS[index].numeric ? 'num' : ''}">${value}</td>`).join('');
@@ -405,7 +434,10 @@
       tip.push(`protocol    ${record.protocol}`);
       tip.push(`volume      ${record.bytes_text} · ${record.packets_text} packets`);
       tip.push(`interfaces  ${record.in_if} / ${record.out_if}`);
-      tip.push(`exporter    ${record.exporter}`);
+      // Both, always: the name is what identifies the device and the
+      // address is what the collector actually received the flow from.
+      if (record.exporter_name) tip.push(`exporter    ${record.exporter_name}`);
+      tip.push(`${record.exporter_name ? 'exporter IP ' : 'exporter    '}${record.exporter}`);
       const text = tip.join('\n');
       tr.addEventListener('mousemove', (event) => App.tooltip(text, event));
       tr.addEventListener('mouseleave', App.hideTooltip);

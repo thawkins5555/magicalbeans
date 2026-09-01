@@ -6,6 +6,53 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.26.0 — Named exporters, coloured tooltips, Scan radios, 15 more MIB vendors, legacy SSH
+
+- **ConfigRX can talk to older gear again.** A backup failing with
+  `Incompatible ssh peer (no acceptable kex algorithm)` was not a device
+  misconfiguration: paramiko 5.0 *deleted* every SHA-1 key exchange, so a
+  switch offering nothing newer became unreachable the moment that version
+  was installed. `requirements.txt` now pins `paramiko>=3.4,<5`, and
+  ConfigRX offers the legacy key exchanges and `ssh-rsa` host keys — but
+  only ever after the modern ones, and only where the installed paramiko
+  still implements them, which it feature-detects rather than guessing from
+  a version number. A new **Allow legacy SSH algorithms** setting (on by
+  default) turns it off where policy forbids SHA-1. **This only takes
+  effect once `pip install -r requirements.txt` is re-run**, allowing pip
+  to downgrade paramiko; where it cannot, the error now names the cause and
+  both ways out instead of just the symptom.
+- **NetFlow: the Exporter column shows the device's name**, resolved
+  against the Nodes inventory the same way Syslog's Host column and Alerts'
+  Object column resolve theirs — SNMP `sysName`, then a manual device name,
+  then reverse DNS — falling back to the bare address when nothing is
+  known. The row tooltip shows both the name and the address, since the
+  address is what the collector actually received the flow from. The column
+  has also moved to sit **immediately after Time**: which device reported a
+  flow is context for reading the rest of the row, not a footnote to it.
+  The chart legend and the top-talkers bars name the exporter too, so all
+  three agree.
+- **NetFlow: the traffic-over-time tooltip carries colour.** Each
+  application in the tooltip now has a small block in the colour of its own
+  band in the chart, so a line in the tooltip can be matched to the shape it
+  describes without counting stack order. The bars' tooltips are swatched to
+  match as well.
+- **Wireless: a scanning radio is labelled "Scan" rather than converted.**
+  A FortiAP's monitor or sniffer radio is a receiver, so the figure the
+  controller reports for it is neither a transmit power in dBm nor a
+  percentage of one — naming it is more honest than picking a unit for it.
+  This also fixes a real mislabelling introduced in 4.25.0: the
+  dBm-or-percent auto-detection took *every* radio into account, so one
+  scanner reporting an impossible 51 flipped its whole controller's column
+  to "% level" and relabelled the serving radios beside it, which were
+  reporting a perfectly good 17 and 20 dBm. Scanning radios are now left out
+  of that decision, and out of the AP's headline transmit power.
+- **Fifteen more MIB vendors in the catalog**, taking it from 17 bundles to
+  32: **Palo Alto PAN-OS** and the two Ubiquiti files the bundle was missing
+  (both asked for by name), plus Check Point, WatchGuard, Sophos, F5 BIG-IP,
+  Citrix NetScaler, Ruckus, Cambium, Aerohive, Zyxel, TP-Link, Eaton,
+  Vertiv/Liebert, Raritan and Rittal. All 227 files across all 32 bundles
+  were fetched and parsed before shipping.
+
 ### 4.25.0 — Confirmations everywhere, a MIB catalog, ping-measured packet loss
 
 - **Nothing destroys data on a single click any more.** The Debug page's

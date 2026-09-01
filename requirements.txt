@@ -3,4 +3,11 @@ PySide6>=6.5
 # ConfigRX's SSH connectivity, chosen specifically because it keeps a
 # device's SSH password entirely in-process (never on a command line or
 # in a process list) — see CREDENTIAL-SECURITY.md.
-paramiko>=3.4
+# Capped below 5.0: paramiko 5 deleted every SHA-1 key exchange outright
+# (paramiko.kex_group1 is gone, kex_gex keeps only KexGexSHA256, _key_info
+# has no plain ssh-rsa), so a switch that offers nothing newer cannot be
+# reached at all and no setting brings it back. 3.x still implements them
+# and merely leaves them out of its preferred list, which ConfigRX puts
+# back when allow_legacy_ssh is on. Raise this cap once the fleet you back
+# up speaks a modern key exchange.
+paramiko>=3.4,<5

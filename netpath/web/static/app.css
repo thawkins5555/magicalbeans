@@ -699,6 +699,19 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
 }
 
 /* -------------------------------------------------------------- tooltip */
+/* A tooltip built from rows rather than one preformatted string, so a
+   series can carry the colour of the band it names (see App.tooltip). The
+   swatch column is fixed-width and the plain rows are indented to match, so
+   text lines up down the tooltip whether or not a row has one. */
+.tip-row { display: flex; align-items: center; gap: 6px; }
+.tip-swatch {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.tip-row-plain { padding-left: 15px; }
+
 .tooltip {
   position: fixed;
   z-index: 50;

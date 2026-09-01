@@ -480,6 +480,13 @@ def _flow_label(service, dimension: str, key, names: dict | None = None) -> str:
         return protocol_name(key)
     if dimension in ("Ingress interface", "Egress interface"):
         return service.flow_db.interface_names().get(text, text)
+    if dimension == "Exporter":
+        # Same name the Exporter column shows, so the chart, the bars and the
+        # table cannot disagree about what a device is called. filterByBar
+        # sends the key rather than this label, so filtering still keys off
+        # the address.
+        return hostresolve.resolve_name(
+            service.nodes_db, service.app_db, text) or text
     if dimension in ("Source AS", "Destination AS"):
         return f"AS{text}"
     if names and dimension in ADDRESS_DIMENSIONS:
@@ -557,6 +564,17 @@ def get_flow_records(service, params, body) -> dict:
         names = {ip: name for ip, name
                  in service.app_db.hostnames(addresses).items() if name}
     interfaces = service.flow_db.interface_names()
+    # A page of records comes from a handful of exporters, so one lookup per
+    # distinct address is cheap. Resolved through the shared helper rather
+    # than a bespoke query, so the Exporter column agrees with Syslog's Host
+    # column and Alerts' Object column about what a device is called:
+    # SNMP sysName, then a manual name that is not just the address, then
+    # the reverse-DNS cache.
+    exporter_names = {}
+    for address in {r["exporter"] for r in rows if r["exporter"]}:
+        name = hostresolve.resolve_name(service.nodes_db, service.app_db, address)
+        if name and name != address:
+            exporter_names[address] = name
     # Flow-to-path correlation: which NetPath target (if any) last traced a
     # route ending at each address, so the frontend can offer a "view route"
     # link without a per-row round trip.
@@ -590,6 +608,9 @@ def get_flow_records(service, params, body) -> dict:
             "out_if": interfaces.get(f"{row['exporter']}:{row['out_if']}",
                                      str(row["out_if"])),
             "exporter": row["exporter"],
+            # Beside the address, never instead of it: the tooltip shows
+            # both, and the exporter filter keys off the address.
+            "exporter_name": exporter_names.get(row["exporter"]),
         })
     return {"records": records}
 
@@ -2848,9 +2869,20 @@ def _controller_json(row) -> dict:
     }
 
 
+# fgWcWtpRadioMode values for a radio that listens rather than serves. Its
+# "operating power" describes a receiver, so the figure is not a transmit
+# power at all and must not be read as one, averaged into one, or used to
+# decide what unit the serving radios beside it are reporting in.
+_SCAN_MODES = ("monitor", "sniffer")
+
+
+def _is_scan_radio(radio) -> bool:
+    return radio["mode"] in _SCAN_MODES
+
+
 def _radio_json(row) -> dict:
     keys = row.keys()
-    return {
+    radio = {
         "radio_id": row["radio_id"], "channel": row["channel"],
         # Kept named for the MIB's own column, and always raw: whatever unit
         # the reader decides on, the number the agent sent stays visible so
@@ -2859,6 +2891,11 @@ def _radio_json(row) -> dict:
         "mode": (row["mode"] if "mode" in keys else None) or "",
         "station_count": row["station_count"],
     }
+    # Named for what it is rather than converted into a percentage of
+    # something: a scanning radio has no transmit power to express in any
+    # unit, and 51 was never 51% of anything either.
+    radio["is_scan"] = _is_scan_radio(radio)
+    return radio
 
 
 def _power_unit(service, powers) -> str:
@@ -2872,6 +2909,11 @@ def _power_unit(service, powers) -> str:
     is a percentage, since no radio in the same chassis switches units.
     Decided per controller, not per radio, so one AP cannot flip the label
     on its neighbours.
+
+    `powers` must already exclude scanning radios. Feeding a monitor radio's
+    receive figure in here was a real bug: one scanner reporting 51 flipped
+    an entire controller's column to "% level", so a FAP-231F's serving
+    radios at a genuine 17 and 20 dBm were relabelled as percentages.
     """
     from ..fortinetoids import MAX_PLAUSIBLE_DBM
 
@@ -2886,7 +2928,10 @@ def _ap_json(service, row) -> dict:
     # The at-a-glance table shows one tx-power figure per AP; a real AP
     # has one radio per band, so this is the strongest of them rather
     # than an arbitrary "first" pick.
-    powers = [r["operating_power_dbm"] for r in radios if r["operating_power_dbm"] is not None]
+    # Scanning radios are excluded from both the unit detection and the
+    # headline figure: neither question is about them.
+    powers = [r["operating_power_dbm"] for r in radios
+              if r["operating_power_dbm"] is not None and not r["is_scan"]]
     channels = [str(r["channel"]) for r in radios if r["channel"] not in (None, "")]
     radio_stations = [r["station_count"] for r in radios if r["station_count"] is not None]
     return {

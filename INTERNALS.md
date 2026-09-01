@@ -2046,6 +2046,15 @@ is always carried through to the AP detail pane so the guess is
 auditable, and the JSON field keeps its MIB name
 (`operating_power_dbm`) rather than being renamed to match a guess.
 
+**A scanning radio is excluded, not converted.** `api._SCAN_MODES` is
+`monitor`/`sniffer`; `_radio_json` stamps `is_scan` from it, and `_ap_json`
+filters those radios out of *both* the `powers` list fed to `_power_unit` and
+the `tx_power_dbm` maximum. That exclusion is a bug fix, not a refinement:
+4.25.0 fed every radio into the ceiling test, so one scanner reporting 51
+flipped its entire controller to "% level" and relabelled serving radios that
+were reporting a genuine 17 and 20 dBm. The frontend renders `Scan` for such a
+radio ahead of any unit choice, and still prints its raw value beside it.
+
 **Radio mode** (`fgWcWtpSessionRadioMode`, column 3, `FgWcWtpRadioMode` =
 other/notExist/disabled/ap/monitor/sniffer) is walked and stored decoded
 in `radios.mode`, added by `wirelessdb._migrate()`. It is what explains a
@@ -2147,6 +2156,30 @@ literal command text. There is no exec-command endpoint, no command
 parameter anywhere in `api.py`'s ConfigRX handlers, and no free-form
 input field anywhere in `configrx.js` — grep for `channel.send` in
 `configrx.py` to confirm this hasn't grown a second call site.
+
+**Legacy key exchange is feature-detected, and the version cap is the real
+fix.** `configrx._apply_legacy_algorithms(paramiko)` appends
+`diffie-hellman-group-exchange-sha1` / `-group14-sha1` / `-group1-sha1` and
+`ssh-rsa` / `ssh-dss` to `Transport._preferred_kex` and `_preferred_keys` —
+but only the names that `Transport._kex_info` / `_key_info` actually contain,
+which is the whole trick. paramiko 3.x *implements* those classes and merely
+leaves them out of its preferred list, where re-adding them works; paramiko
+5.0 **deleted** them (`paramiko.kex_group1` is gone, `kex_gex` keeps only
+`KexGexSHA256`, `_key_info` has no plain `ssh-rsa`), so there is nothing to
+re-add and a version check would have to guess which world it is in. They are
+*appended*, so a device capable of curve25519 still negotiates it and only one
+offering nothing better falls this far; the function is idempotent, so
+restarting the worker does not grow the lists. It runs once from `start()`,
+gated on the `allow_legacy_ssh` setting, because it edits class-level state.
+
+Because paramiko 5 cannot be fixed in code, `requirements.txt` pins
+`paramiko>=3.4,<5`. `_connect_error_text()` covers the gap for an environment
+that still has 5 installed: when a connect failure mentions kex *and*
+`_legacy_kex_available` is False, it appends the cause and both remedies to
+paramiko's own message, which otherwise says only "no acceptable kex
+algorithm" and reads like a device problem. When legacy KEX *is* available the
+device really did refuse, so the original text is left alone — the flag is
+what distinguishes the two.
 
 **paramiko is imported lazily and its absence is a status, not a crash.**
 It is the one third-party dependency in this otherwise stdlib-only app,
@@ -2296,6 +2329,18 @@ close handlers no-ops while set, so a restart in progress can't be
 dismissed by accident — every other modal in the app ignores the second
 `button` argument and the lock entirely, so this was additive rather than
 a rewrite.
+
+`App.tooltip(content, event)` takes either a string — assigned with
+`textContent`, which is what every caller that has one still does — or an array
+of `{text, color}` rows. Rows are built with `createElement`/`textContent` and
+never `innerHTML`, so a hostname or a MIB object name can never become markup on
+its way into a tooltip; the only thing that reaches a style is the colour, and
+that always comes from a palette constant rather than from data. NetFlow's
+`seriesColor(name, index)` is the single source of a series' colour, shared by
+the stacked bands, the legend and the tooltip. The subtlety worth knowing:
+`slotTip` sorts its rows by volume, so it has to carry each series' *original*
+index through the sort — pairing row N with series N after sorting gives every
+line the wrong colour, which looks plausible and is wrong.
 
 `App.confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
 afterClose)` is the one confirmation shape, matching the eight

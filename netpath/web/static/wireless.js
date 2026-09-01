@@ -72,8 +72,14 @@
      observed to report its own 0-100 tx-power level in it — a FortiAP
      reporting "51" is reporting a level, since 51 dBm would be ~126 W. The
      server decides which reading applies per controller (see api._power_unit)
-     and says so here, rather than stamping "dBm" on a number that isn't. */
-  function powerText(value, unit) {
+     and says so here, rather than stamping "dBm" on a number that isn't.
+
+     A monitor or sniffer radio is reported as "Scan" and not converted at
+     all: it is a receiver, so its figure is neither a transmit power in dBm
+     nor a percentage of one, and naming it is more honest than picking a
+     unit for a number that has neither. */
+  function powerText(value, unit, isScan) {
+    if (isScan) return 'Scan';
     if (value == null) return '—';
     return unit === 'percent' ? `${value}% level` : `${value} dBm`;
   }
@@ -97,7 +103,10 @@
     { key: 'model', label: 'Model', width: 120, on: true },
     { key: 'mac_address', label: 'MAC address', width: 140, on: true },
     { key: 'tx_power_dbm', label: 'Tx power', width: 100, numeric: true, on: true,
-      cell: (r) => powerText(r.tx_power_dbm, r.power_unit) },
+      // The AP row's figure already excludes its scanning radios, so an AP
+      // whose only radios scan has nothing to show rather than a "Scan" that
+      // would imply the whole AP is one.
+      cell: (r) => powerText(r.tx_power_dbm, r.power_unit, false) },
     { key: 'controller_id', label: 'Controller', width: 140,
       cell: (r) => escape(controllerName(r.controller_id)),
       value: (r) => controllerName(r.controller_id).toLowerCase() },
@@ -204,15 +213,16 @@
         `  channel      ${radio.channel ?? '—'}`,
         // Both the reading and the number it was read from, so an operator
         // can check the guess against the controller's own display.
-        `  tx power     ${powerText(raw, row.power_unit)}` +
+        `  tx power     ${powerText(raw, row.power_unit, radio.is_scan)}` +
           (raw != null ? `  (raw ${raw})` : ''),
         `  clients      ${radio.station_count ?? '—'}`, '');
     }
-    if (row.radios.some((radio) => radio.mode === 'monitor'
-                                || radio.mode === 'sniffer')) {
-      lines.push('A monitor or sniffer radio scans rather than serving',
-                 'clients, so its power and client count describe a',
-                 'receiver and are not comparable to an AP radio.', '');
+    if (row.radios.some((radio) => radio.is_scan)) {
+      lines.push('A radio shown as Scan is in monitor or sniffer mode: it',
+                 'listens rather than serving clients, so the figure the',
+                 'controller reports for it describes a receiver and is not',
+                 'a transmit power. It is left out of this AP\'s tx power',
+                 'and out of the dBm-or-percent decision for the others.', '');
     }
     App.el('wl-detail').textContent = lines.join('\n');
   }

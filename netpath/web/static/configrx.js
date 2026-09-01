@@ -279,6 +279,19 @@
           value="${s.retention_count_per_device}"></label>
         <p class="hint">An unchanged config never creates a new stored backup, so a
           device that never changes stays at one row regardless of these caps.</p>
+      </fieldset>
+      <fieldset><legend>SSH</legend>
+        <label class="check"><input type="checkbox" id="cxs-legacy"
+          ${s.allow_legacy_ssh !== false ? 'checked' : ''}> Allow legacy SSH
+          algorithms</label>
+        <p class="hint">Offers SHA-1 key exchange (diffie-hellman-group14-sha1 and
+          older) and ssh-rsa host keys as a last resort, which is the best many
+          older switches, routers and firewalls can do — and backing those up is
+          what this module is for. A device that speaks something modern still
+          negotiates it; these are only ever offered after the modern ones. Turn
+          this off where policy forbids SHA-1. It has no effect unless the
+          installed paramiko still implements those algorithms: paramiko 5 removed
+          them, so this app pins paramiko below 5.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
@@ -287,6 +300,7 @@
           backup_interval_hours: Number(m.querySelector('#cxs-interval').value),
           retention_days: Number(m.querySelector('#cxs-days').value),
           retention_count_per_device: Number(m.querySelector('#cxs-count').value),
+          allow_legacy_ssh: m.querySelector('#cxs-legacy').checked,
         } });
         await App.loadState();
         App.closeModal();

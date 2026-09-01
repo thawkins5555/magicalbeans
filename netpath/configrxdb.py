@@ -63,6 +63,13 @@ DEFAULTS = {
     "backup_interval_hours": 24,
     "retention_days": 90,
     "retention_count_per_device": 30,
+    # Offer SHA-1 key exchange and ssh-rsa host keys as a last resort, for
+    # the older switches and firewalls that offer nothing newer. On by
+    # default because backing those up is the job; turn it off where policy
+    # forbids SHA-1 and every device is known to speak something modern.
+    # Only effective when the installed paramiko still implements them —
+    # paramiko 5 removed the code (see configrx._apply_legacy_algorithms).
+    "allow_legacy_ssh": True,
 }
 
 DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")
