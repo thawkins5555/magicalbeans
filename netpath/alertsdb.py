@@ -138,6 +138,11 @@ DEFAULTS = {
     # cabled yet, still booting. Alerts for it are held this long and then
     # fired only if the condition is still true. 0 disables the hold.
     "new_device_grace_s": 300,
+    # When a device stops answering, resolve and suppress the alerts that only
+    # restate the outage — high ping time, packet loss, and every SNMP-polled
+    # metric — leaving one "Device not responding". See alertrules.ROLLED_UP_BY
+    # for exactly which, and why interface alerts are not among them.
+    "rollup_enabled": True,
 }
 
 PENDING_SCHEMA = """
@@ -242,6 +247,14 @@ class AlertsDatabase:
             if column not in rules:
                 self._conn.execute(
                     f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
+        alerts = {row["name"] for row in
+                  self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        if "rollup_note" not in alerts:
+            # What this alert absorbed, one line per rolled-up alert. Its own
+            # column rather than appended to `detail`, which open_or_increment
+            # overwrites every time the same alert recurs.
+            self._conn.execute(
+                "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
 
     def close(self) -> None:
         with self._lock:
@@ -627,6 +640,34 @@ class AlertsDatabase:
             self._conn.commit()
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+
+    def open_by_dedup(self, dedup_key: str) -> sqlite3.Row | None:
+        """The open (or acknowledged) alert for this dedup key, if any.
+
+        Acknowledged counts as open on purpose: an operator who has seen the
+        outage and ticked it off has not made the device reachable, so the
+        alerts it implies are still redundant.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
+                (dedup_key,)).fetchone()
+
+    def add_rollup_note(self, alert_id: int, line: str) -> None:
+        """Appends one line to an alert's rollup note, skipping duplicates so
+        a flapping device does not grow the same line hundreds of times."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT rollup_note FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+            if row is None:
+                return
+            existing = row["rollup_note"] or ""
+            if line in existing.split("\n"):
+                return
+            merged = (existing + "\n" + line).strip() if existing else line
+            self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",
+                               (merged, alert_id))
+            self._conn.commit()
 
     def acknowledge(self, alert_id: int, by: str, note: str = "") -> None:
         with self._lock:

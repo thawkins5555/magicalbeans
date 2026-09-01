@@ -200,6 +200,43 @@
     App.refreshNow('nodes');
   }
 
+  async function bulkPollNow() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    const button = App.el('nd-bulk-poll');
+    if (button.disabled) return;
+    // No confirm dialog: polling a device only reads it, and is exactly what
+    // the scheduler does on its own every interval.
+    const settle = (text) => {
+      button.disabled = false;
+      button.textContent = text;
+      if (text !== 'Poll now') {
+        setTimeout(() => {
+          if (button.textContent === text) button.textContent = 'Poll now';
+        }, 3000);
+      }
+    };
+    button.disabled = true;
+    button.textContent = 'Polling…';
+    let result;
+    try {
+      result = await App.post('/api/nodes/devices/bulk-poll', { device_ids: ids });
+    } catch (error) {
+      settle('Failed');
+      return;
+    }
+    // The POST returning means "queued": a poll runs on a worker thread and
+    // finishes when the device answers, which the list shows by its Last poll
+    // column moving. A device already mid-poll cannot be polled again, and
+    // saying so beats claiming credit for the poll that was already running.
+    const queued = (result.queued || []).length;
+    const busy = (result.already_polling || []).length;
+    if (!queued) settle(busy ? `${busy} already polling` : 'Nothing to poll');
+    else if (busy) settle(`Polling ${queued}, ${busy} already running`);
+    else settle(`Polling ${queued}…`);
+    App.refreshNow('nodes');
+  }
+
   function bulkSetProfile() {
     const ids = [...view.devicesChecked];
     if (!ids.length) return;
@@ -2133,7 +2170,14 @@
       button.disabled = true;
       button.textContent = 'Polling…';
       try {
-        await App.post(`/api/nodes/devices/${deviceId}/poll`, {});
+        const result = await App.post(`/api/nodes/devices/${deviceId}/poll`, {});
+        if (result && result.queued === false) {
+          // A poll for this device was already in flight, so this click
+          // started nothing. Watching last_poll_ts from here would report
+          // "Polled" off the other poll's completion.
+          settle('Already polling…');
+          return;
+        }
       } catch (error) {
         settle('Failed');
         return;
@@ -2175,6 +2219,7 @@
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-offline').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
+    App.el('nd-bulk-poll').onclick = bulkPollNow;
     App.el('nd-bulk-profile').onclick = bulkSetProfile;
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;

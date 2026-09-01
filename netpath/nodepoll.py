@@ -303,8 +303,13 @@ class NodePoller:
     def next_runs(self) -> dict[int, float]:
         return dict(self._next_run)
 
-    def poll_now(self, device_id: int) -> None:
-        self._submit(device_id)
+    def poll_now(self, device_id: int) -> bool:
+        """Submits this device to the worker pool now, ahead of its interval.
+        True when it was queued, False when a poll for it was already queued
+        or running — a click during an in-flight poll cannot start a second
+        one, and reporting "Polled" off the first one's completion claimed
+        credit for work the click did not cause."""
+        return self._submit(device_id)
 
     def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
         """The device a browser has selected polls at interval_s until the
@@ -442,16 +447,20 @@ class NodePoller:
                         self._submit(device["id"])
             self._stop.wait(1.0)
 
-    def _submit(self, device_id: int) -> None:
+    def _submit(self, device_id: int) -> bool:
+        """True when this call put the device on the pool; False when it was
+        already queued or running, or the pool has shut down."""
         with self._lock:
             if device_id in self._queued or device_id in self._started:
-                return
+                return False
             self._queued[device_id] = time.time()
         try:
             self._executor.submit(self._run_one, device_id)
         except RuntimeError:
             with self._lock:
                 self._queued.pop(device_id, None)
+            return False
+        return True
 
     def _record_overrun(self, device, now) -> None:
         self.counters["overruns"] += 1

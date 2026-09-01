@@ -33,11 +33,37 @@ from .configrxdb import ConfigRxDatabase
 from .eventlog import CONFIGRX, ERROR, NullLog
 
 CONNECT_TIMEOUT_S = 10
-SHELL_QUIET_S = 1.5
-SHELL_MAX_S = 25
+# Quiet fallback for a device whose prompt could not be learned. Deliberately
+# far longer than the 1.5s it used to be: a switch answers "Building
+# configuration..." immediately and then thinks, and 1.5s of that thinking
+# used to end the read and store the banner as the whole backup.
+SHELL_QUIET_S = 8.0
+SHELL_SETUP_MAX_S = 15          # per pager_off line
+# How many pager prompts to answer before deciding paging cannot be turned
+# off on this device. A real config is longer than one screen but not
+# thousands of them; a loop here would otherwise sit answering forever.
+MAX_PAGER_REPLIES = 2000
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x08")
 _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
+# The marker anywhere in a line, for stripping it back out of a capture that
+# was paged through (the device erases its own marker with backspaces, which
+# _ANSI_RE removes, leaving the bare text mid-line).
+_PAGER_INLINE_RE = re.compile(
+    r"-{2,}\s*\(?\s*more[^)\n]{0,12}\)?\s*-{0,3}", re.IGNORECASE)
+# The same thing, matched at the END of a buffer with no trailing newline —
+# which is how it actually arrives, because the device is sitting there
+# waiting for a keypress. Covers Cisco's "--More--", HP's "-- MORE --" and
+# Junos' "---(more 23%)---".
+_PAGER_TAIL_RE = re.compile(
+    r"-{2,}\s*\(?\s*more[^)\n]{0,12}\)?\s*-{0,3}\s*$", re.IGNORECASE)
+# A prompt ends in one of these once the shell is ready for another command.
+_PROMPT_ENDS = "#>$%"
+# The line a device prints before it starts building its config. Seeing it as
+# the LAST thing in a capture means the read ended while the device was still
+# working — the exact failure this module shipped with.
+_STILL_WORKING_RE = re.compile(r"building configuration|^\s*\.{2,}\s*$",
+                               re.IGNORECASE)
 
 # paramiko is the one third-party dependency in this otherwise stdlib-only
 # app, and it is imported lazily (inside the backup path) so that a machine
@@ -245,10 +271,17 @@ def _offered_algorithms_detail() -> str:
 def _clean_output(raw: str) -> str:
     """Strips ANSI escape sequences and pager prompts a device's shell may
     have echoed back even with paging disabled. Best-effort — this is
-    display/storage hygiene, not a parser, so it never raises."""
+    display/storage hygiene, not a parser, so it never raises.
+
+    Two passes over pager markers, because they arrive two ways: on a line of
+    their own (paging left on, the device drew "--More--" and a newline), and
+    embedded mid-line where the device erased its own marker with backspaces
+    after we answered it. The second is what a paged capture looks like now
+    that _read_until_prompt answers pagers instead of waiting them out.
+    """
     text = _ANSI_RE.sub("", raw).replace("\r", "")
     lines = [line for line in text.split("\n") if not _PAGER_RE.match(line)]
-    return "\n".join(lines).strip() + "\n"
+    return _PAGER_INLINE_RE.sub("", "\n".join(lines)).strip() + "\n"
 
 
 class _AcceptAndRecordPolicy:
@@ -265,42 +298,153 @@ class _AcceptAndRecordPolicy:
         client.get_host_keys().add(hostname, key.get_name(), key)
 
 
-def _drain(channel, quiet_s: float, max_s: float) -> str:
+def _learn_prompt(banner: str) -> str:
+    """The device's shell prompt, taken from the last non-blank line of the
+    login banner — "switch#", "fw01 #", "[admin@rtr] >".
+
+    Empty when that line does not look like a prompt, which is the honest
+    answer for a device that logs in straight into a menu or prints a motd
+    last. A wrong prompt is worse than none: it would end every read at the
+    first config line that happened to match, so the callers fall back to a
+    silence timeout instead of guessing.
+    """
+    text = _ANSI_RE.sub("", banner or "").replace("\r", "")
+    for line in reversed(text.split("\n")):
+        if not line.strip():
+            continue
+        candidate = line.strip()
+        return candidate if candidate[-1] in _PROMPT_ENDS else ""
+    return ""
+
+
+def _waiting_at(text: str, needle_re=None, prompt: str = "") -> bool:
+    """True when the device has stopped talking and is sitting at `prompt`
+    (or at a pager marker matching `needle_re`) waiting for input.
+
+    The "waiting" part is what makes this safe to check against a stream that
+    is still arriving: a prompt is written WITHOUT a trailing newline, because
+    the cursor stays on it. A config line that merely reads "switch#" is
+    followed by a newline and so never ends the read.
+    """
+    tail = _ANSI_RE.sub("", text[-4096:]).replace("\r", "").rstrip(" \t")
+    if not tail or tail.endswith("\n"):
+        return False
+    if needle_re is not None:
+        return bool(needle_re.search(tail))
+    return bool(prompt) and tail.split("\n")[-1].strip() == prompt
+
+
+def _read_until_prompt(channel, prompt: str, max_s: float,
+                       quiet_s: float = SHELL_QUIET_S) -> tuple[str, str]:
+    """Reads a command's output until the device is finished with it.
+
+    Returns (text, ended) where `ended` is how the read stopped:
+
+      "prompt"     the device's prompt came back — the command is complete.
+      "quiet"      no prompt was learned (or it never returned) and the device
+                   went quiet for quiet_s. Complete as far as we can tell.
+      "pager-loop" the device kept asking for a keypress past MAX_PAGER_REPLIES.
+      "timeout"    the max_s ceiling was hit mid-output — TRUNCATED.
+      "closed"     the device hung up.
+
+    Ending on silence alone is what produced the two-line backups this
+    replaced: a Cisco answers "Building configuration..." instantly and then
+    thinks for several seconds, so any quiet window shorter than its thinking
+    time ends the read on the banner. The prompt is what a human waits for,
+    so it is what this waits for; silence is only the fallback.
+    """
     channel.settimeout(0.5)
-    chunks = []
+    chunks: list[str] = []
     started = time.time()
     last_data = started
+    pager_replies = 0
     while True:
         now = time.time()
         if now - started > max_s:
-            break
+            return "".join(chunks), "timeout"
         if chunks and now - last_data > quiet_s:
-            break
+            return "".join(chunks), "quiet"
         try:
             data = channel.recv(65536)
         except socket.timeout:
             continue
+        except OSError:
+            return "".join(chunks), "closed"
         if not data:
-            break
+            return "".join(chunks), "closed"
         chunks.append(data.decode("utf-8", "replace"))
         last_data = time.time()
-    return "".join(chunks)
+        text = "".join(chunks)
+        if _waiting_at(text, needle_re=_PAGER_TAIL_RE):
+            if pager_replies >= MAX_PAGER_REPLIES:
+                return text, "pager-loop"
+            pager_replies += 1
+            channel.send(" ")
+            continue
+        if _waiting_at(text, prompt=prompt):
+            return text, "prompt"
 
 
-def _pull_config(client, vendor: configrx_vendors.Vendor) -> str:
+def _pull_config(client, vendor: configrx_vendors.Vendor,
+                 max_s: float) -> tuple[str, str]:
     """The only function in this file that talks to a device's shell.
-    Sends exactly vendor.pager_off, then vendor.show_config — nothing
-    else is ever written to this channel."""
+
+    Sends exactly vendor.pager_off, then vendor.show_config — nothing else,
+    with one deliberate exception: when the device stops mid-output at its own
+    pager marker ("--More--"), a single space character is sent to advance it.
+    That is a fixed in-band answer to a prompt the device raised, carrying no
+    newline and no text, so it cannot execute anything; it is the keypress a
+    human would make. The boundary — only pager_off and show_config are ever
+    run on the device — is intact.
+
+    Returns (raw text, how the read ended); see _read_until_prompt.
+    """
     channel = client.invoke_shell(width=512, height=1000)
     try:
-        _drain(channel, quiet_s=0.5, max_s=5)          # the login banner/prompt
+        # The login banner. No prompt is known yet, so this one genuinely does
+        # end on silence — and its last line is where the prompt comes from.
+        banner, _ = _read_until_prompt(channel, "", max_s=5, quiet_s=0.5)
+        prompt = _learn_prompt(banner)
         for line in vendor.pager_off:
             channel.send(line + "\n")
-            _drain(channel, quiet_s=0.5, max_s=5)
+            _read_until_prompt(channel, prompt, max_s=SHELL_SETUP_MAX_S, quiet_s=0.5)
         channel.send(vendor.show_config + "\n")
-        return _drain(channel, quiet_s=SHELL_QUIET_S, max_s=SHELL_MAX_S)
+        return _read_until_prompt(channel, prompt, max_s=max_s)
     finally:
         channel.close()
+
+
+# A real "show running-config" is hundreds of lines. This floor only has to
+# be above the failure it exists to catch — the ~45 characters of echoed
+# command plus "Building configuration..." that used to be stored as a whole
+# backup — while staying under the smallest plausible real config.
+MIN_CONFIG_CHARS = 200
+
+
+def _capture_problem(cleaned: str, ended: str) -> str:
+    """Why this capture must not be stored, or "" when it looks complete."""
+    body = cleaned.strip()
+    if not body:
+        return "The device returned no output for the show-config command"
+    if ended == "timeout":
+        return ("The device was still sending its config when the capture "
+                "timeout was reached, so the capture is incomplete. Raise "
+                "the capture timeout in ConfigRX settings.")
+    if ended == "pager-loop":
+        return ("The device kept asking for a keypress to continue, so paging "
+                "could not be turned off. Check the vendor override for this "
+                "device.")
+    if ended == "closed":
+        return "The device closed the connection before the config finished"
+    last = [line for line in body.split("\n") if line.strip()][-1]
+    if _STILL_WORKING_RE.search(last):
+        return ("The device was still building its config when the read "
+                "ended, so only the banner was captured")
+    if len(body) < MIN_CONFIG_CHARS:
+        return (f"The device returned only {len(body)} characters, which is too "
+                f"short to be a config — the command may not be right for this "
+                f"vendor, or the account may lack the privilege to run it")
+    return ""
 
 
 class ConfigRxWorker:
@@ -494,7 +638,11 @@ class ConfigRxWorker:
         finally:
             password = None
         try:
-            raw = _pull_config(client, vendor)
+            capture_max_s = float(self.db.settings().get("capture_timeout_s", 180))
+        except (TypeError, ValueError):
+            capture_max_s = 180.0
+        try:
+            raw, ended = _pull_config(client, vendor, max_s=capture_max_s)
         except Exception as exc:
             self.db.record_backup_attempt(device_id, ok=False, status="error", error=str(exc))
             return
@@ -502,10 +650,17 @@ class ConfigRxWorker:
             client.close()
 
         cleaned = _clean_output(raw)
-        if len(cleaned.strip()) < 20:
-            self.db.record_backup_attempt(
-                device_id, ok=False, status="error",
-                error="The device returned no usable output for the show-config command")
+        # A truncated capture must never be stored. Storing one is worse than
+        # storing nothing: it overwrites nothing, but it becomes the newest
+        # "good" version, so the next real backup reads as a huge change and
+        # a restore from history hands someone a two-line file. Each of these
+        # is recorded as a failed attempt naming what actually went wrong.
+        problem = _capture_problem(cleaned, ended)
+        if problem:
+            self.db.record_backup_attempt(device_id, ok=False, status="error", error=problem)
+            self.log.add(CONFIGRX, f"Discarded a truncated config capture from {device['ip']}",
+                         detail=f"{problem}\n\nCaptured {len(cleaned.strip())} characters, "
+                                f"read ended on '{ended}'.")
             return
 
         backup_id, _digest = self.db.add_backup(device_id, cleaned)

@@ -18,6 +18,13 @@
   --overrun: #4DB6AC;
   --error: #A371F7;
   --nodata: #1E242D;
+  /* Ticked-for-a-bulk-action rows. Solid rather than a translucent accent so
+     the tint is identical on the odd and even table stripes — the point is a
+     single unbroken bar across the row. --checked-strong is the same colour a
+     step further along, for a row that is both ticked and open in the detail
+     pane. */
+  --checked: #22304A;
+  --checked-strong: #2E4470;
 
   --canvas: #FFFFFF;
   --canvas-panel: #F4F6F9;
@@ -491,10 +498,15 @@ td { padding: 4px 8px; border-bottom: 1px solid var(--grid); color: var(--text);
 tr:nth-child(even) td { background: var(--raised); }
 tr.clickable { cursor: pointer; }
 tr.selected td { background: var(--hairline); }
-/* Ctrl/Cmd-click bulk selection — an inset accent border, distinct from
-   .selected's background tint, since a row can be both at once (checked
-   for a bulk action while also being the open detail-pane row). */
-tr.bulk-checked td { box-shadow: inset 3px 0 0 var(--accent); }
+/* A ticked checkbox tints the whole row. This used to be
+   `box-shadow: inset 3px 0 0 var(--accent)`, which draws that bar on the left
+   edge of EVERY cell — under table-layout: fixed that reads as a blue stripe
+   at each column divider rather than as a selected row.
+   A row can be both ticked and open in the detail pane, so the combination
+   gets its own rule instead of letting one of the two tints win. Shared by
+   Nodes, Alerts and ConfigRX, which all use the same class. */
+tr.bulk-checked td { background: var(--checked); }
+tr.bulk-checked.selected td { background: var(--checked-strong); }
 td.num { text-align: right; }
 
 /* Sortable, resizable tables. Fixed layout so the colgroup widths are obeyed

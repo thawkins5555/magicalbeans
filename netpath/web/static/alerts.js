@@ -244,6 +244,8 @@
       <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
       <p>${escape(row.message)}</p>
       ${row.detail ? `<p class="hint">${escape(row.detail)}</p>` : ''}
+      ${row.rollup_note ? `<p class="hint"><b>Rolled up into this alert</b><br>` +
+        `${escape(row.rollup_note).split('\n').join('<br>')}</p>` : ''}
       <p class="hint">Opened ${new Date(row.opened_ts * 1000).toLocaleString()} · ` +
         `last seen ${new Date(row.last_ts * 1000).toLocaleString()} · occurred ${row.count} time(s)</p>
       ${row.acked_by ? `<p class="hint">Acknowledged by ${escape(row.acked_by)}${row.ack_note ? `: ${escape(row.ack_note)}` : ''}</p>` : ''}
@@ -580,6 +582,17 @@
           true. One that settles inside the window never alerts at all. A
           one-off event that cannot still be true later (rebooted, recovered)
           is dropped rather than raised late. 0 turns the hold off.</p>
+        ${check('as-rollup', 'Roll implied alerts up under the device-down alert',
+                s.rollup_enabled !== false)}
+        <p class="hint">A device that has stopped answering also looks slow and
+          lossy, and its CPU, memory, interface and storage figures stop being
+          measurable — so one outage used to arrive as five or six emails. With
+          this on, only <b>Device not responding</b> is raised: the ping and
+          SNMP-metric alerts it implies are resolved into it and named in its
+          details. Interface up/down and flapping alerts are never rolled up —
+          a port that went down for its own reason is still worth knowing about.
+          When the device comes back, any metric that is genuinely still
+          breaching re-opens on the next poll by itself.</p>
       </fieldset>
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
@@ -621,6 +634,7 @@
           smtp_to_default: recipients, renotify_minutes: num('#as-renotify'),
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
           new_device_grace_s: num('#as-grace') * 60,
+          rollup_enabled: on('#as-rollup'),
         } });
         await App.loadState();
         App.closeModal();

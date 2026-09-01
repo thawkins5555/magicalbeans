@@ -21,8 +21,8 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import hostresolve
-from .alertrules import CLEARS, Occurrence, dedup_key, evaluate_flapping, \
-    evaluate_threshold, match_device
+from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, Occurrence, dedup_key, \
+    evaluate_flapping, evaluate_threshold, match_device
 from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
@@ -64,7 +64,8 @@ class AlertEngine:
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
-                         "emails_sent": 0, "suppressed": 0, "send_errors": 0}
+                         "emails_sent": 0, "suppressed": 0, "send_errors": 0,
+                         "rolled_up": 0}
         self.error: str | None = None
         self._last_tick_ts: float = 0.0
 
@@ -605,12 +606,64 @@ class AlertEngine:
 
     # ---------------------------------------------------------------- apply
 
+    # ------------------------------------------------------------- rollup
+
+    def _rollup_parent(self, rule, occurrence: Occurrence):
+        """The open alert that already says what `rule` is about to say, or
+        None. See alertrules.ROLLED_UP_BY for which rules have a parent."""
+        parent_key = ROLLED_UP_BY.get(rule["key"] or "")
+        if not parent_key or occurrence.entity_kind != "device":
+            return None
+        parent_rule = self.db.rule_by_key(parent_key)
+        if parent_rule is None or not parent_rule["enabled"]:
+            return None
+        return self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
+
+    def _absorb_subordinates(self, parent_rule, occurrence: Occurrence,
+                             parent_row) -> None:
+        """Resolve the alerts a just-opened parent makes redundant.
+
+        Resolved rather than left open, because an operator working the list
+        should see one row for one outage — and the recovery path puts them
+        back on their own: device_up resolves device_down through CLEARS, and
+        _evaluate_thresholds re-derives every threshold from live metrics on
+        the very next tick, so a metric that is genuinely still breaching
+        re-opens without anything having to un-suppress it.
+
+        Deliberately silent: no clear email goes out for an absorbed alert.
+        Fewer emails for one outage is the whole point, and "packet loss
+        recovered" while the device is still down would be a lie.
+        """
+        for child_key in ROLLS_UP.get(parent_rule["key"] or "", ()):
+            child_rule = self.db.rule_by_key(child_key)
+            if child_rule is None:
+                continue
+            resolved = self.db.resolve_by_dedup(
+                dedup_key(child_rule, occurrence),
+                by=f"rolled up into {parent_rule['name']}")
+            if resolved:
+                self.counters["resolved"] += 1
+                self.db.add_rollup_note(
+                    parent_row["id"],
+                    f"Resolved “{child_rule['name']}” — implied by this outage")
+
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
+        rollup = bool(settings.get("rollup_enabled", True))
         for rule in rules:
             if rule["kind"] != occurrence.kind:
                 continue
+            # A rule's source_kind, when set, is which event/metric it is
+            # about; an occurrence that is about something else is not this
+            # rule's business. "threshold" belongs on this list and used to be
+            # missing, which meant a single CPU breach opened all eleven
+            # threshold alerts for that device — every one of them carrying
+            # the CPU occurrence's message.
+            #
+            # syslog and ipam are deliberately absent: their occurrences
+            # always carry source_kind "", so filtering on it would silently
+            # stop matching any custom rule that has one set.
             if rule["kind"] in ("device_event", "interface_event", "trap",
-                                "wireless_event", "dhcp_threshold"):
+                                "wireless_event", "threshold", "dhcp_threshold"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "syslog" and occurrence.severity is not None:
@@ -623,12 +676,26 @@ class AlertEngine:
             if not match_device(rule, occurrence):
                 continue
             key = dedup_key(rule, occurrence)
+            if rollup:
+                parent = self._rollup_parent(rule, occurrence)
+                if parent is not None:
+                    # Not opened at all, so no email and no row to work. The
+                    # parent says where it went, so the latency alert an
+                    # operator expected to see is accounted for rather than
+                    # just missing.
+                    self.counters["rolled_up"] += 1
+                    self.db.add_rollup_note(
+                        parent["id"],
+                        f"Suppressed “{rule['name']}” — implied by this outage")
+                    continue
             row, is_new = self.db.open_or_increment(
                 rule["id"], key, occurrence.entity_kind, occurrence.entity_id,
                 occurrence.entity_label, rule["severity"], occurrence.message,
                 occurrence.detail, occurrence.ts)
             if is_new:
                 self.counters["opened"] += 1
+                if rollup and (rule["key"] or "") in ROLLS_UP:
+                    self._absorb_subordinates(rule, occurrence, row)
             renotify_minutes = float(settings.get("renotify_minutes", 0))
             should_notify = is_new
             if not is_new and renotify_minutes > 0 and row["state"] == "open":

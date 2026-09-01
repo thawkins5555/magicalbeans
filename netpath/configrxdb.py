@@ -63,6 +63,12 @@ DEFAULTS = {
     "backup_interval_hours": 24,
     "retention_days": 90,
     "retention_count_per_device": 30,
+    # Ceiling on one "show config" read, in seconds. Only a ceiling — the read
+    # normally ends the moment the device's prompt comes back, so a fast switch
+    # is not slowed by a generous value here. Set high because a large config
+    # over a slow WAN link legitimately takes minutes, and cutting the read
+    # short is how a partial config gets captured.
+    "capture_timeout_s": 180,
     # Offer SHA-1 key exchange and ssh-rsa host keys as a last resort, for
     # the older switches and firewalls that offer nothing newer. On by
     # default because backing those up is the job; turn it off where policy

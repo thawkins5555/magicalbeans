@@ -111,3 +111,45 @@ CLEARS = {
     # threshold clears are handled by evaluate_threshold's 'clear' return,
     # not this map, since they're keyed by (rule, entity) not a fixed pair
 }
+
+
+# ROLLED_UP_BY: rule key -> the rule key whose open alert makes it redundant.
+#
+# A device that has stopped answering will always also look slow and lossy,
+# and its CPU, memory, interface and storage metrics will all be stale or
+# absent — so a single outage used to arrive as five or six emails saying the
+# same thing in different words. Every rule here measures something that can
+# only be measured BY polling the device, so an open "Device not responding"
+# already says it.
+#
+# Static, mirroring CLEARS above, because "which alerts a dead device implies"
+# is a property of what this app measures, not a per-site preference. The
+# alerts setting `rollup_enabled` is the on/off switch, not a rewrite of this.
+#
+# Deliberately NOT here: interface_down, interface_up and interface_flapping.
+# Those come from ifOperStatus transitions the device itself reported before
+# it went away, and a port that went down for its own reason stays worth
+# knowing about — it is a fact about the network, not an artefact of the
+# device being unreachable.
+ROLLED_UP_BY = {
+    # ping, measured by this app's own probes
+    "response_time_high": "device_down",
+    "packet_loss_high": "device_down",
+    # SNMP-polled device metrics
+    "cpu_high": "device_down",
+    "mem_high": "device_down",
+    "disk_high": "device_down",
+    "if_in_util_high": "device_down",
+    "if_out_util_high": "device_down",
+    "if_in_errors_high": "device_down",
+    "if_out_errors_high": "device_down",
+    "if_in_discards_high": "device_down",
+    "if_out_discards_high": "device_down",
+}
+
+# The rules that roll up under a given parent, the other way round — built
+# once here rather than scanned per tick.
+ROLLS_UP: dict[str, tuple[str, ...]] = {}
+for _child, _parent in ROLLED_UP_BY.items():
+    ROLLS_UP[_parent] = ROLLS_UP.get(_parent, ()) + (_child,)
+del _child, _parent

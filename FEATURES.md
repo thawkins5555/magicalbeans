@@ -342,7 +342,16 @@ status and any SNMP error always show.
 **Poll now shows that it is running.** A poll is handed to a worker
 thread, so the button reports *Queued* or *Polling* until the device's own
 last-poll time actually moves, then settles to *Polled* — it used to look
-inert for however long the device took to answer.
+inert for however long the device took to answer. A click while that device
+is already being polled cannot start a second poll, so the button says
+*Already polling* rather than reporting *Polled* off the poll that was
+already running.
+
+**Poll now works on a selection, too.** Ticking rows reveals a bulk actions
+bar with its own **Poll now**, which polls every ticked device immediately
+rather than waiting for each one's interval, and reports how many it queued
+and how many were already running. The detail pane's button only ever polls
+the one device open in it.
 
 **Devices are keyed by IP address and cannot be added twice.** The address
 column is unique, adding one that already exists is refused by name rather
@@ -423,6 +432,26 @@ alerts and optionally emailing about them.
   added device**; 0 turns it off. Nothing outside Nodes' device inventory
   is ever held — syslog, traps, IPAM conflicts, DHCP scopes and wireless
   AP events have no device to be new.
+- **One outage raises one alert.** A device that has stopped answering will
+  also look slow and lossy, and its CPU, memory, interface and storage
+  figures stop being measurable — so a single outage used to arrive as five
+  or six emails saying the same thing in different words. **Device not
+  responding** now absorbs the alerts it implies: both ping alerts (response
+  time, packet loss) and every SNMP-polled metric threshold (CPU, memory,
+  storage, interface utilisation, error and discard rates) are resolved into
+  it, named in its details so an operator can see where the latency alert
+  went, and not raised again while the outage is open. No clear email is sent
+  for an absorbed alert — "packet loss recovered" while the device is still
+  down would be a lie — and the outage itself still notifies normally.
+  **Interface down, up and flapping are never rolled up**: those come from
+  status transitions the device reported before it went away, and a port that
+  went down for its own reason is a fact about the network rather than an
+  artefact of the device being unreachable. Nothing needs un-suppressing by
+  hand: when the device answers again the outage resolves, thresholds
+  re-derive from live metrics on the very next tick, and a metric that is
+  genuinely still breaching re-opens on its own while one that recovered with
+  the device stays closed. **Alerts → Settings → Roll implied alerts up**
+  turns the whole behaviour off.
 - **The Object column always shows a hostname when one is known** — the
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
@@ -1231,6 +1260,29 @@ to a manual name in Nodes.
   unrecognized vendor is skipped with a clear error rather than guessed
   at. ConfigRX never enters a device's configuration/enable-write mode
   and never sends anything beyond that one fixed command.
+- **A capture runs until the device is finished, not until it goes quiet.**
+  A backup used to end on a pause in the output, and a switch answers
+  `Building configuration...` instantly and then thinks for several seconds
+  before streaming — so the stored "backup" was those two lines. ConfigRX
+  learns the device's prompt from the login banner and reads until that
+  prompt comes back, which is what a person waits for. **Capture timeout**
+  (ConfigRX → Settings, 180 seconds by default) is only a ceiling on that
+  wait: a fast switch still finishes the moment its prompt returns, and a
+  large config over a slow link is given the minutes it genuinely needs.
+- **Pager prompts are answered, not waited out.** A device that stops
+  mid-config at `--More--` is waiting for a keypress, so ConfigRX sends a
+  single space and keeps reading. That space is a fixed in-band answer to a
+  prompt the device raised — no newline, no text — so it cannot execute
+  anything, and the rule above is unchanged: the only things ever *run* on a
+  device are the vendor's fixed pager-off lines and its show-config command.
+- **A truncated capture is refused rather than stored.** A read that hit the
+  capture timeout, that could not get past the device's pager, that ends on
+  "Building configuration...", or that is too short to be a config is
+  recorded as a **failed attempt naming the reason**, and nothing is written
+  to the backup history. A partial capture stored as a good version is worse
+  than no backup at all: it becomes the newest version, the next real backup
+  reads as an enormous change, and a restore from history hands someone a
+  fragment.
 - **The SSH password is encrypted at rest** (see `CREDENTIAL-SECURITY.md`)
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
@@ -1329,7 +1381,7 @@ Configuration sits at the level it belongs to.
 | **Settings** button, top right of Alerts | Engine on/off, evaluation severity floor, SMTP server and credential, volume limits |
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
 | **Settings** button, top right of Wireless | Poller on/off, poll interval — controllers themselves are managed from **Controllers**, next to it |
-| **Settings** button, top right of ConfigRX | Worker on/off, backup interval, retention (days and per-device count) |
+| **Settings** button, top right of ConfigRX | Worker on/off, backup interval, capture timeout, retention (days and per-device count) |
 | **Add** / **Edit** on a destination | That destination's own probe settings, and — Edit only — continuous per-hop probing |
 
 The Settings tab holds only what crosses module boundaries. Reverse DNS is the

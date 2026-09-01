@@ -318,6 +318,12 @@
           ${s.enabled ? 'checked' : ''}> Run the backup worker</label>
         <label>Backup interval (hours) <input id="cxs-interval" type="number" min="1"
           value="${s.backup_interval_hours}"></label>
+        <label>Capture timeout (seconds) <input id="cxs-capture" type="number" min="10"
+          value="${s.capture_timeout_s}"></label>
+        <p class="hint">A ceiling, not a wait: the capture ends the moment the
+          device's prompt comes back, so a fast switch finishes in a second
+          either way. Raise it if a device with a very large config over a slow
+          link reports that the capture timeout was reached.</p>
       </fieldset>
       <fieldset><legend>RETENTION</legend>
         <label>Keep backups for (days) <input id="cxs-days" type="number" min="0"
@@ -347,6 +353,7 @@
         await App.post('/api/settings', { scope: 'configrx', values: {
           enabled: m.querySelector('#cxs-enabled').checked,
           backup_interval_hours: Number(m.querySelector('#cxs-interval').value),
+          capture_timeout_s: Number(m.querySelector('#cxs-capture').value),
           retention_days: Number(m.querySelector('#cxs-days').value),
           retention_count_per_device: Number(m.querySelector('#cxs-count').value),
           allow_legacy_ssh: m.querySelector('#cxs-legacy').checked,

@@ -1765,8 +1765,25 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
 def post_nodes_device_poll(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
-    service.node_poller.poll_now(device_id)
-    return {"ok": True}
+    # queued=False means a poll for this device was already in flight, so
+    # this click started nothing. The button says so rather than reporting
+    # "Polled" off the other poll's completion.
+    return {"ok": True, "queued": bool(service.node_poller.poll_now(device_id))}
+
+
+def post_nodes_devices_bulk_poll(service, params, body) -> dict:
+    """Poll now for every ticked device — the bulk-bar counterpart of the
+    detail pane's button, which only ever polls the one open device."""
+    device_ids = _bulk_device_ids(body)
+    queued, busy, missing = [], [], []
+    for device_id in device_ids:
+        if not service.nodes_db.device(device_id):
+            missing.append(device_id)
+            continue
+        (queued if service.node_poller.poll_now(device_id) else busy).append(device_id)
+    if queued:
+        service.log.add(NODES_CATEGORY, f"Poll now requested for {len(queued)} device(s)")
+    return {"ok": True, "queued": queued, "already_polling": busy, "missing": missing}
 
 
 def post_nodes_device_focus(service, params, body, device_id) -> dict:
@@ -2605,6 +2622,10 @@ def _alert_json(row) -> dict:
         "acked_ts": row["acked_ts"], "acked_by": row["acked_by"],
         "ack_note": row["ack_note"], "resolved_ts": row["resolved_ts"],
         "resolved_by": row["resolved_by"],
+        # Keyed defensively: an alerts.db from before the rollup column was
+        # added is migrated on open, but a row handed here from another
+        # source should still render rather than raise.
+        "rollup_note": (row["rollup_note"] if "rollup_note" in row.keys() else ""),
     }
 
 

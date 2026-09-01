@@ -168,6 +168,19 @@ and records a `poll_overrun` device event rather than queuing a second
 concurrent poll of the same device) are all copied from `Monitor`'s own
 algorithm.
 
+**Poll now, and what "already polling" means.** `poll_now(device_id)` is a
+thin wrapper over `_submit()`, which drops the request when the device is
+already in `_queued` or `_started` — a poll of one device is never run
+concurrently with itself. Both now return a bool, because the frontend needs
+to tell the two cases apart: 4.28.1's button watched the device's
+`last_poll_ts` for movement and reported *Polled* when it moved, which on a
+dropped click was the *other* poll's completion. `POST
+/api/nodes/devices/<id>/poll` returns `queued`, and the bulk endpoint
+`POST /api/nodes/devices/bulk-poll` returns `queued` / `already_polling` /
+`missing` id lists, reusing `_bulk_device_ids` like every other Nodes bulk
+handler. There is no bulk poller: it calls `poll_now` per id, which is the
+whole point — the scheduler's own de-duplication is what makes that safe.
+
 **Ping probing and the down rule.** Every device with `ping_enabled` is
 pinged as well as polled, via `ipam_scan.ping_many(ip, count,
 timeout_ms)`. That sends `count` probes one subprocess at a time rather
@@ -280,8 +293,17 @@ pure interaction change with no effect on `drawBulkBar()`/the `bulk*()`
 action functions, which still just read `[...view.devicesChecked]` /
 `[...view.checked]` unaware of how the Set was populated. A row can
 still be simultaneously selected (detail pane) and checked (bulk set);
-`tr.bulk-checked` (an inset `box-shadow`, `app.css`) and `tr.selected`
-(a background tint) are visually independent for exactly that reason.
+`tr.bulk-checked` and `tr.selected` (`app.css`) are separate rules for
+exactly that reason, and `tr.bulk-checked.selected` gives the combination
+its own shade rather than letting one tint win. The checked marker used to
+be `box-shadow: inset 3px 0 0 var(--accent)`, which draws that bar on the
+left edge of *every cell* — under `table-layout: fixed` that reads as a blue
+stripe at each column divider rather than as a selected row, which is
+exactly how it was reported. It is now `background: var(--checked)`, a solid
+palette colour rather than a translucent accent so the tint is identical over
+the odd and even row stripes (`tr:nth-child(even) td`); a translucent one
+would composite differently on each and break the single unbroken bar the
+change is for.
 Because the bulk bar itself is `hidden` while nothing is checked, the
 **Select all** button lives in the always-visible filter bar instead of
 inside it — otherwise there'd be no way to reach it before checking at
@@ -1074,6 +1096,63 @@ Three different shapes of condition, handled three different ways, because
   re-derives them from current values on *every* tick, so one suppressed
   inside the window simply reappears on the first tick after it. Parking them
   as well would open the same alert twice.
+
+### Alert rollup (`alertrules.py`, `alertengine.py`, `alertsdb.py`)
+
+`alertrules.ROLLED_UP_BY` maps a rule key to the rule key whose open alert
+makes it redundant — every entry currently points at `device_down`. It sits
+beside `CLEARS` and is built the same way, and `ROLLS_UP` inverts it once at
+import so a parent's children are a lookup rather than a scan per tick. It is
+**static** because "which alerts a dead device implies" is a property of what
+this app measures, not a per-site preference; the `rollup_enabled` setting
+(`alertsdb.DEFAULTS`, default on) is the on/off switch, not a way to rewrite
+the map.
+
+Membership is drawn on one line: everything in it can only be measured *by
+polling the device* — the two ping rules, and the SNMP-metric thresholds for
+CPU, memory, storage and interface utilisation/error/discard rates. The
+interface event rules (`interface_down`, `interface_up`,
+`interface_flapping`) are deliberately absent: those come from ifOperStatus
+transitions the device reported before it went away, so a port that went down
+for its own reason is a fact about the network rather than an artefact of
+unreachability.
+
+Both halves live in `_apply()`, the same single choke point the new-device
+hold uses:
+
+- **Suppress.** Before `open_or_increment`, `_rollup_parent()` looks the
+  parent up by `dedup_key(parent_rule, occurrence)` — reusing the existing
+  addressing scheme rather than adding a second one — and a hit means the
+  occurrence is dropped: never opened, so never emailed. `open_by_dedup`
+  treats `acked` as open on purpose: an operator ticking the outage off has
+  not made the device reachable.
+- **Absorb.** When a parent opens (`is_new`), `_absorb_subordinates()` walks
+  `ROLLS_UP` and calls the existing `resolve_by_dedup` for each child with
+  `by="rolled up into <parent name>"`. It deliberately does *not* call
+  `_notify_clear`: a "packet loss recovered" email while the device is still
+  down would be a lie, and fewer emails per outage is the point.
+
+Both paths record a line on the parent through `alertsdb.add_rollup_note`,
+which dedupes by line so a flapping device does not grow the same note
+hundreds of times. That note is its own `alerts.rollup_note` column (added by
+`_migrate`, the usual PRAGMA + ALTER convention) rather than appended to
+`detail`, which `open_or_increment` overwrites every time an alert recurs.
+
+**The recovery path needs no code.** `device_up` resolves `device_down`
+through `CLEARS`, and from the next tick `_evaluate_thresholds` re-derives
+every threshold from current metrics — so a still-breaching CPU re-opens by
+itself and one that recovered with the device stays closed. Nothing is ever
+"un-suppressed"; there is no suppression state to unwind.
+
+**A bug the rollup work uncovered.** `_apply`'s source_kind filter listed
+`device_event`, `interface_event`, `trap`, `wireless_event` and
+`dhcp_threshold` but not `threshold`, so a threshold occurrence matched
+*every* threshold rule: one high CPU reading opened CPU, memory, disk and all
+six interface-rate alerts for that device, each carrying the CPU
+occurrence's message. `threshold` is now on the list. `syslog` and `ipam` are
+still deliberately off it — their occurrences always carry `source_kind ""`,
+so filtering on it would silently stop matching any custom rule that has one
+set.
 
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
@@ -2429,6 +2508,51 @@ literal command text. There is no exec-command endpoint, no command
 parameter anywhere in `api.py`'s ConfigRX handlers, and no free-form
 input field anywhere in `configrx.js` — grep for `channel.send` in
 `configrx.py` to confirm this hasn't grown a second call site.
+
+**The capture ends on the prompt, not on silence.** `_drain()` returned as
+soon as it had any data and 1.5s passed with none, which is a fine rule for a
+login banner and a catastrophic one for `show running-config`: a Cisco writes
+`Building configuration...` immediately and then thinks, so the read ended on
+the banner and those two lines were stored as a whole backup. The
+`SHELL_MAX_S` ceiling never came into it, and the old `len(cleaned) < 20`
+guard passed a ~45-character result.
+
+`_read_until_prompt(channel, prompt, max_s, quiet_s)` replaces it and returns
+`(text, ended)` where `ended` is one of `prompt` / `quiet` / `pager-loop` /
+`timeout` / `closed` — so a complete capture is *distinguishable* from a
+truncated one, which is what the storage guard needs. `_learn_prompt()` takes
+the prompt from the last non-blank line of the login banner and returns `""`
+unless it ends in `#`, `>`, `$` or `%`: a wrong prompt is worse than none,
+because it would end every read at the first config line that matched, so an
+unlearnable prompt falls back to a long silence window instead of a guess.
+`_waiting_at()` is why a config line reading `switch#` never ends a read — a
+prompt is written *without* a trailing newline, because the cursor stays on
+it, so a buffer ending in a newline is never "waiting".
+
+**Pagers are answered, and the safety boundary survives it.** `_PAGER_RE`
+only stripped `--More--` lines after the fact, which does nothing for a device
+sitting there waiting for a keypress. `_read_until_prompt` now matches
+`_PAGER_TAIL_RE` at the *end* of the buffer and sends a single space
+(`MAX_PAGER_REPLIES` caps the loop). That space carries no newline and no
+text, so it cannot execute anything: it is a fixed in-band answer to a prompt
+the device raised, and the boundary above — only `pager_off` plus
+`show_config` are ever *run* — is intact. `_clean_output` gained
+`_PAGER_INLINE_RE` for the markers a paged capture leaves mid-line after the
+device erases its own with backspaces.
+
+**A truncated capture is never stored.** `_capture_problem(cleaned, ended)`
+returns the reason a capture must be refused or `""`: an empty body, an
+`ended` of `timeout` / `pager-loop` / `closed`, a last line matching
+`_STILL_WORKING_RE` ("Building configuration…"), or a body under
+`MIN_CONFIG_CHARS` (200 — comfortably above the ~45-character failure it
+exists to catch and below the smallest plausible real config). `_backup_device`
+records a failed attempt naming it and returns before `add_backup`, because
+storing a partial as a good version is worse than storing nothing: it becomes
+the newest version, the next real backup reads as an enormous change, and a
+restore from history hands someone a fragment. The ceiling itself is the
+`capture_timeout_s` setting (`configrxdb.DEFAULTS`, 180s) rather than a
+constant — a large config over a slow link legitimately takes minutes, and it
+is only a ceiling, since a healthy device ends on its prompt in a second.
 
 **Legacy key exchange is feature-detected, and the version cap is the real
 fix.** `configrx._apply_legacy_algorithms(paramiko)` appends

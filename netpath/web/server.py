@@ -119,6 +119,7 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device, ("nodes", R)),
     ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/bulk-poll$", api.post_nodes_devices_bulk_poll, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),

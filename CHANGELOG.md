@@ -6,6 +6,72 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.29.0 — Backups that wait for the whole config, and one alert per outage
+
+- **ConfigRX stored the banner and called it a backup.** A successful backup
+  contained exactly two lines: `show running-config` and
+  `Building configuration...`. The capture decided a command was finished by
+  *silence*, and a switch answers that banner instantly and then thinks for
+  several seconds before streaming — so 1.5 seconds of that thinking ended the
+  read, and the result was stored as a good version. It now reads until the
+  **device's prompt comes back**, which is what a person waits for: the prompt
+  is learned from the login banner, and the read ends on it rather than on a
+  pause. Devices whose prompt cannot be learned fall back to a much longer
+  silence window.
+- **Pager prompts are answered instead of waited out.** A device that stops
+  mid-config at `--More--` is sitting there waiting for a keypress, so
+  stripping the marker afterwards achieved nothing. ConfigRX now sends a
+  single space and keeps reading. That space is a fixed in-band answer to a
+  prompt the device raised — it carries no newline and no text — so the
+  module's boundary is unchanged: the only things ever *run* on a device are
+  the vendor's fixed pager-off lines and its show-config command.
+- **A truncated capture is never stored.** A read that hit the ceiling, that
+  ended on a pager loop, that ends on "Building configuration...", or that is
+  implausibly short is recorded as a **failed attempt naming the reason**.
+  Storing those two lines as a success was the part that would quietly
+  destroy a real config history — the next real backup would read as a huge
+  change, and a restore from history would hand someone a two-line file.
+- **Capture timeout is a setting** (ConfigRX → Settings, 180 seconds by
+  default) rather than a fixed 25 seconds, because a large config over a slow
+  link legitimately takes minutes. It is only a ceiling: a fast switch still
+  finishes the moment its prompt returns.
+- **One outage, one alert.** A device that has stopped answering also looks
+  slow and lossy, and its CPU, memory, interface and storage figures stop
+  being measurable — so a single outage arrived as five or six emails saying
+  the same thing. **Device not responding** now absorbs what it implies: both
+  ping alerts and every SNMP-polled metric threshold are resolved into it and
+  named in its details, and new ones are not raised while it is open. No
+  clear email goes out for an absorbed alert — "packet loss recovered" while
+  the device is still down would be a lie.
+- **Interface alerts are never rolled up.** Interface down, up and flapping
+  come from status transitions the device reported before it went away; a
+  port that went down for its own reason is a fact about the network, not an
+  artefact of the device being unreachable.
+- **Recovery needs no un-suppressing.** Once the device answers again the
+  outage resolves, and the thresholds re-derive from live metrics on the next
+  tick — so a genuinely still-high CPU re-opens on its own, and a metric that
+  recovered with the device stays closed. The whole behaviour is one setting
+  (Alerts → Settings → *Roll implied alerts up*), and turning it off restores
+  the previous behaviour exactly.
+- **One threshold breach opened every threshold alert.** Found while testing
+  the rollup: threshold rules were not filtered by which metric they are
+  about, so a single high-CPU reading opened CPU, memory, disk and all six
+  interface-rate alerts for that device — every one of them carrying the CPU
+  reading's message. Each threshold rule now only sees its own metric.
+- **Poll now, for everything that is ticked.** The Nodes bulk bar has a
+  **Poll now** button; the detail pane's button only ever polled the one open
+  device. It polls each ticked device immediately, ahead of its interval, and
+  says how many it queued.
+- **Poll now no longer claims credit for a poll it did not start.** A click
+  while that device is already being polled cannot start a second one; both
+  buttons now say *Already polling* instead of reporting *Polled* when the
+  in-flight poll finishes.
+- **Ticked rows are tinted, not striped.** The selection marker was an inset
+  bar on the left edge of every cell, which under fixed table layout read as
+  a blue stripe at each column divider. A ticked row now carries a single
+  tint across its whole width, in Nodes, Alerts and ConfigRX alike, with a
+  distinct shade for a row that is both ticked and open in the detail pane.
+
 ### 4.28.1 — The OID browser actually walks, and two buttons that said nothing
 
 - **The OID browser worked on almost nothing, and the cause was the
