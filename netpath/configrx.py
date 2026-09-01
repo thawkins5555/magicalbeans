@@ -364,16 +364,40 @@ class ConfigRxWorker:
             return "Worker stopped"
         return "Running"
 
-    def backup_now(self, device_id: int) -> None:
+    class NotRunning(RuntimeError):
+        """Asked to back up while the worker is stopped. Its own type so the
+        API can turn it into a plain message rather than a 500, and so the
+        scheduled loop can go on ignoring it."""
+
+    def backup_now(self, device_id: int) -> bool:
+        """Queues one device's backup. True when it was queued, False when
+        that device is already waiting for one — a second click is a no-op,
+        not an error.
+
+        Raises NotRunning when the worker is stopped. It used to return
+        silently, so pressing "Back up now" with the worker off reported
+        success and did nothing at all: the operator was told the backup had
+        been queued and then watched no backup ever appear.
+        """
         with self._lock:
-            if device_id in self._queued or not self._executor:
-                return
+            if not self._executor or not self.running:
+                raise self.NotRunning(
+                    "The ConfigRX worker is not running, so nothing would "
+                    "run this backup. Start it with the Start worker button "
+                    "and try again."
+                    if paramiko_available() else PARAMIKO_MISSING)
+            if device_id in self._queued:
+                return False
             self._queued.add(device_id)
         try:
             self._executor.submit(self._run_one, device_id)
         except RuntimeError:
             with self._lock:
                 self._queued.discard(device_id)
+            raise self.NotRunning(
+                "The ConfigRX worker stopped while the backup was being "
+                "queued. Start it and try again.")
+        return True
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -381,7 +405,12 @@ class ConfigRxWorker:
             if settings.get("enabled", True):
                 interval = float(settings.get("backup_interval_hours", 24))
                 for row in self.db.devices_due(interval):
-                    self.backup_now(row["device_id"])
+                    try:
+                        self.backup_now(row["device_id"])
+                    except self.NotRunning:
+                        # Shutting down between the due-list and the submit;
+                        # the next start picks these up again.
+                        break
             self._stop.wait(30.0)
 
     def _run_one(self, device_id: int) -> None:

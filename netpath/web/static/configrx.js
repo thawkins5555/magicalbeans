@@ -382,11 +382,33 @@
     App.el('cx-bulk-credential').onclick = bulkSetCredential;
     App.el('cx-settings').onclick = settingsDialog;
     App.el('cx-device-settings').onclick = deviceSettingsModal;
+    /* Backing up with the worker stopped used to report success and do
+       nothing — the queue it went into was never being drained. The server
+       now refuses it, so say why rather than swallowing the rejection. */
     App.el('cx-backup-now').onclick = async () => {
       if (!view.selectedDeviceId) return;
-      await App.post(`/api/configrx/devices/${view.selectedDeviceId}/backup`, {});
-      App.el('cx-backup-now').textContent = 'Queued…';
-      setTimeout(() => { App.el('cx-backup-now').textContent = 'Back up now'; }, 3000);
+      const button = App.el('cx-backup-now');
+      const settle = (text) => {
+        button.disabled = false;
+        button.textContent = text;
+        if (text !== 'Back up now') {
+          setTimeout(() => {
+            if (button.textContent === text) button.textContent = 'Back up now';
+          }, 3000);
+        }
+      };
+      button.disabled = true;
+      button.textContent = 'Queueing…';
+      try {
+        const result = await App.post(
+          `/api/configrx/devices/${view.selectedDeviceId}/backup`, {});
+        settle(result.queued === false ? 'Already queued…' : 'Queued…');
+      } catch (error) {
+        settle('Back up now');
+        App.modal('Cannot back up now',
+          `<p>${escape(error.message)}</p>`,
+          [{ label: 'Close', primary: true, onClick: App.closeModal }]);
+      }
     };
     App.el('cx-toggle').onclick = async () => {
       const running = (App.state.serverState.configrx || {}).running;

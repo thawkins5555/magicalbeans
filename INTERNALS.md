@@ -498,6 +498,26 @@ deliberately pointed elsewhere) is never replaced, and records a
 `mib_assigned` device event, since this changes what is polled every cycle and
 should be visible rather than discovered from new metric names.
 
+**On-demand reads and the working credential** (`NodePoller.working_config`):
+`effective_config()` resolves a device's own overrides over its profile's
+columns — which is the profile's PRIMARY credential and nothing else. A
+profile can also carry alternates (`group_credentials`, for a mixed-vendor
+subnet), and the scheduled poller finds whichever one works and caches the
+index in `self._credentials`. Every on-demand read built its own config from
+`effective_config()`, so on a device answering an alternate it queried with
+the wrong community: every request ignored, every read a timeout, on a device
+the poller shows as up. That is what made the OID browser report "the device
+stopped answering" for every device, and it left `read_mac_table` and
+`read_dom` quietly returning "this device cannot tell us" on the same
+devices — the same bug, invisible because those two swallow it by design.
+
+`working_config()` is the fix and the single place this is resolved. One
+candidate (the common case, and any device with its own credential override)
+returns `effective_config` unchanged and costs no extra request; with
+alternates the poller's cached winner is trusted, and only a device it has
+not resolved yet is probed here — one cheap sysObjectID GET per candidate,
+caching the winner exactly as the poll path does.
+
 **OID browser** (`NodePoller.walk_subtree` / `browse_bases`, `api.get_nodes_device_oids`):
 deliberately a sibling of `_walk_column` rather than a widening of it —
 `_walk_column` returns index-suffix → value for one table column and caps at

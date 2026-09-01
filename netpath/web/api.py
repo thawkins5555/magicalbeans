@@ -8,6 +8,7 @@ this file stays about the data.
 from __future__ import annotations
 
 import ipaddress
+import sqlite3
 import json
 import math
 import time
@@ -1662,11 +1663,17 @@ def post_nodes_device(service, params, body) -> dict:
     overrides = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY
                 and k not in ("name", "group_id", "device_group_id",
                               "display_name_source", "enabled")}
-    device_id = service.nodes_db.add_device(
-        ip, name=body.get("name") or None,
-        group_id=int(group_id) if group_id else None,
-        device_group_id=int(device_group_id) if device_group_id else None,
-        **overrides)
+    try:
+        device_id = service.nodes_db.add_device(
+            ip, name=body.get("name") or None,
+            group_id=int(group_id) if group_id else None,
+            device_group_id=int(device_group_id) if device_group_id else None,
+            **overrides)
+    except sqlite3.IntegrityError:
+        # devices.ip is UNIQUE, so the check above is a courtesy that gives a
+        # readable message; this is the same answer for the race where two
+        # adds of one address arrive together, rather than a 500.
+        raise ValueError(f"{ip} is already a device")
     # Not an add_device parameter: like device_group_id before it,
     # add_device's **overrides filter only knows credential/polling
     # columns and would silently drop it.
@@ -3384,8 +3391,11 @@ def post_configrx_device_backup(service, params, body, device_id) -> dict:
     config = service.configrx_db.device_config(device_id)
     if not config or not config["backup_enabled"]:
         raise ValueError("Backup is not enabled for this device")
-    service.configrx.backup_now(device_id)
-    return {"ok": True}
+    try:
+        queued = service.configrx.backup_now(device_id)
+    except configrx.ConfigRxWorker.NotRunning as exc:
+        raise ValueError(str(exc))
+    return {"ok": True, "queued": queued}
 
 
 def post_configrx_worker(service, params, body) -> dict:

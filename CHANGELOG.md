@@ -6,6 +6,42 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.28.1 — The OID browser actually walks, and two buttons that said nothing
+
+- **The OID browser worked on almost nothing, and the cause was the
+  credential.** Reported as "it simply gives *the device stopped answering*
+  no matter what device or what OID". It did — and so, silently, did the MAC
+  address table and the DOM sensor reads on those same devices. A polling
+  profile can carry **alternate credentials** for a mixed-vendor subnet, and
+  the scheduled poller finds whichever one works and remembers it. Every
+  on-demand read, though, built its own config from the profile's *primary*
+  credential alone, so on any device that answers on an alternate it queried
+  with the wrong community: every request ignored, every read a timeout — on
+  a device the Nodes list happily shows as up. Reproduced end to end, fixed
+  with a single `working_config()` that resolves the credential the device
+  actually answers on, and used by all three on-demand reads. A device with
+  one credential costs no extra request; only a device the poller has not
+  resolved yet is probed.
+- **A walk that still fails now says what was tried.** Instead of "the device
+  stopped answering", the message names the address, the port and the kind of
+  credential used — never the community string itself, which is a secret.
+- **Nodes → Poll now shows that it is running.** The poll is handed to a
+  worker thread, so the button returning meant "queued", not "done", and it
+  looked inert for however long the device took. It now reports Queued or
+  Polling, refuses a second click while it runs, and settles to *Polled* when
+  the device's own last-poll time actually moves.
+- **ConfigRX → Back up now with the worker stopped is refused.** It used to
+  report success and do nothing at all: the queue it went into was never
+  being drained, so the operator was told the backup was queued and then
+  watched no backup appear. It now explains the reason and points at the
+  Start worker button. A second click on a device already queued stays a
+  harmless no-op rather than becoming an error.
+- **Duplicate devices** were already prevented in three places — the address
+  column is unique, adding an existing address is refused by name, and
+  promoting a discovery result whose address is already a device links to
+  that device. The one gap was the race between the check and the insert,
+  which surfaced as a 500; it now gives the same readable message.
+
 ### 4.28.0 — Which paramiko, vendor identification, an OID browser, per-AP latency, checkboxes
 
 - **ConfigRX now names the paramiko it is actually running.** Reported as

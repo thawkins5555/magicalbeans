@@ -2111,9 +2111,58 @@
     App.el('nd-edit-device').onclick = editDevice;
     App.el('nd-remove-device').onclick = removeDevice;
     App.el('nd-browse-oids').onclick = oidBrowser;
+    /* A poll is handed to a worker thread, so the POST returning means
+       "queued", not "done" — which is why this button used to look inert for
+       however long the device took to answer. Completion is the device's own
+       last_poll_ts moving; `polling` (the server's live worker state) is what
+       distinguishes still-running from queued behind other work. */
     App.el('nd-poll-now').onclick = async () => {
-      if (!view.selected) return;
-      await App.post(`/api/nodes/devices/${view.selected}/poll`, {});
+      const button = App.el('nd-poll-now');
+      const deviceId = view.selected;
+      if (!deviceId || button.disabled) return;
+      const before = (view.devices.find((d) => d.id === deviceId) || {}).last_poll_ts || 0;
+      const settle = (text) => {
+        button.disabled = false;
+        button.textContent = text;
+        if (text !== 'Poll now') {
+          setTimeout(() => {
+            if (button.textContent === text) button.textContent = 'Poll now';
+          }, 2500);
+        }
+      };
+      button.disabled = true;
+      button.textContent = 'Polling…';
+      try {
+        await App.post(`/api/nodes/devices/${deviceId}/poll`, {});
+      } catch (error) {
+        settle('Failed');
+        return;
+      }
+      // Bounded: a device on a long SNMP timeout with retries can genuinely
+      // take a while, and giving up silently would put us back where we
+      // started — so say it is still going rather than pretend it finished.
+      const deadline = Date.now() + 90000;
+      const check = async () => {
+        if (view.selected !== deviceId) { settle('Poll now'); return; }
+        let payload;
+        try {
+          payload = await App.get(`/api/nodes/devices/${deviceId}`);
+        } catch (error) {
+          settle('Poll now');
+          return;
+        }
+        const device = payload.device || {};
+        if ((device.last_poll_ts || 0) > before) {
+          settle('Polled');
+          await loadDetail();
+          App.refreshNow('nodes');
+          return;
+        }
+        if (Date.now() > deadline) { settle('Still running…'); return; }
+        button.textContent = device.polling ? 'Polling…' : 'Queued…';
+        setTimeout(check, 1000);
+      };
+      setTimeout(check, 600);
     };
     App.el('nd-apply').onclick = () => App.refreshNow('nodes');
     App.el('nd-q').onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('nodes'); };

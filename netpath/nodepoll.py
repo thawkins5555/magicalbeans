@@ -172,6 +172,18 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
                   f"hundredths of a second after {elapsed_s:.0f}s")
 
 
+def _credential_label(config: dict) -> str:
+    """How to name the credential in an operator-facing message, without
+    ever printing the credential itself: a community string is a secret."""
+    version = int(config.get("snmp_version") or 1)
+    if version == 3:
+        user = config.get("v3_user")
+        return f"SNMPv3 user {user!r}" if user else "SNMPv3 (no user set)"
+    name = {0: "v1", 1: "v2c"}.get(version, f"v{version}")
+    return (f"the SNMP{name} community" if config.get("community")
+            else f"SNMP{name} with no community set")
+
+
 def _oid_key(oid: str) -> tuple:
     """An OID as a tuple of ints, so "…1.10" orders after "…1.9" rather than
     between "…1.1" and "…1.2" the way string comparison would put it. A
@@ -704,6 +716,47 @@ class NodePoller:
         for key, label, unit, kind, value in metrics:
             self.db.record_metric_sample(device_id, key, label, unit, kind, now, value)
 
+    def working_config(self, device) -> dict:
+        """The config an *on-demand* read should use — effective_config()
+        merged with the credential this device actually answers on.
+
+        effective_config() resolves a device's overrides over its profile's
+        own columns, which is the profile's PRIMARY credential and nothing
+        else. But a profile can carry alternates (group_credentials, for a
+        mixed-vendor subnet), and the scheduled poller finds whichever one
+        works and caches it in self._credentials. Any on-demand read that
+        built its own config straight from effective_config() therefore
+        queried a device that answers on an alternate with the wrong
+        community — every request ignored, every read a timeout, on a device
+        the poller shows as up. That is what made the OID browser report
+        "the device stopped answering" for every device, and what left the
+        MAC-address and DOM reads quietly empty on the same devices.
+
+        One candidate (the overwhelmingly common case, and any device with
+        its own credential override) costs nothing extra: it *is*
+        effective_config. With alternates, the poller's cached winner is
+        trusted; only a device the poller has not resolved yet is probed
+        here, one cheap GET per candidate, and the winner is cached the same
+        way the poll path caches it.
+        """
+        config = self.db.effective_config(device)
+        candidates = self.db.credential_candidates(device)
+        if len(candidates) <= 1:
+            return config
+        cached = self._credentials.get(device["id"])
+        if cached is not None and cached < len(candidates):
+            return {**config, **candidates[cached]}
+        for index, candidate in enumerate(candidates):
+            trial = {**config, **candidate}
+            try:
+                self._snmp_get(device, trial,
+                               [nodeoids.SYSTEM_SCALARS["sys_object_id"]])
+            except SnmpError:
+                continue
+            self._credentials[device["id"]] = index
+            return trial
+        return config
+
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
         """One GET round trip against a device, handling v1/v2c/v3
         (noAuthNoPriv/authNoPriv only) transparently."""
@@ -1131,7 +1184,7 @@ class NodePoller:
         device = self.db.device(device_id)
         if device is None:
             return []
-        config = self.db.effective_config(device)
+        config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return []
 
@@ -1352,7 +1405,7 @@ class NodePoller:
         device = self.db.device(device_id)
         if device is None:
             return None
-        config = self.db.effective_config(device)
+        config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return None
 
@@ -1420,7 +1473,7 @@ class NodePoller:
         device = self.db.device(device_id)
         if device is None:
             return None
-        config = self.db.effective_config(device)
+        config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return None
         base = (base_oid or "").strip().strip(".")
@@ -1442,7 +1495,14 @@ class NodePoller:
             try:
                 response = self._snmp_get_next(device, config, current)
             except SnmpTimeout:
-                stopped = "the device stopped answering"
+                # Name what was actually tried. "The device stopped
+                # answering" alone sent an operator hunting the device when
+                # the answer was on this end — which credential we used, and
+                # against which address and port.
+                stopped = (
+                    f"no reply from {device['ip']}:{DEFAULT_SNMP_PORT} "
+                    f"using {_credential_label(config)}"
+                    + (f" — stopped after {len(rows)} row(s)" if rows else ""))
                 break
             except SnmpError as exc:
                 stopped = f"SNMP error: {exc}"

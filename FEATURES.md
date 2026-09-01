@@ -339,6 +339,16 @@ fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
 
+**Poll now shows that it is running.** A poll is handed to a worker
+thread, so the button reports *Queued* or *Polling* until the device's own
+last-poll time actually moves, then settles to *Polled* — it used to look
+inert for however long the device took to answer.
+
+**Devices are keyed by IP address and cannot be added twice.** The address
+column is unique, adding one that already exists is refused by name rather
+than by a database error, and promoting a discovery result whose address is
+already a device links to that device instead of creating a second one.
+
 **Browse OIDs** opens a live view of what the device actually answers,
 decoded against every MIB the app knows. It opens on `system`,
 `interfaces` and the device's own vendor arc — a few hundred objects,
@@ -351,6 +361,13 @@ number rather than guessed at, and uploading its MIB names it
 immediately. A walk that hits its row or time limit says so rather than
 looking complete. This is also how to read a device's sysObjectID
 straight off it, which is what identifies its vendor.
+
+Every on-demand read — the OID browser, the MAC address table and the
+DOM/SFP sensors — uses the credential the device **actually answers on**,
+which for a profile carrying alternates is not necessarily its primary one.
+A walk that still gets nothing names the address, the port and the kind of
+credential tried (never the community itself), rather than only reporting
+that the device stopped answering.
 
 Clicking a port in the interface list opens that port's own dialog: a
 live up/down bandwidth graph of the last hour with **Smoothed** on by
@@ -1218,6 +1235,10 @@ to a manual name in Nodes.
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
   discarded the moment the connection attempt finishes.
+- **Backing up with the worker stopped says so.** "Back up now" used to
+  report success and do nothing: the queue it went into was never being
+  drained. It is now refused with a message naming the reason, and the
+  Start worker button is the fix it points at.
 - **SSH needs the `paramiko` package**, the one third-party dependency in
   this otherwise standard-library-only app. Without it every other module
   runs normally and ConfigRX alone stands down, saying so plainly — in
