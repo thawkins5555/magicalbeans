@@ -230,6 +230,10 @@ class NodePoller:
         # not on every poll thereafter. In-memory and process-lifetime only,
         # the same tradeoff EngineCache above already makes.
         self._credentials: dict[int, int] = {}
+        # device_id -> when an on-demand credential probe last failed for it,
+        # so a device that is simply down does not re-sweep its profile's
+        # candidates on every dialog a human opens. See working_config().
+        self._credential_probe_failed: dict[int, float] = {}
         # (device_id, expires_ts, interval_s): the device currently selected
         # in a browser polls at interval_s until expires_ts. Renewed by the
         # frontend every refresh tick while selected, so it self-expires
@@ -746,15 +750,33 @@ class NodePoller:
         cached = self._credentials.get(device["id"])
         if cached is not None and cached < len(candidates):
             return {**config, **candidates[cached]}
+        # A probe that just failed is not worth repeating for every read: the
+        # interface dialog alone fires two (MAC table and DOM sensors), and an
+        # unreachable device would pay the whole candidate sweep for each.
+        failed_at = self._credential_probe_failed.get(device["id"], 0.0)
+        if time.time() - failed_at < self._PROBE_RETRY_S:
+            return config
+        # retries=0, and a budget across the whole sweep: the probe only asks
+        # "does this credential answer at all", and the real read that follows
+        # still gets the device's full configured timeout and retries. With
+        # them, an unreachable device with a few alternates took
+        # candidates x timeout x (retries+1) — half a minute of a request a
+        # human is waiting on, for a device that is simply down.
+        deadline = time.time() + self._PROBE_BUDGET_S
         for index, candidate in enumerate(candidates):
-            trial = {**config, **candidate}
+            if time.time() > deadline:
+                break
+            trial = {**config, **candidate, "snmp_retries": 0}
             try:
                 self._snmp_get(device, trial,
                                [nodeoids.SYSTEM_SCALARS["sys_object_id"]])
             except SnmpError:
                 continue
             self._credentials[device["id"]] = index
-            return trial
+            # The winning credential is returned with the device's own retry
+            # setting restored — only the probe went without them.
+            return {**config, **candidate}
+        self._credential_probe_failed[device["id"]] = time.time()
         return config
 
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
@@ -1450,6 +1472,10 @@ class NodePoller:
     # a full walk of a large device is tens of thousands of objects and
     # minutes of GETNEXTs, which is why this browses subtrees rather than
     # offering "walk everything".
+    # Bounds on the on-demand credential probe in working_config().
+    _PROBE_BUDGET_S = 8.0
+    _PROBE_RETRY_S = 60.0
+
     _BROWSE_MAX_ROWS = 600
     _BROWSE_BUDGET_S = 20.0
 

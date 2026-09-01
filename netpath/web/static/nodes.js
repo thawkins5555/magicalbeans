@@ -2143,7 +2143,11 @@
       // started — so say it is still going rather than pretend it finished.
       const deadline = Date.now() + 90000;
       const check = async () => {
-        if (view.selected !== deviceId) { settle('Poll now'); return; }
+        // Stop if the operator moved on: another device, or another tab.
+        if (view.selected !== deviceId || App.state.tab !== 'nodes') {
+          settle('Poll now');
+          return;
+        }
         let payload;
         try {
           payload = await App.get(`/api/nodes/devices/${deviceId}`);
