@@ -9,7 +9,10 @@
     devices: [],
     selectedDeviceId: null,
     devicesChecked: new Set(),
+    deviceSort: { key: 'name', descending: false },
     backups: [],
+    backupsChecked: new Set(),
+    backupSort: { key: 'ts', descending: true },
     selectedBackupId: null,
     backupContent: '',
   };
@@ -72,43 +75,82 @@
   /* ------------------------------------------------------------- devices */
 
   const COLUMNS = [
-    { key: 'check', label: '', sortable: false, width: 34 },
-    { key: 'backup_enabled', label: '', width: 28 },
-    { key: 'name', label: 'Device', width: 220 },
-    { key: 'vendor', label: 'Vendor', width: 110 },
-    { key: 'last_backup_status', label: 'Last backup', width: 110 },
-    { key: 'last_backup_ts', label: 'When', width: 100, numeric: true,
-      value: (r) => r.last_backup_ts || 0 },
+    { key: 'check', label: '', sortable: false, fixed: true, width: 34,
+      cell: (r) => `<input type="checkbox" class="cx-check"${
+        view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
+    { key: 'backup_enabled', label: '', width: 28, on: true, sortable: false,
+      cell: (r) => (r.backup_enabled ? statusDot(r.last_backup_status) : '') },
+    { key: 'name', label: 'Device', width: 220, on: true,
+      cell: (r) => `${escape(r.name)}<div class="hint">${escape(r.ip)}</div>` },
+    // The vendor the backup would actually RUN as, not the one Nodes
+    // detected: an explicit per-device override wins, and the column marks
+    // it so the list and the worker cannot silently disagree.
+    { key: 'vendor', label: 'Vendor', width: 130, on: true,
+      value: (r) => r.effective_vendor || '',
+      cell: (r) => escape(r.effective_vendor || '\u2014')
+        + (r.vendor_is_override ? ' <span class="hint">(override)</span>' : '') },
+    { key: 'last_backup_status', label: 'Last backup', width: 110, on: true,
+      // An in-flight backup wins over the last completed one: the row used to
+      // sit on a stale "unchanged" for the whole minute a backup was running.
+      cell: (r) => (r.backing_up ? '<span class="hint">backing up…</span>'
+        : r.backup_queued ? '<span class="hint">queued…</span>'
+        : r.last_backup_error
+          ? `<span title="${escape(r.last_backup_error)}">error</span>`
+          : escape(r.last_backup_status || (r.backup_enabled ? 'pending' : '\u2014'))) },
+    { key: 'last_backup_ts', label: 'When', width: 100, numeric: true, on: true,
+      value: (r) => r.last_backup_ts || 0, cell: (r) => ago(r.last_backup_ts) },
+    { key: 'detected_vendor', label: 'Detected vendor', width: 130,
+      value: (r) => r.vendor || '', cell: (r) => escape(r.vendor || '\u2014') },
+    { key: 'ssh_username', label: 'SSH user', width: 120,
+      cell: (r) => escape(r.ssh_username || '\u2014') },
+    { key: 'ssh_port', label: 'Port', width: 70, numeric: true },
+    { key: 'has_credential', label: 'Credential', width: 90,
+      value: (r) => (r.has_credential ? 1 : 0),
+      cell: (r) => (r.has_credential ? 'stored' : '\u2014') },
   ];
 
+  const deviceColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.configrxSettings || {}).table_columns);
+
+  function onDeviceSort(key, descending) {
+    view.deviceSort = { key, descending };
+    drawDevices();
+  }
+
   function drawDevices() {
-    const table = App.grid(App.el('cx-devices'), { name: 'configrx-devices', columns: COLUMNS });
+    const columns = deviceColumns();
+    const checked = view.devicesChecked;
+    const table = App.grid(App.el('cx-devices'), {
+      name: 'configrx-devices', columns,
+      sort: view.deviceSort, onSort: onDeviceSort,
+      selectAll: {
+        key: 'check',
+        checked: view.devices.length > 0 && view.devices.every((d) => checked.has(d.id)),
+        some: view.devices.some((d) => checked.has(d.id)),
+        onToggle: (on) => {
+          checked.clear();
+          if (on) for (const d of view.devices) checked.add(d.id);
+          drawDevices();
+        },
+      } });
     const body = document.createElement('tbody');
-    for (const row of view.devices) {
-      const tr = document.createElement('tr');
+    const rows = App.sortRows(view.devices, view.deviceSort.key,
+                              view.deviceSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable'
         + (view.selectedDeviceId === row.id ? ' selected' : '')
         + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
-      const status = row.last_backup_error
-        ? `<span title="${escape(row.last_backup_error)}">error</span>`
-        : escape(row.last_backup_status || (row.backup_enabled ? 'pending' : '—'));
-      tr.innerHTML =
-        `<td><input type="checkbox" class="cx-check"${
-          view.devicesChecked.has(row.id) ? ' checked' : ''}></td>` +
-        `<td>${row.backup_enabled ? statusDot(row.last_backup_status) : ''}</td>` +
-        `<td>${escape(row.name)}<div class="hint">${escape(row.ip)}</div></td>` +
-        `<td>${escape(row.vendor || '—')}</td>` +
-        `<td>${status}</td>` +
-        `<td>${ago(row.last_backup_ts)}</td>`;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane — same convention as Nodes' and Alerts' own tables.
-      tr.querySelector('.cx-check').onclick = (event) => {
-        event.stopPropagation();
-        toggleChecked(row.id, tr);
-      };
+      const box = tr.querySelector('.cx-check');
+      if (box) {
+        box.onclick = (event) => {
+          event.stopPropagation();
+          toggleChecked(row.id, tr);
+        };
+      }
       tr.onclick = () => selectDevice(row.id);
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
     App.el('cx-device-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
@@ -126,16 +168,14 @@
       tr.classList.toggle('bulk-checked', on);
       const box = tr.querySelector('.cx-check');
       if (box) box.checked = on;
+      App.refreshSelectAll(App.el('cx-devices'), view.devices.length,
+                           view.devicesChecked.size);
       drawBulkBar();
       return;
     }
     drawDevices();
   }
 
-  function bulkSelectAll() {
-    view.devices.forEach((d) => view.devicesChecked.add(d.id));
-    drawDevices();
-  }
 
   function bulkClearSelection() {
     view.devicesChecked.clear();
@@ -183,6 +223,9 @@
   }
 
   async function selectDevice(deviceId) {
+    // Moving to another device drops the backup selection with it — a bulk
+    // delete must never act on rows that belong to the device you left.
+    if (view.selectedDeviceId !== deviceId) view.backupsChecked.clear();
     view.selectedDeviceId = deviceId;
     view.selectedBackupId = null;
     view.backupContent = '';
@@ -195,28 +238,126 @@
 
   /* ------------------------------------------------------------- backups */
 
+  const BACKUP_COLUMNS = [
+    { key: 'check', label: '', sortable: false, fixed: true, width: 30,
+      cell: (r) => `<input type="checkbox" class="cx-bcheck"${
+        view.backupsChecked.has(r.id) ? ' checked' : ''}>` },
+    { key: 'ts', label: 'Taken', width: 150, numeric: true, on: true,
+      align: 'left', descendingFirst: true,
+      cell: (r) => escape(new Date(r.ts * 1000).toLocaleString()) },
+    { key: 'size_bytes', label: 'Size', width: 80, numeric: true, on: true,
+      cell: (r) => bytesText(r.size_bytes) },
+    { key: 'sha256', label: 'Digest', width: 110,
+      cell: (r) => escape(r.sha256.slice(0, 12)) },
+  ];
+
+  const backupColumns = () => App.visibleColumns(
+    BACKUP_COLUMNS, (App.state.configrxSettings || {}).table_columns_backups);
+
+  function onBackupSort(key, descending) {
+    view.backupSort = { key, descending };
+    drawBackups();
+  }
+
   function drawBackups() {
-    const list = App.el('cx-backup-list');
-    list.innerHTML = '';
     const device = view.devices.find((d) => d.id === view.selectedDeviceId);
     App.el('cx-backup-header').textContent = device
-      ? `BACKUPS — ${device.name}` : 'BACKUPS';
+      ? `BACKUPS \u2014 ${device.name}` : 'BACKUPS';
     App.el('cx-backup-now').hidden = !device || !device.backup_enabled;
     App.el('cx-device-settings').hidden = !device;
+    const empty = App.el('cx-backup-empty');
+    const wrap = App.el('cx-backup-wrap');
     if (!view.backups.length) {
-      list.innerHTML = '<div class="hint" style="padding:8px">No backups stored yet.</div>';
+      empty.hidden = false;
+      wrap.hidden = true;
+      App.el('cx-backup-bulk').hidden = true;
       return;
     }
-    for (const backup of view.backups) {
-      const row = document.createElement('div');
-      row.className = 'clickable-row' + (view.selectedBackupId === backup.id ? ' selected' : '');
-      row.style.cssText = 'padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--hairline)';
-      if (view.selectedBackupId === backup.id) row.style.background = 'var(--panel)';
-      row.innerHTML = `<div>${new Date(backup.ts * 1000).toLocaleString()}</div>` +
-        `<div class="hint">${bytesText(backup.size_bytes)} · ${backup.sha256.slice(0, 12)}</div>`;
-      row.onclick = () => selectBackup(backup.id);
-      list.appendChild(row);
-    }
+    empty.hidden = true;
+    wrap.hidden = false;
+    const columns = backupColumns();
+    const checked = view.backupsChecked;
+    const table = App.grid(App.el('cx-backups'), {
+      name: 'configrx-backups', columns,
+      sort: view.backupSort, onSort: onBackupSort,
+      selectAll: {
+        key: 'check',
+        checked: view.backups.every((b) => checked.has(b.id)),
+        some: view.backups.some((b) => checked.has(b.id)),
+        onToggle: (on) => {
+          checked.clear();
+          if (on) for (const b of view.backups) checked.add(b.id);
+          drawBackups();
+        },
+      } });
+    const body = document.createElement('tbody');
+    const rows = App.sortRows(view.backups, view.backupSort.key,
+                              view.backupSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
+      tr.className = 'clickable'
+        + (view.selectedBackupId === row.id ? ' selected' : '')
+        + (checked.has(row.id) ? ' bulk-checked' : '');
+      const box = tr.querySelector('.cx-bcheck');
+      if (box) {
+        box.onclick = (event) => {
+          event.stopPropagation();
+          if (checked.has(row.id)) checked.delete(row.id);
+          else checked.add(row.id);
+          tr.classList.toggle('bulk-checked', checked.has(row.id));
+          box.checked = checked.has(row.id);
+          App.refreshSelectAll(App.el('cx-backups'), view.backups.length,
+                               checked.size);
+          drawBackupBulkBar();
+        };
+      }
+      tr.onclick = () => selectBackup(row.id);
+    });
+    table.appendChild(body);
+    drawBackupBulkBar();
+  }
+
+  function drawBackupBulkBar() {
+    const n = view.backupsChecked.size;
+    App.el('cx-backup-bulk').hidden = n === 0;
+    if (n) App.el('cx-backup-bulk-count').textContent = `${n} selected`;
+  }
+
+  /* Deleting the NEWEST stored backup is not the same act as deleting an
+     older one, and the confirmation says so: add_backup dedupes against the
+     device's latest hash, so once the top row is gone the next scheduled run
+     stores a "changed" backup for a config that has not changed. Better to
+     say that than to let someone discover it from a diff. */
+  function deleteBackups(ids) {
+    if (!ids.length) return;
+    const newest = view.backups.length
+      ? view.backups.reduce((a, b) => (b.ts > a.ts ? b : a)) : null;
+    const takingNewest = newest && ids.includes(newest.id);
+    const device = view.devices.find((d) => d.id === view.selectedDeviceId);
+    App.confirmDestructive(
+      ids.length === 1 ? 'Delete this backup' : `Delete ${ids.length} backups`,
+      `<p>Permanently delete <b>${ids.length}</b> stored config backup(s)` +
+      `${device ? ` for <b>${escape(device.name)}</b>` : ''}? The stored config` +
+      ' text is removed and cannot be recovered.</p>' +
+      (takingNewest
+        ? '<p class="hint">This includes the <b>most recent</b> backup. A new'
+          + ' backup is only stored when it differs from the last one, so after'
+          + ' this the next run will store the device\u2019s current config as a'
+          + ' change even though nothing on the device has changed.</p>'
+        : ''),
+      'Delete',
+      async () => {
+        if (ids.length === 1) {
+          await App.del(`/api/configrx/backups/${ids[0]}`, {});
+        } else {
+          await App.post('/api/configrx/backups/bulk-delete', { backup_ids: ids });
+        }
+        view.backupsChecked.clear();
+        if (ids.includes(view.selectedBackupId)) {
+          view.selectedBackupId = null;
+          view.backupContent = '';
+        }
+        await selectDevice(view.selectedDeviceId);
+      });
   }
 
   async function selectBackup(backupId) {
@@ -312,7 +453,7 @@
 
   function settingsDialog() {
     const s = App.state.configrxSettings || {};
-    App.modal('ConfigRX settings', `
+    const settingsBox = App.modal('ConfigRX settings', `
       <fieldset><legend>SCHEDULE</legend>
         <label class="check"><input type="checkbox" id="cxs-enabled"
           ${s.enabled ? 'checked' : ''}> Run the backup worker</label>
@@ -347,7 +488,11 @@
           every other setting here. Enabling it can only help where the installed
           paramiko still implements those algorithms: paramiko 5 removed them
           outright, which is why this app pins paramiko below 5.</p>
-      </fieldset>`, [
+      </fieldset>
+      ${App.columnPickerFieldset('DEVICE LIST COLUMNS', 'cxdevices', COLUMNS,
+                                 s.table_columns)}
+      ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
+                                 s.table_columns_backups)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
         await App.post('/api/settings', { scope: 'configrx', values: {
@@ -357,12 +502,17 @@
           retention_days: Number(m.querySelector('#cxs-days').value),
           retention_count_per_device: Number(m.querySelector('#cxs-count').value),
           allow_legacy_ssh: m.querySelector('#cxs-legacy').checked,
+          table_columns: App.readColumnPicker(
+            m.querySelector('#cols-cxdevices'), COLUMNS),
+          table_columns_backups: App.readColumnPicker(
+            m.querySelector('#cols-cxbackups'), BACKUP_COLUMNS),
         } });
         await App.loadState();
         App.closeModal();
         App.refreshNow('configrx');
       } },
     ]);
+    App.wireColumnPickers(settingsBox);
   }
 
   /* ----------------------------------------------------------- refresh */
@@ -370,12 +520,31 @@
   async function refresh() {
     if (App.state.tab !== 'configrx') return;
     drawStatus();
+    const vendorSelect = App.el('cx-filter-vendor');
     const params = { q: App.el('cx-q').value.trim() };
     if (App.el('cx-enabled-only').checked) params.enabled_only = 1;
+    if (vendorSelect.value) params.vendor = vendorSelect.value;
     const result = await App.get('/api/configrx/devices', params);
     view.devices = result.devices;
+    drawVendorFilter(result.devices, vendorSelect);
     drawDevices();
     drawBackups();
+  }
+
+  /* Built from the vendors actually present rather than from the vendor
+     catalogue, so the filter never offers a choice that returns nothing.
+     While a vendor is selected the response only contains that vendor, so
+     the current choice is kept in the list — otherwise picking one would
+     immediately empty the control that made the choice. */
+  function drawVendorFilter(devices, select) {
+    const current = select.value;
+    const seen = new Set(devices.map((d) => d.effective_vendor || '(none)'));
+    if (current) seen.add(current);
+    const options = [...seen].sort();
+    select.innerHTML = '<option value="">All vendors</option>' +
+      options.map((v) =>
+        `<option value="${escape(v)}">${escape(v)}</option>`).join('');
+    select.value = current;
   }
 
   function init() {
@@ -384,8 +553,13 @@
       if (event.key === 'Enter') App.refreshNow('configrx');
     };
     App.el('cx-enabled-only').onchange = () => App.refreshNow('configrx');
-    App.el('cx-bulk-selectall').onclick = bulkSelectAll;
+    App.el('cx-filter-vendor').onchange = () => App.refreshNow('configrx');
     App.el('cx-bulk-clear').onclick = bulkClearSelection;
+    App.el('cx-backup-delete').onclick = () => deleteBackups([...view.backupsChecked]);
+    App.el('cx-backup-clear').onclick = () => {
+      view.backupsChecked.clear();
+      drawBackups();
+    };
     App.el('cx-bulk-credential').onclick = bulkSetCredential;
     App.el('cx-settings').onclick = settingsDialog;
     App.el('cx-device-settings').onclick = deviceSettingsModal;
@@ -407,9 +581,44 @@
       button.disabled = true;
       button.textContent = 'Queueing…';
       try {
+        const deviceId = view.selectedDeviceId;
+        const before = (view.devices.find((d) => d.id === deviceId) || {})
+          .last_backup_ts || 0;
         const result = await App.post(
-          `/api/configrx/devices/${view.selectedDeviceId}/backup`, {});
-        settle(result.queued === false ? 'Already queued…' : 'Queued…');
+          `/api/configrx/devices/${deviceId}/backup`, {});
+        if (result.queued === false) { settle('Already queued…'); return; }
+        button.textContent = 'Queued…';
+        // Bounded, and reporting real state rather than a guess: a backup runs
+        // on a worker thread, so the POST returning means "queued". The device
+        // row now carries backing_up/backup_queued, and last_backup_ts moving
+        // is what "done" actually means. Same shape as the Nodes Poll now
+        // button, which had exactly this problem first.
+        const deadline = Date.now() + 180000;
+        const watch = async () => {
+          if (view.selectedDeviceId !== deviceId || App.state.tab !== 'configrx') {
+            settle('Back up now');
+            return;
+          }
+          let payload;
+          try {
+            payload = await App.get(`/api/configrx/devices/${deviceId}`, {});
+          } catch (error) {
+            settle('Back up now');
+            return;
+          }
+          const device = payload.device || {};
+          if ((device.last_backup_ts || 0) > before) {
+            settle(device.last_backup_status === 'error' ? 'Failed'
+              : (device.last_backup_status || 'Done'));
+            await selectDevice(deviceId);
+            App.refreshNow('configrx');
+            return;
+          }
+          if (Date.now() > deadline) { settle('Still running…'); return; }
+          button.textContent = device.backing_up ? 'Backing up…' : 'Queued…';
+          setTimeout(watch, 1000);
+        };
+        setTimeout(watch, 600);
       } catch (error) {
         settle('Back up now');
         App.modal('Cannot back up now',

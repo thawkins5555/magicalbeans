@@ -6,6 +6,9 @@
   const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
+    // Newest first, matching the order the server already returns them
+    // in, so the first draw looks the same as it always did.
+    messageSort: { key: 'ts', descending: true },
     t0: Date.now() / 1000 - 86400,
     t1: Date.now() / 1000,
     follow: true,
@@ -151,31 +154,44 @@
      read; Source and Host are wide enough for a resolved hostname, not
      just the raw address, since either can show one. */
   const COLUMNS = [
-    { key: 'ts', label: 'Time', width: 92 },
-    { key: 'severity', label: 'Severity', width: 90 },
-    { key: 'source', label: 'Source', width: 160 },
-    { key: 'host', label: 'Host', width: 140 },
-    { key: 'app', label: 'App', width: 100 },
-    { key: 'message', label: 'Message', width: 520 },
+    { key: 'ts', label: 'Time', width: 92, numeric: true, on: true,
+      align: 'left', cell: (r) => App.clock(r.ts) },
+    { key: 'severity', label: 'Severity', width: 90, numeric: true, on: true,
+      align: 'left',
+      cell: (r) => `<span class="sev sev-${r.severity}">${escape(r.severity_name)}</span>` },
+    { key: 'source', label: 'Source', width: 160, on: true,
+      value: (r) => (view.showHostname && r.source_name) || r.source || '',
+      cell: (r) => escape((view.showHostname && r.source_name) || r.source) },
+    { key: 'host', label: 'Host', width: 140, on: true },
+    { key: 'app', label: 'App', width: 100, on: true },
+    { key: 'message', label: 'Message', width: 520, on: true,
+      cell: (r) => `<span class="msg">${escape(r.message)}</span>` },
+    { key: 'facility_name', label: 'Facility', width: 110 },
+    { key: 'severity_name', label: 'Severity name', width: 110 },
+    { key: 'source_name', label: 'Source name', width: 160,
+      cell: (r) => escape(r.source_name || '\u2014') },
   ];
 
+  const messageColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.syslogSettings || {}).table_columns);
+
+  function onMessageSort(key, descending) {
+    view.messageSort = { key, descending };
+    drawTable();
+  }
+
   function drawTable() {
+    const columns = messageColumns();
     const table = App.grid(App.el('syslog-table'),
-      { name: 'syslog-messages', columns: COLUMNS });
+      { name: 'syslog-messages', columns,
+        sort: view.messageSort, onSort: onMessageSort });
     const body = document.createElement('tbody');
-    for (const row of view.messages) {
-      const tr = document.createElement('tr');
+    const rows = App.sortRows(view.messages, view.messageSort.key,
+                              view.messageSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.innerHTML =
-        `<td>${App.clock(row.ts)}</td>` +
-        `<td><span class="sev sev-${row.severity}">${row.severity_name}</span></td>` +
-        `<td>${escape((view.showHostname && row.source_name) || row.source)}</td>` +
-        `<td>${escape(row.host)}</td>` +
-        `<td>${escape(row.app)}</td>` +
-        `<td class="msg">${escape(row.message)}</td>`;
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
   }
 
@@ -243,7 +259,9 @@
         ${number('s-maxrows', 'Row cap', s.max_rows, 'min=10000 step=100000')}
         <p class="hint">The database size cap lives on the Settings tab with the others,
           since all three databases share one disk.</p>
-      </fieldset>`, [
+      </fieldset>
+      ${App.columnPickerFieldset('MESSAGE LIST COLUMNS', 'syslog', COLUMNS,
+                                 s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const on = (id) => box.querySelector(id).checked;
@@ -260,6 +278,8 @@
           allowed_sources: text('#s-allowed'),
           resolve_sources: on('#s-resolve'),
           use_receive_time: on('#s-recv-time'),
+          table_columns: App.readColumnPicker(
+            box.querySelector('#cols-syslog'), COLUMNS),
           retention_days: num('#s-retention'), max_rows: num('#s-maxrows'),
         } });
         await App.loadState();
@@ -267,6 +287,7 @@
         App.refreshNow('syslog');
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(box);
 
     const select = box.querySelector('#s-minsev');
     (App.state.severities || []).forEach((name, index) => {

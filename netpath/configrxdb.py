@@ -76,6 +76,18 @@ DEFAULTS = {
     # Only effective when the installed paramiko still implements them —
     # paramiko 5 removed the code (see configrx._apply_legacy_algorithms).
     "allow_legacy_ssh": True,
+    # Comma-joined column keys the ConfigRX device table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns": "",
+    # Comma-joined column keys the backups table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns_backups": "",
 }
 
 DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")
@@ -238,6 +250,30 @@ class ConfigRxDatabase:
         if not row:
             return None
         return zlib.decompress(row["content_gz"]).decode("utf-8", "replace")
+
+    def delete_backup(self, backup_id: int) -> bool:
+        """Removes one stored backup. True when a row went, False when the id
+        was already gone — a double-click is a no-op, not an error.
+
+        Note for callers: deleting a device's MOST RECENT backup changes what
+        the next run stores, because add_backup dedupes against
+        latest_backup_hash. The operator is warned about that in the UI; this
+        method just does what it was asked."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def delete_backups(self, backup_ids: list[int]) -> int:
+        """The bulk form, one statement rather than one per id."""
+        if not backup_ids:
+            return 0
+        marks = ",".join("?" * len(backup_ids))
+        with self._lock:
+            cur = self._conn.execute(
+                f"DELETE FROM backups WHERE id IN ({marks})", backup_ids)
+            self._conn.commit()
+            return cur.rowcount or 0
 
     def prune(self, retention_days: float, retention_count_per_device: int) -> int:
         """retention_days=0 deletes every backup regardless of age — the

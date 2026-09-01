@@ -307,15 +307,27 @@
      as though it were. An address that has never answered now shows "never"
      rather than a recent-looking timestamp left by the last sweep. */
   const HOST_COLUMNS = [
-    { key: 'ip', label: 'IP address', width: 130, value: (r) => r.ip },
-    { key: 'mac', label: 'MAC', width: 150, value: (r) => r.mac || '' },
-    { key: 'alive', label: 'Alive', width: 70, value: (r) => (r.alive ? 1 : 0) },
-    { key: 'hostname', label: 'Hostname', width: 220, value: (r) => r.hostname || '' },
-    { key: 'last_up', label: 'Last reply', width: 110, numeric: true,
-      align: 'left', descendingFirst: true, value: (r) => r.last_up },
-    { key: 'first_seen', label: 'First probed', width: 120, numeric: true,
-      align: 'left', value: (r) => r.first_seen },
+    { key: 'ip', label: 'IP address', width: 130, on: true, value: (r) => r.ip,
+      cell: (r) => escape(r.ip) },
+    { key: 'mac', label: 'MAC', width: 150, on: true, value: (r) => r.mac || '',
+      cell: (r) => escape(r.mac || '\u2014') },
+    { key: 'alive', label: 'Alive', width: 70, on: true,
+      value: (r) => (r.alive ? 1 : 0),
+      cell: (r) => (r.alive ? '<span class="sev sev-3">up</span>'
+                            : '<span class="sev sev-7">down</span>') },
+    { key: 'hostname', label: 'Hostname', width: 220, on: true,
+      value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
+    { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
+      align: 'left', descendingFirst: true, value: (r) => r.last_up,
+      cell: (r) => ago(r.last_up) },
+    { key: 'first_seen', label: 'First probed', width: 120, numeric: true, on: true,
+      align: 'left', value: (r) => r.first_seen, cell: (r) => ago(r.first_seen) },
+    { key: 'last_seen', label: 'Last probed', width: 120, numeric: true,
+      align: 'left', value: (r) => r.last_seen, cell: (r) => ago(r.last_seen) },
   ];
+
+  const hostColumns = () => App.visibleColumns(
+    HOST_COLUMNS, (App.state.ipamSettings || {}).table_columns_hosts);
 
   function onHostSort(key, descending) {
     view.hostSort = { key, descending };
@@ -323,24 +335,15 @@
   }
 
   function drawHosts() {
+    const columns = hostColumns();
     const table = App.grid(App.el('ipam-hosts-table'),
-      { name: 'ipam-hosts', columns: HOST_COLUMNS, sort: view.hostSort, onSort: onHostSort });
+      { name: 'ipam-hosts', columns, sort: view.hostSort, onSort: onHostSort });
     const body = document.createElement('tbody');
     const aliveOnly = App.el('ipam-alive-only').checked;
     const rows = App.sortRows(
       aliveOnly ? view.hosts.filter((h) => h.alive) : view.hosts,
-      view.hostSort.key, view.hostSort.descending, HOST_COLUMNS);
-    for (const host of rows) {
-      const tr = document.createElement('tr');
-      tr.innerHTML =
-        `<td>${escape(host.ip)}</td>` +
-        `<td>${escape(host.mac || '—')}</td>` +
-        `<td>${host.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
-        `<td>${escape(host.hostname || '')}</td>` +
-        `<td>${ago(host.last_up)}</td>` +
-        `<td>${ago(host.first_seen)}</td>`;
-      body.appendChild(tr);
-    }
+      view.hostSort.key, view.hostSort.descending, columns);
+    App.drawRows(body, rows, columns);
     table.appendChild(body);
     App.el('ipam-hosts-count').textContent = `${rows.length} of ${view.hosts.length}`;
   }
@@ -820,13 +823,29 @@
   }
 
   const LEASE_COLUMNS = [
-    { key: 'ip', label: 'IP address', width: 130, value: (r) => r.ip },
-    { key: 'mac', label: 'MAC', width: 150, value: (r) => r.mac || '' },
-    { key: 'hostname', label: 'Hostname', width: 200, value: (r) => r.hostname || '' },
-    { key: 'state', label: 'State', width: 140, value: (r) => r.address_state || '' },
-    { key: 'expires', label: 'Lease expires', width: 150, numeric: true,
-      align: 'left', value: (r) => r.lease_expires || 0 },
+    { key: 'ip', label: 'IP address', width: 130, on: true, value: (r) => r.ip,
+      cell: (r) => escape(r.ip) },
+    { key: 'mac', label: 'MAC', width: 150, on: true, value: (r) => r.mac || '',
+      cell: (r) => escape(r.mac || '') },
+    { key: 'hostname', label: 'Hostname', width: 200, on: true,
+      value: (r) => r.hostname || r.description || '',
+      cell: (r) => escape(r.hostname || r.description || '') },
+    { key: 'state', label: 'State', width: 140, on: true,
+      value: (r) => r.address_state || '',
+      cell: (r) => (r.is_reservation
+        ? `<span class="sev sev-5">${escape(r.address_state || 'reservation')}</span>`
+        : escape(r.address_state || '')) },
+    { key: 'expires', label: 'Lease expires', width: 150, numeric: true, on: true,
+      align: 'left', value: (r) => r.lease_expires || 0,
+      cell: (r) => (r.lease_expires ? App.stamp(r.lease_expires) : '') },
+    { key: 'scope_id', label: 'Scope', width: 130,
+      cell: (r) => escape(r.scope_id || '\u2014') },
+    { key: 'server_label', label: 'Server', width: 160,
+      cell: (r) => escape(r.server_label || '\u2014') },
   ];
+
+  const leaseColumns = () => App.visibleColumns(
+    LEASE_COLUMNS, (App.state.ipamSettings || {}).table_columns_leases);
 
   function onLeaseSort(key, descending) {
     view.leaseSort = { key, descending };
@@ -834,23 +853,13 @@
   }
 
   function drawLeases() {
+    const columns = leaseColumns();
     const table = App.grid(App.el('ipam-dhcp-lease-table'),
-      { name: 'ipam-leases', columns: LEASE_COLUMNS, sort: view.leaseSort, onSort: onLeaseSort });
+      { name: 'ipam-leases', columns, sort: view.leaseSort, onSort: onLeaseSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.dhcpLeases, view.leaseSort.key,
-      view.leaseSort.descending, LEASE_COLUMNS);
-    for (const lease of rows) {
-      const tr = document.createElement('tr');
-      const state = lease.is_reservation
-        ? `<span class="sev sev-5">${escape(lease.address_state || 'reservation')}</span>`
-        : escape(lease.address_state || '');
-      tr.innerHTML =
-        `<td>${escape(lease.ip)}</td><td>${escape(lease.mac || '')}</td>` +
-        `<td>${escape(lease.hostname || lease.description || '')}</td>` +
-        `<td>${state}</td>` +
-        `<td>${lease.lease_expires ? App.stamp(lease.lease_expires) : ''}</td>`;
-      body.appendChild(tr);
-    }
+      view.leaseSort.descending, columns);
+    App.drawRows(body, rows, columns);
     table.appendChild(body);
     App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;
   }
@@ -917,7 +926,7 @@
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
-    App.modal('IPAM settings', `
+    const settingsBox = App.modal('IPAM settings', `
       <fieldset><legend>SCANNING</legend>
         ${check('i-enabled', 'Run the IPAM worker', s.enabled)}
         ${number('i-interval', 'Scan every', s.scan_interval_minutes, 'min=5')} minutes
@@ -939,7 +948,11 @@
         ${number('i-conflict-days', 'Forget resolved conflicts after', s.conflict_retention_days, 'min=1')} days
         ${number('i-scan-days', 'Keep scan history for', s.scan_history_days, 'min=1')} days
         ${number('i-dhcp-history-days', 'Keep DHCP leased-IP history for', s.dhcp_history_days, 'min=7')} days
-      </fieldset>`, [
+      </fieldset>
+      ${App.columnPickerFieldset('HOST LIST COLUMNS', 'ipamhosts',
+                                 HOST_COLUMNS, s.table_columns_hosts)}
+      ${App.columnPickerFieldset('DHCP LEASE COLUMNS', 'ipamleases',
+                                 LEASE_COLUMNS, s.table_columns_leases)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const on = (id) => box.querySelector(id).checked;
@@ -957,11 +970,16 @@
           conflict_retention_days: num('#i-conflict-days'),
           scan_history_days: num('#i-scan-days'),
           dhcp_history_days: num('#i-dhcp-history-days'),
+          table_columns_hosts: App.readColumnPicker(
+            box.querySelector('#cols-ipamhosts'), HOST_COLUMNS),
+          table_columns_leases: App.readColumnPicker(
+            box.querySelector('#cols-ipamleases'), LEASE_COLUMNS),
         } });
         await App.loadState();
         App.closeModal();
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(settingsBox);
   }
 
   /* --------------------------------------------------------------- lifecycle */

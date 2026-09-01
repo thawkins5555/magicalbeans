@@ -365,27 +365,46 @@
      can show a resolved hostname rather than a bare address; everything
      else only needs room for what it actually holds. */
   const COLUMNS = [
-    { key: 'ts', label: 'Time', numeric: true, descendingFirst: true,
-      width: 92, value: (r) => r.ts },
+    { key: 'ts', label: 'Time', numeric: true, descendingFirst: true, on: true,
+      width: 92, value: (r) => r.ts, cell: (r) => App.clock(r.ts) },
     // Second, immediately after Time: which device reported a flow is
     // context for reading the rest of the row, not a footnote to it. Sorts
     // on the name where there is one, the way Source and Destination do.
-    { key: 'exporter', label: 'Exporter', width: 150,
-      value: (r) => (r.exporter_name || r.exporter || '').toLowerCase() },
-    { key: 'src', label: 'Source', width: 190, value: (r) => r.src_name || r.src_ip },
-    { key: 'src_port', label: 'Src port', numeric: true,
-      width: 96, value: (r) => r.src_port_num },
-    { key: 'dst', label: 'Destination', width: 190, value: (r) => r.dst_name || r.dst_ip },
-    { key: 'dst_port', label: 'Dst port', numeric: true,
-      width: 96, value: (r) => r.dst_port_num },
-    { key: 'protocol', label: 'Proto', width: 76 },
-    { key: 'bytes', label: 'Bytes', numeric: true, descendingFirst: true,
-      width: 84, value: (r) => r.bytes },
-    { key: 'packets', label: 'Packets', numeric: true, descendingFirst: true,
-      width: 84, value: (r) => r.packets },
-    { key: 'interfaces', label: 'In/Out', sortable: false, width: 96,
-      value: (r) => `${r.in_if} / ${r.out_if}` },
-    { key: 'route', label: '', sortable: false, width: 84, value: () => '' },
+    { key: 'exporter', label: 'Exporter', width: 150, on: true,
+      value: (r) => (r.exporter_name || r.exporter || '').toLowerCase(),
+      // Escaped, unlike the bare address it replaces — a device name is
+      // typed by an admin, and this is interpolated into innerHTML.
+      cell: (r) => escape(r.exporter_name || r.exporter || '') },
+    { key: 'src', label: 'Source', width: 190, on: true,
+      value: (r) => r.src_name || r.src_ip,
+      cell: (r) => escape(r.src_name || r.src_ip || '') },
+    { key: 'src_port', label: 'Src port', numeric: true, on: true,
+      width: 96, value: (r) => r.src_port_num, cell: (r) => r.src_port },
+    { key: 'dst', label: 'Destination', width: 190, on: true,
+      value: (r) => r.dst_name || r.dst_ip,
+      cell: (r) => escape(r.dst_name || r.dst_ip || '') },
+    { key: 'dst_port', label: 'Dst port', numeric: true, on: true,
+      width: 96, value: (r) => r.dst_port_num, cell: (r) => r.dst_port },
+    { key: 'protocol', label: 'Proto', width: 76, on: true,
+      cell: (r) => escape(r.protocol) },
+    { key: 'bytes', label: 'Bytes', numeric: true, descendingFirst: true, on: true,
+      width: 84, value: (r) => r.bytes, cell: (r) => r.bytes_text },
+    { key: 'packets', label: 'Packets', numeric: true, descendingFirst: true, on: true,
+      width: 84, value: (r) => r.packets, cell: (r) => r.packets_text },
+    { key: 'interfaces', label: 'In/Out', sortable: false, width: 96, on: true,
+      value: (r) => `${r.in_if} / ${r.out_if}`,
+      cell: (r) => `${r.in_if} / ${r.out_if}` },
+    { key: 'src_ip', label: 'Source IP', width: 140,
+      cell: (r) => escape(r.src_ip || '') },
+    { key: 'dst_ip', label: 'Destination IP', width: 140,
+      cell: (r) => escape(r.dst_ip || '') },
+    { key: 'exporter_ip', label: 'Exporter IP', width: 140,
+      value: (r) => r.exporter || '', cell: (r) => escape(r.exporter || '') },
+    // The route button is a `fixed` column, not an appendix bolted on after
+    // the row was built: it used to be appended outside the cell map, which
+    // is exactly the pattern that breaks the moment columns can be hidden.
+    { key: 'route', label: '', sortable: false, fixed: true, width: 84,
+      cell: () => '' },
   ];
 
   /* Which column the table is ordered by. Separate from the selector above it:
@@ -398,40 +417,29 @@
     drawTable(view.records || []);
   }
 
+  const recordColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.flowSettings || {}).table_columns);
+
   function drawTable(records) {
     view.records = records;
+    const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
-                           { name: 'nf-records', columns: COLUMNS, sort, onSort });
+                           { name: 'nf-records', columns, sort, onSort });
     const body = document.createElement('tbody');
-    for (const record of App.sortRows(records, sort.key, sort.descending, COLUMNS)) {
-      const tr = document.createElement('tr');
-      const src = record.src_name || record.src_ip || '';
+    const rows = App.sortRows(records, sort.key, sort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, record) => {
       const dst = record.dst_name || record.dst_ip || '';
-      // Positional: this array and COLUMNS are zipped below, so the two
-      // orders have to move together.
-      const cells = [
-        App.clock(record.ts),
-        // Escaped, unlike the bare address it replaces — a device name is
-        // typed by an admin, and this is interpolated into innerHTML.
-        escape(record.exporter_name || record.exporter || ''),
-        escape(src), record.src_port, escape(dst),
-        record.dst_port, record.protocol, record.bytes_text, record.packets_text,
-        `${record.in_if} / ${record.out_if}`,
-      ];
-      tr.innerHTML = cells.map((value, index) =>
-        `<td class="${COLUMNS[index].numeric ? 'num' : ''}">${value}</td>`).join('');
-
       // Flow-to-path correlation: jump straight to the NetPath route that
       // this conversation's destination was last traced over. Always shown,
       // greyed when no target has ever traced that address, so the control's
       // position in the row stays constant and its existence is discoverable.
-      const routeCell = document.createElement('td');
-      if (record.dst_target_id) {
+      const routeCell = tr.cells[columns.findIndex((c) => c.key === 'route')];
+      if (routeCell && record.dst_target_id) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'linkish';
         btn.title = `View the NetPath route to ${dst}`;
-        btn.textContent = '→ Route';
+        btn.textContent = '\u2192 Route';
         btn.onclick = (event) => {
           event.stopPropagation();
           App.pages.netpath.activate({
@@ -441,13 +449,11 @@
           App.selectTab('netpath');
         };
         routeCell.appendChild(btn);
-      } else {
-        routeCell.textContent = '—';
+      } else if (routeCell) {
+        routeCell.textContent = '\u2014';
         routeCell.style.color = 'var(--faint)';
         routeCell.title = 'No NetPath target has traced a route to this destination';
       }
-      tr.appendChild(routeCell);
-
       const tip = [
         new Date(record.ts * 1000).toLocaleString(),
         `${record.src_ip}:${record.src_port} → ${record.dst_ip}:${record.dst_port}`,
@@ -464,8 +470,7 @@
       const text = tip.join('\n');
       tr.addEventListener('mousemove', (event) => App.tooltip(text, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
   }
 
@@ -477,7 +482,7 @@
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
-    App.modal('NetFlow settings', `
+    const settingsBox = App.modal('NetFlow settings', `
       <fieldset><legend>COLLECTOR</legend>
         ${check('n-enabled', 'Run the collector', s.enabled)}
         <label>Bind address <input id="n-bind" value="${escape(s.bind_address)}"></label>
@@ -513,7 +518,9 @@
         ${check('n-addr', 'Reverse-resolve addresses in the flow table', s.resolve_addresses)}
         <p class="hint">Reverse DNS threads, timeout and cache lifetime are shared with
           NetPath and live on the Settings tab.</p>
-      </fieldset>`, [
+      </fieldset>
+      ${App.columnPickerFieldset('FLOW LIST COLUMNS', 'netflow', COLUMNS,
+                                 s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const on = (id) => box.querySelector(id).checked;
@@ -531,6 +538,8 @@
           max_flows: num('#n-max'), top_n: num('#n-topn'),
           bucket_seconds: num('#n-bucket'), resolve_ports: on('#n-ports'),
           resolve_addresses: on('#n-addr'),
+          table_columns: App.readColumnPicker(
+            box.querySelector('#cols-netflow'), COLUMNS),
         } });
         await App.loadState();
         App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
@@ -538,6 +547,7 @@
         App.refreshNow('netflow');
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(settingsBox);
   }
 
   async function sendTestPacket() {

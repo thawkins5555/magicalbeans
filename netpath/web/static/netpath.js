@@ -586,7 +586,13 @@
     }
 
     const tip = [`Address   ${node.label}`];
-    if (node.hostname) tip.push(`Name      ${node.hostname}`);
+    // Saying where the name came from matters here: a hop named from the
+    // Nodes inventory is a device this app monitors, and a PTR-derived name
+    // looks identical to one.
+    if (node.hostname) {
+      tip.push(`Name      ${node.hostname}` +
+               (node.hostname_source === 'nodes' ? '  (from Nodes)' : ''));
+    }
     if (node.asn) {
       tip.push(`Network   AS${node.asn}${node.asn_org ? ` (${node.asn_org})` : ''}`);
     }

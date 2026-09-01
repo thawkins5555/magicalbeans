@@ -508,6 +508,10 @@ tr.selected td { background: var(--hairline); }
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
 td.num { text-align: right; }
+/* The select-all box sits in the header cell above the row checkboxes.
+   Vertically centred against the header text of its neighbours, and never
+   picking up the sortable-header cursor — its column is not sortable. */
+th .select-all { margin: 0; vertical-align: middle; cursor: pointer; }
 
 /* Sortable, resizable tables. Fixed layout so the colgroup widths are obeyed
    exactly rather than treated as suggestions the browser may widen. Every

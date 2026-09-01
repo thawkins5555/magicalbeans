@@ -131,23 +131,14 @@
      (table_columns, comma-joined keys), not in a private localStorage
      key: it is saved by the same dialog as the rest of the module's
      settings, and Reset layout — which clears the shared per-browser
-     column-width store — must not silently keep or eat it. */
-  function chosenColumnKeys() {
-    const stored = String((App.state.wirelessSettings || {}).table_columns || '')
-      .split(',').map((k) => k.trim()).filter(Boolean)
-      .filter((k) => ALL_COLUMNS.some((c) => c.key === k));
-    // An admin who unchecks everything gets the defaults back rather
-    // than a table with no columns at all.
-    if (stored.length) return stored;
-    return ALL_COLUMNS.filter((c) => c.on).map((c) => c.key);
-  }
+     column-width store — must not silently keep or eat it.
 
-  function activeColumns() {
-    const chosen = chosenColumnKeys();
-    // Ordered by the catalog, not by click order, so the table's column
-    // order stays stable however the boxes were ticked.
-    return ALL_COLUMNS.filter((c) => chosen.includes(c.key));
-  }
+     This module shipped the pattern first and privately; since 4.30.0 the
+     implementation is App.visibleColumns and every pickable table shares it,
+     so there is one set of rules (unknown keys dropped, unticking everything
+     restores the defaults) rather than one per module. */
+  const activeColumns = () => App.visibleColumns(
+    ALL_COLUMNS, (App.state.wirelessSettings || {}).table_columns);
 
   function onApSort(key, descending) {
     view.apSort = { key, descending };
@@ -160,17 +151,10 @@
       { name: 'wireless-aps', columns, sort: view.apSort, onSort: onApSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.aps, view.apSort.key, view.apSort.descending, columns);
-    for (const row of rows) {
-      const tr = document.createElement('tr');
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.innerHTML = columns.map((c) => {
-        if (c.cell) return `<td>${c.cell(row)}</td>`;
-        const raw = row[c.key];
-        return `<td>${raw === null || raw === undefined || raw === '' ? '—' : escape(raw)}</td>`;
-      }).join('');
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
     App.el('wl-count').textContent = `${rows.length} AP(s)`;
     drawApActions();
@@ -351,10 +335,6 @@
 
   function settingsDialog() {
     const s = App.state.wirelessSettings || {};
-    const chosen = chosenColumnKeys();
-    const columnBoxes = ALL_COLUMNS.map((c) => `
-      <label class="check"><input type="checkbox" data-column="${c.key}"
-        ${chosen.includes(c.key) ? 'checked' : ''}> ${escape(c.label)}</label>`).join('');
     const box = App.modal('Wireless settings', `
       <fieldset><legend>POLLING</legend>
         <label class="check"><input type="checkbox" id="wl-enabled"
@@ -381,25 +361,23 @@
           radio reports above 30 dBm. The raw number is always shown in the AP detail
           pane either way.</p>
       </fieldset>
-      <fieldset><legend>COLUMNS</legend>
-        ${columnBoxes}
-        <p class="hint">Which of the controller's SNMP-reported fields the access
-          point table shows. Unticking every box restores the defaults.</p>
-      </fieldset>`, [
+      ${App.columnPickerFieldset('ACCESS POINT COLUMNS', 'wireless', ALL_COLUMNS,
+                                 s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
           radio_power_unit: m.querySelector('#wl-power-unit').value,
-          table_columns: [...m.querySelectorAll('[data-column]')]
-            .filter((cb) => cb.checked).map((cb) => cb.dataset.column).join(','),
+          table_columns: App.readColumnPicker(
+            m.querySelector('#cols-wireless'), ALL_COLUMNS),
         } });
         await App.loadState();
         App.closeModal();
         App.refreshNow('wireless');
       } },
     ]);
+    App.wireColumnPickers(box);
     return box;
   }
 

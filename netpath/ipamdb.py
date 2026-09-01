@@ -194,6 +194,18 @@ DEFAULTS = {
     "dhcp_poll_interval_minutes": 15,
     "dhcp_timeout_s": 30,
     "dhcp_history_days": 35,
+    # Comma-joined column keys the IPAM host table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns_hosts": "",
+    # Comma-joined column keys the DHCP lease table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns_leases": "",
 }
 
 

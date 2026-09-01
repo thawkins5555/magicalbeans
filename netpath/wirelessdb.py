@@ -244,7 +244,8 @@ class WirelessDatabase:
                                   ("last_seen_ts", "missed_polls", *fields))
         with self._lock:
             existed = self._conn.execute(
-                "SELECT 1 FROM access_points WHERE controller_id = ? AND vdom = ?"
+                "SELECT status, out_of_service FROM access_points"
+                " WHERE controller_id = ? AND vdom = ?"
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
             self._conn.execute(
                 f"INSERT INTO access_points({','.join(cols)}) VALUES ({marks})"
@@ -262,10 +263,50 @@ class WirelessDatabase:
                 name = str(fields.get("name") or wtp_id)
                 self.add_ap_event(controller_id, wtp_id, vdom, name, "ap_returned",
                                   f"{name} is reported by its controller again")
+            else:
+                self._record_status_change(controller_id, wtp_id, vdom, existed,
+                                           fields)
             row = self._conn.execute(
                 "SELECT id FROM access_points WHERE controller_id = ? AND vdom = ?"
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
             return row["id"]
+
+    # Connection states that mean "the controller has this AP and it is
+    # working". Everything else (offline, and the transient image states) is
+    # an AP the controller can see but cannot use.
+    _ONLINE_STATES = ("online",)
+
+    def _record_status_change(self, controller_id, wtp_id, vdom, previous,
+                              fields) -> None:
+        """Records ap_offline / ap_online on a connection-state transition.
+
+        The gap this closes: an AP that stops working while its controller
+        still lists it was a silent UPDATE here. missed_polls is reset by this
+        very method (the poll *did* see it), so prune_stale correctly skips it
+        and ap_removed never fires — meaning an AP could be dead for a week
+        with nothing but a red dot on the Wireless tab to say so.
+
+        Mirrors ap_removed/ap_returned exactly, including the exemption: an AP
+        deliberately marked out of service raises neither, for the same reason
+        it is never aged out. Called with the lock already held.
+        """
+        if "status" not in fields:
+            return
+        if previous["out_of_service"]:
+            return
+        was_online = (previous["status"] or "") in self._ONLINE_STATES
+        now_online = str(fields.get("status") or "") in self._ONLINE_STATES
+        if was_online == now_online:
+            return
+        name = str(fields.get("name") or wtp_id)
+        if now_online:
+            self.add_ap_event(controller_id, wtp_id, vdom, name, "ap_online",
+                              f"{name} is online again")
+        else:
+            self.add_ap_event(
+                controller_id, wtp_id, vdom, name, "ap_offline",
+                f"{name} is {fields.get('status') or 'not online'} — its "
+                f"controller still lists it")
 
     def replace_radios(self, ap_id: int, radios: list[dict]) -> None:
         with self._lock:

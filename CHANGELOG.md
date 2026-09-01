@@ -6,6 +6,85 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.30.0 — Tables you can shape, identity you can point at an OID
+
+- **Vendor and Location can be read from an OID you choose.** Vendor was
+  always derived from sysObjectID with a sysDescr fallback, and Location was
+  always sysLocation — both hardcoded. Plenty of gear puts its real vendor or
+  its site name in a proprietary scalar instead, and there was no way to say
+  so. A device or a polling profile can now name a **Vendor OID** and a
+  **Location OID**; blank keeps today's behaviour exactly. Either form of the
+  OID works — the object or its `.0` instance — because both are asked for in
+  the same GET the standard scalars already use, so this costs no extra
+  request.
+- **A custom vendor changes what is displayed, not how the device is
+  treated.** The vendor SNMP detected is kept alongside it, and that is what
+  ConfigRX uses to pick its backup command, what gates the Cisco per-VLAN
+  MAC-table read, and what discovery suggests a profile from. A device whose
+  OID answers "Cisco Systems, Inc." still backs up as cisco.
+- **Browse OIDs can fill those fields in.** Each row in the OID browser has
+  **Use as vendor / location**, so an OID is chosen from a list showing what it
+  currently answers rather than typed from memory. The device header now also
+  says where the vendor name came from — an IANA arc assignment, a sysDescr
+  substring guess, or a custom OID are not equally trustworthy and used to
+  look identical.
+- **Every main table now sorts by column, and lets you choose its columns.**
+  Only 7 of about 30 tables sorted, and exactly one (Wireless) could hide a
+  column. Nodes devices and interfaces, Alerts, ConfigRX devices and backups,
+  NetFlow, Syslog, SNMP traps, IPAM hosts and DHCP leases all now do both,
+  from **one shared implementation** in `app.js` — Wireless's own bespoke
+  version was replaced by it rather than left as a second copy. Each module's
+  Settings dialog carries the picker, with All / None buttons.
+- **Unticking every column restores the defaults** rather than leaving a table
+  with nothing in it, and unknown column keys are ignored, so a saved choice
+  survives a release that adds or removes a column. Which columns are shown is
+  a setting; column *widths* stay per-browser and are still cleared by Reset
+  layout.
+- **The Select all control is now a checkbox directly above the row
+  checkboxes**, where it reads as "these rows", instead of a button off in the
+  filter bar. It shows the indeterminate state for a partial selection, and
+  clicking it again clears. The three filter-bar buttons are retired. Both
+  discovery lists — results and the approval dialog — gained one, having had
+  no select-all at all.
+- **ConfigRX backups can be deleted.** There was no way to remove a single
+  stored backup; the only deletes were retention pruning and removing the
+  device from Nodes. The backups pane is now a real table with checkboxes, and
+  deletes one or many. Deleting the **most recent** backup gets its own
+  warning, because a new backup is only stored when it differs from the last
+  one — so removing the top row makes the next run record an unchanged config
+  as a change.
+- **A running backup is visible.** "Back up now" reported "Queued…" and then
+  went silent for however long the SSH session took, and the device row sat on
+  the last *completed* attempt throughout. Both now report Queued → Backing
+  up… → the outcome, off the device's own state. Internally the worker gained
+  the same `worker_state()` the Nodes poller has, which also fixes queued and
+  running being indistinguishable.
+- **ConfigRX has a vendor filter, showing the vendor it will actually use.**
+  The list showed Nodes' detected vendor while the backup worker used the
+  per-device override, so a device could read `cisco` and back up as `hp` with
+  no sign of it. The column now shows the effective vendor, marks an override,
+  and the new dropdown filters on it.
+- **An access point that goes offline now raises an alert.** Answering the
+  question asked: no, *Device not responding* does not cover access points —
+  it comes only from Nodes' own device events. Behind that question was a real
+  gap: the wireless module recorded only "removed from its controller", and an
+  AP that stopped working while its controller still listed it was a silent
+  database update. It could be dead for a week with nothing but a red dot to
+  say so. **Access point offline** is a new built-in rule, raised on the
+  online→offline transition and cleared when it comes back, mirroring the
+  existing removed/returned pair exactly. An AP marked out of service raises
+  neither, as before.
+- **NetPath hops that are managed devices show their names.** A hop with no
+  PTR record showed the literal "no PTR record" even when it was a device this
+  app polls every minute and names correctly everywhere else. Hops with no
+  reverse-DNS answer now fall back to the Nodes device at that address, and
+  the tooltip says the name came from Nodes. A hop with a real PTR record
+  keeps it.
+- **A device pinned to its manual name is now honoured everywhere.** The
+  shared name lookup ignored `display_name_source`, so a device explicitly set
+  to display its manual name still showed its sysName in Alerts, Syslog and
+  NetFlow. Fixed once, in the shared helper, for all of them.
+
 ### 4.29.0 — Backups that wait for the whole config, and one alert per outage
 
 - **ConfigRX stored the banner and called it a backup.** A successful backup

@@ -226,6 +226,70 @@ def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:
     return "", ""
 
 
+# ---------------------------------------------------------- custom identity
+
+def normalize_oid(text: str) -> str:
+    """A dotted OID with surrounding whitespace and leading dot stripped, or
+    "" for anything that is not one. Deliberately strict: this string goes
+    straight into an SNMP request, so a typo should read as "not configured"
+    rather than as a request for something meaningless."""
+    oid = (text or "").strip().strip(".")
+    if not oid:
+        return ""
+    parts = oid.split(".")
+    if len(parts) < 2 or not all(part.isdigit() for part in parts):
+        return ""
+    return oid
+
+
+def oid_variants(text: str) -> tuple[str, ...]:
+    """Both forms of an operator-typed OID: the object itself and its .0
+    instance.
+
+    An OID browser shows "1.3.6.1.4.1.9.1.1208"; a MIB says the same; but the
+    thing an agent actually answers is the instance, "…1208.0". Asking for
+    both in one GET costs one extra varbind on a request already being made
+    and removes the single most likely way to get this wrong. Ordered so the
+    OID as typed wins when both answer — a real table cell the operator picked
+    deliberately is not second-guessed.
+    """
+    oid = normalize_oid(text)
+    if not oid:
+        return ()
+    return (oid,) if oid.endswith(".0") else (oid, oid + ".0")
+
+
+def identity_oid_variants(config: dict) -> dict:
+    """{"vendor": (...), "location": (...), "all": [...]} for a device's
+    effective config. Empty tuples when nothing is configured, which is the
+    normal case and costs nothing."""
+    vendor = oid_variants((config or {}).get("vendor_oid") or "")
+    location = oid_variants((config or {}).get("location_oid") or "")
+    merged = []
+    for oid in vendor + location:
+        if oid not in merged:
+            merged.append(oid)
+    return {"vendor": vendor, "location": location, "all": merged}
+
+
+def first_text(values: dict, oids) -> str:
+    """The first non-empty printable answer among `oids`, as text.
+
+    A vendor or a location is a label, so a numeric answer is almost certainly
+    the operator having pointed at the wrong object; it is still rendered
+    rather than dropped, because a device that reports its site as a number is
+    the operator's business, not this function's.
+    """
+    for oid in oids or ():
+        value = values.get(oid)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 def suggest_group(sys_descr: str, sys_object_id: str, groups: list) -> int | None:
     """Discovery's best-effort profile suggestion: an exact vendor-name
     match against an existing group's name, else the Default group's id,

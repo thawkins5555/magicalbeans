@@ -24,7 +24,7 @@ from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
-from .nodesdb import NodesDatabase
+from .nodesdb import NodesDatabase, detected_vendor
 from .snmppoll import (
     ERROR_STATUS, PDU_GET, PDU_GETNEXT, PDU_REPORT, Response, SnmpError,
     SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
@@ -876,8 +876,17 @@ class NodePoller:
 
     def _poll_snmp_scalars(self, device, config: dict):
         oids = list(nodeoids.SYSTEM_SCALARS.values())
+        # An operator-chosen OID for vendor and/or location, read in the SAME
+        # GET as the standard scalars — no extra round trip. Both the bare and
+        # the .0 instance form are asked for, because "1.3.6.1.4.1.x.y" and
+        # "…y.0" are both reasonable things to type and only one of them
+        # answers; whichever does is used. See nodeoids.identity_oid_variants.
+        custom = nodeoids.identity_oid_variants(config)
+        oids += [oid for oid in custom["all"] if oid not in oids]
         response = self._snmp_get(device, config, oids)
-        values = {vb["oid"]: vb["value"] for vb in response.varbinds}
+        values = {vb["oid"]: vb["value"] for vb in response.varbinds
+                  if vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                        "endOfMibView")}
         identity = {
             "sys_descr": values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or "",
             "sys_object_id": values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or "",
@@ -889,8 +898,22 @@ class NodePoller:
         # device this app cannot name gets neither a profile suggestion nor a
         # vendor MIB, and plenty of gear answers a generic sysObjectID while
         # describing itself perfectly well in text.
-        identity["vendor"], identity["vendor_source"] = nodeoids.identify_vendor(
+        detected, source = nodeoids.identify_vendor(
             identity["sys_object_id"], identity["sys_descr"])
+        # Always stored, always what the behavioural readers use — a custom
+        # vendor name replaces the display value only (see
+        # nodesdb.detected_vendor).
+        identity["vendor_detected"] = detected
+        identity["vendor"], identity["vendor_source"] = detected, source
+
+        custom_vendor = nodeoids.first_text(values, custom["vendor"])
+        if custom_vendor:
+            identity["vendor"] = custom_vendor
+            identity["vendor_source"] = "oid"
+        custom_location = nodeoids.first_text(values, custom["location"])
+        if custom_location:
+            identity["sys_location"] = custom_location
+
         uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
         uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
 
@@ -1441,7 +1464,10 @@ class NodePoller:
             return None
 
         target_ports, answered = self._bridge_ports_for(device, config, if_index)
-        is_cisco = (device["vendor"] or "").lower() == "cisco"
+        # detected_vendor, not device["vendor"]: a custom vendor_oid may have
+        # replaced the displayed name with whatever the device calls itself,
+        # and this gate needs the identified vendor key.
+        is_cisco = detected_vendor(device).lower() == "cisco"
 
         entries = []
         if target_ports:

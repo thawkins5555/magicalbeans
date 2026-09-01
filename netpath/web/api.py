@@ -28,6 +28,7 @@ from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
 from .. import configrx
+from .. import nodesdb
 from .. import permissions as _permissions
 
 MIN_BLOCK_PX = 3
@@ -323,7 +324,8 @@ def get_timeline(service, params, body) -> dict:
     }
 
 
-def _topology_json(service, topo, refusal, target_id: int | None = None) -> dict:
+def _topology_json(service, topo, refusal, target_id: int | None = None,
+                   from_nodes: dict | None = None) -> dict:
     code, address = refusal
     # Continuous-probe stats: cumulative counters kept alongside whatever the
     # scheduled traceroutes themselves derived, so a hop shows both "what the
@@ -340,6 +342,10 @@ def _topology_json(service, topo, refusal, target_id: int | None = None) -> dict
             "ip": node.ip,
             "label": node.label,
             "hostname": node.hostname_label,
+            # Where the name came from. A hop named from the Nodes inventory
+            # rather than from a PTR record is a device this app monitors,
+            # which is worth knowing and is not visible from the name itself.
+            "hostname_source": (from_nodes or {}).get(node.ip or "", "dns"),
             "rtt": node.avg_rtt,
             "loss": node.avg_loss,
             "traces": node.traces,
@@ -393,6 +399,7 @@ def get_topology(service, params, body) -> dict:
         rows = service.db.hop_rows_for_trace(trace["id"])
         ips = {r["ip"] for r in rows}
         names = service.app_db.hostnames(ips)
+        from_nodes = hostresolve.fill_from_nodes(service.nodes_db, names, ips)
         asn_data = service.app_db.asn_info(ips)
         topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
                               hostnames=names, asn_data=asn_data)
@@ -400,7 +407,7 @@ def get_topology(service, params, body) -> dict:
         code = trace["icmp_code"] if "icmp_code" in keys else None
         payload = _topology_json(service, topo, (code, trace["icmp_from"]
                                                  if "icmp_from" in keys else None),
-                                 target_id)
+                                 target_id, from_nodes)
         payload["snapshot"] = {
             "found": True,
             "at": trace["started_ts"],
@@ -417,6 +424,13 @@ def get_topology(service, params, body) -> dict:
     rows = service.db.hop_rows_between(target_id, t0, t1)
     ips = {r["ip"] for r in rows}
     names = service.app_db.hostnames(ips)
+    # A hop with no PTR record that IS a device this app monitors gets that
+    # device's name instead of the literal "no PTR record". Done here rather
+    # than in monitor.Resolver because service.nodes_db is already in hand at
+    # this layer — and because baking a Nodes name into the DNS cache would
+    # have it aged out on a DNS schedule and go stale when the device is
+    # renamed. See hostresolve.fill_from_nodes for the precedence.
+    from_nodes = hostresolve.fill_from_nodes(service.nodes_db, names, ips)
     asn_data = service.app_db.asn_info(ips)
     # Aged against t1, the end of the window being drawn, so panning back into
     # last month still shows the path as it stood then. The pinned-snapshot
@@ -434,7 +448,7 @@ def get_topology(service, params, body) -> dict:
         if "icmp_code" in keys and trace["icmp_code"]:
             code, address = trace["icmp_code"], trace["icmp_from"]
             break
-    payload = _topology_json(service, topo, (code, address), target_id)
+    payload = _topology_json(service, topo, (code, address), target_id, from_nodes)
     payload["snapshot"] = {"found": False}
     return payload
 
@@ -1522,6 +1536,14 @@ def _device_json(row) -> dict:
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
+        # What SNMP identification worked out, and which source spoke. Shown
+        # beside the displayed vendor so an operator who has pointed vendor at
+        # a custom OID can still see what the app itself detected — and can
+        # tell an IANA arc assignment from a sysDescr substring guess.
+        "vendor_detected": row["vendor_detected"],
+        "vendor_source": row["vendor_source"] or "",
+        "vendor_oid": row["vendor_oid"] or "",
+        "location_oid": row["location_oid"] or "",
         "status": row["status"], "ping_ok": _tri(row["ping_ok"]),
         "ping_rtt_ms": row["ping_rtt_ms"], "snmp_ok": _tri(row["snmp_ok"]),
         "snmp_error": row["snmp_error"], "consecutive_fail": row["consecutive_fail"],
@@ -1544,6 +1566,8 @@ def _group_json(service, row) -> dict:
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
+        "vendor_oid": row["vendor_oid"] or "",
+        "location_oid": row["location_oid"] or "",
         "is_default": bool(row["is_default"]),
         "created_ts": row["created_ts"],
         # The profile's own snmp_version/community/v3_* above are its
@@ -1591,12 +1615,13 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "v3_user", "v3_auth_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
                          "snmp_enabled", "oid_set", "mib_file_id",
-                         "ping_count", "ping_timeout_ms", "unreachable_ping_only")
+                         "ping_count", "ping_timeout_ms", "unreachable_ping_only",
+                         "vendor_oid", "location_oid")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
-                        "unreachable_ping_only")
+                        "unreachable_ping_only", "vendor_oid", "location_oid")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -3228,8 +3253,13 @@ def post_wireless_collector(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- configrx
 
-def _configrx_device_json(service, device_row) -> dict:
+def _configrx_device_json(service, device_row, worker_state=None) -> dict:
     config = service.configrx_db.device_config(device_row["id"])
+    # Whether a backup is in flight for this device right now — the same join
+    # the Nodes list does with node_poller.worker_state(). Without it the row
+    # sat on the last COMPLETED attempt for the whole duration of a run, so a
+    # backup taking a minute looked like nothing was happening.
+    state = (worker_state or {}).get(device_row["id"])
     # Same precedence as nodes.js's displayName(): the SNMP-reported
     # hostname wins unless the device is explicitly pinned to its manual
     # name, with the IP as the last resort. ConfigRX has no display of its
@@ -3237,10 +3267,19 @@ def _configrx_device_json(service, device_row) -> dict:
     # device_row["name"] (the manual name) outright.
     name = ((device_row["name"] if device_row["display_name_source"] == "manual" else None)
            or device_row["sys_name"] or device_row["name"] or device_row["ip"])
+    override = (config["vendor_override"] if config else "") or ""
     return {
         "id": device_row["id"], "ip": device_row["ip"],
         "name": name,
         "vendor": device_row["vendor"],
+        # The vendor this device would ACTUALLY back up as, resolved the same
+        # way configrx._backup_device resolves it: the explicit override, then
+        # what SNMP detected (not the displayed vendor, which a custom vendor
+        # OID may have replaced with a free-text name). The list used to show
+        # Nodes' vendor verbatim while the worker used something else, so a
+        # device could read "cisco" and back up as "hp" with no sign of it.
+        "effective_vendor": override or nodesdb.detected_vendor(device_row) or "",
+        "vendor_is_override": bool(override),
         "backup_enabled": bool(config["backup_enabled"]) if config else False,
         "ssh_port": config["ssh_port"] if config else 22,
         "ssh_username": (config["ssh_username"] if config else "") or "",
@@ -3251,12 +3290,34 @@ def _configrx_device_json(service, device_row) -> dict:
         "last_backup_ts": config["last_backup_ts"] if config else None,
         "last_backup_status": config["last_backup_status"] if config else None,
         "last_backup_error": config["last_backup_error"] if config else None,
+        "backing_up": bool(state and state.get("started")),
+        "backup_queued": bool(state and not state.get("started")),
     }
 
 
 def _configrx_backup_json(row) -> dict:
     return {"id": row["id"], "device_id": row["device_id"], "ts": row["ts"],
             "sha256": row["sha256"], "size_bytes": row["size_bytes"]}
+
+
+def delete_configrx_backup(service, params, body, backup_id) -> dict:
+    row = service.configrx_db.backup(backup_id)
+    if row is None:
+        raise ValueError("No such backup")
+    removed = service.configrx_db.delete_backup(backup_id)
+    if removed:
+        service.log.add(CONFIGRX_CATEGORY,
+                        f"Deleted a stored config backup for device {row['device_id']}")
+    return {"ok": True, "removed": 1 if removed else 0}
+
+
+def post_configrx_backups_bulk_delete(service, params, body) -> dict:
+    ids = body.get("backup_ids") or []
+    if not ids:
+        raise ValueError("backup_ids is required")
+    removed = service.configrx_db.delete_backups([int(i) for i in ids])
+    service.log.add(CONFIGRX_CATEGORY, f"Deleted {removed} stored config backup(s)")
+    return {"ok": True, "removed": removed}
 
 
 def get_configrx_overview(service, params, body) -> dict:
@@ -3282,9 +3343,17 @@ def get_configrx_devices(service, params, body) -> dict:
     a second, parallel list in sync."""
     text = params.get("q") or None
     rows = service.nodes_db.devices(text=text)
-    devices = [_configrx_device_json(service, r) for r in rows]
+    worker_state = service.configrx.worker_state()
+    devices = [_configrx_device_json(service, r, worker_state) for r in rows]
     if params.get("enabled_only") is not None:
         devices = [d for d in devices if d["backup_enabled"]]
+    # Filtered on the effective vendor, so picking "cisco" gives the devices
+    # that will actually run Cisco's show-config command — including any
+    # steered there by a per-device override.
+    vendor = (params.get("vendor") or "").strip()
+    if vendor:
+        devices = [d for d in devices
+                   if (d["effective_vendor"] or "(none)") == vendor]
     return {"devices": devices}
 
 
@@ -3292,7 +3361,8 @@ def get_configrx_device(service, params, body, device_id) -> dict:
     device = service.nodes_db.device(device_id)
     if not device:
         raise ValueError("No such device")
-    return {"device": _configrx_device_json(service, device)}
+    return {"device": _configrx_device_json(
+        service, device, service.configrx.worker_state())}
 
 
 def post_configrx_device_config(service, params, body, device_id) -> dict:

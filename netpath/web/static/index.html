@@ -78,8 +78,7 @@
       <label class="check"><input type="checkbox" id="nd-filter-offline"> Only offline</label>
       <button id="nd-apply">Apply</button>
       <span class="grow"></span>
-      <span class="hint">Tick rows to select them</span>
-      <button id="nd-bulk-selectall">Select all</button>
+      <span class="hint">Tick the box above the rows to select them all</span>
       <span id="nd-count" class="hint"></span>
     </div>
     <div class="bar wrap" id="nd-bulk-bar" hidden>
@@ -214,8 +213,7 @@
       <select id="alerts-range"></select>
       <button id="alerts-apply">Apply</button>
       <span class="grow"></span>
-      <span class="hint">Tick rows to select them</span>
-      <button id="alerts-bulk-selectall">Select all</button>
+      <span class="hint">Tick the box above the rows to select them all</span>
       <span id="alerts-count" class="hint"></span>
     </div>
     <div class="bar wrap" id="alerts-bulk-bar" hidden>
@@ -688,11 +686,11 @@
 
   <div class="bar wrap">
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
+    <label>Vendor <select id="cx-filter-vendor"></select></label>
     <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
     <button id="cx-apply" class="primary">Search</button>
     <span class="grow"></span>
-    <span class="hint">Tick rows to select them</span>
-    <button id="cx-bulk-selectall">Select all</button>
+      <span class="hint">Tick the box above the rows to select them all</span>
   </div>
   <!-- data-requires-write sits on the buttons, not the bar:
        drawBulkBar() owns the bar's .hidden (selection), the attribute
@@ -724,7 +722,17 @@
       <button id="cx-backup-now" data-requires-write="configrx" hidden>Back up now</button>
       <button id="cx-device-settings" data-requires-write="configrx" hidden>Device settings</button>
     </header>
-    <div id="cx-backup-list" style="overflow:auto;height:100%"></div>
+    <!-- data-requires-write sits on the Delete button, not on the bar: the
+         bar is shown by the selection, and applyPermissions() is hide-only,
+         so a hidden bar that later reappears would bring the button back. -->
+    <div class="bar wrap" id="cx-backup-bulk" hidden>
+      <span id="cx-backup-bulk-count" class="hint"></span>
+      <button id="cx-backup-delete" data-requires-write="configrx">Delete</button>
+      <span class="grow"></span>
+      <button id="cx-backup-clear">Clear</button>
+    </div>
+    <div id="cx-backup-empty" class="hint" style="padding:8px">No backups stored yet.</div>
+    <div id="cx-backup-wrap" class="table-wrap" hidden><table id="cx-backups"></table></div>
    </div>
    <div class="divider"></div>
    <div class="pane pad-x pad-b" data-grow="2">

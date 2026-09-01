@@ -82,21 +82,61 @@
      `value` accessor or App.sortRows would sort by a field that does not
      exist and the header click would look broken. The lookups are filled in
      by drawTable() before sorting, since the id->name maps live there. */
+  /* The device table's full column catalogue. `on: true` is the set this
+     page ships with; everything else is available from Nodes → Settings →
+     Columns. `cell` renders, `value` sorts, `fixed` means the column is the
+     table's own machinery and is never offered for hiding. */
   const COLUMNS = [
-    { key: 'check', label: '', sortable: false, width: 34 },
-    { key: 'status', label: 'Status', width: 90, value: (r) => r.status || '' },
-    { key: 'name', label: 'Name / IP', width: 200,
-      value: (r) => displayName(r) || r.ip || '' },
-    { key: 'group', label: 'Profile', width: 130, value: (r) => r._groupName || '' },
-    { key: 'devgroup', label: 'Group', width: 120, value: (r) => r._devGroupName || '' },
-    { key: 'vendor', label: 'Vendor', width: 120, value: (r) => r.vendor || '' },
-    { key: 'response', label: 'Response', width: 90, numeric: true,
+    { key: 'check', label: '', sortable: false, fixed: true, width: 34,
+      cell: (r) => `<input type="checkbox" class="nd-check"${
+        view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
+    { key: 'status', label: 'Status', width: 90, on: true,
+      value: (r) => r.status || '',
+      cell: (r) => `<span class="dot" style="background:${
+        STATUS_COLOR[r.status] || 'var(--faint)'};display:inline-block;` +
+        `width:8px;height:8px;border-radius:50%;margin-right:6px"></span>` +
+        escape(r.status) },
+    { key: 'name', label: 'Name / IP', width: 200, on: true,
+      value: (r) => displayName(r) || r.ip || '',
+      cell: (r) => `${escape(displayName(r))}<div class="hint">${escape(r.ip)}</div>` },
+    { key: 'group', label: 'Profile', width: 130, on: true,
+      value: (r) => r._groupName || '',
+      cell: (r) => escape(r._groupName || '\u2014') },
+    { key: 'devgroup', label: 'Group', width: 120, on: true,
+      value: (r) => r._devGroupName || '',
+      cell: (r) => escape(r._devGroupName || '\u2014') },
+    { key: 'vendor', label: 'Vendor', width: 120, on: true,
+      value: (r) => r.vendor || '',
+      cell: (r) => escape(r.vendor || '\u2014') },
+    { key: 'response', label: 'Response', width: 90, numeric: true, on: true,
       // Sorted on the number, not on the "12 ms (ping only)" text, and a
       // device with no reading sorts as blank rather than as zero.
-      value: (r) => (r.ping_rtt_ms == null ? null : r.ping_rtt_ms) },
-    { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true,
-      value: (r) => r.last_poll_ts || 0 },
+      value: (r) => (r.ping_rtt_ms == null ? null : r.ping_rtt_ms),
+      cell: (r) => escape(r.snmp_ok
+        ? (r.ping_rtt_ms != null ? `${r.ping_rtt_ms.toFixed(0)} ms` : 'ok')
+        : (r.ping_ok ? `${(r.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '\u2014')) },
+    { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true, on: true,
+      value: (r) => r.last_poll_ts || 0, cell: (r) => ago(r.last_poll_ts) },
+    // Available but off by default — sysLocation is empty on plenty of gear,
+    // and a column of dashes helps nobody. Worth offering now that it can be
+    // pointed at a custom OID.
+    { key: 'sys_location', label: 'Location', width: 160,
+      value: (r) => r.sys_location || '',
+      cell: (r) => escape(r.sys_location || '\u2014') },
+    { key: 'sys_name', label: 'sysName', width: 150,
+      value: (r) => r.sys_name || '',
+      cell: (r) => escape(r.sys_name || '\u2014') },
+    { key: 'sys_contact', label: 'Contact', width: 150,
+      value: (r) => r.sys_contact || '',
+      cell: (r) => escape(r.sys_contact || '\u2014') },
+    { key: 'ip', label: 'IP', width: 120, cell: (r) => escape(r.ip) },
+    { key: 'sys_object_id', label: 'sysObjectID', width: 180,
+      value: (r) => r.sys_object_id || '',
+      cell: (r) => escape(r.sys_object_id || '\u2014') },
   ];
+
+  const deviceColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.nodesSettings || {}).table_columns);
 
   function onDeviceSort(key, descending) {
     view.deviceSort = { key, descending };
@@ -104,9 +144,22 @@
   }
 
   function drawTable() {
+    const columns = deviceColumns();
+    const checked = view.devicesChecked;
     const table = App.grid(App.el('nodes-table'), {
-      name: 'nodes-devices', columns: COLUMNS,
-      sort: view.deviceSort, onSort: onDeviceSort });
+      name: 'nodes-devices', columns,
+      sort: view.deviceSort, onSort: onDeviceSort,
+      selectAll: {
+        key: 'check',
+        checked: view.devices.length > 0
+          && view.devices.every((d) => checked.has(d.id)),
+        some: view.devices.some((d) => checked.has(d.id)),
+        onToggle: (on) => {
+          checked.clear();
+          if (on) for (const d of view.devices) checked.add(d.id);
+          drawTable();
+        },
+      } });
     const body = document.createElement('tbody');
     const groupsById = {};
     for (const g of view.groups) groupsById[g.id] = g.name;
@@ -119,35 +172,23 @@
       row._devGroupName = devGroupsById[row.device_group_id] || '';
     }
     const rows = App.sortRows(view.devices, view.deviceSort.key,
-                              view.deviceSort.descending, COLUMNS);
-    for (const row of rows) {
-      const tr = document.createElement('tr');
+                              view.deviceSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
         + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
-      const dot = `<span class="dot" style="background:${STATUS_COLOR[row.status] || 'var(--faint)'};display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px"></span>`;
-      const rtt = row.snmp_ok ? (row.ping_rtt_ms != null ? `${row.ping_rtt_ms.toFixed(0)} ms` : 'ok')
-        : (row.ping_ok ? `${(row.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '—');
-      tr.innerHTML =
-        `<td><input type="checkbox" class="nd-check"${
-          view.devicesChecked.has(row.id) ? ' checked' : ''}></td>` +
-        `<td>${dot}${escape(row.status)}</td>` +
-        `<td>${escape(displayName(row))}<div class="hint">${escape(row.ip)}</div></td>` +
-        `<td>${escape(row._groupName || '—')}</td>` +
-        `<td>${escape(row._devGroupName || '—')}</td>` +
-        `<td>${escape(row.vendor || '—')}</td>` +
-        `<td>${escape(rtt)}</td>` +
-        `<td>${ago(row.last_poll_ts)}</td>`;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.
-      tr.querySelector('.nd-check').onclick = (event) => {
-        event.stopPropagation();
-        toggleChecked(row.id, tr);
-      };
+      const box = tr.querySelector('.nd-check');
+      if (box) {
+        box.onclick = (event) => {
+          event.stopPropagation();
+          toggleChecked(row.id, tr);
+        };
+      }
       tr.onclick = () => selectDevice(row.id);
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
@@ -166,16 +207,14 @@
       tr.classList.toggle('bulk-checked', on);
       const box = tr.querySelector('.nd-check');
       if (box) box.checked = on;
+      App.refreshSelectAll(App.el('nodes-table'), view.devices.length,
+                           view.devicesChecked.size);
       drawBulkBar();
       return;
     }
     drawTable();
   }
 
-  function bulkSelectAll() {
-    view.devices.forEach((d) => view.devicesChecked.add(d.id));
-    drawTable();
-  }
 
   function drawBulkBar() {
     const n = view.devicesChecked.size;
@@ -351,8 +390,16 @@
       sys_name: () => field('sysName', d.sys_name),
       sys_object_id: () => field('sysObjectID', d.sys_object_id),
       sys_contact: () => field('contact', d.sys_contact),
-      sys_location: () => field('location', d.sys_location),
-      vendor: () => field('vendor', d.vendor),
+      sys_location: () => field('location', d.sys_location
+        + (d.location_oid ? ' (from a custom OID)' : '')),
+      // Which source spoke matters: an arc under `enterprises` is an IANA
+      // assignment, a sysDescr match is a substring guess, and a custom OID
+      // is whatever the operator pointed at. They are not equally trustworthy
+      // and the header used to present all three identically.
+      vendor: () => field('vendor', d.vendor + ({
+        sysObjectID: ' (sysObjectID)', sysDescr: ' (sysDescr)',
+        oid: ' (custom OID)',
+      }[d.vendor_source] || '')),
       snmp_version: () => field('SNMP',
         `v${{ 0: '1', 1: '2c', 3: '3' }[d.effective_config.snmp_version]
             || d.effective_config.snmp_version}`),
@@ -579,19 +626,45 @@
   }
 
   const IFACE_COLUMNS = [
-    { key: 'if_index', label: '#', width: 55, numeric: true },
-    { key: 'descr', label: 'Descr', width: 170,
-      value: (r) => (r.descr || r.alias || '').toLowerCase() },
-    { key: 'admin_status', label: 'Admin', width: 80 },
-    { key: 'oper_status', label: 'Oper', width: 80 },
+    { key: 'if_index', label: '#', width: 55, numeric: true, on: true,
+      cell: (r) => r.if_index },
+    { key: 'descr', label: 'Descr', width: 170, on: true,
+      value: (r) => (r.descr || r.alias || '').toLowerCase(),
+      cell: (r) => escape(r.descr || r.alias || '') },
+    { key: 'admin_status', label: 'Admin', width: 80, on: true,
+      cell: (r) => escape(r.admin_status || '\u2014') },
+    { key: 'oper_status', label: 'Oper', width: 80, on: true,
+      cell: (r) => `<span style="color:${r.oper_status === 'up' ? 'var(--ok)'
+        : r.oper_status === 'down' ? 'var(--fail)' : 'var(--faint)'}">` +
+        `${escape(r.oper_status || '\u2014')}</span>` },
     // No custom value() for these three: the default row[key] lookup
     // preserves null/undefined so App.sortRows' blanks-sort-last rule
     // applies — an interface with no speed or no rate sample yet should
     // sort after a genuine 0, not be indistinguishable from one.
-    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true },
-    { key: 'in_bps', label: 'In', width: 95, numeric: true },
-    { key: 'out_bps', label: 'Out', width: 95, numeric: true },
+    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true, on: true,
+      cell: (r) => (r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '\u2014') },
+    { key: 'in_bps', label: 'In', width: 95, numeric: true, on: true,
+      cell: (r) => (r.in_bps != null ? App.rate(r.in_bps, 1) : '\u2014') },
+    { key: 'out_bps', label: 'Out', width: 95, numeric: true, on: true,
+      cell: (r) => (r.out_bps != null ? App.rate(r.out_bps, 1) : '\u2014') },
+    { key: 'alias', label: 'Alias', width: 150,
+      cell: (r) => escape(r.alias || '\u2014') },
+    { key: 'phys_addr', label: 'MAC', width: 140,
+      cell: (r) => escape(r.phys_addr || '\u2014') },
+    // Only fields /api/nodes/devices/<id>/interfaces actually returns are
+    // offered — a column that can never hold anything is worse than no
+    // column, because it looks like missing data rather than a missing
+    // feature.
+    { key: 'in_error_rate', label: 'In err/s', width: 90, numeric: true,
+      cell: (r) => (r.in_error_rate != null ? r.in_error_rate.toFixed(2) : '\u2014') },
+    { key: 'out_error_rate', label: 'Out err/s', width: 95, numeric: true,
+      cell: (r) => (r.out_error_rate != null ? r.out_error_rate.toFixed(2) : '\u2014') },
+    { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
+      cell: (r) => ago(r.last_seen_ts) },
   ];
+
+  const ifaceColumns = () => App.visibleColumns(
+    IFACE_COLUMNS, (App.state.nodesSettings || {}).table_columns_ifaces);
 
   function onIfaceSort(key, descending) {
     view.ifaceSort = { key, descending };
@@ -599,25 +672,17 @@
   }
 
   function drawIfaceTable() {
+    const columns = ifaceColumns();
     const table = App.grid(App.el('nd-if-table'),
-      { name: 'nodes-ifaces', columns: IFACE_COLUMNS,
+      { name: 'nodes-ifaces', columns,
         sort: view.ifaceSort, onSort: onIfaceSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.ifaces, view.ifaceSort.key,
-      view.ifaceSort.descending, IFACE_COLUMNS);
-    for (const r of rows) {
-      const tr = document.createElement('tr');
+      view.ifaceSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, r) => {
       tr.className = 'clickable';
-      tr.innerHTML =
-        `<td>${r.if_index}</td><td>${escape(r.descr || r.alias || '')}</td>` +
-        `<td>${escape(r.admin_status || '—')}</td>` +
-        `<td><span style="color:${r.oper_status === 'up' ? 'var(--ok)' : r.oper_status === 'down' ? 'var(--fail)' : 'var(--faint)'}">${escape(r.oper_status || '—')}</span></td>` +
-        `<td>${r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'}</td>` +
-        `<td>${r.in_bps != null ? App.rate(r.in_bps, 1) : '—'}</td>` +
-        `<td>${r.out_bps != null ? App.rate(r.out_bps, 1) : '—'}</td>`;
       tr.onclick = () => interfaceDialog(r);
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
   }
 
@@ -692,7 +757,12 @@
       { key: 'name', label: 'Name', width: 200 },
       { key: 'suffix', label: 'Index', width: 70 },
       { key: 'type', label: 'Type', width: 90 },
-      { key: 'value', label: 'Value', width: 320 },
+      { key: 'value', label: 'Value', width: 280 },
+      // The point of browsing is usually "which OID holds this?", and the
+      // answer is only useful if you can act on it. Setting the field from
+      // a row whose value is on screen is the difference between choosing an
+      // OID and guessing one.
+      { key: 'use', label: 'Use as', width: 150, sortable: false },
     ];
     let rows = [];
     let sort = { key: 'oid', descending: false };
@@ -715,7 +785,13 @@
           `<td>${row.name ? escape(row.name) : '<span class="hint">—</span>'}</td>` +
           `<td>${escape(row.suffix || '')}</td>` +
           `<td>${escape(row.type)}</td>` +
-          `<td>${escape(row.value)}</td>`;
+          `<td>${escape(row.value)}</td>` +
+          '<td><button class="linkish oid-use-vendor">vendor</button> ' +
+          '<button class="linkish oid-use-location">location</button></td>';
+        tr.querySelector('.oid-use-vendor').onclick =
+          () => useOidFor('vendor_oid', row);
+        tr.querySelector('.oid-use-location').onclick =
+          () => useOidFor('location_oid', row);
         body.appendChild(tr);
       }
       table.appendChild(body);
@@ -765,6 +841,39 @@
       () => walk(box.querySelector('#oid-base').value.trim());
     draw();
     walk('1.3.6.1.2.1.1');
+  }
+
+  /* Sets the browsed OID as the open device's vendor or location source.
+
+     Applied straight away rather than through a confirm: it is a plain
+     device override, reversible by clearing the field in Edit, and this app
+     reserves confirmation dialogs for destructive actions. The browser stays
+     open — an operator setting one of the two usually wants the other — and
+     the status line says what happened, including the value the OID answered
+     with, so the choice is visibly the one that was made. */
+  async function useOidFor(field, row) {
+    const deviceId = view.selected;
+    const status = document.getElementById('oid-status');
+    if (!deviceId) return;
+    const what = field === 'vendor_oid' ? 'Vendor' : 'Location';
+    try {
+      await App.put(`/api/nodes/devices/${deviceId}`, { [field]: row.oid });
+    } catch (error) {
+      if (status) {
+        status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
+      }
+      return;
+    }
+    if (status) {
+      status.innerHTML = `${what} now reads from <code>${escape(row.oid)}</code>` +
+        ` — currently <b>${escape(row.value)}</b>.` +
+        (field === 'vendor_oid'
+          ? ' <span class="hint">Displayed vendor only; ConfigRX and the' +
+            ' Cisco MAC-table read keep using the detected vendor.</span>'
+          : '');
+    }
+    await loadDetail();
+    App.refreshNow('nodes');
   }
 
   /* Numeric arc-by-arc, so 1.3.6.1.2.1.1.10 sorts after .9 rather than
@@ -1016,7 +1125,45 @@
           "(profile)" to inherit whatever the polling profile has assigned, or "None"
           to poll no custom MIB regardless of the profile.</p>
       </fieldset>
+      <fieldset><legend>IDENTITY</legend>
+        ${identityOidFieldsHtml(d)}
+      </fieldset>
       <p id="nd-f-test-result" class="hint"></p>`;
+  }
+
+  /* Vendor and Location normally come from sysObjectID/sysDescr and
+     sysLocation. Plenty of gear puts its real vendor or its site name in a
+     proprietary scalar instead, so either can be pointed at any OID. Blank
+     keeps the standard behaviour, which is what every existing install has.
+
+     Shared verbatim by the device form and the profile form — a device's
+     blank inherits the profile's, exactly like every other override here. */
+  function identityOidFieldsHtml(d, forGroup = false) {
+    const inherit = forGroup ? 'standard detection' : 'inherit';
+    const p = forGroup ? 'nd-p' : 'nd-f';
+    return `
+      <label>Vendor OID <input id="${p}-vendoroid" size="30"
+        placeholder="${inherit}" value="${escape(d.vendor_oid || '')}"></label>
+      <label>Location OID <input id="${p}-locationoid" size="30"
+        placeholder="${inherit}" value="${escape(d.location_oid || '')}"></label>
+      <p class="hint">Read on every poll and used instead of the detected vendor
+        and sysLocation. Either form works — the object OID or its
+        <code>.0</code> instance — both are asked for and whichever answers is
+        used. Browse OIDs on a device shows what each OID actually returns and
+        can fill these in for you. A custom vendor changes what is
+        <em>displayed</em> only: ConfigRX still picks its backup command, and
+        the Cisco MAC-table read still works, from the vendor SNMP detected.</p>`;
+  }
+
+  function identityOidValues(box, forGroup = false) {
+    // Blank is NULL ("inherit"), never "" — an empty-string override would
+    // read as a deliberate choice and stop the profile's value applying.
+    const p = forGroup ? 'nd-p' : 'nd-f';
+    const text = (id) => (box.querySelector(id) || { value: '' }).value.trim();
+    return {
+      vendor_oid: text(`#${p}-vendoroid`) || null,
+      location_oid: text(`#${p}-locationoid`) || null,
+    };
   }
 
   // mib_file_id is a plain nullable override, same shape as poll_interval_s/
@@ -1069,6 +1216,7 @@
     overrides.ping_count = blankToNull(box.querySelector('#nd-f-pingcount').value);
     overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
+    Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
 
@@ -1426,6 +1574,9 @@
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
+      <fieldset><legend>IDENTITY</legend>
+        ${identityOidFieldsHtml(p, true)}
+      </fieldset>
       ${credentialsSectionHtml(p)}`;
   }
 
@@ -1450,6 +1601,7 @@
       ping_timeout_ms: blankToNull(box.querySelector('#nd-p-pingtimeout').value),
       unreachable_ping_only: blankToNull(box.querySelector('#nd-p-pingonly').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
+      ...identityOidValues(box, true),
     };
   }
 
@@ -1614,6 +1766,33 @@
     }).join('');
   }
 
+  /* A select-all box in the header cell above the row boxes, the same
+     affordance every checkbox list in the app now carries. It governs only
+     the SELECTABLE rows — a result already promoted, or one no credential
+     identified, has no box of its own and must not be counted as "all". */
+  function wireDiscSelectAll(table, cls, checkedSet, redraw) {
+    const boxes = [...table.querySelectorAll(`.${cls}`)];
+    const head = table.querySelector('thead th');
+    if (!head || !boxes.length) return;
+    const all = document.createElement('input');
+    all.type = 'checkbox';
+    all.className = 'select-all';
+    const ids = boxes.map((b) => Number(b.dataset.result));
+    const chosen = ids.filter((id) => checkedSet.has(id)).length;
+    all.checked = chosen === ids.length;
+    all.indeterminate = chosen > 0 && chosen < ids.length;
+    all.title = all.checked ? 'Clear selection' : 'Select all';
+    all.onclick = (event) => {
+      event.stopPropagation();
+      for (const id of ids) {
+        if (all.checked) checkedSet.add(id); else checkedSet.delete(id);
+      }
+      redraw();
+    };
+    head.textContent = '';
+    head.appendChild(all);
+  }
+
   function drawDiscResultsTable() {
     const table = App.el('disc-results-table');
     const job = view.discJobs.find((j) => j.id === view.discSelected);
@@ -1623,8 +1802,10 @@
       box.onchange = () => {
         const id = Number(box.dataset.result);
         if (box.checked) view.discChecked.add(id); else view.discChecked.delete(id);
+        wireDiscSelectAll(table, 'disc-check', view.discChecked, drawDiscResultsTable);
       };
     }
+    wireDiscSelectAll(table, 'disc-check', view.discChecked, drawDiscResultsTable);
   }
 
   function startDiscovery() {
@@ -1770,12 +1951,21 @@
           view.discChecked = saved; return html;
         })()}</tbody></table>
       </div>`, buttons);
-    for (const cb of box.querySelectorAll('.disc-approve')) {
+    const approveTable = box.querySelector('table');
+    const syncApprove = () => {
+      for (const cb of approveTable.querySelectorAll('.disc-approve')) {
+        cb.checked = checked.has(Number(cb.dataset.result));
+      }
+      wireDiscSelectAll(approveTable, 'disc-approve', checked, syncApprove);
+    };
+    for (const cb of approveTable.querySelectorAll('.disc-approve')) {
       cb.onchange = () => {
         const id = Number(cb.dataset.result);
         if (cb.checked) checked.add(id); else checked.delete(id);
+        wireDiscSelectAll(approveTable, 'disc-approve', checked, syncApprove);
       };
     }
+    syncApprove();
   }
 
   function fillDiscGroups() {
@@ -2003,7 +2193,7 @@
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
     const detailChosen = new Set(String(s.detail_fields || '')
       .split(',').map((f) => f.trim()).filter(Boolean));
-    App.modal('Nodes settings', `
+    const settingsBox = App.modal('Nodes settings', `
       <fieldset><legend>POLLING</legend>
         ${check('np-enabled', 'Run the poller', s.enabled)}
         ${number('np-workers', 'Poll worker threads', s.poll_workers, 'min=1 max=256')}
@@ -2040,6 +2230,10 @@
         ${DETAIL_FIELDS.map(([key, label]) =>
           check(`np-df-${key}`, label, detailChosen.has(key))).join('')}
       </fieldset>
+      ${App.columnPickerFieldset('DEVICE LIST COLUMNS', 'devices', COLUMNS,
+                                 s.table_columns)}
+      ${App.columnPickerFieldset('INTERFACE LIST COLUMNS', 'ifaces', IFACE_COLUMNS,
+                                 s.table_columns_ifaces)}
       <fieldset><legend>STORAGE</legend>
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
@@ -2061,6 +2255,10 @@
           max_scan_addresses: num('#np-maxscan'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
+          table_columns: App.readColumnPicker(
+            box.querySelector('#cols-devices'), COLUMNS),
+          table_columns_ifaces: App.readColumnPicker(
+            box.querySelector('#cols-ifaces'), IFACE_COLUMNS),
           sample_retention_days: num('#np-sampledays'), event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
         } });
@@ -2069,6 +2267,7 @@
         App.refreshNow('nodes');
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(settingsBox);
   }
 
   /* ----------------------------------------------------------- refresh */
@@ -2224,7 +2423,6 @@
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
-    App.el('nd-bulk-selectall').onclick = bulkSelectAll;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
     App.el('nd-d-range').onchange = (e) => {
       view.chartRange = Number(e.target.value);

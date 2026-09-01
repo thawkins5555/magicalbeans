@@ -143,6 +143,12 @@ DEFAULTS = {
     # metric — leaving one "Device not responding". See alertrules.ROLLED_UP_BY
     # for exactly which, and why interface alerts are not among them.
     "rollup_enabled": True,
+    # Comma-joined column keys the alert table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns": "",
 }
 
 PENDING_SCHEMA = """
@@ -203,6 +209,11 @@ _BUILTIN_RULES = [
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
     ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "device_down", None, None, 1),
+    # Distinct from ap_removed, and deliberately not rolled up under it: "the
+    # controller lost this AP" and "the controller has it but it is not
+    # working" are different facts with different remedies. An AP marked out
+    # of service raises neither.
+    ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "device_down", None, None, 1),
     # DHCP scope utilization, as a percentage of the scope's address range
     # that is leased or reserved. Its own kind rather than a "threshold"
     # rule because the threshold evaluator reads Nodes' metrics table for a

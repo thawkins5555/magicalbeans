@@ -51,6 +51,30 @@ The server uses only the Python standard library. PySide6 is needed for the
 console window and nothing else, so a headless install needs neither it nor a
 web framework. TLS is used when `--cert` and `--key` are supplied.
 
+**Every main table works the same way.** The device list in Nodes, the alert
+list, ConfigRX's devices and its stored backups, the flow, trap and syslog
+lists, IPAM's hosts and DHCP leases, and the wireless AP list all share one
+set of table behaviours:
+
+- **Click a header to sort by that column**; click again to reverse it. Empty
+  cells always sort last whichever way the column points — a blank is absent,
+  not smaller than everything else. The sort lasts for the session.
+- **Choose which columns are shown**, from that module's own Settings dialog.
+  Each table offers more columns than it shows by default; tick the ones you
+  want, or use All / None. Unticking everything restores the columns the page
+  ships with rather than leaving an empty table, and a column a later release
+  removes is ignored rather than breaking a saved choice. This is a setting
+  and is shared by everyone using the server.
+- **Drag a column edge to resize it.** Widths are per browser, not a setting,
+  and **Reset layout** on the Settings tab clears them — it does not touch
+  which columns are shown.
+- **Where rows have checkboxes**, a select-all box sits in the header directly
+  above them. It shows a dash when only some rows are ticked, and clicking it
+  again clears the selection.
+
+The Debug page is deliberately outside this: its tables are live worker state
+rather than records to work through.
+
 ---
 
 ## Nodes — SNMP poller and device inventory
@@ -353,6 +377,25 @@ rather than waiting for each one's interval, and reports how many it queued
 and how many were already running. The detail pane's button only ever polls
 the one device open in it.
 
+**Vendor and Location can be read from an OID you choose.** Vendor is
+normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr
+keyword fallback, and Location is sysLocation. Plenty of gear puts its real
+vendor or its site name in a proprietary scalar instead, so a device or a
+whole polling profile can name a **Vendor OID** and a **Location OID** in its
+edit form; a device's own setting beats the profile's, and blank means the
+standard behaviour. Either form of the OID works — the object or its `.0`
+instance — since both are asked for in the SNMP request the poller was
+already making. **Browse OIDs** offers *Use as vendor* and *Use as location*
+on every row, so the OID is picked from a list showing what it currently
+returns rather than typed from memory.
+
+A custom vendor changes **what is displayed**, nothing else: the vendor SNMP
+detected is kept alongside it and remains what ConfigRX picks its backup
+command from, what enables the Cisco per-VLAN MAC-table read, and what
+discovery matches a profile against. The device header says which source the
+displayed name came from, because an arc assignment, a sysDescr substring
+guess and an operator-chosen OID are not equally trustworthy.
+
 **Devices are keyed by IP address and cannot be added twice.** The address
 column is unique, adding one that already exists is refused by name rather
 than by a database error, and promoting a discovery result whose address is
@@ -452,6 +495,16 @@ alerts and optionally emailing about them.
   genuinely still breaching re-opens on its own while one that recovered with
   the device stays closed. **Alerts → Settings → Roll implied alerts up**
   turns the whole behaviour off.
+- **An access point that stops working raises an alert, not just a red dot.**
+  *Access point offline* fires when an AP's connection state leaves online and
+  clears when it comes back — distinct from *Access point removed from its
+  controller*, which is the controller no longer listing it at all. The two
+  are different facts with different remedies, so neither rolls up under the
+  other. An AP marked out of service raises neither, the same exemption that
+  keeps it from being aged out. Note that **Device not responding does not
+  cover access points**: that alert comes from Nodes' own device polling, and
+  an AP lives in the Wireless module unless it has also been added to Nodes by
+  IP in its own right.
 - **The Object column always shows a hostname when one is known** — the
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
@@ -582,6 +635,13 @@ traces it appeared in.
   looked up for public addresses, this only ever applies to external hops;
   an unnamed hop inside your own network still reads "no PTR record". A real
   PTR name, once found, always wins over the ASN fallback.
+- **A hop that is a device this app monitors shows that device's name.** A
+  router with no reverse-DNS entry read "no PTR record" in the graph while
+  showing its sysName in Alerts, NetFlow and Syslog. Hops with no PTR answer
+  now fall back to the Nodes inventory at that address, and the hop tooltip
+  says the name came from Nodes — "this hop is a device I manage" is the part
+  worth knowing, and a PTR-derived name looks identical otherwise. A hop with
+  a real PTR record keeps it.
 
 ### Continuous per-hop probing (MTR-style)
 
@@ -1260,6 +1320,21 @@ to a manual name in Nodes.
   unrecognized vendor is skipped with a clear error rather than guessed
   at. ConfigRX never enters a device's configuration/enable-write mode
   and never sends anything beyond that one fixed command.
+- **A stored backup can be deleted**, one at a time or several at once from
+  the backups list's own checkboxes. Deleting the **most recent** backup is
+  called out separately in the confirmation: a new backup is only stored when
+  it differs from the last one, so once the top row is gone the next run
+  records the device's current config as a change even though nothing on the
+  device changed.
+- **A backup in progress is visible.** The device row reports *queued…* and
+  *backing up…* rather than sitting on the last completed attempt for the
+  whole run, and the Back up now button follows the same states through to the
+  outcome instead of saying "Queued…" and going silent.
+- **The Vendor column shows the vendor the backup will actually use**, and a
+  dropdown filters on it. A per-device vendor override steers which
+  show-config command runs, but the list used to show what Nodes detected — so
+  a device could read `cisco` and back up as `hp` with nothing to show for it.
+  An overridden value is marked as one.
 - **A capture runs until the device is finished, not until it goes quiet.**
   A backup used to end on a pause in the output, and a switch answers
   `Building configuration...` instantly and then thinks for several seconds

@@ -604,7 +604,7 @@ const App = (() => {
      reports which column and which direction, since only the caller knows
      whether that means re-querying or reordering what it already has. */
   function grid(table, options) {
-    const { name, columns, sort, onSort } = options;
+    const { name, columns, sort, onSort, selectAll } = options;
     const stored = loadColumns();
     const widths = stored[name] || {};
 
@@ -626,8 +626,28 @@ const App = (() => {
     const row = document.createElement('tr');
     columns.forEach((column, index) => {
       const th = document.createElement('th');
-      const labelText = document.createTextNode(column.label);
-      th.appendChild(labelText);
+      // A select-all checkbox belongs directly above the boxes it governs,
+      // not in a filter bar several controls away — that is the only place
+      // it reads as "these rows". Rendered here rather than per module so
+      // there is one implementation and one indeterminate rule; a column
+      // opts in by naming itself in selectAll.key.
+      if (selectAll && selectAll.key === column.key) {
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.className = 'select-all';
+        box.checked = !!selectAll.checked;
+        // Some-but-not-all is a real third state and a plain tick would lie
+        // about it. It cannot be set from markup, only from script.
+        box.indeterminate = !selectAll.checked && !!selectAll.some;
+        box.title = selectAll.checked ? 'Clear selection' : 'Select all';
+        box.onclick = (event) => {
+          event.stopPropagation();
+          selectAll.onToggle(box.checked);
+        };
+        th.appendChild(box);
+      } else {
+        th.appendChild(document.createTextNode(column.label));
+      }
       // `numeric` governs how the column sorts. Right-alignment is a
       // separate question: "14s ago" sorts by a timestamp but reads as text,
       // and aligning the header right while the cells stayed left was what
@@ -688,6 +708,135 @@ const App = (() => {
     table.appendChild(colgroup);
     table.appendChild(head);
     return table;
+  }
+
+  /* The same escape every module file defines for itself, needed here now
+     that app.js builds markup of its own. */
+  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  /* ------------------------------------------------- choosing columns
+
+     Which columns a table shows. Lifted out of the Wireless module, which
+     shipped this first and bespoke; every pickable table now shares one
+     implementation, one storage convention and one set of judgement calls.
+
+     The choice lives in the owning module's own settings (a `table_columns`
+     key in its DEFAULTS, saved through /api/settings) rather than in
+     localStorage, for the reason wirelessdb.py already gives: Reset layout
+     clears per-browser column *widths*, and must not also eat a deliberate
+     settings choice. Widths are per-browser; which columns exist is not. */
+
+  /* The catalogue entries a stored choice selects, in catalogue order.
+
+     Two deliberate behaviours, both carried over from Wireless:
+     unrecognised keys are dropped, so a column removed in a later release
+     does not break a saved choice and an older client ignores a newer one;
+     and an empty or fully-unticked choice yields the shipped defaults rather
+     than a table with no columns at all, which is not a state anyone wants
+     to be stuck in. */
+  function visibleColumns(all, storedCsv) {
+    // A `fixed` column is the table's own machinery — the row checkbox, an
+    // action button — and is always present whatever the choice says. It is
+    // also excluded from the "did they choose anything?" test below, or
+    // unticking every real column would leave a table of nothing but
+    // checkboxes, which is the one state nobody can get out of.
+    const stored = String(storedCsv || '')
+      .split(',').map((k) => k.trim()).filter(Boolean)
+      .filter((k) => all.some((c) => c.key === k && !c.fixed));
+    const keep = (c) => c.fixed || (stored.length ? stored.includes(c.key) : !!c.on);
+    // Ordered by the catalogue, not by the order the boxes were ticked, so
+    // the table's column order is stable however the choice was made.
+    return all.filter(keep);
+  }
+
+  /* Re-syncs a header select-all box after a single row was toggled.
+
+     Ticking one row deliberately does NOT redraw the table — that is what
+     made picking several rows on a long list feel slow — so the header box
+     has to be corrected in place or it goes stale the moment anything is
+     ticked by hand. */
+  function refreshSelectAll(table, total, selected) {
+    const box = table && table.querySelector('thead input.select-all');
+    if (!box) return;
+    box.checked = total > 0 && selected === total;
+    box.indeterminate = selected > 0 && selected < total;
+    box.title = box.checked ? 'Clear selection' : 'Select all';
+  }
+
+  /* Builds a table body from column descriptors: `cell(row)` renders when
+     given, otherwise the raw field with an em dash for blank. This is what
+     makes hiding a column safe — every other table in this app used to zip a
+     positional array of <td> strings against its column list, so removing one
+     column silently shifted every cell after it into the wrong header. */
+  function drawRows(tbody, rows, columns, onRow) {
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = columns.map((c) => {
+        if (c.cell) return `<td class="${c.numeric ? 'num' : ''}">${c.cell(row)}</td>`;
+        const raw = row[c.key];
+        const blank = raw === null || raw === undefined || raw === '';
+        return `<td class="${c.numeric ? 'num' : ''}">` +
+          `${blank ? '\u2014' : escapeHtml(raw)}</td>`;
+      }).join('');
+      if (onRow) onRow(tr, row);
+      tbody.appendChild(tr);
+    }
+    return tbody;
+  }
+
+  /* The checkbox block for a settings dialog. `fixed` columns (a row's
+     checkbox, an action button) are not offered — hiding them would remove
+     the table's controls, not a column of data. */
+  function columnPickerHtml(all, storedCsv) {
+    const chosen = visibleColumns(all, storedCsv).map((c) => c.key);
+    return all.filter((c) => !c.fixed).map((c) =>
+      `<label class="check"><input type="checkbox" data-column="${c.key}"` +
+      `${chosen.includes(c.key) ? ' checked' : ''}> ${escapeHtml(c.label)}</label>`
+    ).join('');
+  }
+
+  /* The whole fieldset a settings dialog drops in: legend, the checkboxes,
+     an All/None pair and the note explaining what unticking everything does.
+
+     The All/None pair rather than a single "select all" box, for the reason
+     the Debug page's own pair already documents: ticking fifteen boxes back
+     on one at a time is what makes "None" on its own a trap, so both
+     directions are offered. `id` scopes the block so one dialog can carry
+     several pickers (Nodes has two). */
+  function columnPickerFieldset(legend, id, all, storedCsv) {
+    return `<fieldset><legend>${escapeHtml(legend)}</legend>
+      <div id="cols-${id}" class="cats">${columnPickerHtml(all, storedCsv)}</div>
+      <p><button type="button" data-cols-all="${id}">All</button>
+         <button type="button" data-cols-none="${id}">None</button></p>
+      <p class="hint">Unticking everything restores the columns this page
+        ships with rather than leaving an empty table. Column <em>widths</em>
+        are per browser and are cleared by Reset layout; which columns exist
+        is a setting and is not.</p>
+    </fieldset>`;
+  }
+
+  /* Wires the All/None buttons inside a modal that used columnPickerFieldset.
+     Called once after the dialog is built; harmless when it contains none. */
+  function wireColumnPickers(box) {
+    for (const button of box.querySelectorAll('[data-cols-all],[data-cols-none]')) {
+      const all = button.hasAttribute('data-cols-all');
+      const id = button.getAttribute(all ? 'data-cols-all' : 'data-cols-none');
+      button.onclick = () => {
+        const group = box.querySelector(`#cols-${id}`);
+        if (!group) return;
+        for (const cb of group.querySelectorAll('[data-column]')) cb.checked = all;
+      };
+    }
+  }
+
+  /* Reads that block back as the CSV the settings key stores. Fixed columns
+     are re-added, since they were never on offer to untick. */
+  function readColumnPicker(box, all) {
+    const ticked = [...box.querySelectorAll('[data-column]')]
+      .filter((cb) => cb.checked).map((cb) => cb.dataset.column);
+    return all.filter((c) => c.fixed || ticked.includes(c.key))
+      .map((c) => c.key).join(',');
   }
 
   /* Order rows by a column the caller describes. Numbers compare as numbers,
@@ -922,5 +1071,7 @@ const App = (() => {
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     resetLayout,
     grid, sortRows, canRead, canWrite, accountModal,
+    visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
+    refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };
 })();

@@ -77,6 +77,12 @@ DEFAULTS = {
     # files its messages at the wrong time, which is worse than useless when
     # correlating an incident, so arrival time can be used instead.
     "use_receive_time": False,
+    # Comma-joined column keys the syslog message table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns": "",
 }
 
 

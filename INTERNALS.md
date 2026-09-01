@@ -151,6 +151,42 @@ bit — matching the trap receiver's own inbound-decryption deferral;
 `nodesdb`'s schema has no privacy-protocol column at all, so the UI never
 offers configuring it in the first place.
 
+### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
+
+`vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`
+and `_GROUP_EDITABLE`, so `effective_config()` resolves device-over-profile
+for free and no new merge path exists. NULL means today's behaviour, which is
+the whole backward-compatibility story.
+
+Deliberately *not* reusing `oid_set`: that column is declared, migrated,
+round-tripped by the API and read by nothing (`nodepoll.py` never mentions
+it), and its schema comment promises a different feature — "comma-separated
+metric keys". A pre-carved seat is not an invitation to sit in it with
+something else.
+
+`nodeoids.oid_variants()` returns both the object OID and its `.0` instance
+unless one was typed, and `_poll_snmp_scalars` appends them to the GET it was
+already making for the six system scalars — two extra varbinds, no extra
+round trip. Asking for both removes the single most likely way to get this
+wrong, since an OID browser, a MIB and an agent disagree about which form you
+name. `normalize_oid()` rejects anything that is not dotted digits, so a typo
+reads as "not configured" rather than going on the wire.
+
+**The vendor split is the part to be careful with.** `identity["vendor"]` is
+the *displayed* name and a custom OID may supply it; `vendor_detected` is
+always what `identify_vendor()` worked out. Three readers behave differently
+per vendor and must use the detected one — `configrx._backup_device` (an
+exact `configrx_vendors.resolve()` dict lookup that "Cisco Systems, Inc."
+fails), `nodepoll.read_mac_table`'s `is_cisco` gate, and
+`nodeoids.suggest_group` (which reads sysObjectID itself, so it was already
+safe). `nodesdb.detected_vendor(row)` is the single place that rule lives,
+and it falls back to `vendor` for rows written before the column existed,
+where the two were the same value by definition. `vendor_source` —
+`sysObjectID` / `sysDescr` / `oid` — was computed on every poll and thrown
+away; it is now stored, because an IANA arc assignment and a sysDescr
+substring guess are not equally trustworthy and the header used to present
+them identically.
+
 ### Scheduler (`nodepoll.py`)
 
 `NodePoller` is shaped like NetPath's own `Monitor`, not `IpamWorker` —
@@ -292,7 +328,40 @@ swapping the *input mechanism* (checkbox click → modifier-key click) a
 pure interaction change with no effect on `drawBulkBar()`/the `bulk*()`
 action functions, which still just read `[...view.devicesChecked]` /
 `[...view.checked]` unaware of how the Set was populated. A row can
-still be simultaneously selected (detail pane) and checked (bulk set);
+**Shared table machinery (`app.js`).** Four helpers, added in 4.30.0 by
+lifting Wireless's bespoke column-picking out of that one module:
+`visibleColumns(all, storedCsv)` resolves a catalogue plus a stored choice
+into the columns to draw, `columnPickerFieldset`/`readColumnPicker` are the
+settings-dialog block and its read-back, and `drawRows(tbody, rows, columns,
+onRow)` builds the body from each column's `cell(row)`. That last one is the
+part that makes hiding a column *safe*: every table used to zip a positional
+array of `<td>` strings against its column list, so removing one column
+silently shifted every later cell under the wrong header — netflow.js said so
+in a comment ("this array and COLUMNS are zipped below, so the two orders
+have to move together") and appended its route button outside the map
+entirely, which is exactly the shape that breaks.
+
+Three rules are encoded once rather than per module: unrecognised keys are
+dropped (so a column a release removes does not break a saved choice, and an
+older client ignores a newer one); a `fixed` column — a row checkbox, an
+action button — is always drawn and never offered for hiding; and a stored
+choice containing no non-fixed column falls back to the defaults, or
+unticking everything would leave a table of nothing but checkboxes, the one
+state with no way out. Storage is a `table_columns` key in the owning
+module's own settings scope (`/api/settings`, nine scopes), never
+`localStorage`, for the reason `wirelessdb.py:95` gives: Reset layout clears
+per-browser *widths* and must not eat a settings choice. Sort state is the
+opposite — a per-session `view.*Sort` object, deliberately not persisted,
+because mixing the two storage models is how that bug happens.
+
+`App.grid` gained a `selectAll: {key, checked, some, onToggle}` option that
+renders the checkbox into the named column's header cell, with
+`indeterminate` for a partial selection. It lives in `grid` rather than in
+each module so there is one implementation and one tri-state rule.
+`refreshSelectAll(table, total, selected)` corrects it in place after a
+single-row toggle, because `toggleChecked` deliberately does not redraw.
+
+A row can still be simultaneously selected (detail pane) and checked (bulk set);
 `tr.bulk-checked` and `tr.selected` (`app.css`) are separate rules for
 exactly that reason, and `tr.bulk-checked.selected` gives the combination
 its own shade rather than letting one tint win. The checked marker used to
@@ -1858,6 +1927,33 @@ then the DNS reverse-lookup cache, else `None`. Callers decide their own
 last resort (Syslog's Host column leaves a true gap as `""`; Alerts
 falls back to the bare IP, per its "always show something" requirement).
 
+4.30.0 split the device half out as `device_name(device)` and fixed a real
+omission in it: `display_name_source` was ignored, so a device explicitly
+pinned to its manual name still displayed its sysName in Alerts, Syslog and
+NetFlow — everywhere except the Nodes tab and ConfigRX, which each computed
+the correct precedence themselves. One two-line fix in the shared helper
+corrects all of its callers at once.
+
+`fill_from_nodes(nodes_db, names, ips)` is the NetPath direction and runs the
+precedence the *other* way round — DNS first, Nodes second — because it fills
+gaps in a reverse-DNS result rather than deciding a display name from
+scratch: a hop with a real PTR record keeps it, and only a hop the resolver
+could not name falls back to the device this app monitors at that address. It
+returns `{ip: "nodes"}` for what it filled, which `_topology_json` passes
+through as `hostname_source` so the hop tooltip can say where the name came
+from.
+
+It is called in `get_path`/`get_topology` rather than in `monitor.Resolver`
+for two reasons: `service.nodes_db` is already in hand at the API layer (the
+resolver would need a new constructor argument), and a Nodes name written
+into the *DNS* cache would be aged out on a DNS schedule
+(`service.py` housekeeping) and go stale the moment the device is renamed.
+Note the interaction with `analysis.PathNode.hostname_label`: it reports
+`"resolving…"` when the IP is absent from the map entirely and
+`"no PTR record"` when it is present but empty, so filling an entry is also
+what makes the hop count as *looked up* — which is correct, and a hop that is
+neither resolved nor managed still reads "resolving…".
+
 This lookup is **not** gated by the `resolve_sources` setting the way
 the Source column's separate `source_name` resolution still is — that
 setting predates this fix and was found to be silently disabling the
@@ -2429,6 +2525,24 @@ log it and `alertengine`'s `_drain_ap_events()` can raise a real alert
 (built-in rule `wireless_ap_removed`, kind `wireless_event`). The reverse
 transition pairs the same way its device siblings do: `upsert_ap` records
 `ap_returned` whenever it inserts a brand-new row, and
+**AP offline vs AP removed.** `_record_status_change` (`wirelessdb.py`) is
+called from `upsert_ap` when the row already existed, and records `ap_offline`
+/ `ap_online` on the connection-state transition — mirroring the
+`ap_removed`/`ap_returned` pair exactly, including the `out_of_service`
+exemption and the fact that it fires on the *transition* rather than on every
+poll that still finds the AP unhealthy. It runs with the database lock held,
+which is safe because the lock is an `RLock` and `add_ap_event` takes it
+again — the same thing the existing `ap_returned` call in `upsert_ap` does.
+
+The gap it closes is worth stating plainly, because it is not obvious from
+either side: `upsert_ap` resets `missed_polls` to 0, correctly, since the poll
+*did* see the AP; `prune_stale` therefore skips it, correctly; so `ap_removed`
+never fires for an AP the controller still lists. An AP could be offline
+indefinitely with nothing recorded anywhere. `wireless_ap_offline` is
+deliberately absent from `ROLLED_UP_BY`: "the controller lost it" and "the
+controller has it and it is not working" are different facts with different
+remedies, and 4.29.0's rollup exists for alerts that *restate* one outage.
+
 `alertrules.CLEARS` maps it to `wireless_ap_removed`, so an AP that comes
 back auto-resolves its own removal alert (a genuinely new AP has no such
 alert, making the event inert for it). The drain uses the same cursor
@@ -2709,6 +2823,33 @@ exceptions rather than building HTTP responses themselves. A handful of
 `selfupdate.apply()`) instead return `{"ok": False, "error": ...}` on an
 *expected* failure — a DHCP server not answering, no update available —
 reserving raised exceptions for genuinely unexpected conditions.
+
+### Backup deletion and in-flight state (`configrxdb.py`, `configrx.py`)
+
+`delete_backup` / `delete_backups` sit beside `prune`, which was previously
+the only thing that removed a backup row other than `forget_device`. The
+caller-facing subtlety is documented on the method rather than left to be
+discovered: deleting a device's *most recent* backup changes what the next
+run stores, because `add_backup` dedupes against `latest_backup_hash`. The UI
+says so in the confirmation when the selection includes the newest row.
+
+`ConfigRxWorker._queued` was a bare `set[int]` that `_run_one` only discarded
+in its `finally`, so "queued behind three others" and "mid-SSH-session" were
+the same state. It is now `dict[int, float]` plus a `_started` map and a
+`worker_state()` returning the same `{id: {queued, started}}` shape
+`NodePoller.worker_state()` does — which is what lets
+`_configrx_device_json` join it per device exactly the way the Nodes list
+already joins its own (`api.py:1649`).
+
+### Effective vendor in the ConfigRX list (`api.py`)
+
+`_configrx_device_json` used to return Nodes' `devices.vendor` verbatim while
+`vendor_override` came back as a separate field the UI only used to fill an
+input. The worker meanwhile resolves `vendor_override or detected_vendor` —
+so the list could show `cisco` for a device that backs up as `hp`. The row now
+carries `effective_vendor` resolved the same way the worker resolves it, plus
+`vendor_is_override` so the column can mark it, and the vendor filter matches
+on that field. One resolution rule, in two places that agree.
 
 ### Which paramiko is loaded (`configrx.py`)
 

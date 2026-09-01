@@ -296,22 +296,55 @@ DEFAULTS = {
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
                               # auto-loaded, so a deliberate delete is never
                               # silently redone on the next restart
+    # Comma-joined column keys the device table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns": "",
+    # Comma-joined column keys the interface table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns_ifaces": "",
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
-                     "unreachable_ping_only")
+                     "unreachable_ping_only", "vendor_oid", "location_oid")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
-                   "unreachable_ping_only")
+                   "unreachable_ping_only", "vendor_oid", "location_oid")
 
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
                     "enabled") + _OVERRIDE_COLUMNS
+
+
+def detected_vendor(device_row) -> str:
+    """The vendor SNMP identification worked out, never a custom one.
+
+    Every reader that *behaves* differently per vendor must call this rather
+    than reading `vendor` directly: ConfigRX picks its show-config command by
+    exact vendor key, the Cisco per-VLAN MAC read is gated on the string
+    "cisco", and discovery suggests a profile by exact name match. A device
+    whose vendor_oid answers "Cisco Systems, Inc." must not lose any of those.
+
+    Falls back to `vendor` for a row polled before 4.30.0 added the column,
+    where the two were by definition the same value.
+    """
+    if device_row is None:
+        return ""
+    keys = device_row.keys() if hasattr(device_row, "keys") else device_row
+    detected = device_row["vendor_detected"] if "vendor_detected" in keys else None
+    if detected:
+        return detected
+    return (device_row["vendor"] if "vendor" in keys else "") or ""
 
 class NodesDatabase:
     def __init__(self, path: str):
@@ -361,6 +394,30 @@ class NodesDatabase:
             if column not in devices:
                 self._conn.execute(
                     f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
+        # Identity OIDs: when set, the poller reads the device's vendor and
+        # location from these instead of deriving vendor from sysObjectID and
+        # reading sysLocation. NULL/"" keeps today's behaviour exactly, which
+        # is the whole backward-compatibility story for this feature.
+        for column in ("vendor_oid", "location_oid"):
+            if column not in devices:
+                self._conn.execute(
+                    f"ALTER TABLE devices ADD COLUMN {column} TEXT")
+        if "vendor_detected" not in devices:
+            # What identify_vendor() worked out from sysObjectID/sysDescr,
+            # kept separately from `vendor` (which a custom OID may have
+            # replaced for display). ConfigRX's command choice, the Cisco
+            # MAC-table gate and discovery's profile suggestion all read this
+            # one, so naming a device "Acme Networks Ltd" cannot quietly stop
+            # its backups working.
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN vendor_detected TEXT")
+        if "vendor_source" not in devices:
+            # 'sysObjectID' | 'sysDescr' | 'oid' | '' — which of the three
+            # spoke. It was computed on every poll and thrown away; an
+            # operator looking at a vendor name deserves to know whether it
+            # is an IANA arc assignment or a substring guess.
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN vendor_source TEXT")
         if "mib_covered" not in devices:
             # Last vendor-MIB coverage verdict for this device: NULL =
             # never evaluated (or not applicable), 0/1 = uncovered/covered.
@@ -386,6 +443,10 @@ class NodesDatabase:
             if column not in groups:
                 self._conn.execute(
                     f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
+        for column in ("vendor_oid", "location_oid"):
+            if column not in groups:
+                self._conn.execute(
+                    f"ALTER TABLE groups ADD COLUMN {column} TEXT")
 
         interfaces = {row["name"] for row in
                       self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
@@ -733,10 +794,15 @@ class NodesDatabase:
         bare IP until its first poll (which overwrites these with the same
         values anyway)."""
         with self._lock:
+            # vendor_detected too: discovery identified this from SNMP, so it
+            # is a detected value by definition, and leaving it NULL until the
+            # first poll would make ConfigRX and the Cisco MAC read fall back
+            # to a blank vendor on a device that was just identified.
             self._conn.execute(
                 "UPDATE devices SET sys_descr = ?, sys_name = ?,"
-                " sys_object_id = ?, vendor = ? WHERE id = ?",
-                (sys_descr, sys_name, sys_object_id, vendor, device_id))
+                " sys_object_id = ?, vendor = ?, vendor_detected = ?"
+                " WHERE id = ?",
+                (sys_descr, sys_name, sys_object_id, vendor, vendor, device_id))
             self._conn.commit()
 
     def update_device(self, device_id: int, **fields) -> None:
@@ -895,7 +961,14 @@ class NodesDatabase:
                     "sys_object_id": identity.get("sys_object_id"),
                     "sys_contact": identity.get("sys_contact"),
                     "sys_location": identity.get("sys_location"),
+                    # `vendor` is what the operator sees and a custom
+                    # vendor_oid may have supplied it; `vendor_detected` is
+                    # always what SNMP identification worked out, and is what
+                    # every behavioural reader uses. Keeping both is what lets
+                    # a custom vendor name be display-only.
                     "vendor": identity.get("vendor"),
+                    "vendor_detected": identity.get("vendor_detected"),
+                    "vendor_source": identity.get("vendor_source"),
                 })
             if uptime_ticks is not None:
                 fields["last_uptime_ticks"] = uptime_ticks

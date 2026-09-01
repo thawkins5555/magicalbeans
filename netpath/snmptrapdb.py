@@ -105,6 +105,12 @@ DEFAULTS = {
     "retention_days": 90,
     "max_rows": 5_000_000,
     "resolve_sources": False,
+    # Comma-joined column keys the trap table shows; "" means the
+    # frontend's defaults. Lives here rather than in the browser's
+    # localStorage so it sits beside the rest of the module's settings
+    # and survives Reset layout, which clears per-browser column widths
+    # but must not eat a settings choice.
+    "table_columns": "",
 }
 
 

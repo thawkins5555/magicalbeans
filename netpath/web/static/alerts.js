@@ -11,6 +11,10 @@
     alerts: [],
     selected: null,
     checked: new Set(),
+    // Per session only, like every other table's sort: a saved sort order is
+    // a different feature from saved columns, and mixing the two storage
+    // models is how Reset layout ends up eating a settings choice.
+    alertSort: { key: 'last_ts', descending: true },
     rules: [],
     rulesSelected: null,
     templates: [],
@@ -118,50 +122,77 @@
     // click looks like it selects a row when all it does is move the detail
     // highlight, so a bulk action then acts on far fewer rows than the
     // operator believes they picked.
-    { key: 'check', label: '', sortable: false, width: 34 },
-    { key: 'severity', label: 'Sev', width: 60 },
-    { key: 'state', label: 'State', width: 80 },
-    { key: 'entity_label', label: 'Object', width: 170 },
-    { key: 'rule_name', label: 'Rule', width: 150 },
-    { key: 'message', label: 'Message', width: 260 },
-    { key: 'count', label: 'Count', width: 60, numeric: true },
-    { key: 'opened_ts', label: 'Opened', width: 90, numeric: true },
-    { key: 'last_ts', label: 'Last seen', width: 90, numeric: true },
+    { key: 'check', label: '', sortable: false, fixed: true, width: 34,
+      cell: (r) => `<input type="checkbox" class="alerts-check"${
+        view.checked.has(r.id) ? ' checked' : ''}>` },
+    { key: 'severity', label: 'Sev', width: 60, numeric: true, on: true,
+      cell: (r) => `<span class="sev sev-${r.severity}">${r.severity}</span>` },
+    { key: 'state', label: 'State', width: 80, on: true },
+    { key: 'entity_label', label: 'Object', width: 170, on: true },
+    { key: 'rule_name', label: 'Rule', width: 150, on: true },
+    { key: 'message', label: 'Message', width: 260, on: true,
+      cell: (r) => `<span class="msg">${escape(r.message)}</span>` },
+    { key: 'count', label: 'Count', width: 60, numeric: true, on: true,
+      cell: (r) => (r.count > 1 ? r.count : '') },
+    { key: 'opened_ts', label: 'Opened', width: 90, numeric: true, on: true,
+      cell: (r) => ago(r.opened_ts) },
+    { key: 'last_ts', label: 'Last seen', width: 90, numeric: true, on: true,
+      cell: (r) => ago(r.last_ts) },
+    { key: 'severity_name', label: 'Severity name', width: 110 },
+    { key: 'acked_by', label: 'Acknowledged by', width: 140,
+      cell: (r) => escape(r.acked_by || '\u2014') },
+    { key: 'resolved_ts', label: 'Resolved', width: 90, numeric: true,
+      cell: (r) => (r.resolved_ts ? ago(r.resolved_ts) : '\u2014') },
+    { key: 'entity_kind', label: 'Kind', width: 80 },
   ];
 
+  const alertColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.alertsSettings || {}).table_columns);
+
+  function onAlertSort(key, descending) {
+    view.alertSort = { key, descending };
+    drawTable();
+  }
+
   function drawTable() {
-    const table = App.grid(App.el('alerts-table'), { name: 'alerts', columns: COLUMNS });
+    const columns = alertColumns();
+    const checked = view.checked;
+    const table = App.grid(App.el('alerts-table'), {
+      name: 'alerts', columns,
+      sort: view.alertSort, onSort: onAlertSort,
+      selectAll: {
+        key: 'check',
+        checked: view.alerts.length > 0 && view.alerts.every((a) => checked.has(a.id)),
+        some: view.alerts.some((a) => checked.has(a.id)),
+        onToggle: (on) => {
+          checked.clear();
+          if (on) for (const a of view.alerts) checked.add(a.id);
+          drawTable();
+        },
+      } });
     const body = document.createElement('tbody');
-    for (const row of view.alerts) {
-      const tr = document.createElement('tr');
+    const rows = App.sortRows(view.alerts, view.alertSort.key,
+                              view.alertSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
         + (view.checked.has(row.id) ? ' bulk-checked' : '');
-      tr.innerHTML =
-        `<td><input type="checkbox" class="alerts-check"${
-          view.checked.has(row.id) ? ' checked' : ''}></td>` +
-        `<td><span class="sev sev-${row.severity}">${row.severity}</span></td>` +
-        `<td>${escape(row.state)}</td>` +
-        `<td>${escape(row.entity_label)}</td>` +
-        `<td>${escape(row.rule_name)}</td>` +
-        `<td class="msg">${escape(row.message)}</td>` +
-        `<td>${row.count > 1 ? row.count : ''}</td>` +
-        `<td>${ago(row.opened_ts)}</td>` +
-        `<td>${ago(row.last_ts)}</td>`;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.
-      tr.querySelector('.alerts-check').onclick = (event) => {
-        event.stopPropagation();
-        toggleChecked(row.id, tr);
-      };
+      const box = tr.querySelector('.alerts-check');
+      if (box) {
+        box.onclick = (event) => {
+          event.stopPropagation();
+          toggleChecked(row.id, tr);
+        };
+      }
       tr.onclick = () => {
         view.selected = row.id;
         drawTable();
         showDetail(row);
       };
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
     App.el('alerts-count').textContent = `${view.alerts.length} shown`;
     drawBulkBar();
@@ -180,16 +211,14 @@
       tr.classList.toggle('bulk-checked', on);
       const box = tr.querySelector('.alerts-check');
       if (box) box.checked = on;
+      App.refreshSelectAll(App.el('alerts-table'), view.alerts.length,
+                           view.checked.size);
       drawBulkBar();
       return;
     }
     drawTable();
   }
 
-  function bulkSelectAll() {
-    view.alerts.forEach((a) => view.checked.add(a.id));
-    drawTable();
-  }
 
   function drawBulkBar() {
     const n = view.checked.size;
@@ -594,6 +623,8 @@
           When the device comes back, any metric that is genuinely still
           breaching re-opens on the next poll by itself.</p>
       </fieldset>
+      ${App.columnPickerFieldset('ALERT LIST COLUMNS', 'alerts', COLUMNS,
+                                 s.table_columns)}
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
         <p class="hint" id="as-test-status"></p>
@@ -635,12 +666,15 @@
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
           new_device_grace_s: num('#as-grace') * 60,
           rollup_enabled: on('#as-rollup'),
+          table_columns: App.readColumnPicker(
+            box.querySelector('#cols-alerts'), COLUMNS),
         } });
         await App.loadState();
         App.closeModal();
         App.refreshNow('alerts');
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(box);
     const select = box.querySelector('#as-minsev');
     (App.state.severities || []).forEach((name, index) => {
       const option = document.createElement('option');
@@ -765,7 +799,6 @@
         '<p class="hint">Resolved alerts are what "Delete resolved alerts" in ' +
         'Settings later removes.</p>', 'Resolve', bulkResolve);
     };
-    App.el('alerts-bulk-selectall').onclick = bulkSelectAll;
     App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
     App.el('alerts-toggle').onclick = async () => {
       const running = (App.state.serverState.alerts || {}).running;

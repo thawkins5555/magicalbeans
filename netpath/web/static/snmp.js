@@ -7,6 +7,8 @@
   const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
+    // Newest first, the order the server already returns.
+    trapSort: { key: 'ts', descending: true },
     t0: Date.now() / 1000 - 86400,
     t1: Date.now() / 1000,
     follow: true,
@@ -147,39 +149,59 @@
   /* ------------------------------------------------------------- table */
 
   const COLUMNS = [
-    { key: 'ts', label: 'Time', width: 92 },
-    { key: 'severity', label: 'Severity', width: 90 },
-    { key: 'source', label: 'Source', width: 160 },
-    { key: 'version', label: 'Ver', width: 54 },
-    { key: 'community', label: 'Community / user', width: 130 },
-    { key: 'trap', label: 'Trap', width: 200 },
-    { key: 'uptime', label: 'Agent uptime', width: 110 },
-    { key: 'summary', label: 'Varbinds', width: 420 },
+    { key: 'ts', label: 'Time', width: 92, numeric: true, on: true,
+      align: 'left', cell: (r) => App.clock(r.ts) },
+    { key: 'severity', label: 'Severity', width: 90, numeric: true, on: true,
+      align: 'left',
+      cell: (r) => `<span class="sev sev-${r.severity}">${escape(r.severity_name)}</span>` },
+    { key: 'source', label: 'Source', width: 160, on: true,
+      value: (r) => (view.showHostname && r.source_name) || r.source || '',
+      cell: (r) => escape((view.showHostname && r.source_name) || r.source) },
+    { key: 'version', label: 'Ver', width: 54, on: true,
+      value: (r) => r.version_name || '', cell: (r) => escape(r.version_name) },
+    { key: 'community', label: 'Community / user', width: 130, on: true },
+    { key: 'trap', label: 'Trap', width: 200, on: true,
+      value: (r) => r.trap_name || r.trap_oid || '',
+      cell: (r) => escape(r.trap_name || r.trap_oid)
+        + (r.is_inform ? ' <span class="hint">inform</span>' : '') },
+    { key: 'uptime', label: 'Agent uptime', width: 110, on: true,
+      value: (r) => r.uptime_text || '', cell: (r) => escape(r.uptime_text) },
+    { key: 'summary', label: 'Varbinds', width: 420, on: true,
+      value: (r) => varbindSummary(r),
+      cell: (r) => `<span class="msg">${escape(varbindSummary(r))}</span>` },
+    { key: 'trap_oid', label: 'Trap OID', width: 200,
+      cell: (r) => escape(r.trap_oid || '\u2014') },
+    { key: 'source_name', label: 'Source name', width: 160,
+      cell: (r) => escape(r.source_name || '\u2014') },
   ];
 
+  /* The varbinds a row shows: sysUpTime and snmpTrapOID are already the
+     Agent uptime and Trap columns, so repeating them here is noise. */
+  function varbindSummary(row) {
+    return (row.varbinds || [])
+      .filter((v) => v.oid !== '1.3.6.1.2.1.1.3.0' && v.oid !== '1.3.6.1.6.3.1.1.4.1.0')
+      .map((v) => `${v.name}=${v.text}`).join('  ');
+  }
+
+  const trapColumns = () => App.visibleColumns(
+    COLUMNS, (App.state.snmpSettings || {}).table_columns);
+
+  function onTrapSort(key, descending) {
+    view.trapSort = { key, descending };
+    drawTable();
+  }
+
   function drawTable() {
+    const columns = trapColumns();
     const table = App.grid(App.el('snmp-table'),
-      { name: 'snmp-traps', columns: COLUMNS });
+      { name: 'snmp-traps', columns, sort: view.trapSort, onSort: onTrapSort });
     const body = document.createElement('tbody');
-    for (const row of view.traps) {
-      const tr = document.createElement('tr');
+    const rows = App.sortRows(view.traps, view.trapSort.key,
+                              view.trapSort.descending, columns);
+    App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      const summary = row.varbinds
-        .filter((v) => v.oid !== '1.3.6.1.2.1.1.3.0' && v.oid !== '1.3.6.1.6.3.1.1.4.1.0')
-        .map((v) => `${v.name}=${v.text}`).join('  ');
-      const flag = row.is_inform ? ' <span class="hint">inform</span>' : '';
-      tr.innerHTML =
-        `<td>${App.clock(row.ts)}</td>` +
-        `<td><span class="sev sev-${row.severity}">${row.severity_name}</span></td>` +
-        `<td>${escape((view.showHostname && row.source_name) || row.source)}</td>` +
-        `<td>${escape(row.version_name)}</td>` +
-        `<td>${escape(row.community)}</td>` +
-        `<td>${escape(row.trap_name || row.trap_oid)}${flag}</td>` +
-        `<td>${escape(row.uptime_text)}</td>` +
-        `<td class="msg">${escape(summary)}</td>`;
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
-      body.appendChild(tr);
-    }
+    });
     table.appendChild(body);
   }
 
@@ -291,7 +313,9 @@
         ${number('sp-maxrows', 'Row cap', s.max_rows, 'min=1000 step=10000')}
         <p class="hint">The database size cap lives on the Settings tab with the
           others, since all the databases share one disk.</p>
-      </fieldset>`, [
+      </fieldset>
+      ${App.columnPickerFieldset('TRAP LIST COLUMNS', 'snmp', COLUMNS,
+                                 s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const on = (id) => box.querySelector(id).checked;
@@ -311,12 +335,15 @@
           oid_names: text('#sp-oidnames'), severity_rules: text('#sp-sevrules'),
           resolve_sources: on('#sp-resolve'),
           retention_days: num('#sp-retention'), max_rows: num('#sp-maxrows'),
+          table_columns: App.readColumnPicker(
+            box.querySelector('#cols-snmp'), COLUMNS),
         } });
         await App.loadState();
         App.closeModal();
         App.refreshNow('snmp');
       } },
     ], { buttonsTop: true });
+    App.wireColumnPickers(box);
 
     const select = box.querySelector('#sp-minsev');
     (App.state.severities || []).forEach((name, index) => {

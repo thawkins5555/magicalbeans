@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
+from .nodesdb import detected_vendor
 from .eventlog import CONFIGRX, ERROR, NullLog
 
 CONNECT_TIMEOUT_S = 10
@@ -465,7 +466,14 @@ class ConfigRxWorker:
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._queued: set[int] = set()
+        # Two maps, not one set: a device in the middle of an SSH session and
+        # one waiting behind three others are different things to an operator
+        # watching a backup, and the single set could not tell them apart —
+        # _run_one only discarded the id in its finally. Same shape as
+        # NodePoller's _queued/_started, and worker_state() below returns the
+        # same dict the Nodes API already joins per device.
+        self._queued: dict[int, float] = {}
+        self._started: dict[int, float] = {}
         self._lock = threading.Lock()
         self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0}
         self.error: str | None = None
@@ -540,14 +548,14 @@ class ConfigRxWorker:
                     "run this backup. Start it with the Start worker button "
                     "and try again."
                     if paramiko_available() else PARAMIKO_MISSING)
-            if device_id in self._queued:
+            if device_id in self._queued or device_id in self._started:
                 return False
-            self._queued.add(device_id)
+            self._queued[device_id] = time.time()
         try:
             self._executor.submit(self._run_one, device_id)
         except RuntimeError:
             with self._lock:
-                self._queued.discard(device_id)
+                self._queued.pop(device_id, None)
             raise self.NotRunning(
                 "The ConfigRX worker stopped while the backup was being "
                 "queued. Start it and try again.")
@@ -567,7 +575,19 @@ class ConfigRxWorker:
                         break
             self._stop.wait(30.0)
 
+    def worker_state(self) -> dict:
+        """{device_id: {"queued": ts, "started": ts}} for every backup in
+        flight — the same shape NodePoller.worker_state() returns, so the API
+        joins it per device the identical way."""
+        with self._lock:
+            return {device_id: {"queued": self._queued.get(device_id),
+                                "started": self._started.get(device_id)}
+                    for device_id in set(self._queued) | set(self._started)}
+
     def _run_one(self, device_id: int) -> None:
+        with self._lock:
+            self._queued.pop(device_id, None)
+            self._started[device_id] = time.time()
         try:
             self.counters["backups"] += 1
             self._backup_device(device_id)
@@ -578,7 +598,8 @@ class ConfigRxWorker:
                         detail=traceback.format_exc())
         finally:
             with self._lock:
-                self._queued.discard(device_id)
+                self._queued.pop(device_id, None)
+                self._started.pop(device_id, None)
 
     # --------------------------------------------------------------- backup
 
@@ -604,7 +625,11 @@ class ConfigRxWorker:
         if not config or not config["backup_enabled"]:
             return
 
-        vendor_key = (config["vendor_override"] or device["vendor"] or "")
+        # detected_vendor rather than device["vendor"]: configrx_vendors.resolve
+        # is an exact dict lookup, and a device whose custom vendor OID answers
+        # "Cisco Systems, Inc." must still back up as cisco. The explicit
+        # per-device override still wins over both.
+        vendor_key = (config["vendor_override"] or detected_vendor(device) or "")
         vendor = configrx_vendors.resolve(vendor_key)
         if vendor is None:
             self.db.record_backup_attempt(

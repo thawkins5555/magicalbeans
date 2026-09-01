@@ -108,6 +108,11 @@ CLEARS = {
     # genuinely new AP resolves nothing (no matching open alert), so the
     # pairing is noise-free.
     ("wireless_event", "ap_returned"): "wireless_ap_removed",
+    # An AP whose connection state comes back to online clears its offline
+    # alert, the same pairing one line up — recorded by
+    # wirelessdb._record_status_change on the transition, so it fires once
+    # rather than on every poll that finds it healthy.
+    ("wireless_event", "ap_online"): "wireless_ap_offline",
     # threshold clears are handled by evaluate_threshold's 'clear' return,
     # not this map, since they're keyed by (rule, entity) not a fixed pair
 }
