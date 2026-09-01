@@ -130,7 +130,7 @@ class AlertEngine:
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
-        occurrences += self._drain_pending(settings, rules)
+        occurrences += self._drain_pending()
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
             if self._hold_for_new_device(occurrence, settings):
@@ -197,7 +197,7 @@ class AlertEngine:
         self.counters["held"] = self.counters.get("held", 0) + 1
         return True
 
-    def _drain_pending(self, settings, rules) -> list[Occurrence]:
+    def _drain_pending(self) -> list[Occurrence]:
         """Occurrences whose hold has expired and whose condition is still
         true. One that has cleared in the meantime is dropped: the whole
         point of holding is that a device settling in should not alert."""

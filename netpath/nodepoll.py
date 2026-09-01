@@ -172,6 +172,15 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
                   f"hundredths of a second after {elapsed_s:.0f}s")
 
 
+def _oid_key(oid: str) -> tuple:
+    """An OID as a tuple of ints, so "…1.10" orders after "…1.9" rather than
+    between "…1.1" and "…1.2" the way string comparison would put it. A
+    malformed arc sorts as a string after every numeric one — the caller only
+    ever asks "did the walk advance?", and a garbled answer did not."""
+    return tuple((0, int(arc)) if arc.isdigit() else (1, arc)
+                 for arc in str(oid).split("."))
+
+
 def _ago(ts: float) -> str:
     if not ts:
         return "never"
@@ -887,13 +896,19 @@ class NodePoller:
         to each device and set the Custom MIB override by hand, so the
         common case — install the bundle for the vendor you actually run —
         left every device still undecoded. Assignment happens only where the
-        operator has expressed no preference: a device with any mib_file_id
-        already set, including one deliberately set to a different MIB, is
-        never touched. It is an ordinary override afterwards and can be
-        cleared or changed from the device like any other.
+        operator has expressed no preference — and a preference can live on
+        the polling profile as well as the device: mib_file_id is an
+        _OVERRIDE_COLUMNS entry, so a device-level auto-assignment layered
+        over a group whose MIB was chosen by hand would *beat* that choice,
+        the opposite of standing aside. Hence the effective (device-or-group)
+        value is what is checked, not the device column alone. It is an
+        ordinary override afterwards and can be cleared or changed from the
+        device like any other.
         """
         device = self.db.device(device_id)
-        if device is None or device["mib_file_id"] is not None:
+        if device is None:
+            return
+        if self.db.effective_config(device).get("mib_file_id") is not None:
             return
         mib_file_id = self.db.mib_file_covering(sys_object_id)
         if mib_file_id is None:
@@ -1440,6 +1455,14 @@ class NodePoller:
             if not oid or not (oid == base or oid.startswith(base + ".")):
                 break                      # walked out of the subtree: done
             if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                break
+            # A GETNEXT answer must lexicographically follow the request; a
+            # broken agent that echoes the request OID (or goes backwards)
+            # would otherwise fill the dialog with the same row until the cap
+            # or the clock stopped it, presented as the device's answer.
+            if _oid_key(oid) <= _oid_key(current):
+                stopped = ("the device answered with a non-increasing OID "
+                           f"({oid}) — its SNMP agent is misbehaving")
                 break
             rows.append({"oid": oid, "type": vb["type"],
                          "value": vb["value"], "text": vb.get("text")})
