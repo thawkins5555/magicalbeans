@@ -117,6 +117,11 @@ body {
    regardless of rule order, so this coexists safely with the existing
    .hidden toggle in nodes.js. */
 #nd-detail { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+/* The interfaces/events subtabs take whatever height is left under the
+   status timeline. min-height:0 for the same reason as above: without it
+   the tables grow to their content height instead of scrolling inside
+   this box. */
+#nd-d-subs { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 
 .badge {
   background: var(--warn);
@@ -243,6 +248,12 @@ body.tiny .terms { display: none; }
 }
 .bar.wrap { flex-wrap: wrap; }
 .bar.footer { border-top: 1px solid var(--hairline); background: var(--panel); }
+/* A pane header's title carries a device name, and a long one used to push
+   that header's own buttons past the pane's edge and under the next pane
+   (ConfigRX's "Device settings" disappearing behind the config viewer).
+   The title is the part that gives way; the controls keep their size. */
+.bar > .section { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar > button { flex: none; }
 .row { display: flex; gap: 6px; }
 .row button { flex: 1; }
 .row button.half { flex: 0 1 50%; }
@@ -410,6 +421,10 @@ body.tiny .terms { display: none; }
 /* A compact "at a glance" strip rather than a primary resizable panel —
    the Alerts histogram sits above its own splitter, not inside one. */
 .canvas.small { flex: none; height: 90px; min-height: 90px; }
+/* Thinner still: a single lane of discrete state over time, sized to match
+   NetPath's own status lane (STATUS_H = 26 in netpath.js) rather than
+   reading as a chart panel. Used by the Nodes device up/down timeline. */
+.canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: 8px; }
 .timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: 6px; }
 .timeline svg { width: 100%; height: 100%; display: block; }
 

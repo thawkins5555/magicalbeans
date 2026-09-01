@@ -212,6 +212,14 @@ own subtabs.
 - **Resolved names also flow into the SNMP Trap page** — a trap from a
   device an uploaded MIB describes shows a name instead of a raw OID
   there too, without duplicating the name table.
+- **A device whose vendor MIB isn't here says so.** Every poll already
+  identifies a device's vendor from its sysObjectID; when that vendor is
+  identified but no uploaded MIB actually describes its objects, the
+  device records it once — naming the vendor and the OID — and a
+  low-severity built-in alert rule surfaces it. The bundled
+  enterprise-number roots deliberately don't count as coverage: a root
+  arc names a vendor, it doesn't decode anything, so a device only looks
+  covered once a MIB with real objects under that arc is uploaded.
 - **Assign a MIB to a device or group to have it actually polled.** By
   itself, an uploaded MIB only feeds the browse view above — it has no
   effect on polling. Picking one from a device or group's "Custom MIB"
@@ -226,34 +234,29 @@ own subtabs.
 
 ### Drill-down
 
-Selecting a device opens its identity, live status, a status timeline, a
-metric picker with a zoomable chart, its current interface table, and a
-combined device/interface event history.
+Selecting a device opens its identity, live status, a status timeline,
+its current interface table, and a combined device/interface event
+history.
 
-**The status timeline is always the first thing shown**, above the metric
-picker — a colored bar of up/down/unsupported/auth-failed segments across
-the selected time window, visible immediately on selecting a device
-rather than only after picking a metric. It's built from `device_events`
-(a sparse transition log, not a dense per-poll sample table), so a device
-that's been up for a week with zero events still renders as one solid
-"up" segment rather than appearing to have no data.
+**The status timeline is the device pane's headline** — a thin colored
+bar of up/down/unsupported/auth-failed segments across the selected time
+window, sized to match NetPath's own status lane rather than reading as
+a chart panel. It's built from `device_events` (a sparse transition log,
+not a dense per-poll sample table), so a device that's been up for a week
+with zero events still renders as one solid "up" segment rather than
+appearing to have no data. The range dropdown beside it sets the window.
 
-Below it, the metric chart (recent points plotted directly; a wide window
-reads an hourly min/avg/max rollup instead of scanning months of raw
-samples), the interface table, and the event history — the interface and
-event lists scroll independently of the chart and header above them once
-they outgrow the panel, and a draggable divider
-between chart and lists sets the split (remembered per browser). An
-interface's in/out directions share one picker entry and one chart, drawn
-as two colored lines; axis labels are unit-formatted ("1.6 Mbps", "40%").
+**Bandwidth is a per-port question, so it is asked per port** — there is
+no device-level metric chart or metric picker. Clicking an interface
+opens that port's own graph (below), which is where a traffic question
+actually gets answered; the device pane keeps the space for the
+interface and event lists instead.
+
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out — the same way every other table in the app does. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
-status and any SNMP error always show. A "Smoothed" checkbox next to the
-metric/range pickers applies a moving average to raw per-poll points
-(off by default, so real spikes stay visible unless smoothing is asked
-for); wide-window rollup views are unaffected by it.
+status and any SNMP error always show.
 
 Clicking a port in the interface list opens that port's own dialog: a
 live up/down bandwidth graph of the last hour, its statistics and
@@ -925,16 +928,39 @@ reports on all of them in one SNMP walk.
   power** — the last shown per-radio, since a real AP has more than one
   (2.4/5/6 GHz). Selecting a row shows the full per-radio breakdown:
   channel, tx power and client count for each.
+- **Sort by any column** — click its heading, the same way every other
+  table in the app sorts.
+- **Choose which columns to show** in Settings → Columns. The six above
+  are the defaults; Controller, VDOM, WTP id, Radios, Channels, Radio
+  clients and Last seen can be added. The list is the fields the
+  controller's own SNMP tables report, so adding one costs no extra
+  polling.
 - **Polled on a fixed interval** (default 60 s) via repeated SNMP
   GETNEXT walks of the FortiGate Wireless Controller MIB's
   `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable` —
   the exact same table-walking approach Nodes' own SNMP poller uses,
-  rather than a second, separate GETBULK code path. An AP the controller
-  stops reporting on is removed from the list; a controller that's
-  briefly unreachable does not wipe its AP list, only a poll that
-  genuinely succeeded but no longer sees that AP does.
+  rather than a second, separate GETBULK code path. A controller that's
+  briefly unreachable does not wipe its AP list; only a poll that
+  genuinely succeeded but no longer sees that AP counts against it.
+- **An AP that disappears raises an alert rather than vanishing
+  quietly.** Once a controller has failed to report an AP for the
+  configured number of consecutive polls, it is removed from the list —
+  and that removal opens an alert ("Access point removed from its
+  controller") and writes an event to the log, so a decommissioned or
+  unplugged AP is something you are told about rather than something you
+  notice missing later.
+- **Mark an AP Out Of Service** when its absence is expected. That
+  exempts it from both halves of the above: it is never aged out of the
+  list (so the marking, and the AP, survive the controller dropping it —
+  precisely what happens once it is unracked) and it never raises a
+  removal alert. Marking it back into service restores normal behaviour;
+  **Remove** clears one permanently.
 - **Search** filters by AP name, MAC address, or model; a **Controller**
-  dropdown narrows the list to one controller.
+  dropdown narrows the list to one controller; a **Show** dropdown filters
+  by Online, Offline, Out of service, or All (the default). Beside them,
+  one **last reported** age covers the whole page — every AP in the list
+  came from the same controller poll, so a per-row age said the same
+  thing on every line.
 
 ## ConfigRX — SSH config backups
 
@@ -978,6 +1004,11 @@ to a manual name in Nodes.
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
   discarded the moment the connection attempt finishes.
+- **SSH needs the `paramiko` package**, the one third-party dependency in
+  this otherwise standard-library-only app. Without it every other module
+  runs normally and ConfigRX alone stands down, saying so plainly — in
+  the worker's status line and on each affected device — with the install
+  command, rather than failing with a traceback.
 - **Retention**: keep for N days, and/or keep at most N per device —
   either can be set to 0 to disable that particular cap. A device whose
   config never changes stays at one stored backup regardless of either

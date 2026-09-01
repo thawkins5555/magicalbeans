@@ -11,16 +11,13 @@
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
     detail: null,           // full device detail payload
+    // Still fetched: the per-port dialog's own bandwidth chart looks up
+    // its metric ids here. The device pane itself no longer charts them —
+    // bandwidth is a per-port question, asked by clicking a port.
     metrics: [],
-    metricId: null,
-    series: null,
     timeline: null,
+    // The status timeline's window, set by the range dropdown above it.
     chartRange: 3600,
-    // Absolute [t0, t1] set by a wheel zoom, overriding chartRange until
-    // the range dropdown resets it to null — same "frozen window" idea
-    // netflow.js's/netpath.js's own charts already use for wheel zoom.
-    chartWindow: null,
-    chartSmooth: false,
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -248,15 +245,10 @@
     view.metrics = metrics.metrics;
     view.ifaces = ifaces.interfaces;
     view.events = events;
-    const options = metricOptions();
-    if (!view.metricId || !options.some((o) => o.value === String(view.metricId))) {
-      view.metricId = options.length ? options[0].value : null;
-    }
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
-    fillMetricSelect(options);
-    await loadSeries();
+    await loadStatusTimeline();
     drawIfaceTable();
     drawEventTable();
   }
@@ -286,107 +278,26 @@
     App.el('nd-d-summary').textContent = lines.join('  ·  ');
   }
 
-  /* An interface's in/out directions are one thing to look at, not two:
-     the picker offers a single "traffic in/out" (and "errors in/out")
-     entry per interface, drawn as two colored lines on one chart. A
-     metric with no partner — and every non-interface metric — stays a
-     plain single entry whose value is its numeric id. */
-  function metricOptions() {
-    const pairs = {};
-    const options = [];
-    for (const m of view.metrics) {
-      const match = /^if_(in|out)_(bps|err)\.(\d+)$/.exec(m.key);
-      if (match) {
-        (pairs[`${match[2]}.${match[3]}`] = pairs[`${match[2]}.${match[3]}`] || {})[match[1]] = m;
-      } else {
-        options.push({ value: String(m.id), label: `${m.label} (${m.unit})` });
-      }
-    }
-    for (const [key, pair] of Object.entries(pairs)) {
-      if (pair.in && pair.out) {
-        const base = pair.in.label.replace(/ in_(bps|err)$/, '');
-        const kind = key.startsWith('bps.') ? 'traffic in/out' : 'errors in/out';
-        options.push({ value: `pair:${pair.in.id}:${pair.out.id}`,
-          label: `${base} — ${kind} (${pair.in.unit})` });
-      } else {
-        const m = pair.in || pair.out;
-        options.push({ value: String(m.id), label: `${m.label} (${m.unit})` });
-      }
-    }
-    return options;
+  function timelineWindow() {
+    const now = Date.now() / 1000;
+    return [now - view.chartRange, now];
   }
 
-  function fillMetricSelect(options) {
-    const select = App.el('nd-d-metric');
-    select.innerHTML = '';
-    if (!options.length) {
-      const opt = document.createElement('option');
-      opt.textContent = 'No metrics yet';
-      select.appendChild(opt);
-      return;
-    }
-    for (const o of options) {
-      const opt = document.createElement('option');
-      opt.value = o.value;
-      opt.textContent = o.label;
-      select.appendChild(opt);
-    }
-    select.value = String(view.metricId);
-  }
-
-  function chartWindow() {
-    return view.chartWindow || (() => {
-      const now = Date.now() / 1000;
-      return [now - view.chartRange, now];
-    })();
-  }
-
-  /* The status timeline shares the metric chart's own time window (the
-     range picker / wheel-zoom above), but not its metric selection — it
-     redraws whenever the window changes, not on every metric swap, so
-     it's fetched from loadSeries() (called on both) rather than wired to
-     the metric <select> directly. */
+  /* The status timeline is the device pane's only time-series view now,
+     so it owns the range dropdown above it outright rather than sharing a
+     window with a metric chart. Per-port bandwidth still charts, in the
+     interface dialog, over its own fixed last-hour window. */
   async function loadStatusTimeline() {
     if (!view.selected) return;
+    // A quick run of range changes can land out of order; a ticket that
+    // must still be current when the response arrives keeps a stale
+    // window from becoming the displayed one.
     const requestId = (view.timelineRequestId = (view.timelineRequestId || 0) + 1);
-    const [t0, t1] = chartWindow();
+    const [t0, t1] = timelineWindow();
     const result = await App.get(`/api/nodes/devices/${view.selected}/timeline`, { t0, t1 });
     if (requestId !== view.timelineRequestId) return;   // superseded — drop it
     view.timeline = result;
     drawStatusTimeline();
-  }
-
-  async function loadSeries() {
-    // A quick run of wheel ticks fires loadSeries repeatedly; nothing
-    // stops an earlier request's response landing after a later one's.
-    // A ticket that must still be current when the response arrives
-    // keeps a stale, out-of-order series from becoming the displayed
-    // (and then zoomed-from) window.
-    const requestId = (view.seriesRequestId = (view.seriesRequestId || 0) + 1);
-    loadStatusTimeline();
-    if (!view.metricId) { view.series = null; drawChart(); return; }
-    const [t0, t1] = chartWindow();
-    const sel = String(view.metricId);
-    const fetchOne = (id) => App.get(
-      `/api/nodes/devices/${view.selected}/series`, { metric_id: id, t0, t1 });
-    let series;
-    if (sel.startsWith('pair:')) {
-      const [, inId, outId] = sel.split(':');
-      const inMetric = view.metrics.find((m) => String(m.id) === inId);
-      const [a, b] = await Promise.all([fetchOne(inId), fetchOne(outId)]);
-      series = { t0: a.t0, t1: a.t1, unit: inMetric ? inMetric.unit : '',
-        series: [{ label: 'in', color: 'var(--ok)', points: a.points || [] },
-                 { label: 'out', color: 'var(--accent)', points: b.points || [] }] };
-    } else {
-      const metric = view.metrics.find((m) => String(m.id) === sel);
-      const result = await fetchOne(sel);
-      series = { t0: result.t0, t1: result.t1,
-        unit: metric ? metric.unit : '',
-        series: [{ label: '', color: 'var(--accent)', points: result.points || [] }] };
-    }
-    if (requestId !== view.seriesRequestId) return;   // superseded — drop it
-    view.series = series;
-    drawChart();
   }
 
   function niceCeiling(value) {
@@ -539,31 +450,6 @@
         'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
     }
     return geo;
-  }
-
-  function drawChart() {
-    const svg = App.el('nd-chart-svg');
-    const geo = drawSeriesChart(svg, App.el('nd-chart'), view.series,
-      { fractions: [0, 0.25, 0.5, 0.75, 1], smooth: view.chartSmooth });
-    // onwheel ASSIGNMENT, never addEventListener: this redraws on every
-    // refresh tick, and accumulated listeners each zoomed from their own
-    // stale time window — the "timeframe doesn't scale" bug.
-    svg.onwheel = geo === null ? null : (event) => {
-      event.preventDefault();
-      const rect = svg.getBoundingClientRect();
-      const scaleX = geo.width / rect.width;
-      const cx = (event.clientX - rect.left) * scaleX;
-      const anchor = geo.t0 + ((cx - geo.plot.x) / geo.plot.w) * (geo.t1 - geo.t0);
-      // The absolute [start, end] wheelWindow returns is what keeps the
-      // point under the cursor in place; keeping only the span and
-      // re-anchoring to "now" (as loadSeries does when not following)
-      // would recentre the window on every zoom instead of zooming
-      // around the cursor.
-      const [nt0, nt1] = App.wheelWindow(event, geo.t0, geo.t1, anchor);
-      view.chartWindow = [nt0, nt1];
-      view.chartRange = nt1 - nt0;
-      loadSeries();
-    };
   }
 
   /* Colored segments, one per real status change, across the full window
@@ -1780,13 +1666,10 @@
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
     App.el('nd-bulk-selectall').onclick = bulkSelectAll;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
-    App.el('nd-d-metric').onchange = (e) => { view.metricId = e.target.value; loadSeries(); };
     App.el('nd-d-range').onchange = (e) => {
       view.chartRange = Number(e.target.value);
-      view.chartWindow = null;   // back to following "now" at this span
-      loadSeries();
+      loadStatusTimeline();
     };
-    App.el('nd-d-smooth').onchange = (e) => { view.chartSmooth = e.target.checked; drawChart(); };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
@@ -1803,9 +1686,11 @@
     App.el('disc-start').onclick = startDiscovery;
     App.el('disc-promote').onclick = promoteSelected;
 
+    // The timeline is drawn into a viewBox sized from its box, so a
+    // resize needs a redraw from the data already loaded — no refetch.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
-        if (App.state.tab === 'nodes') drawChart();
+        if (App.state.tab === 'nodes') drawStatusTimeline();
       });
     }
   }

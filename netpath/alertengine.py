@@ -40,13 +40,17 @@ def _ago(ts: float) -> str:
 
 
 class AlertEngine:
-    def __init__(self, db, *, nodes_db, snmp_db, syslog_db, ipam_db, app_db=None, log=None):
+    def __init__(self, db, *, nodes_db, snmp_db, syslog_db, ipam_db, app_db=None,
+                 wireless_db=None, log=None):
         self.db = db
         self.nodes_db = nodes_db
         self.snmp_db = snmp_db
         self.syslog_db = syslog_db
         self.ipam_db = ipam_db
         self.app_db = app_db
+        # Optional: an engine constructed without it simply never raises
+        # wireless occurrences, so existing callers keep working unchanged.
+        self.wireless_db = wireless_db
         self.log = log or NullLog()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -116,6 +120,7 @@ class AlertEngine:
         occurrences += self._drain_traps(settings)
         occurrences += self._drain_syslog(settings)
         occurrences += self._drain_ipam_conflicts(settings)
+        occurrences += self._drain_ap_events(settings)
         occurrences += self._evaluate_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         for occurrence in occurrences:
@@ -288,6 +293,36 @@ class AlertEngine:
                 device_ip=row["ip"]))
         if max_id > cursor:
             self.db.set_cursor("ipam_conflicts", max_id)
+        return occurrences
+
+    def _drain_ap_events(self, settings) -> list[Occurrence]:
+        """Wireless AP lifecycle events — today just ap_removed, raised by
+        wirelessdb.prune_stale when a controller stops reporting an AP.
+        Same cursor shape as every other drain above. An AP a human marked
+        out of service never produces one of these in the first place, so
+        no filtering is needed here."""
+        if self.wireless_db is None:
+            return []
+        if not self.db.has_cursor("ap_events"):
+            self.db.set_cursor("ap_events", self.wireless_db.max_ap_event_id())
+            return []
+        cursor = self.db.cursor("ap_events")
+        rows = self.wireless_db.ap_events_since(cursor)
+        occurrences = []
+        max_id = cursor
+        for row in rows:
+            max_id = max(max_id, row["id"])
+            controller = self.wireless_db.controller(row["controller_id"])
+            label = row["name"] or row["wtp_id"]
+            occurrences.append(Occurrence(
+                kind="wireless_event", source_kind=row["kind"], entity_kind="ap",
+                entity_id=f"{row['controller_id']}:{row['vdom']}:{row['wtp_id']}",
+                entity_label=label, ts=row["ts"],
+                message=row["detail"] or f"{label}: {row['kind']}",
+                device_name=controller["name"] if controller else "",
+                device_ip=controller["ip"] if controller else ""))
+        if max_id > cursor:
+            self.db.set_cursor("ap_events", max_id)
         return occurrences
 
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:

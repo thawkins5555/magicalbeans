@@ -108,11 +108,12 @@ class Service:
         self.wireless = WirelessPoller(self.wireless_db, log=self.log)
         # Reads Nodes' device list for IP/vendor, so constructed after nodes_db.
         self.configrx = ConfigRxWorker(self.configrx_db, self.nodes_db, log=self.log)
-        # Depends on nodes_db/snmp_db/syslog_db/ipam_db, so constructed last.
+        # Depends on nodes_db/snmp_db/syslog_db/ipam_db/wireless_db, so
+        # constructed last.
         self.alert_engine = AlertEngine(
             self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
             syslog_db=self.syslog_db, ipam_db=self.ipam_db, app_db=self.app_db,
-            log=self.log)
+            wireless_db=self.wireless_db, log=self.log)
 
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),

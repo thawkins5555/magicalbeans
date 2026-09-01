@@ -135,8 +135,9 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "template_id")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 24 built-in rules: 6 device_event + 3 interface_event + 10 threshold +
-# 3 trap + 1 syslog + 1 ipam. Each `template` name is a templates.key —
+# 26 built-in rules: 7 device_event + 3 interface_event + 10 threshold +
+# 3 trap + 1 syslog + 1 ipam + 1 wireless_event. Each `template` name is a
+# templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 5 ship; an admin can point any rule at any template.
 _BUILTIN_RULES = [
@@ -147,6 +148,7 @@ _BUILTIN_RULES = [
     ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "device_down", None, None, 1),
     ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "device_down", None, None, 1),
     ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "device_down", None, None, 1),
+    ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "device_down", None, None, 1),
     ("interface_down", "Interface down", "interface_event", "link_down", 3, "device_down", None, None, 1),
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
     ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "device_down", None, None, 1),
@@ -165,6 +167,7 @@ _BUILTIN_RULES = [
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
+    ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "device_down", None, None, 1),
 ]
 
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",

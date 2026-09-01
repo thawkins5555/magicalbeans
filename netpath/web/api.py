@@ -2766,12 +2766,20 @@ def _ap_json(service, row) -> dict:
     # has one radio per band, so this is the strongest of them rather
     # than an arbitrary "first" pick.
     powers = [r["operating_power_dbm"] for r in radios if r["operating_power_dbm"] is not None]
+    channels = [str(r["channel"]) for r in radios if r["channel"] not in (None, "")]
+    radio_stations = [r["station_count"] for r in radios if r["station_count"] is not None]
     return {
         "id": row["id"], "controller_id": row["controller_id"],
         "wtp_id": row["wtp_id"], "vdom": row["vdom"], "name": row["name"],
         "status": row["status"], "model": row["model"],
         "mac_address": row["mac_address"], "station_count": row["station_count"],
         "tx_power_dbm": max(powers) if powers else None,
+        # Derived from the radio rows the poller already walks, so these
+        # are selectable table columns without polling anything new.
+        "radio_count": len(radios),
+        "channels": ", ".join(channels),
+        "radio_station_count": sum(radio_stations) if radio_stations else None,
+        "out_of_service": bool(row["out_of_service"]),
         "radios": radios,
         "last_seen_ts": row["last_seen_ts"],
     }
@@ -2880,7 +2888,43 @@ def get_wireless_aps(service, params, body) -> dict:
         result = [ap for ap in result if text in (ap["name"] or "").lower()
                  or text in (ap["mac_address"] or "").lower()
                  or text in (ap["model"] or "").lower()]
-    return {"aps": result}
+    # out_of_service is an admin marking, not a reported status, so it
+    # takes precedence over whatever status the AP last reported: an AP
+    # marked out of service is only ever listed under that state.
+    state = (params.get("state") or "all").strip().lower()
+    if state == "out_of_service":
+        result = [ap for ap in result if ap["out_of_service"]]
+    elif state == "online":
+        result = [ap for ap in result if not ap["out_of_service"] and ap["status"] == "online"]
+    elif state == "offline":
+        result = [ap for ap in result if not ap["out_of_service"] and ap["status"] != "online"]
+    # One "last reported" figure for the page as a whole: the most recent
+    # successful poll across the controllers actually in view, which is
+    # what makes every AP row's own age redundant.
+    controllers = service.wireless_db.controllers()
+    if controller_id:
+        controllers = [c for c in controllers if c["id"] == int(controller_id)]
+    stamps = [c["last_poll_ts"] for c in controllers if c["last_poll_ts"]]
+    return {"aps": result, "last_reported_ts": max(stamps) if stamps else None}
+
+
+def post_wireless_ap_service(service, params, body, ap_id) -> dict:
+    ap = service.wireless_db.access_point(int(ap_id))
+    if ap is None:
+        raise ValueError("No such access point")
+    service.wireless_db.set_out_of_service(int(ap_id), bool(body.get("out_of_service")))
+    return {"ok": True, "out_of_service": bool(body.get("out_of_service"))}
+
+
+def delete_wireless_ap(service, params, body, ap_id) -> dict:
+    """Removes one AP row by hand. Needed because an out-of-service AP is
+    deliberately exempt from prune_stale — without this there would be no
+    way to retire one permanently once the controller stops reporting it."""
+    ap = service.wireless_db.access_point(int(ap_id))
+    if ap is None:
+        raise ValueError("No such access point")
+    service.wireless_db.remove_ap(int(ap_id))
+    return {"ok": True}
 
 
 def post_wireless_collector(service, params, body) -> dict:

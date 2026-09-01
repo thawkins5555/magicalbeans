@@ -588,6 +588,8 @@ class NodePoller:
             if rebooted:
                 self.db.record_device_event(device_id, "rebooted", note)
 
+        self._check_vendor_mib(device_id, previous, identity)
+
         # ----------------------------------------------------- interfaces
 
         if interfaces:
@@ -765,6 +767,45 @@ class NodePoller:
             pass   # best-effort: UCD-SNMP-MIB not present on this device
 
         return identity, uptime_ticks, metrics
+
+    def _check_vendor_mib(self, device_id: int, previous, identity: dict | None) -> None:
+        """Vendor autodetection already happens on every poll
+        (nodeoids.vendor_for on the device's sysObjectID). This is the
+        other half the user asked for: if the vendor is identified but no
+        uploaded MIB actually describes that vendor's objects, say so —
+        once — so an admin knows there is a MIB to go and add rather than
+        wondering why a device's own metrics never appear.
+
+        Raised only when the sysObjectID is newly learned or has changed,
+        not on every poll: the condition persists until someone uploads a
+        MIB, and re-recording it every interval would bury the event log.
+        The paired alert rule dedups per device on top of that."""
+        if not identity:
+            return
+        sys_object_id = identity.get("sys_object_id") or ""
+        if not sys_object_id:
+            return
+        # Only on a change, so this fires once per device per identity.
+        if previous["sys_object_id"] == sys_object_id:
+            return
+        # Only devices whose sysObjectID sits under enterprises have a
+        # vendor MIB at all. This is checked before consulting vendor_for:
+        # that function longest-prefix-matches trapoids.WELL_KNOWN, which
+        # also names standard-tree nodes ("system" for 1.3.6.1.2.1.1), so a
+        # device reporting a standard-tree sysObjectID would otherwise be
+        # reported as missing a "system MIB" that does not exist.
+        if not nodeoids.enterprise_root(sys_object_id):
+            return
+        vendor = identity.get("vendor") or nodeoids.vendor_for(sys_object_id)
+        if not vendor:
+            return          # unknown vendor: no specific MIB to ask for
+        if self.db.has_mib_covering(sys_object_id):
+            return
+        self.db.record_device_event(
+            device_id, "mib_missing",
+            f"No uploaded MIB describes {vendor} objects ({sys_object_id}). "
+            f"Upload the {vendor} MIB under Nodes → Profiles & MIBs to decode "
+            f"this device's vendor-specific data.")
 
     def _poll_custom_mib(self, device, config: dict, mib_file_id: int) -> list[tuple]:
         """A device or its polling profile can be assigned one uploaded

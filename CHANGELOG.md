@@ -6,6 +6,52 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.24.0 — Wireless AP lifecycle and table controls, leaner Nodes detail, ConfigRX fixes
+
+- **Wireless: an AP that disappears from its controller now raises an
+  alert** instead of silently vanishing from the list. A new built-in
+  rule ("Access point removed from its controller") fires once the
+  controller has failed to report it for the configured number of
+  consecutive polls, and the same fact is written to the event log.
+- **Wireless: mark an access point Out Of Service.** An AP marked this
+  way is exempt from both halves of the above — it is never aged out of
+  the list (so the marking survives the controller dropping it, which is
+  exactly what happens when it is unracked) and never raises a removal
+  alert. A **Show** dropdown filters the list by Online, Offline, Out of
+  service, or All (the default). An AP can also be removed by hand, which
+  is how a genuinely retired one is cleared.
+- **Wireless: the access point table sorts and its columns are
+  configurable.** Click any column heading to sort by it; Settings →
+  Columns chooses which of the controller's SNMP-reported fields to show.
+  The previous columns remain the defaults, with Controller, VDOM, WTP
+  id, Radios, Channels and Radio clients newly available.
+- **Wireless: "Last seen" moved off the rows.** Every AP in the list is
+  reported by the same controller poll, so a per-row age repeated the
+  same value on every line; there is now one **last reported** age beside
+  the Controller picker instead.
+- **Nodes: the device pane is simpler.** The per-metric bandwidth chart
+  and its metric/smoothing pickers are gone — bandwidth is a per-port
+  question, answered by clicking a port, which opens the same graph it
+  always did. The up/down status timeline stays, now driven by the range
+  picker directly and drawn as a thin lane matching NetPath's, rather
+  than a chart-sized panel.
+- **Nodes: a device whose vendor MIB is missing now says so.** The poller
+  already identifies a device's vendor from its sysObjectID; if no
+  uploaded MIB actually describes that vendor's objects, it records the
+  fact once (with the vendor and OID) and a new low-severity built-in
+  rule surfaces it — so an unfamiliar device's missing data has an
+  explanation instead of just being absent.
+- **Fixed:** ConfigRX failed with a raw `ModuleNotFoundError` traceback
+  in the Errors log when paramiko was not installed. It now reports the
+  missing dependency, and how to install it, as a plain status on the
+  affected device and in the worker's own status line.
+- **Fixed:** a long device name in ConfigRX's backups pane pushed "Back
+  up now" and "Device settings" underneath the config viewer where they
+  could not be clicked.
+- **Fixed:** ConfigRX's "Set SSH credential" button appeared and
+  disappeared on its own, shifting the page — the bulk bar's visibility
+  was being written both by the selection and by the permission check.
+
 ### 4.23.0 — Custom-MIB polling, MAC address table, ConfigRX bulk edit, bug fixes
 
 - **Nodes: assign an uploaded MIB to a device or group to have it actually

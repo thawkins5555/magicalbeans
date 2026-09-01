@@ -115,30 +115,26 @@
             <button id="nd-remove-device">Remove</button>
           </div>
           <div id="nd-d-summary" class="hint"></div>
-          <div id="nd-status-timeline" class="canvas chart small">
+          <!-- The range picker drives the status timeline. Per-metric
+               bandwidth charting lives in the per-port dialog (click an
+               interface below), not here. -->
+          <div class="bar">
+            <span class="section">STATUS</span>
+            <select id="nd-d-range"></select>
+          </div>
+          <div id="nd-status-timeline" class="canvas chart strip">
             <svg id="nd-status-timeline-svg"></svg>
           </div>
-          <div class="bar">
-            <label>Metric <select id="nd-d-metric"></select></label>
-            <select id="nd-d-range"></select>
-            <label class="check"><input type="checkbox" id="nd-d-smooth"> Smoothed</label>
-          </div>
-          <div class="rows" data-splitter="nodes-detail">
-            <div class="pane" data-grow="2">
-              <div id="nd-chart" class="canvas chart"><svg id="nd-chart-svg"></svg></div>
+          <div id="nd-d-subs">
+            <nav class="subtabs">
+              <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
+              <button class="subtab" data-subtab="events">EVENTS</button>
+            </nav>
+            <div id="nd-d-sub-interfaces" class="subpage active">
+              <div class="table-wrap"><table id="nd-if-table"></table></div>
             </div>
-            <div class="divider"></div>
-            <div class="pane" data-grow="3">
-              <nav class="subtabs">
-                <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
-                <button class="subtab" data-subtab="events">EVENTS</button>
-              </nav>
-              <div id="nd-d-sub-interfaces" class="subpage active">
-                <div class="table-wrap"><table id="nd-if-table"></table></div>
-              </div>
-              <div id="nd-d-sub-events" class="subpage">
-                <div class="table-wrap"><table id="nd-ev-table"></table></div>
-              </div>
+            <div id="nd-d-sub-events" class="subpage">
+              <div class="table-wrap"><table id="nd-ev-table"></table></div>
             </div>
           </div>
         </div>
@@ -643,6 +639,16 @@
   <div class="bar wrap">
     <label>Search <input id="wl-q" size="26" placeholder="AP name, MAC or model"></label>
     <label>Controller <select id="wl-controller"><option value="">All controllers</option></select></label>
+    <!-- One age for the whole page: every AP in the list was reported by
+         the same controller poll, so a per-AP "last seen" said the same
+         thing on every row. -->
+    <span id="wl-last-reported" class="hint"></span>
+    <label>Show <select id="wl-state">
+      <option value="all" selected>All</option>
+      <option value="online">Online</option>
+      <option value="offline">Offline</option>
+      <option value="out_of_service">Out of service</option>
+    </select></label>
     <button id="wl-apply" class="primary">Search</button>
   </div>
 
@@ -656,6 +662,17 @@
    </div>
    <div class="divider"></div>
    <div class="pane pad-x pad-b" data-grow="1">
+    <header class="bar">
+      <span id="wl-detail-name" class="section">AP DETAIL</span>
+      <span class="grow"></span>
+      <!-- No data-requires-write here on purpose: drawApActions() owns
+           these buttons' .hidden (selection AND permission together).
+           Adding the attribute would let applyPermissions() un-hide them
+           whenever it runs — the same two-owners bug the ConfigRX bulk
+           bar had. -->
+      <button id="wl-oos" hidden>Mark out of service</button>
+      <button id="wl-remove-ap" hidden>Remove</button>
+    </header>
     <pre id="wl-detail" class="detail">Select an AP to see its per-radio detail.</pre>
    </div>
   </div>
@@ -680,9 +697,14 @@
     <span class="hint">Ctrl-click a row to select it</span>
     <button id="cx-bulk-selectall">Select all</button>
   </div>
-  <div class="bar wrap" id="cx-bulk-bar" hidden data-requires-write="configrx">
+  <!-- data-requires-write sits on the buttons, never on this bar:
+       applyPermissions() writes .hidden on every [data-requires-write]
+       element, and drawBulkBar() writes .hidden on the bar itself — both
+       on the same element made the bar (and "Set SSH credential") flicker
+       in and out and shift the page. Same shape as the Nodes bulk bar. -->
+  <div class="bar wrap" id="cx-bulk-bar" hidden>
     <span id="cx-bulk-count" class="hint"></span>
-    <button id="cx-bulk-credential">Set SSH credential</button>
+    <button id="cx-bulk-credential" data-requires-write="configrx">Set SSH credential</button>
     <span class="grow"></span>
     <button id="cx-bulk-clear">Clear selection</button>
   </div>

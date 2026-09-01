@@ -190,6 +190,8 @@ ROUTES = [
     ("DELETE", r"^/api/wireless/controllers/(\d+)/credential$", api.delete_wireless_controller_credential, ("wireless", W)),
     ("POST", r"^/api/wireless/controllers/(\d+)/poll$", api.post_wireless_controller_poll, ("wireless", W)),
     ("GET", r"^/api/wireless/aps$", api.get_wireless_aps, ("wireless", R)),
+    ("POST", r"^/api/wireless/aps/(\d+)/service$", api.post_wireless_ap_service, ("wireless", W)),
+    ("DELETE", r"^/api/wireless/aps/(\d+)$", api.delete_wireless_ap, ("wireless", W)),
     ("POST", r"^/api/wireless/collector$", api.post_wireless_collector, ("wireless", W)),
     ("GET", r"^/api/configrx/overview$", api.get_configrx_overview, ("configrx", R)),
     ("GET", r"^/api/configrx/devices$", api.get_configrx_devices, ("configrx", R)),

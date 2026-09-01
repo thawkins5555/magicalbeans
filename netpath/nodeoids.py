@@ -80,6 +80,25 @@ def enum_text(key: str, value) -> str:
     return f"{name} ({value})" if name else str(value)
 
 
+ENTERPRISES = "1.3.6.1.4.1"
+
+
+def enterprise_root(sys_object_id: str) -> str:
+    """'1.3.6.1.4.1.9.1.1208' -> '1.3.6.1.4.1.9' (the vendor's own arc).
+    Empty for anything outside the enterprises subtree — a device whose
+    sysObjectID sits in the standard tree has no vendor MIB at all, which
+    vendor_for() alone can't tell you: it longest-prefix-matches
+    trapoids.WELL_KNOWN, which names standard nodes too ("system" for
+    1.3.6.1.2.1.1)."""
+    oid = (sys_object_id or "").strip().strip(".")
+    if not oid.startswith(ENTERPRISES + "."):
+        return ""
+    parts = oid.split(".")
+    if len(parts) < 7:
+        return ""
+    return ".".join(parts[:7])
+
+
 def vendor_for(sys_object_id: str) -> str:
     """Longest-prefix match against trapoids.WELL_KNOWN's vendor-root
     entries, reused rather than duplicated."""

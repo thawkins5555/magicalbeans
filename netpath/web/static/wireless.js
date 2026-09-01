@@ -8,13 +8,18 @@
 (() => {
   const STATUS_COLOR = { online: 'var(--ok)', offline: 'var(--fail)',
     standby: 'var(--warn)', downloading_image: 'var(--warn)',
-    connected_image: 'var(--warn)', other: 'var(--faint)' };
+    connected_image: 'var(--warn)', other: 'var(--faint)',
+    // Not a reported status — an admin marking, deliberately muted so an
+    // AP someone already knows about doesn't read as a live failure.
+    out_of_service: 'var(--faint)' };
 
   const view = {
     controllers: [],
     aps: [],
     selected: null,
     controllerFilter: '',
+    lastReportedTs: null,
+    apSort: { key: 'name', descending: false },
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -49,48 +54,129 @@
     const parts = [`${wireless.controller_count || 0} controller(s)`,
       `${counts.total || 0} AP(s)`, `${counts.online || 0} online`,
       `${counts.offline || 0} offline`];
+    if (counts.out_of_service) parts.push(`${counts.out_of_service} out of service`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
     App.el('wl-counters').textContent = parts.join(' · ');
+    App.el('wl-last-reported').textContent = view.lastReportedTs
+      ? `last reported ${ago(view.lastReportedTs)}` : 'never reported';
   }
 
   /* ------------------------------------------------------------- table */
-
-  const COLUMNS = [
-    { key: 'status', label: 'Status', width: 90 },
-    { key: 'name', label: 'Name', width: 200 },
-    { key: 'station_count', label: 'Clients', width: 70, numeric: true },
-    { key: 'model', label: 'Model', width: 120 },
-    { key: 'mac_address', label: 'MAC address', width: 140 },
-    { key: 'tx_power_dbm', label: 'Tx power', width: 90, numeric: true,
-      value: (r) => r.tx_power_dbm ?? -1 },
-    { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
-      value: (r) => r.last_seen_ts || 0 },
-  ];
 
   function controllerName(id) {
     const c = view.controllers.find((x) => x.id === id);
     return c ? c.name : `#${id}`;
   }
 
+  /* Every column the controller's own SNMP tables can fill, whether or not
+     it is currently shown. `on` is the default set — the columns this page
+     shipped with — and an admin's choice (Settings → Columns) overrides it
+     from there. `cell` renders, `value` sorts; a column with neither sorts
+     and renders on the raw field. */
+  const ALL_COLUMNS = [
+    // Wide enough for "out of service" plus its dot without truncating.
+    { key: 'status', label: 'Status', width: 130, on: true,
+      cell: (r) => (r.out_of_service
+        ? `${dot('out_of_service')}out of service`
+        : `${dot(r.status)}${escape(r.status)}`),
+      value: (r) => (r.out_of_service ? 'out of service' : r.status) },
+    { key: 'name', label: 'Name', width: 200, on: true,
+      cell: (r) => escape(r.name || r.wtp_id),
+      value: (r) => (r.name || r.wtp_id || '').toLowerCase() },
+    { key: 'station_count', label: 'Clients', width: 70, numeric: true, on: true },
+    { key: 'model', label: 'Model', width: 120, on: true },
+    { key: 'mac_address', label: 'MAC address', width: 140, on: true },
+    { key: 'tx_power_dbm', label: 'Tx power', width: 90, numeric: true, on: true,
+      cell: (r) => (r.tx_power_dbm != null ? `${r.tx_power_dbm} dBm` : '—') },
+    { key: 'controller_id', label: 'Controller', width: 140,
+      cell: (r) => escape(controllerName(r.controller_id)),
+      value: (r) => controllerName(r.controller_id).toLowerCase() },
+    { key: 'vdom', label: 'VDOM', width: 100 },
+    { key: 'wtp_id', label: 'WTP id', width: 150 },
+    { key: 'radio_count', label: 'Radios', width: 70, numeric: true },
+    { key: 'channels', label: 'Channels', width: 110 },
+    { key: 'radio_station_count', label: 'Radio clients', width: 100, numeric: true },
+    { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true, align: 'left',
+      cell: (r) => ago(r.last_seen_ts), value: (r) => r.last_seen_ts || 0 },
+  ];
+
+  const COLUMN_PREF_KEY = 'sappiwhere.wireless.columns';
+
+  function chosenColumnKeys() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(COLUMN_PREF_KEY) || 'null');
+      // An admin who unchecks everything gets the defaults back rather
+      // than a table with no columns at all.
+      if (Array.isArray(stored) && stored.length) {
+        const known = stored.filter((k) => ALL_COLUMNS.some((c) => c.key === k));
+        if (known.length) return known;
+      }
+    } catch (error) { /* private browsing, or corrupt value: use defaults */ }
+    return ALL_COLUMNS.filter((c) => c.on).map((c) => c.key);
+  }
+
+  function saveColumnKeys(keys) {
+    try {
+      localStorage.setItem(COLUMN_PREF_KEY, JSON.stringify(keys));
+    } catch (error) { /* not worth failing a column choice over */ }
+  }
+
+  function activeColumns() {
+    const chosen = chosenColumnKeys();
+    // Ordered by the catalog, not by click order, so the table's column
+    // order stays stable however the boxes were ticked.
+    return ALL_COLUMNS.filter((c) => chosen.includes(c.key));
+  }
+
+  function onApSort(key, descending) {
+    view.apSort = { key, descending };
+    drawTable();
+  }
+
   function drawTable() {
-    const table = App.grid(App.el('wireless-table'), { name: 'wireless-aps', columns: COLUMNS });
+    const columns = activeColumns();
+    const table = App.grid(App.el('wireless-table'),
+      { name: 'wireless-aps', columns, sort: view.apSort, onSort: onApSort });
     const body = document.createElement('tbody');
-    for (const row of view.aps) {
+    const rows = App.sortRows(view.aps, view.apSort.key, view.apSort.descending, columns);
+    for (const row of rows) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.innerHTML =
-        `<td>${dot(row.status)}${escape(row.status)}</td>` +
-        `<td>${escape(row.name || row.wtp_id)}</td>` +
-        `<td>${row.station_count ?? '—'}</td>` +
-        `<td>${escape(row.model || '—')}</td>` +
-        `<td>${escape(row.mac_address || '—')}</td>` +
-        `<td>${row.tx_power_dbm != null ? `${row.tx_power_dbm} dBm` : '—'}</td>` +
-        `<td>${ago(row.last_seen_ts)}</td>`;
+      tr.innerHTML = columns.map((c) => {
+        if (c.cell) return `<td>${c.cell(row)}</td>`;
+        const raw = row[c.key];
+        return `<td>${raw === null || raw === undefined || raw === '' ? '—' : escape(raw)}</td>`;
+      }).join('');
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
       body.appendChild(tr);
     }
     table.appendChild(body);
-    App.el('wl-count').textContent = `${view.aps.length} AP(s)`;
+    App.el('wl-count').textContent = `${rows.length} AP(s)`;
+    drawApActions();
+  }
+
+  function selectedAp() {
+    return view.aps.find((a) => a.id === view.selected) || null;
+  }
+
+  function drawApActions() {
+    const ap = selectedAp();
+    const oos = App.el('wl-oos');
+    const remove = App.el('wl-remove-ap');
+    // Both conditions are tested here, in one place, because .hidden can
+    // only have one owner: these buttons deliberately carry no
+    // data-requires-write, since applyPermissions() would then un-hide
+    // them on every state reload regardless of whether an AP is selected.
+    if (!ap || !App.canWrite('wireless')) {
+      oos.hidden = true;
+      remove.hidden = true;
+    } else {
+      oos.hidden = false;
+      remove.hidden = false;
+      oos.textContent = ap.out_of_service ? 'Return to service' : 'Mark out of service';
+    }
+    App.el('wl-detail-name').textContent = ap
+      ? (ap.name || ap.wtp_id) : 'AP DETAIL';
   }
 
   function showDetail(row) {
@@ -99,7 +185,7 @@
       `controller  ${controllerName(row.controller_id)}`,
       `wtp id      ${row.wtp_id}`,
       `vdom        ${row.vdom || '—'}`,
-      `status      ${row.status}`,
+      `status      ${row.status}${row.out_of_service ? ' (marked out of service)' : ''}`,
       `model       ${row.model || '—'}`,
       `MAC         ${row.mac_address || '—'}`,
       `clients     ${row.station_count ?? '—'}`,
@@ -232,6 +318,10 @@
 
   function settingsDialog() {
     const s = App.state.wirelessSettings || {};
+    const chosen = chosenColumnKeys();
+    const columnBoxes = ALL_COLUMNS.map((c) => `
+      <label class="check"><input type="checkbox" data-column="${c.key}"
+        ${chosen.includes(c.key) ? 'checked' : ''}> ${escape(c.label)}</label>`).join('');
     const box = App.modal('Wireless settings', `
       <fieldset><legend>POLLING</legend>
         <label class="check"><input type="checkbox" id="wl-enabled"
@@ -239,10 +329,19 @@
         <label>Poll interval (seconds) <input id="wl-interval" type="number" min="10"
           value="${s.poll_interval_s}"></label>
         <p class="hint">Each configured controller is polled on this interval for its
-          managed APs. An AP the controller stops reporting is removed from the list.</p>
+          managed APs. An AP the controller stops reporting for several consecutive
+          polls is removed from the list and raises an alert — unless it has been
+          marked out of service, which exempts it from both.</p>
+      </fieldset>
+      <fieldset><legend>COLUMNS</legend>
+        ${columnBoxes}
+        <p class="hint">Which of the controller's SNMP-reported fields the access
+          point table shows. Unticking every box restores the defaults.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
+        saveColumnKeys([...m.querySelectorAll('[data-column]')]
+          .filter((cb) => cb.checked).map((cb) => cb.dataset.column));
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
@@ -272,9 +371,19 @@
     const search = await App.get('/api/wireless/aps', {
       q: App.el('wl-q').value.trim(),
       controller_id: filterSelect.value || undefined,
+      state: App.el('wl-state').value,
     });
     view.aps = search.aps;
+    view.lastReportedTs = search.last_reported_ts;
+    // The selected AP can have been filtered out (or removed) by this
+    // refresh; a stale id would leave the detail pane showing an AP no
+    // longer in the list, with its action buttons still live.
+    if (view.selected && !view.aps.some((a) => a.id === view.selected)) {
+      view.selected = null;
+      App.el('wl-detail').textContent = 'Select an AP to see its per-radio detail.';
+    }
     drawTable();
+    drawStatus();
   }
 
   function init() {
@@ -283,8 +392,32 @@
       if (event.key === 'Enter') App.refreshNow('wireless');
     };
     App.el('wl-controller').onchange = () => App.refreshNow('wireless');
+    App.el('wl-state').onchange = () => App.refreshNow('wireless');
     App.el('wl-controllers').onclick = controllersModal;
     App.el('wl-settings').onclick = settingsDialog;
+    App.el('wl-oos').onclick = async () => {
+      const ap = selectedAp();
+      if (!ap) return;
+      await App.post(`/api/wireless/aps/${ap.id}/service`,
+        { out_of_service: !ap.out_of_service });
+      await App.refreshNow('wireless');
+    };
+    App.el('wl-remove-ap').onclick = () => {
+      const ap = selectedAp();
+      if (!ap) return;
+      App.modal('Remove access point',
+        `<p>Remove <b>${escape(ap.name || ap.wtp_id)}</b> from the list?</p>
+         <p class="hint">If its controller still reports this AP, the next poll
+           adds it back — removing is for an AP that is genuinely gone.</p>`, [
+          { label: 'Cancel', onClick: App.closeModal },
+          { label: 'Remove', primary: true, onClick: async () => {
+            await App.del(`/api/wireless/aps/${ap.id}`);
+            App.closeModal();
+            view.selected = null;
+            await App.refreshNow('wireless');
+          } },
+        ]);
+    };
     App.el('wl-toggle').onclick = async () => {
       const running = (App.state.serverState.wireless || {}).running;
       await App.post('/api/wireless/collector', { action: running ? 'stop' : 'start' });

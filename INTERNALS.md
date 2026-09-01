@@ -444,6 +444,27 @@ doesn't invalidate the whole poll — the device answered enough to
 enumerate interfaces — so it's counted (`skipped_timeouts`) and logged,
 not raised.
 
+**Missing vendor MIB detection** (`NodePoller._check_vendor_mib`,
+`NodesDatabase.has_mib_covering`): vendor autodetection already happened
+on every poll (`nodeoids.vendor_for` on the device's sysObjectID); this
+reports the other half — that the vendor is known but nothing on the
+server describes it. "Covering" means a resolved `mib_objects` row
+*strictly below* the device's enterprise arc: the app bundles
+enterprise-number roots for ~20 vendors, so a plain prefix test would
+match every common vendor out of the box and could never report anything
+missing. A root-only entry names a vendor; an object beneath it decodes
+something, and only the latter counts.
+
+Two guards keep this quiet rather than noisy. It fires only when the
+stored `sys_object_id` actually changes, so the condition — which
+persists until someone uploads a MIB — is recorded once per device rather
+than every interval. And it returns early unless
+`nodeoids.enterprise_root()` is non-empty: that check exists specifically
+because `vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`,
+which names standard-tree nodes too ("system" for 1.3.6.1.2.1.1), so a
+device with a standard-tree sysObjectID would otherwise be reported as
+missing a "system MIB" that does not exist.
+
 **Per-poll debug logging**: `eventlog.NODES` had been imported into
 `nodepoll.py` since the Alerts build and never once used. `_poll_device`
 now logs one `NODES`-category event per poll with a structured `detail`
@@ -1882,10 +1903,40 @@ configured controller, carrying its own SNMP credential columns —
 there's no group/profile system here, since a handful of controllers
 doesn't need one), `access_points` and `radios` (child rows, replaced
 wholesale on each successful poll of that controller via
-`replace_radios()`). `prune_stale()` only ever runs after a controller's
-own poll *succeeded* — a transient controller outage never wipes its AP
-list, only a poll that genuinely completed but no longer sees a
-particular AP does.
+`replace_radios()`), and `ap_events`. `prune_stale()` only ever runs
+after a controller's own poll *succeeded* — a transient controller
+outage never wipes its AP list, only a poll that genuinely completed but
+no longer sees a particular AP does.
+
+**AP removal is an event, not a silent delete.** `prune_stale()` writes
+an `ap_removed` row into `ap_events` for every AP it ages out and returns
+the removed list, so `fortipoll` can log it and `alertengine`'s new
+`_drain_ap_events()` can raise a real alert (built-in rule
+`wireless_ap_removed`, kind `wireless_event`). The drain uses the same
+cursor contract as every other source — first tick seeds
+`max_ap_event_id()`, later ticks read `ap_events_since()` — and
+`AlertEngine`'s `wireless_db` is an optional keyword argument, so an
+engine constructed without it simply raises no wireless occurrences.
+
+**`out_of_service`** (added to `access_points` by a new
+`wirelessdb._migrate()`, the same PRAGMA-diff/ALTER pattern nodesdb uses)
+is an admin marking, orthogonal to the reported `status`. It does two
+things, both inside `prune_stale`: such an AP is skipped entirely — never
+aged out, never even counted as missing — and therefore never produces an
+`ap_removed` event. That exemption is what makes the marking survive the
+thing it describes: an unracked AP stops being reported, and without it
+the row carrying "we know about this one" would be the first thing
+deleted. The consequence is that an out-of-service AP can never age out
+on its own, which is why `DELETE /api/wireless/aps/{id}` exists.
+
+The API layer keeps the same precedence: `get_wireless_aps`'s `state`
+filter lists an out-of-service AP only under `out_of_service`, never
+under the status it last reported. Its `last_reported_ts` is the newest
+successful poll across the controllers in view — one age for the page,
+which is what made a per-AP "last seen" column redundant (every row came
+from the same walk). The extra selectable columns (`radio_count`,
+`channels`, `radio_station_count`) are derived in `_ap_json` from radio
+rows the poller already walks, so adding one costs no extra SNMP.
 
 ## ConfigRX (`configrxdb.py`, `configrx.py`, `configrx_vendors.py`)
 
@@ -1912,6 +1963,18 @@ literal command text. There is no exec-command endpoint, no command
 parameter anywhere in `api.py`'s ConfigRX handlers, and no free-form
 input field anywhere in `configrx.js` — grep for `channel.send` in
 `configrx.py` to confirm this hasn't grown a second call site.
+
+**paramiko is imported lazily and its absence is a status, not a crash.**
+It is the one third-party dependency in this otherwise stdlib-only app,
+so the import lives inside `_backup_device` and every other module runs
+without it. Missing it is a deployment fact rather than a bug, so the
+`ImportError` is caught right there and turned into a normal
+`record_backup_attempt(..., status="error")` naming the pip command —
+previously it propagated to `_run_one`'s handler and produced a raw
+`ModuleNotFoundError` traceback in the Errors log, with the device's own
+row saying nothing at all. `paramiko_available()` re-checks on each
+`status_text()` call rather than caching at construction, so installing
+it and restarting the worker is enough — no app restart.
 
 **The SSH credential** follows the identical discipline every other
 stored secret in this app does (see `CREDENTIAL-SECURITY.md`):
@@ -1944,6 +2007,17 @@ storage hygiene, not a parser, so it never raises.
 `display_name_source`, so a device Nodes had never been told to pin to a
 manual name showed a stale/blank one here instead of its live SNMP
 hostname.
+
+**One owner per `.hidden`.** `applyPermissions()` in `app.js` writes
+`el.hidden = !canWrite(...)` on every `[data-requires-write]` element, and
+`drawBulkBar()` writes `.hidden` on the bulk bar from the selection count.
+Putting `data-requires-write` on the bar itself made both write the same
+property: for an account *with* write access `applyPermissions` un-hid the
+bar whenever it ran (every `loadState()`), the next `drawDevices()` hid it
+again, and the result was "Set SSH credential" flickering in and out with
+the page shifting under it. The attribute belongs on the buttons inside,
+never on a container something else already shows and hides — which is how
+the Nodes and Alerts bulk bars were already built.
 
 **Bulk edit** (`post_configrx_devices_bulk_config`/
 `post_configrx_devices_bulk_credential`): the same `_bulk_device_ids(body)`

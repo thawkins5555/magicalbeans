@@ -39,6 +39,23 @@ SHELL_MAX_S = 25
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x08")
 _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
 
+# paramiko is the one third-party dependency in this otherwise stdlib-only
+# app, and it is imported lazily (inside the backup path) so that a machine
+# without it can still run every other module. Missing it is a deployment
+# fact, not a bug: it gets reported as a plain, actionable status on every
+# affected device and in the worker's own status line, never as a raised
+# traceback in the Errors log.
+PARAMIKO_MISSING = ("paramiko is not installed on this server — ConfigRX needs it"
+                    " for SSH. Install it with: pip install paramiko")
+
+
+def paramiko_available() -> bool:
+    try:
+        import paramiko  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
 
 def _clean_output(raw: str) -> str:
     """Strips ANSI escape sequences and pager prompts a device's shell may
@@ -136,6 +153,10 @@ class ConfigRxWorker:
     def status_text(self) -> str:
         if self.error:
             return self.error
+        # Checked here rather than at construction so installing paramiko
+        # and restarting the worker is enough — no app restart needed.
+        if not paramiko_available():
+            return PARAMIKO_MISSING
         if not self.running:
             return "Worker stopped"
         return "Running"
@@ -176,7 +197,17 @@ class ConfigRxWorker:
     # --------------------------------------------------------------- backup
 
     def _backup_device(self, device_id: int) -> None:
-        import paramiko
+        try:
+            import paramiko
+        except ImportError:
+            # Recorded like any other per-device failure so the device row
+            # says exactly what is wrong and how to fix it, rather than the
+            # whole backup raising into _run_one's traceback handler.
+            self.db.record_backup_attempt(device_id, ok=False, status="error",
+                                          error=PARAMIKO_MISSING)
+            self.log.add(CONFIGRX, f"Backup of device {device_id} skipped: paramiko missing",
+                        detail=PARAMIKO_MISSING)
+            return
 
         device = self.nodes_db.device(device_id)
         if not device:

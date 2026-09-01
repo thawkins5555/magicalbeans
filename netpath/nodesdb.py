@@ -291,7 +291,6 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
                     "enabled") + _OVERRIDE_COLUMNS
 
-
 class NodesDatabase:
     def __init__(self, path: str):
         self.path = path
@@ -1228,6 +1227,30 @@ class NodesDatabase:
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM mib_objects{where} ORDER BY name", params).fetchall()
+
+    def has_mib_covering(self, sys_object_id: str) -> bool:
+        """Whether any uploaded MIB actually describes objects belonging to
+        this device's vendor, given its sysObjectID.
+
+        "Covering" deliberately means *deeper than the bare enterprise
+        arc*: this app ships enterprise-number roots for ~20 vendors, so a
+        plain prefix test would match every common vendor out of the box
+        and could never report anything as missing. A root-only entry
+        (1.3.6.1.4.1.9, six arcs) names the vendor; it decodes nothing. An
+        object below it (1.3.6.1.4.1.9.9.13.1.3.1.3, say) is a real
+        description, and that is what this looks for."""
+        from . import nodeoids
+        prefix = nodeoids.enterprise_root(sys_object_id)
+        if not prefix:
+            return False
+        # Strictly below the enterprise arc — an object AT the arc is the
+        # bundled root-only entry, which names the vendor but describes
+        # nothing, so it deliberately does not count as coverage.
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM mib_objects WHERE oid IS NOT NULL"
+                " AND oid LIKE ? LIMIT 1", (prefix + ".%",)).fetchone()
+        return row is not None
 
     def all_known_oids(self) -> dict[str, str]:
         """Every resolved mib_objects name -> OID, across every uploaded

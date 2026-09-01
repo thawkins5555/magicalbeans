@@ -58,6 +58,23 @@ CREATE TABLE IF NOT EXISTS radios (
     PRIMARY KEY (ap_id, radio_id)
 );
 
+-- An AP leaving the controller's own list is a real operational event
+-- (someone unplugged it, it was decommissioned, it lost power), so it is
+-- recorded here rather than the row simply vanishing. The Alerts engine
+-- drains this table with a cursor, exactly as it drains Nodes' own
+-- device_events/interface_events.
+CREATE TABLE IF NOT EXISTS ap_events (
+    id            INTEGER PRIMARY KEY,
+    ts            REAL NOT NULL,
+    controller_id INTEGER NOT NULL,
+    wtp_id        TEXT NOT NULL,
+    vdom          TEXT NOT NULL DEFAULT '',
+    name          TEXT NOT NULL DEFAULT '',
+    kind          TEXT NOT NULL,
+    detail        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_ap_events_ts ON ap_events(ts);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -88,7 +105,19 @@ class WirelessDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Adds columns an older database predates. Same shape as
+        nodesdb._migrate: diff PRAGMA table_info and ALTER TABLE what's
+        missing, never rewrite the CREATE TABLE above."""
+        aps = {row["name"] for row in
+               self._conn.execute("PRAGMA table_info(access_points)").fetchall()}
+        if "out_of_service" not in aps:
+            self._conn.execute(
+                "ALTER TABLE access_points ADD COLUMN"
+                " out_of_service INTEGER NOT NULL DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -228,18 +257,75 @@ class WirelessDatabase:
                 "SELECT * FROM radios WHERE ap_id = ? ORDER BY radio_id",
                 (ap_id,)).fetchall()
 
+    def access_point(self, ap_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM access_points WHERE id = ?", (ap_id,)).fetchone()
+
+    def set_out_of_service(self, ap_id: int, out_of_service: bool) -> None:
+        """Marks an AP as deliberately out of service. Two consequences,
+        both in prune_stale below: it is never aged out (so the marking —
+        and the AP — survives the controller no longer reporting it, which
+        is exactly what happens when someone unracks it), and its
+        disappearance raises no ap_removed event, since a human already
+        said they know about it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE access_points SET out_of_service = ? WHERE id = ?",
+                (1 if out_of_service else 0, ap_id))
+            self._conn.commit()
+
+    def remove_ap(self, ap_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM access_points WHERE id = ?", (ap_id,))
+            self._conn.commit()
+
     def ap_counts(self) -> dict:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT status, COUNT(*) AS n FROM access_points GROUP BY status").fetchall()
+            oos = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM access_points"
+                " WHERE out_of_service = 1").fetchone()["n"]
         counts = {"total": 0}
         for row in rows:
             counts["total"] += row["n"]
             counts[row["status"]] = row["n"]
+        # Orthogonal to status (an out-of-service AP still has whatever
+        # status it last reported), so it is counted separately rather
+        # than folded into the status tally above.
+        counts["out_of_service"] = oos
         return counts
 
+    # -------------------------------------------------------------- ap events
+
+    def add_ap_event(self, controller_id: int, wtp_id: str, vdom: str,
+                     name: str, kind: str, detail: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO ap_events(ts, controller_id, wtp_id, vdom, name,"
+                " kind, detail) VALUES (?,?,?,?,?,?,?)",
+                (time.time(), controller_id, wtp_id, vdom, name, kind, detail))
+            self._conn.commit()
+
+    def ap_events_since(self, last_id: int, limit: int = 2000) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM ap_events WHERE id > ? ORDER BY id LIMIT ?",
+                (last_id, limit)).fetchall()
+
+    def max_ap_event_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(id) AS m FROM ap_events").fetchone()
+        return row["m"] or 0
+
+    def ap_events(self, limit: int = 200) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM ap_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
-                    stale_after_polls: int = 5) -> None:
+                    stale_after_polls: int = 5) -> list[dict]:
         """Ages an AP out only after `stale_after_polls` consecutive polls
         that didn't see it, for a controller whose own poll otherwise
         succeeded — a real "this AP is gone", not "the controller was
@@ -248,19 +334,34 @@ class WirelessDatabase:
         list) or "one GETNEXT reply got lost on an otherwise-fine poll"
         (a single miss on lossy SNMP-over-UDP just increments the
         counter; upsert_ap resets it back to 0 the moment the AP is seen
-        again)."""
+        again).
+
+        An AP a human has marked out of service is exempt entirely: it is
+        never aged out and never counted as missing, so the marking (and
+        the row carrying it) survives the controller dropping it, which is
+        precisely what happens once it is unracked.
+
+        Returns the APs actually removed, so the caller can raise a real
+        event for each rather than letting them vanish silently."""
         threshold = max(1, stale_after_polls)
+        removed: list[dict] = []
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, vdom, wtp_id, missed_polls FROM access_points"
-                " WHERE controller_id = ?", (controller_id,)).fetchall()
+                "SELECT id, vdom, wtp_id, name, missed_polls, out_of_service"
+                " FROM access_points WHERE controller_id = ?", (controller_id,)).fetchall()
             stale_ids = []
             for row in rows:
+                if row["out_of_service"]:
+                    continue
                 if (row["vdom"], row["wtp_id"]) in seen_wtp_ids:
                     continue
                 missed = row["missed_polls"] + 1
                 if missed >= threshold:
                     stale_ids.append(row["id"])
+                    removed.append({"id": row["id"], "vdom": row["vdom"],
+                                    "wtp_id": row["wtp_id"],
+                                    "name": row["name"] or row["wtp_id"],
+                                    "missed_polls": missed})
                 else:
                     self._conn.execute(
                         "UPDATE access_points SET missed_polls = ? WHERE id = ?",
@@ -269,7 +370,16 @@ class WirelessDatabase:
                 marks = ",".join("?" * len(stale_ids))
                 self._conn.execute(
                     f"DELETE FROM access_points WHERE id IN ({marks})", stale_ids)
+            for ap in removed:
+                self._conn.execute(
+                    "INSERT INTO ap_events(ts, controller_id, wtp_id, vdom, name,"
+                    " kind, detail) VALUES (?,?,?,?,?,?,?)",
+                    (time.time(), controller_id, ap["wtp_id"], ap["vdom"], ap["name"],
+                     "ap_removed",
+                     f"{ap['name']} is no longer reported by its controller"
+                     f" (missing from {ap['missed_polls']} consecutive polls)"))
             self._conn.commit()
+        return removed
 
     # ------------------------------------------------------------- maintenance
 

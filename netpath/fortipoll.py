@@ -180,7 +180,17 @@ class WirelessPoller:
 
         self.db.record_poll(controller["id"], ok=True)
         stale_after_polls = int(self.db.settings().get("stale_after_polls", 5))
-        self.db.prune_stale(controller["id"], seen, stale_after_polls)
+        removed = self.db.prune_stale(controller["id"], seen, stale_after_polls)
+        for ap in removed:
+            # prune_stale has already recorded the ap_removed row the
+            # Alerts engine drains; this is the same fact in the event log,
+            # where an operator watching the Debug feed will see it.
+            self.log.add(WIRELESS,
+                        f"AP {ap['name']} removed from {controller['name']}",
+                        target=controller["ip"],
+                        detail=f"wtp id   {ap['wtp_id']}\n"
+                               f"vdom     {ap['vdom'] or '-'}\n"
+                               f"missed   {ap['missed_polls']} consecutive poll(s)")
 
     # ------------------------------------------------------------ SNMP layer
 
