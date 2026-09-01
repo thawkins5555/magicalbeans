@@ -21,6 +21,8 @@
   const view = {
     targets: [],
     targetId: null,
+    windows: {},
+    windowFor: null,
     t0: Date.now() / 1000 - 3600,
     t1: Date.now() / 1000,
     follow: true,
@@ -42,6 +44,80 @@
 
   const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
 
+  /* ------------------------------------------- per-destination windows */
+
+  /* One window for the whole page meant switching destinations dragged the
+     last one's range along: a link you watch by the hour and one you watch by
+     the minute could not both keep their own. Each destination now remembers
+     its own, in this browser. */
+  const WINDOW_KEY = 'sappiwhere.netpath.windows';
+  const DEFAULT_RANGE = 3600;
+
+  function loadWindows() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(WINDOW_KEY) || '{}');
+      return stored && typeof stored === 'object' ? stored : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function saveWindows() {
+    try {
+      localStorage.setItem(WINDOW_KEY, JSON.stringify(view.windows));
+    } catch (error) { /* private browsing, or storage full: not worth failing */ }
+  }
+
+  function rememberWindow() {
+    if (view.targetId === null) return;
+    view.windows[String(view.targetId)] = {
+      t0: view.t0, t1: view.t1, follow: view.follow,
+      range: App.el('range-select').value,
+    };
+    saveWindows();
+  }
+
+  function applyWindow(targetId) {
+    view.windowFor = targetId;
+    const select = App.el('range-select');
+    const stored = targetId === null ? null : view.windows[String(targetId)];
+    if (!stored) {
+      // A destination seen for the first time starts on the page's own
+      // default rather than inheriting whatever the last one was showing.
+      const now = Date.now() / 1000;
+      view.t0 = now - DEFAULT_RANGE;
+      view.t1 = now;
+      view.follow = true;
+      select.value = String(DEFAULT_RANGE);
+    } else {
+      view.follow = stored.follow !== false;
+      if (view.follow) {
+        // A following window is anchored to now, not to whenever it was left.
+        view.t1 = Date.now() / 1000;
+        view.t0 = view.t1 - Math.max(stored.t1 - stored.t0, 60);
+      } else {
+        view.t0 = stored.t0;
+        view.t1 = stored.t1;
+      }
+      if (stored.range) select.value = stored.range;
+    }
+    App.el('tl-follow').checked = view.follow;
+    rememberWindow();
+  }
+
+  /* Destinations come and go; without this the key would grow forever. */
+  function pruneWindows() {
+    const live = new Set(view.targets.map((t) => String(t.id)));
+    let dropped = false;
+    for (const key of Object.keys(view.windows)) {
+      if (!live.has(key)) {
+        delete view.windows[key];
+        dropped = true;
+      }
+    }
+    if (dropped) saveWindows();
+  }
+
   function setWindow(t0, t1, follow) {
     if (t1 - t0 < 60) t1 = t0 + 60;
     view.t0 = t0; view.t1 = t1;
@@ -49,6 +125,7 @@
       view.follow = follow;
       App.el('tl-follow').checked = follow;
     }
+    rememberWindow();
     App.refreshNow('netpath');
   }
 
@@ -977,7 +1054,9 @@
     if (App.state.tab !== 'netpath') return;
     const payload = await App.get('/api/netpath/targets');
     view.targets = payload.targets;
+    pruneWindows();
     if (view.targetId === null && view.targets.length) view.targetId = view.targets[0].id;
+    if (view.windowFor !== view.targetId) applyWindow(view.targetId);
     renderTargets();
     renderTerms();
 
@@ -1067,13 +1146,14 @@
 
   function init() {
     App.fillRanges(App.el('range-select'), 'Last hour');
+    view.windows = loadWindows();
     App.el('range-select').onchange = resetWindow;
     App.el('tl-follow').onchange = (event) => {
       view.follow = event.target.checked;
       if (view.follow) {
         const span = view.t1 - view.t0;
         setWindow(Date.now() / 1000 - span, Date.now() / 1000);
-      }
+      } else rememberWindow();
     };
     App.el('tl-reset').onclick = resetWindow;
     App.el('tl-in').onclick = () => zoom(0.5);

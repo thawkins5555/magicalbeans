@@ -202,10 +202,21 @@ class AlertEngine:
                     if resolved:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, cleared_rule, settings)
+        # The flapping rule's own thresholds, looked up once rather than per
+        # interface. NULL columns mean "as shipped", so an install that has
+        # never touched them behaves exactly as it did before they existed.
+        flap_rule = self.db.rule_by_key("interface_flapping")
+        flap_window = float((flap_rule and flap_rule["flap_window_s"]) or 600)
+        flap_min = int((flap_rule and flap_rule["flap_min_transitions"]) or 3)
         for interface_id in touched_interfaces:
-            recent = [dict(r) for r in
-                     self.nodes_db.recent_interface_events_for(interface_id)]
-            if not evaluate_flapping(recent):
+            # since_s must follow the configured window: the default lookback
+            # is 15 minutes, so a longer window would silently see nothing to
+            # count. The row limit is generous for the same reason.
+            recent = [dict(r) for r in self.nodes_db.recent_interface_events_for(
+                interface_id, since_s=max(flap_window, 900.0),
+                limit=max(flap_min * 10, 50))]
+            if not evaluate_flapping(recent, window_s=flap_window,
+                                     min_transitions=flap_min):
                 continue
             interface = self.nodes_db.interface_by_id(interface_id)
             if interface is None:

@@ -1153,45 +1153,31 @@ class NodePoller:
     # ifIndex the rest of the app already keys interfaces by.
     _DOT1D_BASE_PORT_IF_INDEX = "1.3.6.1.2.1.17.1.4.1.2"
     _DOT1D_FDB_PORT = "1.3.6.1.2.1.17.4.3.1.2"
+    # Q-BRIDGE-MIB (RFC 4363) dot1qTpFdbPort. The table a VLAN-aware switch
+    # actually populates, and the one most modern gear answers instead of
+    # dot1dTpFdbTable. Its index is <dot1qFdbId>.<6 MAC bytes> rather than
+    # the MAC alone, which is why a six-arc-only parser sees nothing here.
+    _DOT1Q_FDB_PORT = "1.3.6.1.2.1.17.7.1.2.2.1.2"
+    # CISCO-VTP-MIB vtpVlanState: the VLAN list for the per-VLAN community
+    # trick below. 1 == operational.
+    _VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"
+    # Bounds on the Cisco per-VLAN path: a trunk-heavy switch can carry
+    # hundreds of VLANs and this runs while a human waits on a dialog.
+    _MAX_VLAN_CONTEXTS = 48
+    _VLAN_WALK_BUDGET_S = 15.0
 
-    def read_mac_table(self, device_id: int, if_index: int) -> list[str] | None:
-        """Live on-demand read of the BRIDGE-MIB forwarding database
-        (dot1dTpFdbTable) entries learned on one switch port — same
-        on-demand-while-the-dialog-is-open shape as read_dom() above:
-        walked only when a human asks, never on the poll cycle.
+    @staticmethod
+    def _fdb_entries(fdb_port: dict, target_ports: set, vlan: str | None,
+                     vlan_indexed: bool) -> list[dict]:
+        """Rows of a forwarding-database column, filtered to one port.
 
-        dot1dTpFdbTable is INDEXed by dot1dTpFdbAddress itself, so each
-        dot1dTpFdbPort row's own OID suffix (six decimal sub-identifiers,
-        one per MAC byte) already *is* the learned MAC address — no
-        separate GET for the dot1dTpFdbAddress column is needed.
-
-        Returns None (not []) when the device doesn't answer BRIDGE-MIB
-        at all, so the dialog can say "no data" instead of "zero MACs
-        learned on this port" — those are different facts."""
-        device = self.db.device(device_id)
-        if device is None:
-            return None
-        config = self.db.effective_config(device)
-        if not config.get("snmp_enabled", True):
-            return None
-
-        # dot1dBasePortIfIndex: bridge port number -> ifIndex. Find which
-        # bridge port(s), if any, correspond to the requested ifIndex.
-        base_port_if_index = self._walk_column(device, config, self._DOT1D_BASE_PORT_IF_INDEX)
-        if not base_port_if_index:
-            return None
-        target_ports = set()
-        for suffix, value in base_port_if_index.items():
-            try:
-                if int(value) == if_index:
-                    target_ports.add(int(suffix))
-            except (TypeError, ValueError):
-                continue
-        if not target_ports:
-            return []
-
-        fdb_port = self._walk_column(device, config, self._DOT1D_FDB_PORT)
-        macs = []
+        Both FDB tables carry the learned MAC in the row's own OID suffix,
+        so no second GET is needed for the address column. dot1dTpFdbTable
+        is indexed by the MAC alone (six arcs); dot1qTpFdbTable prefixes it
+        with the filtering-database id, so the MAC is always the **last
+        six** arcs and anything before it is the VLAN.
+        """
+        entries = []
         for suffix, port in fdb_port.items():
             try:
                 if int(port) not in target_ports:
@@ -1199,14 +1185,130 @@ class NodePoller:
             except (TypeError, ValueError):
                 continue
             parts = suffix.split(".")
-            if len(parts) != 6:
+            if len(parts) < 6:
+                continue
+            if vlan_indexed and len(parts) < 7:
                 continue
             try:
-                macs.append(":".join(f"{int(p):02x}" for p in parts))
+                mac = ":".join(f"{int(p):02x}" for p in parts[-6:])
             except ValueError:
                 continue
-        macs.sort()
-        return macs
+            entries.append({
+                "mac": mac,
+                "vlan": (parts[0] if vlan_indexed else vlan) or "",
+            })
+        return entries
+
+    def _bridge_ports_for(self, device, config: dict, if_index: int):
+        """(bridge ports mapping to this ifIndex, whether the device answered).
+
+        A switch that does not answer dot1dBasePortIfIndex at all is a
+        different fact from one that answers and simply has no bridge port
+        for this interface, and the caller reports them differently.
+        """
+        base_port_if_index = self._walk_column(
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+        if not base_port_if_index:
+            return set(), False
+        ports = set()
+        for suffix, value in base_port_if_index.items():
+            try:
+                if int(value) == if_index:
+                    ports.add(int(suffix))
+            except (TypeError, ValueError):
+                continue
+        return ports, True
+
+    def _cisco_vlan_fdb(self, device, config: dict, target_ports: set) -> list[dict]:
+        """Classic Cisco IOS exposes its forwarding database only inside
+        per-VLAN SNMP contexts, reached by suffixing the community with
+        `@<vlan>`. There is no community to suffix under v3, so that is
+        skipped rather than pretended at; and the walk is bounded in both
+        VLAN count and wall-clock, because this runs while a human waits on
+        an interface dialog and a trunk switch can carry hundreds of VLANs.
+        """
+        if int(config.get("snmp_version") or 1) == 3:
+            return []
+        community = config.get("community")
+        if not community:
+            return []
+        vlan_states = self._walk_column(device, config, self._VTP_VLAN_STATE)
+        vlans = []
+        for suffix, state in vlan_states.items():
+            try:
+                if int(state) != 1:          # operational only
+                    continue
+            except (TypeError, ValueError):
+                continue
+            vlan = suffix.split(".")[-1]
+            # VLAN 1002-1005 are the legacy FDDI/token-ring defaults every
+            # IOS switch reports and none of them ever learn anything.
+            if vlan.isdigit() and not (1002 <= int(vlan) <= 1005):
+                vlans.append(vlan)
+        entries = []
+        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
+            if time.time() > deadline:
+                break
+            scoped = {**config, "community": f"{community}@{vlan}"}
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            entries.extend(self._fdb_entries(fdb_port, target_ports, vlan, False))
+        return entries
+
+    def read_mac_table(self, device_id: int, if_index: int) -> list[dict] | None:
+        """Live on-demand read of the MAC addresses learned on one switch
+        port — same on-demand-while-the-dialog-is-open shape as read_dom()
+        above: walked only when a human asks, never on the poll cycle.
+
+        Three sources, because no single one covers the field. Q-BRIDGE's
+        dot1qTpFdbTable is what a VLAN-aware switch actually populates and
+        is tried first; the original BRIDGE-MIB dot1dTpFdbTable is the
+        fallback; and classic Cisco IOS, which populates neither globally,
+        is read per VLAN through the community@vlan convention. The first
+        source that yields anything wins — they describe the same port, so
+        merging them would double-count.
+
+        Note the MIB catalog has nothing to do with this: polling uses these
+        numeric OIDs directly, and an uploaded MIB only ever supplies display
+        names. Reading more tables is the only thing that widens coverage.
+
+        Returns None (not []) when the device answers none of them, so the
+        dialog can say "no data" instead of "zero MACs learned on this
+        port" — those are different facts."""
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.db.effective_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+
+        target_ports, answered = self._bridge_ports_for(device, config, if_index)
+        if not answered:
+            return None
+        if not target_ports:
+            return []
+
+        entries = self._fdb_entries(
+            self._walk_column(device, config, self._DOT1Q_FDB_PORT),
+            target_ports, None, True)
+        if not entries:
+            entries = self._fdb_entries(
+                self._walk_column(device, config, self._DOT1D_FDB_PORT),
+                target_ports, None, False)
+        if not entries and (device["vendor"] or "").lower() == "cisco":
+            entries = self._cisco_vlan_fdb(device, config, target_ports)
+
+        # One MAC can legitimately appear in several VLANs; dedupe on the
+        # pair rather than the address so that stays visible.
+        seen = set()
+        unique = []
+        for entry in sorted(entries, key=lambda e: (e["mac"], e["vlan"])):
+            key = (entry["mac"], entry["vlan"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(entry)
+        return unique
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
         version = int(config.get("snmp_version") or 1)

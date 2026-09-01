@@ -376,6 +376,16 @@
       view.paused = !view.paused;
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
     };
+    /* Ticking every category back on one at a time is the reason "None" on
+       its own would be a trap, so both directions are offered. Nothing is
+       stored: categoriesOn() reads the boxes live on every draw. */
+    const setAllCategories = (on) => {
+      for (const input of cats.querySelectorAll('input')) input.checked = on;
+      drawEvents();
+    };
+    App.el('dbg-cats-all').onclick = () => setAllCategories(true);
+    App.el('dbg-cats-none').onclick = () => setAllCategories(false);
+
     App.el('dbg-clear').onclick = () => {
       App.confirmDestructive('Clear event log',
         '<p>Discard every event currently in the log?</p>' +

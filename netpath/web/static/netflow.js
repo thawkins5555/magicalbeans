@@ -23,6 +23,8 @@
     records: [],
     fetchedAt: null,
     drag: null,
+    windowTimer: null,
+    request: 0,
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -39,16 +41,37 @@
     return `${(age / 3600).toFixed(1)}h ago`;
   }
 
-  function setWindow(t0, t1, follow) {
+  function showWindow() {
+    const span = view.t1 - view.t0;
+    App.el('nf-window').textContent =
+      `${App.stamp(view.t0, span)} – ${App.stamp(view.t1, span)}`;
+  }
+
+  /* `defer` collapses a burst of window changes into one fetch. The wheel
+     fires several events per zoom gesture, and each one used to launch a full
+     overview + records pair over an ever wider window, so zooming out queued
+     work up faster than the server could finish it. The window itself still
+     moves on every event, so the label tracks the gesture live. */
+  function setWindow(t0, t1, follow, defer) {
     if (t1 - t0 < 60) t1 = t0 + 60;
     view.t0 = t0; view.t1 = t1;
     if (follow !== undefined) {
       view.follow = follow;
       App.el('nf-follow').checked = follow;
     }
-    // A window change is a direct request, so fetch now rather than waiting
-    // out the refresh interval.
-    App.refreshNow('netflow');
+    showWindow();
+    if (view.windowTimer) clearTimeout(view.windowTimer);
+    view.windowTimer = null;
+    if (!defer) {
+      // A window change is a direct request, so fetch now rather than waiting
+      // out the refresh interval.
+      App.refreshNow('netflow');
+      return;
+    }
+    view.windowTimer = setTimeout(() => {
+      view.windowTimer = null;
+      App.refreshNow('netflow');
+    }, 250);
   }
 
   function zoom(factor) {
@@ -259,7 +282,7 @@
       const fraction = Math.min(Math.max((x - plot.x) / plot.w, 0), 1);
       const anchor = view.t0 + fraction * (view.t1 - view.t0);
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
-      setWindow(start, end, false);
+      setWindow(start, end, false, true);
     };
   }
 
@@ -590,7 +613,10 @@
     }
 
     const f = filters();
-    view.data = await App.get('/api/netflow/overview', {
+    // A wide window answers slower than the narrow one that replaced it, so
+    // without this guard a stale response repaints over the newer view.
+    const token = (view.request += 1);
+    const data = await App.get('/api/netflow/overview', {
       t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
       port: f.port, protocol: f.protocol, exporter: f.exporter,
     });
@@ -598,14 +624,14 @@
       t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
       protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
     });
+    if (token !== view.request) return;
+    view.data = data;
 
     const totals = view.data.totals;
     App.el('nf-totals').textContent =
       `${totals.bytes_text} · ${totals.rate_text} avg · ` +
       `${totals.packets_text} packets · ${totals.flows} flow records`;
-    const span = view.t1 - view.t0;
-    App.el('nf-window').textContent =
-      `${App.stamp(view.t0, span)} – ${App.stamp(view.t1, span)}`;
+    showWindow();
     App.el('nf-top-title').textContent = `TOP ${f.dimension.toUpperCase()}`;
 
     const exporter = App.el('nf-exporter');

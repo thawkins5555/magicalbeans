@@ -416,18 +416,46 @@ vendor unit tables. A device without ENTITY-MIB support returns `[]`,
 which the dialog reports as "no DOM/sensor data" rather than an error.
 
 **MAC address table** (`NodePoller.read_mac_table`): same on-demand shape
-as `read_dom` above — walked only while the interface dialog is open, via
-BRIDGE-MIB's `dot1dBasePortIfIndex` (bridge port → ifIndex, to find which
-bridge port(s) map to the requested ifIndex) and `dot1dTpFdbPort` (FDB
-entry → the bridge port that learned it). `dot1dTpFdbTable` is INDEXed by
-`dot1dTpFdbAddress` itself, so each `dot1dTpFdbPort` row's own OID suffix
-(six decimal sub-identifiers, one per MAC byte) already *is* the learned
-MAC address — no separate GET for the `dot1dTpFdbAddress` column is
-needed. Returns `None` (not `[]`) when the device doesn't answer
-BRIDGE-MIB at all (an empty `_walk_column` on `dot1dBasePortIfIndex`),
-which the dialog and the `/mac-table` API route's `"supported"` flag both
-key off, so "this device can't tell us" and "this port genuinely has zero
-MACs learned right now" render as different messages.
+as `read_dom` above — walked only while the interface dialog is open.
+`dot1dBasePortIfIndex` (bridge port → ifIndex) is read first to find
+which bridge port(s) map to the requested ifIndex; the forwarding entries
+themselves then come from up to three sources, tried in order, first one
+that yields anything winning:
+
+1. **`dot1qTpFdbPort`** (`1.3.6.1.2.1.17.7.1.2.2.1.2`, Q-BRIDGE-MIB) —
+   what most VLAN-aware switches actually answer. Its index is
+   `<fdbId>.<6 MAC bytes>`, so the parser takes the **last six** arcs as
+   the MAC and the first as the VLAN, which the dialog shows in its own
+   column when any entry carries one.
+2. **`dot1dTpFdbPort`** (original BRIDGE-MIB) — the only source read
+   before 4.27.0, and still the fallback.
+3. **Cisco per-VLAN community indexing** — classic IOS exposes its
+   forwarding table only inside per-VLAN SNMP contexts, reached by
+   re-querying with `community@<vlan>`. The VLAN list comes from
+   CISCO-VTP-MIB `vtpVlanState` (`1.3.6.1.4.1.9.9.46.1.3.1.1.2`, state
+   `1` only, 1002–1005 excluded), then source 2 is repeated per VLAN. It
+   is **v1/v2c only** — there is no community to suffix under v3 — and
+   gated on the device's vendor already reading `cisco`, so a 200-VLAN
+   walk never starts against a switch that would not answer it anyway.
+   `_MAX_VLAN_CONTEXTS` (48) and `_VLAN_WALK_BUDGET_S` (15s) bound it so
+   opening a port dialog cannot hang. `_walk_column` derives its
+   credentials through `credential_for(config)`, so passing a modified
+   copy of the config is all that re-scoping a walk takes.
+
+Both FDB tables are INDEXed by the MAC itself, so each row's own OID
+suffix already *is* the learned address — no separate GET for an address
+column is needed. Entries are deduplicated on the `(mac, vlan)` pair,
+since the same address legitimately appears in several VLANs.
+
+Note that **the MIB catalog cannot widen any of this**: the poller uses
+hardcoded numeric OIDs throughout (`nodepoll.py`, `nodeoids.py`,
+`fortinetoids.py`) and uploaded MIBs only ever supply display names.
+Adding Q-BRIDGE and the Cisco path is what changed the coverage.
+
+Returns `None` (not `[]`) when the device answers no forwarding table at
+all, which the dialog and the `/mac-table` API route's `"supported"` flag
+both key off, so "this device can't tell us" and "this port genuinely has
+zero MACs learned right now" render as different messages.
 
 **Custom-MIB-scoped polling** (`NodePoller._poll_custom_mib`): a
 device/group `mib_file_id` override (new `_OVERRIDE_COLUMNS` entry,
@@ -912,7 +940,7 @@ occurrences match a *particular* rule; other kinds (`device_event`,
 are unaffected, since `_apply()`'s check only fires when
 `occurrence.severity is not None`.
 
-### Bulk resolve (`alertsdb.py`)
+### Bulk resolve and acknowledge (`alertsdb.py`)
 
 `resolve_many(alert_ids, by)` mirrors `resolve()`'s single-id `UPDATE`
 but over `WHERE id IN (?,?,...)` in one statement, the same shape as
@@ -921,6 +949,44 @@ ids are selected, rather than looping a Python call per id. Both still
 carry `AND state IN ('open','acked')`, so resolving an already-resolved
 alert a second time (e.g. a stale checkbox from a previous filter view)
 is a harmless no-op rather than an error.
+
+`acknowledge_many(alert_ids, by)` is the same statement against
+`state='open'` only — acknowledging a resolved or already-acked alert is
+a no-op, matching single-alert `acknowledge()`. It exists because
+"Acknowledge all" is deliberately server-wide (`ack-all`, ignoring both
+the selection and the current filter), so there was no way to
+acknowledge *exactly* the rows an operator had picked; `POST
+/api/alerts/bulk-ack` and `alerts.js`'s shared `bulkAction(path)` are
+the rest of that path.
+
+Selection itself was the real complaint behind "bulk resolve only clears
+one of the selected items": the list offered Ctrl-click selection with no
+visible affordance, so a plain click looked like it was selecting when
+all it did was move the detail highlight, and a bulk action then acted on
+one row. `alerts.js`'s first column is now a real checkbox whose
+`onclick` calls `stopPropagation()` — the box owns selection, the rest of
+the row owns the detail pane, and Ctrl-click still toggles so the old
+habit keeps working. The `UPDATE ... WHERE id IN` statements themselves
+were never at fault and are unchanged.
+
+### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
+
+`alertrules.evaluate_flapping()` always took `window_s` and
+`min_transitions` arguments, but nothing ever passed them, so the shipped
+600s/3 was unreachable from the UI. `alertsdb.py` had no `_migrate()` at
+all; it has one now, following the `nodesdb._migrate` PRAGMA-then-ALTER
+convention, adding two nullable `rules` columns — `flap_window_s` and
+`flap_min_transitions` — both added to `_RULE_EDITABLE` so the builtin
+rule can be edited. NULL means "as shipped", so an existing install
+behaves identically until someone changes it.
+
+The coupling worth knowing about: `_tick()` fetches the events to judge
+with `nodes_db.recent_interface_events_for()`, whose defaults are
+`since_s=900, limit=50`. A configured window longer than 15 minutes would
+therefore have silently seen nothing, so the engine passes
+`since_s=max(flap_window, 900.0)` and
+`limit=max(flap_min * 10, 50)` — the fetch window can never be narrower
+than the window being evaluated.
 
 ### Object column resolution (`alertengine.py`)
 
@@ -1186,6 +1252,30 @@ nothing found," distinct from no row at all ("never looked up"), so the
 next resolver pass doesn't retry a genuinely nameless address until the
 TTL (`dns_cache_days`, default 7) expires.
 
+### Per-destination timeline windows (`netpath.js`)
+
+`view.t0/t1/follow` are page-global, so switching destination used to
+carry whatever window was on screen onto the next one. `view.windows`
+keys `{t0, t1, follow, range}` by target id, persisted to `localStorage`
+under `sappiwhere.netpath.windows` with the same try/catch every other
+`localStorage` write in `app.js` uses (a private window or a full quota
+must not break the page).
+
+`view.windowFor` records which destination the window on screen belongs
+to; `refresh()` compares it to `view.targetId` and calls `applyWindow()`
+when they diverge, so restoring happens in exactly one place regardless
+of how the selection changed — the target list, the NetFlow "view route"
+jump through `activate()`, or the first load picking `targets[0]`. Every
+`setWindow()` and the Follow checkbox call `rememberWindow()`.
+
+A *following* window is stored as bounds but restored as a span anchored
+to now — restoring a day-old `t1` verbatim would silently unfollow it. A
+destination with no entry starts on the page's own default (`Last hour`)
+rather than inheriting the previous destination's range, which is the
+behaviour being fixed. `pruneWindows()` drops entries for destinations
+that no longer exist on every `refresh()`, so the key cannot grow
+forever.
+
 ### Topology and timeline (`analysis.py`)
 
 `build_topology()` takes raw hop rows and a candidate destination IP.
@@ -1304,6 +1394,42 @@ interface, AS, ToS) and multiplies every byte/packet figure by the
 flow's stored `sampling` rate before returning it, since that's the only
 point downstream of decode where the true (unsampled) volume can still be
 reconstructed.
+
+**One scan per refresh** (`overview()`): the page used to cost four full
+aggregate passes over the window — `series()` called `top()` internally,
+`get_flow_overview` called `top()` again beside it, and `totals()` made a
+third — each walking the same rows. Widening the window multiplies the
+rows every one of them reads, which is why zooming out felt like the app
+had hung. `overview()` does the single `GROUP BY key, slot` pass those
+three shared and derives all of it from the result: summed per key it is
+`top`, summed overall it is `totals`, and bucketed it is the stacked
+series. Ties are broken by name rather than left to SQL's arbitrary
+`ORDER BY` order, so two equal-volume keys keep the same position — and
+therefore the same colour — between refreshes. `series()`, `top()` and
+`totals()` remain for their other callers.
+
+The record list's `ORDER BY bytes * sampling DESC` over the whole window
+is the remaining unindexed cost, left alone deliberately: changing it
+would change what "top 250 by volume" means.
+
+### Zoom debounce and the stale-response guard (`netflow.js`)
+
+The `overview()` rework above halves nothing on its own if the page fires
+a fetch per wheel event, which it did: `setWindow()` called
+`App.refreshNow('netflow')` synchronously, so spinning the wheel out six
+steps queued six overview+records pairs over ever-wider windows — faster
+than the server could answer them. `setWindow()` now takes a `defer`
+flag, set only from `svg.onwheel`: the window itself still moves on every
+event and `showWindow()` repaints the label, so the gesture stays live,
+but the fetch waits ~250 ms and any further step restarts that timer. A
+direct change (the range dropdown, the zoom/pan buttons, a drag) is still
+immediate — deferring those would only feel laggy.
+
+Separately, `refresh()` stamps each run with `view.request` and drops its
+response if the counter moved while it was in flight, the same guard
+`nodes.js`'s `loadStatusTimeline` uses. Without it a slow wide-window
+answer repaints over the newer narrow one the operator has already zoomed
+back to.
 
 ### Flow-to-path correlation
 
@@ -1569,6 +1695,20 @@ markup change (moving `active` off `subnets`'s button/panel and onto
 scheduling or state-loading change — sub-tabs aren't `localStorage`-
 persisted the way the top-level module tabs are, so there was no stored
 preference to account for either.
+
+### Keeping the DHCP scope across servers (`ipam.js`)
+
+`view.dhcpScopeId` is a `dhcp_scopes` **row id**, which differs per
+server even for the same scope, so it cannot survive a server switch —
+the old `onchange` nulled it and `loadDhcpScopes()` fell back to the
+first scope. `view.dhcpScopeKey` carries the scope's own `scope_id`
+string (`"10.20.3.0"`), which is what an operator means by "the same
+scope", across the switch: after the new server's scopes load, a scope
+whose `scope_id` matches is preferred, and only with no match does the
+first-scope fallback apply. Whatever ends up selected — including that
+fallback — is written back to `dhcpScopeKey`, so a later switch looks for
+the scope actually on screen rather than a stale one. The same path runs
+on a background refresh, so a poll cannot move the selection either.
 
 ### Leased-IP sparkline scale (`ipam.js drawScopeTrend`)
 

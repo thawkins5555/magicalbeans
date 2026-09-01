@@ -516,10 +516,12 @@ def get_flow_overview(service, params, body) -> dict:
     bucket = _flow_bucket(service, span)
     top_n = int(service.flow_settings.get("top_n", 10))
 
-    times, series, bucket_s = service.flow_db.series(
-        t0, t1, dimension, filters, bucket, limit=8)
-    top_rows = service.flow_db.top(t0, t1, dimension, filters, top_n)
-    totals = service.flow_db.totals(t0, t1, filters)
+    # One aggregate pass over the window feeds the chart, the top-N bars and
+    # the totals line together; they used to be three separate scans (four,
+    # counting the one series() made internally), which is what made a wide
+    # window crawl.
+    times, series, bucket_s, top_rows, totals = service.flow_db.overview(
+        t0, t1, dimension, filters, bucket, series_limit=8, top_limit=top_n)
 
     names = _address_names(service, dimension,
                            list(series) + [row["key"] for row in top_rows])
@@ -2538,6 +2540,8 @@ def _rule_json(row) -> dict:
         "source_kind": row["source_kind"], "severity": row["severity"],
         "enabled": bool(row["enabled"]), "is_builtin": bool(row["is_builtin"]),
         "device_filter": row["device_filter"], "threshold": row["threshold"],
+        "flap_window_s": row["flap_window_s"],
+        "flap_min_transitions": row["flap_min_transitions"],
         "clear_threshold": row["clear_threshold"], "for_polls": row["for_polls"],
         "template_id": row["template_id"], "created_ts": row["created_ts"],
     }
@@ -2634,6 +2638,12 @@ def _bulk_alert_ids(body) -> list[int]:
     return [int(i) for i in ids]
 
 
+def post_alerts_bulk_ack(service, params, body) -> dict:
+    alert_ids = _bulk_alert_ids(body)
+    n = service.alerts_db.acknowledge_many(alert_ids, params.get("_username", ""))
+    return {"acknowledged": n}
+
+
 def post_alerts_bulk_resolve(service, params, body) -> dict:
     alert_ids = _bulk_alert_ids(body)
     n = service.alerts_db.resolve_many(alert_ids, params.get("_username", ""))
@@ -2670,7 +2680,8 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
     if not row:
         raise ValueError("No such rule")
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
-                    "clear_threshold", "for_polls", "template_id")
+                    "clear_threshold", "for_polls", "template_id",
+                    "flap_window_s", "flap_min_transitions")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
     fields = {k: v for k, v in body.items() if k in allowed_keys}

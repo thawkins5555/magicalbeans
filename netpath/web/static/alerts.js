@@ -114,6 +114,11 @@
   /* ------------------------------------------------------------- table */
 
   const COLUMNS = [
+    // A real checkbox column, because Ctrl-click alone is invisible: a plain
+    // click looks like it selects a row when all it does is move the detail
+    // highlight, so a bulk action then acts on far fewer rows than the
+    // operator believes they picked.
+    { key: 'check', label: '', sortable: false, width: 34 },
     { key: 'severity', label: 'Sev', width: 60 },
     { key: 'state', label: 'State', width: 80 },
     { key: 'entity_label', label: 'Object', width: 170 },
@@ -133,6 +138,8 @@
         + (view.selected === row.id ? ' selected' : '')
         + (view.checked.has(row.id) ? ' bulk-checked' : '');
       tr.innerHTML =
+        `<td><input type="checkbox" class="alerts-check"${
+          view.checked.has(row.id) ? ' checked' : ''}></td>` +
         `<td><span class="sev sev-${row.severity}">${row.severity}</span></td>` +
         `<td>${escape(row.state)}</td>` +
         `<td>${escape(row.entity_label)}</td>` +
@@ -141,9 +148,15 @@
         `<td>${row.count > 1 ? row.count : ''}</td>` +
         `<td>${ago(row.opened_ts)}</td>` +
         `<td>${ago(row.last_ts)}</td>`;
-      // Ctrl/Cmd-click toggles bulk selection without touching the
-      // single-row detail-pane selection; a plain click keeps doing
-      // exactly what it always did.
+      // The checkbox owns selection; the rest of the row owns the detail
+      // pane. stopPropagation keeps ticking a box from also moving the
+      // highlight, which would make one click mean two different things.
+      tr.querySelector('.alerts-check').onclick = (event) => {
+        event.stopPropagation();
+        toggleChecked(row.id);
+      };
+      // Ctrl/Cmd-click still toggles selection anywhere in the row, so the
+      // habit this page shipped with keeps working alongside the boxes.
       tr.onclick = (event) => {
         if (event.ctrlKey || event.metaKey) {
           toggleChecked(row.id);
@@ -193,9 +206,20 @@
   }
 
   async function bulkResolve() {
+    await bulkAction('/api/alerts/bulk-resolve');
+  }
+
+  async function bulkAcknowledge() {
+    await bulkAction('/api/alerts/bulk-ack');
+  }
+
+  /* Both bulk actions have the same shape: act on exactly what is ticked,
+     then drop the selection and the detail pane, because either could have
+     changed the state of whatever was on show. */
+  async function bulkAction(path) {
     const ids = [...view.checked];
     if (!ids.length) return;
-    await App.post('/api/alerts/bulk-resolve', { alert_ids: ids });
+    await App.post(path, { alert_ids: ids });
     clearSelection();
     view.checked.clear();
     App.refreshNow('alerts');
@@ -272,6 +296,10 @@
     // about — it just measures a DHCP scope rather than a device metric.
     const isThreshold = r.kind === 'threshold' || r.kind === 'dhcp_threshold';
     const pollNoun = r.kind === 'dhcp_threshold' ? 'DHCP polls' : 'polls';
+    // The flapping rule counts link transitions in a time window rather than
+    // comparing a value to a threshold, so it gets its own two fields
+    // instead of the threshold ones.
+    const isFlapping = r.source_kind === 'flapping';
     App.modal(`Edit ${r.name}`, `
       <label>Name <input id="ar-name" value="${escape(r.name)}"></label>
       <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
@@ -283,6 +311,14 @@
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
       <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>
+      ${isFlapping ? `
+      <label>Flaps before firing <input id="ar-flapcount" type="number" min="2"
+        placeholder="3" value="${r.flap_min_transitions ?? ''}"></label>
+      <label>Within <input id="ar-flapwindow" type="number" min="1"
+        placeholder="10" value="${r.flap_window_s ? Math.round(r.flap_window_s / 60) : ''}"> minutes</label>
+      <p class="hint">Fires when an interface records this many link up/down
+        transitions inside the window. Blank uses the shipped defaults, 3
+        transitions within 10 minutes.</p>` : ''}
       ${r.kind === 'dhcp_threshold' ? `<p class="hint">Percentage of a scope's
         address range that is leased or reserved. Counted the same way the DHCP
         page counts it, and evaluated once per DHCP poll rather than once per
@@ -301,6 +337,14 @@
           values.threshold = Number(box.querySelector('#ar-threshold').value);
           values.clear_threshold = Number(box.querySelector('#ar-clear').value);
           values.for_polls = Number(box.querySelector('#ar-forpolls').value);
+        }
+        if (isFlapping) {
+          // Blank means NULL — "use the shipped defaults" — not zero, which
+          // would mean "fire on no transitions at all".
+          const count = box.querySelector('#ar-flapcount').value.trim();
+          const minutes = box.querySelector('#ar-flapwindow').value.trim();
+          values.flap_min_transitions = count === '' ? null : Number(count);
+          values.flap_window_s = minutes === '' ? null : Number(minutes) * 60;
         }
         await App.put(`/api/alerts/rules/${r.id}`, values);
         App.closeModal();
@@ -666,13 +710,24 @@
       const open = view.alerts.filter((a) => a.state === 'open').length;
       App.confirmDestructive('Acknowledge all',
         `<p>Acknowledge every open alert${open ? ` (${open} shown)` : ''}?</p>` +
-        '<p class="hint">This applies to every open alert on the server, not just ' +
-        'the ones matching the current filter. They cannot be un-acknowledged in ' +
-        'bulk.</p>', 'Acknowledge', async () => {
+        '<p class="hint">Every open alert on the server — not your ticked ' +
+        'selection, and not just the ones matching the current filter. Use ' +
+        '"Acknowledge selected" for the rows you have ticked. They cannot be ' +
+        'un-acknowledged in bulk.</p>', 'Acknowledge', async () => {
           await App.post('/api/alerts/ack-all', {});
+          view.checked.clear();
           clearSelection();
           App.refreshNow('alerts');
         });
+    };
+    App.el('alerts-bulk-ack').onclick = () => {
+      const n = view.checked.size;
+      if (!n) return;
+      App.confirmDestructive('Acknowledge alerts',
+        `<p>Acknowledge the <b>${n}</b> selected alert(s)?</p>` +
+        '<p class="hint">Only the ones you have ticked, and only those still ' +
+        'open. They cannot be un-acknowledged in bulk.</p>',
+        'Acknowledge', bulkAcknowledge);
     };
     App.el('alerts-bulk-resolve').onclick = () => {
       const n = view.checked.size;

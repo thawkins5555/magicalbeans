@@ -320,10 +320,16 @@ history, and DOM/SFP sensor readings — voltage, current, light levels,
 temperature — read live over SNMP from devices that expose them via the
 standard ENTITY-SENSOR-MIB (values, units and scaling exactly as the
 device reports them; devices without it simply show "no DOM/sensor
-data"), and the MAC addresses currently learned on that port — read live
-over SNMP from the standard BRIDGE-MIB forwarding-database table
-(devices that don't answer it show "no MAC address data" instead of an
-empty table). Per-interface "show run" still appears as a placeholder
+data"), and the MAC addresses currently learned on that port, with the VLAN each
+was learned in where the switch reports one — read live over SNMP from
+three forwarding tables in turn: the VLAN-aware **Q-BRIDGE-MIB**
+(`dot1qTpFdbTable`, which is what most modern switches actually answer),
+then the original **BRIDGE-MIB** (`dot1dTpFdbTable`), and finally, on
+Cisco devices only, the **per-VLAN SNMP contexts** classic IOS hides its
+forwarding table behind (community indexing, `community@vlan`, with the
+VLAN list read from CISCO-VTP-MIB). The first source that returns
+anything wins. Devices that answer none of them show "no MAC address
+data" instead of an empty table. Per-interface "show run" still appears as a placeholder
 until SSH integration lands.
 
 ---
@@ -337,13 +343,15 @@ alerts and optionally emailing about them.
 
 ### Working the alert list
 
-- **Alerts can be resolved individually or in bulk.** Ctrl/Cmd-click a
-  row to add or remove it from the selection (a plain click still opens
-  the detail pane, unchanged), or use **Select all**; either reveals a
-  bulk actions bar with a single **Resolve selected**, applied to every
-  checked alert in one request — alongside the existing single-alert
-  Resolve button in the detail pane and the all-open **Acknowledge all**
-  button.
+- **Alerts can be acknowledged or resolved individually or in bulk.**
+  Every row carries a **checkbox** in its first column: tick the rows you
+  want, or use **Select all**. Ctrl/Cmd-click anywhere in a row still
+  toggles it too, and a plain click still opens the detail pane,
+  unchanged. Any selection reveals a bulk actions bar with **Acknowledge
+  selected** and **Resolve selected**, each applied to exactly the ticked
+  alerts in one request — alongside the single-alert buttons in the
+  detail pane and the server-wide **Acknowledge all**, which
+  deliberately ignores the selection and its confirmation says so.
 - **The Object column always shows a hostname when one is known** — the
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
@@ -364,7 +372,10 @@ alerts and optionally emailing about them.
 - **A built-in rule can be edited** (severity, enabled, which devices it
   applies to by a substring filter, its threshold/clear-threshold/
   consecutive-polls-before-firing where relevant, which template it
-  uses) but not deleted — disable it instead. A custom rule can be added
+  uses) but not deleted — disable it instead. **Interface flapping** has
+  two settings of its own: how many link transitions, within how many
+  minutes, count as flapping. Left blank they stay at the shipped 3
+  transitions in 10 minutes. A custom rule can be added
   for anything the built-ins do not cover.
 - **A rule's severity is a threshold for syslog messages, not just a
   label.** A syslog rule (built-in "Critical syslog message" included)
@@ -519,6 +530,13 @@ Ticks above the RTT lane mark blocks where the route changed.
 
 Presets run 15 minutes to 30 days. Drag to focus a range, scroll to zoom
 (anchored on the cursor), buttons to zoom and pan, right-click to clear.
+
+**Each destination keeps its own window.** A link you watch by the hour and
+one you watch by the minute no longer drag their range onto each other:
+selecting a destination restores the window, preset and Follow state you last
+left it on, and a destination you have never opened starts on the page default
+of the last hour. The windows are remembered in your browser and survive a
+reload; entries for deleted destinations are dropped automatically.
 
 ### Point-in-time snapshots
 
@@ -683,6 +701,11 @@ looked up at all while the checkbox is off.
 Drag across the chart to zoom into a range, scroll to zoom about the cursor,
 or use the `‹ − + ›` buttons. **Follow now** pins the right edge to the
 present, and any zoom or pan releases it.
+
+Wheel zoom moves the window on every step but waits a moment before fetching,
+so spinning the wheel out several steps costs one query rather than one per
+step; the window label tracks the gesture live meanwhile. A response for a
+window you have already zoomed away from is discarded rather than drawn.
 
 ### Storage
 
@@ -944,6 +967,13 @@ counts spelled out alongside the scope's own subnet (from its network
 identity, not the narrower dynamic range) and its configured router
 address where one is set.
 
+**Switching servers keeps the scope you were looking at**, where the new
+server has one with the same scope identifier — comparing the same subnet
+across two servers no longer means finding it again in the sidebar every
+time. Where the new server has no such scope it falls back to that
+server's first, and from then on that is the scope a further switch looks
+for. A background poll never moves the selection either.
+
 Underneath that, a thin chart tracks the scope's leased-IP count over the
 **last 24 hours** or **last 7 days** — one point per DHCP poll, filled area
 under a line, with the current count and how much it has moved over the
@@ -1178,7 +1208,9 @@ disk.
   status strip alongside the trace/DNS/IPAM/Nodes summary line.
 - Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, SNMP
   Trap, Nodes, Alerts, IPAM, Wireless, ConfigRX, System, Errors) or by free
-  text across both messages and details.
+  text across both messages and details. **All** and **None** beside the
+  category boxes set every one at once, so narrowing to a single category
+  is None then one tick rather than ten untick.
 - **Follow**, **Pause**, **Clear** and **Export** — the last writes the
   filtered view to a text file, which is the thing to attach to a ticket.
 
@@ -1231,8 +1263,10 @@ across Nodes, IPAM and Alerts raises a confirmation naming what is about
 to be lost. The wording is specific where it matters: five of the
 maintenance actions empty a whole table rather than pruning old rows, and
 their dialogs say so rather than saying "prune". Alerts'
-**Acknowledge all** and bulk **Resolve** confirm too — they delete
-nothing, but neither can be undone one row at a time. Buttons that clear
+**Acknowledge all** and the bulk **Acknowledge selected** / **Resolve
+selected** confirm too — they delete nothing, but none can be undone one
+row at a time, and **Acknowledge all**'s confirmation spells out that it
+takes every open alert on the server rather than the rows you ticked. Buttons that clear
 a filter or a selection, which destroy nothing, are deliberately left
 unconfirmed.
 

@@ -356,6 +356,74 @@ class FlowDatabase:
         times = [t0 + i * bucket_s for i in range(n_buckets)]
         return times, series, bucket_s
 
+    def overview(self, t0: float, t1: float, dimension: str, filters: dict,
+                 bucket_s: float, series_limit: int = 8, top_limit: int = 10):
+        """Everything the NetFlow overview needs, from ONE pass over the window.
+
+        The page used to cost four full aggregate scans per refresh: series()
+        called top() internally, the handler called top() again beside it, and
+        totals() made a third — every one of them reading the same rows. That
+        is what made zooming out feel like the app had hung, since a wider
+        window multiplies the rows each of them walks.
+
+        The `GROUP BY key, slot` pass below already contains all three
+        answers: summed per key it *is* top(), summed over everything it *is*
+        totals(), and laid out by slot it is the stacked series. top() and
+        totals() stay for their own callers; this is the combined path.
+
+        Returns (times, series, bucket_s, top_rows, totals).
+        """
+        key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
+        where, params = self._where(t0, t1, filters)
+        bucket_s = max(float(bucket_s), 1.0)
+        n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {key} AS key, CAST((ts_end - ?) / ? AS INTEGER) AS slot,"
+                f" SUM(bytes * sampling) AS bytes,"
+                f" SUM(packets * sampling) AS packets, COUNT(*) AS flows"
+                f" FROM flows WHERE {where} GROUP BY key, slot",
+                (t0, bucket_s, *params),
+            ).fetchall()
+
+        per_key: dict[object, dict] = {}
+        totals = {"bytes": 0, "packets": 0, "flows": 0}
+        for row in rows:
+            entry = per_key.setdefault(
+                row["key"], {"bytes": 0, "packets": 0, "flows": 0})
+            entry["bytes"] += row["bytes"] or 0
+            entry["packets"] += row["packets"] or 0
+            entry["flows"] += row["flows"] or 0
+            totals["bytes"] += row["bytes"] or 0
+            totals["packets"] += row["packets"] or 0
+            totals["flows"] += row["flows"] or 0
+
+        # The name breaks a tie, so two equal-volume keys keep the same order
+        # — and so the same colour — from one refresh to the next. SQL's
+        # ORDER BY left that order arbitrary.
+        ordered = sorted(per_key.items(),
+                         key=lambda kv: (-kv[1]["bytes"], str(kv[0])))
+        top_rows = [{"key": k, **v} for k, v in ordered[:top_limit]]
+        top_keys = [k for k, _ in ordered[:series_limit]]
+
+        series: dict[object, list[float]] = {k: [0.0] * n_buckets for k in top_keys}
+        other = [0.0] * n_buckets
+        wanted = set(top_keys)
+        for row in rows:
+            slot = row["slot"]
+            if slot is None or slot < 0 or slot >= n_buckets:
+                continue
+            if row["key"] in wanted:
+                series[row["key"]][slot] += row["bytes"] or 0
+            else:
+                other[slot] += row["bytes"] or 0
+        if any(other):
+            series["\u2014 other \u2014"] = other
+
+        times = [t0 + i * bucket_s for i in range(n_buckets)]
+        return times, series, bucket_s, top_rows, totals
+
     def flows(self, t0: float, t1: float, filters: dict, limit: int = 200,
               order: str = "bytes") -> list[sqlite3.Row]:
         where, params = self._where(t0, t1, filters)

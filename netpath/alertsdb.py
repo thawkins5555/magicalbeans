@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS rules (
     threshold       REAL,
     clear_threshold REAL,
     for_polls       INTEGER NOT NULL DEFAULT 1,
+    -- Flapping rules only. NULL means "use the shipped defaults" so an
+    -- upgraded install behaves exactly as before until someone changes it;
+    -- see alertrules.evaluate_flapping.
+    flap_window_s        INTEGER,
+    flap_min_transitions INTEGER,
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     created_ts      REAL NOT NULL
 );
@@ -132,7 +137,8 @@ DEFAULTS = {
 }
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
-                  "clear_threshold", "for_polls", "template_id")
+                  "clear_threshold", "for_polls", "template_id",
+                  "flap_window_s", "flap_min_transitions")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
 # 26 built-in rules: 7 device_event + 3 interface_event + 10 threshold +
@@ -196,9 +202,25 @@ class AlertsDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
         self._seed_templates()
         self._seed_rules()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a column
+        added to `rules` after some installs already have an alerts.db has to
+        be added explicitly — the same convention nodesdb.py, wirelessdb.py
+        and db.py already use for their own post-release columns.
+        """
+        rules = {row["name"] for row in
+                 self._conn.execute("PRAGMA table_info(rules)").fetchall()}
+        for column in ("flap_window_s", "flap_min_transitions"):
+            if column not in rules:
+                self._conn.execute(
+                    f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -522,6 +544,21 @@ class AlertsDatabase:
             cursor = self._conn.execute(
                 f"UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?"
                 f" WHERE id IN ({marks}) AND state IN ('open','acked')",
+                (time.time(), by, *alert_ids))
+            self._conn.commit()
+            return cursor.rowcount or 0
+
+    def acknowledge_many(self, alert_ids: list[int], by: str = "") -> int:
+        """Acknowledge exactly the given alerts — the selection-respecting
+        counterpart to acknowledge_all, which deliberately ignores any
+        selection and takes every open alert on the server."""
+        if not alert_ids:
+            return 0
+        marks = ",".join("?" * len(alert_ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE alerts SET state='acked', acked_ts=?, acked_by=?"
+                f" WHERE id IN ({marks}) AND state='open'",
                 (time.time(), by, *alert_ids))
             self._conn.commit()
             return cursor.rowcount or 0

@@ -6,6 +6,84 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.27.0 — Alert checkboxes, MAC tables that answer, per-destination windows, NetFlow speed
+
+- **Alerts: real checkboxes, and an "Acknowledge selected" that respects
+  them.** Reported as "bulk acknowledge and bulk resolve only clear 1 of
+  the selected items". Investigated first, and the bulk statements turned
+  out not to be at fault: six seeded alerts, four selected, resolve —
+  four resolved, two left, and the selection survives background
+  refreshes. `resolve_many` was already a single
+  `UPDATE ... WHERE id IN`. What was actually wrong is that **selection
+  was Ctrl-click only**, with no visible affordance beyond a small hint,
+  so a plain click looked like it was selecting when all it did was move
+  the detail highlight — and a bulk action then acted on the one row that
+  really was ticked. And there was **no "Acknowledge selected" button at
+  all**: "Acknowledge all" acknowledges every open alert on the server
+  and ignores the selection entirely. Every row now carries a checkbox in
+  its first column; ticking one never moves the detail pane, clicking
+  elsewhere in the row still opens it, and Ctrl-click still works.
+  **Acknowledge selected** sits beside **Resolve selected** in the bulk
+  bar, backed by a new `acknowledge_many` and `POST
+  /api/alerts/bulk-ack`. "Acknowledge all"'s confirmation now spells out
+  that it takes every open alert rather than the ticked rows.
+- **MAC addresses on a port now come from three tables, not one.** Asked
+  whether the extra MIBs the application now ships let these be polled
+  successfully, and whether the logic was only using part of what is
+  available. The second half was right, the first half cannot be: the
+  poller uses hardcoded numeric OIDs and uploaded MIBs only ever supply
+  display *names*, so the MIB catalog has no bearing on polling coverage.
+  The real gap was that only the original BRIDGE-MIB `dot1dTpFdbTable`
+  was ever read. Three sources are now tried in order — **Q-BRIDGE-MIB**
+  `dot1qTpFdbTable` (what most VLAN-aware switches actually answer, and
+  whose VLAN-prefixed index the old parser rejected outright), then
+  `dot1dTpFdbTable` as before, then, on Cisco devices only, the
+  **per-VLAN SNMP contexts** classic IOS hides its forwarding table
+  behind (`community@vlan`, VLAN list from CISCO-VTP-MIB). The dialog
+  shows the VLAN each address was learned in where the switch reports
+  one. The Cisco path is v1/v2c only (there is no community to suffix
+  under v3), is gated on the device's vendor already reading Cisco, and
+  is bounded to 48 VLANs and 15 seconds so opening a port dialog cannot
+  hang. A device that answers none of the three still says "no MAC
+  address data" rather than showing an empty table.
+- **NetPath: every destination keeps its own timeline window.** Selecting
+  a destination restores the window, preset and Follow state you last
+  left it on, so a link watched by the hour and one watched by the minute
+  stop dragging their range onto each other. Remembered in the browser
+  and kept across a reload; a destination never opened starts on the page
+  default, and entries for deleted destinations are pruned.
+- **NetFlow stops crawling when you zoom out.** Two causes, both fixed.
+  The overview cost **four** full aggregate passes over the window per
+  refresh — `series()` called `top()` internally, the handler called
+  `top()` again beside it, and `totals()` made a third — every one
+  walking the same rows, which a wider window multiplies. One
+  `GROUP BY key, slot` pass now yields the chart series, the top-N bars
+  and the totals together. And every wheel step fired a fresh pair of
+  requests over an ever-wider window: zooming now moves the window (and
+  its label) immediately but collapses a burst of steps into a single
+  fetch ~250 ms later. A response for a window already zoomed away from
+  is discarded instead of being drawn over the newer one.
+- **IPAM: the selected DHCP scope follows you to another server.** Where
+  the server you switch to has a scope with the same identifier, that
+  scope stays selected instead of the list jumping back to the first one;
+  where it does not, it falls back to the first, and from then on that is
+  what a further switch looks for. Matching is on the scope's own
+  identifier rather than its database row id, which differs per server
+  for the same scope. A background poll no longer moves the selection
+  either.
+- **Debug: All and None buttons for the category filters.** The ask was
+  for "uncheck all"; both are here, because unchecking all and then
+  wanting them back was otherwise eleven clicks.
+- **Interface flapping is configurable.** The rule always had a window
+  and a transition count — 3 transitions in 10 minutes — but nothing ever
+  passed them, so they could not be reached from the UI. The rule editor
+  now offers both, blank meaning "as shipped". Two nullable columns were
+  added to `rules`; `alertsdb.py` had no migration step at all, so it has
+  one now, following the same PRAGMA-then-ALTER convention the other
+  databases use. The engine widens its event fetch to match the
+  configured window, which previously would have silently truncated
+  anything longer than 15 minutes.
+
 ### 4.26.0 — Named exporters, coloured tooltips, Scan radios, 15 more MIB vendors, legacy SSH
 
 - **ConfigRX can talk to older gear again.** A backup failing with

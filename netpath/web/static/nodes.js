@@ -715,15 +715,22 @@
         const mac = box.querySelector('#ifd-mac');
         if (!mac || !current()) return;
         if (!r.supported) {
-          mac.innerHTML = '<p class="hint">No MAC address data available — this device does not answer BRIDGE-MIB requests.</p>';
+          mac.innerHTML = '<p class="hint">No MAC address data available — this device answers ' +
+            'neither the Q-BRIDGE nor the BRIDGE-MIB forwarding tables.</p>';
           return;
         }
         if (!r.macs || !r.macs.length) {
           mac.innerHTML = '<p class="hint">No MAC addresses currently learned on this port.</p>';
           return;
         }
-        mac.innerHTML = '<table><tr><th>MAC address</th></tr>' +
-          r.macs.map((m) => `<tr><td>${escape(m)}</td></tr>`).join('') + '</table>';
+        // The VLAN column only earns its place when the source actually knew
+        // one: dot1dTpFdbTable has no VLAN in it at all.
+        const anyVlan = r.macs.some((m) => m.vlan);
+        mac.innerHTML = `<table><tr><th>MAC address</th>${
+          anyVlan ? '<th>VLAN</th>' : ''}</tr>` +
+          r.macs.map((m) => `<tr><td>${escape(m.mac)}</td>${
+            anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
+          '</table>';
       })
       .catch(() => {
         const mac = box.querySelector('#ifd-mac');

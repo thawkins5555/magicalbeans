@@ -9,6 +9,10 @@
     hosts: [], hostSort: { key: 'ip', descending: false },
     conflicts: [],
     dhcpServers: [], dhcpServerId: null,
+    // The selected scope's own scope_id (e.g. "10.20.3.0"), kept beside the
+    // row id so the selection can follow a server switch — see
+    // loadDhcpScopes().
+    dhcpScopeKey: null,
     dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
     leaseSort: { key: 'ip', descending: false },
     scopeSort: 'least',
@@ -633,6 +637,9 @@
       tr.addEventListener('mouseleave', App.hideTooltip);
       tr.onclick = () => {
         view.dhcpScopeId = scope.id;
+        // Picking a scope by hand is what a later server switch should try to
+        // preserve, so record its identifier alongside the row id.
+        view.dhcpScopeKey = scope.scope_id;
         view.scopeTrend = [];
         renderDhcpScopes();
         drawScopeDetail();
@@ -867,10 +874,22 @@
     }
     const payload = await App.get('/api/ipam/dhcp/scopes', { server_id: view.dhcpServerId });
     view.dhcpScopes = payload.scopes;
+    // dhcpScopeId is a database row id, which differs per server even for the
+    // same scope, so "keep showing 10.20.3.0 after switching server" has to
+    // match on the scope_id the DHCP server itself uses. view.dhcpScopeKey
+    // carries that across the switch; the row id alone cannot.
     if (view.dhcpScopeId && !view.dhcpScopes.some((s) => s.id === view.dhcpScopeId)) {
       view.dhcpScopeId = null;
     }
+    if (!view.dhcpScopeId && view.dhcpScopeKey) {
+      const same = view.dhcpScopes.find((s) => s.scope_id === view.dhcpScopeKey);
+      if (same) view.dhcpScopeId = same.id;
+    }
     if (!view.dhcpScopeId && view.dhcpScopes.length) view.dhcpScopeId = view.dhcpScopes[0].id;
+    // Whatever ended up selected is what a later server switch should look
+    // for, including the first-scope fallback.
+    const chosen = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    view.dhcpScopeKey = chosen ? chosen.scope_id : null;
     renderDhcpScopes();
     drawScopeDetail();
     await loadDhcpLeases();
@@ -1018,6 +1037,9 @@
     App.el('ipam-poll-now').onclick = pollNow;
     App.el('ipam-dhcp-server-select').onchange = (event) => {
       view.dhcpServerId = Number(event.target.value) || null;
+      // Drop the row id (it belongs to the old server) but keep the scope's
+      // own identifier, so the same scope stays selected where the new
+      // server also has one.
       view.dhcpScopeId = null;
       loadDhcpScopes();
     };
