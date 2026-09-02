@@ -6,6 +6,42 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.36.0 — SSH from the device pane, with host keys that are remembered
+
+- **An SSH button on the device pane opens a terminal to the selected
+  device in a new window.** It takes the place of Remove, which moves into
+  the Edit dialog beside Clear credential (bulk Delete on the device list
+  is unchanged). The terminal is a real one — cursor movement, colours,
+  paging, `vi` — rendered by a vendored copy of xterm.js, the first
+  third-party library this frontend has ever carried, served as a plain
+  file from this application with no build step. It signs in with the SSH
+  credential ConfigRX already holds for the device, and asks for a username
+  and password when there is none or it is refused; typed credentials are
+  used for that one connection and never stored. The window carries the
+  device's name and address, Reconnect and Disconnect, and the same session
+  cookie as the tab that opened it, so a signed-out window lands on the
+  sign-in page.
+- **A device's SSH host key is accepted the first time and remembered.**
+  ConfigRX used to accept whatever key a device presented on every
+  connection and forget it again. Now the first connection — from the
+  terminal or from a ConfigRX backup — stores the key, and every later
+  connection is checked against it. A different key is refused: the
+  terminal shows a warning naming the old and new SHA-256 fingerprints and
+  when the old key was first seen, with a **Trust the new key** button for
+  the case where the device was genuinely replaced or re-keyed; a backup
+  against a changed key fails with the same facts in its error rather than
+  running. Keys are compared as bytes, so a device that starts signing its
+  RSA key with SHA-2 is not mistaken for a changed one. The ConfigRX device
+  dialog shows the stored fingerprint with a Forget button.
+- **SSH access is its own permission, granted to nobody by default.**
+  ConfigRX write access means "can back up configs"; it has never meant
+  "can type anything into every switch", and the terminal must not widen it
+  silently. A new **SSH** grant under Settings → Users gates the button,
+  the connection and trusting a key. On upgrade, accounts that already hold
+  write access to every module receive it; everyone else gets it when an
+  administrator says so. Every session is recorded in the device's event
+  log with who opened it and from where — never what was typed.
+
 ### 4.35.0 — A question mark beside the setting
 
 - **Settings can now explain themselves.** A small **?** beside a control

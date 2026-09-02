@@ -393,6 +393,22 @@ Selecting a device opens its identity, live status, a status timeline,
 its current interface table, and a combined device/interface event
 history.
 
+**SSH opens a terminal to the device in a new window.** The pane's SSH
+button (shown only to accounts with the SSH permission, see Permissions)
+opens a real terminal — cursor keys, colours, pagers, `vi` — sized to the
+window and refitted when it is resized. It signs in with the SSH credential
+ConfigRX holds for the device, and asks for a username and password when
+there is none or the device refuses it; a typed credential is used for that
+connection only and never stored. The first connection stores the device's
+host key; a later connection presenting a different key is refused with a
+warning that names both fingerprints and when the old key was first seen,
+and a **Trust the new key** button for a device that really was replaced.
+Sessions end after fifteen minutes idle, at most sixteen run at once, and
+each is recorded in the device's event log with who opened it and from
+where. **Remove** now lives in the device's Edit dialog, beside Clear
+credential, so the pane's buttons are the things you do *to* a device
+rather than the one thing you do to get rid of it.
+
 **The status timeline is the device pane's headline** — a thin colored
 bar of up/down/unsupported/auth-failed segments across the selected time
 window, sized to match NetPath's own status lane rather than reading as
@@ -1788,7 +1804,7 @@ password ends every session on that account, this one included.
 
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
-ConfigRX, Settings, Debug — set from **Settings → Users** (itself gated
+ConfigRX, SSH, Settings, Debug — set from **Settings → Users** (itself gated
 on Settings write access). Write implies read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
 bar, and a write-gated control (add/edit/delete buttons, a module's
@@ -1810,7 +1826,12 @@ existing account's access exactly as it was — the first time the
 permissions table is created, every account already on file is granted
 full write access to every module, so nobody loses anything on upgrade.
 Only accounts created after that point start with whatever grants an
-admin explicitly assigns in the Add User dialog.
+admin explicitly assigns in the Add User dialog. **SSH is the one module
+that is not handed out that way**: it arrived later, it lets an account
+type anything into a device, and ConfigRX write access was never meant to
+imply it — so on upgrade only accounts that already hold write access to
+every other module receive it, and everyone else gets it when an
+administrator grants it.
 
 ---
 
@@ -1898,4 +1919,14 @@ moves its settings, accounts and name cache into it on the first start.
 - **ConfigRX never pushes a configuration change, to any device, ever.**
   There is no code path in this module capable of it — no free-form
   command box, no "push config" action, nowhere in its UI or API. It only
-  ever pulls a read-only snapshot.
+  ever pulls a read-only snapshot. The interactive SSH terminal on the
+  Nodes page is a different feature with its own permission (see Nodes →
+  Drill-down); it shares ConfigRX's stored credential and host-key store,
+  not its code.
+- **Host keys are remembered.** The first connection to a device — a
+  backup or a terminal session — stores its SSH host key; a later
+  connection presenting a different key is refused and the backup fails
+  with an error naming both fingerprints and when the old one was first
+  seen. The device dialog shows the stored fingerprint with a **Forget**
+  button (SSH permission) for a device that was genuinely replaced; the
+  terminal window offers **Trust the new key** for the same case.

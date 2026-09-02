@@ -445,7 +445,9 @@ in this module; every scheduled pull and every manual **Back up now**
 decrypts fresh from `configrx.db` and discards it again.
 
 **No free-form command execution exists anywhere in this module, and
-that boundary is load-bearing, not incidental.** The only function that
+that boundary is load-bearing, not incidental.** (The interactive SSH
+terminal, section 7, is a separate module under a separate permission; it
+shares this credential, not this code.) The only function in ConfigRX that
 ever writes to a device's SSH shell channel, `configrx._pull_config()`,
 sends exactly two things: a fixed, per-vendor pagination-disable command
 (session-scoped and itself read-only, e.g. `terminal length 0`) and one
@@ -462,7 +464,49 @@ one of a short, fixed, read-only list of commands, never anything an
 operator (or an attacker who somehow obtained write access to this
 module) could supply.
 
-## 7. What this application deliberately never does
+## 7. The interactive SSH terminal (Nodes → SSH)
+
+The SSH button on a device opens a real shell in the operator's browser
+(`netpath/sshterm.py`, `netpath/web/wsock.py`, `netpath/web/static/ssh.js`).
+It is the one place in this application that sends what a person types to a
+device, and it is built around that fact.
+
+**Its own permission, granted to nobody by default.** ConfigRX write access
+means "can store a backup credential and run the fixed show-config
+command"; it has never meant "can type anything into every switch", and
+the terminal does not widen it. A separate **SSH** module in the
+per-account permission grid gates the button, the connection itself (the
+server checks it before the socket is upgraded) and trusting a changed
+host key. On upgrade only accounts already holding write access to every
+other module receive it.
+
+**The stored credential is used the way ConfigRX uses it.** The ConfigRX
+credential for the device, if one exists, is decrypted immediately before
+`paramiko.SSHClient.connect()` and the plaintext variable is cleared the
+instant the attempt resolves; the live session holds the SSH channel, never
+the password, so a reconnect decrypts fresh. When no credential is stored,
+or the device refuses it, the window asks for a username and password: they
+travel once over the same TLS-protected WebSocket the terminal uses, are
+handed to `connect()` and cleared the same way, and are never written to
+any database, log or event.
+
+**Keystrokes are never recorded.** The device's event log gets one line
+when a session opens — the account name and the client address — and one
+when it closes, with the duration. Nothing typed or displayed in the
+terminal is stored anywhere on this server.
+
+**Host keys are pinned after first sight.** The first connection to a
+device stores its host key (a public value: type, key bytes, SHA-256
+fingerprint, first-seen time). Every later connection, terminal or backup,
+loads that key into paramiko before connecting and is refused if the device
+presents different key bytes — a different key type from the same device
+counts as different, and an RSA key that starts signing with SHA-2 does
+not. Replacing the stored key is an explicit act (**Trust the new key** in
+the terminal window, **Forget** in ConfigRX), both under the SSH
+permission, and the warning always shows both fingerprints so the decision
+is made on the facts.
+
+## 8. What this application deliberately never does
 
 - Never stores a password in a form that can be turned back into the
   password — not the web login, not a DHCP, SNMPv3 or SMTP credential.
@@ -472,10 +516,12 @@ module) could supply.
   anything else user-supplied) into command text; every value that varies
   travels as an environment variable or a script parameter, never as string
   concatenation.
-- Never gives ConfigRX (or anything else) a way to run an arbitrary
-  command on a device over SSH — only a short, fixed, per-vendor
-  allow-list of read-only "show config" commands exists anywhere in that
-  module, and there is no free-form command field in its UI or API.
+- Never gives ConfigRX a way to run an arbitrary command on a device over
+  SSH — only a short, fixed, per-vendor allow-list of read-only "show
+  config" commands exists anywhere in that module, and there is no
+  free-form command field in its UI or API. The interactive terminal
+  (section 7) is the single, deliberate place a person's own input reaches
+  a device, behind its own permission that no account holds by default.
 - Never logs a password, on success or failure, in the event log or the
   access log.
 - Never falls back to weaker or absent protection silently — a DPAPI
@@ -488,7 +534,7 @@ module) could supply.
   `NETWORK-AND-STORAGE-REQUIREMENTS.md` for the complete, closed list of
   every outbound connection this application makes.
 
-## 8. What is still the administrator's job
+## 9. What is still the administrator's job
 
 Encryption and hashing close the gaps this application controls. A few
 things remain outside its reach entirely:
