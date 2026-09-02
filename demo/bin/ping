@@ -139,6 +139,19 @@ def real_ping() -> str | None:
     return None
 
 
+def fleet_alive(host: str):
+    """True/False from the fleet's control API, or None when no fleet is
+    running (then the real ping decides)."""
+    port = os.environ.get("FLEET_CONTROL_PORT", "8099")
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/alive?ip={host}", timeout=0.3) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("alive")
+    except Exception:                       # noqa: BLE001 - no fleet, no opinion
+        return None
+
+
 def unreachable(host: str, count: int) -> int:
     print(f"PING {host} ({host}) 56(84) bytes of data.")
     print()
@@ -190,6 +203,10 @@ def main() -> int:
         return 2
 
     if host.startswith("127."):
+        # A simulated device the fleet has taken "down" must stop answering
+        # ICMP too, or the app (correctly) keeps it up on ping alone.
+        if host != "127.0.0.1" and fleet_alive(host) is False:
+            return unreachable(host, opts["c"])
         binary = real_ping()
         if binary:
             try:

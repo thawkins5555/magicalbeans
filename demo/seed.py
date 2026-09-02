@@ -132,6 +132,8 @@ class Client:
         self.timeout = timeout
         self.cookie = ""
         self.username = ""
+        self._creds = None
+        self.relogins = 0
         self._conn = None
         self.log = None                     # set by main(); a SeedLog
         self.step = ""
@@ -196,6 +198,14 @@ class Client:
 
     def call(self, method: str, path: str, body=None):
         status, payload, _headers = self.raw(method, path, body)
+        if status == 401 and self._creds and path != "/api/login":
+            # The server's idle timeout (10 min by default) counts browser
+            # input only, so a script polling the API is signed out mid-run
+            # regardless of how busy it is. There are no API tokens; the only
+            # remedy is to log in again.
+            self.relogins += 1
+            self.login(*self._creds)
+            status, payload, _headers = self.raw(method, path, body)
         if status < 200 or status >= 300:
             raise ApiError(status, payload)
         return payload
@@ -224,6 +234,7 @@ class Client:
         if "sw_session=" in cookie:
             self.cookie = cookie.split("sw_session=")[1].split(";")[0]
         self.username = payload.get("username", username)
+        self._creds = (username, password)
         return payload
 
 

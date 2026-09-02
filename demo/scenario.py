@@ -637,21 +637,34 @@ class Scenario:
                                                        "site": "Site-A",
                                                        "limit": 500})]
             return {"events": events}
-        self.run_step(2, "core outage + Site-A access layer down", outage, 180)
+        # down_after_failures (3) x the 60 s profile interval means the
+        # third failed poll lands around 180 s; give the engine a tick or two
+        # past that so the device_down alerts and their emails are inside
+        # the window that counts them.
+        self.run_step(2, "core outage + Site-A access layer down", outage, 240)
+
+        def outage_over():
+            events = [
+                self.fleet_event("up", ips=core),
+                self.fleet_event("up", select={"persona": "cisco_access",
+                                               "site": "Site-A", "limit": 500}),
+            ]
+            return {"events": events}
+        self.run_step(3, "outage recovery (core + Site-A back)", outage_over, 150)
 
         def flaps():
             # fleet.py's apply() takes the interface index itself as `arg`
             # (demo/fleet.py:570), not a dict.
             return {"events": [self.fleet_event("flap_start", ips=access, arg=7)]}
-        self.run_step(3, "interface flap storm (if 7 on 100 switches)", flaps, 120)
+        self.run_step(4, "interface flap storm (if 7 on 100 switches)", flaps, 120)
 
         def reboots():
             return {"events": [self.fleet_event("reboot", ips=reboot_set)]}
-        self.run_step(4, "reboot 20 devices", reboots, 120)
+        self.run_step(5, "reboot 20 devices", reboots, 120)
 
         def auth_fail():
             return {"events": [self.fleet_event("auth_fail_on", ips=auth_set)]}
-        self.run_step(5, "SNMP auth failure on 5 devices", auth_fail, 90)
+        self.run_step(6, "SNMP auth failure on 5 devices", auth_fail, 90)
 
         def bursts():
             duration = max(5, int(60 * self.scale))
@@ -666,7 +679,7 @@ class Scenario:
                                ["--tcp", "--framing", "octet"]),
             ]
             return {"generators": sum(1 for p in started if p is not None)}
-        self.run_step(6, "trap + syslog burst (storm mix, TCP octet framing)",
+        self.run_step(7, "trap + syslog burst (storm mix, TCP octet framing)",
                       bursts, 75)
 
         def netflow():
@@ -674,18 +687,15 @@ class Scenario:
             started = self.generator("netflow", sources, 200, duration,
                                      ["--version", "mixed"])
             return {"generators": 1 if started else 0}
-        self.run_step(7, "netflow burst (mixed v5/v9, 200 flows/s)", netflow, 75)
+        self.run_step(8, "netflow burst (mixed v5/v9, 200 flows/s)", netflow, 75)
 
         def recovery():
             events = [
-                self.fleet_event("up", ips=core),
-                self.fleet_event("up", select={"persona": "cisco_access",
-                                               "site": "Site-A", "limit": 500}),
                 self.fleet_event("flap_stop", ips=access),
                 self.fleet_event("auth_fail_off", ips=auth_set),
             ]
             return {"events": events}
-        self.run_step(8, "recovery", recovery, 180)
+        self.run_step(9, "recovery (flaps stop, auth restored)", recovery, 150)
 
     # -- UI walk ----------------------------------------------------------
 

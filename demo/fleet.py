@@ -630,6 +630,19 @@ class _ControlHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/state", "/"):
             self._send(200, self.fleet.state())
+        elif path == "/alive":
+            # A one-device liveness answer for demo/bin/ping, so a device
+            # taken "down" stops answering ICMP as well as SNMP — loopback
+            # would otherwise answer every ping and the app (correctly)
+            # never marks a ping-answering device down.
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            ip = ""
+            for part in query.split("&"):
+                if part.startswith("ip="):
+                    ip = part[3:]
+            dev = self.fleet.devices.get(ip)
+            self._send(200, {"ip": ip,
+                             "alive": (bool(dev.alive) if dev is not None else None)})
         elif path == "/personas":
             self._send(200, {"personas": sorted(personas.PERSONAS)})
         elif path == "/specials":

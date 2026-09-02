@@ -1,7 +1,7 @@
 # SappiWhere demo harness
 
 A self-contained rig that stands up a fake network, points a real SappiWhere at
-it, drives eight scripted incidents through it, walks the browser UI with
+it, drives nine scripted incidents through it, walks the browser UI with
 Playwright, and writes down what happened.
 
 Nothing here touches `netpath/` or `tests/`. Everything the app talks to is on
