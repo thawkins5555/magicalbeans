@@ -6,6 +6,32 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.33.1 — Tests you can actually run
+
+- **The end-to-end suites now live in the repository, under `tests/`, and
+  every one of them passes.** Four of them had been listed as "known
+  environmental failures" since 4.28. None of those failures was the
+  application's: three suites expected a stub SNMP agent to have been
+  started by hand on a fixed UDP port (16161, 16261, 16262) before they ran,
+  and the fourth predated two deliberate changes — discovery takes its
+  communities from the chosen polling profile and guesses nothing, and a
+  promoted device keeps the IP as its manual name while sysName is seeded
+  into the identity. Each suite now starts its own stub as a child process
+  on a free loopback port, points the module under test at it, waits for
+  the stub's bound banner rather than a fixed sleep, and kills it on exit.
+  The custom-MIB suite also waits for the poll worker to finish instead of
+  sleeping three seconds and then shutting the service down under an
+  in-flight poll, which is what produced its "cannot operate on a closed
+  database" trace.
+- `python3 tests/run_all.py` runs them all and reports PASS/FAIL per file;
+  `tests/README.md` says what each one proves. Standard library only, no
+  network, no `ping` binary, no root, temporary databases.
+- One consistency fix found while merging: 4.33.0 added Moxa (arc 8691) to
+  the well-known sysObjectID table and shipped a Moxa MIB bundle read from
+  MOXA-GENERAL-MIB, but the arc was still listed as curated-from-memory in
+  the enterprise table. It is now in the verified list, as every well-known
+  root and every bundle arc must be.
+
 ### 4.33.0 — How long it was down, loss you can see, and paths that alert
 
 - **"Device recovered" now says when it recovered and how long it was down.**
