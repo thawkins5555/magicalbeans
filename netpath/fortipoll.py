@@ -9,10 +9,11 @@ by controller id instead of device id), `nodepoll.credential_for()`
 functions. Same v1/v2c/v3 noAuthNoPriv/authNoPriv-only limitation as
 Nodes (snmppoll raises SnmpUnsupported for v3 authPriv).
 
-Table walking is repeated GETNEXT, not GETBULK — the same choice
-nodepoll.py's own `_walk_column` already made ("avoiding a separate
-GETBULK code path"), matched here rather than introducing a second table-
-walking idiom for one small poller.
+Table walking here is repeated GETNEXT, not GETBULK: this poller manages a
+handful of controllers, not an estate of switches with hundreds-of-rows
+forwarding tables, so the request-count problem GETBULK solves for
+nodepoll.py's own `_walk_column` (4.34) does not arise here, and it is not
+worth introducing a second table-walking idiom for one small poller.
 """
 
 from __future__ import annotations

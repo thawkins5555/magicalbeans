@@ -1700,8 +1700,10 @@
           min="0" step="60" placeholder="inherit"
           value="${d.mac_table_interval_s ?? ''}"> s</label>
         <p class="hint">Walks this switch's forwarding table on its own slower
-          schedule, so a MAC address on it can be found from the Find box. 0
-          switches it off for this device whatever the profile says.</p>
+          schedule, so a MAC address on it can be found from the Find box. A
+          GETBULK walk costs only a few dozen requests per switch, so 300
+          (five minutes) is a sensible starting point. 0 switches it off for
+          this device whatever the profile says.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. Leave as
@@ -2178,10 +2180,10 @@
         step="60" placeholder="inherit" value="${p.mac_table_interval_s ?? ''}"> s</label>
       <p class="hint">Walks each switch's forwarding table on this separate,
         slower schedule so MAC addresses can be searched for in the Find box.
-        <b>0 switches it off</b>, and off is the default — a forwarding table
-        is hundreds to thousands of extra SNMP reads per switch, so it is
-        worth turning on only for the switches you actually trace hosts
-        through. 900 (fifteen minutes) is a sensible starting point.</p>
+        <b>0 switches it off</b>, and off is the default. A forwarding-table
+        walk uses GETBULK, so it now costs only a few dozen SNMP requests per
+        switch rather than hundreds to thousands — <b>300 (five minutes)</b>
+        is a sensible starting point.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
@@ -2844,6 +2846,20 @@
           poll is what makes loss measurable at all — a single probe can only ever say
           0% or 100%. Both are overridable per device and per profile.</p>
       </fieldset>
+      <fieldset><legend>SNMP TABLE WALKS</legend>
+        ${number('np-bulkreps', 'GETBULK rows per request (0 = GETNEXT only)',
+                 s.snmp_bulk_max_repetitions, 'min=0 step=5')}
+        ${number('np-tablewalkrows', 'Stop a table walk after',
+                 s.snmp_walk_max_rows, 'min=100 step=1000')} rows
+        <p class="hint">Every table walk — interfaces, MAC forwarding tables,
+          DOM sensors, and the OID browser's own per-subtree reads — uses
+          GETBULK on v2c/v3: one request answers this many rows instead of
+          one GETNEXT per row. 0 falls back to plain GETNEXT, for a device
+          whose agent mishandles GetBulk. A device answering "tooBig" is
+          retried automatically at half as many rows. v1 always uses
+          GETNEXT — GETBULK does not exist in that version of the
+          protocol.</p>
+      </fieldset>
       <fieldset><legend>MAC ADDRESS TABLES</legend>
         ${number('np-macretention', 'Forget a learned MAC after',
                  s.mac_table_retention_days, 'min=0 step=1')} days
@@ -2918,6 +2934,8 @@
           ping_timeout_ms: num('#np-pingtimeout'),
           ping_interval_s: num('#np-pinginterval'),
           mac_table_retention_days: num('#np-macretention'),
+          snmp_bulk_max_repetitions: num('#np-bulkreps'),
+          snmp_walk_max_rows: num('#np-tablewalkrows'),
           oid_walk_max_rows: num('#np-walkrows'),
           oid_walk_budget_s: num('#np-walkbudget'),
           vendor_walk_enabled: on('#np-vendorwalk'),
@@ -3024,31 +3042,63 @@
     }
     const ports = new Map();
     for (const loc of locations) ports.set(`${loc.device_id}:${loc.if_index}`, loc);
-    if (ports.size === 1) {
-      const loc = locations[0];
-      show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
-           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
-           `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}</span>`);
+    const all = [...ports.values()];
+    const present = all.filter((loc) => loc.present);
+    const stale = all.filter((loc) => !loc.present);
+    const mac = escape(formatMac(payload.mac));
+    const port = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+      `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}`;
+    const lastSeen = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+      `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''} at ${App.stamp(loc.seen_ts)} ` +
+      `(${ago(loc.seen_ts)})`;
+    const wireHits = (hits) => {
+      for (const button of note.querySelectorAll('.nd-mac-hit')) {
+        button.onclick = () => {
+          const loc = hits[Number(button.dataset.hit)];
+          selectDevice(loc.device_id);
+          openPort(loc.device_id, loc.if_index).catch(() => {});
+        };
+      }
+    };
+
+    if (!present.length) {
+      // Nothing has it now, but it was seen before: say when and where,
+      // rather than reporting it as unknown.
+      if (stale.length === 1) {
+        show(`<span class="hint"><b>${mac}</b> is not in any forwarding table ` +
+             `now — last seen on ${lastSeen(stale[0])}.</span>`);
+        return;
+      }
+      show(`<span class="hint"><b>${mac}</b> is not in any forwarding table ` +
+           `now — last seen on ${stale.length} ports:</span> ` +
+           stale.map((loc, i) =>
+             `<button class="linkish nd-mac-hit" data-hit="${i}">last seen ` +
+             `${lastSeen(loc)}</button>`).join(' '));
+      wireHits(stale);
+      return;
+    }
+    // present.length === 1: one auto-opens the port dialog, same as
+    // before stale rows existed. present.length > 1: name them all and let
+    // the operator choose — clicking one opens it, so this is a shortlist
+    // rather than a dead end. Either way, a stale sighting elsewhere earns
+    // one extra hint line rather than being folded into the main answer.
+    const earlier = stale.length
+      ? ` <span class="hint">— earlier also on ${stale.length === 1
+          ? lastSeen(stale[0]) : `${stale.length} other port(s)`}.</span>`
+      : '';
+    if (present.length === 1) {
+      const loc = present[0];
+      show(`<span class="hint"><b>${mac}</b> is on ${port(loc)}</span>${earlier}`);
       selectDevice(loc.device_id);
       await openPort(loc.device_id, loc.if_index);
       return;
     }
-    // Several: name them all and let the operator choose. Clicking one
-    // opens it, so this is a shortlist rather than a dead end.
-    show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
-         `${ports.size} ports — pick one:</span> ` +
-         [...ports.values()].map((loc, i) =>
-           `<button class="linkish nd-mac-hit" data-hit="${i}">` +
-           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
-           `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''}</button>`).join(' '));
-    const hits = [...ports.values()];
-    for (const button of note.querySelectorAll('.nd-mac-hit')) {
-      button.onclick = () => {
-        const loc = hits[Number(button.dataset.hit)];
-        selectDevice(loc.device_id);
-        openPort(loc.device_id, loc.if_index).catch(() => {});
-      };
-    }
+    show(`<span class="hint"><b>${mac}</b> is on ${present.length} ports — ` +
+         `pick one:</span> ` +
+         present.map((loc, i) =>
+           `<button class="linkish nd-mac-hit" data-hit="${i}">${port(loc)}` +
+           `</button>`).join(' ') + earlier);
+    wireHits(present);
   }
 
   /* Opens one port's dialog by id, fetching the interface row rather than
