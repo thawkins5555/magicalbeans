@@ -18,6 +18,32 @@ A comprehensive performance review of the SappiWhere codebase identified **8 maj
 
 **Recommended Action:** Implement fixes in priority order (1-3 are critical for production deployment)
 
+**Status Update (2026-09-02):** Issues #1, #2, and #3 (the three critical N+1 query
+patterns) have been implemented and verified with end-to-end tests — see
+"Implementation Status" below. Issue #4 (missing `device_group_id` index) turned
+out to be a false positive: the index already exists, added via `_migrate()` in
+`nodesdb.py` rather than the `SCHEMA` block the review agent read.
+
+---
+
+## Implementation Status
+
+| Issue | Status | Fix |
+|-------|--------|-----|
+| #1 N+1: `last_trace()` in `get_targets()` | ✅ Fixed | Added `Database.last_traces()`; `get_targets()` batches, `_target_json()` takes `last` as a param instead of querying |
+| #2 N+1: `interface_events()` in `get_nodes_device_events()` | ✅ Fixed | Added `NodesDatabase.interface_events_for_device()`, a single JOIN query replacing the per-interface loop |
+| #3 N+1: `device()` in `post_nodes_devices_bulk_poll()` | ✅ Fixed | Added `NodesDatabase.devices_by_ids()`; existence check is now one query, not one per device |
+| #4 Missing `device_group_id` index | ✅ Already fixed | Index already existed (`nodesdb.py` `_migrate()`); original finding was a false positive |
+| #5 N+1: `last_trace()` in `get_debug()` | ✅ Fixed | Same `last_traces()` batch method reused; the `devices()` full-table load for `node_workers` now calls `devices_by_ids()` with only the ids being polled |
+| #6 Subnet/server full-table load in `get_debug()` | Not yet fixed | Deferred — medium priority, same pattern as #5's device load |
+| #7 Missing batch methods | ✅ Fixed | `last_traces()`, `devices_by_ids()`, `interface_events_for_device()` added |
+| #8 Repeated `settings()` calls in `effective_config()` | Not yet fixed | Deferred — low priority, minor impact (settings table is tiny) |
+
+All three fixes were verified with unit tests against real SQLite databases (batch
+methods return correct data, handle empty input, respect `since_s` filters) and
+end-to-end tests calling the actual `api.py` handler functions to confirm the
+response shape is unchanged from before the fix.
+
 ---
 
 ## Critical Issues (Fix Before Production)

@@ -754,6 +754,16 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM devices WHERE ip = ?", (ip,)).fetchone()
 
+    def devices_by_ids(self, device_ids: list[int]) -> list[sqlite3.Row]:
+        """device() for many ids in one query. Order is unspecified — callers
+        needing a particular order build a dict keyed by id from the result."""
+        if not device_ids:
+            return []
+        marks = ",".join("?" * len(device_ids))
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT * FROM devices WHERE id IN ({marks})", device_ids).fetchall()
+
     def device_count(self) -> int:
         with self._lock:
             return self._conn.execute(
@@ -1261,6 +1271,26 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM interface_events WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(last_id), int(limit))).fetchall()
+
+    def interface_events_for_device(self, device_id: int, since_s: float | None = None,
+                                    limit: int = 2000) -> list[sqlite3.Row]:
+        """interface_events() for every interface of a device in one query,
+        joined against `interfaces` (whose if_index/descr the caller wants
+        alongside each event) so the per-interface fan-out of one
+        interface_events() call per port is a single round trip instead."""
+        clauses = ["i.device_id = ?"]
+        params: list = [device_id]
+        if since_s is not None:
+            clauses.append("e.ts >= ?")
+            params.append(time.time() - since_s)
+        where = " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT e.id, e.interface_id, e.ts, e.kind, e.detail,"
+                f" i.if_index, i.descr FROM interface_events e"
+                f" JOIN interfaces i ON i.id = e.interface_id"
+                f" WHERE {where} ORDER BY e.ts DESC LIMIT ?",
+                (*params, limit)).fetchall()
 
     def max_interface_event_id(self) -> int:
         with self._lock:
