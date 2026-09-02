@@ -164,7 +164,90 @@ Thirteen special devices exercise the poller's edge paths:
 
 ## 3. Demonstration results
 
-*(Filled from `demo/out/results-<N>.json` after the three tiers complete.)*
+All three tiers ran the same nine-step campaign against the same application
+build on one Linux container (Python 3.11, local disk), with the polling
+profile at a 60 s interval, 32 poll workers, the `cpu_high` threshold lowered to
+20% and `response_time_high` to 5 ms so the fleet would trip them, the
+new-device grace set to 0, and the email cap raised so every notification was
+counted at the sink. Numbers are from `demo/out/results-<N>.json`; "alerts"
+are rows opened or resolved during the step's window, "emails" are messages
+received by the local SMTP sink during it.
+
+### 3.1 Cross-tier summary
+
+| Measure | 250 devices | 1,000 devices | 2,000 devices |
+|---|---|---|---|
+| Seeding via single POSTs | 250 in 0.75 s (336/s) | 1,000 in 23.0 s | *pending* |
+| Devices up after the first poll cycle | 249/250 within 12 s | 999/1,000 within ~15 s | *pending* |
+| Baseline app CPU / RSS | 27% / 88 MB | *pending* | *pending* |
+| Site outage: devices down → `device_down` alerts → emails | 143 → 143 → 238 | *pending* | *pending* |
+| Open alerts before the outage / after full recovery | 258 / 405 | *pending* | *pending* |
+| Open alerts at the end of the run (nothing left failing) | 636 | *pending* | *pending* |
+| Emails over the whole run | 1,338 | *pending* | *pending* |
+| Longest single device poll observed | 160 s (interval 60 s) | *pending* | *pending* |
+| Peak busy poll workers (of 32) | 33 | *pending* | *pending* |
+| App CPU during the trap + syslog burst | 63% | *pending* | *pending* |
+| `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | *pending* | *pending* |
+| Nodes table fill time after refresh | 181 ms | *pending* | *pending* |
+| `/api/nodes/devices` payload per refresh | 332 KB | *pending* | *pending* |
+| Browser long tasks during the walk (longest) | 52 (230 ms) | *pending* | *pending* |
+| Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | *pending* | *pending* |
+
+### 3.2 What each step showed (250-device tier; the larger tiers are read against it in §3.3)
+
+| Step | Alerts opened | Alerts cleared | Emails | Polls ok / timeout / auth | CPU% |
+|---|---|---|---|---|---|
+| 1 baseline (120 s) | cpu_high 15, interface_down 1, interface_up 4, netpath_unreachable 1, poll_overrun 1, mib_missing 1 | — | 173 | 492 / 1 / 6 | 27 |
+| 2 core + 143 Site-A switches dark (240 s) | **device_down 143**, packet_loss_high 94, netpath_path_unstable 1 | packet_loss_high 93 | **238** | 347 / 567 / 0 | 14 |
+| 3 outage recovery (150 s) | **device_up 143**, device_rebooted 1, interface_down 1, interface_flapping 1 | device_down 143, interface_down 1 | **292** | 567 / 7 / 6 | 29 |
+| 4 flap storm, port 7 on 100 switches (120 s) | interface_down 56, interface_up 34 | interface_down 12 | 103 | 492 / 1 / 6 | 26 |
+| 5 reboot 20 devices (120 s) | **device_rebooted 20**, interface_down 50, interface_flapping 17, interface_up 22 | interface_down 29 | 138 | 492 / 1 / 6 | 28 |
+| 6 wrong credentials on 5 devices (90 s) | **device_auth_fail 5**, interface_down 36, interface_flapping 19, interface_up 8 | interface_down 33 | 100 | 481 / 2 / 16 | 32 |
+| 7 trap + syslog storm (75 s) | trap_critical 5, syslog_critical 17, trap_link_down_unmanaged 1, interface_* 26 | interface_down 18 | 77 | 242 / 0 / 8 | **64** |
+| 8 NetFlow burst, mixed v5/v9 at 200 flows/s (75 s) | interface_* 32 | interface_down 18 | 50 | 241 / 0 / 8 | 31 |
+| 9 flaps stop, credentials restored (150 s) | interface_down 8, interface_up 24 | interface_down 48 | 80 | 717 / 3 / 9 | 29 |
+
+Reading the 250-tier run against the findings:
+
+- **Outage fan-out (§4.3 F3, F4, F24).** 143 devices behind one core produced 143
+  independent "Device not responding" alerts and 238 emails, then 143 "Device
+  recovered" alerts and 292 more emails. Nothing correlated them to the core
+  switch. The per-device `packet_loss_high` alerts (94) did roll up under
+  `device_down` once the third failed poll landed, which is the same-device
+  rollup working as designed.
+- **Recoveries never close (§4.3 F9).** After the outage was fully recovered the
+  open-alert count was 405, up from 258 before it: the 143 `device_up` rows stay
+  open until someone clicks Resolve. By the end of the run, with nothing failing,
+  636 alerts were open.
+- **Flapping is detected late and partially (§4.3 F13).** A port toggling every
+  20–40 s on 100 switches produced 56 `interface_down` and 34 `interface_up`
+  alerts in its first two minutes but only 1 `interface_flapping`; the flapping
+  rule caught up during the *following* steps (17, 19, 6, 10) because it needs
+  three sampled transitions inside a ten-minute window and the poller samples
+  once a minute.
+- **Reboots, auth failures, traps and syslog fired correctly** (20 of 20
+  reboots, 5 of 5 auth failures, 17 critical syslog, 5 trap alerts). The
+  `trap_critical` rule opened on `linkUp` and config-save traps as well as real
+  faults (§4.3 F5), and one `linkDown` from a *managed* switch also opened
+  "Link-down trap from an unmanaged device" (F6).
+- **Poll pool saturation is visible (§4.1 S1, S5).** With 32 workers, the busiest
+  sample had 33 in flight and the longest single poll took 160 s against a 60 s
+  interval: the dark devices each cost three SNMP timeouts plus three ping
+  timeouts per poll, and the 500-port chassis costs 513 requests. `poll_overrun`
+  events were recorded but nothing said "the pool is full".
+- **History is not being kept (§4.1 B1, B2).** 162,766 raw sample rows and an
+  hourly rollup table with zero rows after 25 minutes; at this tier the 50,000-row
+  global cap had not yet bitten because the 15-minute prune had run only once.
+- **Onboarding storm (§4.3 F27).** 235 `mib_missing` alerts opened within the
+  first poll of seeding, every one emailed with the subject "… is not responding"
+  (§4.3 F26).
+- **The UI held up at this size.** 250 rows filled in 181 ms, no uncaught page
+  errors across 12 tabs, 10 subtabs and 21 dialogs; the read-only user saw every
+  tab with zero write controls, and hit two 403s opening Settings (§4.6 C3).
+
+### 3.3 Scale tiers
+
+*(1,000 and 2,000: pending — filled when those runs complete.)*
 
 ---
 
