@@ -46,6 +46,37 @@ methods return correct data, handle empty input, respect `since_s` filters) and
 end-to-end tests calling the actual `api.py` handler functions to confirm the
 response shape is unchanged from before the fix.
 
+### Frontend: diff-based redraw for drawTable() — ✅ Fixed
+
+The "Frontend DOM optimization" item was investigated further before being
+implemented: the originally-suspected cause (row-by-row `appendChild` on a
+live table, no `DocumentFragment`) turned out not to apply — `drawTable()` in
+`nodes.js` already builds rows into a detached `<tbody>` and appends it once,
+so there's no per-row reflow. The real cost is that `drawTable()` fully tears
+down and rebuilds every `<tr>` on every poll tick (`nodes_refresh_s`, 2s by
+default) regardless of whether the underlying data changed, including
+re-sorting the whole list with a locale-aware comparator each time.
+
+Fixed by making `drawTable()` diff against a `Map` of the previously rendered
+rows (device id → `{tr, cells, columnsKey}`), reusing each row's `<tr>` node
+and patching only the `<td>`s whose rendered HTML actually differs, instead of
+recreating every row from scratch every cycle. A structural change (the
+operator picking different visible columns) is detected via a `columnsKey`
+signature and falls back to a full rebuild for that row, since a cell-level
+diff isn't meaningful across a different column set. Cache entries for
+devices no longer present are pruned each draw.
+
+Verified with a Playwright test driving the actual production
+`index.html`/`app.js`/`nodes.js` in a real Chromium browser (network calls
+intercepted and mocked), proving via live DOM node reference identity
+(`document.body.contains()`/`td.contains()` on captured node handles, not
+just comparing rendered HTML strings) that: an unchanged refresh reuses every
+row and every cell untouched; a refresh with one field changed on one device
+reuses that row's `<tr>` and patches only the changed cell, leaving its other
+cells and every other device's row completely untouched; a reorder moves
+existing nodes rather than recreating them; and device removal/re-addition
+behave correctly with no cache corruption.
+
 ---
 
 ## Critical Issues (Fix Before Production)
