@@ -76,8 +76,13 @@ path monitor into a usable fleet monitor.
   paramiko fake SSH device exercises ConfigRX's capture chain directly.
 - **A timed incident campaign** (`demo/scenario.py`) at 250, 1,000 and 2,000
   devices: baseline, core-switch outage taking its downstream access switches,
-  port-flap storm, reboots, authentication failures, trap and syslog burst,
-  NetFlow burst, recovery. Alerts, emails at a local SMTP sink, poll counters,
+  outage recovery, port-flap storm, reboots, authentication failures, trap and
+  syslog burst, NetFlow burst, final recovery. (A first pass of this campaign
+  taught the harness two things about the application that are findings in
+  their own right: a simulated device that stops answering SNMP is still *up*
+  while loopback answers ping, so the ping shim now consults the fleet; and the
+  API session signed the campaign script out after ten minutes, so the client
+  now re-authenticates on 401. See §4.4 N15 and §4.3 F27.) Alerts, emails at a local SMTP sink, poll counters,
   overruns, process CPU and RSS were sampled before and after each step.
 - **A Playwright walk** (`demo/ui_walk.mjs`) of all twelve tabs, every subtab
   and every dialog, capturing screenshots, console errors, failed requests and
@@ -267,6 +272,8 @@ thresholds are `ping_rtt_ms` and `ping_loss_pct`.
 | F22 | notable | `count` inflates by 12/minute on threshold alerts and is printed in the email ("occurred 8640 time(s)"). | `alertengine.py:678-695` | increment on new sample only; **S** |
 | F23 | notable | `duration_text(0.4)` renders "0 s" — the case its docstring says it avoids. Seen live in a recovery mail. | `alertmail.py:132-138` | round first; **S** |
 | F24 | severe | No dependency map: a core failure is N independent alerts; interface alerts on the upstream's ports are excluded from rollup by design. | `alertrules.py:142-189`, `:158-162` | upstream-device field (manual or seeded from NetPath), consulted before opening `device_down`; **L**, very high value |
+| F26 | severe | Six unrelated rules are bound to the `device_down` email template, whose subject is "{{device_name}} is not responding": `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down`, `interface_flapping`. CONFIRMED in the demo: adding 250 devices produced 234 emails titled "acc-sw-070 is not responding" that were actually "vendor MIB not uploaded". An operator reading the inbox sees a site outage that is not happening. | `alertsdb.py:217-222`, `alertmail.py:20` | one generic "{{rule_name}}: {{entity_label}}" template for non-outage rules; **S** |
+| F27 | severe | Onboarding storm: every device with a recognised enterprise arc and no uploaded MIB opens `mib_missing` on its first poll. 234 alerts and their emails within the first minute of seeding 250 devices; with the default 300 s grace they are held, then fire anyway because the condition persists. Nothing bulk-resolves them and the rule has no auto-resolve. CONFIRMED. | `nodepoll.py:1390`, `alertsdb.py:220` | ship `mib_missing` disabled or severity 7 with no email; bulk-resolve by rule; **S** |
 | F25 | notable | Missing NOC essentials: top-N noisy devices, alert history/MTTR report, SLA/uptime report (segments already computed in `device_status_segments`), per-site filter, export, ticket link, runbook URL, appendable notes, desktop notification. | `alertsdb.py:675-695`, `nodesdb.py:1558-1592` | top-N and CSV **S**; runbook column **S**; site filter and SLA **M** |
 
 ### 4.4 Security and credentials
@@ -297,6 +304,7 @@ thresholds are `ping_rtt_ms` and `ping_loss_pct`.
 | N12 | notable | Maintenance "prune" actions delete *everything* (`prune(0, 0)`), including all config backups, with no typed confirmation. | `api.py:876-913` | require `confirm` and log counts; **S** |
 | N13 | notable | Slowloris: no handler timeout, no connection cap, 128 MiB max body. PLAUSIBLE. | `server.py:316`, `:367`, `:565-568` | `timeout = 30`, bounded pool; **S** |
 | N14 | notable | Chunked request bodies are treated as empty (a proxy forwarding chunked POSTs would execute defaults). CONFIRMED. | `server.py:369-381` | reject `Transfer-Encoding`; **S** |
+| N15 | notable | Scripts are signed out after the idle timeout regardless of API activity: the timeout counts browser heartbeats only, so a polling automation loses its session after 10 min (the campaign's snapshots went blank at exactly that point) and must re-login; there is no API token or service account and no documented heartbeat for non-browser clients. CONFIRMED in the demo. | `auth.py:180-193`, `app.js:136-216` | API tokens, or a documented `/api/heartbeat` for scripts; **S/M** |
 | — | absent | LDAP/AD/SAML/RADIUS/TACACS+, MFA, API tokens or service accounts, per-site RBAC, password expiry, persisted failed-login records, on-disk audit log. | `permissions.py:16-19`, `FEATURES.md:48` | procurement gates for a regulated network; **L** |
 
 ### 4.5 Performance and scale
@@ -416,6 +424,7 @@ weighted by effort. "Where" names the code that already carries the mechanism.
 5. **SMTP off the tick**: sender queue thread, failures count against the quota, breaker after N failures — `alertengine.py:1218-1228`. **M.**
 6. **Fix `renotify_minutes`** (`last_notified_ts`) and give momentary-event rules an `auto_resolve_after_s` — `alertengine.py:1146-1152`, `alertrules.py:115-135`. **M.**
 7. **Trap identity and severity**: entity `source:oid`, carry `traps.severity`, apply the gate to traps, real "unmanaged" check — `alertengine.py:504-509`, `:1116`. Syslog dedup on a message signature — `:535-539`.
+7a. **Stop non-outage rules emailing "is not responding"**: give `mib_missing`, `device_auth_fail`, `device_unsupported`, `poll_overrun`, `interface_down` and `interface_flapping` their own subjects — `alertsdb.py:217-222`; ship `mib_missing` without email.
 8. **SNMPv1 interface GET split** — `nodepoll.py:1642-1645`. Every v1-only switch and PLC is invisible until this lands.
 9. **Advance SNMPv3 engineTime** — `nodepoll.py:1145`, `:1164-1171`.
 10. **Security blockers**: server-side `must_change` (`server.py:_route`), the `debug` settings scope escalation (`server.py:48-56`), signed or pinned self-update with an off switch (`selfupdate.py`), stored-SMTP-password exfiltration (`api.py:3265-3298`), database file modes (`__main__.py:20-27`), and the two stale "no authentication yet" strings.
@@ -488,6 +497,8 @@ Documented only, per the reviewer's instruction. Each is CONFIRMED unless noted.
 20. `netpath/alertengine.py:672-676` — treat a metric whose `last_ts` is older than 3 × the device's poll interval as absent: clear the streak and resolve.
 21. `netpath/alertengine.py:1042-1051` — while `nodes_db.device(id)["status"] == "down"`, keep `ROLLS_UP` children suppressed even if the parent alert was operator-resolved.
 22. `netpath/alertmail.py:132-138` — `total = int(round(total))` before the `<= 0` test. `:104-108` — append `%z`.
+22a. `netpath/alertsdb.py:217-222` — bind `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down` and `interface_flapping` to a new generic template (`subject: "SappiWhere: {{rule_name}} — {{entity_label}}"`) instead of `device_down`; seed `mib_missing` with `notify = 0`.
+22b. `netpath/auth.py:180-193` — accept a `heartbeat` on any authenticated API request that carries an `X-Sappiwhere-Client: script` header, or add long-lived API tokens (`api_tokens` table, `Authorization: Bearer`), so automation is not signed out by the browser idle rule.
 23. `netpath/web/server.py:_route` — when `app_db.user(username)["must_change"]`, refuse every route except `/api/session`, `/api/logout`, `/api/state`, `/api/password`.
 24. `netpath/web/server.py:48-56` — return `("settings", W)` for any scope `post_settings` does not dispatch explicitly; `api.py:841-862` — filter the returned settings through the same rule `get_state` uses.
 25. `netpath/selfupdate.py` — pin to a signed tag or a published SHA-256; add `updates_enabled` (default false) checked in `apply()` and `post_update`.
