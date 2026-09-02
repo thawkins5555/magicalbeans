@@ -266,7 +266,7 @@ class WirelessPoller:
         return values
 
     def _snmp_get_next(self, controller, config: dict, oid: str):
-        version = int(config.get("snmp_version") or 1)
+        version = int(config.get("snmp_version", 1))
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
         try:
             if version in (0, 1):

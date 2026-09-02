@@ -103,7 +103,7 @@ def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
     blob decrypted immediately before use and never cached. `config` is
     already the effective_config() merge of a device's own overrides over
     its group's defaults."""
-    if int(config.get("snmp_version") or 1) == 3:
+    if int(config.get("snmp_version", 1)) == 3:
         identity = config.get("v3_user")
     else:
         identity = config.get("community")
@@ -175,7 +175,7 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
 def _credential_label(config: dict) -> str:
     """How to name the credential in an operator-facing message, without
     ever printing the credential itself: a community string is a secret."""
-    version = int(config.get("snmp_version") or 1)
+    version = int(config.get("snmp_version", 1))
     if version == 3:
         user = config.get("v3_user")
         return f"SNMPv3 user {user!r}" if user else "SNMPv3 (no user set)"
@@ -791,7 +791,7 @@ class NodePoller:
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
         """One GET round trip against a device, handling v1/v2c/v3
         (noAuthNoPriv/authNoPriv only) transparently."""
-        version = int(config.get("snmp_version") or 1)
+        version = int(config.get("snmp_version", 1))
         timeout_s = float(config.get("snmp_timeout_s", 3.0))
         retries = int(config.get("snmp_retries", 2))
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
@@ -1396,7 +1396,7 @@ class NodePoller:
         "this switch cannot tell us" from "it can, and this port has learned
         nothing" on a device whose global context answers neither.
         """
-        if int(config.get("snmp_version") or 1) == 3:
+        if int(config.get("snmp_version", 1)) == 3:
             return [], False
         community = config.get("community")
         if not community:
@@ -1609,7 +1609,7 @@ class NodePoller:
         return bases
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
-        version = int(config.get("snmp_version") or 1)
+        version = int(config.get("snmp_version", 1))
         timeout_s = float(config.get("snmp_timeout_s", 3.0))
         retries = int(config.get("snmp_retries", 2))
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
