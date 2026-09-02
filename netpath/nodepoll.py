@@ -1741,14 +1741,12 @@ class NodePoller:
         settings = self.db.settings()
         max_repetitions = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
         max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
-        # Deliberately NOT the `config.get("snmp_version") or 1` fallback
-        # `_walk_request`/`_snmp_get`/`_snmp_get_next` use for framing —
-        # that coercion is what silently polls a v1-configured device as
-        # v2c elsewhere (a known, documented, out-of-scope quirk); GETBULK
-        # itself does not exist in v1, so whether to use it is decided on
-        # the raw configured version, with 0 (v1) the only value that says
-        # no. Framing (build_request vs build_v3_request) is unaffected —
-        # v1 and v2c share the same community-based wire format either way.
+        # GETBULK does not exist in v1, so whether to use it is decided on
+        # the configured version with 0 (v1) the only value that says no —
+        # an absent version means v2c, the same default `_walk_request`,
+        # `_snmp_get` and `_snmp_get_next` apply for framing. Framing
+        # (build_request vs build_v3_request) is unaffected either way: v1
+        # and v2c share the same community-based wire format.
         raw_version = config.get("snmp_version")
         is_v1 = raw_version is not None and int(raw_version) == 0
         use_bulk = not is_v1 and max_repetitions > 0
@@ -2480,7 +2478,7 @@ class NodePoller:
         every walk here is over a single column, so there is nothing to
         exempt from repetition. Ignored by `build_request`/`build_v3_request`
         for a non-GETBULK `pdu_tag`, so a v1 caller can pass it unused."""
-        version = int(config.get("snmp_version") or 1)
+        version = int(config.get("snmp_version", 1))
         if version in (0, 1):
             identity, _proto, _pw = credential_for(config)
             packet = build_request(version, identity or "public", pdu_tag,

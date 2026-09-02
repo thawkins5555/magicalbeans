@@ -486,7 +486,7 @@ point now. A switch that is down or whose last poll failed is not walked.
 A MAC that leaves a port is not erased on the next walk: it is kept, marked
 absent, with the time it was last confirmed, so the Find box can still say
 where it was; entries no walk has refreshed for the retention window (a
-week by default, **Alerts** aside, set under **Nodes → Settings**) are then
+week by default, set under **Nodes → Settings**) are then
 dropped.
 
 **Vendor and Location can be read from an OID you choose.** Vendor is

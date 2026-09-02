@@ -66,6 +66,15 @@ Listed newest first. Version numbers are build order, not dates.
   seen — on which switch and which port — for as long as the retention window
   (a week by default). A MAC that moved between ports shows the port it is on
   now first, and where it used to be underneath.
+- **SNMPv1 is now actually spoken.** 4.33.0 recorded that a device configured
+  for v1 went on the wire as v2c, because the poller resolved its version as
+  "the configured value, or 1" and v1 is stored as 0. Every such site now
+  defaults only a missing version, never an explicit v1, and the new table
+  walker follows the same rule: a v1 device is walked with GETNEXT in real v1
+  frames. The guard that reads a v1 device's custom identity OIDs in a
+  separate request, which that coercion had made unreachable, now protects
+  the devices it was written for.
+
 ### 4.33.1 — Tests you can actually run
 
 - **The end-to-end suites now live in the repository, under `tests/`, and
