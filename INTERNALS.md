@@ -1509,9 +1509,13 @@ unmeasurable.
 threshold alert clears by being re-evaluated and found to have recovered, which
 never happens for a destination that was disabled or deleted. The sweep
 resolves open netpath alerts whose entity is not in the current enabled-target
-set, with `resolved_by = "destination no longer traced"`, and sends no clear
-email — nobody needs telling that a destination they just turned off stopped
-being measured.
+set and sends no clear email — nobody needs telling that a destination they
+just turned off stopped being measured. It writes `resolved_by = ''`, the
+same marker every other engine auto-resolve uses: the descriptive string it
+used to write ("destination no longer traced") read to
+`operator_resolved_since` as a hand resolve, which would have kept a
+destination that is re-enabled and breaching the same rule again suppressed
+for the whole seven-day window. See "Operator resolves stick" below.
 
 **There is deliberately no per-hop rule.** Intermediate routers rate-limit ICMP
 as policy (`monitor.classify`'s docstring is explicit that only the destination
@@ -1660,18 +1664,58 @@ opened again as a new row on the next tick — new id, unticked, a fresh
 notification. "Bulk resolve does nothing" was this, five seconds later.
 
 The rule now: **an operator's resolve closes the breach run it was made
-in.** Both `_evaluate_thresholds` and `_evaluate_netpath_thresholds` keep
-`first_breach_ts` in their streak state (the NetPath streak gained it for
-this), and once per tick the engine loads
+in.** All three threshold evaluators — `_evaluate_thresholds`,
+`_evaluate_dhcp_thresholds` and `_evaluate_netpath_thresholds` — keep
+`first_breach_ts` in their streak state (the NetPath streak gained it in
+4.34.0, the DHCP streak in 4.37.0), and once per tick the engine loads
 `AlertsDatabase.operator_resolved_since(cutoff)` — `dedup_key → latest
 resolved_ts` over resolved rows whose `resolved_by` is neither `''` nor
 `'engine'`, within `OPERATOR_RESOLVE_WINDOW_S` (seven days), served by
-`ix_alerts_dedup_state (dedup_key, state, resolved_ts)`. A breach whose
+`ix_alerts_state_resolved (state, resolved_ts, dedup_key)`. A breach whose
 `first_breach_ts` is at or before that timestamp is the run the operator
 already closed and produces no occurrence. A clear observation resets
 `first_breach_ts`, so the next breach is a new run and opens normally.
 Every resolve a person makes goes through the API with a session username,
-so "non-empty and not `engine`" is exactly "resolved by hand".
+so "non-empty and not `engine`" is exactly "resolved by hand" — written
+`COALESCE(resolved_by, '') NOT IN ('', 'engine')`, since a NULL from an
+older build would otherwise make the predicate NULL and drop the row from
+a WHERE clause asked either way round.
+
+That index leads with `(state, resolved_ts)` because this is a range scan
+over recent resolves. Its predecessor `ix_alerts_dedup_state` led with
+`dedup_key`, the one column the query does not constrain, so SQLite walked
+every resolved alert in the table on every tick. `_migrate` drops the old
+index and creates the new one — an index, never in `SCHEMA`; see the
+storage-layer rule above.
+
+**A resolve of a rollup parent covers the children it was hiding**
+(`_parent_operator_resolved`, 4.37.0). A child is suppressed only while its
+parent is open or acknowledged (`_rollup_parent` → `open_by_dedup`), so
+resolving "Device not responding" for a device that is still down released
+every alert that outage was covering: a dead device records
+`ping_loss_pct = 100` on every poll, so "Packet loss to device high" was
+guaranteed to be breaching and opened one new row and one new email per
+device on the next tick. The gate above could not see it — it is keyed on
+the *child's* dedup key, which no person ever resolved, and the engine
+deliberately absorbs children with `resolved_by = ''` so they stay free to
+re-open. `_apply` therefore asks, when `_rollup_parent` finds nothing and
+`ROLLED_UP_BY` names a parent, whether that parent's dedup key is in the
+per-tick `_operator_resolves` cache and whether its condition still holds:
+for `device_down` that the device's `status` is still `"down"` (exactly
+`_still_true`'s predicate for a held `down` occurrence), and for a parent
+with no such state to re-read (`netpath_unreachable`) that the child's own
+`first_breach_ts` is at or before the resolve. If so the occurrence is
+counted `rolled_up` and dropped, with no rollup note — there is no open
+parent row to write one onto. Widening `open_by_dedup` to resolved rows was
+rejected: that would suppress children forever. This ends by itself, the
+moment the device answers again, and a child still breaching on its own
+account (a device that is up but lossy) opens normally.
+
+It costs no query. The parent's rule comes from `_rules_by_key`, rebuilt
+once per tick from the rule list `_tick` already reads; the hand resolve
+comes from the per-tick `_operator_resolves` cache; and the device read
+behind the condition is memoised per tick in `_parent_conditions`, so N
+children of one dead device ask once.
 
 Two engine paths used to write descriptive strings into `resolved_by` —
 the NetPath sweep for a destination no longer traced, and a child alert
@@ -1686,6 +1730,19 @@ after a restart every streak rebuilds from scratch, `first_breach_ts`
 becomes "since restart", and a still-breaching alert an operator resolved
 before the restart re-opens once. The seven-day window is a backstop, not
 the mechanism — a clear ends suppression long before it matters.
+
+**Device events are transitions, and `auth_fail` had stopped being one**
+(`nodepoll._poll_device`). The up/down/unsupported events are recorded on a
+change of state; `auth_fail` was recorded on *every* poll that failed with
+an authentication error, so "SNMP authentication failing" re-opened within
+a poll interval however often it was resolved — the credentials are wrong
+until somebody fixes them, and the poller was reporting that as news each
+minute. It is now recorded when this poll fails on auth and the previous
+one did not (a different auth error counts as a new fact; an identical
+repeat does not). Its clear, `auth_ok`, had never fired at all: it tested
+`previous["snmp_ok"] is False`, and SQLite hands back `1`, `0` or `NULL` —
+never a Python `False`. The test is `== 0`, which `None` correctly fails,
+so a device that has never been polled is not a recovery.
 
 ### Newly added device hold (`alertengine.py`, `alertsdb.py`)
 

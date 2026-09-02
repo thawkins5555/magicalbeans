@@ -302,6 +302,53 @@ def main():
     assert reboot_events, "no 'rebooted' device_event recorded despite uptime reset"
     print("poll 8: device recovers to 'up' and a 'rebooted' event fires OK")
 
+    # --- polls 9-12: SNMP authentication events are TRANSITIONS
+    # A credential that is wrong stays wrong on every poll, so recording
+    # auth_fail each time meant "SNMP authentication failing" re-opened
+    # within a poll interval however often an operator resolved it. And the
+    # clear compared the device row's snmp_ok — SQLite hands back 0, 1 or
+    # None, never a Python False — with `is False`, so auth_ok had never
+    # fired at all. The failure is injected at the credential call rather
+    # than in the stub agent, because the event logic under test is in
+    # _poll_device and this keeps the stub what workstream A shipped.
+    from netpath.nodepoll import _AuthFailure
+
+    real_scalars = poller._poll_snmp_scalars_with_credential
+    auth_message = ["authentication failure (wrong community)"]
+
+    def failing_auth(device, config):
+        raise _AuthFailure(auth_message[0])
+
+    def auth_kinds():
+        return [e["kind"] for e in db.device_events(device_id)
+                if e["kind"] in ("auth_fail", "auth_ok")]
+
+    before = auth_kinds()
+    poller._poll_snmp_scalars_with_credential = failing_auth
+    do_poll()
+    do_poll()
+    after = auth_kinds()
+    assert after.count("auth_fail") == before.count("auth_fail") + 1, \
+        f"two failing polls must record ONE auth_fail, got {after}"
+    print("poll 9-10: two identical auth failures record one auth_fail OK")
+
+    auth_message[0] = "authentication failure (wrong v3 user)"
+    do_poll()
+    changed = auth_kinds()
+    assert changed.count("auth_fail") == after.count("auth_fail") + 1, \
+        f"a different auth error is a new fact and is recorded: {changed}"
+    print("poll 11: a different auth error records another auth_fail OK")
+
+    poller._poll_snmp_scalars_with_credential = real_scalars
+    do_poll()
+    cleared = auth_kinds()
+    assert cleared.count("auth_ok") == before.count("auth_ok") + 1, \
+        f"SNMP working again after a failure must record one auth_ok, got {cleared}"
+    do_poll()
+    assert auth_kinds().count("auth_ok") == cleared.count("auth_ok"), \
+        "auth_ok is a transition too: a second good poll records nothing"
+    print("poll 12-13: SNMP works again -> exactly one auth_ok OK")
+
     poller.shutdown()
     agent.stop()
     db.close()
