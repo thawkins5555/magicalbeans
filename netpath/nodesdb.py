@@ -180,8 +180,9 @@ CREATE TABLE IF NOT EXISTS mac_entries (
 );
 CREATE INDEX IF NOT EXISTS ix_mac_entries_mac ON mac_entries(mac);
 CREATE INDEX IF NOT EXISTS ix_mac_entries_seen ON mac_entries(seen_ts);
-CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present
-    ON mac_entries(mac, present, seen_ts);
+-- ix_mac_entries_mac_present (mac, present, seen_ts) is created in _migrate,
+-- NOT here: this script runs before the migration, and on a database from
+-- before 4.34 the `present` column does not exist yet when it runs.
 
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
@@ -644,6 +645,10 @@ class NodesDatabase:
         if "present" not in mac_entries:
             self._conn.execute(
                 "ALTER TABLE mac_entries ADD COLUMN present INTEGER NOT NULL DEFAULT 1")
+        # Here and not in SCHEMA's CREATE INDEX block: that script runs
+        # before this, and on a pre-4.34 database `present` only exists once
+        # the ALTER above has run. 4.34.0 had it in both places and could not
+        # open any existing nodes.db.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
             " ON mac_entries(mac, present, seen_ts)")

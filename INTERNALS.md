@@ -89,6 +89,18 @@ through an `RLock` (`db.py`, `appdb.py`) or plain `Lock`
 SQL, since `check_same_thread=False` lets any worker thread use the
 connection directly.
 
+**Indexes on migrated columns go in `_migrate()`, never in `SCHEMA`.** The
+schema script runs first, and `CREATE TABLE IF NOT EXISTS` on an existing
+table adds nothing, so a `CREATE INDEX` in that script that names a column
+the migration is about to add fails with "no such column" on every database
+from an earlier release — and `executescript` aborts the whole script, so
+nothing opens. A fresh database never shows it, which is exactly why a test
+suite that starts from empty files cannot catch it. 4.34.0 shipped one of
+these (`ix_mac_entries_mac_present`) and would not start on an upgraded
+install; `tests/test_upgrade_from_previous.py` now opens databases in the
+previous release's shape, and `nodesdb.py` carries the rule at both the
+schema and the migration site.
+
 **Size caps** share one algorithm across `Database.trim_to_size()`,
 `FlowDatabase.trim_to_size()`, `SyslogDatabase.trim_to_size()` and
 `IpamDatabase.trim_to_size()`: while the file is over its cap, delete the
