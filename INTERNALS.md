@@ -3731,6 +3731,73 @@ also ticked the checkbox would be worse than no help. The first entries are
 the profile editor's Ping and SNMP checkboxes and the device form's matching
 selectors, sharing the same two keys.
 
+### SSH host keys (`hostkeys.py`, `configrxdb.ssh_host_keys`)
+
+`netpath/hostkeys.py` owns one table, `ssh_host_keys` in configrx.db, keyed
+by `(host, port)`: `key_type`, `key_b64` (paramiko's `get_base64()`, the
+wire form a known_hosts line carries), `fingerprint`, `first_seen_ts`,
+`last_seen_ts`, `trusted_by`. It is keyed by address rather than by device
+id because a host key belongs to the endpoint, not to the Nodes row pointing
+at it, and two device rows for one address must not each remember a
+different key. It lives in configrx.db because that is where SSH for these
+devices already lives, but it is not ConfigRX's alone — the terminal writes
+and checks the same rows. `HostKeyStore(configrx_db)` is the whole API:
+`prepare(client, host, port)` loads the remembered key into an `SSHClient`
+under paramiko's own naming (the bare host on port 22, `[host]:port`
+otherwise) so paramiko itself checks the connection; `policy(host, port)`
+is the `MissingHostKeyPolicy` for what paramiko finds unknown;
+`trust(host, port, key, by)` replaces; `record_seen` touches last-seen;
+`forget` removes; `as_changed(exc, host, port)` maps paramiko's own
+`BadHostKeyException` to the app's `HostKeyChanged`. The table is new, so
+it ships in SCHEMA with its primary key and no other index — every read is
+a `(host, port)` lookup.
+
+**Compared by bytes, never by name.** A host key is identified by
+`key.asbytes()` and fingerprinted as OpenSSH does — `SHA256:` plus unpadded
+base64 of the SHA-256 of those bytes — so what the app displays can be read
+against `ssh-keyscan` or `ssh-keygen -lf` output. Comparing by `get_name()`
+would be wrong twice over: an RSA host key negotiates as `rsa-sha2-256` or
+`-512` while the key object still calls itself `ssh-rsa`, so the same key
+arrives under more than one label; and a genuinely different key of the
+same type would compare equal.
+
+**First connection, and a change.** The first time this app reaches a host
+on a port, the policy stores the key it was shown and lets the connection
+proceed, leaving the fingerprint on `policy.stored_new` so the caller can
+say so — network gear rarely carries a stable known_hosts entry anywhere,
+and refusing every first connection only teaches operators to click past
+warnings. Afterwards a different key raises `HostKeyChanged`, carrying both
+fingerprints, the new key's type, when the old key was first seen, and the
+new key object itself so a decision to trust it needs no second connection.
+Two code paths produce it — paramiko's `BadHostKeyException` when `prepare`
+loaded a key and the host presented another, and the policy's own refusal
+when a row exists but no key could be loaded — and the policy re-reads the
+store rather than trusting that `prepare` ran.
+
+**What ConfigRX does with it.** `_backup_device` calls `prepare` and
+installs the store's policy in place of the old accept-everything one. A
+changed key fails the backup before anything is sent, with "Host key for
+<ip> changed (was SHA256:… first seen <date>, now SHA256:…). Trust it from
+the SSH window or forget it in ConfigRX." as the device's error and an
+Errors-log event; no capture runs and nothing is stored. The status note
+"(host key stored on first connection)" is appended only to the backup that
+actually stored a key — the old "(host key not previously known)" was
+appended to every backup, because the key was thrown away with the
+connection. Reading a stored key is a `configrx` read (it is shown in
+ConfigRX's device dialog with a Forget button); forgetting one is an `ssh`
+write, since forgetting is what lets the next connection accept whatever it
+is offered; and there is deliberately no HTTP route for trusting a *new*
+key — that decision is only taken with the offered key in hand, over the
+terminal's own socket. Removing a device from Nodes forgets its key.
+
+**The scoped boundary.** "Only `pager_off` + `show_config` are ever sent"
+remains true and is still the point of `configrx_vendors.py`, but it is now
+a property of the **backup path** rather than of the application: the
+terminal in `sshterm.py` is a real shell a person types into, behind its
+own `ssh` permission that nobody holds by default, and it neither uses the
+vendor table nor reaches `_pull_config`. The two features share exactly one
+thing, the host-key store.
+
 ### The SSH window (`static/ssh.html`, `ssh.js`, `ssh.css`)
 
 A standalone page in `login.html`'s shape: it loads `app.css` for the
