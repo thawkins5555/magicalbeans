@@ -500,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, 400)
             except Exception as exc:
                 traceback.print_exc()
-                self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+                self._json({"error": "Internal Server Error"}, 500)
             return
 
         if path.startswith("/api/"):

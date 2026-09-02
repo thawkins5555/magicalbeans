@@ -119,6 +119,10 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS ix_devices_group ON devices(group_id);
 CREATE INDEX IF NOT EXISTS ix_devices_status ON devices(status);
+-- devices() always orders by this pair (with or without a WHERE clause), so
+-- this index lets SQLite satisfy the ORDER BY directly instead of a
+-- full-table sort on every Nodes page load.
+CREATE INDEX IF NOT EXISTS ix_devices_name_ip ON devices(name COLLATE NOCASE, ip);
 
 CREATE TABLE IF NOT EXISTS interfaces (
     id              INTEGER PRIMARY KEY,
@@ -211,6 +215,14 @@ CREATE TABLE IF NOT EXISTS interface_events (
     detail          TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_interface_events_ts ON interface_events(ts);
+-- The interface_id counterpart to ix_device_events_device_ts above. Every
+-- per-interface read (interface_events(interface_id=...),
+-- recent_interface_events_for, interface_events_for_device's join) is
+-- keyed on it; without this SQLite scans or auto-indexes the whole table
+-- on each call, growing with the fleet's total history rather than the
+-- one device's.
+CREATE INDEX IF NOT EXISTS ix_interface_events_iface_ts
+    ON interface_events(interface_id, ts);
 
 CREATE TABLE IF NOT EXISTS mib_files (
     id              INTEGER PRIMARY KEY,
@@ -849,6 +861,16 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM devices WHERE ip = ?", (ip,)).fetchone()
 
+    def devices_by_ids(self, device_ids: list[int]) -> list[sqlite3.Row]:
+        """device() for many ids in one query. Order is unspecified — callers
+        needing a particular order build a dict keyed by id from the result."""
+        if not device_ids:
+            return []
+        marks = ",".join("?" * len(device_ids))
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT * FROM devices WHERE id IN ({marks})", device_ids).fetchall()
+
     def device_count(self) -> int:
         with self._lock:
             return self._conn.execute(
@@ -969,19 +991,19 @@ class NodesDatabase:
             config[key] = value
         if config.get("snmp_version") is None:
             config["snmp_version"] = 1
+        settings = self.settings()  # fetched once; every fallback below reuses it
         if config.get("poll_interval_s") is None:
-            config["poll_interval_s"] = self.settings().get("default_interval_s", 120)
+            config["poll_interval_s"] = settings.get("default_interval_s", 120)
         if config.get("snmp_timeout_s") is None:
-            config["snmp_timeout_s"] = self.settings().get("default_snmp_timeout_s", 3.0)
+            config["snmp_timeout_s"] = settings.get("default_snmp_timeout_s", 3.0)
         if config.get("snmp_retries") is None:
-            config["snmp_retries"] = self.settings().get("default_snmp_retries", 2)
+            config["snmp_retries"] = settings.get("default_snmp_retries", 2)
         if config.get("ping_enabled") is None:
             config["ping_enabled"] = 1
         if config.get("snmp_enabled") is None:
             config["snmp_enabled"] = 1
         if config.get("oid_set") is None:
             config["oid_set"] = "auto"
-        settings = self.settings()
         if config.get("ping_count") is None:
             config["ping_count"] = settings.get("ping_count", 3)
         if config.get("ping_timeout_ms") is None:
@@ -1447,6 +1469,36 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM interface_events WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(last_id), int(limit))).fetchall()
+
+    def interface_events_for_device(self, device_id: int, since_s: float | None = None,
+                                    per_interface: int = 300) -> list[sqlite3.Row]:
+        """interface_events() for every interface of a device in one query,
+        joined against `interfaces` (whose if_index/descr the caller wants
+        alongside each event) so the per-interface fan-out of one
+        interface_events() call per port is a single round trip instead.
+
+        The cap is per interface, not per device, on purpose: it keeps the
+        contract the fan-out had (interface_events()'s own default of the
+        newest 300 per port). A single flat LIMIT would let one port that
+        flaps continuously fill the whole result and erase every other
+        port's link history from the detail pane."""
+        clauses = ["i.device_id = ?"]
+        params: list = [device_id]
+        if since_s is not None:
+            clauses.append("e.ts >= ?")
+            params.append(time.time() - since_s)
+        where = " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT id, interface_id, ts, kind, detail, if_index, descr FROM ("
+                f"SELECT e.id, e.interface_id, e.ts, e.kind, e.detail,"
+                f" i.if_index, i.descr,"
+                f" ROW_NUMBER() OVER (PARTITION BY e.interface_id ORDER BY e.ts DESC) AS rn"
+                f" FROM interface_events e"
+                f" JOIN interfaces i ON i.id = e.interface_id"
+                f" WHERE {where}"
+                f") WHERE rn <= ? ORDER BY ts DESC",
+                (*params, per_interface)).fetchall()
 
     def max_interface_event_id(self) -> int:
         with self._lock:

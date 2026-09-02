@@ -299,6 +299,22 @@ class Database:
                 (target_id,),
             ).fetchone()
 
+    def last_traces(self, target_ids: list[int]) -> dict[int, sqlite3.Row]:
+        """last_trace() for many targets in one query — target_id -> row.
+        A target with no traces yet is simply absent from the result."""
+        if not target_ids:
+            return {}
+        marks = ",".join("?" * len(target_ids))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT t.* FROM traces t"
+                f" JOIN (SELECT target_id, MAX(started_ts) AS ts FROM traces"
+                f" WHERE target_id IN ({marks}) GROUP BY target_id) latest"
+                f" ON t.target_id = latest.target_id AND t.started_ts = latest.ts",
+                target_ids,
+            ).fetchall()
+        return {row["target_id"]: row for row in rows}
+
     def traces_between(self, target_id: int, t0: float, t1: float) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(

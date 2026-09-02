@@ -156,6 +156,15 @@
     drawTable();
   }
 
+  // device id -> { tr, cells: [rendered <td> html per column], columnsKey }.
+  // drawTable() runs on every poll tick (nodes_refresh_s, 2s by default),
+  // not just on user action, so rebuilding every <tr> from scratch every
+  // cycle is real, recurring cost once the device count is in the hundreds.
+  // Kept across draws so a row whose rendered output hasn't actually
+  // changed reuses its existing DOM node instead of being torn down and
+  // recreated.
+  let rowCache = new Map();
+
   function drawTable() {
     const columns = deviceColumns();
     const checked = view.devicesChecked;
@@ -186,15 +195,58 @@
     }
     const rows = App.sortRows(view.devices, view.deviceSort.key,
                               view.deviceSort.descending, columns);
-    App.drawRows(body, rows, columns, (tr, row) => {
-      tr.className = 'clickable'
+
+    // Changes when the operator picks different columns (Nodes → Settings →
+    // Columns) — a layout change, not a data change, so a row cached under
+    // the old column set is rebuilt rather than cell-diffed against a
+    // <tr> whose <td> count/order no longer matches.
+    const columnsKey = columns.map((c) => c.key).join(',');
+    const seen = new Set();
+    for (const row of rows) {
+      seen.add(row.id);
+      const cellHtml = columns.map((c) => {
+        if (c.cell) return c.cell(row);
+        const raw = row[c.key];
+        const blank = raw === null || raw === undefined || raw === '';
+        return blank ? '\u2014' : escape(raw);
+      });
+      const cached = rowCache.get(row.id);
+      let tr;
+      if (cached && cached.columnsKey === columnsKey) {
+        tr = cached.tr;
+        for (let i = 0; i < cellHtml.length; i++) {
+          if (cached.cells[i] !== cellHtml[i]) {
+            tr.children[i].innerHTML = cellHtml[i];
+            cached.cells[i] = cellHtml[i];
+          }
+        }
+      } else {
+        tr = document.createElement('tr');
+        tr.innerHTML = columns.map((c, i) =>
+          `<td class="${c.numeric ? 'num' : ''}">${cellHtml[i]}</td>`).join('');
+        rowCache.set(row.id, { tr, cells: cellHtml, columnsKey });
+      }
+      const className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
         + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
+      if (tr.className !== className) tr.className = className;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.
+      // Re-wired on every draw regardless of whether the cell was patched:
+      // a plain property assignment, not addEventListener, so redoing it
+      // neither leaks nor accumulates, and it's the only way to pick up
+      // a freshly-replaced checkbox <input> after a cell rebuild.
       const box = tr.querySelector('.nd-check');
       if (box) {
+        // The markup diff can't be trusted for the tick itself: toggleChecked
+        // flips the live `checked` property in place without going through
+        // drawTable, so the cached markup and the real box can disagree. If
+        // the selection then flips back (Clear, select-all, a header click)
+        // the recomputed markup matches the stale cache, the cell is left
+        // alone, and the box would stay in the wrong state. Setting the
+        // property directly is cheap and always right.
+        box.checked = view.devicesChecked.has(row.id);
         box.onclick = (event) => {
           event.stopPropagation();
           toggleChecked(row.id, tr);
@@ -203,9 +255,18 @@
       tr.onclick = () => selectDevice(row.id);
       // Single click keeps its meaning — move the detail pane. A double
       // click opens the device in a dialog, which need not be the selected
-      // one; alerts.js:458 is the same gesture on the templates table.
+      // one; alerts.js's templates table is the same gesture. Assigned on
+      // every draw for the same reason onclick is: a cached <tr> already
+      // carries a handler closed over the previous draw's `row`, and a
+      // plain property assignment replaces it rather than stacking.
       tr.ondblclick = () => deviceDialog(row.id);
-    });
+      body.appendChild(tr);
+    }
+    // Drop cache entries for devices no longer in the list (removed, or
+    // filtered out) so the cache can't grow without bound.
+    for (const id of rowCache.keys()) {
+      if (!seen.has(id)) rowCache.delete(id);
+    }
     table.appendChild(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();

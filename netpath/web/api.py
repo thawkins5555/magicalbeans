@@ -218,8 +218,7 @@ def get_state(service, params, body) -> dict:
 
 # ------------------------------------------------------------------ netpath
 
-def _target_json(service, row) -> dict:
-    last = service.db.last_trace(row["id"])
+def _target_json(service, row, last=None) -> dict:
     keys = row.keys()
     return {
         "id": row["id"],
@@ -240,7 +239,10 @@ def _target_json(service, row) -> dict:
 
 
 def get_targets(service, params, body) -> dict:
-    return {"targets": [_target_json(service, row) for row in service.db.targets()]}
+    rows = service.db.targets()
+    last_traces = service.db.last_traces([row["id"] for row in rows])
+    return {"targets": [_target_json(service, row, last_traces.get(row["id"]))
+                        for row in rows]}
 
 
 def post_target(service, params, body) -> dict:
@@ -688,8 +690,10 @@ def get_debug(service, params, body) -> dict:
 
     workers = []
     running = queued = 0
-    for target in service.db.targets():
-        last = service.db.last_trace(target["id"])
+    targets = service.db.targets()
+    last_traces = service.db.last_traces([target["id"] for target in targets])
+    for target in targets:
+        last = last_traces.get(target["id"])
         work = state.get(target["id"])
         keys = target.keys()
         timeout_s = float(target["timeout_s"]) if "timeout_s" in keys else 2.0
@@ -737,8 +741,10 @@ def get_debug(service, params, body) -> dict:
     ipam_state = service.ipam.state()
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
-        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets()}
-        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers()}
+        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
+            list(ipam_state.get("scan_started", {}).keys()))}
+        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers_by_ids(
+            list(ipam_state.get("poll_started", {}).keys()))}
         for subnet_id, started in ipam_state.get("scan_started", {}).items():
             subnet = subnets_by_id.get(subnet_id)
             ipam_workers.append({
@@ -763,7 +769,8 @@ def get_debug(service, params, body) -> dict:
     node_state = service.node_poller.worker_state()
     node_workers = []
     if node_state:
-        devices_by_id = {d["id"]: d for d in service.nodes_db.devices()}
+        devices_by_id = {d["id"]: d for d in
+                         service.nodes_db.devices_by_ids(list(node_state.keys()))}
         for device_id, work in node_state.items():
             device = devices_by_id.get(device_id)
             label = (device["name"] or device["ip"]) if device else f"device #{device_id}"
@@ -1843,9 +1850,10 @@ def post_nodes_devices_bulk_poll(service, params, body) -> dict:
     """Poll now for every ticked device — the bulk-bar counterpart of the
     detail pane's button, which only ever polls the one open device."""
     device_ids = _bulk_device_ids(body)
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
     queued, busy, missing = [], [], []
     for device_id in device_ids:
-        if not service.nodes_db.device(device_id):
+        if device_id not in existing:
             missing.append(device_id)
             continue
         (queued if service.node_poller.poll_now(device_id) else busy).append(device_id)
@@ -2164,14 +2172,11 @@ def get_nodes_device_events(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     since_s = _num(params, "since_s", None)
     device_events = service.nodes_db.device_events(device_id=device_id, since_s=since_s)
-    interface_events = []
-    for iface in service.nodes_db.interfaces(device_id):
-        for ev in service.nodes_db.interface_events(interface_id=iface["id"], since_s=since_s):
-            interface_events.append({
-                "id": ev["id"], "interface_id": ev["interface_id"],
-                "if_index": iface["if_index"], "descr": iface["descr"],
-                "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]})
-    interface_events.sort(key=lambda e: e["ts"], reverse=True)
+    interface_events = [
+        {"id": ev["id"], "interface_id": ev["interface_id"],
+         "if_index": ev["if_index"], "descr": ev["descr"],
+         "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]}
+        for ev in service.nodes_db.interface_events_for_device(device_id, since_s=since_s)]
     return {
         "device_events": [
             {"id": r["id"], "ts": r["ts"], "kind": r["kind"], "detail": r["detail"]}
@@ -3559,9 +3564,10 @@ def post_configrx_devices_bulk_config(service, params, body) -> dict:
                       "ssh_username")}
     if not fields:
         raise ValueError("Nothing to update")
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
     updated = []
     for device_id in device_ids:
-        if service.nodes_db.device(device_id):
+        if device_id in existing:
             service.configrx_db.update_device_config(device_id, **fields)
             updated.append(device_id)
     service.log.add(CONFIGRX_CATEGORY,
@@ -3583,9 +3589,12 @@ def post_configrx_devices_bulk_backup(service, params, body) -> dict:
     the server, not twelve facts about twelve switches.
     """
     device_ids = _bulk_device_ids(body)
+    # One query for the whole selection rather than device() per id, the
+    # same shape post_nodes_devices_bulk_poll uses.
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
     queued, busy, missing, not_enabled = [], [], [], []
     for device_id in device_ids:
-        if not service.nodes_db.device(device_id):
+        if device_id not in existing:
             missing.append(device_id)
             continue
         config = service.configrx_db.device_config(device_id)
