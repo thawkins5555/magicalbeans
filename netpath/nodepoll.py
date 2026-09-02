@@ -26,8 +26,8 @@ from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase, detected_vendor
 from .snmppoll import (
-    ERROR_STATUS, PDU_GET, PDU_GETNEXT, PDU_REPORT, Response, SnmpError,
-    SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
+    ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
+    SnmpError, SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
     decode_response, discovery_probe,
 )
 from .trapdecode import localized_key
@@ -1707,10 +1707,24 @@ class NodePoller:
 
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False) -> dict[str, object]:
-        """Repeated GETNEXT (works for v1/v2c/v3 alike, avoiding a separate
-        GETBULK code path) over one table column: index suffix -> value.
-        Stops when the walk leaves base_oid's subtree or hits a safety
-        cap.
+        """One table column, walked to completion: index suffix -> value.
+
+        v2c and v3 walk with GETBULK — one request answers up to
+        `settings["snmp_bulk_max_repetitions"]` rows instead of one GETNEXT
+        per row, which is where the whole cost of a forwarding-table walk
+        used to go. v1 has no GETBULK PDU and always uses GETNEXT. Either
+        way the walk runs on one shared `_Session` (one UDP socket) rather
+        than opening a fresh one per row. Per response, every varbind is
+        taken in order until the first one that leaves `base_oid`'s
+        subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`, or
+        is not lexicographically after the request (a misbehaving agent
+        echoing itself, or going backwards) — the next request resumes
+        from the last accepted OID. A device that answers a GETBULK with
+        `error_status == 1` (tooBig, its reply would not fit) is retried
+        at half the repetitions; at one repetition it falls back to
+        GETNEXT for the rest of this walk rather than looping on tooBig
+        forever. Stops when the walk leaves the subtree or hits
+        `settings["snmp_walk_max_rows"]` (logged once, not per row).
 
         `noSuchObject`/`noSuchInstance`/`endOfMibView` and "left the
         subtree" are all genuine, substantive "that's the end of the
@@ -1725,28 +1739,75 @@ class NodePoller:
         `raise_on_timeout=True` so a genuine mid-poll timeout is reported
         as the real failure it is instead of masquerading as "this
         device just doesn't have any more rows."""
+        settings = self.db.settings()
+        max_repetitions = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+        max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
+        # Deliberately NOT the `config.get("snmp_version") or 1` fallback
+        # `_walk_request`/`_snmp_get`/`_snmp_get_next` use for framing —
+        # that coercion is what silently polls a v1-configured device as
+        # v2c elsewhere (a known, documented, out-of-scope quirk); GETBULK
+        # itself does not exist in v1, so whether to use it is decided on
+        # the raw configured version, with 0 (v1) the only value that says
+        # no. Framing (build_request vs build_v3_request) is unaffected —
+        # v1 and v2c share the same community-based wire format either way.
+        raw_version = config.get("snmp_version")
+        is_v1 = raw_version is not None and int(raw_version) == 0
+        use_bulk = not is_v1 and max_repetitions > 0
+
         values: dict[str, object] = {}
         current = base_oid
-        for _ in range(512):
-            try:
-                response = self._snmp_get_next(device, config, current)
-            except SnmpTimeout as exc:
-                if raise_on_timeout:
-                    raise SnmpTimeout(
-                        f"{exc} (table walk cut short after {len(values)} row(s))") from exc
-                break
-            except SnmpError:
-                break
-            if not response.varbinds:
-                break
-            vb = response.varbinds[0]
-            oid = vb["oid"]
-            if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
-                break
-            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
-                break
-            values[oid[len(base_oid) + 1:]] = vb["value"]
-            current = oid
+        hit_cap = False
+        session = self._session_for(device, config)
+        try:
+            while True:
+                if len(values) >= max_rows:
+                    hit_cap = True
+                    break
+                try:
+                    pdu_tag = PDU_GETBULK if use_bulk else PDU_GETNEXT
+                    response = self._walk_request(
+                        session, device, config, current, pdu_tag, max_repetitions)
+                except SnmpTimeout as exc:
+                    if raise_on_timeout:
+                        raise SnmpTimeout(
+                            f"{exc} (table walk cut short after {len(values)} row(s))") from exc
+                    break
+                except SnmpError:
+                    break
+                if use_bulk and response.error_status == 1:   # tooBig
+                    if max_repetitions <= 1:
+                        use_bulk = False
+                    else:
+                        max_repetitions = max(1, max_repetitions // 2)
+                    continue
+                if not response.varbinds:
+                    break
+                stop = False
+                for vb in response.varbinds:
+                    oid = vb["oid"]
+                    if not oid or not (oid == base_oid or oid.startswith(base_oid + ".")):
+                        stop = True
+                        break
+                    if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                        stop = True
+                        break
+                    if _oid_key(oid) <= _oid_key(current):
+                        stop = True
+                        break
+                    values[oid[len(base_oid) + 1:]] = vb["value"]
+                    current = oid
+                    if len(values) >= max_rows:
+                        hit_cap = True
+                        stop = True
+                        break
+                if stop:
+                    break
+        finally:
+            session.close()
+        if hit_cap:
+            self.log.add(NODES, f"Table walk of {base_oid} on {device['ip']} "
+                                f"stopped at the {max_rows}-row cap",
+                         target=device["ip"])
         return values
 
     def _walk_indexes(self, device, config: dict, base_oid: str,
@@ -2402,6 +2463,44 @@ class NodePoller:
             return session.request(packet)
         finally:
             session.close()
+
+    def _session_for(self, device, config: dict) -> _Session:
+        """One `_Session` (one UDP socket) for a caller that makes several
+        round trips of its own — `_walk_column`'s whole walk, rather than a
+        fresh socket per row the way `_snmp_get_next`/`_snmp_get` do for
+        their single-request callers."""
+        timeout_s = float(config.get("snmp_timeout_s", 3.0))
+        retries = int(config.get("snmp_retries", 2))
+        return _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
+
+    def _walk_request(self, session: _Session, device, config: dict, oid: str,
+                      pdu_tag: int, max_repetitions: int = 0) -> Response:
+        """One GETNEXT/GETBULK round trip over an already-open session —
+        the same v1/v2c/v3 request assembly `_snmp_get_next` uses, minus
+        opening and closing a socket per call. `non_repeaters` is always 0:
+        every walk here is over a single column, so there is nothing to
+        exempt from repetition. Ignored by `build_request`/`build_v3_request`
+        for a non-GETBULK `pdu_tag`, so a v1 caller can pass it unused."""
+        version = int(config.get("snmp_version") or 1)
+        if version in (0, 1):
+            identity, _proto, _pw = credential_for(config)
+            packet = build_request(version, identity or "public", pdu_tag,
+                                   random.randint(1, 2**16), [oid],
+                                   max_repetitions=max_repetitions)
+            return session.request(packet)
+        identity, auth_proto, password = credential_for(config)
+        engine = self._engines.get(device["id"])
+        if engine is None:
+            engine = self._discover_engine(session, device)
+        engine_id, boots, engine_time, _learned_at = engine
+        auth_key = localized_key(auth_proto, password, engine_id) \
+            if auth_proto and password else None
+        packet = build_v3_request(
+            random.randint(1, 2**16), random.randint(1, 2**16), pdu_tag, [oid],
+            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+            user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
+            max_repetitions=max_repetitions)
+        return session.request(packet)
 
 
 class _AuthFailure(SnmpError):

@@ -1757,13 +1757,17 @@ def get_nodes_mac_search(service, params, body) -> dict:
             "if_index": row["if_index"],
             "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
             "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
+            "first_seen_ts": row["first_seen_ts"],
+            "present": bool(row["present"]),
         })
     # How many devices are actually walking their forwarding tables, so the
     # frontend can say "nothing has been learned yet" rather than "not
     # found" when the feature is simply switched off everywhere. One query,
     # not effective_config() per device — this runs on a keystroke.
     return {"mac": mac, "locations": locations,
-            "enabled_devices": service.nodes_db.mac_walk_enabled_count()}
+            "enabled_devices": service.nodes_db.mac_walk_enabled_count(),
+            "retention_days": float(
+                service.nodes_settings.get("mac_table_retention_days", 7))}
 
 
 def post_nodes_device(service, params, body) -> dict:
