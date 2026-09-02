@@ -6,6 +6,22 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.34.1 — Starts again on an existing database
+
+- **4.34.0 could not open a nodes database from any earlier release, so the
+  application did not start after updating.** The new index on the MAC
+  table's `present` column was created in two places: in the migration, after
+  the column is added, which is right — and in the schema script that runs
+  *before* the migration, which is wrong, because on an existing database the
+  table has no such column yet and the whole script fails on that line. A
+  fresh database never hit it, which is why every test passed: they all
+  start from empty files. The index is now created only by the migration.
+- **A test now opens the previous release's databases.** It rebuilds the MAC
+  table in its 4.33 shape and reopens it, and where the checkout has git
+  history it also creates every database with the previous main commit's
+  code and starts the current application on them — the exact path that
+  failed.
+
 ### 4.34.0 — Resolves that stick, MAC tables you can afford, charts that hold still
 
 - **Resolving an alert now means it stays resolved.** Threshold alerts — a
