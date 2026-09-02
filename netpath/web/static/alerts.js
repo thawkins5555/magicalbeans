@@ -11,6 +11,10 @@
     alerts: [],
     selected: null,
     checked: new Set(),
+    // Set by bulkAction right after a resolve/acknowledge completes ("Resolved
+    // 3 of 3"), shown once in place of the selection count, then cleared at
+    // the top of the very next refresh() — see drawBulkBar.
+    bulkNotice: null,
     // Per session only, like every other table's sort: a saved sort order is
     // a different feature from saved columns, and mixing the two storage
     // models is how Reset layout ends up eating a settings choice.
@@ -229,6 +233,15 @@
 
   function drawBulkBar() {
     const n = view.checked.size;
+    // A just-finished bulk action's result ("Resolved 3 of 3") takes over the
+    // bar for one redraw even though the selection it acted on has already
+    // been cleared — see bulkAction/refresh, which is what makes it go away
+    // again: the bar itself has no independent notion of "transient".
+    if (view.bulkNotice) {
+      App.el('alerts-bulk-bar').hidden = false;
+      App.el('alerts-bulk-count').textContent = view.bulkNotice;
+      return;
+    }
     App.el('alerts-bulk-bar').hidden = n === 0;
     if (n) App.el('alerts-bulk-count').textContent = `${n} selected`;
   }
@@ -247,22 +260,28 @@
   }
 
   async function bulkResolve() {
-    await bulkAction('/api/alerts/bulk-resolve');
+    await bulkAction('/api/alerts/bulk-resolve', 'Resolved', 'resolved');
   }
 
   async function bulkAcknowledge() {
-    await bulkAction('/api/alerts/bulk-ack');
+    await bulkAction('/api/alerts/bulk-ack', 'Acknowledged', 'acknowledged');
   }
 
   /* Both bulk actions have the same shape: act on exactly what is ticked,
      then drop the selection and the detail pane, because either could have
-     changed the state of whatever was on show. */
-  async function bulkAction(path) {
+     changed the state of whatever was on show. `key` is the count the API
+     hands back ({"resolved": n} / {"acknowledged": n}) — read here rather
+     than assumed equal to the selection, since a row someone else already
+     resolved between the tick and the click counts as ticked but not acted
+     on, and a mismatch is exactly what an operator needs to see. */
+  async function bulkAction(path, verb, key) {
     const ids = [...view.checked];
     if (!ids.length) return;
-    await App.post(path, { alert_ids: ids });
+    const result = await App.post(path, { alert_ids: ids });
+    view.bulkNotice = `${verb} ${result[key]} of ${ids.length}`;
     clearSelection();
     view.checked.clear();
+    drawBulkBar();
     App.refreshNow('alerts');
   }
 
@@ -805,6 +824,10 @@
 
   async function refresh() {
     if (App.state.tab !== 'alerts') return;
+    // The bulk-action notice (if any) has already had its one redraw, from
+    // the direct drawBulkBar() call bulkAction makes before kicking off this
+    // very refresh; this is "the next refresh" that retires it.
+    view.bulkNotice = null;
     drawStatus();
     const { t0, t1 } = window_();
     const span = t1 - t0;
