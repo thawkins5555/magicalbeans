@@ -1243,15 +1243,14 @@ class NodePoller:
         # (v1) into 1 (v2c) and would make the branch below unreachable for
         # exactly the devices it protects.
         #
-        # KNOWN, and the reason this split currently protects nobody: _snmp_get
-        # applies that very fallback (`int(config.get("snmp_version") or 1)`),
-        # so a device configured for v1 is actually polled as v2c and the
-        # noSuchName case above cannot arise as things stand. The split is kept
-        # because it is correct the moment that coercion is fixed, and costs one
-        # extra GET only on v1-configured devices that set a custom identity
-        # OID. Fixing the coercion is a separate change: it alters how every
-        # v1-configured device is polled, which is not something to slip into a
-        # release about vendor identification.
+        # _snmp_get's own `int(config.get("snmp_version") or 1)` fallback used
+        # to apply the identical coercion — a configured 0 (v1) collapsing to
+        # 1 (v2c) — which meant a device configured for v1 was actually polled
+        # as v2c and the noSuchName case above could never arise. That
+        # coercion is now fixed (`config.get("snmp_version", 1)` only defaults
+        # a missing key, never an explicit 0), so this split is what actually
+        # protects a v1 device's identity fields, now that v1 devices are
+        # really polled as v1.
         configured_version = config.get("snmp_version")
         is_v1 = configured_version is not None and int(configured_version) == 0
         custom = nodeoids.identity_oid_variants(config)
@@ -2127,7 +2126,7 @@ class NodePoller:
         contexts — the community@vlan path read_mac_table already needs,
         without the per-port filter. Bounded in VLAN count and wall clock
         for the same reason: a trunk switch can carry hundreds of VLANs."""
-        if int(config.get("snmp_version") or 1) == 3:
+        if int(config.get("snmp_version", 1)) == 3:
             return [], False
         community = config.get("community")
         if not community:
