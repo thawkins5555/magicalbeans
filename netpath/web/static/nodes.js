@@ -1794,8 +1794,8 @@
           placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>
         <label>Poll interval <input id="nd-f-interval" type="number" min="10" value="${d.poll_interval_s || ''}"> s</label>
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
-        <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>
-        <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>
+        <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${App.helpLink('nodes.profile.ping')}
+        <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>${App.helpLink('nodes.profile.snmp')}
         <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="1" max="20"
           placeholder="inherit" value="${d.ping_count ?? ''}"></label>
         <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="100" step="100"
@@ -2272,8 +2272,8 @@
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
       <div style="display:flex;justify-content:flex-start;gap:14px">
-        <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>
-        <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>
+        <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>${App.helpLink('nodes.profile.ping')}
+        <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>${App.helpLink('nodes.profile.snmp')}
       </div>
       <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="1" max="20"
         placeholder="inherit" value="${p.ping_count ?? ''}"></label>
@@ -2348,6 +2348,81 @@
     ]);
     box.classList.add('wide');
   }
+
+  /* The "?" texts for the polling-profile and device forms (App.helpLink).
+     Written for the operator, not the developer: what the control changes
+     and what stops happening when it is off. Keep them true to nodepoll's
+     _poll_device — the "down" rule at the end is quoted from its branches. */
+  App.registerHelp({
+    'nodes.profile.ping': {
+      title: 'Ping',
+      html: `
+        <p>The <b>Ping</b> checkbox decides whether every device on this
+        profile is ICMP-pinged as part of each poll. It is on by default, and
+        a device's own edit form can override it per device with the Ping
+        selector there.</p>
+        <p><b>With it ticked</b>, each poll sends several ICMP probes to the
+        device, as many as <b>Ping probes per poll</b> says, waiting
+        <b>Ping timeout</b> for each. That produces three things: whether the
+        device answered at all, its round-trip time, and its packet-loss
+        percentage. The loss and response time are recorded as metrics, so
+        they feed the packet-loss chart in the device dialog and the built-in
+        "Packet loss to device high" and "Ping response time high" alert
+        rules. If the Nodes setting for ping interval is longer than the poll
+        interval, the probes run only on the polls that fall due and the last
+        result is carried forward in between.</p>
+        <p><b>With it unticked</b>, nothing pings the device. No loss or
+        response-time metrics are recorded, those two alert rules have nothing
+        to read, and the packet-loss chart says the device is not being
+        ping-probed.</p>
+        <p><b>It also changes what "down" means</b>, together with the SNMP
+        checkbox beside it:</p>
+        <ul>
+          <li><b>Both ticked:</b> the device is down only when ping and SNMP
+          have both failed. A box that answers ping but has a wrong community
+          string shows as up with an SNMP error, not as an outage. The
+          <b>Down needs both ping and SNMP to fail</b> selector on the same
+          form is what flips that rule for a profile where SNMP failing alone
+          should count as down.</li>
+          <li><b>Ping unticked, SNMP ticked:</b> SNMP is the only evidence, so
+          an SNMP failure is a failure of the device.</li>
+          <li><b>Ping ticked, SNMP unticked:</b> a ping-only device, judged
+          reachable by ping alone.</li>
+        </ul>
+        <p>The two fields under the checkbox and the down rule are per
+        profile, and blank ones inherit the Nodes settings.</p>`,
+    },
+    'nodes.profile.snmp': {
+      title: 'SNMP',
+      html: `
+        <p>The <b>SNMP</b> checkbox decides whether every device on this
+        profile is polled over SNMP as part of each poll, with the profile's
+        credentials (and any additional ones listed below). It is on by
+        default, and a device's own edit form can override it per device with
+        the SNMP selector there.</p>
+        <p><b>With it ticked</b>, each poll reads the device's identity
+        (sysDescr, sysName, sysObjectID, uptime, and the Vendor and Location
+        OIDs if set), its interface table with the traffic and error counters
+        that become per-port bandwidth, the CPU, memory and storage figures
+        its MIBs expose, and any custom MIB assigned to it. Vendor
+        identification, the scheduled MAC-table walk, the OID browser and the
+        port dialogs all depend on it.</p>
+        <p><b>With it unticked</b>, no SNMP request is ever sent to the
+        device: it is a ping-only device. It has no interfaces, no metrics
+        beyond ping loss and response time, no vendor, and no MAC table, and
+        it is judged up or down by ping alone, so the Ping checkbox must stay
+        on for it to be monitored at all.</p>
+        <p><b>Together with Ping it decides what "down" means:</b></p>
+        <ul>
+          <li><b>Both ticked:</b> down only when ping and SNMP have both
+          failed, unless <b>Down needs both ping and SNMP to fail</b> says
+          otherwise.</li>
+          <li><b>SNMP ticked, Ping unticked:</b> an SNMP failure is a failure
+          of the device.</li>
+          <li><b>SNMP unticked, Ping ticked:</b> reachable by ping alone.</li>
+        </ul>`,
+    },
+  });
 
   function editProfile() {
     const g = view.groups.find((x) => x.id === view.groupSelected);

@@ -414,6 +414,72 @@ const App = (() => {
     window.dispatchEvent(new Event('modal-closed'));
   };
 
+  /* ------------------------------------------------------------ help
+     A "?" beside a setting opens a short explanation of what it controls.
+     It is its own layer (#help) above the form modal rather than a second
+     use of #modal, because there is only one modal box and replacing its
+     content would destroy the form the operator is in the middle of
+     editing. Each module registers the texts for its own settings with
+     registerHelp({key: {title, html}}) and drops helpLink(key) into its
+     markup; the click is handled once, by delegation, in start(). Keys are
+     dotted, module first ("nodes.profile.ping"), so two modules can never
+     collide and a grep finds every use. */
+  const HELP = {};
+  // The "?" that opened the panel, so closing it can hand keyboard focus
+  // back to where the operator was rather than dropping it on the body.
+  let helpTrigger = null;
+
+  function registerHelp(entries) {
+    Object.assign(HELP, entries);
+  }
+
+  function helpLink(key) {
+    // A <button>, not an <a>, so it never navigates and never submits;
+    // type="button" for the same reason inside any form. Keep it OUTSIDE
+    // a <label> in the calling markup: a click inside a label activates
+    // the label's control, and a "?" that also ticked the box would be
+    // worse than no help at all.
+    return `<button type="button" class="help-link" data-help="${key}"` +
+           ` title="What does this control?" aria-label="Help">?</button>`;
+  }
+
+  function showHelp(key, trigger = null) {
+    const entry = HELP[key];
+    if (!entry) return;
+    helpTrigger = trigger;
+    let wrap = document.getElementById('help');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'help';
+      wrap.className = 'modal help';
+      wrap.hidden = true;
+      wrap.innerHTML = '<div class="modal-box" id="help-box" role="dialog"' +
+                       ' aria-modal="true" aria-labelledby="help-title"></div>';
+      document.body.appendChild(wrap);
+      wrap.onclick = (event) => { if (event.target === wrap) closeHelp(); };
+    }
+    const box = wrap.querySelector('#help-box');
+    box.innerHTML = `<h2 id="help-title">${entry.title}</h2>` +
+      `<div class="help-body">${entry.html}</div>` +
+      '<div class="row"><button class="primary" id="help-close">Close</button></div>';
+    box.querySelector('#help-close').onclick = closeHelp;
+    wrap.hidden = false;
+    box.querySelector('#help-close').focus();
+  }
+
+  function closeHelp() {
+    const wrap = document.getElementById('help');
+    if (!wrap || wrap.hidden) return;
+    wrap.hidden = true;
+    if (helpTrigger && document.contains(helpTrigger)) helpTrigger.focus();
+    helpTrigger = null;
+  }
+
+  function helpOpen() {
+    const wrap = document.getElementById('help');
+    return Boolean(wrap) && !wrap.hidden;
+  }
+
   /* One confirmation shape for everything that destroys stored data, so
      no button deletes on a single click. Body should name the collateral
      damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
@@ -1044,7 +1110,19 @@ const App = (() => {
       if (event.target.id === 'modal') closeModal();
     };
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') closeModal();
+      // Escape peels one layer: the help panel if it is open, else the
+      // dialog under it. Closing both at once would throw away the form
+      // the operator was reading the help for.
+      if (event.key !== 'Escape') return;
+      if (helpOpen()) closeHelp();
+      else closeModal();
+    });
+    document.addEventListener('click', (event) => {
+      const link = event.target.closest && event.target.closest('.help-link');
+      if (!link) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showHelp(link.dataset.help, link);
     });
 
     try {
@@ -1089,6 +1167,7 @@ const App = (() => {
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, sortRows, canRead, canWrite, accountModal,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,

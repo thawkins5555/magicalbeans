@@ -99,6 +99,11 @@ own subtabs.
   enabled, how many ping probes to send and how long to wait for them,
   and whether SNMP failing on its own counts as down — and can override
   any of it individually. One profile, `Default`, always exists.
+- **A ? beside a setting explains it.** Where a control's effect is not
+  obvious from its label — the Ping and SNMP checkboxes on a polling
+  profile to begin with — a small **?** opens a plain-language note over the
+  form: what the setting produces, what depends on it, and what changes when
+  it is off. Escape or Close puts the form back exactly as it was.
 - **Every SNMP-polled device is pinged as well**, several probes per poll
   rather than one, so packet loss to the device is measurable at all — a
   single probe can only ever report 0% or 100%. Probe count (3 by
