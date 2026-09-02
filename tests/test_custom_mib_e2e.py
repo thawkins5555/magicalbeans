@@ -2,11 +2,10 @@ import base64
 import http.client
 import json
 import os
-import socket
 import sys
 import time
 
-from _paths import spawn_stub, tmpdir
+from _paths import free_tcp_port, spawn_stub, tmpdir
 
 TMPDIR = tmpdir("custom_mib_e2e_")
 
@@ -20,14 +19,6 @@ from netpath.web import Service, WebServer
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
 
 
-def free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
-
 service = Service(
     os.path.join(TMPDIR, "netpath.db"), os.path.join(TMPDIR, "flows.db"),
     os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
@@ -36,7 +27,7 @@ service = Service(
     os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
 service.start()
 
-port = free_port()
+port = free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=port, certfile=None, keyfile=None)
 assert server.start(block=False), server.error
 print(f"server up on 127.0.0.1:{port}")

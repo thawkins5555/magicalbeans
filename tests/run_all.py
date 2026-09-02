@@ -18,7 +18,11 @@ TAIL = 15
 def main(argv) -> int:
     only = ""
     if "--only" in argv:
-        only = argv[argv.index("--only") + 1]
+        rest = argv[argv.index("--only") + 1:]
+        if not rest:
+            print("usage: run_all.py [--only <substring>]")
+            return 2
+        only = rest[0]
     suites = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
     suites = [s for s in suites if only in os.path.basename(s)]
     if not suites:

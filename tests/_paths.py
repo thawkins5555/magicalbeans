@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
@@ -53,11 +54,13 @@ def spawn_stub(script: str, *args: str, timeout_s: float = 10.0):
     if not banner or "listening" not in banner.lower():
         proc.kill()
         raise RuntimeError(f"{script} did not come up on 127.0.0.1:{port}: {banner!r}")
+    # Keep draining what the stub prints after the banner (some log every
+    # dropped request); a full pipe would block the stub on its own print.
+    threading.Thread(target=_drain, args=(proc,), daemon=True).start()
     return proc, port
 
 
 def _read_line(proc, timeout_s: float) -> str:
-    import threading
     box = []
 
     def reader():
@@ -70,3 +73,11 @@ def _read_line(proc, timeout_s: float) -> str:
     t.start()
     t.join(timeout_s)
     return box[0] if box else ""
+
+
+def _drain(proc) -> None:
+    try:
+        for _line in proc.stdout:
+            pass
+    except Exception:  # the pipe closes when the stub is killed
+        pass
