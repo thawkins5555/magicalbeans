@@ -408,14 +408,19 @@ class _VendorIdJob:
                 rows_by_arc[arc] = [row["oid"] for row in rows]
                 capped[arc] = len(rows) >= per_arc or why.startswith("stopped")
             self.requests += walk_requests
+            if self._cancel.is_set():
+                # What was gathered is kept and shown, but a cancelled walk
+                # is not a verdict: it is recorded as incomplete, so the
+                # dialog says so and the bounded retries still apply.
+                error = "cancelled"
             walk_info = {"objects": sum(len(v) for v in rows_by_arc.values()),
                          "requests": walk_requests,
                          "elapsed_s": round(time.time() - walk_started, 2),
                          "stopped": stopped}
             candidates = vendorid.fingerprint(rows_by_arc, poller._mib_index_cached())
         except Exception as exc:              # a job thread must not die quietly
-            error = str(exc) or exc.__class__.__name__
-            self.error = error
+            error = ("cancelled" if self._cancel.is_set()
+                     else (str(exc) or exc.__class__.__name__))
             if not isinstance(exc, (SnmpError, ValueError)):
                 poller.log.add(ERROR, f"Vendor identification failed for device "
                                       f"#{self.device_id}: {error}",
@@ -437,6 +442,7 @@ class _VendorIdJob:
                 attempts=previous_attempts + 1)
             db.record_identification(self.device_id, decision, evidence, sys_object_id)
             poller._apply_identification(self.device_id, decision, error)
+            self.error = error
             self.state = "failed" if error else "done"
         except Exception as exc:
             self.error = str(exc) or exc.__class__.__name__
@@ -989,7 +995,7 @@ class NodePoller:
             and config.get("snmp_enabled", True)
             and self._identification_due(previous, identity.get("sys_object_id") or "", now))
         self._check_vendor_mib(device_id, previous, identity, defer_assignment=walk_pending)
-        if snmp_ok:
+        if walk_pending:
             self._maybe_identify(device_id, identity, config, settings)
 
         # ----------------------------------------------------- interfaces

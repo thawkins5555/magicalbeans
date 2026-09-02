@@ -948,8 +948,9 @@
         `${ev.walk.stopped && ev.walk.stopped !== 'complete' ? ` — ${escape(ev.walk.stopped)}` : ''}` +
         `${ev.ts ? ` · ${new Date(ev.ts * 1000).toLocaleString()}` : ''}` +
         `${ev.trigger ? ` (${escape(ev.trigger.replace('_', ' '))})` : ''}</p>` : '';
+    const chosen = (ev.candidates || []).find((c) => c.mib_file_id === d.mib_file_id);
     const mib = d.mib_file_id
-      ? `<p class="hint">Custom MIB assigned: #${d.mib_file_id}` +
+      ? `<p class="hint">Custom MIB assigned: ${chosen ? escape(chosen.module) : `#${d.mib_file_id}`}` +
         `${ev.chosen_mib_file_id && ev.chosen_mib_file_id !== d.mib_file_id
           ? ' (chosen by hand — Re-identify never changes an assigned MIB)' : ''}</p>`
       : '';
@@ -1665,7 +1666,8 @@
     // the device form offers it; the profile form gets the two OIDs only.
     const manual = forGroup ? '' : `
       <label>Vendor (manual) <input id="${p}-vendormanual" size="30" maxlength="64"
-        placeholder="automatic" value="${escape(d.vendor_override || '')}"></label>
+        placeholder="automatic" value="${escape(d.vendor_override || '')}"
+        data-original="${escape(d.vendor_override || '')}"></label>
       <p class="hint">Overrides what identification decided, for display AND
         for ConfigRX's command choice; and when this device's sysObjectID is
         specific to one vendor, every device with the same sysObjectID
@@ -1693,10 +1695,13 @@
       vendor_oid: text(`#${p}-vendoroid`) || null,
       location_oid: text(`#${p}-locationoid`) || null,
     };
-    // Device form only. Sent as "" (clear) rather than null, because the
-    // API treats the key's presence as "the operator touched this".
-    if (!forGroup && box.querySelector(`#${p}-vendormanual`)) {
-      values.vendor_override = text(`#${p}-vendormanual`);
+    // Device form only, and only when it changed: the API treats the key's
+    // presence as "the operator touched this" (setting teaches the fleet,
+    // clearing re-decides the row and records an event), so an ordinary
+    // Save of some other field must not send it.
+    const manual = !forGroup ? box.querySelector(`#${p}-vendormanual`) : null;
+    if (manual && manual.value.trim() !== (manual.dataset.original || '')) {
+      values.vendor_override = manual.value.trim();
     }
     return values;
   }

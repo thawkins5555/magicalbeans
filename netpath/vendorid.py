@@ -355,13 +355,19 @@ def poll_decision(sys_object_id: str, sys_descr: str, device_row, learned: str =
                   if "identified_sys_object_id" in keys else None)
     sys_arc = enterprise_arc(sys_object_id)
     real_sys_arc = sys_arc is not None and sys_arc not in GENERIC_ARCS
-    if not manual and not learned and not real_sys_arc and stored_for == sys_object_id:
+    evidence = _evidence_dict(device_row) if not manual and not learned and not real_sys_arc else {}
+    # A device promoted from discovery carries the sweep's hop verdict but
+    # no identified_ts yet; honouring it until the first walk replaces it
+    # stops the vendor flickering to the agent's name for one poll.
+    from_sweep = (stored_for is None and evidence.get("trigger") == "discovery"
+                  and evidence.get("sys_object_id") == sys_object_id)
+    if evidence and (stored_for == sys_object_id or from_sweep):
         # The walk's verdict lives in the evidence, not in the row's current
         # vendor_source: that column says what is showing NOW, and while a
         # manual or learned vendor was in force it said so. Reading the
         # evidence is what lets a cleared override fall back to the walk
         # rather than to the agent's own name.
-        stored = (_evidence_dict(device_row).get("decision") or {})
+        stored = (evidence.get("decision") or {})
         if stored.get("source") == "walk" and stored.get("vendor"):
             return (stored["vendor"], "walk", stored.get("confidence") or "medium",
                     stored.get("vendor_arc"))

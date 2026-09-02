@@ -1910,6 +1910,11 @@ class NodesDatabase:
                 f"Vendor set to {vendor} by {set_by or 'an operator'}"
                 + (f"; devices with sysObjectID {sys_object_id} will follow"
                    if learnable else f" (this device only: {why})"))
+        elif device["vendor_override"] is None:
+            # Nothing to clear: an edit form that never had an override must
+            # not record a "cleared" event or re-decide anything.
+            result.update({"vendor": device["vendor"] or "",
+                           "source": device["vendor_source"] or ""})
         else:
             forgot = self.forget_learned(sys_object_id, only_from_device=device_id)
             fresh = self.device(device_id)
