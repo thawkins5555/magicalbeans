@@ -6,7 +6,10 @@ system/error categories) and was never meant to double as an authorization
 module list.
 
 MODULES is the exhaustive list of gate-able modules — one per top-level
-tab, including the two added alongside this feature (Wireless, ConfigRX).
+tab, including the two added alongside this feature (Wireless, ConfigRX),
+plus "ssh", the one entry with no tab of its own: an interactive shell on a
+device is a different power from reading or backing up its config, so it is
+its own module, granted to nobody by default.
 "dashboard" is intentionally excluded: it's an aggregate view of whatever
 other modules a user can already read, not a module with its own data to
 gate (see api.get_state's per-section filtering).

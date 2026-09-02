@@ -1,10 +1,26 @@
-"""A stub SSH device for exercising ConfigRX's capture path.
+"""A stub SSH device: a real paramiko server on loopback, in-process.
+
+There is no `sshd` in the test environment and there never will be, so both
+things that speak SSH here — ConfigRX's config capture and the interactive
+terminal — are exercised paramiko-against-paramiko. Password authentication
+always succeeds (what is under test is never the password); every byte the
+client writes is recorded in `sent_bytes`, which is how a test proves that
+nothing beyond the intended commands was ever sent.
 
 Modes:
   slow    — answers "Building configuration..." then PAUSES several seconds
             before streaming the config (the exact shape of the reported bug)
   paged   — streams the config a screen at a time behind a --More-- marker
   hang    — prints the banner and then never returns its prompt
+
+`host_key=` takes a paramiko key, so a test can restart a device on the same
+port with a different identity and watch the host-key check refuse it; it
+defaults to one RSA key generated once per process. `host=`/`port=` pin the
+listener, for a test that needs two devices at different addresses (the
+whole 127/8 loopback range answers here) or the same address twice.
+
+Imported, not spawned: unlike the SNMP stubs there is no child process and
+no "listening" banner — construct `StubDevice()` and read `.port`.
 """
 from __future__ import annotations
 
@@ -14,8 +30,8 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 
 import paramiko
 
@@ -48,42 +64,57 @@ class _Server(paramiko.ServerInterface):
 
 class StubDevice:
     def __init__(self, mode: str = "slow", pause_s: float = 4.0, page: int = 20,
-                 host_key=None):
+                 host_key=None, host: str = "127.0.0.1", port: int = 0):
         self.mode = mode
         self.pause_s = pause_s
         self.page = page
-        # The key this device presents. Defaults to the module-level one, so
-        # every stub in a run is the same host as far as a client is
-        # concerned; pass a freshly generated key to be a DIFFERENT host on
-        # the same address and port, which is what a host-key change is.
         self.host_key = host_key or HOST_KEY
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
+        self.host = host
+        self.sock.bind((host, port))
         self.sock.listen(4)
+        # A blocked accept() holds the listening port even after close(), so
+        # the loop wakes up regularly instead and close() joins it — that is
+        # what lets a test restart a device on its own port with a new key.
+        self.sock.settimeout(0.5)
         self.port = self.sock.getsockname()[1]
         self.sent_bytes: list[bytes] = []          # everything the client wrote
+        self._transports: list = []                # live sessions, for close()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
     def close(self):
+        """Stop listening AND drop every live session: a test that restarts a
+        device on the same port needs the port actually free, and both a
+        blocked accept() and an accepted connection hold it."""
         self._stop.set()
+        self._thread.join(timeout=3)
         try:
             self.sock.close()
         except OSError:
             pass
+        for transport in list(self._transports):
+            try:
+                transport.close()
+            except Exception:
+                pass
+        self._transports.clear()
 
     def _serve(self):
         while not self._stop.is_set():
             try:
                 conn, _ = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             threading.Thread(target=self._session, args=(conn,), daemon=True).start()
 
     def _session(self, conn):
         transport = paramiko.Transport(conn)
+        self._transports.append(transport)
         transport.add_server_key(self.host_key)
         server = _Server()
         try:
@@ -116,6 +147,10 @@ class StubDevice:
         while True:
             line = self._readline(channel)
             if not line:
+                return
+            if line in ("exit", "quit", "logout"):
+                channel.send(line + "\r\n")
+                channel.close()
                 return
             channel.send(line + "\r\n")            # the echo
             if "show" not in line and "export" not in line:
