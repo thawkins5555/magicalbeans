@@ -6,6 +6,47 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.34.0 — Resolves that stick, MAC tables you can afford, charts that hold still
+
+- **Resolving an alert now means it stays resolved.** Threshold alerts — a
+  metric over its limit, a NetPath path failing — are re-derived from live
+  data on every five-second tick, and a resolved alert was invisible to the
+  engine's "is this already open" check, so an alert an operator resolved
+  while its condition still held came straight back as a brand-new row: a new
+  id, unticked, with a fresh notification. Bulk resolve looked as if it did
+  nothing, because within five seconds it had. An operator's resolve now
+  closes *that breach run*: the alert re-opens only after the condition has
+  been observed clear and then breaches again. Acknowledge remains the way to
+  keep watching a live problem. Two engine paths that recorded a descriptive
+  string in the resolved-by field — a NetPath destination no longer traced, a
+  child alert rolled up into a device outage — now record nothing there, so
+  they cannot be mistaken for a hand resolve. The engine keeps this state in
+  memory, so a restart lets a still-breaching, operator-resolved alert re-open
+  once.
+- **The bulk Acknowledge and Resolve buttons report what they did** —
+  "Resolved 3 of 4" on the engine counters line for a few seconds, because a
+  row somebody else resolved between the tick and the click counts as ticked
+  but not acted on, and that mismatch is exactly what an operator needs to
+  see. They also gained the write-permission gate every other Alerts control
+  already had, so a read-only user no longer sees a button that fails.
+- **The per-port bandwidth chart no longer turns to hash when live polling
+  starts.** Selecting a device polls it every three seconds, and the chart
+  drew every one of those samples raw: the rate's time base was the poll's
+  start rather than the moment the port's counters were read — a ±17 % error
+  per point at that spacing — the smoothing window shrank with the sample
+  spacing to under half a minute, and the axis was re-fitted to the raw
+  maximum on every five-second redraw. Rates are now timed from each port's
+  own SNMP reply; the hour is served as fifteen-second averages
+  (`/series` gained a `bucket_s` parameter), so fast and slow samples land
+  evenly; **Smoothed** spans a fixed ninety seconds whatever the spacing;
+  and the axis grows at once for a spike but does not shrink for a dip. The
+  text readout keeps its five-second refresh; the chart redraws every
+  fifteen, when it has a whole new point to show.
+- **The packet-loss chart moved from the device pane into the device
+  dialog** — double-click a row. It keeps its own range dropdown (still
+  capped at three days, for the reason 4.33.0 gave), its pinned 0–100 % axis
+  and its "not being ping-probed" message, and refreshes every fifteen
+  seconds while the dialog is open. The pane keeps the status timeline.
 ### 4.33.1 — Tests you can actually run
 
 - **The end-to-end suites now live in the repository, under `tests/`, and
