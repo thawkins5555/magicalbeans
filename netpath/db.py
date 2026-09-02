@@ -299,6 +299,22 @@ class Database:
                 (target_id,),
             ).fetchone()
 
+    def last_traces(self, target_ids: list[int]) -> dict[int, sqlite3.Row]:
+        """last_trace() for many targets in one query — target_id -> row.
+        A target with no traces yet is simply absent from the result."""
+        if not target_ids:
+            return {}
+        marks = ",".join("?" * len(target_ids))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT t.* FROM traces t"
+                f" JOIN (SELECT target_id, MAX(started_ts) AS ts FROM traces"
+                f" WHERE target_id IN ({marks}) GROUP BY target_id) latest"
+                f" ON t.target_id = latest.target_id AND t.started_ts = latest.ts",
+                target_ids,
+            ).fetchall()
+        return {row["target_id"]: row for row in rows}
+
     def traces_between(self, target_id: int, t0: float, t1: float) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
@@ -306,6 +322,31 @@ class Database:
                 " ORDER BY started_ts",
                 (target_id, t0, t1),
             ).fetchall()
+
+    def reach_summary(self, target_id: int, t0: float, t1: float) -> dict:
+        """{"traces": n, "unreached": n, "measured": n} over a window.
+
+        Counted in SQLite rather than by reading every row back, because the
+        alert engine asks this per destination on every tick and the answer is
+        three integers.
+
+        `measured` excludes the statuses that are a fault in the measurement
+        rather than in the path — a traceroute that could not run at all, and
+        a slot skipped because the previous run was still going. Counting
+        those as unreachable would report a missing traceroute binary or a
+        badly chosen interval as a network outage.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS traces,"
+                " SUM(CASE WHEN status NOT IN ('error','overrun') THEN 1 ELSE 0 END) AS measured,"
+                " SUM(CASE WHEN status NOT IN ('error','overrun') AND reached = 0"
+                "     THEN 1 ELSE 0 END) AS unreached"
+                " FROM traces WHERE target_id=? AND started_ts>=? AND started_ts<=?",
+                (target_id, t0, t1)).fetchone()
+        return {"traces": row["traces"] or 0,
+                "measured": row["measured"] or 0,
+                "unreached": row["unreached"] or 0}
 
     def hop_rows_between(self, target_id: int, t0: float, t1: float) -> list[sqlite3.Row]:
         """Flat join of hops to traces, used to build the path topology."""

@@ -27,7 +27,9 @@ from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
+from .. import nodeoids
 from .. import configrx
+from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
 
@@ -218,8 +220,7 @@ def get_state(service, params, body) -> dict:
 
 # ------------------------------------------------------------------ netpath
 
-def _target_json(service, row) -> dict:
-    last = service.db.last_trace(row["id"])
+def _target_json(service, row, last=None) -> dict:
     keys = row.keys()
     return {
         "id": row["id"],
@@ -240,7 +241,10 @@ def _target_json(service, row) -> dict:
 
 
 def get_targets(service, params, body) -> dict:
-    return {"targets": [_target_json(service, row) for row in service.db.targets()]}
+    rows = service.db.targets()
+    last_traces = service.db.last_traces([row["id"] for row in rows])
+    return {"targets": [_target_json(service, row, last_traces.get(row["id"]))
+                        for row in rows]}
 
 
 def post_target(service, params, body) -> dict:
@@ -688,8 +692,10 @@ def get_debug(service, params, body) -> dict:
 
     workers = []
     running = queued = 0
-    for target in service.db.targets():
-        last = service.db.last_trace(target["id"])
+    targets = service.db.targets()
+    last_traces = service.db.last_traces([target["id"] for target in targets])
+    for target in targets:
+        last = last_traces.get(target["id"])
         work = state.get(target["id"])
         keys = target.keys()
         timeout_s = float(target["timeout_s"]) if "timeout_s" in keys else 2.0
@@ -737,8 +743,10 @@ def get_debug(service, params, body) -> dict:
     ipam_state = service.ipam.state()
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
-        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets()}
-        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers()}
+        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
+            list(ipam_state.get("scan_started", {}).keys()))}
+        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers_by_ids(
+            list(ipam_state.get("poll_started", {}).keys()))}
         for subnet_id, started in ipam_state.get("scan_started", {}).items():
             subnet = subnets_by_id.get(subnet_id)
             ipam_workers.append({
@@ -763,7 +771,8 @@ def get_debug(service, params, body) -> dict:
     node_state = service.node_poller.worker_state()
     node_workers = []
     if node_state:
-        devices_by_id = {d["id"]: d for d in service.nodes_db.devices()}
+        devices_by_id = {d["id"]: d for d in
+                         service.nodes_db.devices_by_ids(list(node_state.keys()))}
         for device_id, work in node_state.items():
             device = devices_by_id.get(device_id)
             label = (device["name"] or device["ip"]) if device else f"device #{device_id}"
@@ -1533,9 +1542,21 @@ def _device_json(row) -> dict:
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
+        "mac_table_interval_s": row["mac_table_interval_s"],
+        # Vendor identification (4.32): keyed defensively for a row handed
+        # in from an older-shaped source.
+        "vendor_confidence": (row["vendor_confidence"] or ""
+                              if "vendor_confidence" in row.keys() else ""),
+        "vendor_override": (row["vendor_override"]
+                            if "vendor_override" in row.keys() else None),
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
+        # The vendor's own name for itself, where its key does not read as
+        # one ("rockwellAutomation" -> "Rockwell Automation"). Presentation
+        # only: `vendor` stays the token everything that behaves per-vendor
+        # compares against, and a key with no display name serves itself.
+        "vendor_label": nodeoids.vendor_label(row["vendor"] or ""),
         # What SNMP identification worked out, and which source spoke. Shown
         # beside the displayed vendor so an operator who has pointed vendor at
         # a custom OID can still see what the app itself detected — and can
@@ -1566,6 +1587,7 @@ def _group_json(service, row) -> dict:
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
+        "mac_table_interval_s": row["mac_table_interval_s"],
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
         "is_default": bool(row["is_default"]),
@@ -1599,14 +1621,42 @@ def _discovery_job_json(row) -> dict:
             "error": row["error"]}
 
 
-def _discovery_result_json(row) -> dict:
+def _discovery_result_json(row, installed=None) -> dict:
+    """`installed` is the set of MIB filenames present, passed by the caller
+    once per listing so the "install these MIBs" hint is not a query per row."""
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
             "snmp_version": row["snmp_version"], "sys_descr": row["sys_descr"],
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
             "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
-            "promoted_device_id": row["promoted_device_id"]}
+            "promoted_device_id": row["promoted_device_id"],
+            **_discovery_identification(row, installed)}
+
+
+def _discovery_identification(row, installed=None) -> dict:
+    """What the sweep's arc hop found for a result, or blanks for a row
+    written before 4.32."""
+    keys = row.keys()
+    arcs = []
+    if "arcs" in keys and row["arcs"]:
+        try:
+            arcs = [int(a) for a in json.loads(row["arcs"])]
+        except (TypeError, ValueError):
+            arcs = []
+    bundle_key = (row["suggest_bundle"] if "suggest_bundle" in keys else None) or None
+    bundle = mibcatalog.bundle(bundle_key) if bundle_key else None
+    bundle_installed = bool(bundle) and installed is not None and \
+        all(fn in installed for fn, _url in bundle.files)
+    return {
+        "vendor_source": (row["vendor_source"] if "vendor_source" in keys else "") or "",
+        "vendor_confidence": (row["vendor_confidence"]
+                              if "vendor_confidence" in keys else "") or "",
+        "arcs": arcs,
+        "arc_names": [vendorid.arc_name(a) for a in arcs],
+        "suggest_bundle": bundle_key,
+        "suggest_bundle_installed": bundle_installed,
+    }
 
 
 _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
@@ -1616,12 +1666,14 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
-                         "vendor_oid", "location_oid")
+                         "vendor_oid", "location_oid", "mac_table_interval_s",
+                         "vendor_override")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
-                        "unreachable_ping_only", "vendor_oid", "location_oid")
+                        "unreachable_ping_only", "vendor_oid", "location_oid",
+                        "mac_table_interval_s")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -1668,12 +1720,50 @@ def get_nodes_devices(service, params, body) -> dict:
         device_group_id=int(device_group_id) if device_group_id else None,
         status=status, text=text, exclude_up=exclude_up)
     worker_state = service.node_poller.worker_state()
+    # A mute lives in the Alerts module but has to be visible here: an
+    # operator who silenced a device an hour ago and then wonders why it
+    # is quiet should be able to see why without opening Alerts.
+    muted = service.alerts_db.muted_entity_ids("device")
     devices = []
     for row in rows:
         device = _device_json(row)
         device["polling"] = row["id"] in worker_state
+        device["muted_until"] = muted.get(str(row["id"]))
         devices.append(device)
     return {"devices": devices}
+
+
+def get_nodes_mac_search(service, params, body) -> dict:
+    """Where a MAC address has been seen, from the stored forwarding tables.
+
+    Returns every (device, port) that learned it — an address on an uplink
+    is on every switch between here and the host, and that is the normal
+    case on a stacked network. The caller decides what to do with one
+    answer versus several; picking one here would silently send an operator
+    to the core switch for a problem on an access port.
+    """
+    text = params.get("q") or ""
+    mac = nodesdb.looks_like_mac_search(text)
+    if len(mac) < 4:
+        return {"mac": "", "locations": [], "enabled_devices": 0}
+    locations = []
+    for row in service.nodes_db.mac_locations(mac):
+        device = service.nodes_db.device(row["device_id"])
+        if device is None:
+            continue
+        locations.append({
+            "device_id": row["device_id"],
+            "device_name": hostresolve.device_name(device),
+            "if_index": row["if_index"],
+            "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
+            "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
+        })
+    # How many devices are actually walking their forwarding tables, so the
+    # frontend can say "nothing has been learned yet" rather than "not
+    # found" when the feature is simply switched off everywhere. One query,
+    # not effective_config() per device — this runs on a keystroke.
+    return {"mac": mac, "locations": locations,
+            "enabled_devices": service.nodes_db.mac_walk_enabled_count()}
 
 
 def post_nodes_device(service, params, body) -> dict:
@@ -1722,7 +1812,43 @@ def get_nodes_device(service, params, body, device_id) -> dict:
         group = service.nodes_db.group(row["group_id"])
         device["group_name"] = group["name"] if group else None
     device["polling"] = device_id in service.node_poller.worker_state()
+    mute = service.alerts_db.mute_row("device", str(device_id))
+    device["muted_until"] = mute["until_ts"] if mute else None
+    device.update(_identification_json(service, row))
     return {"device": device}
+
+
+def _identification_json(service, row) -> dict:
+    """The vendor identification detail for one device: the stored evidence
+    (parsed), whether a walk is running, where a learned vendor came from,
+    and the catalog bundle to suggest, resolved to something a button can
+    install."""
+    keys = row.keys()
+    evidence = vendorid._evidence_dict(row) if "vendor_evidence" in keys else {}
+    learned_from = None
+    if (row["vendor_source"] or "") == "learned":
+        learned = service.nodes_db.learned_row(row["sys_object_id"] or "")
+        if learned is not None:
+            learned_from = {"device_id": learned["source_device_id"],
+                            "set_by": learned["set_by"], "set_ts": learned["set_ts"]}
+    suggest = None
+    key = evidence.get("suggest_bundle")
+    if key:
+        bundle = mibcatalog.bundle(key)
+        if bundle is not None:
+            have = {mib["filename"] for mib in service.nodes_db.mib_files()}
+            suggest = {"key": bundle.key, "name": bundle.name, "vendor": bundle.vendor,
+                       "installed": all(fn in have for fn, _url in bundle.files)}
+    learnable, learn_reason = service.nodes_db._learnable(row["sys_object_id"] or "")
+    return {
+        "vendor_evidence": evidence,
+        "identified_ts": row["identified_ts"] if "identified_ts" in keys else None,
+        "identifying": service.node_poller.identifying(row["id"]),
+        "learned_from": learned_from,
+        "suggest_bundle": suggest,
+        "vendor_display": enterprises.display_name(row["vendor_detected"] or row["vendor"] or ""),
+        "learnable": learnable, "learn_reason": learn_reason,
+    }
 
 
 def _check_display_name_source(body) -> None:
@@ -1736,8 +1862,21 @@ def put_nodes_device(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     _check_display_name_source(body)
     fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
-    service.nodes_db.update_device(device_id, **fields)
-    return {"ok": True}
+    result = {"ok": True}
+    if "vendor_override" in fields:
+        # Not a plain column write: setting a vendor by hand also teaches
+        # the fleet (when the sysObjectID is specific enough) and clearing
+        # it re-decides the row, both of which nodesdb.set_vendor_override
+        # owns. Everything else in the body still goes the ordinary way.
+        value = fields.pop("vendor_override")
+        value = str(value or "").strip()
+        if len(value) > 64:
+            raise ValueError("A vendor name is at most 64 characters")
+        result["vendor"] = service.nodes_db.set_vendor_override(
+            device_id, value or None, params.get("_username", ""))
+    if fields:
+        service.nodes_db.update_device(device_id, **fields)
+    return result
 
 
 def delete_nodes_device(service, params, body, device_id) -> dict:
@@ -1800,9 +1939,10 @@ def post_nodes_devices_bulk_poll(service, params, body) -> dict:
     """Poll now for every ticked device — the bulk-bar counterpart of the
     detail pane's button, which only ever polls the one open device."""
     device_ids = _bulk_device_ids(body)
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
     queued, busy, missing = [], [], []
     for device_id in device_ids:
-        if not service.nodes_db.device(device_id):
+        if device_id not in existing:
             missing.append(device_id)
             continue
         (queued if service.node_poller.poll_now(device_id) else busy).append(device_id)
@@ -1897,6 +2037,132 @@ def get_nodes_device_oids(service, params, body, device_id) -> dict:
     return {"bases": bases, "base": result["base"], "rows": rows,
             "stopped": result["stopped"], "complete": result["complete"],
             "walked": True}
+
+
+def post_nodes_device_oid_walk(service, params, body, device_id) -> dict:
+    """Start a whole-device walk in the background, or report the one
+    already running for this device. Refused politely rather than queued —
+    a second walk of the same device would just fight the first for the
+    agent's attention."""
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    return {"walk": service.node_poller.start_oid_walk(int(device_id))}
+
+
+def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
+    """Progress, or the finished walk. `download` asks for the file text:
+    once handed over, the rows are dropped, since a walk exists to be
+    downloaded once."""
+    status = service.node_poller.oid_walk_status(
+        int(device_id), with_rows=params.get("download") is not None)
+    if status is None:
+        return {"walk": None}
+    if params.get("download") is None or status["state"] != "done":
+        status.pop("walk", None)
+        return {"walk": status}
+    rows = status.pop("walk", [])
+    text = _oid_walk_text(service, status, rows)
+    service.node_poller.forget_oid_walk(int(device_id))
+    return {"walk": status, "text": text,
+            "filename": _oid_walk_filename(status)}
+
+
+def delete_nodes_device_oid_walk(service, params, body, device_id) -> dict:
+    return {"cancelled": service.node_poller.cancel_oid_walk(int(device_id))}
+
+
+def post_nodes_device_identify(service, params, body, device_id) -> dict:
+    """Re-identify: start the bounded vendor walk now, or report the one
+    already running. A job, not a synchronous answer — the walk is up to
+    20 s, the page refreshes every few seconds, and bulk cannot wait."""
+    return {"job": service.node_poller.start_identify(int(device_id), trigger="manual")}
+
+
+def get_nodes_device_identify(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    return {"job": service.node_poller.identify_status(int(device_id)),
+            "result": {"vendor": row["vendor"], "vendor_detected": row["vendor_detected"],
+                       "vendor_source": row["vendor_source"] or "",
+                       "vendor_confidence": (row["vendor_confidence"] or ""
+                                             if "vendor_confidence" in row.keys() else ""),
+                       **_identification_json(service, row)}}
+
+
+def delete_nodes_device_identify(service, params, body, device_id) -> dict:
+    return {"cancelled": service.node_poller.cancel_identify(int(device_id))}
+
+
+def post_nodes_devices_bulk_identify(service, params, body) -> dict:
+    """Re-identify every ticked device. Id lists back, the bulk-poll shape:
+    an operator who ticked twelve switches deserves to know which three
+    were skipped and why."""
+    device_ids = _bulk_device_ids(body)
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(device_ids)}
+    queued, running, snmp_off, missing = [], [], [], []
+    for device_id in device_ids:
+        row = rows.get(device_id)
+        if row is None:
+            missing.append(device_id)
+            continue
+        if not service.nodes_db.effective_config(row).get("snmp_enabled", True):
+            snmp_off.append(device_id)
+            continue
+        if service.node_poller.identifying(device_id):
+            running.append(device_id)
+            continue
+        service.node_poller.start_identify(device_id, trigger="manual")
+        queued.append(device_id)
+    if queued:
+        service.log.add(NODES_CATEGORY,
+                        f"Re-identify requested for {len(queued)} device(s)")
+    return {"ok": True, "queued": queued, "already_running": running,
+            "snmp_disabled": snmp_off, "missing": missing}
+
+
+def _oid_walk_filename(status) -> str:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(status["started_ts"]))
+    safe = "".join(c if c.isalnum() or c in "-_." else "-"
+                   for c in (status.get("device_label") or "device"))
+    return f"snmp-walk-{safe}-{stamp}.txt"
+
+
+def _oid_walk_text(service, status, rows) -> str:
+    """The downloaded file: a header stating what was walked and whether it
+    finished, then one `OID = type: value` line per object with the decoded
+    name where a MIB provides one.
+
+    The header says outright when the walk was cut short and why. A
+    truncated file that looks complete is the failure this whole feature
+    could most easily cause — someone diffing two walks and concluding a
+    device lost half its MIB when in fact the clock ran out.
+    """
+    names = _oid_name_table(service)
+    started = time.strftime("%Y-%m-%d %H:%M:%S",
+                            time.localtime(status["started_ts"]))
+    head = [
+        f"# SNMP walk of {status.get('device_label') or 'device'}",
+        f"# Started {started}, from {status['base']}",
+        f"# {len(rows)} object(s) in {status['elapsed']:.1f}s",
+    ]
+    if status["complete"]:
+        head.append("# COMPLETE — the walk reached the end of the tree.")
+    else:
+        head.append(f"# INCOMPLETE — {status['stopped']}. Objects beyond that "
+                    f"point are NOT in this file.")
+    head.append("#")
+    lines = list(head)
+    for row in rows:
+        value = row["value"]
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        text = row["text"] if row["text"] is not None else (
+            "" if value is None else str(value))
+        name, suffix = _decode_oid(names, row["oid"])
+        label = f"  [{name}{'.' + suffix if suffix else ''}]" if name else ""
+        lines.append(f"{row['oid']} = {row['type']}: {text}{label}")
+    return "\n".join(lines) + "\n"
 
 
 def post_nodes_device_test(service, params, body, device_id) -> dict:
@@ -2045,14 +2311,11 @@ def get_nodes_device_events(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     since_s = _num(params, "since_s", None)
     device_events = service.nodes_db.device_events(device_id=device_id, since_s=since_s)
-    interface_events = []
-    for iface in service.nodes_db.interfaces(device_id):
-        for ev in service.nodes_db.interface_events(interface_id=iface["id"], since_s=since_s):
-            interface_events.append({
-                "id": ev["id"], "interface_id": ev["interface_id"],
-                "if_index": iface["if_index"], "descr": iface["descr"],
-                "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]})
-    interface_events.sort(key=lambda e: e["ts"], reverse=True)
+    interface_events = [
+        {"id": ev["id"], "interface_id": ev["interface_id"],
+         "if_index": ev["if_index"], "descr": ev["descr"],
+         "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]}
+        for ev in service.nodes_db.interface_events_for_device(device_id, since_s=since_s)]
     return {
         "device_events": [
             {"id": r["id"], "ts": r["ts"], "kind": r["kind"], "detail": r["detail"]}
@@ -2375,8 +2638,9 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     if not job:
         raise ValueError("No such discovery job")
     results = service.nodes_db.discovery_results(job_id)
+    installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r) for r in results]}
+            "results": [_discovery_result_json(r, installed) for r in results]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -2555,6 +2819,7 @@ def get_nodes_mib_catalog(service, params, body) -> dict:
             "file_count": bundle.file_count, "present": present,
             "installed": present == bundle.file_count,
             "files": [filename for filename, _ in bundle.files],
+            "arcs": list(bundle.arcs), "vendor_key": bundle.vendor_key,
         })
     return {"bundles": bundles, "job": service.mib_install_status()}
 
@@ -2663,6 +2928,8 @@ def _rule_json(row) -> dict:
         "flap_window_s": row["flap_window_s"],
         "flap_min_transitions": row["flap_min_transitions"],
         "clear_threshold": row["clear_threshold"], "for_polls": row["for_polls"],
+        # Keyed defensively for the same reason as rollup_note above.
+        "for_seconds": (row["for_seconds"] if "for_seconds" in row.keys() else None),
         "template_id": row["template_id"], "created_ts": row["created_ts"],
     }
 
@@ -2746,6 +3013,56 @@ def post_alert_resolve(service, params, body, alert_id) -> dict:
     return {"ok": True}
 
 
+def _mute_json(row) -> dict:
+    return {"entity_kind": row["entity_kind"], "entity_id": row["entity_id"],
+            "until_ts": row["until_ts"], "created_ts": row["created_ts"],
+            "created_by": row["created_by"], "reason": row["reason"]}
+
+
+def _mute_entity(body) -> tuple[str, str]:
+    """The (kind, id) a mute request names, refusing anything the engine
+    would not actually check — a mute that silences nothing is worse than
+    an error, because the operator walks away believing it worked."""
+    kind = str(body.get("entity_kind", "device")).strip() or "device"
+    if kind != "device":
+        # The column is general, so a per-interface or per-AP mute later
+        # needs no migration; nothing else is muteable today.
+        raise ValueError("Only devices can be muted")
+    entity_id = str(body.get("entity_id", "")).strip()
+    if not entity_id:
+        raise ValueError("A device is required")
+    return kind, entity_id
+
+
+def get_alerts_mutes(service, params, body) -> dict:
+    return {"mutes": [_mute_json(row) for row in service.alerts_db.mutes()]}
+
+
+def post_alerts_mute(service, params, body) -> dict:
+    kind, entity_id = _mute_entity(body)
+    try:
+        device = service.nodes_db.device(int(entity_id))
+    except (TypeError, ValueError):
+        device = None
+    if device is None:
+        raise ValueError("No such device")
+    try:
+        hours = float(body.get("hours", 1))
+    except (TypeError, ValueError):
+        raise ValueError("Mute duration must be a number of hours")
+    if hours <= 0:
+        raise ValueError("Mute duration must be more than zero")
+    row = service.alerts_db.mute(kind, entity_id, hours,
+                                 by=params.get("_username", ""),
+                                 reason=str(body.get("reason", "")))
+    return {"mute": _mute_json(row)}
+
+
+def delete_alerts_mute(service, params, body) -> dict:
+    kind, entity_id = _mute_entity(body)
+    return {"lifted": service.alerts_db.unmute(kind, entity_id)}
+
+
 def post_alerts_ack_all(service, params, body) -> dict:
     n = service.alerts_db.acknowledge_all(params.get("_username", ""))
     return {"acknowledged": n}
@@ -2782,14 +3099,14 @@ def post_alerts_rule(service, params, body) -> dict:
     if not key or not name or not kind:
         raise ValueError("key, name and kind are all required")
     if kind not in ("device_event", "interface_event", "threshold",
-                    "dhcp_threshold", "trap", "syslog", "ipam",
-                    "wireless_event"):
+                    "dhcp_threshold", "netpath_threshold", "trap", "syslog",
+                    "ipam", "wireless_event"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
     fields = {k: v for k, v in body.items() if k in
              ("severity", "enabled", "device_filter", "threshold",
-              "clear_threshold", "for_polls", "template_id")}
+              "clear_threshold", "for_polls", "for_seconds", "template_id")}
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
     return {"id": rule_id}
@@ -2800,7 +3117,7 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
     if not row:
         raise ValueError("No such rule")
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
-                    "clear_threshold", "for_polls", "template_id",
+                    "clear_threshold", "for_polls", "for_seconds", "template_id",
                     "flap_window_s", "flap_min_transitions")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
@@ -2890,10 +3207,15 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
         context = alertmail.build_context(alert_row, rule_row)
     else:
         now = time.time()
+        # The sample is a RESOLVED alert, opened a couple of hours ago: the
+        # recovery template's whole subject is how long something was down,
+        # and a sample with no resolution renders that sentence as blanks and
+        # makes a correct template look broken.
         fake_alert = {"entity_label": "sample-device (10.20.3.5)",
                      "entity_id": "10.20.3.5", "message": "This is a sample alert.",
                      "detail": "", "severity": 4, "count": 1,
-                     "opened_ts": now, "last_ts": now}
+                     "opened_ts": now - 8040, "last_ts": now - 300,
+                     "resolved_ts": now}
         context = alertmail.build_context(
             fake_alert, {"name": "Sample rule"},
             extra={"metric_label": "CPU", "value": "95%", "threshold": "90%",
@@ -3379,16 +3701,61 @@ def post_configrx_devices_bulk_config(service, params, body) -> dict:
     Nodes' own bulk-update — a batch of switches sharing one local SSH
     account is the common case this exists for, not a per-row grid edit."""
     device_ids = _bulk_device_ids(body)
+    # ssh_username belongs here as much as the other three: the database
+    # layer has always allowed it (DEVICE_CONFIG_EDITABLE), and only this
+    # allow-list withheld it, which meant a bulk settings dialog could set
+    # everything about a batch of switches except who to log in as.
     fields = {k: v for k, v in body.items()
-             if k in ("backup_enabled", "ssh_port", "vendor_override")}
+             if k in ("backup_enabled", "ssh_port", "vendor_override",
+                      "ssh_username")}
     if not fields:
         raise ValueError("Nothing to update")
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
+    updated = []
     for device_id in device_ids:
-        if service.nodes_db.device(device_id):
+        if device_id in existing:
             service.configrx_db.update_device_config(device_id, **fields)
+            updated.append(device_id)
     service.log.add(CONFIGRX_CATEGORY,
-                    f"Bulk-updated {len(device_ids)} device(s): {', '.join(fields)}")
-    return {"ok": True, "updated": len(device_ids)}
+                    f"Bulk-updated {len(updated)} device(s): {', '.join(fields)}")
+    return {"ok": True, "updated": len(updated), "device_ids": updated}
+
+
+def post_configrx_devices_bulk_backup(service, params, body) -> dict:
+    """Back up every ticked device now.
+
+    Id lists back, not counts, mirroring post_nodes_devices_bulk_poll: an
+    operator who ticked twelve switches and got "9 queued" still has to work
+    out which three did not. The extra bucket Nodes has no counterpart to is
+    `not_enabled` — a device with backups switched off is deliberately
+    skipped rather than quietly backed up anyway.
+
+    The worker being stopped fails the whole request ONCE, with the reason,
+    rather than raising the same message per device: it is one fact about
+    the server, not twelve facts about twelve switches.
+    """
+    device_ids = _bulk_device_ids(body)
+    # One query for the whole selection rather than device() per id, the
+    # same shape post_nodes_devices_bulk_poll uses.
+    existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
+    queued, busy, missing, not_enabled = [], [], [], []
+    for device_id in device_ids:
+        if device_id not in existing:
+            missing.append(device_id)
+            continue
+        config = service.configrx_db.device_config(device_id)
+        if not (config and config["backup_enabled"]):
+            not_enabled.append(device_id)
+            continue
+        try:
+            (queued if service.configrx.backup_now(device_id) else busy).append(device_id)
+        except configrx.ConfigRxWorker.NotRunning as exc:
+            raise ValueError(str(exc))
+    if queued:
+        service.log.add(CONFIGRX_CATEGORY,
+                        f"Backup now requested for {len(queued)} device(s)")
+    return {"ok": True, "queued": queued, "already_queued": busy,
+            "missing": missing, "not_enabled": not_enabled}
 
 
 def post_configrx_devices_bulk_credential(service, params, body) -> dict:

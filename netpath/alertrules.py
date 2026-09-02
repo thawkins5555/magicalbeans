@@ -66,15 +66,29 @@ def evaluate_flapping(recent_interface_events: list, window_s: float = 600,
     return len(within_window) >= min_transitions
 
 
-def evaluate_threshold(rule, current_value: float | None, streak: int) -> str:
-    """Returns 'breach' once current_value is over rule.threshold AND
-    `streak` (consecutive polls at/over threshold *including this one* —
-    the caller increments it before calling this) reaches rule.for_polls;
-    'clear' once a value drops below rule.clear_threshold; '' otherwise
-    (either still under for_polls, or in the hysteresis gap between
-    clear_threshold and threshold). The threshold/clear_threshold gap is
-    hysteresis — without it a value oscillating exactly at the threshold
-    reopens and recloses the alert every single poll."""
+def evaluate_threshold(rule, current_value: float | None, streak: int,
+                       breach_seconds: float = 0.0) -> str:
+    """Returns 'breach' once current_value is over rule.threshold and the
+    breach has been sustained long enough; 'clear' once a value drops below
+    rule.clear_threshold; '' otherwise (either not sustained yet, or in the
+    hysteresis gap between clear_threshold and threshold). The
+    threshold/clear_threshold gap is hysteresis — without it a value
+    oscillating exactly at the threshold reopens and recloses the alert
+    every single poll.
+
+    "Long enough" is measured one of two ways, and only ever one:
+
+    - `for_seconds` set: the breach must have lasted that many seconds of
+      real sample time. `breach_seconds` is how long the metric has been
+      continuously at or over the threshold, measured between the sample
+      timestamps themselves — never between engine ticks, which run every
+      five seconds regardless of whether anything was polled.
+    - `for_seconds` NULL (the shipped default for every rule but packet
+      loss): `streak` consecutive polls at or over the threshold, including
+      this one, must reach `for_polls`.
+
+    Both counters are the caller's to keep, and both must only advance when
+    a genuinely new sample arrives; see alertengine._evaluate_thresholds."""
     if current_value is None:
         return ""
     threshold = rule["threshold"]
@@ -82,6 +96,9 @@ def evaluate_threshold(rule, current_value: float | None, streak: int) -> str:
     if threshold is None:
         return ""
     if current_value >= threshold:
+        for_seconds = rule["for_seconds"] if "for_seconds" in rule.keys() else None
+        if for_seconds:
+            return "breach" if breach_seconds >= float(for_seconds) else ""
         for_polls = max(1, int(rule["for_polls"] or 1))
         return "breach" if streak >= for_polls else ""
     if clear_threshold is not None and current_value < clear_threshold:
@@ -118,6 +135,13 @@ CLEARS = {
 }
 
 
+# The entity kinds that take part in rollup at all. A rollup pairing says
+# "this alert is implied by that one about the SAME thing", so it is only
+# meaningful where an entity can have both; listing the kinds explicitly stops
+# a future entity kind inheriting the device pairings by accident.
+ROLLUP_ENTITY_KINDS = frozenset({"device", "netpath_target"})
+
+
 # ROLLED_UP_BY: rule key -> the rule key whose open alert makes it redundant.
 #
 # A device that has stopped answering will always also look slow and lossy,
@@ -150,6 +174,18 @@ ROLLED_UP_BY = {
     "if_out_errors_high": "device_down",
     "if_in_discards_high": "device_down",
     "if_out_discards_high": "device_down",
+    # A poll that overran because every request timed out says nothing the
+    # outage does not. nodepoll._record_overrun already declines to record
+    # one while the device is failing, so this only catches an overrun
+    # alert opened in the moments before the first poll actually failed.
+    "poll_overrun": "device_down",
+    # NetPath: a destination nothing comes back from is also, necessarily, a
+    # path whose traces are not reaching it and one whose latency cannot be
+    # measured. One broken path is one alert, the same rule as an unreachable
+    # device — and the same recovery mechanism too, since all three re-derive
+    # from the next trace rather than needing to be un-suppressed.
+    "netpath_path_unstable": "netpath_unreachable",
+    "netpath_latency_high": "netpath_unreachable",
 }
 
 # The rules that roll up under a given parent, the other way round — built

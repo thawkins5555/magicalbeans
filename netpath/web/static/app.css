@@ -135,15 +135,19 @@ body {
   color: var(--text);
   letter-spacing: 0;
 }
-#nd-d-summary {
+/* Classed as well as id'd: the device dialog renders the same identity
+   line for a device that is not the selected one, and must look identical
+   to the pane's. */
+#nd-d-summary, .nd-summary {
   font-size: 12px;
   line-height: 1.6;
   color: var(--muted);
   margin: 2px 0 6px;
 }
-#nd-d-summary .nd-f { margin-right: 14px; white-space: nowrap; }
-#nd-d-summary .nd-v { color: var(--text); }
-#nd-d-summary .nd-err { color: var(--fail); }
+.nd-summary .nd-f { margin-right: 14px; white-space: nowrap; }
+.nd-summary .nd-v { color: var(--text); }
+.nd-summary .nd-err { color: var(--fail); }
+.nd-summary .warn-text { color: var(--warn); }
 /* The interfaces/events subtabs take whatever height is left under the
    status timeline. min-height:0 for the same reason as above: without it
    the tables grow to their content height instead of scrolling inside
@@ -761,6 +765,12 @@ body.compact .canvas { min-height: 120px; }
    .canvas.strip) and min-height-beats-height would balloon the 28px lane
    to 120px on exactly the small screens compact mode exists for. */
 body.compact .canvas.strip { min-height: 28px; }
+/* Same trap, one panel: the Nodes packet-loss chart is a fixed 90px lane
+   under the status strip, and letting the density rule take it to 120px
+   pushes the interface table below it off exactly the small screens
+   compact mode exists for. Scoped to that chart rather than to
+   .canvas.small, so the Alerts histogram keeps whatever it has today. */
+body.compact #nd-loss-chart { min-height: 90px; }
 body.compact .sidebar { width: 240px; padding: 8px; }
 body.compact fieldset { padding: 8px 10px 10px; }
 body.compact fieldset label { margin: 5px 0; }
@@ -769,6 +779,7 @@ body.tiny .tab { padding: 5px 12px; }
 body.tiny .bar { padding: 4px 8px; gap: 6px; }
 body.tiny .canvas { min-height: 90px; }
 body.tiny .canvas.strip { min-height: 28px; }
+body.tiny #nd-loss-chart { min-height: 70px; height: 70px; }
 body.tiny .sidebar { width: 210px; }
 body.tiny .legend, body.tiny .hint.pad { display: none; }
 
@@ -833,6 +844,10 @@ body.login-page {
 .modal-box.wide { max-width: 960px; }
 .modal-box.wide > label { display: flex; }
 .modal-box h2 { margin: 0 0 12px; font-size: 15px; }
+/* The interface dialog's parent device name: its own line above the port
+   name and inside the same h2, so it is the same size rather than dropping
+   to hint text. Dimmer only so the port stays the subject of the dialog. */
+.modal-box h2 .ifd-parent { color: var(--muted); font-weight: 600; }
 .modal-box .row { justify-content: flex-end; margin-top: 14px; }
 .modal-box .row.top {
   margin: 0 0 12px;
@@ -851,3 +866,4 @@ body.login-page {
 }
 .modal-box fieldset { margin-bottom: 10px; }
 .err { color: var(--fail); }
+.warn-text { color: var(--warn); }

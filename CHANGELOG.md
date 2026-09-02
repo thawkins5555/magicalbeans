@@ -6,6 +6,281 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.33.1 — Tests you can actually run
+
+- **The end-to-end suites now live in the repository, under `tests/`, and
+  every one of them passes.** Four of them had been listed as "known
+  environmental failures" since 4.28. None of those failures was the
+  application's: three suites expected a stub SNMP agent to have been
+  started by hand on a fixed UDP port (16161, 16261, 16262) before they ran,
+  and the fourth predated two deliberate changes — discovery takes its
+  communities from the chosen polling profile and guesses nothing, and a
+  promoted device keeps the IP as its manual name while sysName is seeded
+  into the identity. Each suite now starts its own stub as a child process
+  on a free loopback port, points the module under test at it, waits for
+  the stub's bound banner rather than a fixed sleep, and kills it on exit.
+  The custom-MIB suite also waits for the poll worker to finish instead of
+  sleeping three seconds and then shutting the service down under an
+  in-flight poll, which is what produced its "cannot operate on a closed
+  database" trace.
+- `python3 tests/run_all.py` runs them all and reports PASS/FAIL per file;
+  `tests/README.md` says what each one proves. Standard library only, no
+  network, no `ping` binary, no root, temporary databases.
+- One consistency fix found while merging: 4.33.0 added Moxa (arc 8691) to
+  the well-known sysObjectID table and shipped a Moxa MIB bundle read from
+  MOXA-GENERAL-MIB, but the arc was still listed as curated-from-memory in
+  the enterprise table. It is now in the verified list, as every well-known
+  root and every bundle arc must be.
+
+### 4.33.0 — How long it was down, loss you can see, and paths that alert
+
+- **"Device recovered" now says when it recovered and how long it was down.**
+  The notice read "responding again" and nothing else, so the one question an
+  operator opens it to answer — how long was this out — had to be reconstructed
+  from the outage alert's timestamp in another row. It now reads *"responding
+  again at 14:03:21 after 2 h 14 m down"*, with the exact time the outage began
+  underneath it. The outage's start comes from the alert this recovery just
+  resolved, whose opened time **is** the moment the device stopped answering,
+  and from the device's own event log when there is no such alert — the rule
+  disabled, the device muted, the alert held as a newly added device or
+  resolved by hand. When neither knows, the clause is left out rather than
+  guessed at: an outage of unknown length is not a zero-length one. A resolved
+  alert of any kind now also carries how long it stood, in its detail pane.
+- **Fixed: the recovery email named the wrong time.** It said "is responding
+  again as of {{last_time}}", and on a resolution notification `last_time` is
+  when the *outage* last recurred — a moment before the recovery, not the
+  recovery. The template now uses three new tokens, `recovered_time`,
+  `down_since` and `downtime`, and every resolution notification carries them:
+  a port coming back, an access point returning and a threshold dropping below
+  its clear value all now state how long the problem stood, which none of them
+  did before.
+- **An upgraded install gets the new wording, unless it wrote its own.**
+  Built-in templates seed once and are then left alone, which is right for a
+  template somebody edited and wrong for one nobody has touched — that one is
+  simply the old shipped text sitting where the new shipped text belongs. The
+  upgrade now rewrites a built-in template only where it still matches, exactly,
+  what the previous release shipped. An edited template is never touched, and
+  "Reset to built-in" offers this release's wording either way.
+- **The Nodes device pane charts packet loss, on its own time frame.** Loss is
+  sampled on every poll that pings and already drives a shipped alert rule, but
+  there was nowhere to see its shape over time — bandwidth is a per-port
+  question, asked in the port dialog, and loss is not. The chart sits under the
+  status timeline with its own range dropdown: "how long has it been down" and
+  "how lossy is this link" are asked over different spans, and one shared range
+  made every visit to the pane a compromise. Its axis is pinned to 0-100 %,
+  because an auto-scaled one draws a healthy device's flat zero as a
+  full-height alarm. A device that is not being ping-probed says so rather than
+  drawing an empty grid.
+- **That chart's ranges stop at three days, deliberately.** Metric windows
+  wider than three days are read from an hourly rollup table that nothing in
+  this application has ever populated, so offering 7 and 30 days would offer
+  two views that are permanently empty. The status timeline beside it keeps
+  every range — it is built from the device event log, not from metric samples.
+- **NetPath destinations now raise alerts.** Every other module fed the alert
+  engine; traceroute results fed nothing, so a monitored path could be broken
+  for a day with nothing but a red dot on a tab to say so. Three built-in rules
+  ship, and all three are deliberately hard to trip, because a path monitor
+  that cries wolf gets turned off:
+  - **NetPath destination unreachable** — nothing at all comes back from the
+    destination, on three consecutive traces. On the shipped five-minute
+    interval that is a quarter of an hour of silence. One answered probe clears
+    it. A refusal names the router and the ICMP code that sent it.
+  - **NetPath path repeatedly failing** — half the traces in a window failed to
+    reach the destination. The window is the longer of an hour and six trace
+    intervals, and the rule says nothing until at least five traces have landed
+    in it, so a destination traced twice an hour cannot alert on one bad trace.
+    This is the only one of the three that can see a path that works
+    intermittently, which counting consecutive failures by definition cannot.
+  - **NetPath latency far above normal** — round-trip time at three times that
+    destination's **own** warn threshold, sustained for three traces. Relative
+    rather than a fixed number of milliseconds, because "slow" means nothing
+    across a LAN hop and a satellite link at once. Thresholds below 20 ms are
+    treated as 20 ms, since three times a few milliseconds is ordinary jitter,
+    and a trace that did not reach the destination is not measured at all — its
+    round-trip time is to whichever router refused it.
+- **One broken path raises one alert.** An unreachable destination is also,
+  necessarily, one whose traces are failing and whose latency cannot be
+  measured, so the unreachable alert absorbs the other two for that destination
+  the same way *Device not responding* absorbs the alerts a dead device
+  implies. Nothing needs un-suppressing: all three re-derive from the next
+  trace.
+- **A trace that could not run is not an outage.** A traceroute that failed on
+  this machine, or a slot skipped because the previous run was still going,
+  records 100 % loss by construction — and alerting on it would report a
+  missing `traceroute` binary or a badly chosen interval as a network
+  breakdown. Those statuses now produce no sample at all: they leave every
+  streak exactly as it was rather than counting as a failure. Consecutive-trace
+  counts are counted against the traces' own timestamps, too, so "three traces"
+  cannot be satisfied in fifteen seconds by an engine that ticks every five.
+- **A destination that stops being traced resolves its alerts.** A threshold
+  alert clears by being re-evaluated and found to have recovered, which cannot
+  happen for a destination that was disabled or deleted — the alert would have
+  sat open forever, and turning a destination off while working on a link is a
+  normal thing to do.
+- **A Moxa MIB bundle is in the catalog** — 25 files covering the EDS, IKS and
+  PT switch families and the AWK access point: system info and utilization,
+  port status, PoE, Turbo Ring and Turbo Chain redundancy, dual homing, fiber
+  check and digital I/O. Fetched from LibreNMS's public tree at install time
+  like every other bundle; nothing is mirrored here. 4.32.0's arc walk already
+  names a Moxa switch from arc 8691 without any MIB at all; this is what lets
+  it decode the switch's own objects once named, and what the bundle hint on a
+  `mib_missing` event points at.
+- **Rockwell Automation gear is identified from its sysDescr,** and reads as
+  "Rockwell Automation" rather than as a token. No enterprise arc is claimed
+  for it: every arc in this application was read out of that vendor's own MIB
+  text, because a wrong arc silently mislabels every device under it, and no
+  Rockwell MIB was available to read one from. It is therefore the one vendor
+  named by sysDescr with no arc to be keyed by, and carries its display name in
+  `enterprises.ARCLESS_DISPLAY` instead.
+- **Known, not fixed: SNMPv1 is never actually spoken.** The poller resolves
+  the version as `snmp_version or 1`, so a device configured for v1 (stored as
+  `0`) goes on the wire as v2c. One consequence is already guarded — a custom
+  Vendor or Location OID rides in the same request as sysDescr and sysObjectID,
+  which on a real v1 agent would null every answer in it, so those OIDs are read
+  in a separate best-effort request for a v1-configured device — but that guard
+  cannot fire while the coercion stands. Correcting it changes how every
+  v1-configured device is polled and deserves its own change with its own
+  testing, so it is recorded here rather than slipped in.
+
+### 4.32.0 — Know what you are polling
+
+- **A device's vendor is now identified from what it actually answers, not
+  only from its sysObjectID.** Vendor identity lives entirely under the
+  `enterprises` subtree, and the set of enterprise arcs a device populates
+  can be enumerated in (arcs + 1) GETNEXTs by *hopping*: ask for the first
+  object under `1.3.6.1.4.1`, land on arc N, ask for the first object under
+  `1.3.6.1.4.1.(N+1)` and skip the whole of arc N. A device usually answers
+  under two to six arcs, so this is cheaper than one poll — and it finds
+  vendors this app holds no MIB for. A net-snmp radio that used to show as
+  "netSnmp" now shows as Phoenix Contact, because arc 4346 is what it
+  answers under.
+- **Then the installed MIBs are scored against a bounded walk** (about 500
+  objects, 20 seconds, once per device on its first successful poll, again
+  only if its sysObjectID changes, and behind a Re-identify button). Each
+  MIB is credited with the objects it names on that device, and the file
+  that names the most becomes the device's Custom MIB — replacing the old
+  "the file with the most objects under the arc" guess, which was a guess
+  about the device made from the MIB alone. Steady-state polling adds no
+  traffic at all: once identified for its current sysObjectID, a device is
+  never walked again until somebody asks.
+- **The precedence is explicit and explained.** A vendor set by hand wins,
+  then one learned from an operator's override on a device with the same
+  sysObjectID, then a real vendor arc in the sysObjectID (an IANA
+  assignment), then the walk, then a word in the sysDescr, then the SNMP
+  agent's own name. The walk never substitutes a different arc for a real
+  vendor arc — OEM gear routinely implements the chipset vendor's arc
+  alongside its own. Every device stores the evidence: which arcs answered,
+  how many objects, which MIB named how many of them, and the sentence that
+  states the decision. The device dialog shows all of it.
+- **A confidence you can see.** The Vendor column carries one character
+  after a name that is less than certain — `?` for a guess from sysDescr,
+  `~` for probable (a curated enterprise number, or a walk with thin MIB
+  evidence), `*` for a vendor set by hand or learned — and nothing after a
+  name that came from an IANA arc or strong evidence, so the common case
+  reads clean. The title says which source spoke.
+- **Set a vendor by hand, and the fleet learns it.** A manual vendor on a
+  device is shown, acted on by ConfigRX and the Cisco MAC-table read, and —
+  when the device's sysObjectID is specific to one vendor — remembered, so
+  every other device answering the same sysObjectID follows on its next
+  poll. A generic-agent sysObjectID (net-snmp's, shared by every Linux box
+  ever built) is deliberately never learned from; the dialog says so.
+- **"This looks like a Ubiquiti — install the Ubiquiti MIBs."** Catalog
+  bundles now carry the enterprise arcs they describe, so a device answering
+  under an arc no installed MIB decodes is pointed at the bundle that would,
+  with a one-click install from the device dialog. Every arc was read out of
+  the bundle's own root file, never assumed.
+- **Arcs with no MIB still get a name.** A bundled enterprise-number list —
+  48 arcs verified from MIB text and 80 curated from memory of the IANA
+  registry, kept apart and trusted differently — names a device whose vendor
+  this app has never seen a MIB for. A curated entry decides at medium
+  confidence with the arc number in the evidence, so a wrong one is
+  auditable and scoped to devices nothing else could name.
+- **Discovery sweeps list each device's arcs too.** The identity GET gains
+  the hop's few GETNEXTs, the results table marks confidence and hints at
+  the bundle to install, and promotion carries the verdict into the device.
+  Switchable off, in which case a sweep is exactly what it was.
+- Settings → Nodes has a **Vendor identification** fieldset for the walk's
+  bounds, its concurrency (four at once, which is what throttles the
+  post-upgrade burst where every existing device is unidentified) and the
+  discovery hop. Existing devices keep their vendor on upgrade and are
+  walked once, a few at a time, as they poll.
+
+**Not done in this release:** a Phoenix Contact MIB bundle, for the same
+reason as 4.28 — the catalog's upstream ships none. The device is now named
+correctly anyway, and its `mib_missing` event says which arc a MIB would need
+to describe.
+
+### 4.31.0 — Mute a device, sustain a threshold, find a MAC
+
+- **A poll overrun on a device that is not answering is no longer reported.**
+  An overrun is recorded when the previous poll is still running as the next
+  falls due — which is exactly what a device that stopped answering causes,
+  because every request in that poll spends its full timeout and its retries.
+  Worse, it fires *first*: a device takes three completed failing polls to be
+  marked down, so the overruns led the outage by two or three intervals and
+  the first one got out before anything suppressed it. Now nothing is recorded
+  at all — no alert, no event row, no Debug line — while the device is down or
+  its last poll failed. An overrun alert raised in the moments before the
+  outage is absorbed by "Device not responding" like the other polled-metric
+  alerts.
+- **A device's alerts can be muted for 1, 6, 12 or 24 hours.** The button sits
+  beside Resolve and Acknowledge in the alert detail. A mute stops what happens
+  next — new alerts and their emails — and leaves alerts already open in the
+  list to be worked normally; nothing has to un-suppress when it lapses,
+  because thresholds re-derive from live metrics and a still-down device keeps
+  recording events. Muting a switch silences its ports with it. A muted device
+  is marked in the Nodes device list and its detail header, because a mute
+  nobody can see is a mute somebody will spend an afternoon looking for.
+- **Packet loss must now be sustained for 60 seconds before it alerts**, and
+  the duration is adjustable per rule alongside the existing threshold. With
+  the default of three ping probes per poll, measured loss can only ever be 0,
+  33, 67 or 100 %, so a single lost probe used to raise an alert; the rule
+  dialog now says so and points at the setting that changes it.
+- **Fixed: "consecutive polls before firing" counted engine ticks, not polls.**
+  The alert engine ticks every five seconds and a device is polled every sixty,
+  so `for_polls = 2` meant "ten seconds" — and, because the streak advanced
+  whether or not a new sample had arrived, one bad reading satisfied it about
+  ten seconds later and went on satisfying it forever. The streak now advances
+  only when the metric's own timestamp moves, which is what the setting always
+  claimed. (The DHCP evaluator already worked this way; the device one now
+  matches it.)
+- **Double-clicking a device row opens that device in a dialog**, with its
+  identity, its interfaces and its event log — for the device you double-clicked,
+  which need not be the one selected in the pane. Opening a port from it charts
+  that device, and offers a way back to the dialog it came from. Single click
+  still just moves the detail pane.
+- **The interface dialog names its parent device above the port**, on its own
+  line and in the same size font.
+- **Browse OIDs can download a device's entire SNMP walk.** The subtree browser
+  deliberately stops at 600 rows and 20 seconds because somebody is waiting on
+  it; a whole switch is tens of thousands of objects and minutes of SNMP. This
+  runs as a background job instead, showing a live object count with a Cancel,
+  and writes the file when it finishes. The file's header states the device,
+  the time, and whether the walk completed or was cut short and why — a
+  truncated walk that looks complete is the failure worth avoiding. Cancelling
+  keeps what was read rather than throwing it away.
+- **Devices can be found by MAC address.** Type an address into the Nodes Find
+  box in any notation — `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
+  `aabb.ccdd.eeff` or bare hex, or just the first few octets — and the list
+  filters to the switches that have learned it. One switch and one port opens
+  that port's dialog outright; several ports are named as a shortlist rather
+  than one being picked, because a MAC on an uplink is on every switch between
+  here and the host.
+- **Learning MAC addresses is opt-in and separately paced.** Forwarding tables
+  are not read on the poll cycle — they are hundreds to thousands of rows per
+  switch — but on their own `Learn MAC addresses every N seconds` interval, set
+  per polling profile or per device. It is **0 (off) by default**, so an
+  upgrade adds no SNMP load anywhere until you ask for it. Entries a walk has
+  not refreshed for a week are dropped, so a MAC that moved does not answer
+  twice forever.
+- **ConfigRX gained bulk settings and bulk backups.** The old bulk dialog could
+  only set an SSH username and password, and could only ever turn backups *on*.
+  The replacement covers everything the single-device dialog does — enabled as
+  a real three-way choice, SSH port, username, password, vendor override — with
+  every field defaulting to "leave unchanged", and **Back up selected** queues
+  every ticked device, reporting which were queued, which were already queued
+  and which have backups switched off.
+
 ### 4.30.0 — Tables you can shape, identity you can point at an OID
 
 - **Vendor and Location can be read from an OID you choose.** Vendor was

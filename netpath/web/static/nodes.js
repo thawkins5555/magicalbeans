@@ -20,6 +20,10 @@
     timeline: null,
     // The status timeline's window, set by the range dropdown above it.
     chartRange: 3600,
+    // The packet-loss chart's window, set by its own dropdown. Deliberately
+    // separate: an outage is read over days, a lossy link over minutes.
+    loss: null,
+    lossRange: 3600,
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -86,6 +90,42 @@
      page ships with; everything else is available from Nodes → Settings →
      Columns. `cell` renders, `value` sorts, `fixed` means the column is the
      table's own machinery and is never offered for hiding. */
+  /* How much to trust a vendor name, as one character after it: "?" for a
+     low-confidence guess (sysDescr), "~" for probable (a curated enterprise
+     number, or a walk with thin MIB evidence), "*" for a vendor an operator
+     set or one learned from an operator's override. Nothing after a name
+     that came from an IANA arc or strong walk evidence — the common case
+     should read clean. The title says which source spoke. */
+  const SOURCE_LABEL = {
+    sysObjectID: 'from its sysObjectID (IANA enterprise arc)',
+    walk: 'from the enterprise arcs it answers under',
+    sysDescr: 'a guess from a word in its sysDescr',
+    oid: 'from a custom vendor OID (display only)',
+    manual: 'set by an operator',
+    learned: 'learned from an operator override on a device with the same sysObjectID',
+  };
+  function vendorMarker(r) {
+    if (!r.vendor) return '';
+    const source = r.vendor_source || '';
+    const confidence = r.vendor_confidence || '';
+    let mark = '';
+    if (source === 'manual' || source === 'learned') mark = '*';
+    else if (confidence === 'low') mark = '?';
+    else if (confidence === 'medium') mark = '~';
+    if (!mark) return '';
+    const title = `${SOURCE_LABEL[source] || source}${confidence ? ` — ${confidence} confidence` : ''}`;
+    return ` <span class="hint" title="${escape(title)}">${mark}</span>`;
+  }
+
+  /* " · alerts muted" when this device has an active mute, blank otherwise.
+     muted_until comes from the Alerts module via the devices endpoint. */
+  function mutedTag(row) {
+    if (!row.muted_until) return '';
+    const until = new Date(row.muted_until * 1000).toLocaleString();
+    return ` · <span class="warn-text" title="New alerts for this device are ` +
+      `suppressed until ${escape(until)}">alerts muted</span>`;
+  }
+
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
       cell: (r) => `<input type="checkbox" class="nd-check"${
@@ -98,7 +138,11 @@
         escape(r.status) },
     { key: 'name', label: 'Name / IP', width: 200, on: true,
       value: (r) => displayName(r) || r.ip || '',
-      cell: (r) => `${escape(displayName(r))}<div class="hint">${escape(r.ip)}</div>` },
+      // The mute lives in Alerts but is shown here on purpose: an operator
+      // who silenced a device an hour ago and later wonders why it has gone
+      // quiet should not have to go looking for the reason.
+      cell: (r) => `${escape(displayName(r))}<div class="hint">${escape(r.ip)}` +
+        `${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
       cell: (r) => escape(r._groupName || '\u2014') },
@@ -106,8 +150,10 @@
       value: (r) => r._devGroupName || '',
       cell: (r) => escape(r._devGroupName || '\u2014') },
     { key: 'vendor', label: 'Vendor', width: 120, on: true,
+      // Sorted and filtered on the stored key, shown as the vendor's own
+      // name for itself where the two differ.
       value: (r) => r.vendor || '',
-      cell: (r) => escape(r.vendor || '\u2014') },
+      cell: (r) => escape(r.vendor || '\u2014') + vendorMarker(r) },
     { key: 'response', label: 'Response', width: 90, numeric: true, on: true,
       // Sorted on the number, not on the "12 ms (ping only)" text, and a
       // device with no reading sorts as blank rather than as zero.
@@ -143,6 +189,15 @@
     drawTable();
   }
 
+  // device id -> { tr, cells: [rendered <td> html per column], columnsKey }.
+  // drawTable() runs on every poll tick (nodes_refresh_s, 2s by default),
+  // not just on user action, so rebuilding every <tr> from scratch every
+  // cycle is real, recurring cost once the device count is in the hundreds.
+  // Kept across draws so a row whose rendered output hasn't actually
+  // changed reuses its existing DOM node instead of being torn down and
+  // recreated.
+  let rowCache = new Map();
+
   function drawTable() {
     const columns = deviceColumns();
     const checked = view.devicesChecked;
@@ -173,22 +228,78 @@
     }
     const rows = App.sortRows(view.devices, view.deviceSort.key,
                               view.deviceSort.descending, columns);
-    App.drawRows(body, rows, columns, (tr, row) => {
-      tr.className = 'clickable'
+
+    // Changes when the operator picks different columns (Nodes → Settings →
+    // Columns) — a layout change, not a data change, so a row cached under
+    // the old column set is rebuilt rather than cell-diffed against a
+    // <tr> whose <td> count/order no longer matches.
+    const columnsKey = columns.map((c) => c.key).join(',');
+    const seen = new Set();
+    for (const row of rows) {
+      seen.add(row.id);
+      const cellHtml = columns.map((c) => {
+        if (c.cell) return c.cell(row);
+        const raw = row[c.key];
+        const blank = raw === null || raw === undefined || raw === '';
+        return blank ? '\u2014' : escape(raw);
+      });
+      const cached = rowCache.get(row.id);
+      let tr;
+      if (cached && cached.columnsKey === columnsKey) {
+        tr = cached.tr;
+        for (let i = 0; i < cellHtml.length; i++) {
+          if (cached.cells[i] !== cellHtml[i]) {
+            tr.children[i].innerHTML = cellHtml[i];
+            cached.cells[i] = cellHtml[i];
+          }
+        }
+      } else {
+        tr = document.createElement('tr');
+        tr.innerHTML = columns.map((c, i) =>
+          `<td class="${c.numeric ? 'num' : ''}">${cellHtml[i]}</td>`).join('');
+        rowCache.set(row.id, { tr, cells: cellHtml, columnsKey });
+      }
+      const className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
         + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
+      if (tr.className !== className) tr.className = className;
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.
+      // Re-wired on every draw regardless of whether the cell was patched:
+      // a plain property assignment, not addEventListener, so redoing it
+      // neither leaks nor accumulates, and it's the only way to pick up
+      // a freshly-replaced checkbox <input> after a cell rebuild.
       const box = tr.querySelector('.nd-check');
       if (box) {
+        // The markup diff can't be trusted for the tick itself: toggleChecked
+        // flips the live `checked` property in place without going through
+        // drawTable, so the cached markup and the real box can disagree. If
+        // the selection then flips back (Clear, select-all, a header click)
+        // the recomputed markup matches the stale cache, the cell is left
+        // alone, and the box would stay in the wrong state. Setting the
+        // property directly is cheap and always right.
+        box.checked = view.devicesChecked.has(row.id);
         box.onclick = (event) => {
           event.stopPropagation();
           toggleChecked(row.id, tr);
         };
       }
       tr.onclick = () => selectDevice(row.id);
-    });
+      // Single click keeps its meaning — move the detail pane. A double
+      // click opens the device in a dialog, which need not be the selected
+      // one; alerts.js's templates table is the same gesture. Assigned on
+      // every draw for the same reason onclick is: a cached <tr> already
+      // carries a handler closed over the previous draw's `row`, and a
+      // plain property assignment replaces it rather than stacking.
+      tr.ondblclick = () => deviceDialog(row.id);
+      body.appendChild(tr);
+    }
+    // Drop cache entries for devices no longer in the list (removed, or
+    // filtered out) so the cache can't grow without bound.
+    for (const id of rowCache.keys()) {
+      if (!seen.has(id)) rowCache.delete(id);
+    }
     table.appendChild(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
@@ -273,6 +384,43 @@
     if (!queued) settle(busy ? `${busy} already polling` : 'Nothing to poll');
     else if (busy) settle(`Polling ${queued}, ${busy} already running`);
     else settle(`Polling ${queued}…`);
+    App.refreshNow('nodes');
+  }
+
+  /* Re-identify every ticked device. Same shape as bulkPollNow: the POST
+     returning means the walks were started on their own threads, and the
+     list shows the outcome as the Vendor column changes. */
+  async function bulkIdentify() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    const button = App.el('nd-bulk-identify');
+    if (!button || button.disabled) return;
+    const settle = (text) => {
+      button.disabled = false;
+      button.textContent = text;
+      if (text !== 'Re-identify') {
+        setTimeout(() => {
+          if (button.textContent === text) button.textContent = 'Re-identify';
+        }, 4000);
+      }
+    };
+    button.disabled = true;
+    button.textContent = 'Starting…';
+    let result;
+    try {
+      result = await App.post('/api/nodes/devices/bulk-identify', { device_ids: ids });
+    } catch (error) {
+      settle('Failed');
+      return;
+    }
+    const queued = (result.queued || []).length;
+    const running = (result.already_running || []).length;
+    const off = (result.snmp_disabled || []).length;
+    const parts = [];
+    if (queued) parts.push(`Started ${queued}`);
+    if (running) parts.push(`${running} already running`);
+    if (off) parts.push(`${off} SNMP off`);
+    settle(parts.length ? parts.join(' · ') : 'Nothing to identify');
     App.refreshNow('nodes');
   }
 
@@ -362,14 +510,22 @@
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
-    await loadStatusTimeline();
+    await Promise.all([loadStatusTimeline(), loadLossChart()]);
     drawIfaceTable();
     drawEventTable();
   }
 
   function drawDetailHeader() {
-    const d = view.detail;
-    App.el('nd-d-name').textContent = displayName(d);
+    App.el('nd-d-name').textContent = displayName(view.detail);
+    App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
+  }
+
+  /* The identity line for one device, as markup. Takes the device rather
+     than reading view.detail so the device dialog can render a device that
+     is not the selected one through the same code — the alternative was a
+     second copy that would drift from the Settings-driven field list. */
+  function deviceSummaryHtml(d) {
+    if (!d) return '';
     const s = App.state.nodesSettings || {};
     // ?? not ||: an admin who unchecks every field means "just IP·status",
     // which arrives as '' and must not fall back to the defaults.
@@ -390,27 +546,42 @@
       sys_name: () => field('sysName', d.sys_name),
       sys_object_id: () => field('sysObjectID', d.sys_object_id),
       sys_contact: () => field('contact', d.sys_contact),
-      sys_location: () => field('location', d.sys_location
-        + (d.location_oid ? ' (from a custom OID)' : '')),
+      // `|| ''` before concatenating: a device with no answer for these has
+      // null here, and `null + ''` is the string "null", which is truthy and
+      // so rendered the field with the word null in it.
+      sys_location: () => field('location', (d.sys_location || '')
+        && d.sys_location + (d.location_oid ? ' (from a custom OID)' : '')),
       // Which source spoke matters: an arc under `enterprises` is an IANA
-      // assignment, a sysDescr match is a substring guess, and a custom OID
-      // is whatever the operator pointed at. They are not equally trustworthy
-      // and the header used to present all three identically.
-      vendor: () => field('vendor', d.vendor + ({
+      // assignment, a sysDescr match is a substring guess, a vendor OID is a
+      // proprietary object this app knows names its own maker, and a custom
+      // OID is whatever the operator pointed at. They are not equally
+      // trustworthy and the header used to present them identically.
+      vendor: () => field('vendor', (d.vendor_label || d.vendor || '') && (d.vendor_label || d.vendor) + ({
         sysObjectID: ' (sysObjectID)', sysDescr: ' (sysDescr)',
-        oid: ' (custom OID)',
-      }[d.vendor_source] || '')),
-      snmp_version: () => field('SNMP',
-        `v${{ 0: '1', 1: '2c', 3: '3' }[d.effective_config.snmp_version]
-            || d.effective_config.snmp_version}`),
+        oid: ' (custom OID)', walk: ' (walk)', learned: ' (learned)',
+        manual: ' (manual)',
+      }[d.vendor_source] || '')
+        + (d.vendor && d.vendor_confidence && d.vendor_confidence !== 'high'
+           ? ` ${d.vendor_confidence}` : '')),
+      // effective_config is only on the single-device endpoint; guarded so
+      // this stays safe for any caller passing a plain list row.
+      snmp_version: () => field('SNMP', (d.effective_config
+        ? `v${{ 0: '1', 1: '2c', 3: '3' }[d.effective_config.snmp_version]
+              || d.effective_config.snmp_version}` : '')),
     };
     const parts = [
       field('IP', d.ip),
       field('status', d.status),
+      // Sits right after the status, because it changes what the status
+      // means to the person reading it: quiet here is a choice, not health.
+      d.muted_until
+        ? field('alerts', `muted until ${new Date(d.muted_until * 1000).toLocaleString()}`,
+                'nd-v warn-text')
+        : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
       field('error', d.snmp_error, 'nd-err'),
     ].filter(Boolean);
-    App.el('nd-d-summary').innerHTML = parts.join('');
+    return parts.join('');
   }
 
   function timelineWindow() {
@@ -418,10 +589,12 @@
     return [now - view.chartRange, now];
   }
 
-  /* The status timeline is the device pane's only time-series view now,
-     so it owns the range dropdown above it outright rather than sharing a
-     window with a metric chart. Per-port bandwidth still charts, in the
-     interface dialog, over its own fixed last-hour window. */
+  /* The status timeline and the packet-loss chart under it each own their
+     own range dropdown and their own window — the same fault is read over
+     completely different spans depending on which question is being asked,
+     and one shared range made every visit to the pane a compromise. Per-port
+     bandwidth still charts in the interface dialog, over its own fixed
+     last-hour window. */
   async function loadStatusTimeline() {
     if (!view.selected) return;
     // A quick run of range changes can land out of order; a ticket that
@@ -433,6 +606,54 @@
     if (requestId !== view.timelineRequestId) return;   // superseded — drop it
     view.timeline = result;
     drawStatusTimeline();
+  }
+
+  /* Packet loss over the loss chart's own window.
+
+     The samples are already there: the poller records ping_loss_pct on every
+     poll that pings, so this is two reads of endpoints that already exist
+     rather than anything new being stored. The metric row only exists once a
+     device has actually been pinged, which is a real state to render rather
+     than an error — a device polled over SNMP with pinging off has no loss to
+     show and should say so. */
+  async function loadLossChart() {
+    if (!view.selected) return;
+    const requestId = (view.lossRequestId = (view.lossRequestId || 0) + 1);
+    const deviceId = view.selected;
+    const t1 = Date.now() / 1000;
+    const t0 = t1 - view.lossRange;
+    const metric = (view.metrics || []).find((m) => m.key === 'ping_loss_pct');
+    if (!metric) {
+      view.loss = { t0, t1, unit: '%', series: [], notProbed: true };
+      drawLossChart();
+      return;
+    }
+    const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
+                                 { metric_id: metric.id, t0, t1 });
+    // Same ticket discipline as the timeline, and for a second reason here:
+    // loadDetail replaces view.metrics wholesale, so a metric id read before
+    // the selection moved belongs to a device this pane is no longer showing.
+    if (requestId !== view.lossRequestId || deviceId !== view.selected) return;
+    view.loss = { t0: result.t0, t1: result.t1, unit: '%',
+                  series: [{ label: metric.label || 'Packet loss',
+                             color: 'var(--warn)', points: result.points || [] }] };
+    drawLossChart();
+  }
+
+  function drawLossChart() {
+    const wrap = App.el('nd-loss-chart');
+    const svg = App.el('nd-loss-chart-svg');
+    if (!wrap || !svg) return;
+    drawSeriesChart(svg, wrap, view.loss, {
+      // Pinned, because loss is a percentage of a known whole and an
+      // auto-scaled axis lies about a healthy device: a flat 0% series would
+      // otherwise be drawn against a ceiling of 0.001 and read as a
+      // full-height alarm.
+      peak: 100,
+      emptyText: view.loss && view.loss.notProbed
+        ? 'This device is not being ping-probed'
+        : 'No packet-loss samples in this window',
+    });
   }
 
   function niceCeiling(value) {
@@ -525,7 +746,9 @@
       }, opts.emptyText || 'No data in this window'));
       return geo;
     }
-    const peak = niceCeiling(Math.max(...allValues, 0.001));
+    // opts.peak pins the axis for a metric with a known full scale (a
+    // percentage); everything else scales to what it actually got.
+    const peak = opts.peak || niceCeiling(Math.max(...allValues, 0.001));
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
     const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
 
@@ -671,19 +894,227 @@
     drawIfaceTable();
   }
 
-  function drawIfaceTable() {
+  /* Renders an interface list into `el` for `deviceId`. Parameterised rather
+     than reading view.ifaces and #nd-if-table directly, because the device
+     dialog shows a device that need not be the selected one — the pane and
+     the dialog share this renderer instead of growing a second copy that
+     drifts. `onOpen`, when given, replaces what clicking a row does. */
+  function drawIfaceTable(el, rows, deviceId, onOpen) {
+    const target = el || App.el('nd-if-table');
+    const list = rows || view.ifaces;
+    const id = deviceId != null ? deviceId : view.selected;
     const columns = ifaceColumns();
-    const table = App.grid(App.el('nd-if-table'),
-      { name: 'nodes-ifaces', columns,
-        sort: view.ifaceSort, onSort: onIfaceSort });
+    // Only the pane's own table drives the shared sort state; sorting the
+    // dialog's copy would silently reorder the pane behind it.
+    const table = App.grid(target, { name: 'nodes-ifaces', columns,
+      sort: view.ifaceSort,
+      onSort: el ? null : onIfaceSort });
     const body = document.createElement('tbody');
-    const rows = App.sortRows(view.ifaces, view.ifaceSort.key,
+    const sorted = App.sortRows(list, view.ifaceSort.key,
       view.ifaceSort.descending, columns);
-    App.drawRows(body, rows, columns, (tr, r) => {
+    App.drawRows(body, sorted, columns, (tr, r) => {
       tr.className = 'clickable';
-      tr.onclick = () => interfaceDialog(r);
+      tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
     });
     table.appendChild(body);
+  }
+
+  /* ---------------------------------------------- device drill-down */
+
+  /* Everything the detail pane shows about ONE device, in a dialog, for a
+     device that need not be the selected one — so it fetches by id rather
+     than reading view.detail / view.ifaces / view.events, which always
+     describe the selection. Opened by double-clicking a row. */
+  function deviceDialog(deviceId) {
+    if (deviceId == null) return;
+    // The same ticket idiom the interface and OID dialogs use: App.modal
+    // reuses one #modal-box, so a slow fetch must not paint into whatever
+    // dialog is open by the time it lands.
+    const token = (view.deviceDialogSeq = (view.deviceDialogSeq || 0) + 1);
+    const current = () => token === view.deviceDialogSeq
+      && !App.el('modal').hidden;
+    const listed = (view.devices || []).find((d) => d.id === deviceId);
+
+    const box = App.modal(escape(displayName(listed || {})) || 'Device', `
+      <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
+      <p class="section">VENDOR IDENTIFICATION</p>
+      <div id="ndd-vendor" class="hint">Loading\u2026</div>
+      <p class="section">INTERFACES</p>
+      <div class="table-wrap" style="max-height:34vh"><table id="ndd-if-table"></table></div>
+      <p class="section">EVENT LOG</p>
+      <div class="table-wrap" style="max-height:26vh"><table id="ndd-ev-table"></table></div>`, [
+      { label: 'Close', primary: true, onClick: App.closeModal },
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+
+    Promise.all([
+      App.get(`/api/nodes/devices/${deviceId}`),
+      App.get(`/api/nodes/devices/${deviceId}/interfaces`),
+      App.get(`/api/nodes/devices/${deviceId}/events`),
+    ]).then(([detail, ifaces, events]) => {
+      if (!current()) return;
+      const device = detail.device;
+      box.querySelector('h2').textContent = displayName(device);
+      box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(device);
+      renderVendorSection(box, device, deviceId, current);
+      // Opening a port from here replaces this dialog — there is only one
+      // #modal-box — so the port dialog gets a way back to this one.
+      drawIfaceTable(box.querySelector('#ndd-if-table'),
+        ifaces.interfaces || [], deviceId,
+        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)));
+      drawEventTable(box.querySelector('#ndd-ev-table'), events);
+    }).catch(() => {
+      if (!current()) return;
+      box.querySelector('#ndd-summary').innerHTML =
+        '<span class="err">Could not read this device.</span>';
+    });
+  }
+
+  /* ------------------------------------------ vendor identification */
+
+  /* What the app decided a device is, and why — the stored evidence from
+     vendorid, rendered so an operator can check the reasoning rather than
+     take a name on trust. Re-identify, the manual override and the catalog
+     install all live here, and every one of them re-renders from a fresh
+     GET rather than patching the DOM, so the section always shows what the
+     server holds. */
+  function vendorSectionHtml(d) {
+    const ev = d.vendor_evidence || {};
+    const decision = ev.decision || {};
+    const arcs = ev.arcs || [];
+    const source = d.vendor_source || '';
+    const confidence = d.vendor_confidence || '';
+    const canWrite = App.canWrite('nodes');
+    const head = d.vendor
+      ? `<b>${escape(d.vendor_display && d.vendor_display !== d.vendor
+          ? `${d.vendor_display} (${d.vendor})` : d.vendor)}</b>` +
+        ` <span class="hint">${escape(SOURCE_LABEL[source] || source || '')}` +
+        `${confidence ? ` · ${escape(confidence)} confidence` : ''}</span>`
+      : '<b>Not identified</b>';
+    const why = decision.reason || ev.error || '';
+    const arcLines = arcs.length ? `<table class="nd-arcs">${arcs.map((a) => {
+      const name = a.display || a.name || `enterprise ${a.arc}`;
+      const mib = a.mib_file_id
+        ? `${escape(a.module)} names ${a.named} of ${a.objects} (${Math.round((a.score || 0) * 100)}%)`
+        : (a.generic ? 'SNMP agent, not the maker'
+           : (a.bundle ? `no MIB installed — the ${escape(a.bundle)} bundle would decode it`
+              : 'no MIB installed'));
+      return `<tr><td>${a.arc}</td><td>${escape(name)}</td>` +
+        `<td>${a.objects} object${a.objects === 1 ? '' : 's'}${a.capped ? ' (capped)' : ''}</td>` +
+        `<td class="hint">${mib}</td></tr>`;
+    }).join('')}</table>`
+      : (ev.hop ? '<p class="hint">No enterprise arcs answered.</p>' : '');
+    const walk = ev.walk && ev.walk.objects != null && ev.hop
+      ? `<p class="hint">Walked ${ev.walk.objects} object(s) in ${ev.hop.requests + (ev.walk.requests || 0)} ` +
+        `request(s), ${(ev.walk.elapsed_s || 0).toFixed(1)}s` +
+        `${ev.walk.stopped && ev.walk.stopped !== 'complete' ? ` — ${escape(ev.walk.stopped)}` : ''}` +
+        `${ev.ts ? ` · ${new Date(ev.ts * 1000).toLocaleString()}` : ''}` +
+        `${ev.trigger ? ` (${escape(ev.trigger.replace('_', ' '))})` : ''}</p>` : '';
+    const chosen = (ev.candidates || []).find((c) => c.mib_file_id === d.mib_file_id);
+    const mib = d.mib_file_id
+      ? `<p class="hint">Custom MIB assigned: ${chosen ? escape(chosen.module) : `#${d.mib_file_id}`}` +
+        `${ev.chosen_mib_file_id && ev.chosen_mib_file_id !== d.mib_file_id
+          ? ' (chosen by hand — Re-identify never changes an assigned MIB)' : ''}</p>`
+      : '';
+    const suggest = d.suggest_bundle && !d.suggest_bundle.installed && canWrite
+      ? `<p>This looks like a ${escape(d.suggest_bundle.vendor)} — ` +
+        `<button id="ndd-install-bundle" data-key="${escape(d.suggest_bundle.key)}">` +
+        `Install the ${escape(d.suggest_bundle.name)} MIBs</button></p>`
+      : (d.suggest_bundle && d.suggest_bundle.installed
+         ? `<p class="hint">The ${escape(d.suggest_bundle.name)} bundle is installed; ` +
+           'Re-identify to score it.</p>' : '');
+    const learned = d.learned_from
+      ? `<p class="hint">Learned from device #${d.learned_from.device_id}` +
+        `${d.learned_from.set_by ? ` (set by ${escape(d.learned_from.set_by)})` : ''}.</p>` : '';
+    const override = canWrite ? `
+      <div class="bar wrap">
+        <label>Vendor (manual) <input id="ndd-vendor-override" size="18" maxlength="64"
+          value="${escape(d.vendor_override || '')}" placeholder="automatic"></label>
+        <button id="ndd-vendor-save">Save</button>
+        ${d.vendor_override ? '<button id="ndd-vendor-clear">Clear</button>' : ''}
+        <span class="grow"></span>
+        <button id="ndd-reidentify"${d.identifying ? ' disabled' : ''}>` +
+        `${d.identifying ? 'Identifying…' : 'Re-identify'}</button>
+      </div>
+      <p class="hint">${d.learnable
+        ? 'A manual vendor also teaches every device with the same sysObjectID.'
+        : `A manual vendor applies to this device only: ${escape(d.learn_reason || '')}.`}</p>`
+      : '';
+    return `<p>${head}${why ? `<br><span class="hint">${escape(why)}</span>` : ''}</p>` +
+      arcLines + walk + mib + learned + suggest + override;
+  }
+
+  function renderVendorSection(box, device, deviceId, current) {
+    const holder = box.querySelector('#ndd-vendor');
+    if (!holder) return;
+    holder.className = '';
+    holder.innerHTML = vendorSectionHtml(device);
+    const refresh = async () => {
+      const detail = await App.get(`/api/nodes/devices/${deviceId}`);
+      if (!current()) return;
+      renderVendorSection(box, detail.device, deviceId, current);
+      box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(detail.device);
+    };
+    const reidentify = holder.querySelector('#ndd-reidentify');
+    if (reidentify) reidentify.onclick = async () => {
+      reidentify.disabled = true;
+      reidentify.textContent = 'Identifying…';
+      try {
+        await App.post(`/api/nodes/devices/${deviceId}/identify`, {});
+      } catch (error) {
+        reidentify.textContent = 'Failed';
+        reidentify.disabled = false;
+        return;
+      }
+      // Poll the job until it finishes, then re-render from the stored
+      // verdict. The seq token stops a late answer painting into whatever
+      // dialog replaced this one.
+      for (let i = 0; i < 90 && current(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        let status;
+        try { status = await App.get(`/api/nodes/devices/${deviceId}/identify`); }
+        catch (error) { break; }
+        if (!current()) return;
+        const job = status.job;
+        if (!job || job.state === 'done' || job.state === 'failed') break;
+        const live = holder.querySelector('#ndd-reidentify');
+        if (live) live.textContent = `Identifying… (${job.objects || 0} objects)`;
+      }
+      if (current()) refresh().catch(() => {});
+    };
+    const save = holder.querySelector('#ndd-vendor-save');
+    if (save) save.onclick = async () => {
+      const text = holder.querySelector('#ndd-vendor-override').value.trim();
+      await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: text });
+      if (current()) refresh().catch(() => {});
+      App.refreshNow('nodes');
+    };
+    const clear = holder.querySelector('#ndd-vendor-clear');
+    if (clear) clear.onclick = async () => {
+      await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: '' });
+      if (current()) refresh().catch(() => {});
+      App.refreshNow('nodes');
+    };
+    const install = holder.querySelector('#ndd-install-bundle');
+    if (install) install.onclick = async () => {
+      install.disabled = true;
+      install.textContent = 'Installing…';
+      try {
+        await App.post(`/api/nodes/mib-catalog/${install.dataset.key}/install`, {});
+      } catch (error) {
+        install.textContent = 'Install failed';
+        return;
+      }
+      for (let i = 0; i < 120 && current(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        let status;
+        try { status = await App.get('/api/nodes/mib-catalog/status'); }
+        catch (error) { break; }
+        const job = status.job;
+        if (!job || !['running', 'starting', 'queued'].includes(job.state)) break;
+      }
+      if (current()) refresh().catch(() => {});
+    };
   }
 
   /* ------------------------------------------- interface drill-down */
@@ -715,9 +1146,22 @@
       '</table></div>';
   }
 
-  function ifaceTitle(row, ifIndex) {
-    return `${escape(row.descr || `Interface ${ifIndex}`)}` +
-      (row.alias ? ` <span class="hint">${escape(row.alias)}</span>` : '');
+  /* The markup App.modal puts inside the dialog's <h2>. The parent device
+     goes on its own line INSIDE that h2 so it inherits the heading's size —
+     a line in the body would render as .section at 11px, which is not the
+     same size font. Both lines are rebuilt together by the 5s refresh, so
+     they cannot drift apart. */
+  function ifaceTitle(row, ifIndex, deviceId) {
+    const id = deviceId != null ? deviceId : view.selected;
+    const device = (view.devices || []).find((d) => d.id === id)
+      || (view.detail && view.detail.id === id ? view.detail : null);
+    // Omitted rather than guessed when the device is not in the list the
+    // page currently holds: a wrong parent name is worse than none.
+    const parent = device
+      ? `<div class="ifd-parent">${escape(displayName(device))}</div>` : '';
+    return parent + `<div>${escape(row.descr || `Interface ${ifIndex}`)}` +
+      (row.alias ? ` <span class="hint">${escape(row.alias)}</span>` : '') +
+      '</div>';
   }
 
   /* ------------------------------------------------------ OID browser */
@@ -742,7 +1186,11 @@
         <label>Start at <input id="oid-base" size="24" value="1.3.6.1.2.1.1"></label>
         <button id="oid-walk">Walk from here</button>
         <span id="oid-quick" class="hint"></span>
+        <span class="grow"></span>
+        <button id="oid-full">Download full walk</button>
+        <button id="oid-full-cancel" hidden>Cancel</button>
       </div>
+      <div id="oid-full-status" class="hint" hidden></div>
       <p class="hint">Each walk reads the device live over SNMP. Names come
         from the MIBs uploaded under Profiles &amp; MIBs — an OID no MIB
         describes is shown as its number rather than guessed at.</p>
@@ -837,6 +1285,119 @@
       }
     }).catch(() => {});
 
+    /* The whole device, as a file. Runs server-side as a background job —
+       a full walk of a core switch is tens of thousands of GETNEXTs and
+       minutes of SNMP, which is exactly why the table above browses one
+       subtree at a time — so this shows a live count and a cancel, and
+       downloads only once the job is finished. */
+    const fullBtn = box.querySelector('#oid-full');
+    const cancelBtn = box.querySelector('#oid-full-cancel');
+    const fullStatus = box.querySelector('#oid-full-status');
+    let watchTimer = null;
+    // Starting a walk is a write (it drives the device over SNMP), and
+    // applyPermissions only ever runs over markup that already exists, so
+    // dynamically-built controls check canWrite themselves — see app.js.
+    if (!App.canWrite('nodes')) fullBtn.hidden = true;
+
+    function stopWatching() {
+      if (watchTimer) clearInterval(watchTimer);
+      watchTimer = null;
+      fullBtn.disabled = false;
+      cancelBtn.hidden = true;
+    }
+    window.addEventListener('modal-closed', stopWatching, { once: true });
+
+    function say(html, error) {
+      fullStatus.hidden = false;
+      fullStatus.innerHTML = error ? `<span class="err">${html}</span>` : html;
+    }
+
+    async function finishFullWalk() {
+      // download=1 hands over the text and drops the rows server-side, so a
+      // 100k-object walk does not sit in memory for the life of the process.
+      // Which is exactly why this must run once: a second call would find
+      // the rows already dropped and report an empty walk. The watch is
+      // stopped before the request, not after it.
+      const done = await App.get(`/api/nodes/devices/${deviceId}/oid-walk`,
+                                 { download: 1 });
+      if (!current()) return;
+      if (!done.text) { say('The walk produced nothing.', true); return; }
+      // Same Blob-and-anchor download debug.js uses; no server-side
+      // Content-Disposition anywhere in this app.
+      const blob = new Blob([done.text], { type: 'text/plain' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = done.filename || 'snmp-walk.txt';
+      link.click();
+      URL.revokeObjectURL(link.href);
+      const walkInfo = done.walk || {};
+      say(`Downloaded ${walkInfo.rows || 0} object(s) as ` +
+          `${escape(link.download)}` +
+          (walkInfo.complete ? '.' :
+            ` — <b>incomplete</b>: ${escape(walkInfo.stopped || '')}`));
+    }
+
+    async function pollFullWalk() {
+      let payload;
+      try {
+        payload = await App.get(`/api/nodes/devices/${deviceId}/oid-walk`);
+      } catch (error) {
+        stopWatching();
+        if (current()) say(escape(error.message), true);
+        return;
+      }
+      if (!current()) { stopWatching(); return; }
+      const walkInfo = payload.walk;
+      if (!walkInfo) { stopWatching(); return; }
+      if (walkInfo.state === 'failed') {
+        stopWatching();
+        say(escape(walkInfo.error || 'The walk failed.'), true);
+        return;
+      }
+      if (walkInfo.state === 'done') {
+        // Stop the interval BEFORE the download request: formatting a
+        // 100,000-row walk can take longer than the one-second tick, and a
+        // second finishFullWalk would race the first one's own cleanup.
+        stopWatching();
+        fullBtn.disabled = true;
+        say('Preparing the download…');
+        try {
+          await finishFullWalk();
+        } catch (error) {
+          if (current()) say(escape(error.message), true);
+        }
+        fullBtn.disabled = false;
+        return;
+      }
+      say(`Walking the whole device — ${walkInfo.rows} object(s) so far, ` +
+          `${Math.round(walkInfo.elapsed)}s elapsed.`);
+    }
+
+    fullBtn.onclick = async () => {
+      fullBtn.disabled = true;
+      cancelBtn.hidden = false;
+      say('Starting the walk…');
+      try {
+        await App.post(`/api/nodes/devices/${deviceId}/oid-walk`, {});
+      } catch (error) {
+        stopWatching();
+        say(escape(error.message), true);
+        return;
+      }
+      if (!current()) { stopWatching(); return; }
+      watchTimer = setInterval(() => { pollFullWalk().catch(() => {}); }, 1000);
+      pollFullWalk().catch(() => {});
+    };
+
+    cancelBtn.onclick = async () => {
+      cancelBtn.disabled = true;
+      await App.del(`/api/nodes/devices/${deviceId}/oid-walk`, {}).catch(() => {});
+      cancelBtn.disabled = false;
+      // The job stops at its next request and reports "done" with a
+      // cancelled reason, so the rows walked so far still download — a
+      // cancel is "enough, give me what you have", not "throw it away".
+    };
+
     box.querySelector('#oid-walk').onclick =
       () => walk(box.querySelector('#oid-base').value.trim());
     draw();
@@ -888,8 +1449,14 @@
     return 0;
   }
 
-  function interfaceDialog(iface) {
-    const deviceId = view.selected;
+  /* One port, charted and detailed. `deviceId` is explicit: opened from the
+     device dialog this is NOT necessarily the selected device, and reading
+     view.selected here was what charted the wrong device's traffic.
+     `onBack`, when given, adds a button returning to the dialog this was
+     opened from — there is only one #modal-box, so opening this one replaced
+     its parent. */
+  function interfaceDialog(iface, deviceId, onBack) {
+    if (deviceId == null) deviceId = view.selected;
     const ifIndex = iface.if_index;
     // One ticket per opened dialog, checked by everything asynchronous this
     // dialog starts: the 5s timer, the MAC read, the DOM read. App.modal
@@ -905,7 +1472,14 @@
     let smooth = true;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
 
-    const box = App.modal(ifaceTitle(iface, ifIndex), `
+    const buttons = [{ label: 'Close', primary: true, onClick: App.closeModal }];
+    if (onBack) {
+      buttons.unshift({ label: '\u2190 Back to device', onClick: () => {
+        App.closeModal();
+        onBack();
+      } });
+    }
+    const box = App.modal(ifaceTitle(iface, ifIndex, deviceId), `
       <p class="section">BANDWIDTH — LAST HOUR
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
         <span style="color:var(--accent)">▬</span> out)</span>
@@ -921,9 +1495,8 @@
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
-      <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`, [
-      { label: 'Close', primary: true, onClick: App.closeModal },
-    ], { buttonsTop: true });
+      <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`,
+      buttons, { buttonsTop: true });
     box.classList.add('wide');
 
     // Escape and a backdrop click close the modal without the Close button
@@ -988,7 +1561,7 @@
       // beside another section's five-minute-old snapshot.
       const fresh = (ifaces.interfaces || []).find((r) => r.if_index === ifIndex);
       if (fresh) {
-        box.querySelector('h2').innerHTML = ifaceTitle(fresh, ifIndex);
+        box.querySelector('h2').innerHTML = ifaceTitle(fresh, ifIndex, deviceId);
         box.querySelector('#ifd-stats').innerHTML = ifaceStatsHtml(fresh);
       }
       box.querySelector('#ifd-events').innerHTML = ifaceEventsHtml(ifIndex, events);
@@ -1046,12 +1619,16 @@
       });
   }
 
-  function drawEventTable() {
-    const table = App.el('nd-ev-table');
+  /* The event log for one device, into `el` from `payload`. Same reason as
+     drawIfaceTable above: the device dialog renders another device's events
+     through this rather than through a copy of it. */
+  function drawEventTable(el, payload) {
+    const table = el || App.el('nd-ev-table');
+    const events = payload || view.events || {};
     table.innerHTML = '<thead><tr><th>Time</th><th>Kind</th><th>Detail</th></tr></thead>';
     const body = document.createElement('tbody');
-    const all = [...(view.events.device_events || []).map((e) => ({ ...e, scope: 'device' })),
-                ...(view.events.interface_events || []).map((e) => ({ ...e, scope: `if ${e.if_index}` }))]
+    const all = [...(events.device_events || []).map((e) => ({ ...e, scope: 'device' })),
+                ...(events.interface_events || []).map((e) => ({ ...e, scope: `if ${e.if_index}` }))]
       .sort((a, b) => b.ts - a.ts);
     for (const e of all) {
       const tr = document.createElement('tr');
@@ -1119,6 +1696,12 @@
           <option value="1" ${d.unreachable_ping_only === 1 ? 'selected' : ''}>Yes — SNMP failing alone is not down</option>
           <option value="0" ${d.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
         </select></label>
+        <label>Learn MAC addresses every <input id="nd-f-mactable" type="number"
+          min="0" step="60" placeholder="inherit"
+          value="${d.mac_table_interval_s ?? ''}"> s</label>
+        <p class="hint">Walks this switch's forwarding table on its own slower
+          schedule, so a MAC address on it can be found from the Find box. 0
+          switches it off for this device whatever the profile says.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. Leave as
@@ -1141,7 +1724,17 @@
   function identityOidFieldsHtml(d, forGroup = false) {
     const inherit = forGroup ? 'standard detection' : 'inherit';
     const p = forGroup ? 'nd-p' : 'nd-f';
-    return `
+    // The manual vendor is a device fact, not a profile setting, so only
+    // the device form offers it; the profile form gets the two OIDs only.
+    const manual = forGroup ? '' : `
+      <label>Vendor (manual) <input id="${p}-vendormanual" size="30" maxlength="64"
+        placeholder="automatic" value="${escape(d.vendor_override || '')}"
+        data-original="${escape(d.vendor_override || '')}"></label>
+      <p class="hint">Overrides what identification decided, for display AND
+        for ConfigRX's command choice; and when this device's sysObjectID is
+        specific to one vendor, every device with the same sysObjectID
+        follows. Blank returns to automatic.</p>`;
+    return `${manual}
       <label>Vendor OID <input id="${p}-vendoroid" size="30"
         placeholder="${inherit}" value="${escape(d.vendor_oid || '')}"></label>
       <label>Location OID <input id="${p}-locationoid" size="30"
@@ -1160,10 +1753,19 @@
     // read as a deliberate choice and stop the profile's value applying.
     const p = forGroup ? 'nd-p' : 'nd-f';
     const text = (id) => (box.querySelector(id) || { value: '' }).value.trim();
-    return {
+    const values = {
       vendor_oid: text(`#${p}-vendoroid`) || null,
       location_oid: text(`#${p}-locationoid`) || null,
     };
+    // Device form only, and only when it changed: the API treats the key's
+    // presence as "the operator touched this" (setting teaches the fleet,
+    // clearing re-decides the row and records an event), so an ordinary
+    // Save of some other field must not send it.
+    const manual = !forGroup ? box.querySelector(`#${p}-vendormanual`) : null;
+    if (manual && manual.value.trim() !== (manual.dataset.original || '')) {
+      values.vendor_override = manual.value.trim();
+    }
+    return values;
   }
 
   // mib_file_id is a plain nullable override, same shape as poll_interval_s/
@@ -1216,6 +1818,7 @@
     overrides.ping_count = blankToNull(box.querySelector('#nd-f-pingcount').value);
     overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
+    overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
     Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
@@ -1571,6 +2174,14 @@
         <option value="0" ${p.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
       </select></label>
       <p class="hint">Blank ping fields inherit the Nodes settings.</p>
+      <label>Learn MAC addresses every <input id="nd-p-mactable" type="number" min="0"
+        step="60" placeholder="inherit" value="${p.mac_table_interval_s ?? ''}"> s</label>
+      <p class="hint">Walks each switch's forwarding table on this separate,
+        slower schedule so MAC addresses can be searched for in the Find box.
+        <b>0 switches it off</b>, and off is the default — a forwarding table
+        is hundreds to thousands of extra SNMP reads per switch, so it is
+        worth turning on only for the switches you actually trace hosts
+        through. 900 (fifteen minutes) is a sensible starting point.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
@@ -1600,6 +2211,9 @@
       ping_count: blankToNull(box.querySelector('#nd-p-pingcount').value),
       ping_timeout_ms: blankToNull(box.querySelector('#nd-p-pingtimeout').value),
       unreachable_ping_only: blankToNull(box.querySelector('#nd-p-pingonly').value),
+      // Blank inherits (NULL); an explicit 0 means "never walk", which is
+      // the shipped behaviour and a real choice, not the same as blank.
+      mac_table_interval_s: blankToNull(box.querySelector('#nd-p-mactable').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
       ...identityOidValues(box, true),
     };
@@ -1762,8 +2376,20 @@
       return `<tr><td>${box}</td>` +
         `<td>${escape(r.ip)}</td><td>${r.ping_ok ? 'yes' : 'no'}</td>` +
         `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
-        `<td>${escape(r.sys_name || '—')}</td><td>${escape(r.vendor || '—')}${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
+        `<td>${escape(r.sys_name || '—')}</td><td title="${escape(discArcsTitle(r))}">` +
+        `${escape(r.vendor || '—')}${vendorMarker(r)}` +
+        `${r.suggest_bundle && !r.suggest_bundle_installed
+          ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : ''}` +
+        `${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
     }).join('');
+  }
+
+  function discArcsTitle(r) {
+    const arcs = r.arcs || [];
+    if (!arcs.length) return r.vendor_source ? `via ${r.vendor_source}` : '';
+    const names = r.arc_names || [];
+    return 'Answers under enterprise arc(s): ' + arcs.map((a, i) =>
+      names[i] ? `${a} (${names[i]})` : String(a)).join(', ');
   }
 
   /* A select-all box in the header cell above the row boxes, the same
@@ -2218,6 +2844,45 @@
           poll is what makes loss measurable at all — a single probe can only ever say
           0% or 100%. Both are overridable per device and per profile.</p>
       </fieldset>
+      <fieldset><legend>MAC ADDRESS TABLES</legend>
+        ${number('np-macretention', 'Forget a learned MAC after',
+                 s.mac_table_retention_days, 'min=0 step=1')} days
+        <p class="hint">Which switches learn MAC addresses at all, and how
+          often, is set per polling profile (<b>Learn MAC addresses every</b>)
+          and is off by default. This is only how long an entry stays
+          searchable once no walk has refreshed it, so a switch dropped from
+          the schedule stops answering the Find box from a table nobody has
+          confirmed since.</p>
+      </fieldset>
+      <fieldset><legend>FULL SNMP WALK</legend>
+        ${number('np-walkrows', 'Stop a full walk after',
+                 s.oid_walk_max_rows, 'min=100 step=1000')} objects
+        ${number('np-walkbudget', 'or after', s.oid_walk_budget_s,
+                 'min=10 step=10')} seconds
+        <p class="hint">Bounds on <b>Download full walk</b> in the OID browser.
+          Generous, because that runs as a background job with a progress
+          count and a cancel rather than in a dialog you are waiting on — but
+          real, so a device whose agent loops cannot walk forever. Whichever
+          bound stops a walk is named in the downloaded file's header.</p>
+      </fieldset>
+      <fieldset><legend>VENDOR IDENTIFICATION</legend>
+        ${check('np-vendorwalk', 'Identify a device\'s vendor by walking its enterprise arcs once',
+                s.vendor_walk_enabled !== false)}
+        ${number('np-vendorobjects', 'Stop the identification walk after',
+                 s.vendor_walk_max_objects, 'min=50 step=50')} objects
+        ${number('np-vendorbudget', 'or after', s.vendor_walk_budget_s,
+                 'min=5 step=5')} seconds
+        ${number('np-vendorparallel', 'At most', s.vendor_walk_parallel,
+                 'min=1 max=16')} walks at once
+        ${check('np-dischop', 'Discovery sweeps also list each device\'s enterprise arcs',
+                s.discovery_arc_hop !== false)}
+        <p class="hint">Runs once per device on its first successful poll, again
+          only if its sysObjectID changes, and behind <b>Re-identify</b> — never
+          on the steady-state poll cycle. A device that stops answering is
+          retried at most three times, an hour apart. The sweep's arc listing
+          is separate and cheap: one GETNEXT per enterprise arc a device
+          answers under, typically three to eight per device.</p>
+      </fieldset>
       <fieldset><legend>DISCOVERY</legend>
         <p class="hint">Every discovery sweep now uses a chosen polling
           profile's own credentials — see the Profile picker on the
@@ -2252,6 +2917,14 @@
           ping_count: num('#np-pingcount'),
           ping_timeout_ms: num('#np-pingtimeout'),
           ping_interval_s: num('#np-pinginterval'),
+          mac_table_retention_days: num('#np-macretention'),
+          oid_walk_max_rows: num('#np-walkrows'),
+          oid_walk_budget_s: num('#np-walkbudget'),
+          vendor_walk_enabled: on('#np-vendorwalk'),
+          vendor_walk_max_objects: num('#np-vendorobjects'),
+          vendor_walk_budget_s: num('#np-vendorbudget'),
+          vendor_walk_parallel: num('#np-vendorparallel'),
+          discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
@@ -2311,6 +2984,80 @@
     drawMibsTable();
     if (view.selected) await loadDetail();
     else { App.el('nd-detail-empty').hidden = false; App.el('nd-detail').hidden = true; }
+    if (view.macSearchPending) {
+      view.macSearchPending = false;
+      await resolveMacSearch(q).catch(() => {});
+    }
+  }
+
+  /* aabbccddeeff -> aa:bb:cc:dd:ee:ff, and a prefix stays a prefix. */
+  function formatMac(mac) {
+    return (String(mac || '').match(/.{1,2}/g) || []).join(':');
+  }
+
+  /* What a searched-for MAC address resolved to.
+
+     One (device, port) opens that port's dialog outright, which is the
+     stated behaviour: you searched for a MAC because you want to know
+     where it is. Several ports do NOT auto-open one — a MAC on an uplink
+     is on every switch between here and the host, which is the normal case
+     on a stacked network, and silently picking one would send somebody to
+     the core switch for a problem on an access port. The list above has
+     already filtered to the switches that see it; this names the ports. */
+  async function resolveMacSearch(text) {
+    const note = App.el('nd-mac-note');
+    note.hidden = true;
+    note.innerHTML = '';
+    if (!text) return;
+    const payload = await App.get('/api/nodes/mac-search', { q: text });
+    if (!payload.mac) return;                 // not a MAC at all: nothing to say
+    const locations = payload.locations || [];
+    const show = (html) => { note.hidden = false; note.innerHTML = html; };
+    if (!locations.length) {
+      show(payload.enabled_devices
+        ? `<span class="hint">No switch has learned ` +
+          `<b>${escape(formatMac(payload.mac))}</b>.</span>`
+        : `<span class="hint">No forwarding tables have been collected yet — ` +
+          `switch on <b>Learn MAC addresses</b> in a polling profile to search ` +
+          `by MAC address.</span>`);
+      return;
+    }
+    const ports = new Map();
+    for (const loc of locations) ports.set(`${loc.device_id}:${loc.if_index}`, loc);
+    if (ports.size === 1) {
+      const loc = locations[0];
+      show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
+           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+           `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}</span>`);
+      selectDevice(loc.device_id);
+      await openPort(loc.device_id, loc.if_index);
+      return;
+    }
+    // Several: name them all and let the operator choose. Clicking one
+    // opens it, so this is a shortlist rather than a dead end.
+    show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
+         `${ports.size} ports — pick one:</span> ` +
+         [...ports.values()].map((loc, i) =>
+           `<button class="linkish nd-mac-hit" data-hit="${i}">` +
+           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+           `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''}</button>`).join(' '));
+    const hits = [...ports.values()];
+    for (const button of note.querySelectorAll('.nd-mac-hit')) {
+      button.onclick = () => {
+        const loc = hits[Number(button.dataset.hit)];
+        selectDevice(loc.device_id);
+        openPort(loc.device_id, loc.if_index).catch(() => {});
+      };
+    }
+  }
+
+  /* Opens one port's dialog by id, fetching the interface row rather than
+     hunting view.ifaces — the device may not be the selected one, and the
+     pane's own fetch may not have landed yet. */
+  async function openPort(deviceId, ifIndex) {
+    const payload = await App.get(`/api/nodes/devices/${deviceId}/interfaces`);
+    const row = (payload.interfaces || []).find((r) => r.if_index === ifIndex);
+    if (row) interfaceDialog(row, deviceId);
   }
 
   async function loadDiscJobsIfNeeded() {
@@ -2412,13 +3159,21 @@
       setTimeout(check, 600);
     };
     App.el('nd-apply').onclick = () => App.refreshNow('nodes');
-    App.el('nd-q').onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('nodes'); };
+    App.el('nd-q').onkeydown = (e) => {
+      if (e.key !== 'Enter') return;
+      // A MAC lookup runs on a deliberate search, never on the five-second
+      // refresh: it can open a dialog, and a dialog that reopens itself
+      // every five seconds is unusable.
+      view.macSearchPending = true;
+      App.refreshNow('nodes');
+    };
     App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
     App.el('nd-filter-offline').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-bulk-poll').onclick = bulkPollNow;
+    App.el('nd-bulk-identify').onclick = bulkIdentify;
     App.el('nd-bulk-profile').onclick = bulkSetProfile;
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
@@ -2429,6 +3184,16 @@
       loadStatusTimeline();
     };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
+    App.el('nd-loss-range').onchange = (e) => {
+      view.lossRange = Number(e.target.value);
+      loadLossChart();
+    };
+    // Only up to three days, unlike the status timeline's full range list.
+    // A wider window reads metric samples from the hourly rollup table, and
+    // nothing populates that table, so 7 and 30 days would be two options
+    // that are permanently empty. The status timeline is built from the
+    // device event log instead, so its own dropdown keeps every range.
+    App.fillRanges(App.el('nd-loss-range'), 'Last hour', 259200);
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
     App.el('nd-remove-profile').onclick = removeProfile;
@@ -2461,7 +3226,9 @@
     // resize needs a redraw from the data already loaded — no refetch.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
-        if (App.state.tab === 'nodes') drawStatusTimeline();
+        if (App.state.tab !== 'nodes') return;
+        drawStatusTimeline();
+        drawLossChart();
       });
     }
   }

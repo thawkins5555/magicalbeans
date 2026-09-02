@@ -8,6 +8,9 @@ SAPPIWHERE-ENTERPRISE-ROOTS DEFINITIONS ::= BEGIN
 -- here only as "this number belongs to this vendor", not as any part of
 -- that vendor's own MIB text. mibparse.py's own WELL_KNOWN_ROOTS already
 -- knows `enterprises`, so every entry below resolves immediately.
+--
+-- Arcs added after this file was first seeded live in
+-- enterprise-roots-2.mib, which explains why.
 
 cisco          OBJECT IDENTIFIER ::= { enterprises 9 }
 hpCompaq       OBJECT IDENTIFIER ::= { enterprises 232 }

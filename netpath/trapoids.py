@@ -114,6 +114,7 @@ WELL_KNOWN = {
     "1.3.6.1.4.1.6027":        "dellNetworking", # Force10 line; 674 is the
                                                  # separate Dell/OpenManage arc
     "1.3.6.1.4.1.6574":        "synology",
+    "1.3.6.1.4.1.8691":        "moxa",           # MOXA-GENERAL-MIB
     "1.3.6.1.4.1.8741":        "sonicwall",
     "1.3.6.1.4.1.11863":       "tpLink",
     "1.3.6.1.4.1.12276":       "f5Networks",     # 3375 is F5's other arc

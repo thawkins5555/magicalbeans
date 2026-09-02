@@ -46,6 +46,11 @@ netpath/
     api.py         JSON endpoint handlers, one function per route
     server.py      HTTP(S) server, routing, sessions, static files
     static/        the browser interface
+tests/
+  run_all.py       runs every tests/test_*.py as its own process, PASS/FAIL per file
+  _paths.py        repo root on sys.path, free ports, spawn_stub() for a child stub agent
+  stubs/           minimal UDP SNMP agents the end-to-end suites talk to
+  test_*.py        the suites themselves (see tests/README.md)
 ```
 
 ## Process model
@@ -151,6 +156,88 @@ bit — matching the trap receiver's own inbound-decryption deferral;
 `nodesdb`'s schema has no privacy-protocol column at all, so the UI never
 offers configuring it in the first place.
 
+### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll.py`)
+
+**The arc hop.** Vendor identity lives entirely under `1.3.6.1.4.1`. A
+GETNEXT at `1.3.6.1.4.1` lands on the first object under the first populated
+enterprise arc N; a GETNEXT at `1.3.6.1.4.1.(N+1)` skips arc N entirely and
+lands on the next. `vendorid.hop_enterprise_arcs(getnext)` enumerates every
+arc a device populates in (arcs + 1) requests — typically three to eight —
+which is why it is affordable inside a discovery sweep and finds vendors this
+app holds no MIB for. Two loop guards end it: the reply must be strictly
+greater than the probe (`nodeoids.oid_key`, moved there from nodepoll so both
+import it) and its arc must exceed the last one recorded. `getnext` is
+injected: the poller's wrapper (`_getnext_one`) and discovery's
+(`_snmp_getnext_one`) both check `error_status`, because `_snmp_get_next`
+never did and a v1 agent answers a probe past its last object with
+`noSuchName` and the request OID echoed — which would read as a loop.
+
+**The fingerprint.** `build_mib_index` turns `nodesdb.enterprise_objects()`
+(a range predicate, `oid >= '1.3.6.1.4.1.' AND oid < '1.3.6.1.4.1/'`, so
+`ix_mib_objects_oid` is used — `LIKE` is case-insensitive and skips it) into
+object → *set of files*, so two MIBs defining the same object both get the
+credit, unlike `_oid_name_table`'s arbitrary winner. A file whose every
+enterprise object is the bare seven-part arc is root-only (the bundled
+`enterprise-roots.mib`) and never scores, the same "strictly below the arc"
+rule `has_mib_covering` applies. `fingerprint` credits each file with the
+walked objects it names under each arc and ranks by `(named / seen, named)`.
+The poller caches the index against `nodesdb.mib_generation()` and rebuilds
+only when the corpus changes.
+
+**Precedence** is `vendorid.decide`, in one place: manual > learned > a real
+vendor arc in sysObjectID (`trapoids.WELL_KNOWN` at high, the enterprise list
+at high if verified else medium) > the walk (an arc an installed MIB names
+objects under, by score; then a catalog arc; then any named arc — high with
+score ≥ 0.5 and ≥ 10 named, else medium) > a sysDescr word at low > the
+generic agent's own name at low. A real vendor arc is never replaced by a
+walked one: OEM gear implements the chipset vendor's arc alongside its own.
+`vendor_source` gained `walk`, `learned` and `manual`; `vendor_confidence` is
+new. The MIB to assign and the bundle to suggest follow the *decided* arc,
+never another. `poll_decision` is the zero-SNMP per-poll form: the same rule
+with the walk replaced by the stored walk verdict *for this sysObjectID*, so
+a walk-identified device stays stable between identifications and a manual or
+learned vendor takes effect on the next poll without a walk.
+
+**The walk runs off the poll pool** (`_VendorIdJob`, the `_OidWalkJob`
+shape): up to ~565 requests and 20 s by budget, but a device that stops
+answering half way pays its timeout per request on top, and on a 60 s
+profile that is an overrun parked on one of four workers. `_maybe_identify`
+starts one when `_identification_due` says so — never identified, identified
+for a different sysObjectID, or the last run failed and an hour has passed
+(at most three attempts) — and skips when `vendor_walk_parallel` jobs are
+already running, which is what throttles the post-upgrade burst. A hop that
+times out with no arcs is an error, not a verdict. The fingerprint walk runs
+with `snmp_retries = 0`; the hop keeps the device's retries because a missed
+hop loses an arc. Once `identified_ts` is set for the current sysObjectID,
+`_identification_due` returns False before any I/O: the steady-state cost is
+zero.
+
+**Coverage and assignment key on the decided arc.** `_check_vendor_mib`
+reads `vendor_detected` and `vendor_arc` from `poll_decision`, so a net-snmp
+device the walk identified as Phoenix Contact records `mib_missing` for arc
+4346 rather than silently passing on arc 8072. While a walk is still due the
+poll path defers assignment (`defer_assignment`), because assignment never
+overrides an existing choice and the walk's pick — the file that actually
+named this device's objects — must not lose to "the file with the most
+objects under the arc" merely by arriving second.
+
+**Learning.** `set_vendor_override` writes `vendor_detected` as well as
+`vendor` (the operator is asserting the real maker, so ConfigRX and the Cisco
+MAC read follow — unlike `vendor_oid`, which stays display-only) and upserts
+`vendor_learned` keyed on sysObjectID. `_learnable` refuses a generic-agent
+arc or a sysObjectID outside enterprises: `8072.3.2.10` is every Linux box.
+Clearing deletes the learned row only when this device made it, then
+re-decides the row at once.
+
+**`enterprises.py`** keeps VERIFIED (read from MIB text: every WELL_KNOWN
+root plus the catalog arcs checked for 4.32 — 6027, 14179, 47196, 4413, 3375,
+17713, 705, 534) apart from CURATED (from memory; the IANA registry is not
+reachable from the build environment). `vendor_for` falls back to it after
+WELL_KNOWN misses, so `identify_vendor`, `suggest_group` and `browse_bases`
+inherit the names; `_arc_confidence` checks the tables directly because
+`vendor_for` can no longer tell the two apart. `mibcatalog.Bundle.arcs` and
+`vendor_key` join the catalog to the same vocabulary.
+
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
 `vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`
@@ -171,6 +258,48 @@ round trip. Asking for both removes the single most likely way to get this
 wrong, since an OID browser, a MIB and an agent disagree about which form you
 name. `normalize_oid()` rejects anything that is not dotted digits, so a typo
 reads as "not configured" rather than going on the wire.
+
+**Except on SNMPv1, where that merge is destructive.** By construction one of
+the two forms cannot answer. On v2c and v3 that costs nothing: the agent
+reports the missing object per-varbind as `noSuchObject` and every other answer
+in the response is intact. SNMPv1 has no per-varbind exception — it answers a
+request containing one unimplemented object with `noSuchName` and the request's
+own varbind list echoed back as nulls, and `_check_error_status` raises only on
+`authorizationError` — so the response parses cleanly and `identity` comes out
+with sysDescr, sysObjectID, sysName and sysLocation all blank. Silently. A
+device whose configured version is 0 therefore has its custom identity OIDs
+read by `_identity_extras()`, a best-effort GET of their own whose failure
+costs nothing but itself. Note that the version is read as
+`config.get("snmp_version")` directly rather than through the usual
+`int(config.get("snmp_version") or 1)`, which turns a configured 0 into 1.
+
+**That guard is, as things stand, unreachable — a known defect.** `_snmp_get()`
+resolves the version with exactly the `or 1` fallback described above, so a
+device configured for SNMPv1 (`snmp_version = 0`) is put on the wire as v2c and
+the `noSuchName` case never occurs. SNMPv1 is therefore never actually spoken by
+the poller, whatever the profile says. The separate-GET split above is kept
+because it becomes correct the instant that coercion is fixed, and because its
+only cost meanwhile is one extra GET on v1-configured devices that also set a
+custom identity OID. Fixing the coercion is deliberately out of scope of the
+release that added this note: it changes how every v1-configured device is
+polled, and deserves its own change with its own testing rather than riding
+along with vendor identification.
+
+**A per-vendor probe OID was tried here and removed.** An earlier cut of this
+work read one proprietary Moxa scalar in a separate GET when the standard
+sources named nothing, which worked but scaled by hand: one hardcoded OID per
+vendor, each needing that vendor's MIB to find. The enterprise-arc walk in
+`vendorid.py` answers the same question generically — it enumerates the arcs a
+device actually populates, so it names Moxa from arc 8691 with no per-vendor
+knowledge at all, and names vendors this application holds no MIB for. The
+probe table, `probe_oids()`, `vendor_from_probe()` and the `vendor_source`
+value `"probe"` are all gone; `walk` is the source value that replaced it.
+
+**Display names** (`nodeoids.VENDOR_LABELS`, `vendor_label()`) are presentation
+only, applied in `api._device_json` as a separate `vendor_label` field rather
+than by rewriting `vendor`. The key is what ConfigRX, the Cisco MAC-table gate
+and profile suggestion match on, so it stays a token; a key with no entry
+serves itself, so adding one moves nothing else.
 
 **The vendor split is the part to be careful with.** `identity["vendor"]` is
 the *displayed* name and a custom OID may supply it; `vendor_detected` is
@@ -203,6 +332,59 @@ detection (a device still running when its next tick comes due logs once
 and records a `poll_overrun` device event rather than queuing a second
 concurrent poll of the same device) are all copied from `Monitor`'s own
 algorithm.
+
+**An overrun is not recorded while the device is failing.** `_record_overrun`
+returns early when `device["status"] == "down"` **or**
+`device["consecutive_fail"] > 0`. A poll of a device that stopped answering
+overruns by construction — every request in it spends its full timeout and
+all its retries — so the event says nothing the outage does not. Both arms
+are needed and neither is redundant: `down` only becomes true after
+`down_after_failures` (3) *completed* failing polls, so the overruns lead
+the outage by two or three intervals, and the first of them would otherwise
+get out before `device_down` existed to roll it up. Suppressed at source
+rather than filtered in the alert engine, the same shape as
+`wirelessdb.out_of_service`: no event row, no Debug line, no alert. The
+`ROLLED_UP_BY` entry for `poll_overrun` still exists, to catch an alert
+opened in the moments before the first poll actually failed.
+
+**MAC-table walks have their own cadence** (`_maybe_walk_mac_table`, called
+once per device per `_loop` pass). A forwarding table is hundreds to
+thousands of OIDs per switch, which does not belong on a 60-second poll, so
+`mac_table_interval_s` is a separate interval — an override column on both
+`devices` and `groups`, resolved by `effective_config` like every other
+override, defaulting to **0 (never)** rather than to a global setting, so an
+upgrade adds no SNMP load anywhere until a profile opts in. A device's first
+walk is scheduled at a random point inside one interval so a restart does
+not walk every opted-in switch at once, and a device that is down or whose
+last poll failed is skipped for the same reason overruns are not recorded on
+one. The walk itself runs on the poll pool via `_run_mac_table`, guarded by
+`_mac_running` so one device never has two in flight.
+
+`read_device_mac_table` is the whole-device form of `read_mac_table`, with
+the same three-source cascade (Q-BRIDGE `dot1qTpFdbTable`, then BRIDGE-MIB
+`dot1dTpFdbTable`, then Cisco per-VLAN contexts via `community@vlan`) and
+the per-port filter removed; `_fdb_entries` gained an optional bridge-port →
+ifIndex map so both forms share one parser. It returns **None** when the
+device answers no forwarding table at all, which `_run_mac_table` treats as
+"leave what is stored alone" — a switch that failed to answer once has not
+forgotten every MAC it knows, and deleting its table would send the next
+search nowhere.
+
+**Whole-device OID walks** (`_OidWalkJob`, `start_oid_walk`) run on their own
+thread rather than the poll pool: a full walk of a core switch is tens of
+thousands of GETNEXTs and minutes of wall time, and parking one of the poll
+workers on that would stall the devices behind it. One job per device at a
+time, refused politely like `backup_now` does, held in `_oid_walks` in memory
+— a walk result is transient, downloaded once and dropped, and a row
+surviving a restart would describe a thread that is gone.
+`walk_subtree` and the job share `_walk_from`, which gained a `cancelled`
+predicate and an `on_row` progress hook; they differ only in their bounds and
+in having a cancel, not in what a walk is. `GET …/oid-walk?download=1`
+formats the file (`api._oid_walk_text`) and then calls `forget_oid_walk`, so
+a 100,000-row walk does not sit in memory for the life of the process. The
+file's header states plainly whether the walk completed, and names the
+reason when it did not — a truncated walk that looks complete is the failure
+this feature could most easily cause.
 
 **Poll now, and what "already polling" means.** `poll_now(device_id)` is a
 thin wrapper over `_submit()`, which drops the request when the device is
@@ -928,10 +1110,10 @@ group that is a name rather than a row id.
 
 ### Bundled default MIBs (`netpath/mibs/`, `Service._seed_default_mibs`)
 
-Twenty files ship under `netpath/mibs/`, about 900 KB in total. Two are
-hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
+Twenty-one files ship under `netpath/mibs/`, about 900 KB in total. Three
+are hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
 Number arcs for ~20 common vendors, matching `trapoids.WELL_KNOWN`'s own
-number-to-name table) and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
+number-to-name table), `enterprise-roots-2.mib` and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
 2863's IF-MIB covering exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE`
 already poll — kept although the full IF-MIB now ships too, because a
 device may be pinned to it by `mib_file_id`). The other eighteen are the
@@ -941,6 +1123,14 @@ UCD-SNMP-MIB, ENTITY-MIB, ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB,
 Q-BRIDGE-MIB, LLDP-MIB and POWER-ETHERNET-MIB. These are RFC text, freely
 redistributable, and no vendor-proprietary MIB is bundled — vendor MIBs
 are fetched on demand by the catalog above.
+
+An arc added after a release is a **new file**, not a new line in
+`enterprise-roots.mib`, which is why `enterprise-roots-2.mib` exists (Moxa's
+8691, added in 4.32.0). Seeding is tracked by filename, exactly so that a MIB
+an admin deleted is never resurrected — which also means an edit to an
+already-seeded file reaches no existing install. A new filename does. Vendor
+identification itself never depends on this: it reads `trapoids.WELL_KNOWN` in
+code, so only the MIB browser and upload resolution are affected.
 
 `Service._seed_default_mibs()` runs once from `start()`, before
 `_snmp_settings_with_mibs()`. It cannot use "does a `mib_files` row with
@@ -961,6 +1151,40 @@ set is a dependency graph (Q-BRIDGE-MIB hangs off P-BRIDGE-MIB,
 ENTITY-SENSOR-MIB off ENTITY-MIB), and although one sweep in filename
 order happens to work today, a file added later would otherwise land
 half-resolved with nothing to say so.
+
+### Device packet-loss chart (`nodes.js`, `nodesdb.series`)
+
+Purely a front-end addition: `nodepoll` has recorded `ping_loss_pct` as a real
+metric since 4.25, and `/api/nodes/devices/{id}/metrics` plus
+`/api/nodes/devices/{id}/series` already serve it. `loadLossChart()` resolves
+the metric id out of `view.metrics` (loaded by `loadDetail` for the port
+dialog's benefit) and reuses `drawSeriesChart`.
+
+Three things are deliberate:
+
+- **Its own range dropdown and its own window state** (`view.lossRange`,
+  separate from `view.chartRange`). The status timeline's range is about how
+  long a device has been in a state; the loss chart's is about how a link has
+  been behaving. Sharing one made both worse.
+- **`opts.peak`**, a new option on `drawSeriesChart`, pins the Y axis to
+  0–100 %. Without it the auto-scale is `niceCeiling(max(values, 0.001))`, so a
+  device with no loss at all is drawn against a ceiling of 0.001 and its flat
+  zero reads as a full-height alarm.
+- **The range list stops at three days.** `nodesdb.series()` switches to the
+  `samples_hourly` rollup table beyond `86400 * 3`, and `compact_rollup()` —
+  the only thing that writes that table — is never called from anywhere in this
+  application. A 7- or 30-day option would therefore be permanently empty, for
+  every metric, not just this one. Wiring compaction into the maintenance loop
+  is **not** a safe drive-by fix: it deletes raw samples older than an hour, so
+  every window between one hour and three days, which reads raw samples today,
+  would empty out instead. `fillRanges()` grew an optional `maxSeconds` for
+  this; the status timeline keeps the full list because it reads
+  `device_status_segments`, not samples.
+
+The loader uses the same request-ticket discipline as the timeline, and for one
+extra reason: `loadDetail` replaces `view.metrics` wholesale, so a metric id
+read before the selection moved belongs to a device the pane is no longer
+showing. The ticket check is paired with a re-check of `view.selected`.
 
 ### Device status timeline (`nodesdb.device_status_segments`)
 
@@ -995,6 +1219,75 @@ continuous-line renderer, which has no notion of a discrete state. It's
 fetched alongside the rest of `loadDetail()`'s `Promise.all`, using the
 same `t0`/`t1` window the metric chart's range picker already drives, so
 switching the range re-fetches both together.
+
+### MAC search (`nodesdb.py`, `nodes.js`)
+
+Nothing normalised a MAC address anywhere in this app before 4.31.0, and
+nothing stored a learned one: `read_mac_table` is an explicitly on-demand
+live walk, per device *per port*, run only while a dialog is open. So a
+search had nothing to match. `mac_entries(device_id, if_index, mac, vlan,
+seen_ts)` stores what the scheduled walks learn, keyed on all four of the
+first columns and indexed on `mac`.
+
+`mac` is stored **normalised** — lowercase hex, no separators — so one
+stored row answers `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
+`aabb.ccdd.eeff` and bare hex alike. `normalize_mac(text)` strips
+`:-. ` and whitespace and returns "" for anything that is not hex or is
+longer than twelve digits, so callers can use the empty string to mean
+"that was not a MAC". Prefixes are allowed on purpose: searching an OUI is
+a normal thing to want.
+
+`looks_like_mac_search` is the search-path wrapper, and exists for one
+false positive: `10.0.0.5` normalises to `10005`, which is valid hex, so a
+plain `normalize_mac` would quietly turn every IP search into a MAC-prefix
+search too. Text that is digits-and-dots only is an address, and a
+genuinely all-numeric MAC typed with dots is rare enough to be worth
+losing next to searching by IP, which people do constantly.
+
+`devices(text=...)` matches `mac_entries` as well as `ip`/`name`/`sys_name`
+when the text normalises to **four or more** hex digits; fewer would match
+half the estate. `mac_locations(prefix)` returns every (device, port) a
+matching address was learned on, joined to `interfaces` for the port
+description — every one, never a chosen one, because a MAC on an uplink is
+on every switch between here and the host and picking one silently sends
+an engineer to the core switch for an access-port problem. `nodes.js`
+decides from the count: exactly one (device, port) opens that port's
+dialog, several are listed as clickable hits.
+
+`replace_mac_entries` replaces a device's table wholesale rather than
+merging, so a MAC that aged out of the switch ages out here too — a stale
+row is worse than no answer. `prune_mac_entries` (a week by default, from
+`mac_table_retention_days`) runs in `Service.run_maintenance` and drops
+entries no walk has refreshed, so a switch taken out of the walk schedule
+stops answering searches from a table nobody has confirmed since.
+
+The lookup runs only on a deliberate search — Enter in the Find box sets
+`view.macSearchPending`, which `refresh()` consumes once — never on the
+five-second refresh, because a dialog that reopens itself every five
+seconds is unusable.
+
+### Device and interface dialogs (`nodes.js`)
+
+`drawIfaceTable` and `drawEventTable` used to hardcode `#nd-if-table` /
+`#nd-ev-table` and read the module-level `view.ifaces` / `view.events`,
+both of which always describe the *selected* device. The device dialog
+shows a device that need not be selected, so both take a target element
+and their data as arguments and the pane and the dialog share one
+renderer rather than growing a second copy that drifts. The dialog fetches
+by id for the same reason.
+
+`interfaceDialog` had the same bug latent in it: it bound `deviceId` from
+`view.selected`, so a port opened from the device dialog would have
+charted whichever device the list happened to have selected. It now takes
+an explicit id.
+
+There is only one `#modal-box`, so opening a port from the device dialog
+replaces it; the port dialog takes an `onBack` callback and grows a
+**Back to device** button, the `confirmDestructive`-style reopen idiom.
+`ifaceTitle` puts the parent device on its own line **inside** the `<h2>`
+so it inherits the heading's size — a line in the body would render as
+`.section` at 11px. The 5s refresh re-sets that whole `<h2>` from
+`ifaceTitle`, so both lines are rebuilt together and cannot drift apart.
 
 ---
 
@@ -1075,13 +1368,164 @@ Entity is `entity_kind="dhcp_scope"`, `entity_id="{server_id}:{scope_id}"`,
 and `_device_ip_for` resolves that to the DHCP server's address for
 `{{device_ip}}`.
 
-The streak is the subtle part. Everywhere else `for_polls` counts engine
-ticks, which are Nodes polls in all but name; DHCP is polled every 15
-minutes while the engine ticks every `TICK_S` (5 s), so counting ticks
-would make `for_polls=3` mean 15 seconds. `_dhcp_streaks` therefore holds
-`(last polled_ts, streak)` and only advances the streak when the scope's
-`polled_ts` actually moves — so `for_polls` means DHCP polls, which is
-what an operator reading the label assumes.
+The streak is the subtle part, and this evaluator got it right first.
+`_dhcp_streaks` holds `(last polled_ts, streak)` and only advances the
+streak when the scope's `polled_ts` actually moves, so `for_polls` means
+DHCP polls rather than engine ticks — which matters because DHCP is polled
+every 15 minutes while the engine ticks every `TICK_S` (5 s). As of 4.31.0
+`_evaluate_thresholds` does the same thing; see below for why it had to.
+
+### NetPath destination thresholds (`alertengine._evaluate_netpath_thresholds`)
+
+A third threshold evaluator, for the same reason there is a second one: a
+traceroute destination is not a Nodes device, has no row in the Nodes `metrics`
+table, and its "poll" is its own `targets.interval_s`. Kind
+`netpath_threshold`, `entity_kind="netpath_target"`, `entity_id` the target's
+row id, and `_device_ip_for` resolves that through `db.destination_ip()` with
+the configured host as the fallback — a destination entered as a hostname has
+no address until a trace gets through.
+
+The engine reaches NetPath the way it reaches Wireless: an optional
+`netpath_db=` constructor argument (`Service` passes its own `Database`), so an
+engine built without one raises none of these rules rather than failing.
+
+`_netpath_metrics()` is the single place the three metrics are computed, and
+the single place the skip conditions live. A metric it cannot compute honestly
+is **absent** from the dict it returns, and an absent metric is skipped
+entirely — it neither fires nor clears, and does not touch that rule's streak:
+
+| `source_kind` | Value | Skipped when |
+| --- | --- | --- |
+| `trace_loss_pct` | `traces.loss_pct` — destination-hop loss on the newest trace | it is NULL |
+| `trace_unreached_pct` | share of the window's traces with `reached = 0` | fewer than `NETPATH_MIN_WINDOW_TRACES` (5) measured traces in the window |
+| `trace_rtt_warn_pct` | `100 * rtt_ms / max(warn_rtt_ms, 20)` | the trace did not reach the destination, or `warn_rtt_ms <= 0` |
+
+Three details are load-bearing:
+
+- **`status IN ('error', 'overrun')` produces no sample at all** — the whole
+  target is skipped before any metric is computed. `record_trace` stores
+  `loss_pct = 100` for a trace with no hops, so a `traceroute` binary that is
+  missing on *this* machine, or a slot skipped because the previous run was
+  still going, would otherwise be indistinguishable from a destination that
+  went silent. `monitor.classify` keeps those statuses apart from `fail` for
+  the same reason.
+- **`reached` stands in for `TraceResult.rtt_is_to_refuser`.** That flag says
+  the stored RTT is the time to a router that refused, not to the destination —
+  and it is a property of the in-memory result that is never persisted. It can
+  only be true when the destination was not reached, so `reached = 1` is a
+  strictly stronger guard and needs no schema column.
+- **Latency is relative to the destination's own `warn_rtt_ms`**, floored at
+  `NETPATH_MIN_WARN_RTT_MS`. A single millisecond figure cannot serve a LAN hop
+  and a satellite link, and three times a 5 ms warn threshold is 15 ms, which a
+  three-probe mean crosses on a busy switch for no reason at all.
+
+`_netpath_streaks` holds `(last started_ts, streak)` and advances only when the
+trace's own `started_ts` moves — the same discipline as `_dhcp_streaks`, and
+for a starker reason: the engine ticks every 5 s while a destination is traced
+every 300 s by default, so a tick-counted streak would turn "three consecutive
+traces" into fifteen seconds.
+
+Rollup needed one generalisation. `_rollup_parent` hard-required
+`entity_kind == "device"`; it now tests `alertrules.ROLLUP_ENTITY_KINDS`, which
+lists the kinds that take part rather than dropping the guard, so a future
+entity kind cannot inherit the device pairings by accident.
+`netpath_path_unstable` and `netpath_latency_high` are `ROLLED_UP_BY`
+`netpath_unreachable`, because a destination nothing comes back from is by
+construction also one whose traces are failing and whose latency is
+unmeasurable.
+
+`_sweep_netpath_alerts()` closes a hole that only threshold kinds have: a
+threshold alert clears by being re-evaluated and found to have recovered, which
+never happens for a destination that was disabled or deleted. The sweep
+resolves open netpath alerts whose entity is not in the current enabled-target
+set, with `resolved_by = "destination no longer traced"`, and sends no clear
+email — nobody needs telling that a destination they just turned off stopped
+being measured.
+
+**There is deliberately no per-hop rule.** Intermediate routers rate-limit ICMP
+as policy (`monitor.classify`'s docstring is explicit that only the destination
+hop decides a verdict), and `hop_stats` are cumulative counters reset only by a
+path change, so any average over them stays high indefinitely after one bad
+week. Per-hop MTR figures remain a route-graph diagnostic.
+
+Mutes and the newly-added-device hold do not apply: `_occurrence_device`
+returns `None` for anything that is not a Nodes device, so netpath occurrences
+are structurally outside both — the same as syslog, IPAM, DHCP and APs.
+
+### Threshold streaks and durations (`alertengine._evaluate_thresholds`)
+
+Until 4.31.0 the device threshold evaluator counted **engine ticks**
+against a latched `metric["last_value"]`: it incremented the streak on
+every tick the value was over the threshold, whether or not a new sample
+had arrived. Two consequences, both wrong and both invisible from the
+setting's label. `for_polls = 2` meant ten seconds rather than two polls
+(the engine ticks every 5 s; a device is polled every 60 by default). And
+because the streak never reset while the value sat above the threshold, a
+**single** bad sample satisfied any `for_polls` about ten seconds later
+and went on satisfying it indefinitely — the value had stopped changing
+but nothing compared `last_value` against `last_ts`.
+
+`_breach_streaks` now holds `(last sample ts, streak, first breach ts)`
+per `(rule_id, device_id)` and advances only when `metric["last_ts"]`
+moves, exactly as `_dhcp_streaks` already did. The third element is what
+makes a duration expressible at all: `breach_seconds` is
+`sample_ts - first_breach_ts`, measured **between the samples themselves**
+rather than by wall clock, so a device that stopped being polled cannot
+accumulate breach time while silent. Any sample under the threshold clears
+both.
+
+`rules.for_seconds` (nullable INTEGER, added by `_migrate`'s
+PRAGMA-and-ALTER convention) selects between the two. `evaluate_threshold`
+takes `breach_seconds` as a fourth argument and uses `for_seconds` when it
+is set, `for_polls` when it is NULL — never both, because "two polls AND
+sixty seconds" is a rule nobody can reason about. NULL is the shipped
+value for every rule but `packet_loss_high`, which ships at 60; the
+migration also seeds that 60 onto an existing `alerts.db`, so an upgrade
+gets the sustained behaviour rather than silently keeping the old one.
+`for_seconds` had to be added in four places or it would be dropped
+silently at each: `_migrate`, `_RULE_EDITABLE`, `put_alerts_rule`'s
+allow-list, and `_rule_json`.
+
+### Alert mutes (`alertsdb.py`, `alertengine._muted`)
+
+`alert_mutes(entity_kind, entity_id, until_ts, created_ts, created_by,
+reason)` is a new table, so it lives in the `CREATE TABLE IF NOT EXISTS`
+block beside `PENDING_SCHEMA` rather than in `_migrate` — `_migrate` only
+ever ALTERs tables that already exist. Unique on `(entity_kind,
+entity_id)`, with `mute()` upserting so pressing the button again extends
+a mute instead of failing on the index.
+
+The gate is in `_tick`, beside `_hold_for_new_device`, **not** in
+`_apply`. A mute is per device, not per rule, so it belongs where one
+check covers an occurrence rather than where one check covers a
+(rule, occurrence) pair. `_occurrence_device` already resolves both
+`entity_kind="device"` and `entity_kind="interface"` to a device row and
+returns None for everything structurally outside Nodes, so a muted
+switch's ports go quiet with it and syslog/trap/IPAM/AP occurrences
+cannot be muted by a device mute — a property of the lookup rather than a
+list of exemptions to maintain. The active mutes are read once per tick
+into a dict, and the per-occurrence check short-circuits on that dict
+being empty, which is the normal case.
+
+A mute suppresses **new** alerts and their emails and deliberately leaves
+open alerts alone. The CLEARS pairings live in the drains, which run
+before the gate, so an alert opened before the mute still resolves when
+its cause clears — the list stays truthful whatever the mute says. What
+the mute adds there is `_notify_clear`'s own check (`_muted_alert`, its
+own lookup because the drains run before `_tick` reads the per-tick dict):
+the resolution lands, the email does not, because "muted" has to mean the
+operator's inbox goes quiet or it has silenced only half of what it
+promised. Nothing has to un-suppress when one lapses: thresholds
+re-derive from live metrics on the next tick and a still-down device keeps
+recording events. Expired rows read as "not muted" from `until_ts` alone
+(the reads are on the hot path); `prune()` deletes them on the
+housekeeping pass so the table does not grow a row per mute ever set.
+`MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
+silence a device until next year.
+
+The Nodes device list and single-device endpoints carry `muted_until`
+from `alerts_db`, because a mute nobody can see is a mute somebody will
+spend an afternoon looking for.
 
 ### Syslog severity matching (`alertrules.py`, `alertengine.py`)
 
@@ -1293,6 +1737,30 @@ means it is never the address itself; an early version passed
 for a live device-down/up occurrence but produced `{{device_ip}}` →
 the device's numeric id for the synthesized "clear" notification below,
 since that occurrence has no live poll behind it to carry a real address.
+
+`down_since`, `recovered_time` and `downtime` are derived inside
+`build_context()` from the alert row itself whenever `resolved_ts` is set,
+rather than only where the engine happens to know them. A recovery sends **two**
+notifications — the "Device recovered" alert in its own right, and the
+resolution of the outage it cleared — and both render the same `device_up`
+template; the resolution one is built from a synthesized occurrence with no
+extras, so tokens threaded through the occurrence alone would render empty on
+exactly the email that is about the outage. `extra` still updates the context
+last, so the drain's own values win where it has better ones: the `up` event's
+timestamp is the moment the device answered, while `resolved_ts` is whenever
+the next tick got round to noticing. The same derivation gives interface,
+wireless and threshold clears a real duration, which none of them had.
+
+Until 4.32.0 the shipped `device_up` body said "as of `{{last_time}}`", which
+on a resolution is `alerts.last_ts` — when the *outage* last recurred, a moment
+before it cleared. Correcting a shipped template needs a migration, since
+`_seed_templates` inserts `OR IGNORE` and would leave every existing install on
+the old text forever: `_migrate_templates()` always refreshes
+`builtin_subject`/`builtin_body` (so "Reset to built-in" offers this release's
+wording) and rewrites the live `subject`/`body` only where they still match,
+character for character, `_PREVIOUS_BUILTIN_TEMPLATES` — anything else is an
+operator's edit and is left alone. It runs before `_seed_templates`, so a fresh
+database matches nothing and is simply seeded.
 
 A resolution email (`_notify_clear()`, kind `"clear"` — the
 `notifications.kind` enum value the schema already reserved for this)
@@ -2859,6 +3327,33 @@ carries `effective_vendor` resolved the same way the worker resolves it, plus
 `vendor_is_override` so the column can mark it, and the vendor filter matches
 on that field. One resolution rule, in two places that agree.
 
+### Bulk settings and bulk backups (`api.py`, `configrx.js`)
+
+`post_configrx_devices_bulk_config`'s allow-list omitted `ssh_username`,
+which the database layer had always permitted (`DEVICE_CONFIG_EDITABLE`).
+The consequence was a bulk settings dialog that could set everything about
+a batch of switches except who to log in as, which is why the pre-4.31
+bulk dialog was credential-only and lived beside the single-device one.
+It is in the allow-list now, and one dialog covers both.
+
+Every field in the bulk dialog is opt-in — a select with a *Leave
+unchanged* option, or a blank input — and only the keys actually set are
+put in the request body, so a bulk form cannot silently rewrite settings
+you did not come here to change. `backup_enabled` is a genuine three-way
+choice; the old dialog's checkbox could only ever turn it **on**, because
+"unchecked" had to mean "leave alone" and so could never mean "off".
+
+`post_configrx_devices_bulk_backup` mirrors `post_nodes_devices_bulk_poll`:
+id lists back, not counts, because "9 of 12 queued" leaves the operator to
+work out which three. It has a fourth bucket Nodes has no counterpart to,
+`not_enabled`, for the `backup_enabled` guard — a device with backups
+switched off is skipped deliberately rather than backed up anyway. The
+worker being stopped raises `NotRunning` **once for the whole request**,
+not per device: it is one fact about the server, not twelve facts about
+twelve switches. The button settles off the POST result with no watch
+loop, the way `bulkPollNow` does — the device rows already carry
+`backing_up`/`backup_queued`, so the list itself shows progress.
+
 ### Which paramiko is loaded (`configrx.py`)
 
 `_connect_error_text` appends "the installed paramiko removed SHA-1 key
@@ -3072,3 +3567,37 @@ above — `selectTab`/`master()`/the reload-restores-tab logic all key off
 `pages[name]` existing, so a tab with no module registered would either
 throw or silently never refresh. `page-dashboard`'s markup in
 `index.html` is static content, no chart or table of its own yet.
+
+## Tests (`tests/`)
+
+The end-to-end suites are plain scripts, standard library only like the rest
+of the application, run one per process by `tests/run_all.py`. They are not a
+unit-test layer: each one drives a real `NodePoller`, `DiscoveryJob`,
+`WirelessPoller` or the whole `Service` + `WebServer` against a **stub SNMP
+agent** — a few dozen lines of UDP socket that answers GET/GETNEXT for a
+fixed OID table using `snmppoll`/`trapdecode`'s own encoders, so the wire
+format under test is the application's own on both ends.
+
+The one rule that makes them repeatable: **a suite owns its stub.**
+`_paths.spawn_stub("<script>.py")` picks a free loopback UDP port, starts
+`tests/stubs/<script>` as a child process with that port as `argv[1]`, and
+returns only after reading the stub's one-line "listening" banner from its
+stdout — so the socket is bound before the first request, with no sleep to
+guess at. The suite then points the module under test at the port by
+patching its port constant (`nodepoll.DEFAULT_SNMP_PORT`,
+`nodediscover.DEFAULT_SNMP_PORT`, `fortipoll.SNMP_PORT`) and kills the child
+in a `finally` or an `atexit` hook. Two suites (`test_nodepoll_e2e.py`,
+`test_nodediscover_e2e.py`) use an in-process `StubAgent` thread instead,
+for the cases that need to mutate the agent mid-test (an interface flapping,
+a reboot, the agent going dark). Databases go to `tempfile.mkdtemp()`; ports
+are never fixed; suites can run in parallel.
+
+Two of the suites encode rules that are easy to mistake for bugs when read
+cold. Discovery gets its community list only from the polling profile the
+job was started with (`api._discovery_communities_for_group` →
+`discovery_communities` override → `nodediscover._candidate_communities`,
+"no fallback guess"), so a `DiscoveryJob` started from Python with no
+override attempts no SNMP at all. And `NodePoller.promote` leaves a
+promoted device's manual name as the IP on purpose and seeds `sys_name`
+into the identity instead, so the display name follows the device and a
+later rename is never shadowed by a copied sysName.
