@@ -358,15 +358,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # No external resources are loaded, so this can be strict. The
-        # connect-src is for the terminal window's WebSocket: default-src
-        # covers ws: on paper, but browsers differ on whether a ws:// URL
-        # counts as same-origin under 'self', and being explicit costs
-        # nothing. Inline styles stay allowed for the terminal emulator,
+        # No external resources are loaded, so this can be strict.
+        # `connect-src 'self'` is what the terminal window's WebSocket needs
+        # and all it needs: current browsers count a same-origin ws:// (or
+        # wss://) URL as 'self', while the bare scheme-sources `ws: wss:`
+        # this used to carry matched *any* host, which would let every page
+        # in the product open a socket anywhere. `frame-ancestors 'none'`
+        # keeps the terminal — Trust button and all — out of anyone's
+        # iframe. Inline styles stay allowed for the terminal emulator,
         # which injects its own <style>.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline';"
-                         " connect-src 'self' ws: wss:")
+                         " connect-src 'self'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         for key, value in (extra_headers or {}).items():
@@ -516,24 +519,47 @@ class Handler(BaseHTTPRequestHandler):
                         for group in match.groups()]
 
                 # A hijacking handler (the terminal's WebSocket) takes the
-                # connection over and holds it for the life of the session:
-                # it gets the request handler itself, answers the upgrade on
-                # `wfile` and then owns both files. It runs after exactly the
-                # same cookie/session/permission tail as every other route,
-                # which is the whole reason it is a route rather than a
-                # special case earlier in the dispatch. There is no keep-alive
-                # to unwind afterwards (HTTP/1.0), so the connection simply
+                # connection over and holds it for the life of the session.
+                # The upgrade is answered here, not in the handler, so that
+                # everything a refusal depends on stays on this side of the
+                # 101: the handler is handed a socket that is already
+                # established. It runs after exactly the same
+                # cookie/session/permission tail as every other route, which
+                # is the whole reason it is a route rather than a special
+                # case earlier in the dispatch. There is no keep-alive to
+                # unwind afterwards (HTTP/1.0), so the connection simply
                 # closes.
                 if getattr(handler, "hijack", False):
                     self.close_connection = True
-                    self._status = 101
+                    # Origin, checked here rather than in wsock: this is the
+                    # CSRF gate for a route that has none of the usual ones.
+                    # An upgrade is a GET, so the JSON content-type check
+                    # above never sees it, and the session cookie is
+                    # SameSite=*Strict* — which is site-scoped, not
+                    # origin-scoped, so another port on this host or a
+                    # sibling subdomain is "same site" and its page could
+                    # otherwise open this socket with the operator's cookie
+                    # and drive a shell. A browser always sends Origin on an
+                    # upgrade, so a missing one is refused too; it is a check
+                    # about who is asking, which is this layer's business,
+                    # not the framing's.
+                    origin = (self.headers.get("Origin") or "").strip()
+                    host = (self.headers.get("Host") or "").strip().lower()
+                    if not origin or urlparse(origin).netloc.lower() != host:
+                        self._json({"error": "Cross-origin WebSocket refused"}, 403)
+                        return
                     try:
-                        handler(self, self.service, params, *args)
+                        websocket = wsock.accept(self)
                     except wsock.WebSocketError as exc:
                         # Refused before anything was written, so this is
                         # still an ordinary HTTP response.
                         self._send(400, str(exc).encode("utf-8"),
                                    "text/plain; charset=utf-8")
+                        return
+                    # Only now: a refused upgrade is not a 101 in the log.
+                    self._status = 101
+                    try:
+                        handler(websocket, self.service, params, *args)
                     except Exception:
                         traceback.print_exc()
                     return

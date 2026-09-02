@@ -34,16 +34,18 @@ import hashlib
 import time
 
 
-def fingerprint(key) -> str:
-    """OpenSSH's `SHA256:<base64 without padding>` for a paramiko key."""
-    digest = hashlib.sha256(key.asbytes()).digest()
-    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
-
-
 def fingerprint_bytes(blob: bytes) -> str:
-    """The same fingerprint for a key already in its wire form."""
+    """OpenSSH's `SHA256:<base64 without padding>` for a key in its wire
+    form — the one spelling, so what this app shows can be read against
+    `ssh-keyscan` / `ssh-keygen -lf` output directly."""
     digest = hashlib.sha256(blob).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def fingerprint(key) -> str:
+    """The same, for a paramiko key object. Keys are compared and described
+    by their bytes throughout, so this is `fingerprint_bytes` of them."""
+    return fingerprint_bytes(key.asbytes())
 
 
 def host_key_name(host: str, port: int) -> str:
@@ -143,9 +145,9 @@ class HostKeyStore:
 
     def record_seen(self, host: str, port: int) -> None:
         """"The same key was presented again just now." Called after a
-        connection paramiko accepted against the stored key."""
-        if self.stored(host, port) is not None:
-            self.db.touch_host_key(host, int(port or 22))
+        connection paramiko accepted against the stored key. No guarding
+        SELECT first: touching a row that is not there is already a no-op."""
+        self.db.touch_host_key(host, int(port or 22))
 
     def forget(self, host: str, port: int) -> bool:
         return self.db.forget_host_key(host, int(port or 22))
@@ -168,7 +170,8 @@ class HostKeyStore:
 
         Reached when paramiko has no key loaded for the host — normally the
         first connection, which is stored and accepted, with the fingerprint
-        left on `policy.stored_new` so the caller can say that it happened.
+        and type left on `policy.stored_new` / `policy.stored_type` so the
+        caller can say that it happened, and say it about the right key.
 
         It re-reads the store rather than trusting that `prepare` was called,
         or that it could rebuild what it found: if a key IS stored and the
@@ -184,14 +187,18 @@ class HostKeyStore:
 
         class _StoreOrRefusePolicy(paramiko.MissingHostKeyPolicy):
             def __init__(self):
-                # The fingerprint stored on first sight; "" when nothing was.
+                # The fingerprint and type stored on first sight; "" when
+                # nothing was stored, which is how a caller tells the two
+                # apart without asking the store again.
                 self.stored_new = ""
+                self.stored_type = ""
 
             def missing_host_key(self, client, hostname, key):
                 row = store.stored(target_host, target_port)
                 if row is None:
                     store.trust(target_host, target_port, key, by="")
                     self.stored_new = fingerprint(key)
+                    self.stored_type = key.get_name()
                 elif base64.b64decode(row["key_b64"]) != key.asbytes():
                     raise store.changed(row, key, target_host, target_port)
                 else:

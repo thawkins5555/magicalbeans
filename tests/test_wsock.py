@@ -9,6 +9,7 @@ import email
 import socket
 import struct
 import threading
+import time
 
 import _paths  # noqa: F401  (repo root on sys.path)
 
@@ -260,6 +261,74 @@ _, opcode, payload = read_frame(sock)
 assert struct.unpack("!H", payload[:2])[0] == wsock.CLOSE_PROTOCOL_ERROR
 print("PASS: a fragmented control frame closes the connection with 1002")
 sock.close()
+
+# A message that arrives as thousands of small fragments must not be
+# reassembled by concatenating onto one growing buffer: 2 MB in 125-byte
+# frames is 16,777 of them, and copying the buffer each time is quadratic.
+# What is asserted is the whole message and the fact that it lands in
+# seconds rather than minutes.
+sock, ws = pair()
+PIECE = b"a" * 125
+PIECES = wsock.MAX_MESSAGE_BYTES // len(PIECE)
+
+
+def dribble():
+    try:
+        for index in range(PIECES):
+            last = index == PIECES - 1
+            opcode = wsock.OP_BINARY if index == 0 else wsock.OP_CONT
+            sock.sendall(fragment(opcode, PIECE, last))
+    except OSError:
+        pass
+
+
+started = time.time()
+writer = threading.Thread(target=dribble, daemon=True)
+writer.start()
+opcode, payload = ws.recv()
+elapsed = time.time() - started
+assert (opcode, len(payload)) == (wsock.OP_BINARY, PIECES * len(PIECE)), \
+    (opcode, len(payload))
+assert payload == PIECE * PIECES
+assert elapsed < 30, f"{PIECES} fragments took {elapsed:.1f}s"
+print(f"PASS: a {len(payload) // 1024} KB message in {PIECES:,} fragments is "
+      f"reassembled in {elapsed:.1f}s")
+ws.close()
+sock.close()
+
+# ------------------------------------------------------- a peer that stops
+#
+# A browser that stops reading — a laptop shut mid-`show tech-support` —
+# must not pin the socket forever, and the send lock must not be held while
+# it does. The send fails within the timeout, the socket is marked closed,
+# and that is what releases a recv() parked in another thread.
+original_send_timeout = wsock.SEND_TIMEOUT_S
+wsock.SEND_TIMEOUT_S = 1
+try:
+    sock, ws = pair()
+    parked = []
+    reader = threading.Thread(target=lambda: parked.append(ws.recv()), daemon=True)
+    reader.start()
+    time.sleep(0.3)                      # let it settle into the read
+    started = time.time()
+    blob = b"x" * 200000
+    while ws.send_binary(blob):
+        assert time.time() - started < 30, "the socketpair never filled up"
+    elapsed = time.time() - started
+    assert ws.closed
+    assert elapsed < 20, elapsed
+    print(f"PASS: a peer that stops reading fails the send in {elapsed:.1f}s "
+          f"instead of blocking on it forever")
+    reader.join(timeout=5)
+    assert not reader.is_alive(), "recv() was left parked after the failed send"
+    assert parked == [None], parked
+    started = time.time()
+    ws.close()
+    assert time.time() - started < 5
+    print("PASS: the failed send unblocks the reader, and close() still returns")
+    sock.close()
+finally:
+    wsock.SEND_TIMEOUT_S = original_send_timeout
 
 # A peer that simply vanishes ends recv() without an exception.
 sock, ws = pair()
