@@ -209,24 +209,16 @@ class ConfigRxDatabase:
                 (device_id,))
             self._conn.commit()
 
-    def forget_device(self, device_id: int, host: str | None = None) -> None:
+    def forget_device(self, device_id: int) -> None:
         """Called when a device is removed from Nodes, so ConfigRX does not
         keep polling (or displaying) a device that no longer exists.
 
-        `host` is the device's IP, which lives in Nodes rather than here, so
-        the caller has to pass it for the remembered host key to go too. It is
-        optional because forgetting the config must not depend on it: a caller
-        that no longer has the address still gets everything keyed by
-        device_id removed. The port comes from the config row, read before it
-        is deleted — the host key is keyed by (host, port), not by device."""
+        The remembered host key stays. A key belongs to an address and port,
+        not to a device row: another device may already be recorded at the
+        same address, and re-adding this one must not silently start trusting
+        whatever answers there. Only ConfigRX's Forget (forget_host_key)
+        removes a key, deliberately and per address."""
         with self._lock:
-            if host:
-                row = self._conn.execute(
-                    "SELECT ssh_port FROM device_config WHERE device_id = ?",
-                    (device_id,)).fetchone()
-                port = int(row["ssh_port"]) if row and row["ssh_port"] else 22
-                self._conn.execute(
-                    "DELETE FROM ssh_host_keys WHERE host = ? AND port = ?", (host, port))
             self._conn.execute("DELETE FROM device_config WHERE device_id = ?", (device_id,))
             self._conn.execute("DELETE FROM backups WHERE device_id = ?", (device_id,))
             self._conn.commit()

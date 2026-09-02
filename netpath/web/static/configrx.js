@@ -459,13 +459,20 @@
   /* --------------------------------------------------------- device config */
 
   /* The SSH host key this app remembers for the device's address and port —
-     the same stored key the SSH terminal checks, which is why the Forget
-     button is gated on `ssh` write rather than on ConfigRX's: forgetting is
-     the act that lets the next connection accept whatever key it is offered.
-     Fetched after the dialog opens and redrawn in place afterwards, so
-     forgetting one does not close the settings form or reload the page.
-     Dynamically built write-gated controls check canWrite themselves —
-     applyPermissions() only ever hides what is already in the document. */
+     the same stored key the SSH terminal checks. Forget is gated on ConfigRX
+     write, the permission that already decides which port and which
+     credential the next connection uses; forgetting is the act that lets that
+     connection accept whatever key it is offered. Fetched after the dialog
+     opens and redrawn in place afterwards, so forgetting one does not close
+     the settings form or reload the page. Dynamically built write-gated
+     controls check canWrite themselves — applyPermissions() only ever hides
+     what is already in the document.
+
+     `box` is the one shared modal element, so a dialog that was cancelled and
+     replaced while this fetch was in flight would otherwise paint device A's
+     fingerprint (and a Forget bound to A) into device B's dialog. The target
+     captured before the await is detached once the modal's innerHTML has been
+     rewritten, so isConnected is the test for "this dialog is still open". */
   async function drawHostKey(box, device) {
     const target = box.querySelector('#cx-hostkey');
     if (!target) return;
@@ -473,9 +480,11 @@
     try {
       key = (await App.get(`/api/ssh/devices/${device.id}/hostkey`, {})).host_key;
     } catch (error) {
+      if (!target.isConnected) return;
       target.innerHTML = `<p class="hint">Host key: ${escape(error.message)}</p>`;
       return;
     }
+    if (!target.isConnected) return;
     if (!key) {
       target.innerHTML = '<p class="hint">No host key stored yet. The first'
         + ' connection to this device — a backup or an SSH session — stores the'
@@ -486,7 +495,7 @@
       `<p>Host key: <b style="font-family:var(--mono)">${escape(key.fingerprint)}</b>`
       + ` (${escape(key.key_type)}), first seen ${App.stamp(key.first_seen_ts)}`
       + `${key.trusted_by ? `, trusted by ${escape(key.trusted_by)}` : ''}.</p>`
-      + (App.canWrite('ssh')
+      + (App.canWrite('configrx')
         ? '<p><button id="cx-hostkey-forget">Forget</button>'
           + '<span class="hint"> Forget it only when this device was genuinely'
           + ' rebuilt or replaced: the next connection then stores whatever key'
@@ -499,10 +508,12 @@
         try {
           await App.del(`/api/ssh/devices/${device.id}/hostkey`, {});
         } catch (error) {
+          if (!target.isConnected) return;
           target.innerHTML += `<p class="hint" style="color:var(--fail)">`
             + `${escape(error.message)}</p>`;
           return;
         }
+        if (!target.isConnected) return;
         await drawHostKey(box, device);
       };
     }

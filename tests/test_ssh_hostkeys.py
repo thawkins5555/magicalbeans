@@ -16,6 +16,8 @@ back on the port it had — the stub file itself stays what workstream A ships.
 """
 import base64
 import hashlib
+import http.client
+import json
 import os
 import shutil
 import sys
@@ -33,7 +35,11 @@ dpapi_mod.available = lambda: True
 dpapi_mod.protect = lambda plaintext: b"FAKE:" + plaintext
 dpapi_mod.unprotect = lambda ciphertext: bytes(ciphertext)[5:]
 
-import paramiko  # noqa: E402
+try:
+    import paramiko  # noqa: E402
+except ImportError:                       # run_all.py reports this as SKIP
+    print("SKIP: paramiko is not installed, so there is nothing to speak SSH to")
+    raise SystemExit(77)
 
 from netpath import configrx, hostkeys  # noqa: E402
 from netpath.configrxdb import ConfigRxDatabase  # noqa: E402
@@ -321,15 +327,154 @@ check("a backup after trusting the new key succeeds",
 check("and the note is not repeated for a key that was trusted, not discovered",
       "host key" not in (config["last_backup_status"] or ""), config["last_backup_status"])
 
-# ------------------------------------------ 9. removing the device forgets it
+# ------------------------------------- 9. removing the device keeps the key
 
+# A host key belongs to an address and port, not to a device row. Removing
+# the device must not quietly reset the trust anchor: another device row may
+# already be recorded at the same address, and re-adding this one has to be
+# refused if what answers there is not what answered before. Only ConfigRX's
+# Forget takes a key away.
 check("the host key is there before the device is removed",
       db.host_key(HOST, port) is not None)
-db.forget_device(device_id, host=HOST)
-check("removing a device forgets its host key", db.host_key(HOST, port) is None)
-check("and its ConfigRX config", db.device_config(device_id) is None)
+db.forget_device(device_id)
+check("removing a device forgets its ConfigRX config",
+      db.device_config(device_id) is None)
+check("...and its stored backups", db.backups_for(device_id) == [])
+check("...and leaves the remembered host key alone",
+      db.host_key(HOST, port) is not None)
+check("the key left behind is still the trusted one, unchanged",
+      db.host_key(HOST, port)["fingerprint"] == hostkeys.fingerprint(rebuilt_key))
 
 device.close()
+
+# ----------------------------- 10. the routes: who may forget, who may not
+
+# The two rules the store depends on, proved through the real web server
+# rather than by calling the handlers: a Nodes removal does not touch a host
+# key, and Forget belongs to ConfigRX write — the permission that already
+# decides which port and which credential the next connection uses. `ssh`
+# write is a shell on a device, not authority over what this app trusts.
+from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER  # noqa: E402
+from netpath.web import Service, WebServer  # noqa: E402
+
+ROUTE_HOST = "192.0.2.10"
+ROUTE_PORT = 2222
+route_key = paramiko.RSAKey.generate(2048)
+
+
+def remember_route_key():
+    db.store_host_key(ROUTE_HOST, ROUTE_PORT, route_key.get_name(),
+                      route_key.get_base64(), hostkeys.fingerprint(route_key))
+
+
+# The same database files these tests have been using, so the service shares
+# the store above. No service.start(): nothing here polls anything.
+service = Service(
+    os.path.join(TMPDIR, "netpath.db"), os.path.join(TMPDIR, "flows.db"),
+    os.path.join(TMPDIR, "syslog.db"), os.path.join(TMPDIR, "app.db"),
+    os.path.join(TMPDIR, "ipam.db"), os.path.join(TMPDIR, "snmptraps.db"),
+    os.path.join(TMPDIR, "nodes.db"), os.path.join(TMPDIR, "alerts.db"),
+    os.path.join(TMPDIR, "wireless.db"), os.path.join(TMPDIR, "configrx.db"))
+web_port = _paths.free_tcp_port()
+server = WebServer(service, host="127.0.0.1", port=web_port,
+                   certfile=None, keyfile=None)
+assert server.start(block=False), server.error
+
+try:
+    def call(method, path, body=None, token=None):
+        conn = http.client.HTTPConnection("127.0.0.1", web_port, timeout=20)
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Cookie"] = f"sw_session={token}"
+        conn.request(method, path,
+                     body=json.dumps(body).encode() if body is not None else None,
+                     headers=headers)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        try:
+            return response.status, json.loads(raw)
+        except ValueError:
+            return response.status, raw
+
+    def login(username, password):
+        conn = http.client.HTTPConnection("127.0.0.1", web_port, timeout=20)
+        conn.request("POST", "/api/login",
+                     body=json.dumps({"username": username,
+                                      "password": password}).encode(),
+                     headers={"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        cookie = dict(response.getheaders()).get("Set-Cookie", "")
+        conn.close()
+        assert "sw_session=" in cookie, cookie
+        return cookie.split("sw_session=")[1].split(";")[0]
+
+    admin_token = login(DEFAULT_USER, DEFAULT_PASSWORD)
+    accounts = {
+        # ssh write, plus configrx READ so the dialog can still show the key.
+        "shelluser": {"ssh": "write", "configrx": "read", "nodes": "read"},
+        "cxuser": {"configrx": "write"},
+        "nodesuser": {"nodes": "write"},
+    }
+    tokens = {}
+    for username, grants in accounts.items():
+        status, payload = call("POST", "/api/users",
+                               {"username": username,
+                                "password": "Corr3ct-Horse-Battery",
+                                "grants": grants}, token=admin_token)
+        assert status == 200, (username, status, payload)
+        tokens[username] = login(username, "Corr3ct-Horse-Battery")
+
+    group_id = service.nodes_db.ensure_default_group()
+    route_device = service.nodes_db.add_device(ROUTE_HOST, name="Route Switch",
+                                               group_id=group_id)
+    service.configrx_db.update_device_config(route_device, ssh_port=ROUTE_PORT)
+    remember_route_key()
+
+    status, payload = call("GET", f"/api/ssh/devices/{route_device}/hostkey",
+                           token=tokens["shelluser"])
+    check("a configrx-read account can see the stored key",
+          status == 200 and (payload.get("host_key") or {}).get("fingerprint")
+          == hostkeys.fingerprint(route_key), (status, payload))
+
+    status, payload = call("DELETE", f"/api/ssh/devices/{route_device}/hostkey",
+                           token=tokens["shelluser"])
+    check("Forget is refused to an account that holds only ssh write",
+          status == 403, (status, payload))
+    check("...and the key is still there afterwards",
+          db.host_key(ROUTE_HOST, ROUTE_PORT) is not None)
+
+    status, payload = call("DELETE", f"/api/ssh/devices/{route_device}/hostkey",
+                           token=tokens["cxuser"])
+    check("Forget is allowed to an account with configrx write",
+          status == 200 and payload.get("removed") == 1, (status, payload))
+    check("...and the key is gone", db.host_key(ROUTE_HOST, ROUTE_PORT) is None)
+
+    remember_route_key()
+    status, payload = call("DELETE", f"/api/nodes/devices/{route_device}",
+                           token=tokens["nodesuser"])
+    check("a nodes-write account may remove the device", status == 200,
+          (status, payload))
+    check("...and removing it does not take the host key with it",
+          db.host_key(ROUTE_HOST, ROUTE_PORT) is not None)
+    check("...though the ConfigRX config for it is gone",
+          db.device_config(route_device) is None)
+
+    # The bulk form goes through the same forget_device.
+    bulk_device = service.nodes_db.add_device(ROUTE_HOST, name="Route Switch 2",
+                                              group_id=group_id)
+    status, payload = call("POST", "/api/nodes/devices/bulk-delete",
+                           {"device_ids": [bulk_device]},
+                           token=tokens["nodesuser"])
+    check("a bulk removal succeeds too",
+          status == 200 and payload.get("removed") == 1, (status, payload))
+    check("...and leaves the host key at that address alone",
+          db.host_key(ROUTE_HOST, ROUTE_PORT) is not None)
+finally:
+    server.stop()
+    service.shutdown()
+
 db.close()
 nodes_db.close()
 shutil.rmtree(TMPDIR, ignore_errors=True)

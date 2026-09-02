@@ -36,7 +36,7 @@
   let term = null;
   let fitAddon = null;
   let socket = null;
-  let device = null;          // {id, ip, name, sys_name, display_name_source}
+  let device = null;          // {id, ip, name}
   let storedUsername = '';
   let lastSize = { cols: 0, rows: 0 };
   const encoder = new TextEncoder();
@@ -62,10 +62,15 @@
     disconnectBtn.disabled = !(socket && socket.readyState === WebSocket.OPEN);
   }
 
+  /* The notice bar sits above the terminal and takes its own height when it
+     is shown, so showing or hiding one changes how many rows are left. Refit
+     afterwards or the bottom rows — the prompt among them — stay clipped
+     until the window happens to be resized. */
   function setNotice(text, kind) {
     noticeEl.textContent = text || '';
     noticeEl.className = 'ssh-notice' + (kind ? ' is-' + kind : '');
     noticeEl.hidden = !text;
+    fit();
   }
 
   function setTitle() {
@@ -150,19 +155,28 @@
     return true;
   }
 
-  function fit() {
-    if (!fitAddon) return;
+  /* Sizes the terminal to the window and records the result in lastSize,
+     telling nobody. Returns true when the size actually changed. Kept apart
+     from fit() because the size is needed before the session exists: the
+     `open` message carries it, and a `resize` that arrives first is a
+     protocol error the server closes the socket on. */
+  function measure() {
+    if (!fitAddon) return false;
     try {
       fitAddon.fit();
     } catch (error) {
-      return;      // the window can still be 0x0 while it is opening
+      return false;      // the window can still be 0x0 while it is opening
     }
     const cols = term.cols;
     const rows = term.rows;
-    if (cols === lastSize.cols && rows === lastSize.rows) return;
+    if (cols === lastSize.cols && rows === lastSize.rows) return false;
     lastSize = { cols, rows };
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      send({ type: 'resize', cols, rows });
+    return true;
+  }
+
+  function fit() {
+    if (measure() && socket && socket.readyState === WebSocket.OPEN) {
+      send({ type: 'resize', cols: lastSize.cols, rows: lastSize.rows });
     }
   }
 
@@ -202,10 +216,13 @@
 
     ws.onopen = () => {
       if (socket !== ws) return;
-      // Fit before the first message: the server sizes the pty from the
+      // Measure before the first message: the server sizes the pty from the
       // cols/rows in `open`, and a wrong size there is a wrapped prompt for
-      // the life of the session.
-      fit();
+      // the life of the session. measure() rather than fit() because `open`
+      // has to be the first message on the socket — anything a notice shown
+      // in the meantime changed rides out in `open` itself, and every later
+      // change goes as a `resize` through fit().
+      measure();
       send({ type: 'open', cols: lastSize.cols || 80, rows: lastSize.rows || 24 });
       setStatus('connecting', 'Opening the session…');
     };
@@ -420,9 +437,9 @@
     }
 
     device = payload.device || { id: deviceId, ip: '' };
-    nameEl.textContent = device.display_name_source === 'manual'
-      ? (device.name || device.ip)
-      : (device.sys_name || device.name || device.ip || openerName);
+    // The server resolves the display-name precedence once and sends the
+    // answer as `name`; the opener's name is only the stand-in until it does.
+    nameEl.textContent = device.name || openerName;
     ipEl.textContent = device.ip ? `${device.ip}:${payload.ssh_port || 22}` : '';
     setTitle();
 

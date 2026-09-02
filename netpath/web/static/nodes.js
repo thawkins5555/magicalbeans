@@ -2120,15 +2120,24 @@
      modal because a shell is not a dialog: it is kept open beside the rest
      of the product, resized, and lived in. The name keys it to the device,
      so a second SSH click on the same device raises the window it already
-     has instead of opening a rival session; `noopener` keeps the popup from
-     reaching back into this document. The display name rides in the URL
-     because displayName() is private here — the window replaces it with
-     whatever /api/ssh/devices/<id> reports. */
+     has instead of opening a rival session. `noopener` cannot be in the
+     feature string for that: a window opened with it is treated as `_blank`,
+     the name is discarded, and every click would open another window and
+     another shell. Clearing `opener` on the handle does the same job — the
+     window is same-origin, so we still get the handle back — and focus()
+     raises the existing window on the second click. The display name rides
+     in the URL because displayName() is private here — the window replaces
+     it with whatever /api/ssh/devices/<id> reports. */
   function sshDevice() {
     if (!view.detail || !App.canWrite('ssh')) return;
     const d = view.detail;
-    window.open(`/ssh.html?device=${d.id}&name=${encodeURIComponent(displayName(d))}`,
-      `ssh-${d.id}`, 'width=1000,height=640,noopener');
+    const w = window.open(
+      `/ssh.html?device=${d.id}&name=${encodeURIComponent(displayName(d))}`,
+      `ssh-${d.id}`, 'width=1000,height=640');
+    if (w) {
+      w.opener = null;
+      w.focus();
+    }
   }
 
   /* ------------------------------------------------------------ profiles */

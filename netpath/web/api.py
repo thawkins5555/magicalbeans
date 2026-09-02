@@ -1939,7 +1939,7 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     if not row:
         raise ValueError("No such device")
     service.nodes_db.remove_device(device_id)
-    service.configrx_db.forget_device(device_id, host=row["ip"])
+    service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     return {"ok": True}
 
@@ -1974,16 +1974,9 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
-    # The addresses first, while the rows still exist: a removed device's
-    # remembered SSH host key is keyed by its ip, which only Nodes knows.
-    hosts = {}
-    for device_id in device_ids:
-        row = service.nodes_db.device(device_id)
-        if row:
-            hosts[device_id] = row["ip"]
     removed = service.nodes_db.bulk_remove_devices(device_ids)
     for device_id in device_ids:
-        service.configrx_db.forget_device(device_id, host=hosts.get(device_id))
+        service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     return {"ok": True, "removed": removed}
 

@@ -46,9 +46,9 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Absence of a row for (username, module) means no access at all. A
 -- fresh install has no rows and no users beyond the seeded default admin
--- (see AppDatabase.__init__'s one-time backfill for the upgrade case,
--- where existing accounts get full access rather than being silently
--- locked out the moment this table starts being enforced).
+-- (see AppDatabase.backfill_permissions() for the upgrade case, where
+-- existing accounts get full access rather than being silently locked out
+-- the moment this table starts being enforced).
 CREATE TABLE IF NOT EXISTS user_permissions (
     username TEXT NOT NULL,
     module   TEXT NOT NULL,
@@ -155,8 +155,26 @@ class AppDatabase:
                 "SELECT 1 FROM sqlite_master WHERE type='table'"
                 " AND name='user_permissions'").fetchone() is not None
             self._conn.executescript(SCHEMA)
-            if not had_permissions_table:
+            self._conn.commit()
+        # Neither backfill runs here. On an install that predates app.db the
+        # accounts they grant against are still in netpath.db at this point:
+        # Service.__init__ copies them over with migrate_from() immediately
+        # after this constructor returns, and then calls
+        # backfill_permissions(). Running against the empty table would set
+        # the ssh marker having granted nobody, permanently.
+        self._needs_full_backfill = not had_permissions_table
+
+    def backfill_permissions(self) -> None:
+        """Grants the permissions an upgrade owes existing accounts. Call it
+        once the `users` table is final — that is, after migrate_from() has
+        had its chance to bring accounts in from a legacy netpath.db. Both
+        halves are idempotent (the full backfill only runs when this database
+        had no user_permissions table when it was opened, and each is an
+        INSERT OR IGNORE behind a marker), so a second call does nothing."""
+        with self._lock:
+            if self._needs_full_backfill:
                 self._backfill_full_permissions()
+                self._needs_full_backfill = False
             self._backfill_ssh_permission()
             self._conn.commit()
 
@@ -168,7 +186,10 @@ class AppDatabase:
         account write (which implies read) on every module. A fresh
         install has no users yet at this point (the default admin account
         is seeded later, in Service.__init__, once it already sees this
-        table), so this is a no-op there — nothing to backfill."""
+        table), so this is a no-op there — nothing to backfill.
+
+        Called from backfill_permissions(), which holds the lock and
+        commits, and only once the accounts have been migrated in."""
         from . import permissions
         usernames = [row["username"] for row in
                     self._conn.execute("SELECT username FROM users").fetchall()]
@@ -194,6 +215,10 @@ class AppDatabase:
         install has no users at this point (the default admin is seeded
         later, in Service.__init__, with every module), so this is a no-op
         there.
+
+        Called from backfill_permissions(), which holds the lock and
+        commits, and only once the accounts have been migrated in — the
+        marker must not be spent on an empty table.
         """
         from . import permissions
         if self._conn.execute("SELECT 1 FROM meta WHERE key = ?",

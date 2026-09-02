@@ -25,8 +25,8 @@ was checking. `run_all.py` shows the last lines of a failing suite's output.
 | `test_alert_operator_resolve.py` | an operator-resolved threshold alert (Nodes and NetPath) does not re-open for the same breach run, but does after a clear plus a fresh breach; an engine auto-resolve is never mistaken for one | none — drives `AlertEngine` directly |
 | `test_series_buckets.py` | `NodesDatabase.series(..., bucket_s=...)` bucket boundaries/avg/min/max, the `/series` API's `bucket_s` param and its window/2 cap, raw rows when `bucket_s=0` | none — no SNMP involved |
 | `test_mac_tables.py` | GETBULK forwarding-table walks (request counts, tooBig fallback, v1 GETNEXT, the row cap) and the present/first-seen history the Find box searches | `stub_agent_fdb.py` |
-| `test_ssh_hostkeys.py` | the shared SSH host-key store: fingerprints, the first connection storing a key, the same key touching last-seen, a changed key refused (by bytes, whatever its type), trust and forget, and ConfigRX backing up behind all of it | in-process `stub_ssh_device.py` (needs paramiko) |
-| `test_upgrade_from_previous.py` | databases in the previous release's shape open and migrate; with git history, the previous main commit creates every database and the current application starts on them | none — the previous release's own code |
+| `test_ssh_hostkeys.py` | the shared SSH host-key store: fingerprints, the first connection storing a key, the same key touching last-seen, a changed key refused (by bytes, whatever its type), trust and forget, ConfigRX backing up behind all of it, that removing a device (singly or in bulk) leaves its key, and that Forget is ConfigRX write's — 403 for an `ssh`-write-only account | in-process `stub_ssh_device.py` (needs paramiko), plus a real `WebServer` for the route rules |
+| `test_upgrade_from_previous.py` | databases in the previous release's shape open and migrate; with git history, the previous main commit creates every database and the current application starts on them; accounts migrated out of a legacy netpath.db get the permissions the upgrade owes them, once | none — the previous release's own code |
 | `test_wsock.py` | the WebSocket transport on its own: the handshake and its refusals, masked client frames, fragmentation, ping/pong, the close handshake, the 2 MB cap | none — a socketpair |
 | `test_ssh_terminal.py` | the terminal end to end: the upgrade behind the `ssh` permission (403/401 before the hijack), a shell over the socket with ConfigRX's stored credential, keystrokes and output, `need-credentials` then `auth`, a changed host key and `trust`, the session cap (4429) and idle timeout (4408), the device-event audit trail, and the one-time `ssh` permission backfill | in-process `StubDevice` (paramiko) |
 
@@ -38,6 +38,7 @@ use `spawn_stub("<script>.py")` for an agent, and keep the file name
 Two exceptions to "no dependencies": `stub_ssh_device.py` is a real paramiko
 SSH server, imported in-process rather than spawned (there is no `sshd`
 here, and no banner to wait for — construct `StubDevice()` and read
-`.port`), and `test_ssh_terminal.py` needs paramiko itself. A suite that
-cannot run for want of an optional dependency exits `77` after printing why;
-`run_all.py` reports that as SKIP rather than FAIL.
+`.port`), and `test_ssh_terminal.py` and `test_ssh_hostkeys.py` need
+paramiko itself. A suite that cannot run for want of an optional dependency
+exits `77` after printing why; `run_all.py` reports that as SKIP rather than
+FAIL, and says "no suites ran" if that is all that happened.

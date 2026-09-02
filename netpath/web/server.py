@@ -232,11 +232,15 @@ ROUTES = [
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
-    # The remembered SSH host key for a device: shown in ConfigRX's device
-    # dialog (a configrx read), forgotten only by someone who holds ssh write,
-    # since forgetting is what lets the next connection accept a new key.
+    # The remembered SSH host key for a device: shown and forgotten in
+    # ConfigRX's device dialog, so both routes are ConfigRX's. Forgetting is
+    # what lets the next connection accept a new key, and configrx write
+    # already decides which port and which credential that connection uses —
+    # it is the permission that already says which box is trusted, so it is
+    # the right holder of "start over with this device's key". Trusting a new
+    # key from inside the terminal stays ("ssh", W).
     ("GET", r"^/api/ssh/devices/(\d+)/hostkey$", api.get_ssh_device_hostkey, ("configrx", R)),
-    ("DELETE", r"^/api/ssh/devices/(\d+)/hostkey$", api.delete_ssh_device_hostkey, ("ssh", W)),
+    ("DELETE", r"^/api/ssh/devices/(\d+)/hostkey$", api.delete_ssh_device_hostkey, ("configrx", W)),
     # The terminal window. Read is meaningless for a shell — you either get
     # to type on the device or you do not — so both routes want write, and
     # the socket is the one hijacking route in the table (see _route).

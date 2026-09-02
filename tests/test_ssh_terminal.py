@@ -501,6 +501,7 @@ try:
     seed._conn.commit()
     seed.close()
     upgraded = AppDatabase(upgrade_path)
+    upgraded.backfill_permissions()      # Service calls this after migrate_from
     assert upgraded.permissions_for("olduser").get("ssh") == "write", \
         upgraded.permissions_for("olduser")
     assert "ssh" not in upgraded.permissions_for("halfuser"), \
@@ -513,6 +514,7 @@ try:
                                          if m != "ssh"})
     upgraded.close()
     again = AppDatabase(upgrade_path)
+    again.backfill_permissions()
     assert "ssh" not in again.permissions_for("olduser"), \
         again.permissions_for("olduser")
     again.close()

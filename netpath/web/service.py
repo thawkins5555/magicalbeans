@@ -52,6 +52,12 @@ class Service:
         # that predates app.db this lifts the settings, accounts and name cache
         # out of netpath.db and then drops them from it.
         migrate_from(self.app_db, db_path, log=self.log)
+        # Only now are the accounts final: what an upgrade owes them (write on
+        # every module for an install that predates the permission table, and
+        # `ssh` for the accounts that already hold write on everything else)
+        # is granted here rather than in AppDatabase.__init__, which runs
+        # before the migration above.
+        self.app_db.backfill_permissions()
 
         self.db = Database(db_path)
         self.flow_db = FlowDatabase(flow_db_path)
