@@ -31,6 +31,8 @@
     discResults: [],
     discChecked: new Set(),
     discCheckedJob: null,   // which job discChecked's defaults were seeded for
+    // 4.37.0: seeded from App.recallSort('nodes-discovery', …) once the view store lands
+    discSort: { key: 'ip', descending: false },
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
     mibFiles: [],
     mibSelected: null,
@@ -2617,24 +2619,87 @@
     drawDiscResultsTable();
   }
 
-  function discResultRowsHtml(results, job, cls) {
-    const allowPingOnly = !!(job && job.allow_ping_only);
-    return results.map((r) => {
-      const promoted = !!r.promoted_device_id;
-      const selectable = !promoted && (r.snmp_ok || allowPingOnly);
-      const checked = view.discChecked.has(r.id);
-      const box = selectable
-        ? `<input type="checkbox" class="${cls}" data-result="${r.id}" ${checked ? 'checked' : ''}>`
-        : (promoted ? '' : '<span class="hint" title="Only devices identified over SNMP can be added from this scan">—</span>');
-      return `<tr><td>${box}</td>` +
-        `<td>${escape(r.ip)}</td><td>${r.ping_ok ? 'yes' : 'no'}</td>` +
-        `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
-        `<td>${escape(r.sys_name || '—')}</td><td title="${escape(discArcsTitle(r))}">` +
-        `${escape(r.vendor || '—')}${vendorMarker(r)}` +
-        `${r.suggest_bundle && !r.suggest_bundle_installed
-          ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : ''}` +
-        `${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
-    }).join('');
+  /* ------------------------------------------- the results grid
+
+     The results pane is a real grid — sortable, draggable widths, its own
+     select-all — rather than one string of markup. Two reasons: the server
+     hands them over in `ORDER BY ip`, which is TEXT, so .100 came before
+     .9 and there was no way to say otherwise; and a table that can be
+     redrawn without losing its order is what lets a running sweep refresh
+     itself under the operator.
+
+     A row's identity is its RESULT id, never its position, so re-sorting
+     cannot move a tick onto a different device — Promote posts ids. */
+
+  function discSelectedJob() {
+    return view.discJobs.find((j) => j.id === view.discSelected);
+  }
+
+  /* A result can be ticked when nothing has promoted it yet and the scan is
+     allowed to add it: SNMP-identified always, ping-only only when the job
+     was started with that option. */
+  function discSelectable(r, job) {
+    return !r.promoted_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
+  }
+
+  /* The first cell of a discovery row: a box for a result that may be
+     added, an em dash carrying the reason for one no credential
+     identified, and nothing at all for one already promoted. Shared by the
+     grid and the approval dialog, which differ only in the class on the box
+     and in which set holds the ticks. */
+  function discCheckCell(r, job, checkedSet, cls) {
+    if (!discSelectable(r, job)) {
+      return r.promoted_device_id ? ''
+        : '<span class="hint" title="Only devices identified over SNMP can be ' +
+          'added from this scan">\u2014</span>';
+    }
+    return `<input type="checkbox" class="${cls}" data-result="${r.id}"` +
+      `${checkedSet.has(r.id) ? ' checked' : ''}>`;
+  }
+
+  /* Vendor with its confidence marker, the "install these MIBs" hint and
+     the "(added)" tag. The arc title hangs on a <span> inside the cell
+     rather than on the cell itself: App.drawRows owns the <td>. */
+  function discVendorCell(r) {
+    const body = `${escape(r.vendor || '\u2014')}${vendorMarker(r)}` +
+      (r.suggest_bundle && !r.suggest_bundle_installed
+        ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : '') +
+      (r.promoted_device_id ? ' <span class="hint">(added)</span>' : '');
+    const title = discArcsTitle(r);
+    return title ? `<span title="${escape(title)}">${body}</span>` : body;
+  }
+
+  const DISC_COLUMNS = [
+    { key: 'check', label: '', sortable: false, fixed: true, width: 34,
+      cell: (r) => discCheckCell(r, discSelectedJob(), view.discChecked, 'disc-check') },
+    // Sorted as the dotted string it is: App.sortRows collates numerically,
+    // which puts .9 before .100 where the server's ORDER BY ip does not.
+    { key: 'ip', label: 'IP', width: 130, on: true },
+    // Sorted on the flag, not on the word — and deliberately not `numeric`,
+    // which would right-align a column of yes/no as if it were a reading.
+    { key: 'ping_ok', label: 'Ping', width: 64, on: true,
+      value: (r) => (r.ping_ok ? 1 : 0), cell: (r) => (r.ping_ok ? 'yes' : 'no') },
+    { key: 'snmp_ok', label: 'SNMP', width: 68, on: true,
+      value: (r) => (r.snmp_ok ? 1 : 0), cell: (r) => (r.snmp_ok ? 'yes' : 'no') },
+    // No `cell`: App.drawRows escapes the field and writes an em dash for a
+    // device that gave no sysName.
+    { key: 'sys_name', label: 'Name', width: 160, on: true },
+    { key: 'vendor', label: 'Vendor', width: 200, on: true,
+      value: (r) => r.vendor || '', cell: discVendorCell },
+  ];
+
+  /* The approval dialog's own rows. A modal, not a grid: no sorting, no
+     widths, and its own checked set — passed in explicitly rather than
+     swapped through view.discChecked, which used to leave the pane's
+     selection standing in a global for the length of one string build. */
+  function discResultRowsHtml(results, job, cls, checkedSet) {
+    return results.map((r) =>
+      `<tr><td>${discCheckCell(r, job, checkedSet, cls)}</td>` +
+      `<td>${escape(r.ip)}</td>` +
+      `<td>${r.ping_ok ? 'yes' : 'no'}</td>` +
+      `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
+      `<td>${escape(r.sys_name || '\u2014')}</td>` +
+      `<td>${discVendorCell(r)}</td></tr>`).join('');
   }
 
   function discArcsTitle(r) {
@@ -2648,7 +2713,10 @@
   /* A select-all box in the header cell above the row boxes, the same
      affordance every checkbox list in the app now carries. It governs only
      the SELECTABLE rows — a result already promoted, or one no credential
-     identified, has no box of its own and must not be counted as "all". */
+     identified, has no box of its own and must not be counted as "all".
+
+     The results table gets this from App.grid's own selectAll now; what is
+     left here is the approval dialog, whose table is a plain modal one. */
   function wireDiscSelectAll(table, cls, checkedSet, redraw) {
     const boxes = [...table.querySelectorAll(`.${cls}`)];
     const head = table.querySelector('thead th');
@@ -2672,20 +2740,66 @@
     head.appendChild(all);
   }
 
+  function onDiscSort(key, descending) {
+    view.discSort = { key, descending };
+    drawDiscResultsTable();
+  }
+
   function drawDiscResultsTable() {
     const table = App.el('disc-results-table');
-    const job = view.discJobs.find((j) => j.id === view.discSelected);
-    table.innerHTML = '<thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>' +
-      `<tbody>${discResultRowsHtml(view.discResults, job, 'disc-check')}</tbody>`;
-    for (const box of table.querySelectorAll('.disc-check')) {
+    const job = discSelectedJob();
+    const selectable = view.discResults.filter((r) => discSelectable(r, job));
+    const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
+    const chosen = ticked();
+    // A redraw under a running sweep must not throw the pane back to the top
+    // while someone is reading further down it.
+    const wrap = table.parentElement;
+    const scroll = wrap ? wrap.scrollTop : 0;
+    App.grid(table, {
+      name: 'nodes-discovery', columns: DISC_COLUMNS,
+      sort: view.discSort, onSort: onDiscSort,
+      selectAll: {
+        key: 'check',
+        checked: selectable.length > 0 && chosen === selectable.length,
+        some: chosen > 0 && chosen < selectable.length,
+        onToggle: (on) => {
+          for (const r of selectable) {
+            if (on) view.discChecked.add(r.id); else view.discChecked.delete(r.id);
+          }
+          drawDiscResultsTable();
+        },
+      } });
+    const body = document.createElement('tbody');
+    // Sorted into a copy, never in place: view.discResults is what the next
+    // tick's fetch replaces and what the approval dialog reads.
+    const rows = App.sortRows(view.discResults, view.discSort.key,
+                              view.discSort.descending, DISC_COLUMNS);
+    App.drawRows(body, rows, DISC_COLUMNS, (tr, row) => {
+      const box = tr.querySelector('.disc-check');
+      if (!box) return;
       box.onchange = () => {
-        const id = Number(box.dataset.result);
-        if (box.checked) view.discChecked.add(id); else view.discChecked.delete(id);
-        wireDiscSelectAll(table, 'disc-check', view.discChecked, drawDiscResultsTable);
+        if (box.checked) view.discChecked.add(row.id);
+        else view.discChecked.delete(row.id);
+        // One row ticked corrects the header box in place; redrawing the
+        // table under the pointer is what made picking several feel slow.
+        App.refreshSelectAll(table, selectable.length, ticked());
       };
-    }
-    wireDiscSelectAll(table, 'disc-check', view.discChecked, drawDiscResultsTable);
+    });
+    table.appendChild(body);
+    if (wrap && scroll) wrap.scrollTop = scroll;
   }
+
+  /* True only while the Discovery sub-view is the one on screen. A running
+     sweep's results are worth re-fetching every tick; a sweep nobody is
+     looking at is not. */
+  function discoveryVisible() {
+    const pane = document.getElementById('nodes-sub-discovery');
+    return !!pane && pane.classList.contains('active');
+  }
+
+  // The selected job's `id:state` on the previous Nodes tick, so a sweep
+  // that has just stopped gets one final fetch and then goes quiet.
+  let discPrevState = null;
 
   function startDiscovery() {
     const target = App.el('disc-target').value.trim();
@@ -2824,11 +2938,7 @@
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
       <div class="table-wrap" style="max-height:50vh">
         <table><thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>
-        <tbody>${(() => {
-          const saved = view.discChecked; view.discChecked = checked;
-          const html = discResultRowsHtml(found, job, 'disc-approve');
-          view.discChecked = saved; return html;
-        })()}</tbody></table>
+        <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
       </div>`, buttons);
     const approveTable = box.querySelector('table');
     const syncApprove = () => {
@@ -3361,10 +3471,23 @@
     if (row) interfaceDialog(row, deviceId);
   }
 
+  /* Once per Nodes tick, and the one place the results pane follows a
+     sweep that is still running: it used to sit frozen on whatever the job
+     had found when it was clicked, which is what made a re-sort of it look
+     broken. Fetched only for the SELECTED job and only while the Discovery
+     sub-view is on screen; the draw re-applies the operator's sort and
+     their ticks, which are keyed by result id and so survive new rows. */
   async function loadDiscJobsIfNeeded() {
     const jobs = await App.get('/api/nodes/discovery');
     view.discJobs = jobs.jobs;
     drawDiscJobsTable();
+    const job = discSelectedJob();
+    const previous = discPrevState;
+    discPrevState = job ? `${job.id}:${job.state}` : null;
+    if (job && discoveryVisible()
+        && (job.state === 'running' || previous === `${job.id}:running`)) {
+      await loadDiscResults().catch(() => {});
+    }
     maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
   }
 
