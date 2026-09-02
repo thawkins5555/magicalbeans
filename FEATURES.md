@@ -24,9 +24,16 @@ is dragged.
 
 **Reloading the page returns to whichever tab was open**, not back to
 NetPath — the browser remembers the last tab the same way it remembers
-panel sizes and column widths, per browser rather than per account.
-**Signing in always opens on Dashboard**, though: a fresh login is a new
-visit, not a reload, so it starts from the same place every time rather
+panel sizes and column widths, per browser rather than per account. **It
+also keeps the view itself**: the column a table was sorted on and which
+way, whatever was typed into a search box, every dropdown filter, and the
+sub-tab a page was on (Devices or Discovery, Subnets or DHCP) all come back
+as they were. What is deliberately *not* remembered is the Live / follow
+switch on the streaming pages: a page that came back with its updates
+quietly switched off would read as broken, so those start on every load.
+**Reset panel sizes** on the Settings tab resets panel sizes and nothing
+else. **Signing in always opens on Dashboard**, though: a fresh login is a
+new visit, not a reload, so it starts from the same place every time rather
 than wherever a previous session happened to leave off.
 
 ## How it runs
@@ -240,6 +247,14 @@ own subtabs.
   entirely. Any scan that is no longer running can be removed from the
   jobs list with its Remove button. Running scans are visible on the
   Debug page (DISCOVERY SCANS RUNNING) with live progress.
+- **Results are a sortable table.** Click a heading to sort — IP addresses
+  in numeric order, so .9 comes before .100 — drag the column edges, and
+  use the header box to select every result the scan is allowed to add.
+  Ticks belong to rows, not positions, so a re-sort carries them along and
+  Promote adds exactly the devices that were ticked. While a scan is
+  running its results fill in as they are found, keeping the sort and the
+  ticks; the fetching stops when the sweep ends or the Discovery view is
+  left.
 - **Promotion is idempotent**: a result already promoted is a no-op to
   promote again, not a duplicate-IP error. Discovery suggests a polling
   profile from the device's vendor OID root where one matches, falling
@@ -623,6 +638,18 @@ alerts and optionally emailing about them.
   the one not acted on. A restart of the application forgets which breach
   runs were resolved by hand, so a still-breaching alert can re-open once
   after one.
+- **Resolving an outage covers the alerts it was hiding.** "Device not
+  responding" absorbs the packet-loss, response-time, CPU, memory,
+  interface-counter and poll-overrun alerts of a device that is down. A
+  hand resolve of that outage, single or bulk, keeps those covered for as
+  long as the device is still down — they used to come straight back on
+  the next tick, one new alert and one new email per device, which is what
+  made bulk Resolve look as though it did nothing. The cover ends by itself
+  when the device answers again, so a device that is up but lossy raises
+  its packet-loss alert normally. Acknowledge keeps them covered exactly as
+  before. The same discipline now holds for "SNMP authentication failing",
+  recorded once when it starts and cleared when SNMP works again, and for
+  a DHCP scope alert resolved by hand while the scope stays full.
 - **A newly added device is given five minutes before it can raise an
   alert.** A device added a moment ago is usually still being set up —
   wrong community, not cabled yet, still booting — and the alerts that
@@ -698,10 +725,17 @@ alerts and optionally emailing about them.
   recording events, so the alerts simply come back. The mute is shown in
   the Nodes device list and in the device's detail header as well as in
   Alerts — a mute nobody can see is a mute somebody will spend an
-  afternoon looking for. Only Nodes devices can be muted; syslog, traps,
-  IPAM conflicts, DHCP scopes and wireless APs are structurally outside
-  it. Muting requires write access to Alerts; a read-only account can see
-  what is muted but cannot mute.
+  afternoon looking for. The button is offered on every alert that is
+  about a device — a device alert, or an interface alert, which mutes the
+  switch the port is on. It is always in the bar: when the alert is about
+  something outside Nodes (a syslog source, a trap from an unpolled host,
+  an IPAM conflict, a DHCP scope, a wireless AP) or its device has since
+  been removed, or the account lacks write access to Alerts, the button is
+  disabled with a line under the bar saying which, rather than absent — a
+  control that is silently not there reads as a feature that has gone. A
+  read-only account can see what is muted but cannot mute, and sees no
+  Resolve or Acknowledge in the detail either, the same gate the bulk
+  buttons carry.
 - **A poll overrun on a device that is not answering is not reported at
   all.** "Poll taking longer than its interval" is recorded when the
   previous poll is still running as the next falls due — which is exactly

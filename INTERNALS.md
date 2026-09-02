@@ -1598,6 +1598,27 @@ housekeeping pass so the table does not grow a row per mute ever set.
 `MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
 silence a device until next year.
 
+**The page is told which device an alert is about.** Since 4.37.0 every
+alert row the API returns carries `device_id` and `device_name`, resolved in
+`api._alert_device_id` by the same rule `_occurrence_device` applies: a
+device alert is its own device, an interface alert (`entity_id` of the form
+`<device_id>:<if_index>`) is the switch the port is on, and every other kind
+is null — as is a device that has since been removed from Nodes, so the page
+never offers a mute the API would refuse. The names come from one
+`devices_by_ids` query per page. `alerts.js showDetail` draws the mute area
+from that field alone: enabled (the 1/6/12/24 h picker, or "Muted until … /
+Lift mute" looked up in `view.mutes` by the same id) when it is set and the
+account holds alerts write, otherwise disabled with a `title` and a `.hint`
+line naming the reason. Before this the page tested `entity_kind ===
+'device'`, which excluded every interface alert; that, the missing write
+gate on the detail's own Resolve/Acknowledge, and a `bar` without `wrap`
+inside an `overflow:hidden` pane were the three things reported as "the
+Mute button disappeared". The detail bar's rebuild guard
+(`detailSignature`) includes the device id and the mute state so a refresh
+does not churn the pane under an open dropdown, and every single-row
+action goes through `detailAction`, which paints a failure on the counters
+line the way the bulk actions do.
+
 The Nodes device list and single-device endpoints carry `muted_until`
 from `alerts_db`, because a mute nobody can see is a mute somebody will
 spend an afternoon looking for.
@@ -3540,6 +3561,40 @@ The logic was correct, so none of it changed. What changed is that it now says
 `_offered_algorithms_detail()` writes what was actually offered into a failed
 connection's Debug event. A diagnosis nobody can check is not much better than
 no diagnosis.
+
+### The Discovery results grid (`nodes.js DISC_COLUMNS`, `drawDiscResultsTable`)
+
+Until 4.37.0 the results pane under Nodes → Discovery was the last table in
+the app written as one string of markup — no sorting, no widths, a bespoke
+select-all — in the server's `ORDER BY ip`, which is text, so `.100` sorted
+before `.9`. It now goes through the shared facility like every other list:
+a `DISC_COLUMNS` catalogue in the shape `configrx.js` uses (a fixed `check`
+column whose cell is the box, the em-dash hint for a result no credential
+identified, or nothing for one already promoted; `ip` sorted as the dotted
+string, which `App.sortRows`' numeric collation orders correctly; `ping_ok`
+and `snmp_ok` with a `value` of 1/0 so they sort on the flag rather than
+the word; `sys_name`; `vendor` with its marker, MIB hint and "(added)" tag,
+the arc explanation on a `<span title>` because `App.drawRows` owns the
+`<td>`), `App.grid` under the name `nodes-discovery` (so widths persist and
+the sort is remembered like any other grid), `App.sortRows` into a copy —
+never in place, because `view.discResults` is what the next fetch replaces
+and what the approval dialog reads — and `App.drawRows`. Select-all is the
+grid's own, computed over the *selectable* subset only; a single row's
+toggle corrects the header box through `App.refreshSelectAll` rather than
+redrawing. Ticks (`view.discChecked`) are keyed by result id, never by
+position, so a re-sort carries them and Promote posts the same ids.
+
+**A running sweep is followed.** `loadDiscJobsIfNeeded`, already called once
+per Nodes tick, re-fetches the selected job's results while that job's state
+is `running` and the Discovery sub-view is on screen, with one last fetch
+on the tick it stops (a module-level `discPrevState` holds last tick's
+`id:state`) and none after. Before this the results pane was refreshed only
+by a job click or a promote, which is exactly what would have made a new
+sort look as though it broke the live update. The draw saves and restores
+the pane's `scrollTop`. The approval dialog keeps its plain string builder
+but is handed its checked set explicitly instead of swapping
+`view.discChecked` in and out of the module global for the length of one
+build.
 
 ### Bulk selection (`nodes.js`, `alerts.js`, `configrx.js`)
 
