@@ -3736,24 +3736,68 @@ selectors, sharing the same two keys.
 **Hijack and framing.** The web server is a `ThreadingHTTPServer` with one
 daemon thread per connection, HTTP/1.0 (so no keep-alive to unwind),
 `wbufsize = 0` and no handler timeout. That shape makes a WebSocket almost
-free: a handler can answer the upgrade on `self.wfile` and then keep
-`rfile`/`wfile` for the life of the conversation without blocking anything
-else. A route whose handler carries `hijack = True` is called with the
-request handler itself, after exactly the same cookie → session → permission
-tail as every other route — which is why the socket is a route rather than a
-special case earlier in the dispatch: an unsigned-in or unpermitted request
-is answered 401/403 as ordinary HTTP before anything is hijacked. `_route`
-sets `_status = 101` so the access log reads sanely and `close_connection =
-True` so the connection simply ends. A handshake that is not a valid upgrade
-raises `wsock.WebSocketError` before a byte is written and is answered 400.
+free: the connection can be taken over after the 101 and held for the life
+of the conversation without blocking anything else. A route whose handler
+carries `hijack = True` runs after exactly the same cookie → session →
+permission tail as every other route — which is why the socket is a route
+rather than a special case earlier in the dispatch: an unsigned-in or
+unpermitted request is answered 401/403 as ordinary HTTP before anything is
+hijacked. Three things then happen in `_route`, in this order, and the order
+is the point:
+
+1. **`Origin`.** The upgrade is a GET, so the JSON content-type check that
+   is the CSRF gate for every writing route never sees it, and the session
+   cookie's `SameSite=Strict` is *site*-scoped: another port on the NMS host
+   or a sibling subdomain counts as the same site and its page would carry
+   the cookie. So the hijack branch compares `urlparse(Origin).netloc`
+   against `Host`, case-insensitively, and answers
+   `403 {"error": "Cross-origin WebSocket refused"}` when they differ **or
+   when `Origin` is absent** — a browser always sends it on an upgrade. The
+   check lives here rather than in `wsock` because it is about who is
+   asking, which is this layer's business and not the framing's.
+2. **The accept.** `_route` itself calls `wsock.accept(self)`; a handshake
+   that is not a valid upgrade raises `wsock.WebSocketError` before a byte
+   is written and is answered 400. Only once the 101 is on the wire does
+   `_status = 101` (so a refused upgrade is not logged as one), with
+   `close_connection = True` so the connection simply ends afterwards.
+3. **The handler**, called as `handler(websocket, service, params, *args)` —
+   it is handed an established socket and never touches the request handler.
+
 `web/wsock.py` is the framing: the RFC 6455 accept digest, the 101 written by
 hand as HTTP/1.1 (a browser rejects a 101 announced as HTTP/1.0, which is
 what `protocol_version` would otherwise produce), masked client frames,
-fragment reassembly, ping → pong, the close handshake, unmasked server
-frames, and one lock around sending because a session has two writers. A
+fragment reassembly (a list and a running length, joined once — 2 MB of
+125-byte fragments is 16,777 of them, and concatenating onto one buffer is
+quadratic), ping → pong, the close handshake and unmasked server frames. A
 frame — and a reassembled message — may not exceed 2 MB, enforced from the
 length field before any payload is read (close 1009); a protocol error
-closes 1002. The CSP gained `connect-src 'self' ws: wss:` for the socket.
+closes 1002. The CSP is `default-src 'self'; style-src 'self'
+'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'` — `'self'`
+covers the same-origin `ws://`/`wss://` the terminal opens, while the bare
+`ws: wss:` scheme-sources it used to carry matched any host at all, and
+`frame-ancestors` keeps the terminal and its Trust button out of an iframe.
+
+**One socket, one lock.** After the 101 the `WebSocket` stops using the
+handler's `rfile`/`wfile` and talks to `handler.connection` directly,
+draining whatever `rfile` had already buffered (a pipelined client) into its
+own read buffer first. Everything touching the socket — every read, every
+frame written, the close frame — goes through one `_io_lock`, because a
+session has two threads on it and under TLS (`WebServer(certfile=…)` wraps
+the listening socket) concurrent `SSL_read`/`SSL_write` on one `SSLSocket`
+is not something OpenSSL supports: a TLS 1.3 post-handshake message arriving
+during a `show tech-support` can end the connection with a record error. The
+reader waits for readability with `select` **outside** the lock
+(`READ_SLICE_S = 0.25`) and then takes it only for a non-blocking read, so
+the thread that is idle almost all the time cannot starve the one with
+output to send; `select`'s answer is not trusted, since a whole record can
+already be decoded and waiting inside the SSL object. Writes take the lock
+with `SEND_TIMEOUT_S = 15` on the socket: a browser that stops reading fails
+the send, marks the socket closed and releases everything waiting on it, so
+`stop()`, the idle watchdog and `SshSessionRegistry.shutdown()` are bounded
+rather than parked behind a peer. `close()` sends its frame under the same
+lock and then shuts the socket down on *every* call, even one that finds the
+socket already marked closed by a failed write — that shutdown is what ends
+a `recv()` parked in the other thread.
 
 **The protocol.** `GET /api/ssh/devices/<id>/socket`, with the session
 cookie; no subprotocol. Text frames are JSON control messages, binary frames
@@ -3763,15 +3807,21 @@ first, then `resize` and keystrokes; `auth` only in answer to
 server sends `status` (`connecting`, `connected`, `closed`),
 `need-credentials` (`none-stored`, `auth-failed`, `decrypt-failed`, with
 the username to prefill), `hostkey` (`new` is informational — the key was
-stored; `changed` means the connection was refused and carries both
+stored, and both its fields come from the policy that stored it;
+`changed` means the connection was refused and carries both
 fingerprints and when the old key was first seen), `error` (connect
 failures phrased by `configrx._connect_error_text`, so the legacy
 key-exchange guidance is not duplicated), and channel output as binary.
 Order on a fresh connection is `status connecting`, then any `hostkey`,
-then `status connected`. Close codes: 1000 normal, 4401 not authorised
-(only for a `trust` from an account that no longer holds `ssh` write — an
-unpermitted upgrade never gets a socket), 4408 idle, 4429 too many
-sessions.
+then `status connected`. `resize` is tolerated *before* `open` — the page
+measures its terminal as it opens the socket and a notice appearing between
+the two changes that measurement, so the size can legitimately arrive first;
+the session applies it and goes on waiting for `open`. Close codes: 1000
+normal (including "too many failed logins"), 4401 not authorised — a `trust`
+from an account that no longer holds `ssh` write, and also the liveness
+watchdog below: signed out, session expired or deleted, permission revoked —
+4408 idle, 4429 too many sessions (either cap). An unpermitted or
+cross-origin upgrade never gets a socket at all; it is an HTTP 403.
 
 **The session registry and its limits.** `SshSessionRegistry` is built in
 `Service.__init__` after the session store and ConfigRX's database, and
@@ -3780,20 +3830,44 @@ a session writes its closing device event on the way out. Each session owns
 a paramiko client and a shell channel and uses three threads: the request
 handler's own thread reads the socket and writes keystrokes into the
 channel, a pump thread reads channel output and sends it back, and a small
-timer thread hangs up on an idle session. The constants in `sshterm.py` are
+timer thread is the session's heartbeat. The constants in `sshterm.py` are
 the whole policy: `CONNECT_TIMEOUT_S = 10` (ConfigRX's, for the same
 reason), `IDLE_TIMEOUT_S = 900` measured on *keystrokes* — presence, not the
 window being open, the rule `SessionStore.touch` applies to the web session
-— `MAX_SESSIONS = 16` across the application (past which the socket closes
-4429), and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel read so a
+— `MAX_SESSIONS = 16` across the application and `MAX_SESSIONS_PER_USER = 4`
+for one account (past either the socket closes 4429, with a message naming
+the cap that was reached; the per-user one is what stops sixteen sockets
+from one account locking every other operator out), `MAX_AUTH_ATTEMPTS = 5`
+failed logins per socket, `TOUCH_INTERVAL_S = 30`, `PERMISSION_EVERY_TICKS =
+5`, and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel read so a
 device dumping a huge `show tech-support` streams rather than being
 buffered whole. The credential — ConfigRX's, decrypted at connect, or one
 typed into the page — lives in a local for the length of the connect and is
 dropped in its `finally`; the one case where it is held longer is between a
 `hostkey changed` and the operator's answer, so that Trust reconnects
 without asking again. Sessions are audited as `ssh` device events (who,
-from where; the duration on close; a host key replaced) and a NODES
-event-log line — never a keystroke, never a credential.
+from where; the duration on close; a host key replaced; every refused login
+with its attempt number and the SSH username tried; why a shell was closed
+as unauthorised) and a NODES event-log line — never a keystroke, never a
+credential.
+
+**Liveness: a shell is only as live as the sign-in that opened it.** A
+terminal outlives the request that opened it by hours, so being authorised
+at the upgrade is not enough. The session keeps the web session token it was
+opened with, and the 1 Hz watchdog re-reads `service.sessions.get(token)`
+every tick and `permissions_for(app_user)["ssh"]` every fifth (the first is
+a dictionary lookup, the second a database read): a sign-out, an expiry, a
+deleted account or a revoked permission closes the shell with 4401, a
+`status closed` saying which, and an audit line. In the other direction,
+keystrokes are presence for the *web* session too — the same rule server.py
+applies to a POST — so a binary frame calls `sessions.touch(token)`, at most
+once every `TOUCH_INTERVAL_S`, since a shell is a great many keystrokes and
+the web session's idle timeout is measured in hours. And every
+`AuthenticationException` is counted and audited (`SSH login as <ssh user>
+refused (attempt n of 5; requested by <app user> from <ip>)`, never the
+password); at `MAX_AUTH_ATTEMPTS` the session says "Too many failed logins"
+and closes, so the page cannot be used as an unthrottled password oracle
+against every device the app can reach.
 
 **The `ssh` permission and its backfill.** `permissions.MODULES` gained
 `"ssh"`, the only entry with no tab of its own: both terminal routes require
@@ -3826,7 +3900,9 @@ otherwise) so paramiko itself checks the connection; `policy(host, port)`
 is the `MissingHostKeyPolicy` for what paramiko finds unknown;
 `trust(host, port, key, by)` replaces; `record_seen` touches last-seen;
 `forget` removes; `as_changed(exc, host, port)` maps paramiko's own
-`BadHostKeyException` to the app's `HostKeyChanged`. The table is new, so
+`BadHostKeyException` to the app's `HostKeyChanged` and passes an
+already-mapped one straight back, so a caller catching both types funnels
+them through one line. The table is new, so
 it ships in SCHEMA with its primary key and no other index — every read is
 a `(host, port)` lookup.
 
@@ -3841,8 +3917,9 @@ same type would compare equal.
 
 **First connection, and a change.** The first time this app reaches a host
 on a port, the policy stores the key it was shown and lets the connection
-proceed, leaving the fingerprint on `policy.stored_new` so the caller can
-say so — network gear rarely carries a stable known_hosts entry anywhere,
+proceed, leaving the fingerprint and type on `policy.stored_new` /
+`policy.stored_type` so the caller can say so — and say it about the right
+key — network gear rarely carries a stable known_hosts entry anywhere,
 and refusing every first connection only teaches operators to click past
 warnings. Afterwards a different key raises `HostKeyChanged`, carrying both
 fingerprints, the new key's type, when the old key was first seen, and the

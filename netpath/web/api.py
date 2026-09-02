@@ -30,7 +30,6 @@ from .. import trapoids
 from .. import nodeoids
 from .. import configrx
 from .. import sshterm
-from . import wsock
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
@@ -692,41 +691,37 @@ def get_ssh_device(service, params, body, device_id) -> dict:
     device this is, whether it can log in without asking, and what is known
     about the device's host key. Gated on ("ssh", W) like the socket itself
     — there is no read-only half of "open a shell"."""
-    device = service.nodes_db.device(device_id)
-    if not device:
-        raise ValueError("No such device")
+    device, host, port = _ssh_device_host(service, device_id)
     config = service.configrx_db.device_config(device_id)
-    port = int(config["ssh_port"]) if config and config["ssh_port"] else 22
     # nodes.js's displayName() precedence, the same one ConfigRX's device
     # list uses: the SNMP hostname wins unless the device is pinned to its
-    # manual name, with the IP as the last resort.
+    # manual name, with the IP as the last resort. Resolved here, once — the
+    # page shows what it is given rather than recomputing it.
     name = ((device["name"] if device["display_name_source"] == "manual" else None)
             or device["sys_name"] or device["name"] or device["ip"])
     available = configrx.paramiko_available()
     return {
-        "device": {"id": device["id"], "ip": device["ip"], "name": name,
-                   "sys_name": device["sys_name"],
-                   "display_name_source": device["display_name_source"]},
+        "device": {"id": device["id"], "ip": host, "name": name},
         "has_credential": bool(config and config["ssh_username"]
                                and config["ssh_password_enc"]),
-        "ssh_username": (config["ssh_username"] if config else "") or "",
         "ssh_port": port,
         "paramiko": {"available": available,
                      "message": "" if available else configrx.PARAMIKO_MISSING},
-        "host_key": sshterm.stored_host_key(service, device["ip"], port),
+        "host_key": sshterm.stored_host_key(service, host, port),
     }
 
 
-def ws_ssh_device(handler, service, params, device_id) -> None:
-    """The terminal's WebSocket. Hijacking: it answers the upgrade itself
-    and then holds the connection for the whole session, so it takes the
-    request handler rather than a body and returns nothing to serialise.
-    server.py's _route has already established who is asking and that they
-    hold ("ssh", W)."""
-    websocket = wsock.accept(handler)
+def ws_ssh_device(websocket, service, params, device_id) -> None:
+    """The terminal's WebSocket. Hijacking: the connection is held for the
+    whole session, so this takes the socket server.py already upgraded
+    rather than a body, and returns nothing to serialise. server.py's
+    _route has already established who is asking, that the page asking is
+    this one (Origin), and that they hold ("ssh", W); the session token
+    goes with them so the session can be ended the moment that sign-in is."""
     service.ssh_sessions.open(websocket, device_id,
                               params.get("_username", ""),
-                              params.get("_client", ""))
+                              params.get("_client", ""),
+                              params.get("_token", ""))
 
 
 ws_ssh_device.hijack = True

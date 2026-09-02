@@ -13,8 +13,13 @@ The shape:
 * One `SshSession` per socket, owning the paramiko client and the shell
   channel. Two threads: the request handler's own thread reads the WebSocket
   and writes keystrokes into the channel; a pump thread reads channel output
-  and writes binary frames back. A third, tiny, timer thread hangs up on an
-  idle session.
+  and writes binary frames back. A third, tiny, timer thread is the session's
+  heartbeat: it hangs up on an idle session, and it re-asks once a second
+  whether this session is still allowed to exist. A shell outlives the
+  request that opened it by hours, so being authorised at the upgrade is not
+  enough — signing out, a session expiring, an account deleted or the `ssh`
+  permission taken away all close the shell (4401), and every failed login
+  is counted and audited so the page cannot be used as a password oracle.
 * The credential is ConfigRX's stored one for that device when there is one
   — decrypted at connect time and dropped immediately, exactly as the backup
   path does — and otherwise typed into the page and sent once over the
@@ -54,6 +59,24 @@ IDLE_TIMEOUT_S = 900
 # a paramiko transport and three threads; sixteen is far past what a team of
 # operators uses at once and well short of anything the process would feel.
 MAX_SESSIONS = 16
+# And per signed-in account, so one account cannot spend the application-wide
+# cap on its own — sixteen sockets that never get past the login prompt would
+# otherwise lock every other operator out. Four terminals is more than anyone
+# watches at once.
+MAX_SESSIONS_PER_USER = 4
+# Failed logins allowed on one socket. Without a cap the page is an
+# unthrottled password oracle against every device this app can reach; five
+# is the room a mistyped password needs and no more. Every failure is
+# audited, and the cap ends the session.
+MAX_AUTH_ATTEMPTS = 5
+# How often keystrokes refresh the *web* session. A shell being typed into is
+# presence by the same rule server.py applies to a POST, but a touch per
+# keystroke would be a write per character; twice a minute is plenty.
+TOUCH_INTERVAL_S = 30
+# How often the liveness watchdog re-reads the permission (it re-reads the
+# web session every tick, which is one dictionary lookup; the permission is a
+# database read). Five seconds from revoked to closed.
+PERMISSION_EVERY_TICKS = 5
 # The largest terminal output frame. Channel reads are capped at this, so a
 # device dumping a 4 MB `show tech-support` arrives as a stream of frames a
 # browser can render as it goes rather than one it must buffer whole.
@@ -83,47 +106,14 @@ def _int_in(value, low: int, high: int, default: int) -> int:
     return max(low, min(high, number))
 
 
-def fingerprint(key) -> str:
-    """The store's fingerprint spelling, so one connection is described the
-    same way everywhere."""
-    return hostkeys.fingerprint(key)
-
-
-class _KeyChange:
-    """A host key that no longer matches what is on file, however we found
-    out: the store's own `HostKeyChanged`, or paramiko's
-    `BadHostKeyException` when the stored key was loaded into the client and
-    the handshake refused it. Both become this, so the protocol has one
-    shape to send and one path to `trust`."""
-
-    def __init__(self, old_fingerprint: str, new_fingerprint: str,
-                 key_type: str, old_first_seen, new_key):
-        self.old_fingerprint = old_fingerprint
-        self.new_fingerprint = new_fingerprint
-        self.key_type = key_type
-        self.old_first_seen = old_first_seen
-        self.new_key = new_key
-
-
 def stored_host_key(service, host: str, port: int) -> dict | None:
     """What the shared store holds for this device, as plain JSON-able
-    fields, or None. Tolerant of a store that keeps its keys somewhere this
-    function does not know about — the terminal page shows this as an
-    informational line, and not having it is not a failure."""
-    try:
-        store = hostkeys.HostKeyStore(service.configrx_db)
-        record = None
-        if hasattr(store, "record"):
-            record = store.record(host, port)
-        elif hasattr(service.configrx_db, "host_key"):
-            record = service.configrx_db.host_key(host, port)
-        if not record:
-            return None
-        return {"fingerprint": record["fingerprint"],
-                "key_type": record["key_type"],
-                "first_seen_ts": record["first_seen_ts"]}
-    except Exception:
+    fields, or None."""
+    row = hostkeys.HostKeyStore(service.configrx_db).stored(host, port)
+    if not row:
         return None
+    return {"fingerprint": row["fingerprint"], "key_type": row["key_type"],
+            "first_seen_ts": row["first_seen_ts"]}
 
 
 class SshSessionRegistry:
@@ -142,21 +132,26 @@ class SshSessionRegistry:
         with self._lock:
             return len(self._sessions)
 
-    def open(self, ws, device_id: int, username: str, client_ip: str) -> None:
+    def open(self, ws, device_id: int, username: str, client_ip: str,
+             token: str = "") -> None:
         """Run one session to completion on the calling thread (the request
         handler's own thread, which has nothing else to do until the socket
-        closes)."""
-        session = SshSession(self, ws, device_id, username, client_ip)
+        closes). `token` is the web session this terminal belongs to: the
+        session watches it, and ends when it does."""
+        session = SshSession(self, ws, device_id, username, client_ip, token)
         with self._lock:
             if self._stopping:
                 ws.close(CLOSE_NORMAL, "Server shutting down")
                 return
+            mine = sum(1 for live in self._sessions
+                       if live.app_user == session.app_user)
             if len(self._sessions) >= MAX_SESSIONS:
-                ws.send_text(json.dumps({
-                    "type": "error",
-                    "message": f"There are already {MAX_SESSIONS} SSH sessions "
-                               f"open. Close one and try again."}))
-                ws.close(CLOSE_TOO_MANY, "Too many SSH sessions")
+                self._refuse(ws, f"There are already {MAX_SESSIONS} SSH sessions "
+                                 f"open. Close one and try again.")
+                return
+            if mine >= MAX_SESSIONS_PER_USER:
+                self._refuse(ws, f"You already have {MAX_SESSIONS_PER_USER} SSH "
+                                 f"sessions open. Close one and try again.")
                 return
             self._sessions.add(session)
         try:
@@ -164,6 +159,13 @@ class SshSessionRegistry:
         finally:
             with self._lock:
                 self._sessions.discard(session)
+
+    @staticmethod
+    def _refuse(ws, message: str) -> None:
+        """Say why, then close with the code the page's table calls "too
+        many" — whichever of the two caps was reached."""
+        ws.send_text(json.dumps({"type": "error", "message": message}))
+        ws.close(CLOSE_TOO_MANY, "Too many SSH sessions")
 
     def shutdown(self) -> None:
         """End every session. Called before the databases close, because a
@@ -180,13 +182,17 @@ class SshSessionRegistry:
 
 class SshSession:
     def __init__(self, registry: SshSessionRegistry, ws, device_id: int,
-                 username: str, client_ip: str):
+                 username: str, client_ip: str, token: str = ""):
         self.registry = registry
         self.service = registry.service
         self.ws = ws
         self.device_id = device_id
         self.app_user = username or ""
         self.client_ip = client_ip or ""
+        # The web session this terminal hangs off. A shell outlives the
+        # request that opened it, so this is what the watchdog re-reads:
+        # sign out, expiry or a deleted account must take the shell with it.
+        self.token = token or ""
         self.host = ""
         self.port = 22
         self.cols = 80
@@ -196,6 +202,8 @@ class SshSession:
         self._stopped = threading.Event()
         self._stop_lock = threading.Lock()
         self._last_input = time.time()
+        self._last_touch = 0.0
+        self._auth_failures = 0
         self._opened_at = 0.0
         self._audited_open = False
         # The credential in play. `_password` is held only between the page
@@ -255,12 +263,22 @@ class SshSession:
             return
         self.host = device["ip"]
 
-        opening = self._next_control()
-        if not opening or opening.get("type") != "open":
-            self.ws.close(CLOSE_NORMAL, "No open message")
-            return
-        self.cols = _int_in(opening.get("cols"), 20, _MAX_COLS, 80)
-        self.rows = _int_in(opening.get("rows"), 5, _MAX_ROWS, 24)
+        # Wait for `open`, applying any `resize` that overtakes it. The page
+        # measures its terminal as it opens the socket, and a notice
+        # appearing between the two (a device with no stored credential says
+        # so) changes that measurement — so the size can legitimately arrive
+        # first. Anything else before `open` is discarded.
+        while True:
+            opening = self._next_control()
+            if not opening:
+                self.ws.close(CLOSE_NORMAL, "No open message")
+                return
+            kind = opening.get("type")
+            if kind in ("open", "resize"):
+                self.cols = _int_in(opening.get("cols"), 20, _MAX_COLS, self.cols)
+                self.rows = _int_in(opening.get("rows"), 5, _MAX_ROWS, self.rows)
+            if kind == "open":
+                break
 
         if not configrx.paramiko_available():
             self._error(configrx.PARAMIKO_MISSING)
@@ -285,6 +303,10 @@ class SshSession:
                 self._shell()
                 return
             if outcome == "auth-failed":
+                if self._auth_failures >= MAX_AUTH_ATTEMPTS:
+                    self._error("Too many failed logins")
+                    self.ws.close(CLOSE_NORMAL, "Too many failed logins")
+                    return
                 reason = "auth-failed"
                 continue
             if outcome == "changed":
@@ -335,8 +357,9 @@ class SshSession:
 
     def _connect(self) -> tuple[str, object]:
         """One connect attempt. Returns (outcome, detail) where outcome is
-        'connected', 'auth-failed', 'changed' (detail is a _KeyChange) or
-        'failed' (already reported to the page)."""
+        'connected', 'auth-failed', 'changed' (detail is a
+        `hostkeys.HostKeyChanged`) or 'failed' (already reported to the
+        page)."""
         import paramiko
 
         self._status("connecting", f"Connecting to {self.host}:{self.port}…")
@@ -346,7 +369,6 @@ class SshSession:
             store.prepare(client, self.host, self.port)
         except Exception:
             pass
-        known_before = self._known_host_key(client)
         policy = store.policy(self.host, self.port)
         client.set_missing_host_key_policy(policy)
 
@@ -363,26 +385,18 @@ class SshSession:
                 password=password, timeout=CONNECT_TIMEOUT_S,
                 banner_timeout=CONNECT_TIMEOUT_S, auth_timeout=CONNECT_TIMEOUT_S,
                 look_for_keys=False, allow_agent=False)
-        except hostkeys.HostKeyChanged as exc:
+        except (hostkeys.HostKeyChanged, paramiko.BadHostKeyException) as exc:
+            # Either the policy refused a key that differs from the stored
+            # one, or — when `prepare` had loaded that key into the client —
+            # paramiko refused the handshake itself before the policy was
+            # ever consulted. The store maps both to one exception, so there
+            # is one shape to send and one path to `trust`.
             client.close()
-            return "changed", _KeyChange(
-                getattr(exc, "old_fingerprint", ""),
-                getattr(exc, "new_fingerprint", ""),
-                getattr(exc, "key_type", ""),
-                getattr(exc, "old_first_seen", None),
-                getattr(exc, "new_key", None))
-        except paramiko.BadHostKeyException as exc:
-            # The stored key was loaded into the client, so paramiko refused
-            # the handshake itself before the policy was ever consulted.
-            client.close()
-            record = stored_host_key(self.service, self.host, self.port) or {}
-            return "changed", _KeyChange(
-                record.get("fingerprint") or fingerprint(exc.expected_key),
-                fingerprint(exc.key), exc.key.get_name(),
-                record.get("first_seen_ts"), exc.key)
+            return "changed", store.as_changed(exc, self.host, self.port)
         except paramiko.AuthenticationException:
             client.close()
             self._password = None
+            self._audit_auth_failure()
             if self._credential_from_store:
                 self._error("The SSH credential stored in ConfigRX for this "
                             "device was refused.")
@@ -400,12 +414,12 @@ class SshSession:
 
         self._password = None
         self.client = client
-        if not known_before:
-            key = self._remote_key(client)
-            if key is not None:
-                self._send({"type": "hostkey", "event": "new",
-                            "key_type": key.get_name(),
-                            "fingerprint": fingerprint(key)})
+        # The policy is the only thing that knows whether this was a first
+        # sighting: it is what stored the key, and it kept the fingerprint.
+        if policy.stored_new:
+            self._send({"type": "hostkey", "event": "new",
+                        "key_type": policy.stored_type,
+                        "fingerprint": policy.stored_new})
         try:
             self.channel = client.invoke_shell(
                 term="xterm-256color", width=self.cols, height=self.rows)
@@ -419,24 +433,7 @@ class SshSession:
         self._audit_open()
         return "connected", None
 
-    def _known_host_key(self, client):
-        """The key `prepare` loaded into this client, if any — the "have we
-        seen this device before" test, asked of the client rather than of
-        the store so it holds for whichever store is installed."""
-        try:
-            name = self.host if self.port == 22 else f"[{self.host}]:{self.port}"
-            return client.get_host_keys().lookup(name)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _remote_key(client):
-        try:
-            return client.get_transport().get_remote_server_key()
-        except Exception:
-            return None
-
-    def _await_trust(self, change: _KeyChange) -> bool:
+    def _await_trust(self, change: hostkeys.HostKeyChanged) -> bool:
         """Tell the page the key changed and wait for its answer. True when
         the operator trusted the new key and a reconnect should follow."""
         self._send({"type": "hostkey", "event": "changed",
@@ -485,6 +482,7 @@ class SshSession:
             opcode, payload = message
             self._last_input = time.time()
             if opcode == _OP_BINARY:                 # keystrokes
+                self._touch_web_session()
                 try:
                     self.channel.sendall(payload)
                 except Exception:
@@ -504,6 +502,21 @@ class SshSession:
                 except Exception:
                     pass
         self.stop()
+
+    def _touch_web_session(self) -> None:
+        """Someone is typing, so the web session is not idle either — the
+        same "a deliberate action is presence" rule server.py applies to a
+        POST. Rate-limited: a shell is a lot of keystrokes and each touch is
+        a lock and a clock read, and the session's idle timeout is measured
+        in hours."""
+        now = time.time()
+        if not self.token or now - self._last_touch < TOUCH_INTERVAL_S:
+            return
+        self._last_touch = now
+        try:
+            self.service.sessions.touch(self.token)
+        except Exception:
+            pass
 
     def _pump(self) -> None:
         """Channel → socket. Ends when the device hangs up, which is also
@@ -525,7 +538,26 @@ class SshSession:
     # ---------------------------------------------------------------- idle
 
     def _idle_watch(self) -> None:
+        """The session's own heartbeat, once a second: is the person who
+        opened this still signed in, do they still hold `ssh` write, and has
+        anyone typed lately. Authorisation is not settled once at the
+        upgrade — a shell can outlive the sign-in that opened it by hours,
+        and signing out, expiring, being deleted or having the permission
+        taken away must all end it."""
+        ticks = 0
         while not self._stopped.wait(1.0):
+            ticks += 1
+            if self.token and self.service.sessions.get(self.token) is None:
+                self._end_unauthorized(
+                    "You were signed out",
+                    f"SSH session closed: {self.app_user} is no longer signed in")
+                return
+            if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_ssh_write():
+                self._end_unauthorized(
+                    "SSH access was revoked",
+                    f"SSH session closed: {self.app_user} no longer holds "
+                    f"SSH write access")
+                return
             # Read the module global each time: the tests shorten it, and an
             # operator-facing constant is worth being able to change.
             if time.time() - self._last_input < IDLE_TIMEOUT_S:
@@ -535,6 +567,22 @@ class SshSession:
             self.ws.close(CLOSE_IDLE, "Idle timeout")
             self.stop()
             return
+
+    def _has_ssh_write(self) -> bool:
+        try:
+            granted = self.service.app_db.permissions_for(self.app_user).get("ssh")
+        except Exception:
+            return True           # a database that cannot answer is not a verdict
+        return permissions.allows(granted, permissions.WRITE)
+
+    def _end_unauthorized(self, message: str, audit: str) -> None:
+        """The shell is no longer authorised: say so on the socket, close
+        4401 — the code the page's table already means "not authorised" —
+        and leave a line saying why."""
+        self._status("closed", message)
+        self.ws.close(CLOSE_UNAUTHORIZED, message)
+        self._audit(audit, f"{message} ({self.app_user} from {self.client_ip}).")
+        self.stop()
 
     # --------------------------------------------------------------- close
 
@@ -560,6 +608,30 @@ class SshSession:
             pass
 
     # -------------------------------------------------------------- audit
+
+    def _audit(self, headline: str, detail: str) -> None:
+        """One line in both places the terminal is audited: the device's own
+        event list and the NODES log. Never a password, never a keystroke."""
+        try:
+            self.service.nodes_db.record_device_event(self.device_id, "ssh",
+                                                      headline)
+            self.service.log.add(NODES, headline, target=self.host, detail=detail)
+        except Exception:
+            # Shutdown races the database closing; an audit line lost on the
+            # way out is not worth a traceback in the console.
+            pass
+
+    def _audit_auth_failure(self) -> None:
+        """A refused login, counted and recorded. The SSH username is named
+        (it is what was tried), the password never is — and the count is
+        what turns a stream of these into something an operator can see."""
+        self._auth_failures += 1
+        self._audit(
+            f"SSH login as {self._username or '(no user)'} refused "
+            f"(attempt {self._auth_failures} of {MAX_AUTH_ATTEMPTS}; requested "
+            f"by {self.app_user} from {self.client_ip})",
+            f"Attempt {self._auth_failures} of {MAX_AUTH_ATTEMPTS} on "
+            f"port {self.port}.")
 
     def _audit_open(self) -> None:
         if self._audited_open:

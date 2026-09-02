@@ -5,7 +5,7 @@ daemon thread per connection), and that shape makes a WebSocket cheap: a
 handler can answer the upgrade itself and then keep the socket for the life
 of the conversation, because there is no keep-alive pipeline behind it to
 unwind and no event loop whose thread it would be blocking. So rather than
-add a dependency for one page, the ~200 lines of framing that page needs
+add a dependency for one page, the ~250 lines of framing that page needs
 live here.
 
 What this implements, and what it deliberately does not:
@@ -14,12 +14,26 @@ What this implements, and what it deliberately does not:
   `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Key`, and answering with
   the `Sec-WebSocket-Accept` digest. The status line is written by hand as
   HTTP/1.1: the server's `protocol_version` is HTTP/1.0 and a browser will
-  not accept a 101 announced as HTTP/1.0.
+  not accept a 101 announced as HTTP/1.0. Whether the *caller* is allowed
+  to be here at all — the session cookie, the permission, and the `Origin`
+  of the page asking — is settled in server.py before this is reached.
 * Text, binary and continuation frames, with masked payloads (a client
   frame that is not masked is a protocol error, per the RFC), ping answered
   with pong, and the close handshake echoed.
-* One lock around sending, because a session has two writers: the thread
-  pumping the SSH channel and the thread reading the socket.
+* One lock around *all* socket I/O, not merely around sending. A session
+  has two threads on one socket — the one reading it and the one pumping
+  the SSH channel into it — and under TLS that would be a concurrent
+  `SSL_read`/`SSL_write` on a single `SSLSocket`, which OpenSSL does not
+  support: a post-handshake message arriving mid-`show tech-support` can
+  kill the connection with a record error. So after the 101 this stops
+  using the handler's `rfile`/`wfile` buffers and talks to the socket
+  itself. The reader waits for readability *outside* the lock and then
+  takes it only for a non-blocking read, so the thread that is idle 99% of
+  the time cannot starve the one with output to send; the sender holds it
+  under a real timeout (`SEND_TIMEOUT_S`). That timeout is the other half
+  of the bargain: no thread can be parked in socket I/O holding the lock,
+  so `close()`, the idle watchdog and the registry's shutdown are all
+  bounded.
 * A frame/message ceiling (`MAX_MESSAGE_BYTES`). A terminal's keystrokes
   are tiny; anything near a megabyte is a bug or an attack, and without a
   cap the length field alone is an out-of-memory kill.
@@ -35,6 +49,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import select
+import socket
+import ssl
 import struct
 import threading
 
@@ -55,6 +72,24 @@ _CONTROL_OPS = (OP_CLOSE, OP_PING, OP_PONG)
 # cannot exhaust memory.
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 
+# How long the reader waits for the socket to become readable before
+# looking around. The wait itself is outside the I/O lock and the read that
+# follows it is non-blocking, so a reader parked on a terminal nobody is
+# typing at never keeps the pump thread off the socket. A quarter of a
+# second is short enough that a `close()` from another thread is noticed at
+# once and long enough that an idle session is not spinning. A read that
+# ends mid-TLS-record loses nothing — OpenSSL keeps its own state between
+# calls, which is exactly why those calls must not overlap.
+READ_SLICE_S = 0.25
+# How long one write may block. A browser that stops reading (a laptop shut
+# mid-`show tech-support`) must not pin the socket forever: past this the
+# send fails, the socket is marked closed, and everything waiting on it —
+# `stop()`, the idle watchdog, `SshSessionRegistry.shutdown()` — is released.
+SEND_TIMEOUT_S = 15
+# One `recv` from the socket. Independent of the message cap: this is the
+# stream, not a frame.
+_RECV_BYTES = 65536
+
 # Close codes this module sends on its own behalf. The application's own
 # codes (4401/4408/4429) are passed to close() by the caller.
 CLOSE_NORMAL = 1000
@@ -73,6 +108,11 @@ class WebSocketTooBig(WebSocketError):
     because it has its own close code (1009, not 1002) — and because it is
     raised from the length field alone, before a byte of that payload has
     been read into memory, which is the entire point of the cap."""
+
+
+class _Eof(Exception):
+    """The stream ended: the peer went away, or this end closed. Internal —
+    `recv()` turns it into the None that ends the conversation."""
 
 
 def accept(handler) -> "WebSocket":
@@ -98,6 +138,9 @@ def accept(handler) -> "WebSocket":
             raise ValueError
     except Exception as exc:
         raise WebSocketError("Malformed Sec-WebSocket-Key") from exc
+    sock = getattr(handler, "connection", None)
+    if sock is None:
+        raise WebSocketError("This connection cannot be hijacked")
 
     digest = base64.b64encode(
         hashlib.sha1((key + _GUID).encode("ascii")).digest()).decode("ascii")
@@ -113,26 +156,64 @@ def accept(handler) -> "WebSocket":
         handler.wfile.flush()
     except (OSError, ValueError):
         pass
-    return WebSocket(handler.rfile, handler.wfile,
-                     sock=getattr(handler, "connection", None))
+    return WebSocket(sock, initial=_drain(handler.rfile, sock))
+
+
+def _drain(rfile, sock) -> bytes:
+    """Whatever a pipelined client sent behind its handshake and `rfile`
+    has already buffered. From here on the socket is read directly, so
+    anything still sitting in that buffer would simply be lost; this is the
+    one moment it can be recovered. Non-blocking, so "nothing there" — the
+    ordinary case — costs one failed read."""
+    if rfile is None:
+        return b""
+    chunks = []
+    try:
+        sock.setblocking(False)
+    except (OSError, AttributeError):
+        return b""
+    try:
+        while True:
+            try:
+                chunk = rfile.read1(_RECV_BYTES)
+            except (OSError, ValueError):
+                break                     # BlockingIOError: nothing buffered
+            if not chunk:                 # b"" at EOF, None when it would block
+                break
+            chunks.append(chunk)
+    finally:
+        try:
+            sock.setblocking(True)
+        except OSError:
+            pass
+    return b"".join(chunks)
 
 
 class WebSocket:
     """A hijacked connection, after the 101.
 
     `recv()` is single-reader: one thread owns it. `send_*` and `close()`
-    are safe from any thread.
+    are safe from any thread. Everything touching the socket goes through
+    `_io_lock`, so the two threads never overlap on it.
     """
 
-    def __init__(self, rfile, wfile, sock=None):
-        self.rfile = rfile
-        self.wfile = wfile
+    def __init__(self, sock, initial: bytes = b""):
         self.sock = sock
-        self._send_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        # Bytes read from the socket but not yet consumed by a frame.
+        self._buffer = bytearray(initial)
+        self._used = 0
         self.closed = False
         # Filled in when the peer closes: the code and reason it gave.
         self.close_code: int | None = None
         self.close_reason: str = ""
+        self._set_timeout(READ_SLICE_S)
+
+    def _set_timeout(self, seconds: float) -> None:
+        try:
+            self.sock.settimeout(seconds)
+        except (OSError, AttributeError):
+            pass
 
     # ------------------------------------------------------------- reading
 
@@ -141,27 +222,24 @@ class WebSocket:
         OP_BINARY, with fragments already reassembled — or None once the
         conversation is over (the peer closed, the socket died, or this end
         called close()). Pings are answered here and never surface."""
-        buffer = b""
+        fragments: list[bytes] = []
+        pending = 0                       # running length, so no O(n²) concat
         message_op = None
         while True:
             try:
-                frame = self._read_frame()
+                fin, opcode, payload = self._read_frame()
             except WebSocketTooBig as exc:
                 self.close(CLOSE_TOO_BIG, str(exc)[:110])
                 return None
             except WebSocketError as exc:
                 self.close(CLOSE_PROTOCOL_ERROR, str(exc)[:110])
                 return None
-            except (OSError, ValueError):
-                # Socket closed underneath us — including by our own close()
-                # from another thread, which is how the idle timer and
+            except _Eof:
+                # The peer vanished, or our own close() from another thread
+                # shut the socket down — which is how the idle timer and
                 # shutdown unblock this loop.
                 self.closed = True
                 return None
-            if frame is None:                    # clean EOF, no close frame
-                self.closed = True
-                return None
-            fin, opcode, payload = frame
 
             if opcode in _CONTROL_OPS:
                 if opcode == OP_CLOSE:
@@ -184,17 +262,18 @@ class WebSocket:
             else:
                 message_op = opcode
 
-            buffer += payload
-            if len(buffer) > MAX_MESSAGE_BYTES:
+            # Checked before the append, so the cap is a ceiling on what is
+            # ever held, not on what has already been held.
+            if pending + len(payload) > MAX_MESSAGE_BYTES:
                 self.close(CLOSE_TOO_BIG, "Message too large")
                 return None
+            fragments.append(payload)
+            pending += len(payload)
             if fin:
-                return message_op, buffer
+                return message_op, b"".join(fragments)
 
     def _read_frame(self):
         head = self._read_exact(2)
-        if head is None:
-            return None
         first, second = head[0], head[1]
         fin = bool(first & 0x80)
         if first & 0x70:
@@ -207,15 +286,9 @@ class WebSocket:
             # that is not masked" — RFC 6455 §5.1.
             raise WebSocketError("Client frame was not masked")
         if length == 126:
-            extra = self._read_exact(2)
-            if extra is None:
-                return None
-            length = struct.unpack("!H", extra)[0]
+            length = struct.unpack("!H", self._read_exact(2))[0]
         elif length == 127:
-            extra = self._read_exact(8)
-            if extra is None:
-                return None
-            length = struct.unpack("!Q", extra)[0]
+            length = struct.unpack("!Q", self._read_exact(8))[0]
         if opcode in _CONTROL_OPS:
             if not fin:
                 raise WebSocketError("Fragmented control frame")
@@ -224,25 +297,63 @@ class WebSocket:
         if length > MAX_MESSAGE_BYTES:
             raise WebSocketTooBig("Frame exceeds the size limit")
         mask = self._read_exact(4)
-        if mask is None:
-            return None
         payload = self._read_exact(length) if length else b""
-        if payload is None:
-            return None
         return fin, opcode, _apply_mask(payload, mask)
 
-    def _read_exact(self, count: int) -> bytes | None:
-        """Exactly `count` bytes, or None at end of stream. `rfile` is a
-        BufferedReader, whose read() can still come up short at EOF."""
-        chunks = []
-        remaining = count
-        while remaining > 0:
-            chunk = self.rfile.read(remaining)
-            if not chunk:
-                return None
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+    def _read_exact(self, count: int) -> bytes:
+        """Exactly `count` bytes from the buffer, refilling it from the
+        socket as needed. Raises `_Eof` when the stream ends first."""
+        while len(self._buffer) - self._used < count:
+            self._buffer += self._fill()
+        start = self._used
+        self._used += count
+        out = bytes(self._buffer[start:self._used])
+        if self._used >= _RECV_BYTES:            # keep the buffer from growing
+            del self._buffer[:self._used]
+            self._used = 0
+        return out
+
+    def _fill(self) -> bytes:
+        """One read slice: whatever the socket has to give.
+
+        The waiting happens *outside* the lock and the read itself is
+        non-blocking, so the reader — which spends nearly all of its life
+        waiting for the next keystroke — holds the socket for microseconds
+        at a time and the pump thread is never kept out. (A blocking read
+        under the lock would starve it: releasing a lock and immediately
+        re-taking it hands it back to the same thread.)
+        """
+        while not self.closed:
+            self._wait_readable()
+            with self._io_lock:
+                if self.closed:
+                    break
+                try:
+                    self.sock.setblocking(False)
+                    data = self.sock.recv(_RECV_BYTES)
+                except (BlockingIOError, ssl.SSLWantReadError):
+                    data = None           # nothing yet, or half a TLS record
+                except (OSError, ValueError) as exc:
+                    raise _Eof from exc
+                finally:
+                    self._set_timeout(READ_SLICE_S)
+            if data is None:
+                continue
+            if not data:
+                raise _Eof
+            return data
+        raise _Eof
+
+    def _wait_readable(self) -> None:
+        """Wait, without the lock, for the socket to have something — or for
+        the slice to expire, which is what makes `closed` noticed promptly.
+        Its answer is not trusted: the read that follows happens either way,
+        because under TLS a whole record can already be decoded and waiting
+        inside the SSL object with nothing left for `select` to see."""
+        try:
+            select.select([self.sock], [], [], READ_SLICE_S)
+        except (OSError, ValueError):
+            pass                          # closed underneath us; the read says so
 
     # ------------------------------------------------------------- writing
 
@@ -259,40 +370,44 @@ class WebSocket:
         """Send a close frame (best effort) and stop the socket.
 
         Idempotent and safe from any thread: whoever gets there first sends
-        the frame, and shutting the socket down is what unblocks a `recv()`
-        parked in another thread.
+        the frame, and the shutdown — which happens on *every* call, even
+        one that finds the socket already marked closed by a failed write —
+        is what unblocks a `recv()` parked in another thread.
         """
-        with self._send_lock:
-            if self.closed:
-                return
-            self.closed = True
-            payload = struct.pack("!H", int(code)) + reason.encode("utf-8")[:123]
-            try:
-                self.wfile.write(_frame(OP_CLOSE, payload))
-                self.wfile.flush()
-            except (OSError, ValueError):
-                pass
+        payload = struct.pack("!H", int(code)) + reason.encode("utf-8")[:123]
+        with self._io_lock:
+            if not self.closed:
+                self.closed = True
+                self._write(_frame(OP_CLOSE, payload))
         # No waiting for the peer's answering close: the handler thread is
         # about to let the connection go, and a half-closed socket is what
         # unblocks a recv() parked in another thread.
         try:
-            if self.sock is not None:
-                import socket as _socket
-                self.sock.shutdown(_socket.SHUT_RDWR)
+            self.sock.shutdown(socket.SHUT_RDWR)
         except (OSError, AttributeError):
             pass
 
     def _send_frame(self, opcode: int, payload: bytes) -> bool:
-        with self._send_lock:
+        frame = _frame(opcode, payload)
+        with self._io_lock:
             if self.closed:
                 return False
-            try:
-                self.wfile.write(_frame(opcode, payload))
-                self.wfile.flush()
-                return True
-            except (OSError, ValueError):
+            if not self._write(frame):
                 self.closed = True
                 return False
+            return True
+
+    def _write(self, frame: bytes) -> bool:
+        """One frame onto the socket, under `_io_lock` and a real timeout.
+        False when the peer stopped reading or the socket is gone."""
+        self._set_timeout(SEND_TIMEOUT_S)
+        try:
+            self.sock.sendall(frame)
+            return True
+        except (socket.timeout, TimeoutError, OSError, ValueError):
+            return False
+        finally:
+            self._set_timeout(READ_SLICE_S)
 
 
 # ------------------------------------------------------------------ framing
