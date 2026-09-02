@@ -46,6 +46,15 @@ the network described above, for four structural reasons:
    that should replace it (`compact_rollup`, `nodesdb.py:1480`) is never called.
    At fleet scale no chart can draw a line, and the prune stalls the process.
 
+The live campaign put numbers on it: at 250 devices the poller and the alert
+engine behaved as designed (143 dark devices → 143 alerts, correctly rolled up
+per device); at 1,000 devices the 32-worker pool was saturated at idle and a
+500-device site outage produced 16 `device_down` alerts in four minutes; at
+2,000 devices the same outage produced **none**, because each device was being
+polled once every four minutes against a 60 s profile. Meanwhile every tier
+opened one `mib_missing` alert per device on first poll, emailed as "is not
+responding".
+
 Every one of those is fixable, and most of the code needed already exists in the
 repository. §6 ranks the work. The short version: fix the retention and write
 path (two days), add a platform-neutral secret store, poll vendor health OIDs
@@ -177,22 +186,22 @@ received by the local SMTP sink during it.
 
 | Measure | 250 devices | 1,000 devices | 2,000 devices |
 |---|---|---|---|
-| Seeding via single POSTs | 250 in 0.75 s | 1,000 in 23.0 s | *pending* |
-| Devices up after the first poll cycle | 249/250 within 12 s | 955/1,000 after 73 s (never 100%) | *pending* |
-| Baseline app CPU / RSS | 27% / 88 MB | 67% / 121 MB | *pending* |
-| Site outage: devices dark → `device_down` alerts inside the window → emails in the step | 143 → 143 → 238 | 500 → **16** → 1,783 | *pending* |
-| Open alerts before the outage / after full recovery | 258 / 405 | 609 / 1,601 (list capped at 2,000 from step 2 on) | *pending* |
-| Open alerts at the end of the run (nothing left failing) | 636 | 1,448 (capped view) | *pending* |
-| Emails over the whole run | 1,338 | 3,349 | *pending* |
-| Poll-overrun events recorded over the run | 9 | 6,420 | *pending* |
-| Longest single device poll observed (interval 60 s) | 160 s | 129 s | *pending* |
-| Average / peak busy poll workers (of 32) | 11 / 33 | 31 / 47 | *pending* |
-| App CPU during the trap + syslog burst | 63% | 84% | *pending* |
-| `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | 441,991 / 0 | *pending* |
-| Nodes table fill time after refresh | 181 ms | 1,854 ms | *pending* |
-| `/api/nodes/devices` payload per refresh | 332 KB | 1.32 MB in 653 ms | *pending* |
-| Browser long tasks during the walk (longest) | 52 (230 ms) | 122 (429 ms) | *pending* |
-| Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | 0 / 0 (same two 403s) | *pending* |
+| Seeding via single POSTs | 250 in 0.75 s | 1,000 in 23.0 s | 2,000 in 73.0 s |
+| Devices up after the first poll cycle | 249/250 within 12 s | 955/1,000 after 73 s (never 100%) | 1,911/2,000 after 219 s (never 100%) |
+| Baseline app CPU / RSS | 27% / 88 MB | 67% / 121 MB | 70% / 167 MB (268 MB by the end) |
+| Site outage: devices dark → `device_down` alerts inside the window → emails in the step | 143 → 143 → 238 | 500 → **16** → 1,783 | 500 → **0** → 1,639 |
+| Open alerts before the outage / after full recovery | 258 / 405 | 609 / 1,601 (list capped at 2,000 from step 2 on) | 882 / 2,000 (capped) |
+| Open alerts at the end of the run (nothing left failing) | 636 | 1,448 (capped view) | 1,935 (capped view) |
+| Emails over the whole run | 1,338 | 3,349 | 4,441 |
+| Poll-overrun events recorded over the run | 9 | 6,420 | 26,361 |
+| Longest single device poll observed (interval 60 s) | 160 s | 129 s | 159 s |
+| Average / peak busy poll workers (of 32) | 11 / 33 | 31 / 47 | 28 / 48 |
+| App CPU during the trap + syslog burst | 63% | 84% | 86% |
+| `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | 441,991 / 0 | 585,259 / 0 |
+| Nodes table fill time after refresh | 181 ms | 1,854 ms | 1,488 ms |
+| `/api/nodes/devices` payload per refresh | 332 KB | 1.32 MB in 653 ms | 2.64 MB in 201 ms |
+| Browser long tasks during the walk (longest) | 52 (230 ms) | 122 (429 ms) | 251 (1,460 ms) |
+| Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | 0 / 0 (same two 403s) | 0 / 0 (same two 403s) |
 
 ### 3.2 What each step showed (250-device tier; the larger tiers are read against it in §3.3)
 
@@ -289,7 +298,63 @@ What changed between 250 and 1,000 devices:
   tasks (longest 429 ms) during the walk (§4.5 F7, F20).
 - Still no rows in the hourly rollup table after 442k raw samples (§4.1 B2).
 
-**2,000 devices.** *(pending)*
+**2,000 devices.** The first full poll cycle took 219 s to reach 95% of the
+fleet and never reached 100%; the baseline sat at 70% CPU with 1,822 overruns
+in two minutes.
+
+| Step | Alerts opened | Alerts cleared | Emails | Polls ok / timeout / auth | Overruns | CPU% | RSS MB |
+|---|---|---|---|---|---|---|---|
+| 1 baseline (121 s) | — (list capped) | — | 397 | 1,370 / 0 / 3 | 1,822 | 70 | 167 |
+| 2 core + 499 Site-A switches dark (240 s) | **none visible — no `down` event was recorded for any device** | — | **1,639** | 1,374 / 499 / 0 | **5,423** | 69 | 189 |
+| 3 outage recovery (151 s) | — | — | 546 | 1,505 / 0 / 0 | 2,174 | 70 | 200 |
+| 4 flap storm (122 s) | — | interface_down 7 | 356 | 1,110 / 1 / 3 | 1,831 | 71 | 208 |
+| 5 reboot 20 (121 s) | — (21 `rebooted` events in the DB) | — | 325 | 1,323 / 0 / 3 | 3,490 | 63 | 228 |
+| 6 wrong credentials on 5 (91 s) | — (6 `device_auth_fail` rows in the DB) | — | 356 | 903 / 0 / 0 | 1,279 | 77 | 229 |
+| 7 trap + syslog storm (77 s) | — (5 trap, 20 syslog rows in the DB) | interface_down 25 | 28 | 494 / 1 / 8 | 338 | **86** | 264 |
+| 8 NetFlow burst (77 s) | cpu_high 2 | interface_down 20 | 122 | 718 / 0 / 0 | 1,653 | 71 | 265 |
+| 9 flaps stop, credentials restored (151 s) | interface_* 33 | interface_down 26 | 116 | 1,620 / 1 / 3 | 2,991 | 63 | 268 |
+
+What the 2,000-device run shows:
+
+- **The outage was never detected.** 499 switches stopped answering for four
+  minutes and the `device_events` table holds **zero `down` rows** for the whole
+  run: 1,871 polls completed in 240 s across 2,000 devices, i.e. each device was
+  polled about once every four minutes against a 60 s profile, so no device
+  reached three consecutive failures. The only signals were 5,423 poll overruns
+  and 1,639 emails, almost all of them `poll_overrun` and `mib_missing` noise.
+  At this size, on this hardware, with 32 workers, **the poller cannot see a
+  site outage**. This is the capacity ceiling §4.5 predicted (~1,350 devices at
+  48 ports and 120 s; roughly half that at 60 s) measured end to end.
+- **The alert list was capped for the entire campaign from step 2**, so the
+  campaign's own per-step "alerts opened" column went blind; the rows above
+  marked "in the DB" were read directly from `alerts.db`. An operator's browser,
+  defaulting to 300 rows, would have seen 15% of it (§4.3 F20, §4.6 F10).
+- **Every device raised `poll_overrun`** (2,000 alerts, 26,361 events) — the
+  one alert that fires reliably at this scale is the one saying the monitor
+  itself is late.
+- **Onboarding:** 1,898 `mib_missing` alerts, each emailed as "is not
+  responding"; 4,441 emails over 25 minutes with nothing genuinely wrong except
+  the incidents the campaign injected.
+- **UI:** 2,000 rows filled in 1.5 s from a 2.64 MB payload (served in 201 ms);
+  251 long tasks during the walk, the longest 1.46 s; still no uncaught page
+  errors. RSS grew from 167 MB to 268 MB over the run.
+- 585,259 raw samples, hourly rollup still empty (§4.1 B2).
+
+### 3.4 What the three tiers say together
+
+| | 250 | 1,000 | 2,000 |
+|---|---|---|---|
+| Polls per device per minute achieved (60 s profile) | ~1.0 | ~0.5 | ~0.25 |
+| Dark devices detected as down within 4 min | 143 of 143 | 16 of 499 | 0 of 499 |
+| Baseline CPU | 27% | 67% | 70% |
+| Emails during the outage step | 238 | 1,783 | 1,639 |
+
+The poller works correctly and the alert semantics hold at 250 devices; by
+1,000 the pool is saturated and detection is late; by 2,000 detection fails.
+The five ★ fixes in §4.5 (batched sample writes, a fixed retention cap with the
+rollup running, cached settings in the scheduler, one keyed alert query, and
+GETBULK for the interface columns) plus concurrent pings with back-off for
+failing devices (§4.5 F15) are what move that ceiling; none of them is large.
 
 ---
 
@@ -672,7 +737,7 @@ ulimit -n 8192
 export PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 python3 demo/selftest.py                       # every persona through the app's own decoders
 python3 demo/scenario.py --count 250 --out demo/out
-python3 demo/scenario.py --count 1000 --out demo/out --skip-ui
+python3 demo/scenario.py --count 1000 --out demo/out
 python3 demo/scenario.py --count 2000 --out demo/out
 python3 demo/fake_ssh.py & python3 demo/configrx_probe.py   # ConfigRX capture chain
 ```
