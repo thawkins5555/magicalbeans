@@ -2951,14 +2951,60 @@ def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
 
 # ------------------------------------------------------------------ alerts
 
-def _alert_json(row) -> dict:
+def _alert_device_id(row) -> int | None:
+    """The Nodes device an alert row is about, or None when it is about
+    nothing in Nodes.
+
+    The same rule the engine's mute check uses (alertengine._occurrence_device
+    and _muted_alert): a device alert is its own device, an interface alert is
+    the switch the port is on — which is why muting a switch silences its
+    ports with it — and everything structurally outside Nodes (traps from
+    unpolled hosts, syslog from an unknown source, IPAM conflicts, DHCP
+    scopes, wireless APs) resolves to nothing and therefore cannot be muted.
+    Sent on every alert row so the page can offer Mute without having to
+    reimplement the engine's rule in JavaScript.
+    """
+    try:
+        kind = row["entity_kind"]
+        if kind == "device":
+            return int(row["entity_id"])
+        if kind == "interface":
+            # "<device_id>:<if_index>"
+            return int(str(row["entity_id"]).split(":")[0])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _alert_device_names(service, rows) -> dict[int, str]:
+    """id -> display name for the devices a batch of alert rows resolves to.
+
+    One query for the whole page rather than one per row: an alert list is up
+    to 2000 rows and most of them are about the same handful of devices. A
+    device that resolved but is no longer in Nodes (removed while its alerts
+    stayed in history) is simply absent, which is how _alert_json decides to
+    report no device at all rather than offering a Mute the API would reject.
+    """
+    wanted = {device_id for device_id in (_alert_device_id(r) for r in rows)
+              if device_id is not None}
+    return {row["id"]: (row["name"] or row["ip"])
+            for row in service.nodes_db.devices_by_ids(sorted(wanted))}
+
+
+def _alert_json(row, device_names: dict | None = None) -> dict:
     from .. import alertmail
 
     severity = row["severity"]
+    device_id = _alert_device_id(row)
+    names = device_names or {}
+    if device_id is not None and device_id not in names:
+        device_id = None
     return {
         "id": row["id"], "rule_id": row["rule_id"], "dedup_key": row["dedup_key"],
         "entity_kind": row["entity_kind"], "entity_id": row["entity_id"],
         "entity_label": row["entity_label"], "severity": severity,
+        "device_id": device_id,
+        "device_name": names.get(device_id, "") if device_id is not None else "",
         "severity_name": alertmail.SEVERITY_NAMES[severity] if 0 <= severity <= 7
                         else str(severity),
         "message": row["message"], "detail": row["detail"], "state": row["state"],
@@ -3030,9 +3076,10 @@ def get_alerts(service, params, body) -> dict:
         rule_id=int(rule_id) if rule_id else None, device_text=device_text,
         text=text, t0=t0, t1=t1, limit=min(limit, 2000))
     rule_names = {r["id"]: r["name"] for r in service.alerts_db.rules()}
+    device_names = _alert_device_names(service, rows)
     alerts = []
     for row in rows:
-        alert = _alert_json(row)
+        alert = _alert_json(row, device_names)
         alert["rule_name"] = rule_names.get(row["rule_id"], "")
         alerts.append(alert)
     return {"alerts": alerts}
@@ -3042,7 +3089,7 @@ def get_alert(service, params, body, alert_id) -> dict:
     row = service.alerts_db.alert(alert_id)
     if not row:
         raise ValueError("No such alert")
-    alert = _alert_json(row)
+    alert = _alert_json(row, _alert_device_names(service, [row]))
     rule = service.alerts_db.rule(row["rule_id"])
     alert["rule_name"] = rule["name"] if rule else ""
     notifications = service.alerts_db.notifications_for(alert_id)
