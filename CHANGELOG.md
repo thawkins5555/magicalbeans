@@ -6,6 +6,20 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.35.0 — A question mark beside the setting
+
+- **Settings can now explain themselves.** A small **?** beside a control
+  opens a short explanation of what it changes and what stops happening when
+  it is off — on top of the form, not instead of it, so the dialog being
+  edited stays exactly as it was and Escape closes the explanation first. The
+  first two are the **Ping** and **SNMP** checkboxes on the polling-profile
+  editor (and the matching selectors on a device's edit form): what each
+  probe produces, which charts and alert rules depend on it, and how the two
+  together decide what "down" means. The mechanism is shared, so a new
+  setting gets its **?** by registering a title and a paragraph, and the
+  intention is that every setting whose effect is not obvious from its label
+  gets one.
+
 ### 4.34.1 — Starts again on an existing database
 
 - **4.34.0 could not open a nodes database from any earlier release, so the

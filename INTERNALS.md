@@ -3710,3 +3710,23 @@ override attempts no SNMP at all. And `NodePoller.promote` leaves a
 promoted device's manual name as the IP on purpose and seeds `sys_name`
 into the identity instead, so the display name follows the device and a
 later rename is never shadowed by a copied sysName.
+
+### Help links (`app.js registerHelp`, `helpLink`, `showHelp`)
+
+A "?" beside a setting is `App.helpLink(key)`: a `<button type="button"
+class="help-link" data-help="key">`. One delegated click handler in
+`start()` opens `#help`, a second overlay created on first use and kept
+above `#modal` (z-index 30 over 20). It is deliberately not a second use of
+`App.modal`: there is one modal box, and replacing its content would destroy
+the form the operator is reading the help for. Escape peels one layer — the
+help if open, else the dialog — and a backdrop click or the Close button
+closes the help alone.
+
+Texts live with the feature, not in `app.js`: a module calls
+`App.registerHelp({'nodes.profile.ping': {title, html}})` at load, keyed
+module-first so two modules cannot collide and a grep finds every use. The
+markup rule is that the link goes **outside** the `<label>` it belongs to,
+because a click inside a label activates the label's control, and a "?" that
+also ticked the checkbox would be worse than no help. The first entries are
+the profile editor's Ping and SNMP checkboxes and the device form's matching
+selectors, sharing the same two keys.

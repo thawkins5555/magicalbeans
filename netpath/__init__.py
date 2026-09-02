@@ -1,3 +1,3 @@
 """SappiWhere: scheduled traceroutes with a path graph and status timeline."""
 
-__version__ = "4.34.1"
+__version__ = "4.35.0"
