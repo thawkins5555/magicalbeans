@@ -433,6 +433,15 @@ try:
 
     # --------------------------------------------------------- the limits
 
+    # ws.close() returns as soon as the client's close frame is on the wire;
+    # the server thread releases its session a moment later. Wait for that,
+    # or a cap of one is already spent on the session that is still going.
+    for _ in range(200):
+        if service.ssh_sessions.count == 0:
+            break
+        time.sleep(0.05)
+    assert service.ssh_sessions.count == 0, service.ssh_sessions.count
+
     original_max = sshterm.MAX_SESSIONS
     sshterm.MAX_SESSIONS = 1
     try:

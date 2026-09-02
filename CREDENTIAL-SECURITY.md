@@ -484,7 +484,11 @@ other module receive it.
 credential for the device, if one exists, is decrypted immediately before
 `paramiko.SSHClient.connect()` and the plaintext variable is cleared the
 instant the attempt resolves; the live session holds the SSH channel, never
-the password, so a reconnect decrypts fresh. When no credential is stored,
+the password, so a reconnect decrypts fresh. The one exception is a refused
+host key: the credential is held, in memory only, between the warning and
+the operator's answer, so that **Trust the new key** reconnects without
+asking for the password again — and it is dropped with the session if the
+answer is Cancel or the window closes. When no credential is stored,
 or the device refuses it, the window asks for a username and password: they
 travel once over the same TLS-protected WebSocket the terminal uses, are
 handed to `connect()` and cleared the same way, and are never written to

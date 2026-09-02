@@ -20,7 +20,8 @@ Listed newest first. Version numbers are build order, not dates.
   used for that one connection and never stored. The window carries the
   device's name and address, Reconnect and Disconnect, and the same session
   cookie as the tab that opened it, so a signed-out window lands on the
-  sign-in page.
+  sign-in page. Browse OIDs and Edit on the same pane are now gated on Nodes
+  write access, which they should always have been.
 - **A device's SSH host key is accepted the first time and remembered.**
   ConfigRX used to accept whatever key a device presented on every
   connection and forget it again. Now the first connection — from the

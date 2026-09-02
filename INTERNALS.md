@@ -3731,6 +3731,84 @@ also ticked the checkbox would be worse than no help. The first entries are
 the profile editor's Ping and SNMP checkboxes and the device form's matching
 selectors, sharing the same two keys.
 
+### The SSH terminal: WebSocket hijack, protocol, sessions (`web/wsock.py`, `sshterm.py`)
+
+**Hijack and framing.** The web server is a `ThreadingHTTPServer` with one
+daemon thread per connection, HTTP/1.0 (so no keep-alive to unwind),
+`wbufsize = 0` and no handler timeout. That shape makes a WebSocket almost
+free: a handler can answer the upgrade on `self.wfile` and then keep
+`rfile`/`wfile` for the life of the conversation without blocking anything
+else. A route whose handler carries `hijack = True` is called with the
+request handler itself, after exactly the same cookie → session → permission
+tail as every other route — which is why the socket is a route rather than a
+special case earlier in the dispatch: an unsigned-in or unpermitted request
+is answered 401/403 as ordinary HTTP before anything is hijacked. `_route`
+sets `_status = 101` so the access log reads sanely and `close_connection =
+True` so the connection simply ends. A handshake that is not a valid upgrade
+raises `wsock.WebSocketError` before a byte is written and is answered 400.
+`web/wsock.py` is the framing: the RFC 6455 accept digest, the 101 written by
+hand as HTTP/1.1 (a browser rejects a 101 announced as HTTP/1.0, which is
+what `protocol_version` would otherwise produce), masked client frames,
+fragment reassembly, ping → pong, the close handshake, unmasked server
+frames, and one lock around sending because a session has two writers. A
+frame — and a reassembled message — may not exceed 2 MB, enforced from the
+length field before any payload is read (close 1009); a protocol error
+closes 1002. The CSP gained `connect-src 'self' ws: wss:` for the socket.
+
+**The protocol.** `GET /api/ssh/devices/<id>/socket`, with the session
+cookie; no subprotocol. Text frames are JSON control messages, binary frames
+are terminal bytes, both ways. The client sends `open` (`cols`/`rows`)
+first, then `resize` and keystrokes; `auth` only in answer to
+`need-credentials`; `trust` only in answer to a `hostkey changed`. The
+server sends `status` (`connecting`, `connected`, `closed`),
+`need-credentials` (`none-stored`, `auth-failed`, `decrypt-failed`, with
+the username to prefill), `hostkey` (`new` is informational — the key was
+stored; `changed` means the connection was refused and carries both
+fingerprints and when the old key was first seen), `error` (connect
+failures phrased by `configrx._connect_error_text`, so the legacy
+key-exchange guidance is not duplicated), and channel output as binary.
+Order on a fresh connection is `status connecting`, then any `hostkey`,
+then `status connected`. Close codes: 1000 normal, 4401 not authorised
+(only for a `trust` from an account that no longer holds `ssh` write — an
+unpermitted upgrade never gets a socket), 4408 idle, 4429 too many
+sessions.
+
+**The session registry and its limits.** `SshSessionRegistry` is built in
+`Service.__init__` after the session store and ConfigRX's database, and
+ended first in `Service.shutdown()` — before any database closes, because
+a session writes its closing device event on the way out. Each session owns
+a paramiko client and a shell channel and uses three threads: the request
+handler's own thread reads the socket and writes keystrokes into the
+channel, a pump thread reads channel output and sends it back, and a small
+timer thread hangs up on an idle session. The constants in `sshterm.py` are
+the whole policy: `CONNECT_TIMEOUT_S = 10` (ConfigRX's, for the same
+reason), `IDLE_TIMEOUT_S = 900` measured on *keystrokes* — presence, not the
+window being open, the rule `SessionStore.touch` applies to the web session
+— `MAX_SESSIONS = 16` across the application (past which the socket closes
+4429), and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel read so a
+device dumping a huge `show tech-support` streams rather than being
+buffered whole. The credential — ConfigRX's, decrypted at connect, or one
+typed into the page — lives in a local for the length of the connect and is
+dropped in its `finally`; the one case where it is held longer is between a
+`hostkey changed` and the operator's answer, so that Trust reconnects
+without asking again. Sessions are audited as `ssh` device events (who,
+from where; the duration on close; a host key replaced) and a NODES
+event-log line — never a keystroke, never a credential.
+
+**The `ssh` permission and its backfill.** `permissions.MODULES` gained
+`"ssh"`, the only entry with no tab of its own: both terminal routes require
+`("ssh", write)`, since there is no read-only half of "open a shell". It is
+granted to nobody by default, which is the point of not folding it into
+ConfigRX. Because the module is newer than `user_permissions`,
+`AppDatabase._backfill_ssh_permission` runs once on open: any account
+already holding write on *every other* module is an administrator by any
+reading, and the SSH button took the place of one they already had, so it
+gets `ssh: write`; everybody else starts with none. The run is recorded in
+`meta` (`ssh_permission_backfilled`) whether or not anything was granted,
+so an administrator who deliberately takes the permission away is not
+handed it back on the next restart. The Settings permission grid renders
+from `permissions.MODULES`, so the new column appears on its own.
+
 ### SSH host keys (`hostkeys.py`, `configrxdb.ssh_host_keys`)
 
 `netpath/hostkeys.py` owns one table, `ssh_host_keys` in configrx.db, keyed
