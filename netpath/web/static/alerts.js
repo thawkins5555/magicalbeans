@@ -12,8 +12,10 @@
     selected: null,
     checked: new Set(),
     // Set by bulkAction right after a resolve/acknowledge completes ("Resolved
-    // 3 of 3"), shown once in place of the selection count, then cleared at
-    // the top of the very next refresh() — see drawBulkBar.
+    // 3 of 3"): shown on the engine counters line for a few seconds, then
+    // dropped by the first drawStatus after it expires. Not in the bulk bar:
+    // that bar hides the instant the selection clears, and the refresh the
+    // action triggers runs synchronously, so nothing put there would paint.
     bulkNotice: null,
     // Per session only, like every other table's sort: a saved sort order is
     // a different feature from saved columns, and mixing the two storage
@@ -75,7 +77,10 @@
       `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
-      (c.send_errors ? ` · ${c.send_errors} send errors` : '');
+      (c.send_errors ? ` · ${c.send_errors} send errors` : '') +
+      (view.bulkNotice && Date.now() < view.bulkNotice.until
+        ? ` · ${view.bulkNotice.text}` : '');
+    if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
     const badge = App.el('alerts-open-badge');
     const openCount = alerts.open_count || 0;
     badge.textContent = openCount;
@@ -233,15 +238,6 @@
 
   function drawBulkBar() {
     const n = view.checked.size;
-    // A just-finished bulk action's result ("Resolved 3 of 3") takes over the
-    // bar for one redraw even though the selection it acted on has already
-    // been cleared — see bulkAction/refresh, which is what makes it go away
-    // again: the bar itself has no independent notion of "transient".
-    if (view.bulkNotice) {
-      App.el('alerts-bulk-bar').hidden = false;
-      App.el('alerts-bulk-count').textContent = view.bulkNotice;
-      return;
-    }
     App.el('alerts-bulk-bar').hidden = n === 0;
     if (n) App.el('alerts-bulk-count').textContent = `${n} selected`;
   }
@@ -278,10 +274,12 @@
     const ids = [...view.checked];
     if (!ids.length) return;
     const result = await App.post(path, { alert_ids: ids });
-    view.bulkNotice = `${verb} ${result[key]} of ${ids.length}`;
+    view.bulkNotice = { text: `${verb} ${result[key]} of ${ids.length}`,
+                        until: Date.now() + 6000 };
     clearSelection();
     view.checked.clear();
     drawBulkBar();
+    drawStatus();
     App.refreshNow('alerts');
   }
 
@@ -824,10 +822,6 @@
 
   async function refresh() {
     if (App.state.tab !== 'alerts') return;
-    // The bulk-action notice (if any) has already had its one redraw, from
-    // the direct drawBulkBar() call bulkAction makes before kicking off this
-    // very refresh; this is "the next refresh" that retires it.
-    view.bulkNotice = null;
     drawStatus();
     const { t0, t1 } = window_();
     const span = t1 - t0;
