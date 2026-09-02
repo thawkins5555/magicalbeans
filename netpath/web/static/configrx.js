@@ -458,10 +458,60 @@
 
   /* --------------------------------------------------------- device config */
 
+  /* The SSH host key this app remembers for the device's address and port —
+     the same stored key the SSH terminal checks, which is why the Forget
+     button is gated on `ssh` write rather than on ConfigRX's: forgetting is
+     the act that lets the next connection accept whatever key it is offered.
+     Fetched after the dialog opens and redrawn in place afterwards, so
+     forgetting one does not close the settings form or reload the page.
+     Dynamically built write-gated controls check canWrite themselves —
+     applyPermissions() only ever hides what is already in the document. */
+  async function drawHostKey(box, device) {
+    const target = box.querySelector('#cx-hostkey');
+    if (!target) return;
+    let key = null;
+    try {
+      key = (await App.get(`/api/ssh/devices/${device.id}/hostkey`, {})).host_key;
+    } catch (error) {
+      target.innerHTML = `<p class="hint">Host key: ${escape(error.message)}</p>`;
+      return;
+    }
+    if (!key) {
+      target.innerHTML = '<p class="hint">No host key stored yet. The first'
+        + ' connection to this device — a backup or an SSH session — stores the'
+        + ' key it presents, and every later one has to match it.</p>';
+      return;
+    }
+    target.innerHTML =
+      `<p>Host key: <b style="font-family:var(--mono)">${escape(key.fingerprint)}</b>`
+      + ` (${escape(key.key_type)}), first seen ${App.stamp(key.first_seen_ts)}`
+      + `${key.trusted_by ? `, trusted by ${escape(key.trusted_by)}` : ''}.</p>`
+      + (App.canWrite('ssh')
+        ? '<p><button id="cx-hostkey-forget">Forget</button>'
+          + '<span class="hint"> Forget it only when this device was genuinely'
+          + ' rebuilt or replaced: the next connection then stores whatever key'
+          + ' it is offered, with nothing to check it against.</span></p>'
+        : '');
+    const forget = target.querySelector('#cx-hostkey-forget');
+    if (forget) {
+      forget.onclick = async () => {
+        forget.disabled = true;
+        try {
+          await App.del(`/api/ssh/devices/${device.id}/hostkey`, {});
+        } catch (error) {
+          target.innerHTML += `<p class="hint" style="color:var(--fail)">`
+            + `${escape(error.message)}</p>`;
+          return;
+        }
+        await drawHostKey(box, device);
+      };
+    }
+  }
+
   function deviceSettingsModal() {
     const device = view.devices.find((d) => d.id === view.selectedDeviceId);
     if (!device) return;
-    App.modal(`ConfigRX settings: ${device.name}`, `
+    const box = App.modal(`ConfigRX settings: ${device.name}`, `
       <fieldset><legend>BACKUP</legend>
         <label class="check"><input type="checkbox" id="cx-enabled"
           ${device.backup_enabled ? 'checked' : ''}> Back up this device</label>
@@ -480,6 +530,9 @@
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
           is no way to run any other command from here.</p>
+      </fieldset>
+      <fieldset><legend>HOST KEY</legend>
+        <div id="cx-hostkey"><p class="hint">Loading…</p></div>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
@@ -500,6 +553,7 @@
         await App.refreshNow('configrx');
       } },
     ]);
+    drawHostKey(box, device);
   }
 
   /* ---------------------------------------------------------- settings */
