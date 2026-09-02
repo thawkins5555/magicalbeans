@@ -17,6 +17,13 @@ from __future__ import annotations
 MODULES = (
     "netpath", "netflow", "snmp", "syslog", "ipam", "nodes", "alerts",
     "wireless", "configrx", "settings", "debug",
+    # Not a tab: the interactive SSH terminal opened from a Nodes device, and
+    # forgetting a remembered host key. Its own module because ConfigRX write
+    # means "may back up configs", a boundary of exactly two fixed read-only
+    # commands, and an interactive shell is a different thing to be trusted
+    # with. Appended rather than slotted in beside configrx so the grid a user
+    # already knows does not reshuffle.
+    "ssh",
 )
 
 READ = "read"

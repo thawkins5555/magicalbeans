@@ -1,11 +1,18 @@
 """ConfigRxWorker: pulls a read-only "show config" snapshot from each
 enabled device over SSH, on a schedule.
 
-The hard safety boundary lives here: `_pull_config()` is the only place
-in this module that talks to a device's shell, and it sends exactly the
-fixed vendor.pager_off lines plus vendor.show_config from
-configrx_vendors.py — nothing else, ever. There is no free-form command
-execution anywhere in ConfigRX, by construction.
+The hard safety boundary of the BACKUP PATH lives here: `_pull_config()`
+is the only place in this module that talks to a device's shell, and it
+sends exactly the fixed vendor.pager_off lines plus vendor.show_config
+from configrx_vendors.py — nothing else, ever. There is no free-form
+command execution anywhere in ConfigRX, by construction.
+
+That is a statement about backups, not about the whole application. The
+interactive SSH terminal (sshterm.py) is a different feature with a
+different boundary: it is a real shell, a human types into it, and it is
+gated behind its own `ssh` permission which nobody holds by default.
+Nothing on this path can send anything the operator typed there, and
+nothing there runs through this module.
 
 The SSH password follows this app's one credential discipline
 (nodepoll.credential_for's shape): decrypted from its DPAPI blob
@@ -30,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
+from .hostkeys import HostKeyChanged, HostKeyStore
 from .nodesdb import detected_vendor
 from .eventlog import CONFIGRX, ERROR, NullLog
 
@@ -285,20 +293,6 @@ def _clean_output(raw: str) -> str:
     return _PAGER_INLINE_RE.sub("", "\n".join(lines)).strip() + "\n"
 
 
-class _AcceptAndRecordPolicy:
-    """paramiko.MissingHostKeyPolicy: never blocks on an unrecognized host
-    key (this is network gear rarely carrying a stable known_hosts entry),
-    but — unlike AutoAddPolicy — flags that it happened so the caller can
-    say so in the backup's own status rather than silently accepting it."""
-
-    def __init__(self):
-        self.accepted_unknown = False
-
-    def missing_host_key(self, client, hostname, key):
-        self.accepted_unknown = True
-        client.get_host_keys().add(hostname, key.get_name(), key)
-
-
 def _learn_prompt(banner: str) -> str:
     """The device's shell prompt, taken from the last non-blank line of the
     login banner — "switch#", "fw01 #", "[admin@rtr] >".
@@ -397,6 +391,11 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
     newline and no text, so it cannot execute anything; it is the keypress a
     human would make. The boundary — only pager_off and show_config are ever
     run on the device — is intact.
+
+    The boundary is this path's, not the application's: sshterm.py opens an
+    interactive shell for a human to type into, behind the separate `ssh`
+    permission. Nothing it carries reaches this function, and nothing here
+    grows a way to send anything else.
 
     Returns (raw text, how the read ended); see _read_until_prompt.
     """
@@ -652,14 +651,36 @@ class ConfigRxWorker:
                                           error="Stored SSH credential could not be decrypted")
             return
 
+        # The shared host-key store (hostkeys.py), the same one the SSH
+        # terminal uses: prepare() loads what we remember so paramiko itself
+        # checks the connection against it, and the policy stores the key on a
+        # first connection and refuses a changed one. A backup NEVER runs
+        # against a device presenting a different key — that is the one case
+        # where "carry on and mention it" would be the wrong answer, because
+        # the config we would store came from something we cannot identify.
+        host = device["ip"]
+        port = int(config["ssh_port"])
+        store = HostKeyStore(self.db)
         client = paramiko.SSHClient()
-        policy = _AcceptAndRecordPolicy()
+        store.prepare(client, host, port)
+        policy = store.policy(host, port)
         client.set_missing_host_key_policy(policy)
         try:
             client.connect(
-                device["ip"], port=int(config["ssh_port"]), username=config["ssh_username"],
+                host, port=port, username=config["ssh_username"],
                 password=password, timeout=CONNECT_TIMEOUT_S, banner_timeout=CONNECT_TIMEOUT_S,
                 auth_timeout=CONNECT_TIMEOUT_S, look_for_keys=False, allow_agent=False)
+        except (HostKeyChanged, paramiko.BadHostKeyException) as exc:
+            # paramiko raises its own BadHostKeyException when the key loaded
+            # by prepare() is not the one the host presented; the policy
+            # raises ours when nothing was loaded but something is stored.
+            # Both mean the same thing and read the same way.
+            changed = store.as_changed(exc, host, port)
+            detail = changed.message(host)
+            self.db.record_backup_attempt(device_id, ok=False, status="error", error=detail)
+            self.log.add(ERROR, f"ConfigRX refused to back up {host}: its SSH host key changed",
+                         detail=detail)
+            return
         except Exception as exc:
             detail = _connect_error_text(exc)
             self.db.record_backup_attempt(device_id, ok=False, status="error", error=detail)
@@ -672,6 +693,10 @@ class ConfigRxWorker:
             return
         finally:
             password = None
+        # "This same key was presented again just now" — the stored row's
+        # last_seen_ts is the only thing that says a remembered key is still
+        # in use rather than left over from a device that has since gone.
+        store.record_seen(host, port)
         try:
             capture_max_s = float(self.db.settings().get("capture_timeout_s", 180))
         except (TypeError, ValueError):
@@ -699,7 +724,11 @@ class ConfigRxWorker:
             return
 
         backup_id, _digest = self.db.add_backup(device_id, cleaned)
-        note = " (host key not previously known)" if policy.accepted_unknown else ""
+        # Only when a key was actually stored, and said once: the note used to
+        # be appended to every backup, because the accepted key was thrown
+        # away with the connection and every device was unknown again next
+        # time. It now marks the one backup that taught this app the key.
+        note = " (host key stored on first connection)" if policy.stored_new else ""
         if backup_id is not None:
             self.counters["changed"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)

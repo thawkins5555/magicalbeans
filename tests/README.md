@@ -25,6 +25,7 @@ was checking. `run_all.py` shows the last lines of a failing suite's output.
 | `test_alert_operator_resolve.py` | an operator-resolved threshold alert (Nodes and NetPath) does not re-open for the same breach run, but does after a clear plus a fresh breach; an engine auto-resolve is never mistaken for one | none — drives `AlertEngine` directly |
 | `test_series_buckets.py` | `NodesDatabase.series(..., bucket_s=...)` bucket boundaries/avg/min/max, the `/series` API's `bucket_s` param and its window/2 cap, raw rows when `bucket_s=0` | none — no SNMP involved |
 | `test_mac_tables.py` | GETBULK forwarding-table walks (request counts, tooBig fallback, v1 GETNEXT, the row cap) and the present/first-seen history the Find box searches | `stub_agent_fdb.py` |
+| `test_ssh_hostkeys.py` | the shared SSH host-key store: fingerprints, the first connection storing a key, the same key touching last-seen, a changed key refused (by bytes, whatever its type), trust and forget, and ConfigRX backing up behind all of it | in-process `stub_ssh_device.py` (needs paramiko) |
 | `test_upgrade_from_previous.py` | databases in the previous release's shape open and migrate; with git history, the previous main commit creates every database and the current application starts on them | none — the previous release's own code |
 
 Adding a suite: import `_paths` first (it puts the repo root on `sys.path`),

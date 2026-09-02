@@ -1888,7 +1888,7 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     if not row:
         raise ValueError("No such device")
     service.nodes_db.remove_device(device_id)
-    service.configrx_db.forget_device(device_id)
+    service.configrx_db.forget_device(device_id, host=row["ip"])
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     return {"ok": True}
 
@@ -1923,9 +1923,16 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
+    # The addresses first, while the rows still exist: a removed device's
+    # remembered SSH host key is keyed by its ip, which only Nodes knows.
+    hosts = {}
+    for device_id in device_ids:
+        row = service.nodes_db.device(device_id)
+        if row:
+            hosts[device_id] = row["ip"]
     removed = service.nodes_db.bulk_remove_devices(device_ids)
     for device_id in device_ids:
-        service.configrx_db.forget_device(device_id)
+        service.configrx_db.forget_device(device_id, host=hosts.get(device_id))
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     return {"ok": True, "removed": removed}
 
@@ -3876,6 +3883,55 @@ def post_configrx_worker(service, params, body) -> dict:
         service.configrx.stop()
     return {"running": service.configrx.running,
             "status": service.configrx.status_text()}
+
+
+# ------------------------------------------------------------- ssh host keys
+# The remembered host key for a device, and forgetting it. Both live under
+# /api/ssh/ rather than /api/configrx/ because the key is shared: the SSH
+# terminal stores and checks the same row. Reading one is a ConfigRX read (it
+# is shown in ConfigRX's device dialog); forgetting one is an `ssh` WRITE,
+# because it is the act that lets the next connection to that device accept
+# whatever key it is offered.
+#
+# There is no HTTP route for trusting a NEW key: that decision is only ever
+# taken with the offered key in hand, over the terminal's own socket, so
+# there is no endpoint here through which a key could be trusted blind.
+
+def _ssh_device_host(service, device_id):
+    """(device row, ip, port) for a device, or ValueError. The port is
+    ConfigRX's stored SSH port, since that is the port this app connects on
+    and the store is keyed by (host, port)."""
+    device = service.nodes_db.device(device_id)
+    if not device:
+        raise ValueError("No such device")
+    config = service.configrx_db.device_config(device_id)
+    port = int(config["ssh_port"]) if config and config["ssh_port"] else 22
+    return device, device["ip"], port
+
+
+def _host_key_json(row) -> dict:
+    return {
+        "host": row["host"], "port": row["port"], "key_type": row["key_type"],
+        "fingerprint": row["fingerprint"], "first_seen_ts": row["first_seen_ts"],
+        "last_seen_ts": row["last_seen_ts"], "trusted_by": row["trusted_by"] or "",
+    }
+
+
+def get_ssh_device_hostkey(service, params, body, device_id) -> dict:
+    _device, host, port = _ssh_device_host(service, device_id)
+    row = service.configrx_db.host_key(host, port)
+    return {"host_key": _host_key_json(row) if row else None}
+
+
+def delete_ssh_device_hostkey(service, params, body, device_id) -> dict:
+    _device, host, port = _ssh_device_host(service, device_id)
+    removed = service.configrx_db.forget_host_key(host, port)
+    if removed:
+        service.log.add(CONFIGRX_CATEGORY,
+                        f"Forgot the stored SSH host key for {host}",
+                        detail=f"The next connection to {host} port {port} will store"
+                               f" whatever key it is offered.")
+    return {"ok": True, "removed": 1 if removed else 0}
 
 
 # --------------------------------------------------------------------- auth

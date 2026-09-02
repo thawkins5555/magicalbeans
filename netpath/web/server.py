@@ -231,6 +231,11 @@ ROUTES = [
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
+    # The remembered SSH host key for a device: shown in ConfigRX's device
+    # dialog (a configrx read), forgotten only by someone who holds ssh write,
+    # since forgetting is what lets the next connection accept a new key.
+    ("GET", r"^/api/ssh/devices/(\d+)/hostkey$", api.get_ssh_device_hostkey, ("configrx", R)),
+    ("DELETE", r"^/api/ssh/devices/(\d+)/hostkey$", api.delete_ssh_device_hostkey, ("ssh", W)),
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
