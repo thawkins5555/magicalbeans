@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from collections import deque
 
 from . import api
+from . import wsock
 from .. import permissions
 from .service import Service
 
@@ -231,6 +232,11 @@ ROUTES = [
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
+    # The terminal window. Read is meaningless for a shell — you either get
+    # to type on the device or you do not — so both routes want write, and
+    # the socket is the one hijacking route in the table (see _route).
+    ("GET", r"^/api/ssh/devices/(\d+)$", api.get_ssh_device, ("ssh", W)),
+    ("GET", r"^/api/ssh/devices/(\d+)/socket$", api.ws_ssh_device, ("ssh", W)),
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
@@ -276,7 +282,8 @@ class AccessLog:
                      "path": path, "status": status, "ms": ms}
             if not path.startswith(("/app.", "/netpath.js", "/netflow.js",
                                     "/snmp.js", "/syslog.js", "/debug.js",
-                                    "/settings.js")):
+                                    "/settings.js", "/ssh.js", "/ssh.css",
+                                    "/vendor/")):
                 self.recent.appendleft(entry)
             info = self.clients.setdefault(client, {
                 "requests": 0, "first_seen": time.time(), "last_seen": 0.0,
@@ -342,9 +349,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # No external resources are loaded, so this can be strict.
+        # No external resources are loaded, so this can be strict. The
+        # connect-src is for the terminal window's WebSocket: default-src
+        # covers ws: on paper, but browsers differ on whether a ws:// URL
+        # counts as same-origin under 'self', and being explicit costs
+        # nothing. Inline styles stay allowed for the terminal emulator,
+        # which injects its own <style>.
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; style-src 'self' 'unsafe-inline'")
+                         "default-src 'self'; style-src 'self' 'unsafe-inline';"
+                         " connect-src 'self' ws: wss:")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         for key, value in (extra_headers or {}).items():
@@ -492,6 +505,30 @@ class Handler(BaseHTTPRequestHandler):
                 # arrive as ints so no handler signature changes.
                 args = [int(group) if group.isdigit() else group
                         for group in match.groups()]
+
+                # A hijacking handler (the terminal's WebSocket) takes the
+                # connection over and holds it for the life of the session:
+                # it gets the request handler itself, answers the upgrade on
+                # `wfile` and then owns both files. It runs after exactly the
+                # same cookie/session/permission tail as every other route,
+                # which is the whole reason it is a route rather than a
+                # special case earlier in the dispatch. There is no keep-alive
+                # to unwind afterwards (HTTP/1.0), so the connection simply
+                # closes.
+                if getattr(handler, "hijack", False):
+                    self.close_connection = True
+                    self._status = 101
+                    try:
+                        handler(self, self.service, params, *args)
+                    except wsock.WebSocketError as exc:
+                        # Refused before anything was written, so this is
+                        # still an ordinary HTTP response.
+                        self._send(400, str(exc).encode("utf-8"),
+                                   "text/plain; charset=utf-8")
+                    except Exception:
+                        traceback.print_exc()
+                    return
+
                 result = handler(self.service, params, body, *args)
 
                 headers = None
