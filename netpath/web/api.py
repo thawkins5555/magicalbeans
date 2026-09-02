@@ -2224,7 +2224,7 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             result["ping"]["rtt_ms"] = (time.time() - started) * 1000.0
 
     if config.get("snmp_enabled"):
-        version = int(config.get("snmp_version") or 1)
+        version = int(config.get("snmp_version", 1))
         oids = list(nodeoids.SYSTEM_SCALARS.values())
         try:
             session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
