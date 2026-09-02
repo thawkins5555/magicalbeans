@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS rules (
     -- see alertrules.evaluate_flapping.
     flap_window_s        INTEGER,
     flap_min_transitions INTEGER,
+    -- Threshold rules only: require the breach to have lasted this many
+    -- seconds of real sample time before alerting. NULL means "use
+    -- for_polls" — the same NULL-is-the-shipped-default convention as the
+    -- two flapping columns above. See alertrules.evaluate_threshold.
+    for_seconds          INTEGER,
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     created_ts      REAL NOT NULL
 );
@@ -165,10 +170,36 @@ CREATE TABLE IF NOT EXISTS pending_alerts (
     payload       TEXT    NOT NULL      -- the Occurrence, as JSON
 );
 CREATE INDEX IF NOT EXISTS ix_pending_due ON pending_alerts(fire_after_ts);
+
+-- Entities whose new alerts are suppressed until until_ts: an operator
+-- working on a device silences it for an hour rather than watching the same
+-- outage arrive six times. entity_kind is "device" today; the column exists
+-- so a future per-interface or per-AP mute needs no migration.
+--
+-- A mute stops what happens NEXT. Alerts already open stay open and are
+-- worked normally — hiding them would lose the operator's own place in the
+-- list. Nothing has to un-suppress when a mute lapses either: thresholds
+-- re-derive from live metrics on the next tick and a still-down device
+-- keeps recording events, so the alerts simply come back.
+CREATE TABLE IF NOT EXISTS alert_mutes (
+    id          INTEGER PRIMARY KEY,
+    entity_kind TEXT NOT NULL,
+    entity_id   TEXT NOT NULL,
+    until_ts    REAL NOT NULL,
+    created_ts  REAL NOT NULL,
+    created_by  TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_mute_entity
+    ON alert_mutes(entity_kind, entity_id);
 """
 
+# How long a mute may last. The dropdown offers 1/6/12/24 hours; the cap is
+# here so a hand-made API call cannot silence a device until next year.
+MAX_MUTE_HOURS = 24.0
+
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
-                  "clear_threshold", "for_polls", "template_id",
+                  "clear_threshold", "for_polls", "for_seconds", "template_id",
                   "flap_window_s", "flap_min_transitions")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
@@ -223,6 +254,17 @@ _BUILTIN_RULES = [
     ("dhcp_scope_exhaustion", "DHCP scope running out of leases", "dhcp_threshold", "scope_utilization_pct", 3, "threshold_breach", 85.0, 75.0, 1),
 ]
 
+# Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
+# all 28 rows with a column only one of them uses. Absent means NULL, which
+# evaluate_threshold reads as "count polls, don't measure time".
+#
+# Packet loss is the one threshold where a single bad sample is routine: a
+# probe lost to a busy CPU or a queued ARP is not an outage, and with the
+# default ping_count of 3 one lost probe already reads as 33%. Requiring the
+# loss to persist for a minute of real sample time is what makes the alert
+# mean "this link is lossy" rather than "a packet went missing".
+_BUILTIN_FOR_SECONDS = {"packet_loss_high": 60}
+
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
                          "threshold_breach", "trap_forwarded")
 
@@ -254,10 +296,17 @@ class AlertsDatabase:
         """
         rules = {row["name"] for row in
                  self._conn.execute("PRAGMA table_info(rules)").fetchall()}
-        for column in ("flap_window_s", "flap_min_transitions"):
+        for column in ("flap_window_s", "flap_min_transitions", "for_seconds"):
             if column not in rules:
                 self._conn.execute(
                     f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
+        if "for_seconds" not in rules:
+            # Seed the shipped default onto an existing database, so an
+            # install that already has alerts.db gets sustained packet loss
+            # rather than the pre-4.31 single-sample behaviour. Only this
+            # one rule: every other threshold keeps counting polls.
+            self._conn.execute(
+                "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
         alerts = {row["name"] for row in
                   self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
         if "rollup_note" not in alerts:
@@ -295,10 +344,11 @@ class AlertsDatabase:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO rules(key, name, kind, source_kind,"
                     " severity, enabled, is_builtin, device_filter, threshold,"
-                    " clear_threshold, for_polls, template_id, created_ts)"
-                    " VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?)",
+                    " clear_threshold, for_polls, for_seconds, template_id,"
+                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?)",
                     (key, name, kind, source_kind, severity, threshold,
-                     clear_threshold, for_polls, template_ids.get(template_key), now))
+                     clear_threshold, for_polls, _BUILTIN_FOR_SECONDS.get(key),
+                     template_ids.get(template_key), now))
             self._conn.commit()
 
     # --------------------------------------------------------------- settings
@@ -623,6 +673,70 @@ class AlertsDatabase:
                 "SELECT COUNT(*) AS n FROM pending_alerts").fetchone()
         return row["n"] if row else 0
 
+    # -------------------------------------------------------------- mutes
+
+    def mute(self, entity_kind: str, entity_id: str, hours: float,
+             by: str = "", reason: str = "") -> sqlite3.Row | None:
+        """Silence new alerts for an entity for `hours`, replacing any mute
+        it already has — re-muting a device extends it rather than failing on
+        the unique index, which is what pressing the button again means."""
+        hours = max(0.0, min(float(hours), MAX_MUTE_HOURS))
+        if hours <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO alert_mutes(entity_kind, entity_id, until_ts,"
+                " created_ts, created_by, reason) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(entity_kind, entity_id) DO UPDATE SET"
+                " until_ts=excluded.until_ts, created_ts=excluded.created_ts,"
+                " created_by=excluded.created_by, reason=excluded.reason",
+                (entity_kind, str(entity_id), now + hours * 3600.0, now,
+                 by, reason))
+            self._conn.commit()
+        return self.mute_row(entity_kind, entity_id)
+
+    def unmute(self, entity_kind: str, entity_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM alert_mutes WHERE entity_kind = ? AND entity_id = ?",
+                (entity_kind, str(entity_id)))
+            self._conn.commit()
+        return bool(cur.rowcount)
+
+    def mute_row(self, entity_kind: str, entity_id: str) -> sqlite3.Row | None:
+        """The ACTIVE mute for an entity, or None. An expired row reads as no
+        mute rather than being deleted here — reads happen on the hot path and
+        prune() clears the rows out on the housekeeping pass."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alert_mutes WHERE entity_kind = ? AND"
+                " entity_id = ? AND until_ts > ?",
+                (entity_kind, str(entity_id), time.time())).fetchone()
+
+    def mutes(self, entity_kind: str | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM alert_mutes WHERE until_ts > ?"
+        args: list = [time.time()]
+        if entity_kind:
+            sql += " AND entity_kind = ?"
+            args.append(entity_kind)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY until_ts", args).fetchall()
+
+    def muted_entity_ids(self, entity_kind: str = "device") -> dict[str, float]:
+        """entity_id -> until_ts for every active mute of this kind. Read once
+        per engine tick, so the per-occurrence check is a dict lookup rather
+        than a query."""
+        return {row["entity_id"]: row["until_ts"]
+                for row in self.mutes(entity_kind)}
+
+    def purge_expired_mutes(self, now: float | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM alert_mutes WHERE until_ts <= ?",
+                                     (now if now is not None else time.time(),))
+            self._conn.commit()
+        return cur.rowcount or 0
+
     def acknowledge_many(self, alert_ids: list[int], by: str = "") -> int:
         """Acknowledge exactly the given alerts — the selection-respecting
         counterpart to acknowledge_all, which deliberately ignores any
@@ -772,6 +886,10 @@ class AlertsDatabase:
                         " WHERE state = 'resolved' ORDER BY resolved_ts ASC LIMIT ?)",
                         (total - max_rows,))
                     removed += cursor.rowcount or 0
+            # Lapsed mutes read as "not muted" from the moment they expire;
+            # this only stops the table growing a row per mute ever set.
+            self._conn.execute("DELETE FROM alert_mutes WHERE until_ts <= ?",
+                               (time.time(),))
             self._conn.commit()
         return removed
 

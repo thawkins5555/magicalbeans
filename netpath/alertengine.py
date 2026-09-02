@@ -56,7 +56,11 @@ class AlertEngine:
         self.log = log or NullLog()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._breach_streaks: dict[tuple, int] = {}
+        # (rule_id, device_id) -> (last sample ts, streak, first breach ts).
+        # The sample ts is what makes the streak count polls rather than
+        # ticks; the first breach ts is what lets for_seconds measure a
+        # duration. See _evaluate_thresholds.
+        self._breach_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
         # DHCP scopes keep (last polled_ts, streak) rather than a bare
         # count: the engine ticks every few seconds but DHCP is polled
         # every few minutes, so for_polls must count polls, not ticks.
@@ -65,7 +69,7 @@ class AlertEngine:
         self._suppression_logged_hour: int | None = None
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
-                         "rolled_up": 0}
+                         "rolled_up": 0, "muted": 0}
         self.error: str | None = None
         self._last_tick_ts: float = 0.0
 
@@ -132,11 +136,54 @@ class AlertEngine:
         occurrences += self._evaluate_dhcp_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         occurrences += self._drain_pending()
+        # Read once per tick rather than per occurrence, and usually empty —
+        # when nothing is muted the gate below costs one dict truth test.
+        muted = self.db.muted_entity_ids("device")
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
             if self._hold_for_new_device(occurrence, settings):
                 continue
+            if muted and self._muted(occurrence, muted):
+                continue
             self._apply(rules, occurrence, settings)
+
+    def _muted(self, occurrence: Occurrence, muted: dict) -> bool:
+        """True when this occurrence is about a device an operator silenced.
+
+        Per device rather than per rule, so it sits here beside
+        _hold_for_new_device rather than inside _apply: muting a switch means
+        "stop telling me about that switch", not "stop telling me about one
+        rule on it". _occurrence_device resolves interface occurrences to
+        their parent device too, so a muted switch's ports go quiet with it,
+        and returns None for everything structurally outside Nodes — traps
+        from unpolled hosts, syslog, IPAM, DHCP scopes, APs — which therefore
+        cannot be muted by a device mute.
+        """
+        device = self._occurrence_device(occurrence)
+        if device is None:
+            return False
+        if str(device["id"]) not in muted:
+            return False
+        self.counters["muted"] += 1
+        return True
+
+    def _muted_alert(self, alert_row) -> bool:
+        """Whether an existing alert's device is muted.
+
+        Its own lookup rather than the per-tick dict, because the clear path
+        runs inside the drains — before _tick reads that dict — and a clear
+        is rare enough that one query costs nothing.
+        """
+        try:
+            if alert_row["entity_kind"] == "device":
+                device_id = str(int(alert_row["entity_id"]))
+            elif alert_row["entity_kind"] == "interface":
+                device_id = str(int(str(alert_row["entity_id"]).split(":")[0]))
+            else:
+                return False
+        except (TypeError, ValueError):
+            return False
+        return self.db.mute_row("device", device_id) is not None
 
     # ------------------------------------------- newly added device hold
 
@@ -473,6 +520,20 @@ class AlertEngine:
         return occurrences
 
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
+        """Device metrics against their threshold rules.
+
+        The streak advances on a NEW SAMPLE, not on an engine tick. This
+        engine ticks every five seconds; a device is polled every sixty by
+        default, so counting ticks made `for_polls = 2` mean "ten seconds"
+        and, worse, kept counting a value that had stopped changing — one
+        bad sample satisfied any for_polls a few ticks later and went on
+        satisfying it forever. metric["last_ts"] is what tells the two
+        apart, exactly as _evaluate_dhcp_thresholds gates on polled_ts.
+
+        The same state carries first_breach_ts, so a rule with for_seconds
+        can ask how long the breach has actually lasted in sample time
+        rather than in ticks.
+        """
         occurrences = []
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
@@ -484,14 +545,25 @@ class AlertEngine:
             for rule in rules:
                 metric = metrics_by_key.get(rule["source_kind"])
                 value = metric["last_value"] if metric else None
+                sample_ts = metric["last_ts"] if metric else None
                 streak_key = (rule["id"], device["id"])
+                previous_ts, streak, first_breach_ts = self._breach_streaks.get(
+                    streak_key, (None, 0, None))
                 threshold = rule["threshold"]
-                if value is not None and threshold is not None and value >= threshold:
-                    streak = self._breach_streaks.get(streak_key, 0) + 1
-                else:
-                    streak = 0
-                self._breach_streaks[streak_key] = streak
-                result = evaluate_threshold(rule, value, streak)
+                over = (value is not None and threshold is not None
+                        and value >= threshold)
+                if not over:
+                    streak, first_breach_ts = 0, None
+                elif sample_ts != previous_ts:
+                    streak += 1
+                    if first_breach_ts is None:
+                        first_breach_ts = sample_ts
+                self._breach_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
+                # Sample time, not wall-clock: a device that stopped being
+                # polled must not accumulate breach seconds while silent.
+                breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
+                                  else max(0.0, sample_ts - first_breach_ts))
+                result = evaluate_threshold(rule, value, streak, breach_seconds)
                 label = hostresolve.resolve_name(
                     self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
                 if result == "breach":
@@ -629,6 +701,13 @@ class AlertEngine:
         _evaluate_thresholds re-derives every threshold from live metrics on
         the very next tick, so a metric that is genuinely still breaching
         re-opens without anything having to un-suppress it.
+
+        That re-derivation covers every threshold child, but not the
+        event-driven one: poll_overrun is a momentary event with no CLEARS
+        pair, so nothing re-opens it from state. Absorbing it is still
+        right — the next overrun after the device recovers records its own
+        event and opens a fresh alert — but the mechanism is a new event,
+        not a re-derivation.
 
         Deliberately silent: no clear email goes out for an absorbed alert.
         Fewer emails for one outage is the whole point, and "packet loss
@@ -839,6 +918,12 @@ class AlertEngine:
         threshold clears too, per the same reasoning that shipped only 5
         built-in templates instead of one per rule."""
         if not settings.get("notify_on_clear", True):
+            return
+        # A muted device sends no email at all, resolutions included. The
+        # alert itself still resolves — the list stays truthful whatever the
+        # mute says — but "muted" has to mean the operator's inbox goes
+        # quiet, or the mute has silenced only half of what it promised.
+        if self._muted_alert(alert_row):
             return
         template = self.db.template_by_key("device_up")
         if template is None:

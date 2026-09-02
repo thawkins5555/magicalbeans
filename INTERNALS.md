@@ -204,6 +204,59 @@ and records a `poll_overrun` device event rather than queuing a second
 concurrent poll of the same device) are all copied from `Monitor`'s own
 algorithm.
 
+**An overrun is not recorded while the device is failing.** `_record_overrun`
+returns early when `device["status"] == "down"` **or**
+`device["consecutive_fail"] > 0`. A poll of a device that stopped answering
+overruns by construction — every request in it spends its full timeout and
+all its retries — so the event says nothing the outage does not. Both arms
+are needed and neither is redundant: `down` only becomes true after
+`down_after_failures` (3) *completed* failing polls, so the overruns lead
+the outage by two or three intervals, and the first of them would otherwise
+get out before `device_down` existed to roll it up. Suppressed at source
+rather than filtered in the alert engine, the same shape as
+`wirelessdb.out_of_service`: no event row, no Debug line, no alert. The
+`ROLLED_UP_BY` entry for `poll_overrun` still exists, to catch an alert
+opened in the moments before the first poll actually failed.
+
+**MAC-table walks have their own cadence** (`_maybe_walk_mac_table`, called
+once per device per `_loop` pass). A forwarding table is hundreds to
+thousands of OIDs per switch, which does not belong on a 60-second poll, so
+`mac_table_interval_s` is a separate interval — an override column on both
+`devices` and `groups`, resolved by `effective_config` like every other
+override, defaulting to **0 (never)** rather than to a global setting, so an
+upgrade adds no SNMP load anywhere until a profile opts in. A device's first
+walk is scheduled at a random point inside one interval so a restart does
+not walk every opted-in switch at once, and a device that is down or whose
+last poll failed is skipped for the same reason overruns are not recorded on
+one. The walk itself runs on the poll pool via `_run_mac_table`, guarded by
+`_mac_running` so one device never has two in flight.
+
+`read_device_mac_table` is the whole-device form of `read_mac_table`, with
+the same three-source cascade (Q-BRIDGE `dot1qTpFdbTable`, then BRIDGE-MIB
+`dot1dTpFdbTable`, then Cisco per-VLAN contexts via `community@vlan`) and
+the per-port filter removed; `_fdb_entries` gained an optional bridge-port →
+ifIndex map so both forms share one parser. It returns **None** when the
+device answers no forwarding table at all, which `_run_mac_table` treats as
+"leave what is stored alone" — a switch that failed to answer once has not
+forgotten every MAC it knows, and deleting its table would send the next
+search nowhere.
+
+**Whole-device OID walks** (`_OidWalkJob`, `start_oid_walk`) run on their own
+thread rather than the poll pool: a full walk of a core switch is tens of
+thousands of GETNEXTs and minutes of wall time, and parking one of the poll
+workers on that would stall the devices behind it. One job per device at a
+time, refused politely like `backup_now` does, held in `_oid_walks` in memory
+— a walk result is transient, downloaded once and dropped, and a row
+surviving a restart would describe a thread that is gone.
+`walk_subtree` and the job share `_walk_from`, which gained a `cancelled`
+predicate and an `on_row` progress hook; they differ only in their bounds and
+in having a cancel, not in what a walk is. `GET …/oid-walk?download=1`
+formats the file (`api._oid_walk_text`) and then calls `forget_oid_walk`, so
+a 100,000-row walk does not sit in memory for the life of the process. The
+file's header states plainly whether the walk completed, and names the
+reason when it did not — a truncated walk that looks complete is the failure
+this feature could most easily cause.
+
 **Poll now, and what "already polling" means.** `poll_now(device_id)` is a
 thin wrapper over `_submit()`, which drops the request when the device is
 already in `_queued` or `_started` — a poll of one device is never run
@@ -996,6 +1049,75 @@ fetched alongside the rest of `loadDetail()`'s `Promise.all`, using the
 same `t0`/`t1` window the metric chart's range picker already drives, so
 switching the range re-fetches both together.
 
+### MAC search (`nodesdb.py`, `nodes.js`)
+
+Nothing normalised a MAC address anywhere in this app before 4.31.0, and
+nothing stored a learned one: `read_mac_table` is an explicitly on-demand
+live walk, per device *per port*, run only while a dialog is open. So a
+search had nothing to match. `mac_entries(device_id, if_index, mac, vlan,
+seen_ts)` stores what the scheduled walks learn, keyed on all four of the
+first columns and indexed on `mac`.
+
+`mac` is stored **normalised** — lowercase hex, no separators — so one
+stored row answers `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
+`aabb.ccdd.eeff` and bare hex alike. `normalize_mac(text)` strips
+`:-. ` and whitespace and returns "" for anything that is not hex or is
+longer than twelve digits, so callers can use the empty string to mean
+"that was not a MAC". Prefixes are allowed on purpose: searching an OUI is
+a normal thing to want.
+
+`looks_like_mac_search` is the search-path wrapper, and exists for one
+false positive: `10.0.0.5` normalises to `10005`, which is valid hex, so a
+plain `normalize_mac` would quietly turn every IP search into a MAC-prefix
+search too. Text that is digits-and-dots only is an address, and a
+genuinely all-numeric MAC typed with dots is rare enough to be worth
+losing next to searching by IP, which people do constantly.
+
+`devices(text=...)` matches `mac_entries` as well as `ip`/`name`/`sys_name`
+when the text normalises to **four or more** hex digits; fewer would match
+half the estate. `mac_locations(prefix)` returns every (device, port) a
+matching address was learned on, joined to `interfaces` for the port
+description — every one, never a chosen one, because a MAC on an uplink is
+on every switch between here and the host and picking one silently sends
+an engineer to the core switch for an access-port problem. `nodes.js`
+decides from the count: exactly one (device, port) opens that port's
+dialog, several are listed as clickable hits.
+
+`replace_mac_entries` replaces a device's table wholesale rather than
+merging, so a MAC that aged out of the switch ages out here too — a stale
+row is worse than no answer. `prune_mac_entries` (a week by default, from
+`mac_table_retention_days`) runs in `Service.run_maintenance` and drops
+entries no walk has refreshed, so a switch taken out of the walk schedule
+stops answering searches from a table nobody has confirmed since.
+
+The lookup runs only on a deliberate search — Enter in the Find box sets
+`view.macSearchPending`, which `refresh()` consumes once — never on the
+five-second refresh, because a dialog that reopens itself every five
+seconds is unusable.
+
+### Device and interface dialogs (`nodes.js`)
+
+`drawIfaceTable` and `drawEventTable` used to hardcode `#nd-if-table` /
+`#nd-ev-table` and read the module-level `view.ifaces` / `view.events`,
+both of which always describe the *selected* device. The device dialog
+shows a device that need not be selected, so both take a target element
+and their data as arguments and the pane and the dialog share one
+renderer rather than growing a second copy that drifts. The dialog fetches
+by id for the same reason.
+
+`interfaceDialog` had the same bug latent in it: it bound `deviceId` from
+`view.selected`, so a port opened from the device dialog would have
+charted whichever device the list happened to have selected. It now takes
+an explicit id.
+
+There is only one `#modal-box`, so opening a port from the device dialog
+replaces it; the port dialog takes an `onBack` callback and grows a
+**Back to device** button, the `confirmDestructive`-style reopen idiom.
+`ifaceTitle` puts the parent device on its own line **inside** the `<h2>`
+so it inherits the heading's size — a line in the body would render as
+`.section` at 11px. The 5s refresh re-sets that whole `<h2>` from
+`ifaceTitle`, so both lines are rebuilt together and cannot drift apart.
+
 ---
 
 ## Alerts
@@ -1075,13 +1197,87 @@ Entity is `entity_kind="dhcp_scope"`, `entity_id="{server_id}:{scope_id}"`,
 and `_device_ip_for` resolves that to the DHCP server's address for
 `{{device_ip}}`.
 
-The streak is the subtle part. Everywhere else `for_polls` counts engine
-ticks, which are Nodes polls in all but name; DHCP is polled every 15
-minutes while the engine ticks every `TICK_S` (5 s), so counting ticks
-would make `for_polls=3` mean 15 seconds. `_dhcp_streaks` therefore holds
-`(last polled_ts, streak)` and only advances the streak when the scope's
-`polled_ts` actually moves — so `for_polls` means DHCP polls, which is
-what an operator reading the label assumes.
+The streak is the subtle part, and this evaluator got it right first.
+`_dhcp_streaks` holds `(last polled_ts, streak)` and only advances the
+streak when the scope's `polled_ts` actually moves, so `for_polls` means
+DHCP polls rather than engine ticks — which matters because DHCP is polled
+every 15 minutes while the engine ticks every `TICK_S` (5 s). As of 4.31.0
+`_evaluate_thresholds` does the same thing; see below for why it had to.
+
+### Threshold streaks and durations (`alertengine._evaluate_thresholds`)
+
+Until 4.31.0 the device threshold evaluator counted **engine ticks**
+against a latched `metric["last_value"]`: it incremented the streak on
+every tick the value was over the threshold, whether or not a new sample
+had arrived. Two consequences, both wrong and both invisible from the
+setting's label. `for_polls = 2` meant ten seconds rather than two polls
+(the engine ticks every 5 s; a device is polled every 60 by default). And
+because the streak never reset while the value sat above the threshold, a
+**single** bad sample satisfied any `for_polls` about ten seconds later
+and went on satisfying it indefinitely — the value had stopped changing
+but nothing compared `last_value` against `last_ts`.
+
+`_breach_streaks` now holds `(last sample ts, streak, first breach ts)`
+per `(rule_id, device_id)` and advances only when `metric["last_ts"]`
+moves, exactly as `_dhcp_streaks` already did. The third element is what
+makes a duration expressible at all: `breach_seconds` is
+`sample_ts - first_breach_ts`, measured **between the samples themselves**
+rather than by wall clock, so a device that stopped being polled cannot
+accumulate breach time while silent. Any sample under the threshold clears
+both.
+
+`rules.for_seconds` (nullable INTEGER, added by `_migrate`'s
+PRAGMA-and-ALTER convention) selects between the two. `evaluate_threshold`
+takes `breach_seconds` as a fourth argument and uses `for_seconds` when it
+is set, `for_polls` when it is NULL — never both, because "two polls AND
+sixty seconds" is a rule nobody can reason about. NULL is the shipped
+value for every rule but `packet_loss_high`, which ships at 60; the
+migration also seeds that 60 onto an existing `alerts.db`, so an upgrade
+gets the sustained behaviour rather than silently keeping the old one.
+`for_seconds` had to be added in four places or it would be dropped
+silently at each: `_migrate`, `_RULE_EDITABLE`, `put_alerts_rule`'s
+allow-list, and `_rule_json`.
+
+### Alert mutes (`alertsdb.py`, `alertengine._muted`)
+
+`alert_mutes(entity_kind, entity_id, until_ts, created_ts, created_by,
+reason)` is a new table, so it lives in the `CREATE TABLE IF NOT EXISTS`
+block beside `PENDING_SCHEMA` rather than in `_migrate` — `_migrate` only
+ever ALTERs tables that already exist. Unique on `(entity_kind,
+entity_id)`, with `mute()` upserting so pressing the button again extends
+a mute instead of failing on the index.
+
+The gate is in `_tick`, beside `_hold_for_new_device`, **not** in
+`_apply`. A mute is per device, not per rule, so it belongs where one
+check covers an occurrence rather than where one check covers a
+(rule, occurrence) pair. `_occurrence_device` already resolves both
+`entity_kind="device"` and `entity_kind="interface"` to a device row and
+returns None for everything structurally outside Nodes, so a muted
+switch's ports go quiet with it and syslog/trap/IPAM/AP occurrences
+cannot be muted by a device mute — a property of the lookup rather than a
+list of exemptions to maintain. The active mutes are read once per tick
+into a dict, and the per-occurrence check short-circuits on that dict
+being empty, which is the normal case.
+
+A mute suppresses **new** alerts and their emails and deliberately leaves
+open alerts alone. The CLEARS pairings live in the drains, which run
+before the gate, so an alert opened before the mute still resolves when
+its cause clears — the list stays truthful whatever the mute says. What
+the mute adds there is `_notify_clear`'s own check (`_muted_alert`, its
+own lookup because the drains run before `_tick` reads the per-tick dict):
+the resolution lands, the email does not, because "muted" has to mean the
+operator's inbox goes quiet or it has silenced only half of what it
+promised. Nothing has to un-suppress when one lapses: thresholds
+re-derive from live metrics on the next tick and a still-down device keeps
+recording events. Expired rows read as "not muted" from `until_ts` alone
+(the reads are on the hot path); `prune()` deletes them on the
+housekeeping pass so the table does not grow a row per mute ever set.
+`MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
+silence a device until next year.
+
+The Nodes device list and single-device endpoints carry `muted_until`
+from `alerts_db`, because a mute nobody can see is a mute somebody will
+spend an afternoon looking for.
 
 ### Syslog severity matching (`alertrules.py`, `alertengine.py`)
 
@@ -2858,6 +3054,33 @@ so the list could show `cisco` for a device that backs up as `hp`. The row now
 carries `effective_vendor` resolved the same way the worker resolves it, plus
 `vendor_is_override` so the column can mark it, and the vendor filter matches
 on that field. One resolution rule, in two places that agree.
+
+### Bulk settings and bulk backups (`api.py`, `configrx.js`)
+
+`post_configrx_devices_bulk_config`'s allow-list omitted `ssh_username`,
+which the database layer had always permitted (`DEVICE_CONFIG_EDITABLE`).
+The consequence was a bulk settings dialog that could set everything about
+a batch of switches except who to log in as, which is why the pre-4.31
+bulk dialog was credential-only and lived beside the single-device one.
+It is in the allow-list now, and one dialog covers both.
+
+Every field in the bulk dialog is opt-in — a select with a *Leave
+unchanged* option, or a blank input — and only the keys actually set are
+put in the request body, so a bulk form cannot silently rewrite settings
+you did not come here to change. `backup_enabled` is a genuine three-way
+choice; the old dialog's checkbox could only ever turn it **on**, because
+"unchecked" had to mean "leave alone" and so could never mean "off".
+
+`post_configrx_devices_bulk_backup` mirrors `post_nodes_devices_bulk_poll`:
+id lists back, not counts, because "9 of 12 queued" leaves the operator to
+work out which three. It has a fourth bucket Nodes has no counterpart to,
+`not_enabled`, for the `backup_enabled` guard — a device with backups
+switched off is skipped deliberately rather than backed up anyway. The
+worker being stopped raises `NotRunning` **once for the whole request**,
+not per device: it is one fact about the server, not twelve facts about
+twelve switches. The button settles off the POST result with no watch
+loop, the way `bulkPollNow` does — the device rows already carry
+`backing_up`/`backup_queued`, so the list itself shows progress.
 
 ### Which paramiko is loaded (`configrx.py`)
 

@@ -67,7 +67,8 @@
 
   <div id="nodes-sub-devices" class="subpage active">
     <div class="bar wrap">
-      <label>Find <input id="nd-q" size="20"></label>
+      <label>Find <input id="nd-q" size="20"
+        title="Name, IP, sysName, or a MAC address in any notation"></label>
       <label>Profile <select id="nd-filter-group"></select></label>
       <label>Group <select id="nd-filter-devgroup"></select></label>
       <label>Status <select id="nd-filter-status">
@@ -81,6 +82,10 @@
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="nd-count" class="hint"></span>
     </div>
+    <!-- What a MAC-address search resolved to. Its own line rather than
+         inside the filter bar: it can name several ports, and it must not
+         push the filters around as it appears and disappears. -->
+    <div class="bar wrap" id="nd-mac-note" hidden></div>
     <div class="bar wrap" id="nd-bulk-bar" hidden>
       <span id="nd-bulk-count" class="hint"></span>
       <button id="nd-bulk-poll">Poll now</button>
@@ -107,7 +112,7 @@
             <button id="nd-edit-device">Edit</button>
             <button id="nd-remove-device">Remove</button>
           </div>
-          <div id="nd-d-summary" class="hint"></div>
+          <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The range picker drives the status timeline. Per-metric
                bandwidth charting lives in the per-port dialog (click an
                interface below), not here. -->
@@ -701,7 +706,8 @@
        shown. Same shape as the Nodes bulk bar. -->
   <div class="bar wrap" id="cx-bulk-bar" hidden>
     <span id="cx-bulk-count" class="hint"></span>
-    <button id="cx-bulk-credential" data-requires-write="configrx">Set SSH credential</button>
+    <button id="cx-bulk-settings" data-requires-write="configrx">Settings for selected</button>
+    <button id="cx-bulk-backup" data-requires-write="configrx">Back up selected</button>
     <span class="grow"></span>
     <button id="cx-bulk-clear">Clear selection</button>
   </div>

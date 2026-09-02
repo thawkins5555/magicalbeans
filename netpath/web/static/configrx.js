@@ -188,38 +188,119 @@
     if (n) App.el('cx-bulk-count').textContent = `${n} selected`;
   }
 
-  function bulkSetCredential() {
+  /* Everything the single-device settings dialog covers, applied to every
+     ticked device at once. Supersedes the credential-only bulk dialog: an
+     operator setting up a batch of switches needs the vendor override and
+     the enabled flag as much as the login, and two dialogs that overlap by
+     three fields is how they drift apart.
+
+     Every field is opt-in — a select or a blank box that means "leave this
+     alone" — because a bulk form whose defaults silently rewrite settings
+     you did not come here to change is a trap. backup_enabled in particular
+     is a real tri-state now: the old dialog could only ever turn it ON. */
+  function bulkSettings() {
     const ids = [...view.devicesChecked];
     if (!ids.length) return;
-    App.modal(`Set SSH credential for ${ids.length} device(s)`, `
-      <p class="hint">Applies the same username and password to every selected
-        device — the common case for a batch of switches sharing one local
-        SSH account.</p>
+    App.modal(`ConfigRX settings for ${ids.length} device(s)`, `
+      <p class="hint">Only the fields you set are changed. Leave a box blank
+        or a dropdown on <b>Leave unchanged</b> and those devices keep what
+        they have.</p>
+      <fieldset><legend>BACKUP</legend>
+        <label>Back up these devices <select id="cx-bulk-enabled">
+          <option value="">Leave unchanged</option>
+          <option value="1">Yes — back them up</option>
+          <option value="0">No — stop backing them up</option>
+        </select></label>
+        <label>Vendor override <input id="cx-bulk-vendor"
+          placeholder="leave blank to leave unchanged"></label>
+        <p class="hint">Recognized values: cisco, fortinet, juniper, mikrotik,
+          hp, aruba. Setting this replaces whatever each device had; to clear
+          it back to the vendor Nodes detected, use the single-device dialog.</p>
+      </fieldset>
       <fieldset><legend>SSH CREDENTIAL</legend>
-        <label>Port <input id="cx-bulk-port" type="number" min="1" max="65535" value="22"></label>
-        <label>Username <input id="cx-bulk-username"></label>
-        <label>Password <input id="cx-bulk-password" type="password"></label>
-        <label class="check"><input type="checkbox" id="cx-bulk-enabled" checked>
-          Also enable backup for these devices</label>
+        <label>Port <input id="cx-bulk-port" type="number" min="1" max="65535"
+          placeholder="leave blank to leave unchanged"></label>
+        <label>Username <input id="cx-bulk-username"
+          placeholder="leave blank to leave unchanged"></label>
+        <label>Password <input id="cx-bulk-password" type="password"
+          placeholder="leave blank to keep each device's own"></label>
+        <p class="hint">A password is stored only when a username is given with
+          it — the pair is what gets encrypted, and half of one would lock the
+          batch out. Stored encrypted and never shown again.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
         const username = m.querySelector('#cx-bulk-username').value.trim();
         const password = m.querySelector('#cx-bulk-password').value;
-        if (!username || !password) { alert('A username and password are required'); return; }
-        await App.post('/api/configrx/devices/bulk-credential',
-          { device_ids: ids, ssh_username: username, ssh_password: password });
-        const configFields = { device_ids: ids, ssh_port: Number(m.querySelector('#cx-bulk-port').value) };
-        // Only touch backup_enabled when the box is checked — leaving it
-        // unchecked must not silently disable backup for devices that
-        // already had it on.
-        if (m.querySelector('#cx-bulk-enabled').checked) configFields.backup_enabled = true;
-        await App.post('/api/configrx/devices/bulk-config', configFields);
+        const enabled = m.querySelector('#cx-bulk-enabled').value;
+        const vendor = m.querySelector('#cx-bulk-vendor').value.trim();
+        const port = m.querySelector('#cx-bulk-port').value.trim();
+        if (password && !username) {
+          alert('A username is required with a password.');
+          return;
+        }
+        const fields = { device_ids: ids };
+        if (enabled !== '') fields.backup_enabled = enabled === '1';
+        if (vendor) fields.vendor_override = vendor;
+        if (port) fields.ssh_port = Number(port);
+        if (username) fields.ssh_username = username;
+        // The credential POST encrypts the pair; the config POST stores the
+        // rest. Both are optional, so a dialog where nothing was filled in
+        // changes nothing rather than erroring.
+        if (username && password) {
+          await App.post('/api/configrx/devices/bulk-credential',
+            { device_ids: ids, ssh_username: username, ssh_password: password });
+        }
+        if (Object.keys(fields).length > 1) {
+          await App.post('/api/configrx/devices/bulk-config', fields);
+        }
         App.closeModal();
         view.devicesChecked.clear();
         await App.refreshNow('configrx');
       } },
     ]);
+  }
+
+  /* Back up every ticked device now. Settles off the POST result rather
+     than watching, the way Nodes' bulk Poll now does: the device rows
+     already carry backing_up/backup_queued, so the list itself shows
+     progress and a second watch loop would only duplicate it. */
+  async function bulkBackupNow() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    const button = App.el('cx-bulk-backup');
+    if (button.disabled) return;
+    const settle = (text) => {
+      button.disabled = false;
+      button.textContent = text;
+      if (text !== 'Back up selected') {
+        setTimeout(() => {
+          if (button.textContent === text) button.textContent = 'Back up selected';
+        }, 4000);
+      }
+    };
+    button.disabled = true;
+    button.textContent = 'Queueing…';
+    let result;
+    try {
+      result = await App.post('/api/configrx/devices/bulk-backup',
+                              { device_ids: ids });
+    } catch (error) {
+      // The worker being stopped is one fact about the server, and the API
+      // says it once for the whole request rather than per device.
+      settle('Failed');
+      alert(error.message);
+      return;
+    }
+    const queued = (result.queued || []).length;
+    const busy = (result.already_queued || []).length;
+    const off = (result.not_enabled || []).length;
+    const parts = [];
+    if (queued) parts.push(`${queued} queued`);
+    if (busy) parts.push(`${busy} already queued`);
+    if (off) parts.push(`${off} not enabled`);
+    settle(parts.length ? parts.join(', ') : 'Nothing to back up');
+    await App.refreshNow('configrx');
   }
 
   async function selectDevice(deviceId) {
@@ -560,7 +641,8 @@
       view.backupsChecked.clear();
       drawBackups();
     };
-    App.el('cx-bulk-credential').onclick = bulkSetCredential;
+    App.el('cx-bulk-settings').onclick = bulkSettings;
+    App.el('cx-bulk-backup').onclick = bulkBackupNow;
     App.el('cx-settings').onclick = settingsDialog;
     App.el('cx-device-settings').onclick = deviceSettingsModal;
     /* Backing up with the worker stopped used to report success and do

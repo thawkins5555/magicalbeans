@@ -20,7 +20,11 @@
     templates: [],
     templatesSelected: null,
     hist: null,
+    // device entity_id -> until_ts, refreshed with the rest of the page.
+    mutes: new Map(),
   };
+
+  const MUTE_HOURS = [1, 6, 12, 24];
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -265,9 +269,28 @@
     el.hidden = false;
     const rows = view.rules.length ? view.rules : [];
     const rule = rows.find((r) => r.id === row.rule_id);
+    // Only a Nodes device can be muted; entity_id is already its device id.
+    // Checked against canWrite here rather than tagged data-requires-write,
+    // because applyPermissions only ever runs over markup that already
+    // exists — see the note on it in app.js.
+    const muteable = row.entity_kind === 'device' && row.entity_id
+      && App.canWrite('alerts');
+    const mutedUntil = row.entity_kind === 'device'
+      ? view.mutes.get(String(row.entity_id)) : null;
+    let muteHtml = '';
+    if (mutedUntil) {
+      muteHtml = `<span class="hint" id="alerts-d-muted">Muted until ` +
+        `${escape(new Date(mutedUntil * 1000).toLocaleTimeString())}</span>` +
+        (muteable ? `<button id="alerts-d-unmute">Lift mute</button>` : '');
+    } else if (muteable) {
+      muteHtml = `<select id="alerts-d-mute-hours" title="How long to silence new alerts for this device">` +
+        MUTE_HOURS.map((h) => `<option value="${h}">${h} hour${h === 1 ? '' : 's'}</option>`).join('') +
+        `</select><button id="alerts-d-mute">Mute device</button>`;
+    }
     el.innerHTML = `
       <div class="bar"><span class="section sev sev-${row.severity}">${escape(row.severity_name)}</span>
         <span class="grow"></span>
+        ${muteHtml}
         ${row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
         ${row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}</div>
       <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
@@ -289,6 +312,19 @@
     const ackBtn = document.getElementById('alerts-d-ack');
     if (ackBtn) ackBtn.onclick = async () => {
       await App.post(`/api/alerts/${row.id}/ack`, {});
+      App.refreshNow('alerts');
+    };
+    const muteBtn = document.getElementById('alerts-d-mute');
+    if (muteBtn) muteBtn.onclick = async () => {
+      const hours = Number(App.el('alerts-d-mute-hours').value) || 1;
+      await App.post('/api/alerts/mute', {
+        entity_kind: 'device', entity_id: String(row.entity_id), hours });
+      App.refreshNow('alerts');
+    };
+    const unmuteBtn = document.getElementById('alerts-d-unmute');
+    if (unmuteBtn) unmuteBtn.onclick = async () => {
+      await App.del('/api/alerts/mute', {
+        entity_kind: 'device', entity_id: String(row.entity_id) });
       App.refreshNow('alerts');
     };
     App.get(`/api/alerts/${row.id}`).then((full) => {
@@ -347,6 +383,18 @@
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
       <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>
+      ${r.kind === 'threshold' ? `
+      <label>Or: sustained for <input id="ar-forseconds" type="number" min="0"
+        placeholder="off" value="${r.for_seconds ?? ''}"> seconds</label>
+      <p class="hint">Blank counts polls, as above. A number here requires the
+        breach to have lasted that long in real polling time instead —
+        measured between the samples themselves, so a device that stopped
+        being polled cannot accumulate time while silent.</p>
+      ${r.key === 'packet_loss_high' ? `<p class="hint">Loss is quantised by
+        Nodes&nbsp;&rarr;&nbsp;Settings&nbsp;&rarr;&nbsp;<b>Ping probes per
+        poll</b>: at the default of 3 the only measurable values are 0, 33, 67
+        and 100&nbsp;%, so any threshold from 1 to 33 means "one probe of three
+        lost". Raise the probe count for a finer threshold.</p>` : ''}` : ''}
       ${isFlapping ? `
       <label>Flaps before firing <input id="ar-flapcount" type="number" min="2"
         placeholder="3" value="${r.flap_min_transitions ?? ''}"></label>
@@ -373,6 +421,14 @@
           values.threshold = Number(box.querySelector('#ar-threshold').value);
           values.clear_threshold = Number(box.querySelector('#ar-clear').value);
           values.for_polls = Number(box.querySelector('#ar-forpolls').value);
+          const seconds = box.querySelector('#ar-forseconds');
+          if (seconds) {
+            // Blank (and 0) mean NULL — "count polls" — the same
+            // blank-is-the-shipped-default the flapping fields use.
+            const text = seconds.value.trim();
+            values.for_seconds = text === '' || Number(text) === 0
+              ? null : Number(text);
+          }
         }
         if (isFlapping) {
           // Blank means NULL — "use the shipped defaults" — not zero, which
@@ -713,19 +769,25 @@
     const span = t1 - t0;
     const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
     const f = filters();
-    const [overview, list, rules, templates] = await Promise.all([
+    const [overview, list, rules, templates, mutes] = await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', f),
       App.get('/api/alerts/rules'),
       App.get('/api/alerts/templates'),
+      App.get('/api/alerts/mutes'),
     ]);
     view.hist = overview.buckets;
     view.alerts = list.alerts;
     view.rules = rules.rules;
     view.templates = templates.templates;
+    // entity_id -> until_ts, for the devices with an active mute. The server
+    // only ever returns unexpired ones, so presence here means muted.
+    view.mutes = new Map(mutes.mutes.filter((m) => m.entity_kind === 'device')
+      .map((m) => [String(m.entity_id), m.until_ts]));
     view.checked = new Set([...view.checked].filter((id) =>
       view.alerts.some((a) => a.id === id)));
-    if (view.selected && !view.alerts.some((a) => a.id === view.selected)) {
+    const current = view.alerts.find((a) => a.id === view.selected);
+    if (view.selected && !current) {
       view.selected = null;
       App.el('alerts-detail-empty').hidden = false;
       App.el('alerts-detail').hidden = true;
@@ -733,6 +795,10 @@
     fillRuleFilter();
     drawHistogram();
     drawTable();
+    // Re-render the open detail from the row we just fetched, so its state
+    // and the device's mute stay true without a click. Only after
+    // drawTable(), which owns the row highlight.
+    if (current) showDetail(current);
     drawRulesTable();
     drawTemplatesTable();
   }

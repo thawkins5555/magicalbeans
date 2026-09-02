@@ -6,6 +6,77 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.31.0 — Mute a device, sustain a threshold, find a MAC
+
+- **A poll overrun on a device that is not answering is no longer reported.**
+  An overrun is recorded when the previous poll is still running as the next
+  falls due — which is exactly what a device that stopped answering causes,
+  because every request in that poll spends its full timeout and its retries.
+  Worse, it fires *first*: a device takes three completed failing polls to be
+  marked down, so the overruns led the outage by two or three intervals and
+  the first one got out before anything suppressed it. Now nothing is recorded
+  at all — no alert, no event row, no Debug line — while the device is down or
+  its last poll failed. An overrun alert raised in the moments before the
+  outage is absorbed by "Device not responding" like the other polled-metric
+  alerts.
+- **A device's alerts can be muted for 1, 6, 12 or 24 hours.** The button sits
+  beside Resolve and Acknowledge in the alert detail. A mute stops what happens
+  next — new alerts and their emails — and leaves alerts already open in the
+  list to be worked normally; nothing has to un-suppress when it lapses,
+  because thresholds re-derive from live metrics and a still-down device keeps
+  recording events. Muting a switch silences its ports with it. A muted device
+  is marked in the Nodes device list and its detail header, because a mute
+  nobody can see is a mute somebody will spend an afternoon looking for.
+- **Packet loss must now be sustained for 60 seconds before it alerts**, and
+  the duration is adjustable per rule alongside the existing threshold. With
+  the default of three ping probes per poll, measured loss can only ever be 0,
+  33, 67 or 100 %, so a single lost probe used to raise an alert; the rule
+  dialog now says so and points at the setting that changes it.
+- **Fixed: "consecutive polls before firing" counted engine ticks, not polls.**
+  The alert engine ticks every five seconds and a device is polled every sixty,
+  so `for_polls = 2` meant "ten seconds" — and, because the streak advanced
+  whether or not a new sample had arrived, one bad reading satisfied it about
+  ten seconds later and went on satisfying it forever. The streak now advances
+  only when the metric's own timestamp moves, which is what the setting always
+  claimed. (The DHCP evaluator already worked this way; the device one now
+  matches it.)
+- **Double-clicking a device row opens that device in a dialog**, with its
+  identity, its interfaces and its event log — for the device you double-clicked,
+  which need not be the one selected in the pane. Opening a port from it charts
+  that device, and offers a way back to the dialog it came from. Single click
+  still just moves the detail pane.
+- **The interface dialog names its parent device above the port**, on its own
+  line and in the same size font.
+- **Browse OIDs can download a device's entire SNMP walk.** The subtree browser
+  deliberately stops at 600 rows and 20 seconds because somebody is waiting on
+  it; a whole switch is tens of thousands of objects and minutes of SNMP. This
+  runs as a background job instead, showing a live object count with a Cancel,
+  and writes the file when it finishes. The file's header states the device,
+  the time, and whether the walk completed or was cut short and why — a
+  truncated walk that looks complete is the failure worth avoiding. Cancelling
+  keeps what was read rather than throwing it away.
+- **Devices can be found by MAC address.** Type an address into the Nodes Find
+  box in any notation — `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
+  `aabb.ccdd.eeff` or bare hex, or just the first few octets — and the list
+  filters to the switches that have learned it. One switch and one port opens
+  that port's dialog outright; several ports are named as a shortlist rather
+  than one being picked, because a MAC on an uplink is on every switch between
+  here and the host.
+- **Learning MAC addresses is opt-in and separately paced.** Forwarding tables
+  are not read on the poll cycle — they are hundreds to thousands of rows per
+  switch — but on their own `Learn MAC addresses every N seconds` interval, set
+  per polling profile or per device. It is **0 (off) by default**, so an
+  upgrade adds no SNMP load anywhere until you ask for it. Entries a walk has
+  not refreshed for a week are dropped, so a MAC that moved does not answer
+  twice forever.
+- **ConfigRX gained bulk settings and bulk backups.** The old bulk dialog could
+  only set an SSH username and password, and could only ever turn backups *on*.
+  The replacement covers everything the single-device dialog does — enabled as
+  a real three-way choice, SSH port, username, password, vendor override — with
+  every field defaulting to "leave unchanged", and **Back up selected** queues
+  every ticked device, reporting which were queued, which were already queued
+  and which have backups switched off.
+
 ### 4.30.0 — Tables you can shape, identity you can point at an OID
 
 - **Vendor and Location can be read from an OID you choose.** Vendor was

@@ -144,6 +144,29 @@ CREATE TABLE IF NOT EXISTS interfaces (
 );
 CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);
 
+-- Forwarding-database entries: which MAC addresses each switch port has
+-- learned. Stored so "find the port this MAC is on" is a query rather than
+-- a live walk of every switch in the estate — the same address can sit on
+-- every switch between here and the host, so a search has to be able to
+-- see them all at once.
+--
+-- Filled on its own schedule (mac_table_interval_s, 0 = off, off by
+-- default), never on the poll cycle: a forwarding table is a walk of
+-- hundreds to thousands of rows per switch and belongs nowhere near a
+-- 60-second poll. `mac` is stored normalised — lowercase hex, no
+-- separators — so one stored form answers ':', '-', '.' and bare-hex
+-- searches alike; see normalize_mac.
+CREATE TABLE IF NOT EXISTS mac_entries (
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    if_index        INTEGER NOT NULL,
+    mac             TEXT NOT NULL,
+    vlan            TEXT NOT NULL DEFAULT '',
+    seen_ts         REAL NOT NULL,
+    PRIMARY KEY (device_id, if_index, mac, vlan)
+);
+CREATE INDEX IF NOT EXISTS ix_mac_entries_mac ON mac_entries(mac);
+CREATE INDEX IF NOT EXISTS ix_mac_entries_seen ON mac_entries(seen_ts);
+
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -308,22 +331,75 @@ DEFAULTS = {
     # and survives Reset layout, which clears per-browser column widths
     # but must not eat a settings choice.
     "table_columns_ifaces": "",
+    # Bounds on "download the entire SNMP walk" from the OID browser. Far
+    # larger than the browser's own subtree caps because this one runs as a
+    # background job with a progress count and a cancel, not in a dialog
+    # somebody is waiting on — but still real bounds, so a device with a
+    # looping agent cannot walk forever. The downloaded file states which
+    # bound stopped it, if either did.
+    "oid_walk_max_rows": 100_000,
+    "oid_walk_budget_s": 600.0,
+    # How long a learned MAC stays searchable after the last walk that saw
+    # it. A device dropped from the walk schedule stops refreshing its
+    # entries, and after this they are dropped rather than answering
+    # searches with a table nobody has confirmed since.
+    "mac_table_retention_days": 7.0,
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
-                     "unreachable_ping_only", "vendor_oid", "location_oid")
+                     "unreachable_ping_only", "vendor_oid", "location_oid",
+                     "mac_table_interval_s")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
-                   "unreachable_ping_only", "vendor_oid", "location_oid")
+                   "unreachable_ping_only", "vendor_oid", "location_oid",
+                   "mac_table_interval_s")
 
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
                     "enabled") + _OVERRIDE_COLUMNS
+
+
+# The separators a MAC address is written with in the wild. '.' covers the
+# Cisco aabb.ccdd.eeff form; space covers a paste out of a spreadsheet.
+_MAC_SEPARATORS = ":-. \t"
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def normalize_mac(text) -> str:
+    """A MAC (or the start of one) as stored: lowercase hex, no separators.
+
+    Accepts every form the field sees — AA-BB-CC-DD-EE-FF, aa:bb:cc:dd:ee:ff,
+    aabb.ccdd.eeff, aabbccddeeff — and returns "" for anything that is not a
+    MAC or a prefix of one, so a caller can use the empty string to mean
+    "that was not a MAC". Prefixes are deliberately allowed: searching for
+    the first three octets of a vendor's OUI is a normal thing to want.
+    """
+    cleaned = "".join(c for c in str(text or "") if c not in _MAC_SEPARATORS)
+    if not cleaned or len(cleaned) > 12:
+        return ""
+    if any(c not in _HEX for c in cleaned):
+        return ""
+    return cleaned.lower()
+
+
+def looks_like_mac_search(text) -> str:
+    """normalize_mac, but refusing text that is plainly an IP address.
+
+    "10.0.0.5" normalises to "10005", which is valid hex and would quietly
+    turn an address search into a MAC-prefix search. Digits-and-dots only is
+    an address in every case that matters here; a genuinely all-numeric MAC
+    typed with dots is rare enough to be worth losing next to searching by
+    IP, which people do constantly.
+    """
+    raw = str(text or "").strip()
+    if raw and all(c.isdigit() or c == "." for c in raw):
+        return ""
+    return normalize_mac(raw)
 
 
 def detected_vendor(device_row) -> str:
@@ -394,6 +470,11 @@ class NodesDatabase:
             if column not in devices:
                 self._conn.execute(
                     f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
+        # Seconds between forwarding-table walks; 0 (the shipped default)
+        # means never. NULL keeps meaning "inherit the profile".
+        if "mac_table_interval_s" not in devices:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN mac_table_interval_s INTEGER")
         # Identity OIDs: when set, the poller reads the device's vendor and
         # location from these instead of deriving vendor from sysObjectID and
         # reading sysLocation. NULL/"" keeps today's behaviour exactly, which
@@ -439,7 +520,8 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE groups ADD COLUMN mib_file_id INTEGER"
                 " REFERENCES mib_files(id) ON DELETE SET NULL")
-        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only"):
+        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only",
+                       "mac_table_interval_s"):
             if column not in groups:
                 self._conn.execute(
                     f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
@@ -736,8 +818,21 @@ class NodesDatabase:
             # two are meant to be layerable rather than redundant.
             clauses.append("status != 'up'")
         if text:
-            clauses.append("(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?)")
-            params.extend([f"%{text}%"] * 3)
+            # A MAC search matches the stored forwarding tables as well as
+            # the device's own fields, so typing an address a switch has
+            # learned filters the list down to the switches that see it.
+            # Only from four hex digits: fewer would match half the estate
+            # and turn a search into a shuffle.
+            mac = looks_like_mac_search(text)
+            if len(mac) >= 4:
+                clauses.append(
+                    "(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?"
+                    " OR id IN (SELECT device_id FROM mac_entries"
+                    "           WHERE mac LIKE ?))")
+                params.extend([f"%{text}%"] * 3 + [f"{mac}%"])
+            else:
+                clauses.append("(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?)")
+                params.extend([f"%{text}%"] * 3)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             return self._conn.execute(
@@ -894,6 +989,11 @@ class NodesDatabase:
         if config.get("unreachable_ping_only") is None:
             config["unreachable_ping_only"] = \
                 1 if settings.get("unreachable_ping_only", True) else 0
+        # 0, not a global setting, is the fallback: learning forwarding
+        # tables is opt-in per profile, so an upgrade adds no SNMP load
+        # anywhere until somebody asks for it.
+        if config.get("mac_table_interval_s") is None:
+            config["mac_table_interval_s"] = 0
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -993,6 +1093,72 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM interfaces WHERE device_id = ? ORDER BY if_index",
                 (device_id,)).fetchall()
+
+    # ------------------------------------------------ forwarding tables
+
+    def replace_mac_entries(self, device_id: int, entries: list[dict]) -> int:
+        """Replace everything this device has learned with `entries`
+        ({if_index, mac, vlan}). Wholesale rather than merged, because a MAC
+        that has aged out of the switch must age out here too — a stale row
+        would send somebody to the wrong port, which is worse than having no
+        answer at all. The MAC is normalised on the way in, so every stored
+        row is in one form regardless of how the source spelled it."""
+        now = time.time()
+        rows = []
+        for entry in entries:
+            mac = normalize_mac(entry.get("mac"))
+            if len(mac) != 12:
+                continue
+            rows.append((device_id, int(entry["if_index"]), mac,
+                         str(entry.get("vlan") or ""), now))
+        with self._lock:
+            self._conn.execute("DELETE FROM mac_entries WHERE device_id = ?",
+                               (device_id,))
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO mac_entries(device_id, if_index, mac,"
+                " vlan, seen_ts) VALUES (?,?,?,?,?)", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def mac_locations(self, mac_prefix: str, limit: int = 200) -> list[sqlite3.Row]:
+        """Every (device, port) a MAC starting with this prefix was learned
+        on, newest first. A MAC on an uplink is on every switch between here
+        and the host, so this returns them all and lets the caller decide —
+        picking one silently is how you send an engineer to the core switch
+        for a problem on an access port."""
+        prefix = normalize_mac(mac_prefix)
+        if len(prefix) < 4:
+            return []
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.*, i.descr AS if_descr FROM mac_entries m"
+                " LEFT JOIN interfaces i ON i.device_id = m.device_id"
+                "   AND i.if_index = m.if_index"
+                " WHERE m.mac LIKE ? ORDER BY m.seen_ts DESC, m.device_id,"
+                " m.if_index LIMIT ?", (f"{prefix}%", int(limit))).fetchall()
+
+    def mac_entries_for(self, device_id: int,
+                        if_index: int | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM mac_entries WHERE device_id = ?"
+        args: list = [device_id]
+        if if_index is not None:
+            sql += " AND if_index = ?"
+            args.append(if_index)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY mac, vlan", args).fetchall()
+
+    def prune_mac_entries(self, older_than_s: float) -> int:
+        """Drop entries nothing has refreshed for this long. A device taken
+        out of the walk schedule (or out of service) would otherwise keep
+        answering searches with a forwarding table nobody has confirmed
+        since."""
+        if older_than_s <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM mac_entries WHERE seen_ts < ?",
+                                     (time.time() - older_than_s,))
+            self._conn.commit()
+        return cur.rowcount or 0
 
     def replace_interfaces(self, device_id: int, rows: list[dict]) -> dict:
         """Wholesale replace of a device's interface table each poll cycle.
