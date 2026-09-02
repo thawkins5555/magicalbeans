@@ -206,6 +206,92 @@ def _ago(ts: float) -> str:
     return f"{age / 3600:.1f}h ago"
 
 
+class _OidWalkJob:
+    """A whole-device SNMP walk, run on its own thread.
+
+    Its own thread rather than the poll pool: a full walk of a core switch
+    is tens of thousands of GETNEXTs and minutes of wall time, and parking
+    one of four poll workers on it for that long would stall the devices
+    behind it. Exactly one runs per device at a time — a second request
+    while one is running is refused politely, the way backup_now does.
+    """
+
+    def __init__(self, poller, device_id: int, base: str, max_rows: int,
+                 budget_s: float):
+        self.poller = poller
+        self.device_id = device_id
+        self.base = base
+        self.max_rows = max_rows
+        self.budget_s = budget_s
+        self.rows: list[dict] = []
+        self.state = "starting"      # starting|running|done|failed
+        self.stopped = ""
+        self.error = ""
+        self.started_ts = time.time()
+        self.finished_ts: float | None = None
+        self.device_label = ""
+        self._count = 0              # read without the lock by status()
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.state in ("starting", "running")
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name=f"oid-walk-{self.device_id}", daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def status(self, with_rows: bool = False) -> dict:
+        elapsed = (self.finished_ts or time.time()) - self.started_ts
+        result = {"device_id": self.device_id, "state": self.state,
+                  "rows": self._count, "elapsed": elapsed,
+                  "stopped": self.stopped, "error": self.error,
+                  "base": self.base, "started_ts": self.started_ts,
+                  "complete": self.stopped == "end of subtree",
+                  "device_label": self.device_label}
+        if with_rows:
+            result["walk"] = list(self.rows)
+        return result
+
+    def _run(self) -> None:
+        try:
+            device = self.poller.db.device(self.device_id)
+            if device is None:
+                raise ValueError("No such device")
+            self.device_label = device["sys_name"] or device["name"] or device["ip"]
+            config = self.poller.working_config(device)
+            if not config.get("snmp_enabled", True):
+                raise ValueError("SNMP is disabled for this device")
+            self.state = "running"
+
+            # Progress only: _walk_from owns the list and hands it back
+            # whole below, so a status() mid-walk reports a count without
+            # racing a list another thread is appending to.
+            def note(_row):
+                self._count += 1
+
+            rows, stopped = self.poller._walk_from(
+                device, config, self.base, self.max_rows, self.budget_s,
+                cancelled=self._cancel.is_set, on_row=note)
+            self.rows = rows
+            self._count = len(rows)
+            self.stopped = stopped
+            self.state = "done"
+        except Exception as exc:                      # a job thread must not die quietly
+            self.error = str(exc) or exc.__class__.__name__
+            self.state = "failed"
+            self.poller.log.add(
+                ERROR, f"OID walk failed for device #{self.device_id}: {self.error}",
+                detail=traceback.format_exc())
+        finally:
+            self.finished_ts = time.time()
+
+
 class NodePoller:
     def __init__(self, db: NodesDatabase, log=None):
         self.db = db
@@ -220,8 +306,19 @@ class NodePoller:
         # device_id -> when it was last pinged, so ping_interval_s can
         # decouple ICMP probing from the SNMP poll cadence.
         self._last_ping: dict[int, float] = {}
+        # device_id -> when its forwarding table was last walked, and which
+        # walks are in flight. Its own cadence, well away from the poll
+        # cycle: a switch's FDB is hundreds to thousands of rows and is
+        # walked at most once per mac_table_interval_s, opt-in per profile.
+        self._next_mac_walk: dict[int, float] = {}
+        self._mac_running: set[int] = set()
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
+        # device_id -> the whole-device OID walk running or last finished for
+        # it. In memory and one-at-a-time per device, the same shape as
+        # _discovery_jobs above: a walk result is transient, downloaded once
+        # and then dropped.
+        self._oid_walks: dict[int, "_OidWalkJob"] = {}
         self._last_completed: float = 0.0
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
@@ -240,7 +337,8 @@ class NodePoller:
         # when the tab is left or the browser closes — no cleanup path.
         self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
-                         "unsupported": 0, "errors": 0, "overruns": 0}
+                         "unsupported": 0, "errors": 0, "overruns": 0,
+                         "mac_walks": 0}
         self.error: str | None = None
 
     @property
@@ -445,7 +543,42 @@ class NodePoller:
                             self._record_overrun(device, now)
                     else:
                         self._submit(device["id"])
+                self._maybe_walk_mac_table(device, config, now)
             self._stop.wait(1.0)
+
+    def _maybe_walk_mac_table(self, device, config: dict, now: float) -> None:
+        """Queue a forwarding-table walk when this device's own interval has
+        come round. Off (0) unless a profile or a device asks for it, so an
+        upgrade adds no SNMP load anywhere until somebody opts in.
+
+        Not started while the device is failing or SNMP-disabled: a walk of
+        hundreds of OIDs against a box that is not answering is the poll
+        overrun problem all over again, at ten times the size.
+        """
+        interval = float(config.get("mac_table_interval_s") or 0)
+        if interval <= 0 or not config.get("snmp_enabled", True):
+            return
+        if device["status"] == "down" or device["consecutive_fail"]:
+            return
+        device_id = device["id"]
+        due = self._next_mac_walk.get(device_id)
+        if due is None:
+            # First seen: spread the first walk over one interval so a
+            # restart does not walk every opted-in switch at once.
+            self._next_mac_walk[device_id] = now + random.uniform(0, interval)
+            return
+        if now < due:
+            return
+        with self._lock:
+            if device_id in self._mac_running:
+                return
+            self._mac_running.add(device_id)
+        self._next_mac_walk[device_id] = now + interval
+        try:
+            self._executor.submit(self._run_mac_table, device_id)
+        except (RuntimeError, AttributeError):
+            with self._lock:
+                self._mac_running.discard(device_id)
 
     def _submit(self, device_id: int) -> bool:
         """True when this call put the device on the pool; False when it was
@@ -463,6 +596,21 @@ class NodePoller:
         return True
 
     def _record_overrun(self, device, now) -> None:
+        """Record that a poll was still running as the next one fell due.
+
+        Not recorded while the device is not answering: a poll that spends
+        its whole budget in timeouts and retries is the configured timeout
+        doing exactly what it was told to, and the outage itself is already
+        reported by device_down. status == "down" catches a formally down
+        device; consecutive_fail > 0 catches the two or three polls before
+        that, which is when the first overrun would otherwise fire — an
+        overrun leads the outage, it does not follow it. Suppressed at
+        source rather than filtered later, so no event row and no Debug
+        line are written either (wirelessdb.out_of_service is the same
+        shape).
+        """
+        if device["status"] == "down" or device["consecutive_fail"]:
+            return
         self.counters["overruns"] += 1
         running_for = now - self._started.get(device["id"], now)
         interval = self.db.effective_config(device)["poll_interval_s"]
@@ -1331,8 +1479,13 @@ class NodePoller:
 
     @staticmethod
     def _fdb_entries(fdb_port: dict, target_ports: set, vlan: str | None,
-                     vlan_indexed: bool) -> list[dict]:
-        """Rows of a forwarding-database column, filtered to one port.
+                     vlan_indexed: bool, port_map: dict | None = None) -> list[dict]:
+        """Rows of a forwarding-database column.
+
+        Filtered to `target_ports` — one port for the interface dialog, or
+        every bridge port for the whole-device walk, which also passes
+        `port_map` (bridge port -> ifIndex) so each entry says which
+        interface learned the address.
 
         Both FDB tables carry the learned MAC in the row's own OID suffix,
         so no second GET is needed for the address column. dot1dTpFdbTable
@@ -1356,10 +1509,19 @@ class NodePoller:
                 mac = ":".join(f"{int(p):02x}" for p in parts[-6:])
             except ValueError:
                 continue
-            entries.append({
+            entry = {
                 "mac": mac,
                 "vlan": (parts[0] if vlan_indexed else vlan) or "",
-            })
+            }
+            if port_map is not None:
+                # Whole-device form: carry which interface learned it. A
+                # bridge port with no ifIndex mapping is dropped rather than
+                # stored against a guess.
+                if_index = port_map.get(int(port))
+                if if_index is None:
+                    continue
+                entry["if_index"] = if_index
+            entries.append(entry)
         return entries
 
     def _bridge_ports_for(self, device, config: dict, if_index: int):
@@ -1502,6 +1664,136 @@ class NodePoller:
             unique.append(entry)
         return unique
 
+    def read_device_mac_table(self, device_id: int) -> list[dict] | None:
+        """Every MAC this switch has learned, and on which interface.
+
+        The whole-device counterpart of read_mac_table above, and the same
+        three sources in the same order — a forwarding table is a forwarding
+        table whether you want one port of it or all of it. What differs is
+        that this is not filtered to one port, so the bridge-port map is
+        needed in full, and that this runs on the mac_table_interval_s
+        schedule rather than while somebody watches a dialog.
+
+        Returns None when the device answers no forwarding table at all,
+        which the caller must not confuse with an empty one: "this switch
+        cannot tell us" and "this switch has learned nothing" are different
+        facts, and only the second should overwrite what we already stored.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.working_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+
+        port_map = self._bridge_port_map(device, config)
+        is_cisco = detected_vendor(device).lower() == "cisco"
+        answered = bool(port_map)
+
+        entries = []
+        if port_map:
+            ports = set(port_map)
+            entries = self._fdb_entries(
+                self._walk_column(device, config, self._DOT1Q_FDB_PORT),
+                ports, None, True, port_map)
+            if not entries:
+                entries = self._fdb_entries(
+                    self._walk_column(device, config, self._DOT1D_FDB_PORT),
+                    ports, None, False, port_map)
+        if not entries and is_cisco:
+            entries, cisco_answered = self._cisco_vlan_device_fdb(
+                device, config, port_map)
+            answered = answered or cisco_answered
+        if not answered:
+            return None
+
+        seen = set()
+        unique = []
+        for entry in sorted(entries, key=lambda e: (e["if_index"], e["mac"],
+                                                    e["vlan"])):
+            key = (entry["if_index"], entry["mac"], entry["vlan"])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(entry)
+        return unique
+
+    def _bridge_port_map(self, device, config: dict) -> dict:
+        """bridge port -> ifIndex, for every port the device reports."""
+        base_port_if_index = self._walk_column(
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+        mapping = {}
+        for suffix, value in base_port_if_index.items():
+            try:
+                mapping[int(suffix)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return mapping
+
+    def _cisco_vlan_device_fdb(self, device, config: dict, port_map: dict):
+        """The whole device's forwarding table out of classic IOS per-VLAN
+        contexts — the community@vlan path read_mac_table already needs,
+        without the per-port filter. Bounded in VLAN count and wall clock
+        for the same reason: a trunk switch can carry hundreds of VLANs."""
+        if int(config.get("snmp_version") or 1) == 3:
+            return [], False
+        community = config.get("community")
+        if not community:
+            return [], False
+        vlan_states = self._walk_column(device, config, self._VTP_VLAN_STATE)
+        vlans = []
+        for suffix, state in vlan_states.items():
+            try:
+                if int(state) != 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            vlan = suffix.split(".")[-1]
+            if vlan.isdigit() and not (1002 <= int(vlan) <= 1005):
+                vlans.append(vlan)
+        entries = []
+        answered = False
+        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
+            if time.time() > deadline:
+                break
+            scoped = {**config, "community": f"{community}@{vlan}"}
+            mapping = port_map
+            if not mapping:
+                mapping = self._bridge_port_map(device, scoped)
+                answered = answered or bool(mapping)
+                if not mapping:
+                    continue
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            entries.extend(self._fdb_entries(
+                fdb_port, set(mapping), vlan, False, mapping))
+        return entries, answered
+
+    def _run_mac_table(self, device_id: int) -> None:
+        """One scheduled forwarding-table walk, on the poll pool.
+
+        Wrapped in except Exception for the same reason _run_one is: a
+        worker thread must never die quietly. A device that answers no
+        forwarding table leaves what is stored alone rather than deleting
+        it — a switch that failed to answer once has not forgotten every
+        MAC it knows.
+        """
+        try:
+            entries = self.read_device_mac_table(device_id)
+            if entries is None:
+                return
+            stored = self.db.replace_mac_entries(device_id, entries)
+            self.counters["mac_walks"] += 1
+            self.log.add(NODES, f"Learned {stored} MAC address(es) on device "
+                                f"#{device_id}")
+        except Exception:
+            self.counters["errors"] += 1
+            self.log.add(ERROR, f"MAC table walk failed for device #{device_id}",
+                         detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._mac_running.discard(device_id)
+
     # Bounds for the OID browser. Generous enough to be useful on a switch,
     # small enough that a dialog someone is sitting in front of cannot hang:
     # a full walk of a large device is tens of thousands of objects and
@@ -1542,16 +1834,35 @@ class NodePoller:
             raise ValueError("An OID must be numeric, like 1.3.6.1.2.1.1")
 
         max_rows = int(max_rows or self._BROWSE_MAX_ROWS)
-        deadline = time.time() + float(budget_s or self._BROWSE_BUDGET_S)
+        budget = float(budget_s or self._BROWSE_BUDGET_S)
+        rows, stopped = self._walk_from(device, config, base, max_rows, budget)
+        return {"base": base, "rows": rows, "stopped": stopped,
+                "complete": stopped == "end of subtree"}
+
+    def _walk_from(self, device, config, base: str, max_rows: int,
+                   budget_s: float, cancelled=None,
+                   on_row=None) -> tuple[list[dict], str]:
+        """The GETNEXT walk itself: rows collected, and why it stopped.
+
+        Shared by walk_subtree (one subtree, in front of a waiting human)
+        and the background whole-device walk, which differ only in their
+        bounds and in having a cancel — not in what a walk is. `cancelled`
+        is polled between requests; `on_row` sees each row as it arrives so
+        a job can report progress without exposing its list.
+        """
+        deadline = time.time() + budget_s
         rows: list[dict] = []
         stopped = "end of subtree"
         current = base
         while True:
+            if cancelled is not None and cancelled():
+                stopped = f"cancelled after {len(rows)} row(s)"
+                break
             if len(rows) >= max_rows:
                 stopped = f"stopped at the {max_rows}-row limit"
                 break
             if time.time() > deadline:
-                stopped = f"stopped after {self._BROWSE_BUDGET_S:.0f}s"
+                stopped = f"stopped after {budget_s:.0f}s"
                 break
             try:
                 response = self._snmp_get_next(device, config, current)
@@ -1585,11 +1896,64 @@ class NodePoller:
                 stopped = ("the device answered with a non-increasing OID "
                            f"({oid}) — its SNMP agent is misbehaving")
                 break
-            rows.append({"oid": oid, "type": vb["type"],
-                         "value": vb["value"], "text": vb.get("text")})
+            row = {"oid": oid, "type": vb["type"],
+                   "value": vb["value"], "text": vb.get("text")}
+            rows.append(row)
+            if on_row is not None:
+                on_row(row)
             current = oid
-        return {"base": base, "rows": rows, "stopped": stopped,
-                "complete": stopped == "end of subtree"}
+        return rows, stopped
+
+    # The whole-device walk starts here rather than at .1: 1.3.6.1 is
+    # internet(1), which is every MIB an agent can sensibly hold. Starting
+    # above it would miss nothing real and starting below it invites an
+    # agent to walk its own private branches forever.
+    _FULL_WALK_BASE = "1.3.6.1"
+
+    def start_oid_walk(self, device_id: int) -> dict:
+        """Begin a whole-device walk in the background, or report the one
+        already running for this device.
+
+        Held in memory rather than in a table: a walk result is transient —
+        it exists to be downloaded once and then thrown away — and a row
+        surviving a restart would describe a job whose thread is gone.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            raise ValueError("No such device")
+        with self._lock:
+            job = self._oid_walks.get(device_id)
+            if job is not None and job.running:
+                return job.status()
+            settings = self.db.settings()
+            job = _OidWalkJob(
+                self, device_id,
+                base=self._FULL_WALK_BASE,
+                max_rows=int(settings.get("oid_walk_max_rows", 100_000)),
+                budget_s=float(settings.get("oid_walk_budget_s", 600.0)))
+            self._oid_walks[device_id] = job
+        job.start()
+        return job.status()
+
+    def oid_walk_status(self, device_id: int, with_rows: bool = False) -> dict | None:
+        job = self._oid_walks.get(device_id)
+        return None if job is None else job.status(with_rows=with_rows)
+
+    def cancel_oid_walk(self, device_id: int) -> bool:
+        job = self._oid_walks.get(device_id)
+        if job is None or not job.running:
+            return False
+        job.cancel()
+        return True
+
+    def forget_oid_walk(self, device_id: int) -> None:
+        """Drop a finished walk's rows. Called once the file has been handed
+        over, so a 100k-row walk does not sit in memory for the life of the
+        process."""
+        with self._lock:
+            job = self._oid_walks.get(device_id)
+            if job is not None and not job.running:
+                self._oid_walks.pop(device_id, None)
 
     def browse_bases(self, device_id: int) -> list[dict]:
         """The subtrees the browser opens on: the two every SNMP agent

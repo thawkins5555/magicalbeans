@@ -377,6 +377,36 @@ rather than waiting for each one's interval, and reports how many it queued
 and how many were already running. The detail pane's button only ever polls
 the one device open in it.
 
+**Double-clicking a row opens that device in a dialog** — its identity
+line, its interface table and its event log — without moving what the
+detail pane is showing anywhere you did not ask it to go. The dialog is
+about the device you double-clicked, which is not necessarily the one
+selected, so it reads that device by id rather than borrowing the pane's
+data. Opening a port from the dialog charts *that* device, and offers a
+way back to the dialog it came from. A single click still just moves the
+detail pane.
+
+**The Find box accepts a MAC address** as well as a name, an IP or a
+sysName. Any notation works — `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
+`aabb.ccdd.eeff`, bare hex — and so does a prefix of one, so the first
+three octets of a vendor OUI is a valid search. The list filters to the
+switches that have learned the address. When it resolves to exactly one
+switch and one port, that port's dialog opens; when it resolves to
+several, they are listed as a shortlist to pick from rather than one
+being chosen for you — a MAC seen on an uplink is on every switch between
+here and the host, which is the normal case, and guessing which one was
+meant sends someone to the wrong place.
+
+**Learning MAC addresses is off by default and separately paced.** A
+forwarding table is hundreds to thousands of rows per switch, so it is
+never read on the poll cycle. A polling profile (or a single device) sets
+**Learn MAC addresses every N seconds**; 0 means never, and 0 is the
+shipped value, so this costs nothing until you switch it on for the
+switches you actually trace hosts through. Fifteen minutes is a sensible
+starting point. A switch that is down or whose last poll failed is not
+walked, and entries no walk has refreshed for a week are dropped, so a MAC
+that moved does not go on answering from two places forever.
+
 **Vendor and Location can be read from an OID you choose.** Vendor is
 normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr
 keyword fallback, and Location is sysLocation. Plenty of gear puts its real
@@ -405,14 +435,24 @@ already a device links to that device instead of creating a second one.
 decoded against every MIB the app knows. It opens on `system`,
 `interfaces` and the device's own vendor arc — a few hundred objects,
 back in seconds — and an OID box with **Walk from here** reads any other
-subtree on demand. Deliberately not a walk of the whole tree: a switch is
-tens of thousands of objects and minutes of SNMP, and nobody reads that.
-Each row shows the OID, its name where a MIB describes it, the row index,
-the SNMP type and the value; an OID nothing describes is shown as its
-number rather than guessed at, and uploading its MIB names it
-immediately. A walk that hits its row or time limit says so rather than
-looking complete. This is also how to read a device's sysObjectID
-straight off it, which is what identifies its vendor.
+subtree on demand. The browsing table deliberately does not walk the whole
+tree: a switch is tens of thousands of objects and minutes of SNMP, and
+nobody reads that in a dialog. Each row shows the OID, its name where a MIB
+describes it, the row index, the SNMP type and the value; an OID nothing
+describes is shown as its number rather than guessed at, and uploading its
+MIB names it immediately. A walk that hits its row or time limit says so
+rather than looking complete. This is also how to read a device's
+sysObjectID straight off it, which is what identifies its vendor.
+
+**Download full walk** is the whole tree, as a file. It runs as a
+background job on the server rather than in the dialog — showing a live
+object count and a **Cancel** — and downloads when it finishes. Its header
+states the device, the time, and whether the walk completed or was cut
+short and why; a truncated walk that looks complete is the failure this
+could most easily cause, so it never looks complete when it is not.
+Cancelling keeps what has been read so far rather than throwing it away.
+The row and time bounds are in Nodes → Settings (100,000 objects and ten
+minutes by default) so a device whose agent loops cannot walk forever.
 
 Every on-demand read — the OID browser, the MAC address table and the
 DOM/SFP sensors — uses the credential the device **actually answers on**,
@@ -512,6 +552,36 @@ alerts and optionally emailing about them.
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
   or a bare manually-set device name it showed before.
+- **A device's alerts can be muted for 1, 6, 12 or 24 hours.** *Mute
+  device* sits beside Resolve and Acknowledge in the alert detail, for
+  the hours you are working on a box and do not want to be told about it.
+  A mute stops what happens **next** — new alerts and the emails they
+  would send — and deliberately leaves alerts already open in the list, so
+  it never quietly takes work off your screen. Those still **resolve**
+  normally when their cause clears; what a mute silences is the mailbox,
+  not the list. Muting a switch silences
+  its **ports** with it, which is what an operator muting a switch means.
+  Nothing needs un-suppressing when the mute lapses: thresholds re-derive
+  from live metrics on the next tick and a still-down device keeps
+  recording events, so the alerts simply come back. The mute is shown in
+  the Nodes device list and in the device's detail header as well as in
+  Alerts — a mute nobody can see is a mute somebody will spend an
+  afternoon looking for. Only Nodes devices can be muted; syslog, traps,
+  IPAM conflicts, DHCP scopes and wireless APs are structurally outside
+  it. Muting requires write access to Alerts; a read-only account can see
+  what is muted but cannot mute.
+- **A poll overrun on a device that is not answering is not reported at
+  all.** "Poll taking longer than its interval" is recorded when the
+  previous poll is still running as the next falls due — which is exactly
+  what a device that has stopped answering causes, since every request in
+  that poll spends its full timeout and all its retries. It also arrives
+  *first*: a device needs three completed failing polls before it is
+  marked down, so the overruns used to lead the outage by two or three
+  intervals and the first one got out before anything could suppress it.
+  Now nothing is recorded while the device is down **or its last poll
+  failed** — no alert, no event row, no Debug line — and an overrun alert
+  raised in the moments before an outage is absorbed by *Device not
+  responding* like the other polled-metric alerts.
 
 ### Rules
 
@@ -544,6 +614,27 @@ alerts and optionally emailing about them.
   `clear_threshold`, plus a consecutive-polls-before-firing count, so a
   value oscillating right at the edge does not open and close the same
   alert every poll.
+- **A threshold can require a breach to be sustained for a length of
+  time** rather than for a number of polls — *Or: sustained for N
+  seconds* in the rule dialog, measured between the metric's own sample
+  timestamps, so a device that stops being polled cannot accumulate
+  breach time while silent. Blank keeps counting polls, which is what
+  every rule but one does.
+- **Packet loss ships requiring 60 seconds of sustained loss.** A probe
+  lost to a busy CPU or a queued ARP is not an outage, and with the
+  default of three ping probes per poll a single lost probe already reads
+  as 33%, which cleared the shipped 20% threshold on its own. The rule
+  dialog says this outright and points at the probe-count setting that
+  changes the quantisation, because a threshold of 20% on three probes is
+  not really adjustable between 1 and 33.
+- **Fixed: "consecutive polls before firing" counted engine ticks.** The
+  alert engine ticks every five seconds and a device is polled every
+  sixty, so `for_polls = 2` meant "ten seconds"; worse, the count advanced
+  whether or not a new sample had arrived, so one bad reading satisfied
+  any count about ten seconds later and went on satisfying it for as long
+  as the value sat there. The count now advances only when the metric's
+  own timestamp moves — which is what the setting always said it did, and
+  what the DHCP evaluator already did.
 - **"DHCP scope running out of leases" watches IPAM, not Nodes.** Its
   utilization is leases plus reservations against the scope's own address
   range — counted exactly the way the DHCP page counts them, so the
@@ -1295,14 +1386,25 @@ name follows the same SNMP-hostname-first precedence every other module
 already uses: its SNMP-reported name, unless it's been explicitly pinned
 to a manual name in Nodes.
 
-- **Bulk-edit SSH credentials and backup settings across many devices at
-  once**: tick the checkbox on each row (or "select all") to pick several
-  devices,
-  then set one shared SSH username/password/port and backup-enabled
-  setting for all of them in a single action — the same shared-value
-  bulk pattern Nodes' own bulk device operations already use. Leaving a
-  bulk field blank/unchecked never overwrites what a device already had;
-  only the fields you actually set are applied.
+- **Settings and backups both work on a selection.** Tick the checkbox on
+  each row (or "select all") to reveal the bulk actions bar.
+  **Settings for selected** covers everything the single-device dialog
+  does — whether to back the devices up, SSH port, username, password and
+  vendor override — applied as one shared value to every ticked device,
+  the same shared-value bulk pattern Nodes' own bulk operations use.
+  Every field defaults to *leave unchanged*: a blank box or a dropdown
+  left alone never overwrites what a device already had, and only the
+  fields you actually set are applied. Backing up is a real three-way
+  choice, so a batch can be switched **off** as well as on — the earlier
+  bulk dialog could only ever turn it on. A password is stored only when a
+  username is given with it, since the pair is what gets encrypted.
+- **Back up selected** queues every ticked device at once, and reports
+  which were queued, which were already queued, and which have backups
+  switched off — id lists, not a bare count, because "9 of 12" leaves you
+  to work out which three. A device with backups disabled is deliberately
+  skipped rather than backed up anyway. If the worker is stopped, the
+  whole request fails once with that reason rather than reporting the same
+  thing per device.
 - **Selecting a device shows its stored backups** — timestamp and size —
   and selecting a backup shows its raw config text in a read-only panel.
   There is no editable field and no save-back action anywhere in this

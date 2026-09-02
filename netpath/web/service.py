@@ -717,6 +717,12 @@ class Service:
             event_days=float(self.nodes_settings.get("event_retention_days", 180)),
             discovery_days=float(self.nodes_settings.get("discovery_retention_days", 30)),
             max_samples=int(self.nodes_settings.get("sample_row_cap_per_metric", 0)))
+        # Forwarding-table entries nothing has refreshed for a while. A
+        # switch taken out of the walk schedule would otherwise keep
+        # answering MAC searches from a table nobody has confirmed since,
+        # sending someone to a port the address left months ago.
+        self.nodes_db.prune_mac_entries(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         cap = int(self.settings.get("max_nodes_db_mb", 0)) * 1024 * 1024
         if cap:
             removed = self.nodes_db.trim_to_size(cap)
