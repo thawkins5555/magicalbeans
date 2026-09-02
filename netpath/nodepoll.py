@@ -1010,30 +1010,36 @@ class NodePoller:
             for row in interfaces:
                 if_index = row["if_index"]
                 prior = existing.get(if_index)
+                # This row's own GET timestamp, not the poll-start `now`:
+                # the rate's dt has to match when the counters were actually
+                # read (see the comment in _poll_interfaces). Metric samples
+                # recorded below still use `now`, aligned with the rest of
+                # this poll.
+                sample_ts = row.get("_sample_ts") or now
                 in_bps = out_bps = in_err_rate = out_err_rate = None
                 if prior is not None:
                     in_bps = counter_rate(
                         prior["last_in_octets"], prior["last_sample_ts"] or 0,
-                        row.get("in_octets"), now, row.get("_octet_bits", 32),
+                        row.get("in_octets"), sample_ts, row.get("_octet_bits", 32),
                         speed_bps=row.get("speed_bps"))
                     out_bps = counter_rate(
                         prior["last_out_octets"], prior["last_sample_ts"] or 0,
-                        row.get("out_octets"), now, row.get("_octet_bits", 32),
+                        row.get("out_octets"), sample_ts, row.get("_octet_bits", 32),
                         speed_bps=row.get("speed_bps"))
                     # ifInErrors/ifOutErrors are 32-bit counters; the rate
                     # is errors per second between polls.
                     in_err_rate = counter_rate(
                         prior["last_in_errors"], prior["last_sample_ts"] or 0,
-                        row.get("in_errors"), now, 32)
+                        row.get("in_errors"), sample_ts, 32)
                     out_err_rate = counter_rate(
                         prior["last_out_errors"], prior["last_sample_ts"] or 0,
-                        row.get("out_errors"), now, 32)
+                        row.get("out_errors"), sample_ts, 32)
                 self.db.update_interface_rate(
                     device_id, if_index, in_octets=row.get("in_octets"),
                     out_octets=row.get("out_octets"),
                     in_errors=row.get("in_errors"), out_errors=row.get("out_errors"),
                     in_bps=in_bps, out_bps=out_bps,
-                    in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=now)
+                    in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=sample_ts)
                 interface_id = self.db.interface_id_for(device_id, if_index)
                 if interface_id is not None and prior is not None:
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
@@ -1649,6 +1655,12 @@ class NodePoller:
                 continue
             except SnmpError:
                 continue
+            # Stamped right after this interface's own GET returns, not at
+            # poll start: at 3 s focus-poll cadence the gap between an
+            # earlier poll-start timestamp and when the counter was actually
+            # read was up to ±17% of dt. This is the timestamp counter_rate
+            # and update_interface_rate use below for this row.
+            sample_ts = time.time()
             values = {vb["oid"]: vb for vb in response.varbinds}
 
             def _val(table, key):
@@ -1685,6 +1697,7 @@ class NodePoller:
                 "in_errors": int(in_errors) if isinstance(in_errors, (int, float)) else None,
                 "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
                 "_octet_bits": octet_bits,
+                "_sample_ts": sample_ts,
             })
         if skipped_timeouts:
             self.log.add(NODES, f"{skipped_timeouts} of {len(indexes)} interface(s) on "

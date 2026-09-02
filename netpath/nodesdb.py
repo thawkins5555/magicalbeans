@@ -1355,7 +1355,8 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
 
-    def series(self, device_id: int, metric_id: int, t0: float, t1: float) -> list[dict]:
+    def series(self, device_id: int, metric_id: int, t0: float, t1: float,
+               bucket_s: float = 0) -> list[dict]:
         """Raw-vs-hourly selection: a wide window reads the rollup table
         instead of scanning months of raw points.
 
@@ -1365,6 +1366,13 @@ class NodesDatabase:
         stale dialog does when the selected device changes underneath it. A
         mismatch now returns nothing, which reads as "no samples" rather than
         as somebody else's traffic.
+
+        `bucket_s > 0` buckets raw samples server-side into fixed-width
+        windows aligned to epoch time (`floor(ts / bucket_s) * bucket_s`),
+        returning the same `{ts, avg, min, max}` shape the hourly rollup
+        uses so `drawSeriesChart` renders either one unchanged. Bucketing
+        only applies within the raw-sample window (<= 3 days); a wider
+        window already reads the hourly rollup and ignores `bucket_s`.
         """
         with self._lock:
             if not self._conn.execute(
@@ -1372,6 +1380,16 @@ class NodesDatabase:
                     (metric_id, device_id)).fetchone():
                 return []
             if (t1 - t0) <= 86400 * 3:
+                if bucket_s and bucket_s > 0:
+                    rows = self._conn.execute(
+                        "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
+                        " AVG(value) AS avg, MIN(value) AS min, MAX(value) AS max,"
+                        " COUNT(*) AS n FROM samples WHERE metric_id = ?"
+                        " AND ts >= ? AND ts <= ? GROUP BY 1 ORDER BY 1",
+                        (bucket_s, bucket_s, metric_id, t0, t1)).fetchall()
+                    return [{"ts": row["bucket_ts"], "avg": row["avg"],
+                            "min": row["min"], "max": row["max"], "n": row["n"]}
+                            for row in rows]
                 rows = self._conn.execute(
                     "SELECT ts, value FROM samples WHERE metric_id = ?"
                     " AND ts >= ? AND ts <= ? ORDER BY ts",
