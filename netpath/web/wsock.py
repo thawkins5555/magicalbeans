@@ -349,8 +349,12 @@ class WebSocket:
         the slice to expire, which is what makes `closed` noticed promptly.
         Its answer is not trusted: the read that follows happens either way,
         because under TLS a whole record can already be decoded and waiting
-        inside the SSL object with nothing left for `select` to see."""
+        inside the SSL object with nothing left for `select` to see — which
+        is also why a TLS socket that reports pending bytes is not made to
+        wait out the slice first."""
         try:
+            if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending():
+                return
             select.select([self.sock], [], [], READ_SLICE_S)
         except (OSError, ValueError):
             pass                          # closed underneath us; the read says so

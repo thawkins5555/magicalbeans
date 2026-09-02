@@ -6,6 +6,62 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.36.1 — Review of the SSH terminal
+
+A security-focused review of 4.36.0 before it reached main. Nothing about
+the feature's shape changes; what it refuses, what it records and what it
+outlives do.
+
+- **The terminal's socket accepts only this server's own pages.** A
+  WebSocket upgrade is a GET, so the rule that stops cross-site form posts
+  did not cover it, and the session cookie's same-site scope would still
+  have sent it from another port on the same host. The server now requires
+  the browser's `Origin` on the upgrade and refuses any other. The
+  Content-Security-Policy sent with every page is `connect-src 'self'`
+  again — 4.36.0 had opened it to any `ws:`/`wss:` host, which would have
+  let injected script open a socket anywhere — and gains
+  `frame-ancestors 'none'`.
+- **A live shell ends when the sign-in behind it does.** Signing out,
+  the sign-in expiring, the SSH permission being revoked or the account
+  being removed now closes an open terminal within seconds, with a device
+  event; before, a session was checked once at the upgrade and then ran
+  until its own fifteen-minute idle timer. Typing in the terminal counts as
+  presence for the web sign-in, the same as a click in the main window.
+- **Refused logins are counted and recorded.** Every username and password
+  a device refuses is written to that device's event log — the SSH
+  username, the attempt number, the account that asked and its address,
+  never the password — and the fifth refusal closes the window. Each
+  account may hold four sessions at once, out of the server's sixteen.
+- **A remembered host key belongs to the address, not the device row.**
+  Removing a device from Nodes no longer deletes its key, so a Nodes write
+  cannot reset the trust anchor by removing and re-adding the device, and a
+  second device row at the same address keeps its protection. **Forget** in
+  the ConfigRX dialog now needs ConfigRX write — the permission that
+  already chooses the port and credential the next connection uses — rather
+  than SSH write, so a ConfigRX operator can recover a genuinely rebuilt
+  device's backups; **Trust the new key** in the terminal stays under SSH.
+- **One window per device.** The SSH button opened a new window and a new
+  shell on every click; a second click now raises the window the device
+  already has. The window itself no longer fails with a bare "Disconnected"
+  on a device without a stored credential (a resize was reaching the server
+  before the open), and showing a notice above the terminal refits it
+  instead of clipping the prompt.
+- **Browse OIDs is back for read-only Nodes accounts** — 4.36.0 hid it
+  behind Nodes write although it only reads. **Edit** keeps the write gate.
+- **Upgrades from before app.db grant permissions again.** The one-time
+  grants an upgrade owes existing accounts (write on every module for an
+  install that predates the permission table, SSH for accounts already
+  holding write on everything else) ran before those accounts had been
+  copied in from the old netpath.db, so on that path they granted nobody.
+  They now run after the migration.
+- **Under the hood.** The terminal's socket does its own reading and
+  writing through one lock with real timeouts, so a browser that stops
+  reading can no longer wedge the session's shutdown, and a TLS connection
+  is never read and written by two threads at once; a failed write always
+  wakes the reader; a message split into many small frames is reassembled
+  in linear time. The ConfigRX host-key line in the device dialog ignores a
+  fetch that finishes after the dialog has moved on to another device.
+
 ### 4.36.0 — SSH from the device pane, with host keys that are remembered
 
 - **An SSH button on the device pane opens a terminal to the selected

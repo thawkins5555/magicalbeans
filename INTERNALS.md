@@ -3790,7 +3790,9 @@ reader waits for readability with `select` **outside** the lock
 (`READ_SLICE_S = 0.25`) and then takes it only for a non-blocking read, so
 the thread that is idle almost all the time cannot starve the one with
 output to send; `select`'s answer is not trusted, since a whole record can
-already be decoded and waiting inside the SSL object. Writes take the lock
+already be decoded and waiting inside the SSL object (an `SSLSocket` whose
+`pending()` says so skips the wait altogether, so a decoded keystroke is
+not held for a slice). Writes take the lock
 with `SEND_TIMEOUT_S = 15` on the socket: a browser that stops reading fails
 the send, marks the socket closed and releases everything waiting on it, so
 `stop()`, the idle watchdog and `SshSessionRegistry.shutdown()` are bounded
@@ -3939,11 +3941,18 @@ Errors-log event; no capture runs and nothing is stored. The status note
 actually stored a key — the old "(host key not previously known)" was
 appended to every backup, because the key was thrown away with the
 connection. Reading a stored key is a `configrx` read (it is shown in
-ConfigRX's device dialog with a Forget button); forgetting one is an `ssh`
-write, since forgetting is what lets the next connection accept whatever it
-is offered; and there is deliberately no HTTP route for trusting a *new*
-key — that decision is only taken with the offered key in hand, over the
-terminal's own socket. Removing a device from Nodes forgets its key.
+ConfigRX's device dialog with a Forget button); forgetting one is a
+`configrx` write — forgetting is what lets the next connection accept
+whatever it is offered, and configrx write already decides which port and
+which credential that connection uses, so it is the permission that
+already says which box is trusted; and there is deliberately no HTTP route
+for trusting a *new* key — that decision is only taken with the offered key
+in hand, over the terminal's own socket, under `ssh` write. Removing a
+device from Nodes does **not** forget its key (4.36.1): the key belongs to
+the address, a second device row at that address may rely on it, and a
+`nodes` write must not be able to reset a trust anchor that `configrx`
+write guards. `configrxdb.forget_device` therefore takes only the device
+id.
 
 **The scoped boundary.** "Only `pager_off` + `show_config` are ever sent"
 remains true and is still the point of `configrx_vendors.py`, but it is now

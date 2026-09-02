@@ -403,9 +403,15 @@ connection only and never stored. The first connection stores the device's
 host key; a later connection presenting a different key is refused with a
 warning that names both fingerprints and when the old key was first seen,
 and a **Trust the new key** button for a device that really was replaced.
-Sessions end after fifteen minutes idle, at most sixteen run at once, and
-each is recorded in the device's event log with who opened it and from
-where. **Remove** now lives in the device's Edit dialog, beside Clear
+Sessions end after fifteen minutes idle, at most sixteen run at once (four
+per account), and each is recorded in the device's event log with who
+opened it and from where. A session lives only as long as the web sign-in
+behind it: signing out, the sign-in expiring, the SSH permission being
+revoked or the account being removed closes the terminal within seconds
+(typing in it counts as presence for the sign-in, the same as clicking in
+the main window). Five refused logins close the window, and every refusal
+is written to the device's event log with the account that asked and where
+from — never the password. **Remove** now lives in the device's Edit dialog, beside Clear
 credential, so the pane's buttons are the things you do *to* a device
 rather than the one thing you do to get rid of it.
 
@@ -1928,5 +1934,10 @@ moves its settings, accounts and name cache into it on the first start.
   connection presenting a different key is refused and the backup fails
   with an error naming both fingerprints and when the old one was first
   seen. The device dialog shows the stored fingerprint with a **Forget**
-  button (SSH permission) for a device that was genuinely replaced; the
-  terminal window offers **Trust the new key** for the same case.
+  button (ConfigRX write, the permission that already chooses the port and
+  credential the next connection uses) for a device that was genuinely
+  replaced; the terminal window offers **Trust the new key** (SSH
+  permission) for the same case. A key belongs to an address and port, not
+  to a device row: removing a device from Nodes leaves its key in place, so
+  a replacement at the same address is still challenged, and a second
+  device row at that address keeps its protection.

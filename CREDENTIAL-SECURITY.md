@@ -499,16 +499,53 @@ when a session opens — the account name and the client address — and one
 when it closes, with the duration. Nothing typed or displayed in the
 terminal is stored anywhere on this server.
 
+**Every refused login is recorded, and there are only five.** A device
+refusing a username and password writes a device event naming the SSH
+username, the attempt number, the account that asked and its address —
+never the password — and the fifth refusal closes the session. Without
+that, an account holding SSH write could use this server as a quiet
+password oracle against every device it knows about, from an address those
+devices trust, with nothing in any log. Each account may hold at most four
+sessions at once, so one account cannot exhaust the sixteen the server
+allows and lock every other operator out.
+
+**A session is only as alive as the sign-in behind it.** The permission
+check at the socket upgrade is not the last one: once a second the session
+confirms the web sign-in that opened it still exists and still holds SSH
+write, and closes the terminal — with a device event — the moment it does
+not. Signing out in the main window, the sign-in's idle or absolute limit,
+a revoked permission or a removed account therefore all end a live shell
+within seconds rather than leaving it running until its own idle timer
+fires. Typing in the terminal counts as presence for the web sign-in, the
+same as a click in the main window does, so a person working only in the
+terminal is not signed out under them.
+
+**The socket refuses other origins.** A WebSocket upgrade is a GET, so the
+JSON content-type rule that blocks cross-site form posts does not apply to
+it, and the session cookie's `SameSite=Strict` is scoped to the site, not
+the origin — a page served from another port on the same host would still
+carry it. The server therefore requires the browser's `Origin` header on
+the upgrade and refuses (403) any that does not name this server. The
+Content-Security-Policy sent with every page was tightened at the same
+time: `connect-src 'self'` (4.36.0 briefly allowed any `ws:`/`wss:` host,
+which would have let injected script open a socket anywhere) and
+`frame-ancestors 'none'`, so the terminal window and its Trust button
+cannot be framed.
+
 **Host keys are pinned after first sight.** The first connection to a
 device stores its host key (a public value: type, key bytes, SHA-256
 fingerprint, first-seen time). Every later connection, terminal or backup,
 loads that key into paramiko before connecting and is refused if the device
 presents different key bytes — a different key type from the same device
 counts as different, and an RSA key that starts signing with SHA-2 does
-not. Replacing the stored key is an explicit act (**Trust the new key** in
-the terminal window, **Forget** in ConfigRX), both under the SSH
-permission, and the warning always shows both fingerprints so the decision
-is made on the facts.
+not. Replacing the stored key is an explicit act — **Trust the new key** in
+the terminal window, under the SSH permission, or **Forget** in ConfigRX,
+under ConfigRX write, the permission that already decides which port and
+credential the next connection uses — and the warning always shows both
+fingerprints so the decision is made on the facts. Nothing else removes a
+key: deleting a device from Nodes (a Nodes write) leaves it in place, so a
+lower permission cannot reset the trust anchor by removing and re-adding
+the device.
 
 ## 8. What this application deliberately never does
 
