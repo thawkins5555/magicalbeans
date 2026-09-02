@@ -425,6 +425,9 @@ const App = (() => {
      dotted, module first ("nodes.profile.ping"), so two modules can never
      collide and a grep finds every use. */
   const HELP = {};
+  // The "?" that opened the panel, so closing it can hand keyboard focus
+  // back to where the operator was rather than dropping it on the body.
+  let helpTrigger = null;
 
   function registerHelp(entries) {
     Object.assign(HELP, entries);
@@ -440,21 +443,24 @@ const App = (() => {
            ` title="What does this control?" aria-label="Help">?</button>`;
   }
 
-  function showHelp(key) {
+  function showHelp(key, trigger = null) {
     const entry = HELP[key];
     if (!entry) return;
+    helpTrigger = trigger;
     let wrap = document.getElementById('help');
     if (!wrap) {
       wrap = document.createElement('div');
       wrap.id = 'help';
       wrap.className = 'modal help';
       wrap.hidden = true;
-      wrap.innerHTML = '<div class="modal-box" id="help-box"></div>';
+      wrap.innerHTML = '<div class="modal-box" id="help-box" role="dialog"' +
+                       ' aria-modal="true" aria-labelledby="help-title"></div>';
       document.body.appendChild(wrap);
       wrap.onclick = (event) => { if (event.target === wrap) closeHelp(); };
     }
     const box = wrap.querySelector('#help-box');
-    box.innerHTML = `<h2>${entry.title}</h2><div class="help-body">${entry.html}</div>` +
+    box.innerHTML = `<h2 id="help-title">${entry.title}</h2>` +
+      `<div class="help-body">${entry.html}</div>` +
       '<div class="row"><button class="primary" id="help-close">Close</button></div>';
     box.querySelector('#help-close').onclick = closeHelp;
     wrap.hidden = false;
@@ -463,7 +469,10 @@ const App = (() => {
 
   function closeHelp() {
     const wrap = document.getElementById('help');
-    if (wrap) wrap.hidden = true;
+    if (!wrap || wrap.hidden) return;
+    wrap.hidden = true;
+    if (helpTrigger && document.contains(helpTrigger)) helpTrigger.focus();
+    helpTrigger = null;
   }
 
   function helpOpen() {
@@ -1113,7 +1122,7 @@ const App = (() => {
       if (!link) return;
       event.preventDefault();
       event.stopPropagation();
-      showHelp(link.dataset.help);
+      showHelp(link.dataset.help, link);
     });
 
     try {
