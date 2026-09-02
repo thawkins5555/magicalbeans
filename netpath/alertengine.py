@@ -27,6 +27,14 @@ from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
 
+# How far back operator_resolved_since looks for a hand resolve. Long enough
+# that an alert resolved Friday evening still stays closed Monday morning;
+# short enough that the query stays cheap and a resolve from months ago
+# cannot suppress an unrelated new breach run indefinitely. A cleared
+# observation ends suppression well before this ever matters in practice —
+# this is a backstop, not the mechanism.
+OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
+
 
 def _ago(ts: float) -> str:
     if not ts:
@@ -71,7 +79,14 @@ class AlertEngine:
         # started_ts: a destination is traced every five minutes by default
         # while this engine ticks every five seconds, so a streak that
         # advanced per tick would satisfy "three traces" in fifteen seconds.
-        self._netpath_streaks: dict[tuple, tuple[float | None, int]] = {}
+        self._netpath_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
+        # dedup_key -> latest resolved_ts of a hand resolve, refreshed once
+        # per tick from AlertsDatabase.operator_resolved_since (one indexed
+        # query) rather than queried per breaching rule/device. See
+        # _evaluate_thresholds and _evaluate_netpath_thresholds: a breach
+        # whose first_breach_ts is at or before this timestamp is the same
+        # run an operator already resolved, and does not re-open.
+        self._operator_resolves: dict[str, float] = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
@@ -132,6 +147,12 @@ class AlertEngine:
         settings = self.db.settings()
         if not settings.get("enabled", True):
             return
+        # One indexed query per tick, not one per breaching rule/device:
+        # _evaluate_thresholds and _evaluate_netpath_thresholds both consult
+        # this cache to decide whether a breach is the same run an operator
+        # already resolved by hand.
+        self._operator_resolves = self.db.operator_resolved_since(
+            time.time() - OPERATOR_RESOLVE_WINDOW_S)
         occurrences = []
         occurrences += self._drain_device_events(settings)
         occurrences += self._drain_interface_events(settings)
@@ -605,6 +626,22 @@ class AlertEngine:
         The same state carries first_breach_ts, so a rule with for_seconds
         can ask how long the breach has actually lasted in sample time
         rather than in ticks.
+
+        It also settles whether an operator resolved THIS breach run: if
+        _operator_resolves (refreshed once per tick from
+        AlertsDatabase.operator_resolved_since) has a hand resolve at or
+        after first_breach_ts, the run stays closed rather than reopening as
+        a new row — an operator resolving an alert while its condition still
+        holds is exactly the case this streak is otherwise blind to, since
+        open_or_increment only ever looks at open/acked rows. A clear
+        observation resets first_breach_ts (above), so the very next breach
+        is a new run and opens normally.
+
+        This is in-memory state, so a restart forgets it: the first tick
+        after restart rebuilds every streak from scratch, first_breach_ts
+        becomes "since restart", and a still-breaching alert an operator had
+        resolved re-opens once more. Deliberately not persisted — see
+        INTERNALS.md.
         """
         occurrences = []
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
@@ -639,14 +676,23 @@ class AlertEngine:
                 label = hostresolve.resolve_name(
                     self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
                 if result == "breach":
-                    occurrences.append(Occurrence(
+                    occurrence = Occurrence(
                         kind="threshold", source_kind=rule["source_kind"],
                         entity_kind="device", entity_id=str(device["id"]),
                         entity_label=label, ts=time.time(),
                         message=f"{label}: {rule['name']} ({value})",
                         device_name=device["name"] or "", device_ip=device["ip"],
                         extra={"metric_label": metric["label"] if metric else rule["source_kind"],
-                              "value": str(value), "threshold": str(rule["threshold"])}))
+                              "value": str(value), "threshold": str(rule["threshold"])})
+                    resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
+                    if (resolved_ts is not None and first_breach_ts is not None
+                            and first_breach_ts <= resolved_ts):
+                        # An operator resolved this exact breach run by hand;
+                        # it stays closed until a clear observation (which
+                        # resets first_breach_ts above) is followed by a new
+                        # breach — see AlertsDatabase.operator_resolved_since.
+                        continue
+                    occurrences.append(occurrence)
                 elif result == "clear":
                     dedup = dedup_key(rule, Occurrence(
                         kind="threshold", source_kind=rule["source_kind"],
@@ -879,6 +925,11 @@ class AlertEngine:
         path — a traceroute that could not run, a slot skipped because the
         previous run was still going — produce no sample at all: they leave
         every streak exactly as it was rather than counting as a failure.
+
+        The streak also carries first_breach_ts, the same third element
+        _breach_streaks carries for a Nodes device, so a breach an operator
+        resolved by hand can be told apart from the next one: see the
+        operator_resolved_since check right below the streak update.
         """
         if self.netpath_db is None:
             return []
@@ -919,15 +970,18 @@ class AlertEngine:
                     continue
                 value, message, extra = metrics[source]
                 streak_key = (rule["id"], entity_id)
-                previous_ts, streak = self._netpath_streaks.get(streak_key, (None, 0))
+                previous_ts, streak, first_breach_ts = self._netpath_streaks.get(
+                    streak_key, (None, 0, None))
                 sample_ts = trace["started_ts"]
                 threshold = rule["threshold"]
                 over = threshold is not None and value >= threshold
                 if not over:
-                    streak = 0
+                    streak, first_breach_ts = 0, None
                 elif sample_ts != previous_ts:
                     streak += 1
-                self._netpath_streaks[streak_key] = (sample_ts, streak)
+                    if first_breach_ts is None:
+                        first_breach_ts = sample_ts
+                self._netpath_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
 
                 result = evaluate_threshold(rule, value, streak)
                 occurrence = Occurrence(
@@ -937,6 +991,13 @@ class AlertEngine:
                     device_name=label, device_ip=target["host"],
                     extra={**extra, "threshold": str(threshold)})
                 if result == "breach":
+                    resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
+                    if (resolved_ts is not None and first_breach_ts is not None
+                            and first_breach_ts <= resolved_ts):
+                        # Same breach run an operator already resolved by
+                        # hand; see the matching check in
+                        # _evaluate_thresholds.
+                        continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     resolved = self.db.resolve_by_dedup(
@@ -956,6 +1017,12 @@ class AlertEngine:
         that was disabled or deleted, because there is nothing left to
         evaluate. Without this the alert would sit open forever, and disabling
         a destination is a normal thing to do while working on a link.
+
+        resolved_by is written as '' rather than a descriptive string,
+        matching every other engine auto-resolve (see AlertsDatabase.
+        operator_resolved_since): an operator-shaped string here would read
+        as a hand resolve and permanently suppress a destination that gets
+        re-enabled and starts breaching the same rule again.
         """
         for rule in rules:
             for row in self.db.alerts(state="unresolved", rule_id=rule["id"]):
@@ -963,7 +1030,7 @@ class AlertEngine:
                     continue
                 if row["entity_id"] in live:
                     continue
-                self.db.resolve(row["id"], by="destination no longer traced")
+                self.db.resolve(row["id"], by="")
                 self.counters["resolved"] += 1
                 # No clear email: nobody needs telling that a destination they
                 # just turned off has stopped being measured.
@@ -1004,14 +1071,22 @@ class AlertEngine:
         Deliberately silent: no clear email goes out for an absorbed alert.
         Fewer emails for one outage is the whole point, and "packet loss
         recovered" while the device is still down would be a lie.
+
+        resolved_by is '' here, not a "rolled up into <parent>" string: that
+        line is recorded on the PARENT's rollup_note instead (below), which
+        is where an operator looking at the outage would read it. Writing it
+        onto the child's own resolved_by would make an automatic rollup look
+        exactly like a hand resolve to operator_resolved_since, and once the
+        device recovers a still-breaching child threshold has to be free to
+        re-open on the very next tick's re-derivation, not stay suppressed as
+        though someone had resolved that breach run themselves.
         """
         for child_key in ROLLS_UP.get(parent_rule["key"] or "", ()):
             child_rule = self.db.rule_by_key(child_key)
             if child_rule is None:
                 continue
             resolved = self.db.resolve_by_dedup(
-                dedup_key(child_rule, occurrence),
-                by=f"rolled up into {parent_rule['name']}")
+                dedup_key(child_rule, occurrence), by="")
             if resolved:
                 self.counters["resolved"] += 1
                 self.db.add_rollup_note(

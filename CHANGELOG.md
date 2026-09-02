@@ -6,6 +6,75 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.34.0 — Resolves that stick, MAC tables you can afford, charts that hold still
+
+- **Resolving an alert now means it stays resolved.** Threshold alerts — a
+  metric over its limit, a NetPath path failing — are re-derived from live
+  data on every five-second tick, and a resolved alert was invisible to the
+  engine's "is this already open" check, so an alert an operator resolved
+  while its condition still held came straight back as a brand-new row: a new
+  id, unticked, with a fresh notification. Bulk resolve looked as if it did
+  nothing, because within five seconds it had. An operator's resolve now
+  closes *that breach run*: the alert re-opens only after the condition has
+  been observed clear and then breaches again. Acknowledge remains the way to
+  keep watching a live problem. Two engine paths that recorded a descriptive
+  string in the resolved-by field — a NetPath destination no longer traced, a
+  child alert rolled up into a device outage — now record nothing there, so
+  they cannot be mistaken for a hand resolve. The engine keeps this state in
+  memory, so a restart lets a still-breaching, operator-resolved alert re-open
+  once.
+- **The bulk Acknowledge and Resolve buttons report what they did** —
+  "Resolved 3 of 4" on the engine counters line for a few seconds, because a
+  row somebody else resolved between the tick and the click counts as ticked
+  but not acted on, and that mismatch is exactly what an operator needs to
+  see. They also gained the write-permission gate every other Alerts control
+  already had, so a read-only user no longer sees a button that fails.
+- **The per-port bandwidth chart no longer turns to hash when live polling
+  starts.** Selecting a device polls it every three seconds, and the chart
+  drew every one of those samples raw: the rate's time base was the poll's
+  start rather than the moment the port's counters were read — a ±17 % error
+  per point at that spacing — the smoothing window shrank with the sample
+  spacing to under half a minute, and the axis was re-fitted to the raw
+  maximum on every five-second redraw. Rates are now timed from each port's
+  own SNMP reply; the hour is served as fifteen-second averages
+  (`/series` gained a `bucket_s` parameter), so fast and slow samples land
+  evenly; **Smoothed** spans a fixed ninety seconds whatever the spacing;
+  and the axis grows at once for a spike but does not shrink for a dip. The
+  text readout keeps its five-second refresh; the chart redraws every
+  fifteen, when it has a whole new point to show.
+- **The packet-loss chart moved from the device pane into the device
+  dialog** — double-click a row. It keeps its own range dropdown (still
+  capped at three days, for the reason 4.33.0 gave), its pinned 0–100 % axis
+  and its "not being ping-probed" message, and refreshes every fifteen
+  seconds while the dialog is open. The pane keeps the status timeline.
+- **MAC forwarding tables cost a fraction of what they did, and remember
+  where a MAC went.** A switch's forwarding table was read one SNMP request
+  per row — hundreds to thousands per switch — which is why learning MAC
+  addresses had to be a rare, opt-in thing. Table walks now use GETBULK: a
+  ninety-row table that cost about a hundred requests costs about five, and
+  interface discovery, which shares the same walker, got the same drop. So a
+  forwarding table can be refreshed far more often for the same load — five
+  minutes is now a fine interval where fifteen was the old suggestion. Every
+  walk also runs on one socket instead of opening a fresh one per row, honours
+  a configurable row cap in place of the old silent 512 limit, and backs off
+  automatically from an agent that answers "too big".
+- **A MAC that leaves a switch is no longer forgotten.** The forwarding table
+  used to be erased and rewritten on every walk, so an address that moved or
+  went quiet simply vanished from search. Entries are now kept when they
+  disappear, marked absent with the time they were last confirmed, so the
+  Find box answers a search for an absent MAC with where and when it was last
+  seen — on which switch and which port — for as long as the retention window
+  (a week by default). A MAC that moved between ports shows the port it is on
+  now first, and where it used to be underneath.
+- **SNMPv1 is now actually spoken.** 4.33.0 recorded that a device configured
+  for v1 went on the wire as v2c, because the poller resolved its version as
+  "the configured value, or 1" and v1 is stored as 0. Every such site now
+  defaults only a missing version, never an explicit v1, and the new table
+  walker follows the same rule: a v1 device is walked with GETNEXT in real v1
+  frames. The guard that reads a v1 device's custom identity OIDs in a
+  separate request, which that coercion had made unreachable, now protects
+  the devices it was written for.
+
 ### 4.33.1 — Tests you can actually run
 
 - **The end-to-end suites now live in the repository, under `tests/`, and

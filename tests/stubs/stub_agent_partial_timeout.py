@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
-    PDU_GET, PDU_GETNEXT, PDU_RESPONSE, T_NO_SUCH_OBJECT, T_SEQUENCE, V2C,
-    _tlv, enc_int, enc_octets, enc_varbind,
+    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, T_NO_SUCH_OBJECT,
+    T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_varbind,
 )
 
 COMMUNITY = "public"
@@ -57,10 +57,11 @@ def main():
         oids = [vb["oid"] for vb in request.varbinds]
         if request.pdu_tag == PDU_GET:
             sock.sendto(build_get_reply(request.request_id, oids), addr)
-        elif request.pdu_tag == PDU_GETNEXT and oids[0].startswith(IF_INDEX_BASE):
-            print(f"dropping GETNEXT for {oids[0]} (simulated timeout)", flush=True)
+        elif request.pdu_tag in (PDU_GETNEXT, PDU_GETBULK) and oids[0].startswith(IF_INDEX_BASE):
+            kind = "GETNEXT" if request.pdu_tag == PDU_GETNEXT else "GETBULK"
+            print(f"dropping {kind} for {oids[0]} (simulated timeout)", flush=True)
             continue   # silently drop -- simulates the device going unresponsive
-        elif request.pdu_tag == PDU_GETNEXT:
+        elif request.pdu_tag in (PDU_GETNEXT, PDU_GETBULK):
             sock.sendto(build_get_reply(request.request_id, oids), addr)  # harmless fallback
 
 

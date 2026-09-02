@@ -375,6 +375,13 @@ class AlertsDatabase:
             # overwrites every time the same alert recurs.
             self._conn.execute(
                 "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
+        # Backs operator_resolved_ts/operator_resolved_since: both filter on
+        # (state, resolved_by) and group by dedup_key, so an index leading
+        # with dedup_key and covering state and resolved_ts serves the exact
+        # query the engine runs once per tick.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_alerts_dedup_state"
+            " ON alerts(dedup_key, state, resolved_ts)")
 
     def _migrate_templates(self) -> None:
         """Bring a built-in template whose shipped wording changed up to date,
@@ -856,6 +863,47 @@ class AlertsDatabase:
             self._conn.commit()
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+
+    # An alert the engine resolved on its own -- a CLEARS pair, a threshold
+    # dropping back below clear_threshold, a rollup absorbing a child, a
+    # NetPath destination that stopped being traced -- always writes '' to
+    # resolved_by, the same convention every internal resolve_by_dedup(by="")
+    # call already followed; 'engine' is accepted too for any future call
+    # site that wants a non-empty marker without meaning a person. Every
+    # resolve triggered by a person goes through the API with a real,
+    # non-empty session username (write endpoints require a session), so
+    # this predicate is exactly "resolved by hand".
+    _OPERATOR_RESOLVE_SQL = "resolved_by NOT IN ('', 'engine')"
+
+    def operator_resolved_ts(self, dedup_key: str) -> float | None:
+        """The latest resolved_ts of a `resolved` alert with this dedup_key
+        that an operator resolved by hand, or None when the alert has never
+        been resolved or was only ever auto-resolved by the engine.
+
+        Used by AlertEngine to decide whether a still-breaching (or still
+        down) condition is the SAME run an operator already resolved --
+        see operator_resolved_since for the per-tick bulk form of this same
+        query, which is what the engine actually calls on its hot path.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(resolved_ts) AS ts FROM alerts WHERE dedup_key = ?"
+                f" AND state = 'resolved' AND {self._OPERATOR_RESOLVE_SQL}",
+                (dedup_key,)).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
+
+    def operator_resolved_since(self, cutoff_ts: float) -> dict[str, float]:
+        """dedup_key -> latest resolved_ts, for every dedup_key an operator
+        resolved by hand at or after cutoff_ts. One indexed query
+        (ix_alerts_dedup_state) rather than one per breaching rule/device;
+        AlertEngine runs this once per tick and caches the result."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT dedup_key, MAX(resolved_ts) AS ts FROM alerts"
+                f" WHERE state = 'resolved' AND {self._OPERATOR_RESOLVE_SQL}"
+                " AND resolved_ts >= ? GROUP BY dedup_key",
+                (cutoff_ts,)).fetchall()
+        return {row["dedup_key"]: row["ts"] for row in rows}
 
     def open_by_dedup(self, dedup_key: str) -> sqlite3.Row | None:
         """The open (or acknowledged) alert for this dedup key, if any.

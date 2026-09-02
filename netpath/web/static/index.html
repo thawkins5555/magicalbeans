@@ -116,24 +116,17 @@
             <button id="nd-remove-device">Remove</button>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
-          <!-- Two time-series views, each with its own range picker, because
-               "how long has it been down" and "how lossy is this link" are
-               asked over different spans. Per-metric bandwidth charting is
-               still a per-port question and lives in the port dialog (click
-               an interface below), not here. -->
+          <!-- The status timeline, with its own range picker: "how long has
+               it been down" is asked over its own span. Per-metric bandwidth
+               charting is a per-port question and lives in the port dialog
+               (click an interface below), not here; packet loss lives in the
+               device dialog (double-click the device), alongside it. -->
           <div class="bar">
             <span class="section">STATUS</span>
             <select id="nd-d-range"></select>
           </div>
           <div id="nd-status-timeline" class="canvas chart strip">
             <svg id="nd-status-timeline-svg"></svg>
-          </div>
-          <div class="bar">
-            <span class="section">PACKET LOSS</span>
-            <select id="nd-loss-range"></select>
-          </div>
-          <div id="nd-loss-chart" class="canvas chart small">
-            <svg id="nd-loss-chart-svg"></svg>
           </div>
           <div id="nd-d-subs">
             <nav class="subtabs">
@@ -235,8 +228,8 @@
     </div>
     <div class="bar wrap" id="alerts-bulk-bar" hidden>
       <span id="alerts-bulk-count" class="hint"></span>
-      <button id="alerts-bulk-ack">Acknowledge selected</button>
-      <button id="alerts-bulk-resolve">Resolve selected</button>
+      <button id="alerts-bulk-ack" data-requires-write="alerts">Acknowledge selected</button>
+      <button id="alerts-bulk-resolve" data-requires-write="alerts">Resolve selected</button>
       <span class="grow"></span>
       <button id="alerts-bulk-clear">Clear selection</button>
     </div>

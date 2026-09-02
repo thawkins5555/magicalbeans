@@ -348,9 +348,10 @@ rather than filtered in the alert engine, the same shape as
 opened in the moments before the first poll actually failed.
 
 **MAC-table walks have their own cadence** (`_maybe_walk_mac_table`, called
-once per device per `_loop` pass). A forwarding table is hundreds to
-thousands of OIDs per switch, which does not belong on a 60-second poll, so
-`mac_table_interval_s` is a separate interval — an override column on both
+once per device per `_loop` pass). A forwarding table is thousands of rows
+per switch, and although GETBULK (below) has cut the request count roughly
+twenty-fold, that is still not per-poll work, so `mac_table_interval_s` is a
+separate interval — an override column on both
 `devices` and `groups`, resolved by `effective_config` like every other
 override, defaulting to **0 (never)** rather than to a global setting, so an
 upgrade adds no SNMP load anywhere until a profile opts in. A device's first
@@ -619,15 +620,41 @@ picker option (`pair:<inId>:<outId>`) client-side; the storage and
 series API stay strictly one-metric-per-id.
 
 **Chart smoothing** (`nodes.js movingAverage`): a centered moving
-average applied only to raw (non-rollup) series when the Smoothed
-checkbox is on (`opts.smooth`, read from `view.chartSmooth`), before
+average applied when the Smoothed checkbox is on (`opts.smooth`), before
 peak/axis computation so the Y scale reflects what's actually plotted.
-Window size is `clamp(3, 9, round(n / 20))`, shrinking at the array's
-edges rather than reaching past the data. Rollup points (`avg`/`min`/
-`max`) are never smoothed — an hourly aggregate is already a form of
-smoothing, and averaging an average would misrepresent it. The
-interface dialog's own chart call site never passes `opts.smooth`, so
-it always renders raw.
+The window is **time-aware** since 4.34.0: `clamp(round(90 s / median
+point spacing), 3, 25)` points, so it spans about ninety seconds of
+wall-clock time whether the points are two minutes or fifteen seconds
+apart (the count-based `round(n / 20)` it replaced shrank to ~27 s of
+span exactly when 3 s focus polling made the series noisiest). It
+shrinks at the array's edges rather than reaching past the data.
+Bucketed and rollup points (`avg`/`min`/`max`) are smoothed on their
+`avg` only; `min`/`max` pass through untouched, and `drawSeriesChart`
+drops them from a smoothed multi-series draw (no band) while keeping
+them for a single-series band.
+
+**Series buckets, the rate timestamp and axis hysteresis** (4.34.0).
+`NodesDatabase.series(device_id, metric_id, t0, t1, bucket_s=0)` groups
+raw samples into epoch-aligned windows (`CAST(ts / bucket_s AS INTEGER)
+* bucket_s`) when `bucket_s > 0` and the window is within the raw range
+(≤ 3 days), returning the rollup's `{ts, avg, min, max, n}` shape so the
+chart code renders either unchanged; `/series` accepts `bucket_s` and
+caps it at half the window. The interface dialog asks for
+`max(15, window / 240)` — 15 s buckets over its fixed hour, ≤ 240
+points, so 3 s focus samples and 120 s profile samples land evenly
+instead of the fast tail being packed into a few pixels. The rate's
+`dt` was the other half of the jaggedness: `_poll_device` stamped every
+interface with the poll-start `now` while each port's counters were read
+by its own GET later in the poll, a ±17 % error at a 3 s spacing.
+`_poll_interfaces` now stamps each row with `_sample_ts` taken right
+after its GET returns, and that feeds `counter_rate` and
+`update_interface_rate`; the recorded metric sample keeps `now` so it
+stays aligned with the rest of the poll. `drawSeriesChart` takes an
+`opts.axisMemory` object the dialog owns across redraws: the ceiling
+grows immediately, and shrinks only when the new nice ceiling has fallen
+below half the remembered one; a pinned `opts.peak` bypasses it. The
+dialog's one 5 s timer refreshes the text readout every tick and the
+chart every third tick — one bucket of new data per redraw.
 
 **Device chart window model** (`nodes.js`, `view.chartRange`/
 `chartWindow`): the same "frozen window that a preset reselect resets"
@@ -1152,18 +1179,22 @@ ENTITY-SENSOR-MIB off ENTITY-MIB), and although one sweep in filename
 order happens to work today, a file added later would otherwise land
 half-resolved with nothing to say so.
 
-### Device packet-loss chart (`nodes.js`, `nodesdb.series`)
+### Device packet-loss chart (`nodes.js deviceDialog`, `nodesdb.series`)
 
-Purely a front-end addition: `nodepoll` has recorded `ping_loss_pct` as a real
+Purely a front-end feature: `nodepoll` has recorded `ping_loss_pct` as a real
 metric since 4.25, and `/api/nodes/devices/{id}/metrics` plus
-`/api/nodes/devices/{id}/series` already serve it. `loadLossChart()` resolves
-the metric id out of `view.metrics` (loaded by `loadDetail` for the port
-dialog's benefit) and reuses `drawSeriesChart`.
+`/api/nodes/devices/{id}/series` already serve it. 4.33.0 drew it in the
+device pane under the status timeline; 4.34.0 moved it into the double-click
+device dialog (`#ndd-loss-range`, `#ndd-loss-chart`), where the range, the
+request ticket and the 15 s refresh timer are locals of that dialog's closure
+— the same shape as the interface dialog's bandwidth chart — torn down on
+`modal-closed` and guarded by the dialog's `current()` token. Windows past
+six hours are fetched with `bucket_s = window / 300`.
 
 Three things are deliberate:
 
-- **Its own range dropdown and its own window state** (`view.lossRange`,
-  separate from `view.chartRange`). The status timeline's range is about how
+- **Its own range dropdown and its own window state**, separate from the
+  pane timeline's `view.chartRange`. The status timeline's range is about how
   long a device has been in a state; the loss chart's is about how a link has
   been behaving. Sharing one made both worse.
 - **`opts.peak`**, a new option on `drawSeriesChart`, pins the Y axis to
@@ -1181,10 +1212,10 @@ Three things are deliberate:
   this; the status timeline keeps the full list because it reads
   `device_status_segments`, not samples.
 
-The loader uses the same request-ticket discipline as the timeline, and for one
-extra reason: `loadDetail` replaces `view.metrics` wholesale, so a metric id
-read before the selection moved belongs to a device the pane is no longer
-showing. The ticket check is paired with a re-check of `view.selected`.
+The loader reads the metric id fresh from `/metrics` on every refresh rather
+than from `view.metrics`: `loadDetail` replaces that wholesale and can switch
+the selected device underneath an open dialog, which is how the interface
+chart once requested another device's series.
 
 ### Device status timeline (`nodesdb.device_status_segments`)
 
@@ -1254,12 +1285,40 @@ an engineer to the core switch for an access-port problem. `nodes.js`
 decides from the count: exactly one (device, port) opens that port's
 dialog, several are listed as clickable hits.
 
-`replace_mac_entries` replaces a device's table wholesale rather than
-merging, so a MAC that aged out of the switch ages out here too — a stale
-row is worse than no answer. `prune_mac_entries` (a week by default, from
-`mac_table_retention_days`) runs in `Service.run_maintenance` and drops
-entries no walk has refreshed, so a switch taken out of the walk schedule
-stops answering searches from a table nobody has confirmed since.
+`replace_mac_entries` no longer deletes and reinserts a device's table on
+each walk. It marks every stored row for the device `present = 0`, then
+upserts this walk's rows back to `present = 1` with a fresh `seen_ts`
+(`ON CONFLICT(device_id, if_index, mac, vlan)`); `first_seen_ts` is stamped
+once, the first time a key is ever stored, and never touched again. A MAC
+that steps off a port keeps its row — `present = 0`, `seen_ts` frozen at its
+last confirmed sighting — so a search can still say where and when it was
+last seen instead of finding nothing. `mac_locations` returns `present`,
+`seen_ts` and `first_seen_ts` and orders present rows before stale ones;
+`nodes.js` renders a present hit as before and a stale-only result as "last
+seen on … at …". `prune_mac_entries` (a week by default, from
+`mac_table_retention_days`) runs in `Service.run_maintenance` and deletes by
+age regardless of the flag — a present row's `seen_ts` is refreshed on every
+confirming walk, so in practice it reclaims only genuinely stale rows and
+devices dropped from the schedule entirely. The old rule that a failed walk
+(a `None` return) leaves the stored table untouched still holds.
+
+**GETBULK table walks** (`nodepoll._walk_column`, `_session_for`,
+`_walk_request`). One table column is walked over a single shared UDP
+socket rather than a fresh socket per row, and on v2c/v3 with GETBULK —
+`non_repeaters = 0`, `max_repetitions = settings["snmp_bulk_max_repetitions"]`
+(default 40; 0 disables it and falls back to GETNEXT). A 90-row forwarding
+table drops from ~100 requests to about 5. v1 has no GETBULK PDU and always
+uses GETNEXT, still on the shared socket; the choice keys on the raw
+configured version, deliberately not the `version or 1` coercion used only
+for framing. Each response's varbinds are accepted in order until one leaves
+the base OID's subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`,
+or is not lexicographically after the last accepted OID (a looping agent),
+and the next request resumes from there. `error_status == 1` (tooBig) halves
+`max_repetitions` and retries, falling back to GETNEXT at one repetition
+rather than looping. The old hardcoded 512-row ceiling is now
+`settings["snmp_walk_max_rows"]` (default 16384), logged once when hit.
+`_walk_indexes` and so interface discovery share this walker and the same
+reduction.
 
 The lookup runs only on a deliberate search — Enter in the Find box sets
 `view.macSearchPending`, which `refresh()` consumes once — never on the
@@ -1577,6 +1636,44 @@ one row. `alerts.js`'s first column is now a real checkbox whose
 the row owns the detail pane, and Ctrl-click still toggles so the old
 habit keeps working. The `UPDATE ... WHERE id IN` statements themselves
 were never at fault and are unchanged.
+
+### Operator resolves stick (`alertengine.py`, `alertsdb.py`)
+
+Threshold and NetPath alerts are re-derived from live state on every tick
+(see the rollup section: that is what lets a still-breaching metric re-open
+on its own when an outage ends). The cost of that design was that
+`open_or_increment`'s dedup lookup only sees `open`/`acked` rows, so an
+alert an operator resolved while the metric was still over its limit was
+opened again as a new row on the next tick — new id, unticked, a fresh
+notification. "Bulk resolve does nothing" was this, five seconds later.
+
+The rule now: **an operator's resolve closes the breach run it was made
+in.** Both `_evaluate_thresholds` and `_evaluate_netpath_thresholds` keep
+`first_breach_ts` in their streak state (the NetPath streak gained it for
+this), and once per tick the engine loads
+`AlertsDatabase.operator_resolved_since(cutoff)` — `dedup_key → latest
+resolved_ts` over resolved rows whose `resolved_by` is neither `''` nor
+`'engine'`, within `OPERATOR_RESOLVE_WINDOW_S` (seven days), served by
+`ix_alerts_dedup_state (dedup_key, state, resolved_ts)`. A breach whose
+`first_breach_ts` is at or before that timestamp is the run the operator
+already closed and produces no occurrence. A clear observation resets
+`first_breach_ts`, so the next breach is a new run and opens normally.
+Every resolve a person makes goes through the API with a session username,
+so "non-empty and not `engine`" is exactly "resolved by hand".
+
+Two engine paths used to write descriptive strings into `resolved_by` —
+the NetPath sweep for a destination no longer traced, and a child alert
+absorbed into a device outage. Both now write `''`: with the rule above, a
+descriptive string would have read as an operator's decision and kept a
+re-enabled destination, or a still-breaching child metric after the device
+recovered, closed forever. The rollup's reason lives on the parent's
+`rollup_note`, where an operator reads it anyway.
+
+The suppression is in-memory streak state, deliberately not persisted:
+after a restart every streak rebuilds from scratch, `first_breach_ts`
+becomes "since restart", and a still-breaching alert an operator resolved
+before the restart re-opens once. The seven-day window is a backstop, not
+the mechanism — a clear ends suppression long before it matters.
 
 ### Newly added device hold (`alertengine.py`, `alertsdb.py`)
 

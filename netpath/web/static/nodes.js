@@ -20,10 +20,9 @@
     timeline: null,
     // The status timeline's window, set by the range dropdown above it.
     chartRange: 3600,
-    // The packet-loss chart's window, set by its own dropdown. Deliberately
-    // separate: an outage is read over days, a lossy link over minutes.
-    loss: null,
-    lossRange: 3600,
+    // The packet-loss chart lives in the device dialog now (double-click a
+    // device); its window and data are local to that dialog's own closure,
+    // not pane-wide state — see deviceDialog.
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -510,7 +509,7 @@
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
-    await Promise.all([loadStatusTimeline(), loadLossChart()]);
+    await loadStatusTimeline();
     drawIfaceTable();
     drawEventTable();
   }
@@ -589,12 +588,12 @@
     return [now - view.chartRange, now];
   }
 
-  /* The status timeline and the packet-loss chart under it each own their
-     own range dropdown and their own window — the same fault is read over
-     completely different spans depending on which question is being asked,
-     and one shared range made every visit to the pane a compromise. Per-port
-     bandwidth still charts in the interface dialog, over its own fixed
-     last-hour window. */
+  /* The status timeline owns its own range dropdown and its own window.
+     Per-port bandwidth charts in the interface dialog, over its own fixed
+     last-hour window; packet loss charts in the device dialog (see
+     deviceDialog), over its own — the same fault is read over completely
+     different spans depending on which question is being asked, and one
+     shared range made every visit a compromise. */
   async function loadStatusTimeline() {
     if (!view.selected) return;
     // A quick run of range changes can land out of order; a ticket that
@@ -608,54 +607,6 @@
     drawStatusTimeline();
   }
 
-  /* Packet loss over the loss chart's own window.
-
-     The samples are already there: the poller records ping_loss_pct on every
-     poll that pings, so this is two reads of endpoints that already exist
-     rather than anything new being stored. The metric row only exists once a
-     device has actually been pinged, which is a real state to render rather
-     than an error — a device polled over SNMP with pinging off has no loss to
-     show and should say so. */
-  async function loadLossChart() {
-    if (!view.selected) return;
-    const requestId = (view.lossRequestId = (view.lossRequestId || 0) + 1);
-    const deviceId = view.selected;
-    const t1 = Date.now() / 1000;
-    const t0 = t1 - view.lossRange;
-    const metric = (view.metrics || []).find((m) => m.key === 'ping_loss_pct');
-    if (!metric) {
-      view.loss = { t0, t1, unit: '%', series: [], notProbed: true };
-      drawLossChart();
-      return;
-    }
-    const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
-                                 { metric_id: metric.id, t0, t1 });
-    // Same ticket discipline as the timeline, and for a second reason here:
-    // loadDetail replaces view.metrics wholesale, so a metric id read before
-    // the selection moved belongs to a device this pane is no longer showing.
-    if (requestId !== view.lossRequestId || deviceId !== view.selected) return;
-    view.loss = { t0: result.t0, t1: result.t1, unit: '%',
-                  series: [{ label: metric.label || 'Packet loss',
-                             color: 'var(--warn)', points: result.points || [] }] };
-    drawLossChart();
-  }
-
-  function drawLossChart() {
-    const wrap = App.el('nd-loss-chart');
-    const svg = App.el('nd-loss-chart-svg');
-    if (!wrap || !svg) return;
-    drawSeriesChart(svg, wrap, view.loss, {
-      // Pinned, because loss is a percentage of a known whole and an
-      // auto-scaled axis lies about a healthy device: a flat 0% series would
-      // otherwise be drawn against a ceiling of 0.001 and read as a
-      // full-height alarm.
-      peak: 100,
-      emptyText: view.loss && view.loss.notProbed
-        ? 'This device is not being ping-probed'
-        : 'No packet-loss samples in this window',
-    });
-  }
-
   function niceCeiling(value) {
     if (value <= 0) return 1;
     const exponent = Math.floor(Math.log10(value));
@@ -666,25 +617,42 @@
     return 10 * base;
   }
 
-  /* Centered moving average over raw {ts, value} points, for the
-     Smoothed checkbox — window scales with point count so a handful of
-     samples isn't over-smoothed and a few thousand isn't under-smoothed,
-     and shrinks at the edges rather than reaching past the data. Applied
-     only to raw series (see the caller); rollup avg/min/max points never
-     pass through here. */
+  /* Centered moving average over {ts, value} (raw) or {ts, avg, min, max}
+     (bucketed/rollup) points, for the Smoothed checkbox. Time-aware rather
+     than count-based: a count-based window meant a burst of 3 s focus-poll
+     samples smoothed over the same handful of points as 30 s of normal
+     polling, so the effective smoothing span swung with cadence instead of
+     staying put. The window instead targets a fixed ~90 s of wall-clock
+     time — clamp(round(90 / median spacing), 3, 25) — and shrinks at the
+     edges rather than reaching past the data. Only the `avg`/`value` column
+     is smoothed; `min`/`max` on a bucketed point pass through unchanged
+     (they're already a bucket's real extremes — averaging them would blur
+     out the spikes they exist to show). Whether the caller keeps or drops
+     those unsmoothed min/max afterwards is the caller's call (see
+     drawSeriesChart's band logic). */
   function movingAverage(points) {
     const n = points.length;
     if (n < 3) return points;
-    const window = Math.max(3, Math.min(9, Math.round(n / 20)));
+    const spacings = [];
+    for (let i = 1; i < n; i += 1) {
+      const dt = points[i].ts - points[i - 1].ts;
+      if (dt > 0) spacings.push(dt);
+    }
+    spacings.sort((a, b) => a - b);
+    const median = spacings.length ? spacings[Math.floor(spacings.length / 2)] : 1;
+    const window = Math.max(3, Math.min(25, Math.round(90 / median)));
     const half = Math.floor(window / 2);
+    const isRollup = points[0].avg !== undefined;
     return points.map((p, i) => {
       const lo = Math.max(0, i - half);
       const hi = Math.min(n - 1, i + half);
       let sum = 0, count = 0;
       for (let j = lo; j <= hi; j += 1) {
-        if (points[j].value != null) { sum += points[j].value; count += 1; }
+        const v = isRollup ? points[j].avg : points[j].value;
+        if (v != null) { sum += v; count += 1; }
       }
-      return { ts: p.ts, value: count ? sum / count : null };
+      const smoothed = count ? sum / count : null;
+      return isRollup ? { ...p, avg: smoothed } : { ts: p.ts, value: smoothed };
     });
   }
 
@@ -722,13 +690,22 @@
     // (data.t0/t1) is still known, so the caller can keep zooming out of
     // an empty view instead of the wheel going dead — see below.
     if (!data) return null;
+    // The min/max band only when a single series is drawn — two
+    // overlapping bands read as mud, the avg lines carry the story. Decided
+    // here (before smoothing) because it also decides whether a smoothed
+    // bucketed series keeps its min/max: smoothing the avg column is always
+    // fine, but a min/max band next to a single averaged line would read as
+    // the smoothed line's own error bars, which it isn't, if there's more
+    // than one series to confuse it with.
+    const drawBand = (data.series || []).length === 1;
     const seriesList = (data.series || []).map((s) => {
       const points = s.points || [];
-      // Smoothing only makes sense on raw per-poll points — an hourly
-      // rollup's avg/min/max is already an aggregate, and averaging an
-      // average would misrepresent it rather than clarify it.
-      const isRaw = points.length && points[0].avg === undefined;
-      return { ...s, points: opts.smooth && isRaw ? movingAverage(points) : points };
+      if (!opts.smooth || points.length < 3) return { ...s, points };
+      const smoothed = movingAverage(points);
+      const isRollupPts = points[0].avg !== undefined;
+      return { ...s, points: isRollupPts && !drawBand
+        ? smoothed.map((p) => ({ ts: p.ts, avg: p.avg }))
+        : smoothed };
     });
     const value = (p) => p.avg !== undefined ? p.avg : p.value;
     const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
@@ -748,7 +725,22 @@
     }
     // opts.peak pins the axis for a metric with a known full scale (a
     // percentage); everything else scales to what it actually got.
-    const peak = opts.peak || niceCeiling(Math.max(...allValues, 0.001));
+    let peak = opts.peak || niceCeiling(Math.max(...allValues, 0.001));
+    // Axis hysteresis, auto-scaled charts only (a pinned opts.peak, like the
+    // loss chart's 100, never wobbles in the first place). Every redraw of
+    // a live chart recomputed the ceiling from that redraw's raw max, so a
+    // single low-traffic tick made the axis — and every line on it —
+    // visibly snap smaller and then snap back a few seconds later. Growing
+    // still happens immediately (a real spike must not be clipped), but a
+    // shrink is only honored once the new peak has fallen below half the
+    // previous one — a small dip no longer moves the axis at all.
+    if (!opts.peak && opts.axisMemory) {
+      const mem = opts.axisMemory;
+      if (mem.peak != null && peak < mem.peak && peak >= mem.peak / 2) {
+        peak = mem.peak;
+      }
+      mem.peak = peak;
+    }
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
     const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
 
@@ -763,9 +755,6 @@
         formatMetricValue(data.unit || '', peak * frac)));
     }
 
-    // The min/max band only when a single series is drawn — two
-    // overlapping bands read as mud, the avg lines carry the story.
-    const drawBand = seriesList.length === 1;
     for (const s of seriesList) {
       const isRollup = s.points[0] && s.points[0].avg !== undefined;
       if (isRollup && drawBand) {
@@ -935,8 +924,20 @@
       && !App.el('modal').hidden;
     const listed = (view.devices || []).find((d) => d.id === deviceId);
 
+    // The packet-loss chart's window and request ticket, local to this one
+    // dialog instance rather than pane-wide view.* state — the chart moved
+    // here from the device pane (it used to sit under the status timeline),
+    // and a dialog's own data belongs to its own closure the same way the
+    // interface dialog's bandwidth chart already works.
+    let lossRange = 3600;
+    let lossRequestId = 0;
+
     const box = App.modal(escape(displayName(listed || {})) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
+      <div class="bar"><span class="section">PACKET LOSS</span>
+        <select id="ndd-loss-range"></select></div>
+      <div id="ndd-loss-chart" class="canvas chart" style="height:150px">
+        <svg id="ndd-loss-chart-svg"></svg></div>
       <p class="section">VENDOR IDENTIFICATION</p>
       <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">INTERFACES</p>
@@ -946,6 +947,84 @@
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
     box.classList.add('wide');
+
+    // Only up to three days, same reasoning as the pane's own loss chart
+    // used to have: a wider window reads the hourly rollup, and nothing
+    // populates it for this metric, so 7 and 30 days would be permanently
+    // empty options.
+    App.fillRanges(box.querySelector('#ndd-loss-range'), 'Last hour', 259200);
+
+    // Escape and a backdrop click close the modal without Close ever being
+    // pressed, so the timer hangs off the close event rather than off that
+    // button — the interfaceDialog idiom, so a closed device dialog cannot
+    // leave a timer painting into whatever replaced it.
+    const stopLoss = () => {
+      clearInterval(lossTimer);
+      window.removeEventListener('modal-closed', onLossClosed);
+    };
+    const onLossClosed = () => stopLoss();
+    window.addEventListener('modal-closed', onLossClosed);
+
+    function drawLoss(lossData) {
+      const wrap = box.querySelector('#ndd-loss-chart');
+      const svg = box.querySelector('#ndd-loss-chart-svg');
+      if (!wrap || !svg) return;
+      drawSeriesChart(svg, wrap, lossData, {
+        // Pinned, because loss is a percentage of a known whole and an
+        // auto-scaled axis lies about a healthy device: a flat 0% series
+        // would otherwise be drawn against a ceiling of 0.001 and read as
+        // a full-height alarm.
+        peak: 100,
+        emptyText: lossData.notProbed
+          ? 'This device is not being ping-probed'
+          : 'No packet-loss samples in this window',
+      });
+    }
+
+    /* Packet loss over the loss chart's own window. The samples are
+       already there: the poller records ping_loss_pct on every poll that
+       pings, so this is two reads of endpoints that already exist rather
+       than anything new being stored. The metric row only exists once a
+       device has actually been pinged, which is a real state to render
+       rather than an error — a device polled over SNMP with pinging off
+       has no loss to show and should say so. */
+    async function loadLoss() {
+      if (!current()) { stopLoss(); return; }
+      const requestId = (lossRequestId += 1);
+      const t1 = Date.now() / 1000;
+      const t0 = t1 - lossRange;
+      const metrics = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
+      if (!current() || requestId !== lossRequestId) return;
+      const metric = (metrics.metrics || []).find((m) => m.key === 'ping_loss_pct');
+      if (!metric) {
+        drawLoss({ t0, t1, unit: '%', series: [], notProbed: true });
+        return;
+      }
+      // Bucketed only once the window is wide enough that raw points would
+      // otherwise be thousands of them — a 3-day window at 300 buckets is
+      // one every ~14 minutes, still far finer than the fault this chart
+      // is meant to catch.
+      const bucketS = (t1 - t0) > 21600 ? (t1 - t0) / 300 : 0;
+      const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
+        { metric_id: metric.id, t0, t1, bucket_s: bucketS });
+      // Same ticket discipline as the timeline, and for a second reason
+      // here: a metric id read before the range or the dialog moved on
+      // belongs to a window this chart is no longer showing.
+      if (!current() || requestId !== lossRequestId) return;
+      drawLoss({ t0: result.t0, t1: result.t1, unit: '%',
+        series: [{ label: metric.label || 'Packet loss',
+                   color: 'var(--warn)', points: result.points || [] }] });
+    }
+
+    box.querySelector('#ndd-loss-range').onchange = (e) => {
+      lossRange = Number(e.target.value);
+      loadLoss().catch(() => {});
+    };
+
+    // Fast-poll focus (see the interface dialog) keeps new loss samples
+    // landing every few seconds while this dialog is open.
+    const lossTimer = setInterval(() => { loadLoss().catch(() => {}); }, 15000);
+    loadLoss().catch(() => {});
 
     Promise.all([
       App.get(`/api/nodes/devices/${deviceId}`),
@@ -1471,6 +1550,10 @@
 
     let smooth = true;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
+    // The chart owns its own axis-hysteresis memory across redraws of this
+    // one dialog; a fresh dialog (a different port, or this one reopened)
+    // starts with no prior peak to remember.
+    const axisMemory = {};
 
     const buttons = [{ label: 'Close', primary: true, onClick: App.closeModal }];
     if (onBack) {
@@ -1516,6 +1599,7 @@
       drawSeriesChart(svg, wrap, lastChart, {
         emptyText: 'No samples yet — they arrive with each poll',
         smooth,
+        axisMemory,
       });
     }
 
@@ -1524,38 +1608,23 @@
       drawChart();
     };
 
-    async function refreshChartAndStats() {
+    // The text readout (title, stats, events) and the chart used to
+    // refresh together every 5 s. The chart doesn't need to: at 15 s of
+    // real focus-poll data per redraw (one bucket, see refreshChart below)
+    // a 5 s repaint was drawing the same bucket three times over. The text
+    // fields still change every poll, so they keep the 5 s cadence; the
+    // chart re-fetches and redraws on every third tick via the shared timer
+    // below.
+    async function refreshStats() {
       if (!current()) { stop(); return; }
       // A slow tick must not repaint over a newer one, the same way the
       // status timeline guards its own range changes.
       const requestId = (view.ifaceRequestId = (view.ifaceRequestId || 0) + 1);
-      // Metric ids are read fresh for THIS device rather than from
-      // view.metrics: loadDetail() replaces that wholesale on every refresh
-      // and can even switch the selected device underneath an open dialog,
-      // which is how this chart ended up requesting another device's series.
-      const [metrics, ifaces, events] = await Promise.all([
-        App.get(`/api/nodes/devices/${deviceId}/metrics`),
+      const [ifaces, events] = await Promise.all([
         App.get(`/api/nodes/devices/${deviceId}/interfaces`),
         App.get(`/api/nodes/devices/${deviceId}/events`),
       ]);
       if (!current() || requestId !== view.ifaceRequestId) return;
-      const list = metrics.metrics || [];
-      const inM = list.find((m) => m.key === `if_in_bps.${ifIndex}`);
-      const outM = list.find((m) => m.key === `if_out_bps.${ifIndex}`);
-      const t1 = Date.now() / 1000;
-      const t0 = t1 - 3600;
-      const [inS, outS] = await Promise.all([
-        inM ? App.get(`/api/nodes/devices/${deviceId}/series`,
-          { metric_id: inM.id, t0, t1 }) : null,
-        outM ? App.get(`/api/nodes/devices/${deviceId}/series`,
-          { metric_id: outM.id, t0, t1 }) : null,
-      ]);
-      if (!current() || requestId !== view.ifaceRequestId) return;
-      lastChart = { t0, t1, unit: 'bps', series: [
-        { label: 'in', color: 'var(--ok)', points: (inS && inS.points) || [] },
-        { label: 'out', color: 'var(--accent)', points: (outS && outS.points) || [] },
-      ] };
-      drawChart();
       // The title, the stats and the events all come from the same fetch, so
       // a renamed or newly-flapping port cannot show one section's truth
       // beside another section's five-minute-old snapshot.
@@ -1567,11 +1636,51 @@
       box.querySelector('#ifd-events').innerHTML = ifaceEventsHtml(ifIndex, events);
     }
 
+    async function refreshChart() {
+      if (!current()) { stop(); return; }
+      const requestId = (view.ifaceChartRequestId = (view.ifaceChartRequestId || 0) + 1);
+      // Metric ids are read fresh for THIS device rather than from
+      // view.metrics: loadDetail() replaces that wholesale on every refresh
+      // and can even switch the selected device underneath an open dialog,
+      // which is how this chart ended up requesting another device's series.
+      const metrics = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
+      if (!current() || requestId !== view.ifaceChartRequestId) return;
+      const list = metrics.metrics || [];
+      const inM = list.find((m) => m.key === `if_in_bps.${ifIndex}`);
+      const outM = list.find((m) => m.key === `if_out_bps.${ifIndex}`);
+      const t1 = Date.now() / 1000;
+      const t0 = t1 - 3600;
+      // 1 h at 15 s buckets is 240 points — enough to look continuous
+      // without redrawing thousands of raw 3 s focus-poll samples every
+      // tick; a wider window would ask for a proportionally wider bucket.
+      const bucketS = Math.max(15, (t1 - t0) / 240);
+      const [inS, outS] = await Promise.all([
+        inM ? App.get(`/api/nodes/devices/${deviceId}/series`,
+          { metric_id: inM.id, t0, t1, bucket_s: bucketS }) : null,
+        outM ? App.get(`/api/nodes/devices/${deviceId}/series`,
+          { metric_id: outM.id, t0, t1, bucket_s: bucketS }) : null,
+      ]);
+      if (!current() || requestId !== view.ifaceChartRequestId) return;
+      lastChart = { t0, t1, unit: 'bps', series: [
+        { label: 'in', color: 'var(--ok)', points: (inS && inS.points) || [] },
+        { label: 'out', color: 'var(--accent)', points: (outS && outS.points) || [] },
+      ] };
+      drawChart();
+    }
+
     // Fast-poll focus (feature above) keeps new samples landing every few
-    // seconds while this dialog is open; redraw on the same cadence.
-    const refreshTimer = setInterval(
-      () => { refreshChartAndStats().catch(() => {}); }, 5000);
-    refreshChartAndStats().catch(() => {});
+    // seconds while this dialog is open. One timer, one tick counter: the
+    // text readout refreshes every tick (5 s), the chart every third
+    // (15 s — one bucket's worth, so a redraw always has a whole new bucket
+    // to show rather than repainting a partial one).
+    let tick = 0;
+    const refreshTimer = setInterval(() => {
+      tick += 1;
+      refreshStats().catch(() => {});
+      if (tick % 3 === 0) refreshChart().catch(() => {});
+    }, 5000);
+    refreshStats().catch(() => {});
+    refreshChart().catch(() => {});
 
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/dom`)
       .then((r) => {
@@ -1700,8 +1809,10 @@
           min="0" step="60" placeholder="inherit"
           value="${d.mac_table_interval_s ?? ''}"> s</label>
         <p class="hint">Walks this switch's forwarding table on its own slower
-          schedule, so a MAC address on it can be found from the Find box. 0
-          switches it off for this device whatever the profile says.</p>
+          schedule, so a MAC address on it can be found from the Find box. A
+          GETBULK walk costs only a few dozen requests per switch, so 300
+          (five minutes) is a sensible starting point. 0 switches it off for
+          this device whatever the profile says.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. Leave as
@@ -2178,10 +2289,10 @@
         step="60" placeholder="inherit" value="${p.mac_table_interval_s ?? ''}"> s</label>
       <p class="hint">Walks each switch's forwarding table on this separate,
         slower schedule so MAC addresses can be searched for in the Find box.
-        <b>0 switches it off</b>, and off is the default — a forwarding table
-        is hundreds to thousands of extra SNMP reads per switch, so it is
-        worth turning on only for the switches you actually trace hosts
-        through. 900 (fifteen minutes) is a sensible starting point.</p>
+        <b>0 switches it off</b>, and off is the default. A forwarding-table
+        walk uses GETBULK, so it now costs only a few dozen SNMP requests per
+        switch rather than hundreds to thousands — <b>300 (five minutes)</b>
+        is a sensible starting point.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
@@ -2844,6 +2955,20 @@
           poll is what makes loss measurable at all — a single probe can only ever say
           0% or 100%. Both are overridable per device and per profile.</p>
       </fieldset>
+      <fieldset><legend>SNMP TABLE WALKS</legend>
+        ${number('np-bulkreps', 'GETBULK rows per request (0 = GETNEXT only)',
+                 s.snmp_bulk_max_repetitions, 'min=0 step=5')}
+        ${number('np-tablewalkrows', 'Stop a table walk after',
+                 s.snmp_walk_max_rows, 'min=100 step=1000')} rows
+        <p class="hint">Every table walk — interfaces, MAC forwarding tables,
+          DOM sensors, and the OID browser's own per-subtree reads — uses
+          GETBULK on v2c/v3: one request answers this many rows instead of
+          one GETNEXT per row. 0 falls back to plain GETNEXT, for a device
+          whose agent mishandles GetBulk. A device answering "tooBig" is
+          retried automatically at half as many rows. v1 always uses
+          GETNEXT — GETBULK does not exist in that version of the
+          protocol.</p>
+      </fieldset>
       <fieldset><legend>MAC ADDRESS TABLES</legend>
         ${number('np-macretention', 'Forget a learned MAC after',
                  s.mac_table_retention_days, 'min=0 step=1')} days
@@ -2918,6 +3043,8 @@
           ping_timeout_ms: num('#np-pingtimeout'),
           ping_interval_s: num('#np-pinginterval'),
           mac_table_retention_days: num('#np-macretention'),
+          snmp_bulk_max_repetitions: num('#np-bulkreps'),
+          snmp_walk_max_rows: num('#np-tablewalkrows'),
           oid_walk_max_rows: num('#np-walkrows'),
           oid_walk_budget_s: num('#np-walkbudget'),
           vendor_walk_enabled: on('#np-vendorwalk'),
@@ -3024,31 +3151,63 @@
     }
     const ports = new Map();
     for (const loc of locations) ports.set(`${loc.device_id}:${loc.if_index}`, loc);
-    if (ports.size === 1) {
-      const loc = locations[0];
-      show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
-           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
-           `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}</span>`);
+    const all = [...ports.values()];
+    const present = all.filter((loc) => loc.present);
+    const stale = all.filter((loc) => !loc.present);
+    const mac = escape(formatMac(payload.mac));
+    const port = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+      `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}`;
+    const lastSeen = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
+      `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''} at ${App.stamp(loc.seen_ts)} ` +
+      `(${ago(loc.seen_ts)})`;
+    const wireHits = (hits) => {
+      for (const button of note.querySelectorAll('.nd-mac-hit')) {
+        button.onclick = () => {
+          const loc = hits[Number(button.dataset.hit)];
+          selectDevice(loc.device_id);
+          openPort(loc.device_id, loc.if_index).catch(() => {});
+        };
+      }
+    };
+
+    if (!present.length) {
+      // Nothing has it now, but it was seen before: say when and where,
+      // rather than reporting it as unknown.
+      if (stale.length === 1) {
+        show(`<span class="hint"><b>${mac}</b> is not in any forwarding table ` +
+             `now — last seen on ${lastSeen(stale[0])}.</span>`);
+        return;
+      }
+      show(`<span class="hint"><b>${mac}</b> is not in any forwarding table ` +
+           `now — last seen on ${stale.length} ports:</span> ` +
+           stale.map((loc, i) =>
+             `<button class="linkish nd-mac-hit" data-hit="${i}">last seen ` +
+             `${lastSeen(loc)}</button>`).join(' '));
+      wireHits(stale);
+      return;
+    }
+    // present.length === 1: one auto-opens the port dialog, same as
+    // before stale rows existed. present.length > 1: name them all and let
+    // the operator choose — clicking one opens it, so this is a shortlist
+    // rather than a dead end. Either way, a stale sighting elsewhere earns
+    // one extra hint line rather than being folded into the main answer.
+    const earlier = stale.length
+      ? ` <span class="hint">— earlier also on ${stale.length === 1
+          ? lastSeen(stale[0]) : `${stale.length} other port(s)`}.</span>`
+      : '';
+    if (present.length === 1) {
+      const loc = present[0];
+      show(`<span class="hint"><b>${mac}</b> is on ${port(loc)}</span>${earlier}`);
       selectDevice(loc.device_id);
       await openPort(loc.device_id, loc.if_index);
       return;
     }
-    // Several: name them all and let the operator choose. Clicking one
-    // opens it, so this is a shortlist rather than a dead end.
-    show(`<span class="hint"><b>${escape(formatMac(payload.mac))}</b> is on ` +
-         `${ports.size} ports — pick one:</span> ` +
-         [...ports.values()].map((loc, i) =>
-           `<button class="linkish nd-mac-hit" data-hit="${i}">` +
-           `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
-           `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''}</button>`).join(' '));
-    const hits = [...ports.values()];
-    for (const button of note.querySelectorAll('.nd-mac-hit')) {
-      button.onclick = () => {
-        const loc = hits[Number(button.dataset.hit)];
-        selectDevice(loc.device_id);
-        openPort(loc.device_id, loc.if_index).catch(() => {});
-      };
-    }
+    show(`<span class="hint"><b>${mac}</b> is on ${present.length} ports — ` +
+         `pick one:</span> ` +
+         present.map((loc, i) =>
+           `<button class="linkish nd-mac-hit" data-hit="${i}">${port(loc)}` +
+           `</button>`).join(' ') + earlier);
+    wireHits(present);
   }
 
   /* Opens one port's dialog by id, fetching the interface row rather than
@@ -3184,16 +3343,6 @@
       loadStatusTimeline();
     };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
-    App.el('nd-loss-range').onchange = (e) => {
-      view.lossRange = Number(e.target.value);
-      loadLossChart();
-    };
-    // Only up to three days, unlike the status timeline's full range list.
-    // A wider window reads metric samples from the hourly rollup table, and
-    // nothing populates that table, so 7 and 30 days would be two options
-    // that are permanently empty. The status timeline is built from the
-    // device event log instead, so its own dropdown keeps every range.
-    App.fillRanges(App.el('nd-loss-range'), 'Last hour', 259200);
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
     App.el('nd-remove-profile').onclick = removeProfile;
@@ -3228,7 +3377,6 @@
       window.addEventListener(event, () => {
         if (App.state.tab !== 'nodes') return;
         drawStatusTimeline();
-        drawLossChart();
       });
     }
   }

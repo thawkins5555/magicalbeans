@@ -1757,13 +1757,17 @@ def get_nodes_mac_search(service, params, body) -> dict:
             "if_index": row["if_index"],
             "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
             "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
+            "first_seen_ts": row["first_seen_ts"],
+            "present": bool(row["present"]),
         })
     # How many devices are actually walking their forwarding tables, so the
     # frontend can say "nothing has been learned yet" rather than "not
     # found" when the feature is simply switched off everywhere. One query,
     # not effective_config() per device — this runs on a keystroke.
     return {"mac": mac, "locations": locations,
-            "enabled_devices": service.nodes_db.mac_walk_enabled_count()}
+            "enabled_devices": service.nodes_db.mac_walk_enabled_count(),
+            "retention_days": float(
+                service.nodes_settings.get("mac_table_retention_days", 7))}
 
 
 def post_nodes_device(service, params, body) -> dict:
@@ -2294,7 +2298,11 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
     if not metric_id:
         raise ValueError("metric_id is required")
     t0, t1 = _window(params)
-    points = service.nodes_db.series(device_id, int(metric_id), t0, t1)
+    bucket_s = _num(params, "bucket_s", 0)
+    if bucket_s < 0:
+        bucket_s = 0
+    bucket_s = min(bucket_s, (t1 - t0) / 2)
+    points = service.nodes_db.series(device_id, int(metric_id), t0, t1, bucket_s=bucket_s)
     return {"t0": t0, "t1": t1, "points": points}
 
 

@@ -396,19 +396,34 @@ not a dense per-poll sample table), so a device that's been up for a week
 with zero events still renders as one solid "up" segment rather than
 appearing to have no data. The range dropdown beside it sets the window.
 
-**Packet loss is charted under it, on its own time frame.** Loss is measured
-by this app's own ping probes on every poll, so unlike bandwidth it is a
-device-level fact and belongs in the device pane. It has **its own range
-dropdown**, independent of the timeline's: "how long has this been down" and
-"how lossy is this link" are asked over different spans, and one shared range
-made every visit to the pane a compromise. The axis is pinned to 0–100 %, so a
-healthy device draws a flat line along the bottom rather than an auto-scaled
-one that makes a fraction of a percent look like an outage. A device that is
-not being ping-probed says so instead of showing an empty chart. Its ranges
+**Packet loss is charted in the device dialog** — double-click a device row
+— on its own time frame, with its own range dropdown: "how long has this been
+down" (the timeline in the pane) and "how lossy is this link" are asked over
+different spans, and the pane is the place for the answer that has to be
+visible at a glance, the dialog for the one you open to study. The axis is
+pinned to 0–100 %, so a healthy device draws a flat line along the bottom
+rather than an auto-scaled one that makes a fraction of a percent look like an
+outage. A device that is not being ping-probed says so instead of showing an
+empty chart. The chart refreshes every fifteen seconds while the dialog is
+open, so the fast polling a selected device gets shows up in it. Its ranges
 stop at three days, because a wider metric window reads from an hourly rollup
 table that nothing populates — a 7-day option would be permanently empty. The
 status timeline keeps every range, since it is built from the event log rather
 than from samples.
+
+**The per-port bandwidth chart holds still under live polling.** Selecting a
+device polls it every few seconds, and a chart drawn from every one of those
+samples turned to hash the moment that started: the rate of a 3-second
+interval was computed from timestamps taken at the start of the poll rather
+than when the counters were actually read, the smoothing window shrank with
+the sample spacing, and the axis was re-fitted to the raw maximum on every
+redraw. Rates are now timed from the moment each port's counters came back,
+the hour is drawn from fifteen-second averages so fast and slow samples land
+evenly, **Smoothed** spans a fixed ninety seconds of wall-clock time whatever
+the sample spacing, and the axis grows immediately for a real spike but does
+not shrink for a small dip. The figures in the dialog's text still refresh
+every five seconds; the chart redraws every fifteen, when it has a whole new
+point to show.
 
 **Bandwidth is still a per-port question, so it is still asked per port** —
 there is no device-level bandwidth chart or metric picker. Clicking an
@@ -453,17 +468,26 @@ switch and one port, that port's dialog opens; when it resolves to
 several, they are listed as a shortlist to pick from rather than one
 being chosen for you — a MAC seen on an uplink is on every switch between
 here and the host, which is the normal case, and guessing which one was
-meant sends someone to the wrong place.
+meant sends someone to the wrong place. **A MAC no switch is holding right
+now** is not a dead end: the search says where and when it was last seen —
+"last seen on *switch* · *port* at *time*" — from forwarding-table history
+kept for the retention window, so an address that has gone quiet or moved
+still points somewhere.
 
 **Learning MAC addresses is off by default and separately paced.** A
-forwarding table is hundreds to thousands of rows per switch, so it is
-never read on the poll cycle. A polling profile (or a single device) sets
-**Learn MAC addresses every N seconds**; 0 means never, and 0 is the
-shipped value, so this costs nothing until you switch it on for the
-switches you actually trace hosts through. Fifteen minutes is a sensible
-starting point. A switch that is down or whose last poll failed is not
-walked, and entries no walk has refreshed for a week are dropped, so a MAC
-that moved does not go on answering from two places forever.
+forwarding table is still read on its own schedule, not the poll cycle,
+but it is no longer expensive: table walks use GETBULK, so a table that
+once cost a hundred SNMP round trips now costs about five, and it can be
+refreshed far more often for the same load. A polling profile (or a single
+device) sets **Learn MAC addresses every N seconds**; 0 means never, and 0
+is the shipped value, so this costs nothing until you switch it on for the
+switches you actually trace hosts through. Five minutes is a fine starting
+point now. A switch that is down or whose last poll failed is not walked.
+A MAC that leaves a port is not erased on the next walk: it is kept, marked
+absent, with the time it was last confirmed, so the Find box can still say
+where it was; entries no walk has refreshed for the retention window (a
+week by default, set under **Nodes → Settings**) are then
+dropped.
 
 **Vendor and Location can be read from an OID you choose.** Vendor is
 normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr
@@ -560,6 +584,18 @@ alerts and optionally emailing about them.
   alerts in one request — alongside the single-alert buttons in the
   detail pane and the server-wide **Acknowledge all**, which
   deliberately ignores the selection and its confirmation says so.
+- **Resolving means resolved.** An alert an operator resolves stays
+  closed for that breach run even when its condition still holds: a
+  threshold alert re-opens only after the metric has been observed under
+  its clear value and then breaches again, and a NetPath path alert only
+  after a trace that reached the destination is followed by failing ones.
+  Acknowledge is the way to keep an alert on the list while watching a live
+  problem; Resolve is the statement that it is handled. The bulk buttons
+  report their effect — "Resolved 3 of 4" beside the engine counters — so a
+  row somebody else resolved between the tick and the click is visible as
+  the one not acted on. A restart of the application forgets which breach
+  runs were resolved by hand, so a still-breaching alert can re-open once
+  after one.
 - **A newly added device is given five minutes before it can raise an
   alert.** A device added a moment ago is usually still being set up —
   wrong community, not cabled yet, still booting — and the alerts that

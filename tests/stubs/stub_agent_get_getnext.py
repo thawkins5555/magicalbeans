@@ -11,8 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
-    PDU_GET, PDU_GETNEXT, PDU_RESPONSE, T_END_OF_MIB_VIEW, T_NO_SUCH_OBJECT,
-    T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_varbind,
+    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, T_END_OF_MIB_VIEW,
+    T_NO_SUCH_OBJECT, T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_varbind,
 )
 
 COMMUNITY = "public"
@@ -65,6 +65,26 @@ def build_getnext_reply(request_id, requested_oid):
     return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets(COMMUNITY) + pdu)
 
 
+def build_getbulk_reply(request_id, requested_oid, max_repetitions):
+    """Chains the same lexicographic-successor step build_getnext_reply
+    uses, once per repetition, padding with endOfMibView once the table is
+    exhausted — a GetBulk reply is exactly a repeated GetNext."""
+    candidates = sorted(OID_VALUES.keys(), key=oid_key)
+    cursor = requested_oid
+    body = b""
+    for _ in range(max(1, max_repetitions)):
+        rk = oid_key(cursor)
+        next_oid = next((k for k in candidates if oid_key(k) > rk), None)
+        if next_oid is None:
+            body += enc_varbind(cursor, _tlv(T_END_OF_MIB_VIEW, b""))
+            break
+        body += enc_varbind(next_oid, encode_value(*OID_VALUES[next_oid]))
+        cursor = next_oid
+    pdu = _tlv(PDU_RESPONSE, enc_int(request_id) + enc_int(0) + enc_int(0) +
+              _tlv(T_SEQUENCE, body))
+    return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets(COMMUNITY) + pdu)
+
+
 def main():
     port = int(sys.argv[1])
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -84,6 +104,9 @@ def main():
             reply = build_get_reply(request.request_id, oids)
         elif request.pdu_tag == PDU_GETNEXT:
             reply = build_getnext_reply(request.request_id, oids[0])
+        elif request.pdu_tag == PDU_GETBULK:
+            reply = build_getbulk_reply(request.request_id, oids[0],
+                                        request.error_index or 1)
         else:
             continue
         sock.sendto(reply, addr)

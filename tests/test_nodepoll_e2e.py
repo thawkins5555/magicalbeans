@@ -18,7 +18,7 @@ import _paths  # noqa: F401  (puts the repo root on sys.path)
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 from netpath.snmppoll import (
-    PDU_GET, PDU_GETNEXT, PDU_RESPONSE, decode_response, _tlv,
+    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, decode_response, _tlv,
 )
 from netpath.trapdecode import (
     T_SEQUENCE, T_NULL, T_TIMETICKS, T_COUNTER32, T_COUNTER64, T_GAUGE32,
@@ -91,6 +91,18 @@ class StubAgent:
             oid = oids[0]
             next_oid, next_val = self._next_for(oid)
             parts = enc_varbind(next_oid, next_val)
+            return self._response(req.version, "public", req.request_id, parts)
+
+        if req.pdu_tag == PDU_GETBULK:
+            # error_index carries max_repetitions, the same third-integer
+            # slot a real GetBulk-PDU uses (see snmppoll._pdu_bytes). Chain
+            # the same lexicographic-successor step GETNEXT uses, once per
+            # repetition — a GetBulk reply is exactly that, repeated.
+            cursor = oids[0]
+            parts = b""
+            for _ in range(max(1, req.error_index or 1)):
+                cursor, value = self._next_for(cursor)
+                parts += enc_varbind(cursor, value)
             return self._response(req.version, "public", req.request_id, parts)
 
         return None

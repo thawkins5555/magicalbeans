@@ -160,16 +160,28 @@ CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);
 -- 60-second poll. `mac` is stored normalised — lowercase hex, no
 -- separators — so one stored form answers ':', '-', '.' and bare-hex
 -- searches alike; see normalize_mac.
+-- present distinguishes "this walk still sees it" (1) from "the last walk
+-- that saw it was some time ago" (0) — a MAC that steps off a port for one
+-- walk cycle used to vanish outright (DELETE-then-INSERT every walk);
+-- now the row survives with present=0 and its last seen_ts, so a search
+-- can still say where it was, until prune_mac_entries drops it. seen_ts is
+-- refreshed on every walk that still sees the row; first_seen_ts is
+-- stamped once, when the (device, port, mac, vlan) key is first stored,
+-- and never overwritten after.
 CREATE TABLE IF NOT EXISTS mac_entries (
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     if_index        INTEGER NOT NULL,
     mac             TEXT NOT NULL,
     vlan            TEXT NOT NULL DEFAULT '',
     seen_ts         REAL NOT NULL,
+    first_seen_ts   REAL,
+    present         INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (device_id, if_index, mac, vlan)
 );
 CREATE INDEX IF NOT EXISTS ix_mac_entries_mac ON mac_entries(mac);
 CREATE INDEX IF NOT EXISTS ix_mac_entries_seen ON mac_entries(seen_ts);
+CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present
+    ON mac_entries(mac, present, seen_ts);
 
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
@@ -364,6 +376,19 @@ DEFAULTS = {
     # bound stopped it, if either did.
     "oid_walk_max_rows": 100_000,
     "oid_walk_budget_s": 600.0,
+    # Every table walk (interfaces, MAC forwarding tables, DOM sensors, the
+    # OID browser's per-subtree helpers) goes through nodepoll._walk_column,
+    # which uses GETBULK on v2c/v3: one request answers up to this many rows
+    # instead of one GETNEXT per row. 0 falls back to plain GETNEXT for a
+    # device whose agent mishandles GetBulk; v1 always uses GETNEXT since
+    # the PDU does not exist in that version of the protocol. A tooBig
+    # reply from the device halves the request's own repetitions and
+    # retries, independent of this setting.
+    "snmp_bulk_max_repetitions": 40,
+    # Safety cap on a single _walk_column call, replacing the old hardcoded
+    # 512 — high enough that no real switch's forwarding table or ifTable
+    # hits it, low enough that a looping agent cannot walk forever.
+    "snmp_walk_max_rows": 16384,
     # How long a learned MAC stays searchable after the last walk that saw
     # it. A device dropped from the walk schedule stops refreshing its
     # entries, and after this they are dropped rather than answering
@@ -604,6 +629,24 @@ class NodesDatabase:
             if column not in results:
                 self._conn.execute(
                     f"ALTER TABLE discovery_results ADD COLUMN {column} TEXT")
+
+        mac_entries = {row["name"] for row in
+                      self._conn.execute("PRAGMA table_info(mac_entries)").fetchall()}
+        # present/first_seen_ts (4.34): a MAC entry now survives a walk that
+        # no longer sees it (present=0) instead of being deleted outright —
+        # see the CREATE TABLE comment above. Every pre-existing row was, by
+        # definition, seen on its own seen_ts and nothing else is known
+        # about when it first appeared, so first_seen_ts backfills to that.
+        if "first_seen_ts" not in mac_entries:
+            self._conn.execute("ALTER TABLE mac_entries ADD COLUMN first_seen_ts REAL")
+            self._conn.execute(
+                "UPDATE mac_entries SET first_seen_ts = seen_ts WHERE first_seen_ts IS NULL")
+        if "present" not in mac_entries:
+            self._conn.execute(
+                "ALTER TABLE mac_entries ADD COLUMN present INTEGER NOT NULL DEFAULT 1")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
+            " ON mac_entries(mac, present, seen_ts)")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -1171,27 +1214,42 @@ class NodesDatabase:
 
     # ------------------------------------------------ forwarding tables
 
-    def replace_mac_entries(self, device_id: int, entries: list[dict]) -> int:
-        """Replace everything this device has learned with `entries`
-        ({if_index, mac, vlan}). Wholesale rather than merged, because a MAC
-        that has aged out of the switch must age out here too — a stale row
-        would send somebody to the wrong port, which is worse than having no
-        answer at all. The MAC is normalised on the way in, so every stored
-        row is in one form regardless of how the source spelled it."""
-        now = time.time()
+    def replace_mac_entries(self, device_id: int, entries: list[dict],
+                            now: float | None = None) -> int:
+        """Merge this walk's rows into the device's history rather than
+        replacing it outright: every row already stored for this device is
+        marked present=0 first, then each of this walk's rows is upserted
+        with present=1 and a fresh seen_ts — first_seen_ts is carried
+        forward on an existing (device, port, mac, vlan) key and stamped
+        fresh only the first time that key is ever stored. A MAC that has
+        aged out of the switch since the last walk keeps its row, its last
+        seen_ts, and present=0, rather than being deleted outright — a
+        stale answer that says when and where a MAC was last seen is more
+        useful than no answer at all, and prune_mac_entries is what
+        eventually drops it. The MAC is normalised on the way in, so every
+        stored row is in one form regardless of how the source spelled it.
+
+        `entries` being an empty list is a genuine "this switch has learned
+        nothing right now" and marks every row absent; a failed walk must
+        never reach here at all (`entries is None`) — the caller leaves
+        storage alone in that case."""
+        now = now if now is not None else time.time()
         rows = []
         for entry in entries:
             mac = normalize_mac(entry.get("mac"))
             if len(mac) != 12:
                 continue
             rows.append((device_id, int(entry["if_index"]), mac,
-                         str(entry.get("vlan") or ""), now))
+                         str(entry.get("vlan") or ""), now, now))
         with self._lock:
-            self._conn.execute("DELETE FROM mac_entries WHERE device_id = ?",
-                               (device_id,))
+            self._conn.execute(
+                "UPDATE mac_entries SET present = 0 WHERE device_id = ?",
+                (device_id,))
             self._conn.executemany(
-                "INSERT OR REPLACE INTO mac_entries(device_id, if_index, mac,"
-                " vlan, seen_ts) VALUES (?,?,?,?,?)", rows)
+                "INSERT INTO mac_entries(device_id, if_index, mac, vlan,"
+                " seen_ts, first_seen_ts, present) VALUES (?,?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, if_index, mac, vlan) DO UPDATE SET"
+                " seen_ts = excluded.seen_ts, present = 1", rows)
             self._conn.commit()
         return len(rows)
 
@@ -1217,10 +1275,13 @@ class NodesDatabase:
 
     def mac_locations(self, mac_prefix: str, limit: int = 200) -> list[sqlite3.Row]:
         """Every (device, port) a MAC starting with this prefix was learned
-        on, newest first. A MAC on an uplink is on every switch between here
-        and the host, so this returns them all and lets the caller decide —
-        picking one silently is how you send an engineer to the core switch
-        for a problem on an access port."""
+        on — present (still seen on the last walk) first, then stale (not
+        seen on the last walk, but not pruned yet) newest-seen first. A MAC
+        on an uplink is on every switch between here and the host, so this
+        returns them all and lets the caller decide — picking one silently
+        is how you send an engineer to the core switch for a problem on an
+        access port. Each row carries present/seen_ts/first_seen_ts so the
+        caller can tell "here now" from "last seen here"."""
         prefix = normalize_mac(mac_prefix)
         if len(prefix) < 4:
             return []
@@ -1229,11 +1290,14 @@ class NodesDatabase:
                 "SELECT m.*, i.descr AS if_descr FROM mac_entries m"
                 " LEFT JOIN interfaces i ON i.device_id = m.device_id"
                 "   AND i.if_index = m.if_index"
-                " WHERE m.mac LIKE ? ORDER BY m.seen_ts DESC, m.device_id,"
-                " m.if_index LIMIT ?", (f"{prefix}%", int(limit))).fetchall()
+                " WHERE m.mac LIKE ? ORDER BY m.present DESC, m.seen_ts DESC,"
+                " m.device_id, m.if_index LIMIT ?",
+                (f"{prefix}%", int(limit))).fetchall()
 
     def mac_entries_for(self, device_id: int,
                         if_index: int | None = None) -> list[sqlite3.Row]:
+        """Every row stored for this device (optionally one port), present
+        and stale alike — each carries `present`/`seen_ts`/`first_seen_ts`."""
         sql = "SELECT * FROM mac_entries WHERE device_id = ?"
         args: list = [device_id]
         if if_index is not None:
@@ -1243,10 +1307,16 @@ class NodesDatabase:
             return self._conn.execute(sql + " ORDER BY mac, vlan", args).fetchall()
 
     def prune_mac_entries(self, older_than_s: float) -> int:
-        """Drop entries nothing has refreshed for this long. A device taken
-        out of the walk schedule (or out of service) would otherwise keep
-        answering searches with a forwarding table nobody has confirmed
-        since."""
+        """Drop entries nothing has refreshed for this long, present or
+        stale alike. Now that replace_mac_entries keeps a stale row around
+        (present=0) instead of deleting it on the spot, this is what
+        actually reclaims it, once no walk has confirmed it for the
+        retention window — the common case being a MAC that genuinely left
+        the port. A present row's seen_ts is refreshed on every walk that
+        still sees it, so this only reaches one of those when the device
+        itself has stopped being walked (dropped from the schedule, or out
+        of service) and nothing is refreshing it any more; either way, the
+        rule is the same DELETE by age, not a present/absent branch."""
         if older_than_s <= 0:
             return 0
         with self._lock:
@@ -1355,7 +1425,8 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
 
-    def series(self, device_id: int, metric_id: int, t0: float, t1: float) -> list[dict]:
+    def series(self, device_id: int, metric_id: int, t0: float, t1: float,
+               bucket_s: float = 0) -> list[dict]:
         """Raw-vs-hourly selection: a wide window reads the rollup table
         instead of scanning months of raw points.
 
@@ -1365,6 +1436,13 @@ class NodesDatabase:
         stale dialog does when the selected device changes underneath it. A
         mismatch now returns nothing, which reads as "no samples" rather than
         as somebody else's traffic.
+
+        `bucket_s > 0` buckets raw samples server-side into fixed-width
+        windows aligned to epoch time (`floor(ts / bucket_s) * bucket_s`),
+        returning the same `{ts, avg, min, max}` shape the hourly rollup
+        uses so `drawSeriesChart` renders either one unchanged. Bucketing
+        only applies within the raw-sample window (<= 3 days); a wider
+        window already reads the hourly rollup and ignores `bucket_s`.
         """
         with self._lock:
             if not self._conn.execute(
@@ -1372,6 +1450,16 @@ class NodesDatabase:
                     (metric_id, device_id)).fetchone():
                 return []
             if (t1 - t0) <= 86400 * 3:
+                if bucket_s and bucket_s > 0:
+                    rows = self._conn.execute(
+                        "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
+                        " AVG(value) AS avg, MIN(value) AS min, MAX(value) AS max,"
+                        " COUNT(*) AS n FROM samples WHERE metric_id = ?"
+                        " AND ts >= ? AND ts <= ? GROUP BY 1 ORDER BY 1",
+                        (bucket_s, bucket_s, metric_id, t0, t1)).fetchall()
+                    return [{"ts": row["bucket_ts"], "avg": row["avg"],
+                            "min": row["min"], "max": row["max"], "n": row["n"]}
+                            for row in rows]
                 rows = self._conn.execute(
                     "SELECT ts, value FROM samples WHERE metric_id = ?"
                     " AND ts >= ? AND ts <= ? ORDER BY ts",
