@@ -86,6 +86,33 @@
      page ships with; everything else is available from Nodes → Settings →
      Columns. `cell` renders, `value` sorts, `fixed` means the column is the
      table's own machinery and is never offered for hiding. */
+  /* How much to trust a vendor name, as one character after it: "?" for a
+     low-confidence guess (sysDescr), "~" for probable (a curated enterprise
+     number, or a walk with thin MIB evidence), "*" for a vendor an operator
+     set or one learned from an operator's override. Nothing after a name
+     that came from an IANA arc or strong walk evidence — the common case
+     should read clean. The title says which source spoke. */
+  const SOURCE_LABEL = {
+    sysObjectID: 'from its sysObjectID (IANA enterprise arc)',
+    walk: 'from the enterprise arcs it answers under',
+    sysDescr: 'a guess from a word in its sysDescr',
+    oid: 'from a custom vendor OID (display only)',
+    manual: 'set by an operator',
+    learned: 'learned from an operator override on a device with the same sysObjectID',
+  };
+  function vendorMarker(r) {
+    if (!r.vendor) return '';
+    const source = r.vendor_source || '';
+    const confidence = r.vendor_confidence || '';
+    let mark = '';
+    if (source === 'manual' || source === 'learned') mark = '*';
+    else if (confidence === 'low') mark = '?';
+    else if (confidence === 'medium') mark = '~';
+    if (!mark) return '';
+    const title = `${SOURCE_LABEL[source] || source}${confidence ? ` — ${confidence} confidence` : ''}`;
+    return ` <span class="hint" title="${escape(title)}">${mark}</span>`;
+  }
+
   /* " · alerts muted" when this device has an active mute, blank otherwise.
      muted_until comes from the Alerts module via the devices endpoint. */
   function mutedTag(row) {
@@ -120,7 +147,7 @@
       cell: (r) => escape(r._devGroupName || '\u2014') },
     { key: 'vendor', label: 'Vendor', width: 120, on: true,
       value: (r) => r.vendor || '',
-      cell: (r) => escape(r.vendor || '\u2014') },
+      cell: (r) => escape(r.vendor || '\u2014') + vendorMarker(r) },
     { key: 'response', label: 'Response', width: 90, numeric: true, on: true,
       // Sorted on the number, not on the "12 ms (ping only)" text, and a
       // device with no reading sorts as blank rather than as zero.
@@ -354,6 +381,43 @@
     App.refreshNow('nodes');
   }
 
+  /* Re-identify every ticked device. Same shape as bulkPollNow: the POST
+     returning means the walks were started on their own threads, and the
+     list shows the outcome as the Vendor column changes. */
+  async function bulkIdentify() {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    const button = App.el('nd-bulk-identify');
+    if (!button || button.disabled) return;
+    const settle = (text) => {
+      button.disabled = false;
+      button.textContent = text;
+      if (text !== 'Re-identify') {
+        setTimeout(() => {
+          if (button.textContent === text) button.textContent = 'Re-identify';
+        }, 4000);
+      }
+    };
+    button.disabled = true;
+    button.textContent = 'Starting…';
+    let result;
+    try {
+      result = await App.post('/api/nodes/devices/bulk-identify', { device_ids: ids });
+    } catch (error) {
+      settle('Failed');
+      return;
+    }
+    const queued = (result.queued || []).length;
+    const running = (result.already_running || []).length;
+    const off = (result.snmp_disabled || []).length;
+    const parts = [];
+    if (queued) parts.push(`Started ${queued}`);
+    if (running) parts.push(`${running} already running`);
+    if (off) parts.push(`${off} SNMP off`);
+    settle(parts.length ? parts.join(' · ') : 'Nothing to identify');
+    App.refreshNow('nodes');
+  }
+
   function bulkSetProfile() {
     const ids = [...view.devicesChecked];
     if (!ids.length) return;
@@ -484,8 +548,11 @@
       // and the header used to present all three identically.
       vendor: () => field('vendor', d.vendor + ({
         sysObjectID: ' (sysObjectID)', sysDescr: ' (sysDescr)',
-        oid: ' (custom OID)',
-      }[d.vendor_source] || '')),
+        oid: ' (custom OID)', walk: ' (walk)', learned: ' (learned)',
+        manual: ' (manual)',
+      }[d.vendor_source] || '')
+        + (d.vendor && d.vendor_confidence && d.vendor_confidence !== 'high'
+           ? ` ${d.vendor_confidence}` : '')),
       // effective_config is only on the single-device endpoint; guarded so
       // this stays safe for any caller passing a plain list row.
       snmp_version: () => field('SNMP', (d.effective_config
@@ -808,6 +875,8 @@
 
     const box = App.modal(escape(displayName(listed || {})) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
+      <p class="section">VENDOR IDENTIFICATION</p>
+      <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">INTERFACES</p>
       <div class="table-wrap" style="max-height:34vh"><table id="ndd-if-table"></table></div>
       <p class="section">EVENT LOG</p>
@@ -825,6 +894,7 @@
       const device = detail.device;
       box.querySelector('h2').textContent = displayName(device);
       box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(device);
+      renderVendorSection(box, device, deviceId, current);
       // Opening a port from here replaces this dialog — there is only one
       // #modal-box — so the port dialog gets a way back to this one.
       drawIfaceTable(box.querySelector('#ndd-if-table'),
@@ -836,6 +906,153 @@
       box.querySelector('#ndd-summary').innerHTML =
         '<span class="err">Could not read this device.</span>';
     });
+  }
+
+  /* ------------------------------------------ vendor identification */
+
+  /* What the app decided a device is, and why — the stored evidence from
+     vendorid, rendered so an operator can check the reasoning rather than
+     take a name on trust. Re-identify, the manual override and the catalog
+     install all live here, and every one of them re-renders from a fresh
+     GET rather than patching the DOM, so the section always shows what the
+     server holds. */
+  function vendorSectionHtml(d) {
+    const ev = d.vendor_evidence || {};
+    const decision = ev.decision || {};
+    const arcs = ev.arcs || [];
+    const source = d.vendor_source || '';
+    const confidence = d.vendor_confidence || '';
+    const canWrite = App.canWrite('nodes');
+    const head = d.vendor
+      ? `<b>${escape(d.vendor_display && d.vendor_display !== d.vendor
+          ? `${d.vendor_display} (${d.vendor})` : d.vendor)}</b>` +
+        ` <span class="hint">${escape(SOURCE_LABEL[source] || source || '')}` +
+        `${confidence ? ` · ${escape(confidence)} confidence` : ''}</span>`
+      : '<b>Not identified</b>';
+    const why = decision.reason || ev.error || '';
+    const arcLines = arcs.length ? `<table class="nd-arcs">${arcs.map((a) => {
+      const name = a.display || a.name || `enterprise ${a.arc}`;
+      const mib = a.mib_file_id
+        ? `${escape(a.module)} names ${a.named} of ${a.objects} (${Math.round((a.score || 0) * 100)}%)`
+        : (a.generic ? 'SNMP agent, not the maker'
+           : (a.bundle ? `no MIB installed — the ${escape(a.bundle)} bundle would decode it`
+              : 'no MIB installed'));
+      return `<tr><td>${a.arc}</td><td>${escape(name)}</td>` +
+        `<td>${a.objects} object${a.objects === 1 ? '' : 's'}${a.capped ? ' (capped)' : ''}</td>` +
+        `<td class="hint">${mib}</td></tr>`;
+    }).join('')}</table>`
+      : (ev.hop ? '<p class="hint">No enterprise arcs answered.</p>' : '');
+    const walk = ev.walk && ev.walk.objects != null && ev.hop
+      ? `<p class="hint">Walked ${ev.walk.objects} object(s) in ${ev.hop.requests + (ev.walk.requests || 0)} ` +
+        `request(s), ${(ev.walk.elapsed_s || 0).toFixed(1)}s` +
+        `${ev.walk.stopped && ev.walk.stopped !== 'complete' ? ` — ${escape(ev.walk.stopped)}` : ''}` +
+        `${ev.ts ? ` · ${new Date(ev.ts * 1000).toLocaleString()}` : ''}` +
+        `${ev.trigger ? ` (${escape(ev.trigger.replace('_', ' '))})` : ''}</p>` : '';
+    const chosen = (ev.candidates || []).find((c) => c.mib_file_id === d.mib_file_id);
+    const mib = d.mib_file_id
+      ? `<p class="hint">Custom MIB assigned: ${chosen ? escape(chosen.module) : `#${d.mib_file_id}`}` +
+        `${ev.chosen_mib_file_id && ev.chosen_mib_file_id !== d.mib_file_id
+          ? ' (chosen by hand — Re-identify never changes an assigned MIB)' : ''}</p>`
+      : '';
+    const suggest = d.suggest_bundle && !d.suggest_bundle.installed && canWrite
+      ? `<p>This looks like a ${escape(d.suggest_bundle.vendor)} — ` +
+        `<button id="ndd-install-bundle" data-key="${escape(d.suggest_bundle.key)}">` +
+        `Install the ${escape(d.suggest_bundle.name)} MIBs</button></p>`
+      : (d.suggest_bundle && d.suggest_bundle.installed
+         ? `<p class="hint">The ${escape(d.suggest_bundle.name)} bundle is installed; ` +
+           'Re-identify to score it.</p>' : '');
+    const learned = d.learned_from
+      ? `<p class="hint">Learned from device #${d.learned_from.device_id}` +
+        `${d.learned_from.set_by ? ` (set by ${escape(d.learned_from.set_by)})` : ''}.</p>` : '';
+    const override = canWrite ? `
+      <div class="bar wrap">
+        <label>Vendor (manual) <input id="ndd-vendor-override" size="18" maxlength="64"
+          value="${escape(d.vendor_override || '')}" placeholder="automatic"></label>
+        <button id="ndd-vendor-save">Save</button>
+        ${d.vendor_override ? '<button id="ndd-vendor-clear">Clear</button>' : ''}
+        <span class="grow"></span>
+        <button id="ndd-reidentify"${d.identifying ? ' disabled' : ''}>` +
+        `${d.identifying ? 'Identifying…' : 'Re-identify'}</button>
+      </div>
+      <p class="hint">${d.learnable
+        ? 'A manual vendor also teaches every device with the same sysObjectID.'
+        : `A manual vendor applies to this device only: ${escape(d.learn_reason || '')}.`}</p>`
+      : '';
+    return `<p>${head}${why ? `<br><span class="hint">${escape(why)}</span>` : ''}</p>` +
+      arcLines + walk + mib + learned + suggest + override;
+  }
+
+  function renderVendorSection(box, device, deviceId, current) {
+    const holder = box.querySelector('#ndd-vendor');
+    if (!holder) return;
+    holder.className = '';
+    holder.innerHTML = vendorSectionHtml(device);
+    const refresh = async () => {
+      const detail = await App.get(`/api/nodes/devices/${deviceId}`);
+      if (!current()) return;
+      renderVendorSection(box, detail.device, deviceId, current);
+      box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(detail.device);
+    };
+    const reidentify = holder.querySelector('#ndd-reidentify');
+    if (reidentify) reidentify.onclick = async () => {
+      reidentify.disabled = true;
+      reidentify.textContent = 'Identifying…';
+      try {
+        await App.post(`/api/nodes/devices/${deviceId}/identify`, {});
+      } catch (error) {
+        reidentify.textContent = 'Failed';
+        reidentify.disabled = false;
+        return;
+      }
+      // Poll the job until it finishes, then re-render from the stored
+      // verdict. The seq token stops a late answer painting into whatever
+      // dialog replaced this one.
+      for (let i = 0; i < 90 && current(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        let status;
+        try { status = await App.get(`/api/nodes/devices/${deviceId}/identify`); }
+        catch (error) { break; }
+        if (!current()) return;
+        const job = status.job;
+        if (!job || job.state === 'done' || job.state === 'failed') break;
+        const live = holder.querySelector('#ndd-reidentify');
+        if (live) live.textContent = `Identifying… (${job.objects || 0} objects)`;
+      }
+      if (current()) refresh().catch(() => {});
+    };
+    const save = holder.querySelector('#ndd-vendor-save');
+    if (save) save.onclick = async () => {
+      const text = holder.querySelector('#ndd-vendor-override').value.trim();
+      await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: text });
+      if (current()) refresh().catch(() => {});
+      App.refreshNow('nodes');
+    };
+    const clear = holder.querySelector('#ndd-vendor-clear');
+    if (clear) clear.onclick = async () => {
+      await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: '' });
+      if (current()) refresh().catch(() => {});
+      App.refreshNow('nodes');
+    };
+    const install = holder.querySelector('#ndd-install-bundle');
+    if (install) install.onclick = async () => {
+      install.disabled = true;
+      install.textContent = 'Installing…';
+      try {
+        await App.post(`/api/nodes/mib-catalog/${install.dataset.key}/install`, {});
+      } catch (error) {
+        install.textContent = 'Install failed';
+        return;
+      }
+      for (let i = 0; i < 120 && current(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        let status;
+        try { status = await App.get('/api/nodes/mib-catalog/status'); }
+        catch (error) { break; }
+        const job = status.job;
+        if (!job || !['running', 'starting', 'queued'].includes(job.state)) break;
+      }
+      if (current()) refresh().catch(() => {});
+    };
   }
 
   /* ------------------------------------------- interface drill-down */
@@ -1445,7 +1662,17 @@
   function identityOidFieldsHtml(d, forGroup = false) {
     const inherit = forGroup ? 'standard detection' : 'inherit';
     const p = forGroup ? 'nd-p' : 'nd-f';
-    return `
+    // The manual vendor is a device fact, not a profile setting, so only
+    // the device form offers it; the profile form gets the two OIDs only.
+    const manual = forGroup ? '' : `
+      <label>Vendor (manual) <input id="${p}-vendormanual" size="30" maxlength="64"
+        placeholder="automatic" value="${escape(d.vendor_override || '')}"
+        data-original="${escape(d.vendor_override || '')}"></label>
+      <p class="hint">Overrides what identification decided, for display AND
+        for ConfigRX's command choice; and when this device's sysObjectID is
+        specific to one vendor, every device with the same sysObjectID
+        follows. Blank returns to automatic.</p>`;
+    return `${manual}
       <label>Vendor OID <input id="${p}-vendoroid" size="30"
         placeholder="${inherit}" value="${escape(d.vendor_oid || '')}"></label>
       <label>Location OID <input id="${p}-locationoid" size="30"
@@ -1464,10 +1691,19 @@
     // read as a deliberate choice and stop the profile's value applying.
     const p = forGroup ? 'nd-p' : 'nd-f';
     const text = (id) => (box.querySelector(id) || { value: '' }).value.trim();
-    return {
+    const values = {
       vendor_oid: text(`#${p}-vendoroid`) || null,
       location_oid: text(`#${p}-locationoid`) || null,
     };
+    // Device form only, and only when it changed: the API treats the key's
+    // presence as "the operator touched this" (setting teaches the fleet,
+    // clearing re-decides the row and records an event), so an ordinary
+    // Save of some other field must not send it.
+    const manual = !forGroup ? box.querySelector(`#${p}-vendormanual`) : null;
+    if (manual && manual.value.trim() !== (manual.dataset.original || '')) {
+      values.vendor_override = manual.value.trim();
+    }
+    return values;
   }
 
   // mib_file_id is a plain nullable override, same shape as poll_interval_s/
@@ -2078,8 +2314,20 @@
       return `<tr><td>${box}</td>` +
         `<td>${escape(r.ip)}</td><td>${r.ping_ok ? 'yes' : 'no'}</td>` +
         `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
-        `<td>${escape(r.sys_name || '—')}</td><td>${escape(r.vendor || '—')}${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
+        `<td>${escape(r.sys_name || '—')}</td><td title="${escape(discArcsTitle(r))}">` +
+        `${escape(r.vendor || '—')}${vendorMarker(r)}` +
+        `${r.suggest_bundle && !r.suggest_bundle_installed
+          ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : ''}` +
+        `${promoted ? ' <span class="hint">(added)</span>' : ''}</td></tr>`;
     }).join('');
+  }
+
+  function discArcsTitle(r) {
+    const arcs = r.arcs || [];
+    if (!arcs.length) return r.vendor_source ? `via ${r.vendor_source}` : '';
+    const names = r.arc_names || [];
+    return 'Answers under enterprise arc(s): ' + arcs.map((a, i) =>
+      names[i] ? `${a} (${names[i]})` : String(a)).join(', ');
   }
 
   /* A select-all box in the header cell above the row boxes, the same
@@ -2555,6 +2803,24 @@
           real, so a device whose agent loops cannot walk forever. Whichever
           bound stops a walk is named in the downloaded file's header.</p>
       </fieldset>
+      <fieldset><legend>VENDOR IDENTIFICATION</legend>
+        ${check('np-vendorwalk', 'Identify a device\'s vendor by walking its enterprise arcs once',
+                s.vendor_walk_enabled !== false)}
+        ${number('np-vendorobjects', 'Stop the identification walk after',
+                 s.vendor_walk_max_objects, 'min=50 step=50')} objects
+        ${number('np-vendorbudget', 'or after', s.vendor_walk_budget_s,
+                 'min=5 step=5')} seconds
+        ${number('np-vendorparallel', 'At most', s.vendor_walk_parallel,
+                 'min=1 max=16')} walks at once
+        ${check('np-dischop', 'Discovery sweeps also list each device\'s enterprise arcs',
+                s.discovery_arc_hop !== false)}
+        <p class="hint">Runs once per device on its first successful poll, again
+          only if its sysObjectID changes, and behind <b>Re-identify</b> — never
+          on the steady-state poll cycle. A device that stops answering is
+          retried at most three times, an hour apart. The sweep's arc listing
+          is separate and cheap: one GETNEXT per enterprise arc a device
+          answers under, typically three to eight per device.</p>
+      </fieldset>
       <fieldset><legend>DISCOVERY</legend>
         <p class="hint">Every discovery sweep now uses a chosen polling
           profile's own credentials — see the Profile picker on the
@@ -2592,6 +2858,11 @@
           mac_table_retention_days: num('#np-macretention'),
           oid_walk_max_rows: num('#np-walkrows'),
           oid_walk_budget_s: num('#np-walkbudget'),
+          vendor_walk_enabled: on('#np-vendorwalk'),
+          vendor_walk_max_objects: num('#np-vendorobjects'),
+          vendor_walk_budget_s: num('#np-vendorbudget'),
+          vendor_walk_parallel: num('#np-vendorparallel'),
+          discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
@@ -2840,6 +3111,7 @@
     App.el('nd-filter-offline').onchange = () => App.refreshNow('nodes');
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-bulk-poll').onclick = bulkPollNow;
+    App.el('nd-bulk-identify').onclick = bulkIdentify;
     App.el('nd-bulk-profile').onclick = bulkSetProfile;
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;

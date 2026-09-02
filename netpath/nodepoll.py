@@ -19,7 +19,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import nodeoids
+from . import mibcatalog, nodeoids, vendorid
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
@@ -184,13 +184,9 @@ def _credential_label(config: dict) -> str:
             else f"SNMP{name} with no community set")
 
 
-def _oid_key(oid: str) -> tuple:
-    """An OID as a tuple of ints, so "…1.10" orders after "…1.9" rather than
-    between "…1.1" and "…1.2" the way string comparison would put it. A
-    malformed arc sorts as a string after every numeric one — the caller only
-    ever asks "did the walk advance?", and a garbled answer did not."""
-    return tuple((0, int(arc)) if arc.isdigit() else (1, arc)
-                 for arc in str(oid).split("."))
+# Moved to nodeoids in 4.32 so vendorid can share it; kept under its old
+# name here so the walk code and its tests read unchanged.
+_oid_key = nodeoids.oid_key
 
 
 def _ago(ts: float) -> str:
@@ -292,6 +288,173 @@ class _OidWalkJob:
             self.finished_ts = time.time()
 
 
+class _VendorIdJob:
+    """One device's vendor identification, on its own thread.
+
+    Off the poll pool for the same reason _OidWalkJob is: the bounded walk
+    is up to a few hundred requests and ~20 s by budget, but a device that
+    stops answering half way through pays its timeout per request on top,
+    and on a 60 s profile that is an overrun parked on one of the pool's
+    workers. Concurrency is capped by NodePoller._maybe_identify instead.
+    """
+
+    def __init__(self, poller, device_id: int, trigger: str):
+        self.poller = poller
+        self.device_id = device_id
+        self.trigger = trigger
+        self.state = "starting"          # starting|hopping|walking|done|failed
+        self.started_ts = time.time()
+        self.finished_ts: float | None = None
+        self.requests = 0
+        self.objects = 0
+        self.arcs: list[int] = []
+        self.error = ""
+        self.decision = None
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.state in ("starting", "hopping", "walking")
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name=f"vendor-id-{self.device_id}", daemon=True)
+        self._thread.start()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def status(self) -> dict:
+        return {"device_id": self.device_id, "state": self.state, "trigger": self.trigger,
+                "elapsed": (self.finished_ts or time.time()) - self.started_ts,
+                "requests": self.requests, "objects": self.objects,
+                "arcs_found": list(self.arcs), "error": self.error,
+                "decision": self.decision.json() if self.decision else None}
+
+    def _run(self) -> None:
+        poller = self.poller
+        db = poller.db
+        settings = db.settings()
+        hop = None
+        rows_by_arc: dict[int, list[str]] = {}
+        capped: dict[int, bool] = {}
+        candidates: list = []
+        walk_info: dict = {}
+        error = ""
+        device = db.device(self.device_id)
+        sys_object_id = (device["sys_object_id"] if device else "") or ""
+        previous_attempts = 0
+        try:
+            if device is None:
+                raise ValueError("No such device")
+            evidence_before = vendorid._evidence_dict(device)
+            if evidence_before.get("error"):
+                previous_attempts = int(evidence_before.get("attempts") or 0)
+            config = poller.working_config(device)
+            if not config.get("snmp_enabled", True):
+                raise ValueError("SNMP is disabled for this device")
+
+            # The hop keeps the device's own retries: a missed hop loses an
+            # arc. The walk below goes without them.
+            self.state = "hopping"
+
+            def getnext(oid):
+                if self._cancel.is_set():
+                    raise SnmpError("cancelled")
+                self.requests += 1
+                return poller._getnext_one(device, config, oid)
+
+            hop = vendorid.hop_enterprise_arcs(getnext)
+            self.arcs = list(hop.arcs)
+            if hop.stopped == "timeout" and not hop.arcs:
+                # The hop swallows a timeout on purpose so a partial answer
+                # survives — but no answer at all is not an identification,
+                # it is a device that did not reply. Recorded as an error so
+                # the bounded retries apply instead of this counting as done.
+                raise SnmpTimeout(f"no reply from {device['ip']} during the "
+                                  f"identification walk")
+
+            self.state = "walking"
+            max_objects = int(settings.get("vendor_walk_max_objects", 500) or 500)
+            budget_s = float(settings.get("vendor_walk_budget_s", 20.0) or 20.0)
+            walk_config = {**config, "snmp_retries": 0}
+            deadline = time.time() + budget_s
+            walk_started = time.time()
+            walk_requests = 0
+            stopped = "complete"
+            for arc in hop.arcs:
+                remaining = max_objects - self.objects
+                remaining_s = deadline - time.time()
+                if remaining <= 0 or remaining_s <= 0:
+                    stopped = ("stopped at the %d-object limit" % max_objects
+                               if remaining <= 0 else "stopped after %.0fs" % budget_s)
+                    break
+                if self._cancel.is_set():
+                    stopped = "cancelled"
+                    break
+                generic = arc in vendorid.GENERIC_ARCS
+                per_arc = 20 if generic else min(vendorid.PER_ARC_OBJECTS, remaining)
+                per_arc_s = min(vendorid.PER_ARC_BUDGET_S, remaining_s)
+
+                def note(_row):
+                    self.objects += 1
+
+                rows, why = poller._walk_from(
+                    device, walk_config, f"{nodeoids.ENTERPRISES}.{arc}",
+                    max_rows=per_arc, budget_s=per_arc_s,
+                    cancelled=self._cancel.is_set, on_row=note)
+                walk_requests += len(rows) + 1
+                rows_by_arc[arc] = [row["oid"] for row in rows]
+                capped[arc] = len(rows) >= per_arc or why.startswith("stopped")
+            self.requests += walk_requests
+            if self._cancel.is_set():
+                # What was gathered is kept and shown, but a cancelled walk
+                # is not a verdict: it is recorded as incomplete, so the
+                # dialog says so and the bounded retries still apply.
+                error = "cancelled"
+            walk_info = {"objects": sum(len(v) for v in rows_by_arc.values()),
+                         "requests": walk_requests,
+                         "elapsed_s": round(time.time() - walk_started, 2),
+                         "stopped": stopped}
+            candidates = vendorid.fingerprint(rows_by_arc, poller._mib_index_cached())
+        except Exception as exc:              # a job thread must not die quietly
+            error = ("cancelled" if self._cancel.is_set()
+                     else (str(exc) or exc.__class__.__name__))
+            if not isinstance(exc, (SnmpError, ValueError)):
+                poller.log.add(ERROR, f"Vendor identification failed for device "
+                                      f"#{self.device_id}: {error}",
+                               detail=traceback.format_exc())
+        try:
+            device = db.device(self.device_id)
+            if device is None:
+                self.state = "failed"
+                return
+            decision = vendorid.decide(
+                sys_object_id, device["sys_descr"] or "", hop.arcs if hop else [],
+                candidates, manual=device["vendor_override"] or "",
+                learned=db.learned_vendor(sys_object_id),
+                catalog_arcs=mibcatalog.ARC_KEYS)
+            self.decision = decision
+            evidence = vendorid.evidence(
+                sys_object_id, self.trigger, hop, rows_by_arc, capped, candidates,
+                decision, walk_info, catalog_arcs=mibcatalog.ARC_KEYS, error=error,
+                attempts=previous_attempts + 1)
+            db.record_identification(self.device_id, decision, evidence, sys_object_id)
+            poller._apply_identification(self.device_id, decision, error)
+            self.error = error
+            self.state = "failed" if error else "done"
+        except Exception as exc:
+            self.error = str(exc) or exc.__class__.__name__
+            self.state = "failed"
+            poller.log.add(ERROR, f"Vendor identification could not be recorded for "
+                                  f"device #{self.device_id}: {self.error}",
+                           detail=traceback.format_exc())
+        finally:
+            self.finished_ts = time.time()
+            poller.counters["identifications"] += 1
+
+
 class NodePoller:
     def __init__(self, db: NodesDatabase, log=None):
         self.db = db
@@ -319,6 +482,11 @@ class NodePoller:
         # _discovery_jobs above: a walk result is transient, downloaded once
         # and then dropped.
         self._oid_walks: dict[int, "_OidWalkJob"] = {}
+        # device_id -> its running or last vendor identification job, and
+        # the MIB corpus index the fingerprint scores against, rebuilt only
+        # when nodesdb.mib_generation() says the corpus changed.
+        self._vendor_ids: dict[int, "_VendorIdJob"] = {}
+        self._mib_index: tuple | None = None       # (generation, MibIndex)
         self._last_completed: float = 0.0
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
@@ -338,7 +506,7 @@ class NodePoller:
         self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
                          "unsupported": 0, "errors": 0, "overruns": 0,
-                         "mac_walks": 0}
+                         "mac_walks": 0, "identifications": 0}
         self.error: str | None = None
 
     @property
@@ -502,11 +670,17 @@ class NodePoller:
             device_id = self.db.add_device(
                 result["ip"], group_id=group_id, **overrides)
             if result["snmp_ok"]:
+                keys = result.keys()
                 self.db.seed_identity(
                     device_id, sys_descr=result["sys_descr"] or "",
                     sys_name=result["sys_name"] or "",
                     sys_object_id=result["sys_object_id"] or "",
-                    vendor=result["vendor"] or "")
+                    vendor=result["vendor"] or "",
+                    vendor_source=(result["vendor_source"] if "vendor_source" in keys else "") or "",
+                    vendor_confidence=(result["vendor_confidence"]
+                                       if "vendor_confidence" in keys else "") or "",
+                    vendor_evidence=(result["vendor_evidence"]
+                                     if "vendor_evidence" in keys else None))
             self.db.mark_promoted(result_id, device_id)
             device_ids.append(device_id)
         return device_ids
@@ -816,7 +990,13 @@ class NodePoller:
             if rebooted:
                 self.db.record_device_event(device_id, "rebooted", note)
 
-        self._check_vendor_mib(device_id, previous, identity)
+        walk_pending = bool(
+            snmp_ok and identity and settings.get("vendor_walk_enabled", True)
+            and config.get("snmp_enabled", True)
+            and self._identification_due(previous, identity.get("sys_object_id") or "", now))
+        self._check_vendor_mib(device_id, previous, identity, defer_assignment=walk_pending)
+        if walk_pending:
+            self._maybe_identify(device_id, identity, config, settings)
 
         # ----------------------------------------------------- interfaces
 
@@ -1042,17 +1222,20 @@ class NodePoller:
             "sys_contact": values.get(nodeoids.SYSTEM_SCALARS["sys_contact"]) or "",
             "sys_location": values.get(nodeoids.SYSTEM_SCALARS["sys_location"]) or "",
         }
-        # sysObjectID first, sysDescr only where that named nothing — a
-        # device this app cannot name gets neither a profile suggestion nor a
-        # vendor MIB, and plenty of gear answers a generic sysObjectID while
-        # describing itself perfectly well in text.
-        detected, source = nodeoids.identify_vendor(
-            identity["sys_object_id"], identity["sys_descr"])
+        # The zero-SNMP half of vendor identification, every poll: a manual
+        # or learned vendor, a real vendor arc in sysObjectID, the walk this
+        # device already had for this sysObjectID, then the sysDescr guess.
+        # See vendorid.poll_decision for the order and why.
+        detected, source, confidence, vendor_arc = vendorid.poll_decision(
+            identity["sys_object_id"], identity["sys_descr"], device,
+            self.db.learned_vendor(identity["sys_object_id"]))
         # Always stored, always what the behavioural readers use — a custom
         # vendor name replaces the display value only (see
         # nodesdb.detected_vendor).
         identity["vendor_detected"] = detected
         identity["vendor"], identity["vendor_source"] = detected, source
+        identity["vendor_confidence"] = confidence
+        identity["vendor_arc"] = vendor_arc
 
         custom_vendor = nodeoids.first_text(values, custom["vendor"])
         if custom_vendor:
@@ -1083,7 +1266,8 @@ class NodePoller:
 
         return identity, uptime_ticks, metrics
 
-    def _check_vendor_mib(self, device_id: int, previous, identity: dict | None) -> None:
+    def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
+                          defer_assignment: bool = False) -> None:
         """Vendor autodetection already happens on every poll
         (nodeoids.vendor_for on the device's sysObjectID). This is the
         other half the user asked for: if the vendor is identified but no
@@ -1105,16 +1289,21 @@ class NodePoller:
         if not identity:
             return
         sys_object_id = identity.get("sys_object_id") or ""
-        # Only devices whose sysObjectID sits under enterprises have a
-        # vendor MIB at all. This is checked before consulting vendor_for:
-        # that function longest-prefix-matches trapoids.WELL_KNOWN, which
-        # also names standard-tree nodes ("system" for 1.3.6.1.2.1.1), so a
-        # device reporting a standard-tree sysObjectID would otherwise be
-        # reported as missing a "system MIB" that does not exist.
-        vendor = identity.get("vendor") or nodeoids.identify_vendor(
-            sys_object_id, identity.get("sys_descr") or "")[0]
-        applicable = bool(sys_object_id) and \
-            bool(nodeoids.enterprise_root(sys_object_id)) and bool(vendor)
+        # The vendor that was *detected* (never the display value a custom
+        # OID may have replaced), and the arc it was decided from: the
+        # sysObjectID's own for a real vendor arc, the walk's for a
+        # generic-agent device. Coverage is asked about THAT arc — a
+        # net-snmp box identified as Phoenix Contact by the walk needs the
+        # Phoenix MIB, and asking about arc 8072 would never say so.
+        vendor = identity.get("vendor_detected") or identity.get("vendor") or ""
+        vendor_arc = identity.get("vendor_arc")
+        if vendor_arc is None and "vendor_arc" not in identity:
+            # An older-shaped identity (tests, replays): fall back to the
+            # 4.31 rule, sysObjectID's arc only.
+            vendor = vendor or nodeoids.identify_vendor(
+                sys_object_id, identity.get("sys_descr") or "")[0]
+            vendor_arc = nodeoids.enterprise_arc(sys_object_id)
+        applicable = bool(vendor) and vendor_arc is not None
         was_covered = previous["mib_covered"]      # None / 0 / 1
         if not applicable:
             # The coverage question doesn't apply (no identity yet, a
@@ -1123,28 +1312,37 @@ class NodePoller:
             if was_covered is not None:
                 self.db.set_mib_covered(device_id, None)
             return
-        covered = self.db.has_mib_covering(sys_object_id)
-        if covered:
-            self._auto_assign_mib(device_id, sys_object_id, vendor)
+        coverage_oid = f"{nodeoids.ENTERPRISES}.{vendor_arc}"
+        covered = self.db.has_mib_covering(coverage_oid)
+        # While an identification walk is still due for this device, the
+        # poll path leaves assignment to it: the walk's pick is the file that
+        # actually named this device's objects, and an assignment made here
+        # first — by "the file with the most objects under the arc" — would
+        # stand, because assignment never overrides an existing choice.
+        if covered and not defer_assignment:
+            self._auto_assign_mib(device_id, coverage_oid, vendor,
+                                  preferred=identity.get("preferred_mib_file_id"))
         if covered and not (was_covered is None or was_covered):
             # uncovered -> covered: the MIB arrived. CLEARS resolves the
             # standing mib_missing alert off this event.
             self.db.record_device_event(
                 device_id, "mib_present",
                 f"An uploaded MIB now describes {vendor} objects "
-                f"({sys_object_id}); vendor-specific data can be decoded.")
+                f"(enterprise arc {vendor_arc}); vendor-specific data can be decoded.")
         elif not covered and (was_covered is None or was_covered):
             # first verdict, or covered -> uncovered (a MIB was deleted).
+            bundle = mibcatalog.bundle_for_arc(vendor_arc)
+            hint = (f"Install the {bundle.name} bundle from the MIB catalog"
+                    if bundle else f"Upload the {vendor} MIB under Nodes → Profiles & MIBs")
             self.db.record_device_event(
                 device_id, "mib_missing",
-                f"No uploaded MIB describes {vendor} objects ({sys_object_id}). "
-                f"Upload the {vendor} MIB under Nodes → Profiles & MIBs to decode "
-                f"this device's vendor-specific data.")
+                f"No uploaded MIB describes {vendor} objects (enterprise arc "
+                f"{vendor_arc}). {hint} to decode this device's vendor-specific data.")
         if was_covered is None or bool(was_covered) != covered:
             self.db.set_mib_covered(device_id, covered)
 
     def _auto_assign_mib(self, device_id: int, sys_object_id: str,
-                         vendor: str) -> None:
+                         vendor: str, preferred: int | None = None) -> None:
         """Point a device at its own vendor's MIB once one is present.
 
         Uploading a MIB used to do nothing for polling until somebody went
@@ -1165,22 +1363,168 @@ class NodePoller:
             return
         if self.db.effective_config(device).get("mib_file_id") is not None:
             return
-        mib_file_id = self.db.mib_file_covering(sys_object_id)
+        # The fingerprint's pick — the file that actually named the most of
+        # what this device answered — beats "the file with the most objects
+        # under the arc", which is a guess about the device from the MIB
+        # alone. Only when the preferred file still exists.
+        mib_file_id = preferred if preferred and self.db.mib_file(preferred) else None
+        by_evidence = mib_file_id is not None
+        if mib_file_id is None:
+            mib_file_id = self.db.mib_file_covering(sys_object_id)
         if mib_file_id is None:
             return
         self.db.update_device(device_id, mib_file_id=mib_file_id)
         mib = self.db.mib_file(mib_file_id)
         name = (mib["module"] if mib and mib["module"] else
                 (mib["filename"] if mib else str(mib_file_id)))
+        why = ("the identification walk matched its objects on this device"
+               if by_evidence else
+               f"it describes {vendor} objects (enterprise arc "
+               f"{nodeoids.enterprise_arc(sys_object_id)})")
         # Recorded, not silent: this changes what gets polled every cycle, so
         # it belongs in the device's own event history where it can be seen
         # and undone rather than being discovered from new metric names.
         self.db.record_device_event(
             device_id, "mib_assigned",
-            f"Assigned the {name} MIB to this device automatically: it "
-            f"describes {vendor} objects ({sys_object_id}) and no MIB had "
-            f"been chosen. Change or clear it under this device's Custom MIB "
-            f"override.")
+            f"Assigned the {name} MIB to this device automatically: {why} "
+            f"and no MIB had been chosen. Change or clear it under this "
+            f"device's Custom MIB override.")
+
+    # ------------------------------------------------ vendor identification
+
+    _IDENTIFY_RETRY_S = 3600.0
+    _IDENTIFY_MAX_ATTEMPTS = 3
+
+    def _getnext_one(self, device, config: dict, oid: str):
+        """One GETNEXT for the arc hop: (oid, type, value), or None when the
+        agent signalled the end. _snmp_get_next does not check error_status
+        — a v1 agent answers a probe past its last object with noSuchName
+        and the request OID echoed back, which would read as a loop — so the
+        end conditions live here, where vendorid.hop_enterprise_arcs expects
+        them."""
+        response = self._snmp_get_next(device, config, oid)
+        if getattr(response, "error_status", 0):
+            return None
+        if not response.varbinds:
+            return None
+        vb = response.varbinds[0]
+        if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+            return None
+        return vb["oid"], vb["type"], vb["value"]
+
+    def _mib_index_cached(self):
+        """The MIB corpus as vendorid wants it, rebuilt only when the corpus
+        changed. Identification is rare, so even a rebuild per run would do;
+        the cache is for a bulk Re-identify of a few hundred devices."""
+        generation = self.db.mib_generation()
+        with self._lock:
+            cached = self._mib_index
+            if cached is not None and cached[0] == generation:
+                return cached[1]
+        index = vendorid.build_mib_index(self.db.enterprise_objects(), self.db.mib_files())
+        with self._lock:
+            self._mib_index = (generation, index)
+        return index
+
+    def _identification_due(self, device, sys_object_id: str, now: float) -> bool:
+        """Whether this device needs (another) identification walk: never
+        identified, identified for a different sysObjectID, or the last run
+        failed and it is time for one of the bounded retries. A device
+        identified for its current sysObjectID returns False before any I/O
+        — that is the "zero steady-state traffic" rule."""
+        if device["identified_ts"] is None:
+            return True
+        if (device["identified_sys_object_id"] or "") != (sys_object_id or ""):
+            return True
+        evidence = vendorid._evidence_dict(device)
+        if evidence.get("error"):
+            attempts = int(evidence.get("attempts") or 0)
+            last = float(evidence.get("ts") or 0)
+            return attempts < self._IDENTIFY_MAX_ATTEMPTS and \
+                now - last >= self._IDENTIFY_RETRY_S
+        return False
+
+    def _maybe_identify(self, device_id: int, identity, config: dict, settings) -> None:
+        """Start the bounded identification walk for a device whose poll just
+        succeeded, when it is due and there is room. Called from the poll
+        worker but starts a separate thread; see _VendorIdJob."""
+        if not identity or not settings.get("vendor_walk_enabled", True):
+            return
+        if not config.get("snmp_enabled", True):
+            return
+        device = self.db.device(device_id)
+        if device is None:
+            return
+        if not self._identification_due(device, identity.get("sys_object_id") or "",
+                                        time.time()):
+            return
+        limit = int(settings.get("vendor_walk_parallel", 4) or 4)
+        with self._lock:
+            job = self._vendor_ids.get(device_id)
+            if job is not None and job.running:
+                return
+            running = sum(1 for j in self._vendor_ids.values() if j.running)
+            if running >= limit:
+                return           # the next poll tries again; identified_ts stays NULL
+            trigger = ("sysobjectid_changed" if device["identified_ts"] is not None
+                       and not vendorid._evidence_dict(device).get("error")
+                       else "first_poll")
+            job = _VendorIdJob(self, device_id, trigger)
+            self._vendor_ids[device_id] = job
+        job.start()
+
+    def start_identify(self, device_id: int, trigger: str = "manual") -> dict:
+        """Re-identify on demand: forget the previous verdict so the next
+        poll would walk anyway, and start the walk now. Refused politely
+        while one is already running for this device."""
+        device = self.db.device(device_id)
+        if device is None:
+            raise ValueError("No such device")
+        if not self.db.effective_config(device).get("snmp_enabled", True):
+            raise ValueError("SNMP is disabled for this device")
+        with self._lock:
+            job = self._vendor_ids.get(device_id)
+            if job is not None and job.running:
+                return job.status()
+            job = _VendorIdJob(self, device_id, trigger)
+            self._vendor_ids[device_id] = job
+        self.db.clear_identification(device_id)
+        job.start()
+        return job.status()
+
+    def identify_status(self, device_id: int) -> dict | None:
+        job = self._vendor_ids.get(device_id)
+        return job.status() if job else None
+
+    def identifying(self, device_id: int) -> bool:
+        job = self._vendor_ids.get(device_id)
+        return job is not None and job.running
+
+    def cancel_identify(self, device_id: int) -> bool:
+        job = self._vendor_ids.get(device_id)
+        if job is None or not job.running:
+            return False
+        job.cancel()
+        return True
+
+    def _apply_identification(self, device_id: int, decision, error: str = "") -> None:
+        """After a walk: coverage and MIB assignment against the decided arc,
+        and one event saying what was decided and why."""
+        device = self.db.device(device_id)
+        if device is None:
+            return
+        identity = {"sys_object_id": device["sys_object_id"] or "",
+                    "sys_descr": device["sys_descr"] or "",
+                    "vendor_detected": decision.vendor, "vendor": decision.vendor,
+                    "vendor_arc": decision.vendor_arc,
+                    "preferred_mib_file_id": decision.mib_file_id}
+        self._check_vendor_mib(device_id, device, identity)
+        label = decision.vendor or "unidentified"
+        text = (f"{label} via {decision.source} ({decision.confidence}): {decision.reason}"
+                if decision.source else f"unidentified: {decision.reason}")
+        if error:
+            text += f" — walk incomplete: {error}"
+        self.db.record_device_event(device_id, "identified", text)
 
     def _poll_custom_mib(self, device, config: dict, mib_file_id: int) -> list[tuple]:
         """A device or its polling profile can be assigned one uploaded
