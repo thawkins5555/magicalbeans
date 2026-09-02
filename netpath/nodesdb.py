@@ -119,6 +119,10 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 CREATE INDEX IF NOT EXISTS ix_devices_group ON devices(group_id);
 CREATE INDEX IF NOT EXISTS ix_devices_status ON devices(status);
+-- devices() always orders by this pair (with or without a WHERE clause), so
+-- this index lets SQLite satisfy the ORDER BY directly instead of a
+-- full-table sort on every Nodes page load.
+CREATE INDEX IF NOT EXISTS ix_devices_name_ip ON devices(name COLLATE NOCASE, ip);
 
 CREATE TABLE IF NOT EXISTS interfaces (
     id              INTEGER PRIMARY KEY,
@@ -884,19 +888,19 @@ class NodesDatabase:
             config[key] = value
         if config.get("snmp_version") is None:
             config["snmp_version"] = 1
+        settings = self.settings()  # fetched once; every fallback below reuses it
         if config.get("poll_interval_s") is None:
-            config["poll_interval_s"] = self.settings().get("default_interval_s", 120)
+            config["poll_interval_s"] = settings.get("default_interval_s", 120)
         if config.get("snmp_timeout_s") is None:
-            config["snmp_timeout_s"] = self.settings().get("default_snmp_timeout_s", 3.0)
+            config["snmp_timeout_s"] = settings.get("default_snmp_timeout_s", 3.0)
         if config.get("snmp_retries") is None:
-            config["snmp_retries"] = self.settings().get("default_snmp_retries", 2)
+            config["snmp_retries"] = settings.get("default_snmp_retries", 2)
         if config.get("ping_enabled") is None:
             config["ping_enabled"] = 1
         if config.get("snmp_enabled") is None:
             config["snmp_enabled"] = 1
         if config.get("oid_set") is None:
             config["oid_set"] = "auto"
-        settings = self.settings()
         if config.get("ping_count") is None:
             config["ping_count"] = settings.get("ping_count", 3)
         if config.get("ping_timeout_ms") is None:

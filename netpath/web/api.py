@@ -741,8 +741,10 @@ def get_debug(service, params, body) -> dict:
     ipam_state = service.ipam.state()
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
-        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets()}
-        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers()}
+        subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
+            list(ipam_state.get("scan_started", {}).keys()))}
+        servers_by_id = {s["id"]: s for s in service.ipam_db.dhcp_servers_by_ids(
+            list(ipam_state.get("poll_started", {}).keys()))}
         for subnet_id, started in ipam_state.get("scan_started", {}).items():
             subnet = subnets_by_id.get(subnet_id)
             ipam_workers.append({

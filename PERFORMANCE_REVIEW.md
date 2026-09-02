@@ -35,9 +35,11 @@ out to be a false positive: the index already exists, added via `_migrate()` in
 | #3 N+1: `device()` in `post_nodes_devices_bulk_poll()` | ✅ Fixed | Added `NodesDatabase.devices_by_ids()`; existence check is now one query, not one per device |
 | #4 Missing `device_group_id` index | ✅ Already fixed | Index already existed (`nodesdb.py` `_migrate()`); original finding was a false positive |
 | #5 N+1: `last_trace()` in `get_debug()` | ✅ Fixed | Same `last_traces()` batch method reused; the `devices()` full-table load for `node_workers` now calls `devices_by_ids()` with only the ids being polled |
-| #6 Subnet/server full-table load in `get_debug()` | Not yet fixed | Deferred — medium priority, same pattern as #5's device load |
-| #7 Missing batch methods | ✅ Fixed | `last_traces()`, `devices_by_ids()`, `interface_events_for_device()` added |
-| #8 Repeated `settings()` calls in `effective_config()` | Not yet fixed | Deferred — low priority, minor impact (settings table is tiny) |
+| #6 Subnet/server full-table load in `get_debug()` | ✅ Fixed | Added `IpamDatabase.subnets_by_ids()`/`dhcp_servers_by_ids()`; only the ids actually mid-scan/mid-poll are loaded |
+| #7 Missing batch methods | ✅ Fixed | `last_traces()`, `devices_by_ids()`, `interface_events_for_device()`, `subnets_by_ids()`, `dhcp_servers_by_ids()` added |
+| #8 Repeated `settings()` calls in `effective_config()` | ✅ Fixed | `settings()` is now called once per `effective_config()` call and reused across all fallback fields, instead of up to 4 times |
+
+**Also fixed (found during implementation, not in the original report):** `devices()` — called on every Nodes page load, filtered or not — always sorts `ORDER BY name COLLATE NOCASE, ip` with no supporting index, forcing a full-table scan-and-sort. Added `ix_devices_name_ip` so SQLite satisfies the ORDER BY directly from the index; confirmed via `EXPLAIN QUERY PLAN` (`SCAN devices USING INDEX ix_devices_name_ip`, no separate sort step). The originally-proposed "add indexes for text search" fix (#7 in the initial per-file breakdown) was reconsidered: `devices()`'s text search always does `LIKE '%text%'`, and SQLite cannot use a B-tree index for a leading-wildcard LIKE, so a plain index there would have been a no-op. The ORDER BY index above is the version of that idea that actually pays off.
 
 All three fixes were verified with unit tests against real SQLite databases (batch
 methods return correct data, handle empty input, respect `since_s` filters) and
