@@ -177,21 +177,22 @@ received by the local SMTP sink during it.
 
 | Measure | 250 devices | 1,000 devices | 2,000 devices |
 |---|---|---|---|
-| Seeding via single POSTs | 250 in 0.75 s (336/s) | 1,000 in 23.0 s | *pending* |
-| Devices up after the first poll cycle | 249/250 within 12 s | 999/1,000 within ~15 s | *pending* |
-| Baseline app CPU / RSS | 27% / 88 MB | *pending* | *pending* |
-| Site outage: devices down → `device_down` alerts → emails | 143 → 143 → 238 | *pending* | *pending* |
-| Open alerts before the outage / after full recovery | 258 / 405 | *pending* | *pending* |
-| Open alerts at the end of the run (nothing left failing) | 636 | *pending* | *pending* |
-| Emails over the whole run | 1,338 | *pending* | *pending* |
-| Longest single device poll observed | 160 s (interval 60 s) | *pending* | *pending* |
-| Peak busy poll workers (of 32) | 33 | *pending* | *pending* |
-| App CPU during the trap + syslog burst | 63% | *pending* | *pending* |
-| `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | *pending* | *pending* |
-| Nodes table fill time after refresh | 181 ms | *pending* | *pending* |
-| `/api/nodes/devices` payload per refresh | 332 KB | *pending* | *pending* |
-| Browser long tasks during the walk (longest) | 52 (230 ms) | *pending* | *pending* |
-| Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | *pending* | *pending* |
+| Seeding via single POSTs | 250 in 0.75 s | 1,000 in 23.0 s | *pending* |
+| Devices up after the first poll cycle | 249/250 within 12 s | 955/1,000 after 73 s (never 100%) | *pending* |
+| Baseline app CPU / RSS | 27% / 88 MB | 67% / 121 MB | *pending* |
+| Site outage: devices dark → `device_down` alerts inside the window → emails in the step | 143 → 143 → 238 | 500 → **16** → 1,783 | *pending* |
+| Open alerts before the outage / after full recovery | 258 / 405 | 609 / 1,601 (list capped at 2,000 from step 2 on) | *pending* |
+| Open alerts at the end of the run (nothing left failing) | 636 | 1,448 (capped view) | *pending* |
+| Emails over the whole run | 1,338 | 3,349 | *pending* |
+| Poll-overrun events recorded over the run | 9 | 6,420 | *pending* |
+| Longest single device poll observed (interval 60 s) | 160 s | 129 s | *pending* |
+| Average / peak busy poll workers (of 32) | 11 / 33 | 31 / 47 | *pending* |
+| App CPU during the trap + syslog burst | 63% | 84% | *pending* |
+| `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | 441,991 / 0 | *pending* |
+| Nodes table fill time after refresh | 181 ms | 1,854 ms | *pending* |
+| `/api/nodes/devices` payload per refresh | 332 KB | 1.32 MB in 653 ms | *pending* |
+| Browser long tasks during the walk (longest) | 52 (230 ms) | 122 (429 ms) | *pending* |
+| Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | 0 / 0 (same two 403s) | *pending* |
 
 ### 3.2 What each step showed (250-device tier; the larger tiers are read against it in §3.3)
 
@@ -247,7 +248,48 @@ Reading the 250-tier run against the findings:
 
 ### 3.3 Scale tiers
 
-*(1,000 and 2,000: pending — filled when those runs complete.)*
+**1,000 devices.** The same campaign, four times the fleet, on the same 32
+workers at a 60 s interval:
+
+| Step | Alerts opened | Alerts cleared | Emails | Polls ok / timeout / auth | Overruns | CPU% |
+|---|---|---|---|---|---|---|
+| 1 baseline (122 s) | — (list already capped) | — | 382 | 1,378 / 2 / 6 | 421 | 67 |
+| 2 core + 499 Site-A switches dark (241 s) | packet_loss_high 371, **poll_overrun 563**, **device_down 16**, cpu_high 13, netpath 2 | packet_loss_high 16 | **1,783** | 971 / 1,015 / 0 | 1,485 | 56 |
+| 3 outage recovery (151 s) | interface_up 1 | device_down 16, packet_loss_high 365 | 392 | 1,664 / 2 / 6 | 413 | 66 |
+| 4 flap storm (122 s) | interface_down 53, interface_up 19, interface_flapping 1 | interface_down 7 | 106 | 1,396 / 1 / 6 | 697 | 59 |
+| 5 reboot 20 (121 s) | device_rebooted 20, interface_* 41 | interface_down 39 | 113 | 1,330 / 2 / 6 | 519 | 59 |
+| 6 wrong credentials on 5 (91 s) | device_auth_fail 5, interface_* 26 | interface_down 22 | 101 | 902 / 0 / 8 | 693 | 66 |
+| 7 trap + syslog storm (76 s) | trap_critical 5, syslog_critical 8, unmanaged 1 | interface_down 2 | 36 | 656 / 0 / 8 | 220 | **84** |
+| 8 NetFlow burst (76 s) | interface_* 40, response_time_high 1 | interface_down 36 | 117 | 797 / 1 / 8 | 364 | 65 |
+| 9 flaps stop, credentials restored (151 s) | interface_* 33 | interface_down 43 | 79 | 1,572 / 1 / 9 | 745 | 61 |
+
+What changed between 250 and 1,000 devices:
+
+- **The poller fell behind before anything failed.** With nothing wrong, the
+  pool sat at 31 of 32 workers busy, the baseline consumed 67% of a core, and
+  421 poll overruns were recorded in two minutes; over the run 6,420 overrun
+  events and 984 `poll_overrun` alerts were written. 4.5% of the fleet never
+  completed a first poll inside 73 s.
+- **A 500-device outage was mostly invisible for four minutes.** Only 16 of the
+  499 dark switches accumulated the three failed polls needed to become
+  `down` inside a 241 s window, because polls of dark devices (three ping
+  timeouts plus three SNMP timeouts each) occupied the saturated pool and the
+  60 s interval could not be met: 1,015 timeouts against 971 successful polls.
+  The operator's first signal was 371 `packet_loss_high` alerts and 563
+  `poll_overrun` alerts, not "site A is down", and 1,783 emails in four
+  minutes. This is §4.1 S1, S5, N5 and §4.5 F15 measured together.
+- **The alert list stopped being complete.** From step 2 onward the API's
+  2,000-row cap was hit and every later snapshot is a truncated view; the UI's
+  own default of 300 rows would have shown less than a fifth of it (§4.3 F20,
+  §4.6 F10).
+- **The onboarding storm scaled linearly:** 948 `mib_missing` alerts on the
+  first poll, each emailed as "is not responding" (§4.3 F26, F27).
+- **The browser cost scaled linearly too:** 1,000 rows took 1.85 s to fill after
+  a refresh from a 1.32 MB payload that took 653 ms to serve, with 122 long
+  tasks (longest 429 ms) during the walk (§4.5 F7, F20).
+- Still no rows in the hourly rollup table after 442k raw samples (§4.1 B2).
+
+**2,000 devices.** *(pending)*
 
 ---
 
