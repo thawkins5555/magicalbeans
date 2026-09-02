@@ -1711,12 +1711,10 @@ def get_nodes_mac_search(service, params, body) -> dict:
         })
     # How many devices are actually walking their forwarding tables, so the
     # frontend can say "nothing has been learned yet" rather than "not
-    # found" when the feature is simply switched off everywhere.
-    enabled = sum(
-        1 for device in service.nodes_db.devices()
-        if float(service.nodes_db.effective_config(device)
-                 .get("mac_table_interval_s") or 0) > 0)
-    return {"mac": mac, "locations": locations, "enabled_devices": enabled}
+    # found" when the feature is simply switched off everywhere. One query,
+    # not effective_config() per device — this runs on a keystroke.
+    return {"mac": mac, "locations": locations,
+            "enabled_devices": service.nodes_db.mac_walk_enabled_count()}
 
 
 def post_nodes_device(service, params, body) -> dict:

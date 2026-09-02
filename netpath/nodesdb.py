@@ -1120,6 +1120,26 @@ class NodesDatabase:
             self._conn.commit()
         return len(rows)
 
+    def mac_walk_enabled_count(self) -> int:
+        """How many enabled devices are configured to learn MAC addresses.
+
+        One query rather than effective_config() per device: this is asked
+        on every MAC search, and effective_config re-reads the whole
+        settings table up to four times per call, which on a large estate
+        turns one keystroke into thousands of queries for a count used only
+        to choose between two sentences. COALESCE mirrors that function's
+        own merge exactly — the device's own value, then its profile's,
+        then 0.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM devices d"
+                " LEFT JOIN groups g ON g.id = d.group_id"
+                " WHERE d.enabled = 1"
+                "   AND COALESCE(d.mac_table_interval_s,"
+                "                g.mac_table_interval_s, 0) > 0").fetchone()
+        return row["n"] if row else 0
+
     def mac_locations(self, mac_prefix: str, limit: int = 200) -> list[sqlite3.Row]:
         """Every (device, port) a MAC starting with this prefix was learned
         on, newest first. A MAC on an uplink is on every switch between here

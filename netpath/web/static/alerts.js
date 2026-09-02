@@ -22,6 +22,9 @@
     hist: null,
     // device entity_id -> until_ts, refreshed with the rest of the page.
     mutes: new Map(),
+    // What the detail pane was last rendered from, so a refresh that
+    // changes nothing leaves the markup (and any open dropdown) alone.
+    detailSignature: null,
   };
 
   const MUTE_HOURS = [1, 6, 12, 24];
@@ -267,6 +270,17 @@
     App.el('alerts-detail-empty').hidden = true;
     const el = App.el('alerts-detail');
     el.hidden = false;
+    // The refresh re-renders this pane so an alert's state and its device's
+    // mute stay true without a click — but rebuilding the markup wholesale
+    // every few seconds would close the mute dropdown under an operator
+    // half way through choosing a duration, and re-fetch the notification
+    // list for nothing. So the pane is rebuilt only when something it
+    // actually displays has changed.
+    const signature = [row.id, row.state, row.count, row.last_ts,
+                       row.acked_by, row.resolved_ts, row.rollup_note,
+                       view.mutes.get(String(row.entity_id)) || ''].join('|');
+    if (view.detailSignature === signature) return;
+    view.detailSignature = signature;
     const rows = view.rules.length ? view.rules : [];
     const rule = rows.find((r) => r.id === row.rule_id);
     // Only a Nodes device can be muted; entity_id is already its device id.
@@ -789,6 +803,7 @@
     const current = view.alerts.find((a) => a.id === view.selected);
     if (view.selected && !current) {
       view.selected = null;
+      view.detailSignature = null;
       App.el('alerts-detail-empty').hidden = false;
       App.el('alerts-detail').hidden = true;
     }
