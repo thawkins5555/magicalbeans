@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""A scripted stand-in for iputils ping(8), for the SappiWhere demo.
+
+Two callers in the app run `ping` and both must be satisfied by this shim:
+
+  netpath/tracer.py:351      ping -n -c 1 -W <seconds> <ip>   (via shutil.which)
+  netpath/ipam_scan.py:111   ping -c 1 -W <seconds> <ip>      (bare "ping", so
+                                                               PATH order wins)
+
+Both read the RTT out of the output with tracer._UNIX_PING_TIME
+(r"time[=<]\\s*([\\d.]+)\\s*ms") and ipam_scan.ping_once/ping_many additionally
+require exit status 0 for a probe to count as received, so a lost probe here
+must exit 1.
+
+Behaviour:
+  * 127.x.y.z  -> hand off to the real iputils ping if one is installed, so the
+                  demo never fakes a result it can measure for real.
+  * any hop address in demo/routes.json -> emulated replies with plausible RTTs.
+    10.0.0.6 drops one probe in three (a per-target invocation counter), which
+    is what makes packet_loss_high reachable without making the host look down.
+  * anything else -> the 100% loss summary and exit 1.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEMO = os.path.dirname(HERE)
+ROUTES = os.path.join(DEMO, "routes.json")
+STATE = os.path.join(DEMO, "out", "ping_state.json")
+
+VALUE_FLAGS = {"-c", "-W", "-w", "-i", "-s", "-t", "-I", "-M", "-p", "-Q",
+               "-S", "-l", "-T", "-m", "-N"}
+
+# Targets that answer but are not hops in routes.json, plus the RTT floor for
+# addresses whose base RTT the routes file does not give.
+DEFAULT_RTT = 2.5
+
+# Every third probe to this address is lost.  Deliberately deterministic: a
+# random 1-in-3 makes "did the alert fire?" a coin toss to demo.
+LOSSY = {"10.0.0.6": 3}
+
+
+def parse_args(argv):
+    opts = {"c": 1, "W": 1.0}
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        index += 1
+        if arg.startswith("-") and arg != "-":
+            name, _, inline = arg.partition("=")
+            if name in VALUE_FLAGS:
+                value = inline
+                if not value:
+                    if index < len(argv):
+                        value = argv[index]
+                        index += 1
+                    else:
+                        continue
+                if name == "-c":
+                    try:
+                        opts["c"] = max(1, int(value))
+                    except ValueError:
+                        pass
+                elif name in ("-W", "-w"):
+                    try:
+                        opts["W"] = float(value)
+                    except ValueError:
+                        pass
+                continue
+            continue
+        positional.append(arg)
+    return (positional[0] if positional else ""), opts
+
+
+def known_targets() -> dict[str, float]:
+    """{address: base RTT ms} for every address routes.json mentions."""
+    out: dict[str, float] = {}
+    try:
+        with open(ROUTES, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return out
+    for key, route in data.items():
+        if key.startswith("_") or not isinstance(route, dict):
+            continue
+        entries = list(route.get("hops") or [])
+        entries.extend((route.get("alt_hops") or {}).values())
+        for entry in entries:
+            if not entry or entry[0] is None:
+                continue
+            base = entry[1] if len(entry) > 1 and entry[1] else DEFAULT_RTT
+            # A router seen at several TTLs keeps its lowest recorded RTT,
+            # which is the one nearest the truth for a direct probe.
+            out[entry[0]] = min(out.get(entry[0], base), float(base))
+    return out
+
+
+def bump_counter(key: str) -> int:
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        try:
+            with open(STATE, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        count = int(state.get(key, 0)) + 1
+        state[key] = count
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp, STATE)
+        return count
+    except OSError:
+        return int(time.time())
+
+
+def real_ping() -> str | None:
+    """The first real ping on PATH that is not this shim's directory."""
+    candidates = []
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory or os.path.abspath(directory) == HERE:
+            continue
+        candidates.append(os.path.join(directory, "ping"))
+    candidates.extend(("/usr/bin/ping", "/bin/ping"))
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            if os.path.dirname(os.path.abspath(path)) == HERE:
+                continue
+            return path
+    return None
+
+
+def unreachable(host: str, count: int) -> int:
+    print(f"PING {host} ({host}) 56(84) bytes of data.")
+    print()
+    print(f"--- {host} ping statistics ---")
+    print(f"{count} packets transmitted, 0 received, 100% packet loss, "
+          f"time {count * 1000 - 1}ms")
+    return 1
+
+
+def emulate(host: str, base: float, count: int) -> int:
+    print(f"PING {host} ({host}) 56(84) bytes of data.")
+    rtts: list[float] = []
+    started = time.time()
+    every = LOSSY.get(host, 0)
+    for sequence in range(1, count + 1):
+        if every:
+            if bump_counter(host) % every == 0:
+                continue                    # this probe is the one that is lost
+        rng = random.Random(f"{host}|{int(time.time() * 1000)}|{sequence}")
+        spread = max(0.02, base * 0.10)
+        value = max(0.01, base + rng.uniform(-spread, spread))
+        rtts.append(value)
+        ttl = 64 if host.startswith("127.") else 61
+        print(f"64 bytes from {host}: icmp_seq={sequence} ttl={ttl} "
+              f"time={value:.3f} ms")
+
+    elapsed_ms = max(1, int((time.time() - started) * 1000) + (count - 1) * 1000)
+    print()
+    print(f"--- {host} ping statistics ---")
+    loss = 100.0 * (count - len(rtts)) / count
+    print(f"{count} packets transmitted, {len(rtts)} received, {loss:.0f}% "
+          f"packet loss, time {elapsed_ms}ms")
+    if not rtts:
+        return 1
+    low = min(rtts)
+    high = max(rtts)
+    average = sum(rtts) / len(rtts)
+    mdev = (sum((r - average) ** 2 for r in rtts) / len(rtts)) ** 0.5
+    print(f"rtt min/avg/max/mdev = {low:.3f}/{average:.3f}/{high:.3f}/"
+          f"{mdev:.3f} ms")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    host, opts = parse_args(argv)
+    if not host:
+        sys.stderr.write("Usage: ping [-c count] [-W timeout] destination\n")
+        return 2
+
+    if host.startswith("127."):
+        binary = real_ping()
+        if binary:
+            try:
+                os.execv(binary, [binary] + argv)
+            except OSError:
+                pass
+        return emulate(host, 0.048, opts["c"])
+
+    targets = known_targets()
+    if host in targets:
+        return emulate(host, targets[host], opts["c"])
+    return unreachable(host, opts["c"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

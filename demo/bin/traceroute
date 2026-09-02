@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""A scripted stand-in for traceroute(8), for the SappiWhere demo.
+
+netpath/tracer.py runs whatever `traceroute` is first on PATH and parses its
+stdout with tracer._parse_unix.  Putting demo/bin at the front of PATH makes
+the app trace a network that does not exist, on demand, with no privileges and
+no packets.
+
+Paths come from demo/routes.json (see its "_doc" key for the schema).  RTTs are
+jittered from a seed of int(time.time() // 60), so two traces inside the same
+minute are byte-identical and consecutive minutes differ slightly - alive, but
+not noisy enough to make every run look like a route change.
+
+Always exits 0, which is what traceroute(8) does even when nothing answers.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEMO = os.path.dirname(HERE)
+ROUTES = os.path.join(DEMO, "routes.json")
+STATE = os.path.join(DEMO, "out", "traceroute_state.json")
+
+# Flags that consume the following argument.  Anything else starting with "-"
+# is treated as a bare switch and ignored, so an unexpected option never makes
+# the shim mistake an option's value for the destination.
+VALUE_FLAGS = {
+    "-q", "-m", "-w", "-f", "-g", "-i", "-M", "-N", "-p", "-s", "-t", "-z",
+    "--queries", "--max-hops", "--wait", "--first-hop", "--gateway",
+    "--interface", "--module", "--sport", "--port", "--source", "--tos",
+    "--sendwait", "--sim-queries",
+}
+LONG_ALIASES = {
+    "--queries": "-q",
+    "--max-hops": "-m",
+    "--wait": "-w",
+    "--first-hop": "-f",
+}
+
+
+def parse_args(argv):
+    opts = {"n": False, "q": 3, "m": 30, "w": 5.0}
+    positional = []
+    index = 0
+    seen_ddash = False
+    while index < len(argv):
+        arg = argv[index]
+        index += 1
+        if arg == "--":
+            seen_ddash = True
+            continue
+        if not seen_ddash and arg.startswith("-") and arg != "-":
+            name, _, inline = arg.partition("=")
+            name = LONG_ALIASES.get(name, name)
+            if name in ("-n", "--numeric"):
+                opts["n"] = True
+                continue
+            if name in VALUE_FLAGS or LONG_ALIASES.get(name):
+                value = inline
+                if not value:
+                    if index < len(argv):
+                        value = argv[index]
+                        index += 1
+                    else:
+                        continue
+                key = name.lstrip("-")[:1]
+                if key in ("q", "m"):
+                    try:
+                        opts[key] = max(1, int(value))
+                    except ValueError:
+                        pass
+                elif key == "w":
+                    try:
+                        opts["w"] = float(value)
+                    except ValueError:
+                        pass
+                continue
+            # Unknown switch (-I, -T, -U, -A, -d, ...): no value, ignore it.
+            continue
+        positional.append(arg)
+
+    # traceroute takes "host [packetlen]"; the host is the first positional
+    # whichever side of the flags it was written on.
+    host = positional[0] if positional else ""
+    return host, opts
+
+
+def load_routes():
+    try:
+        with open(ROUTES, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def bump_counter(key: str) -> int:
+    """A per-destination invocation counter, so routechange can alternate.
+
+    Best effort: if the state file cannot be read or written the counter falls
+    back to the wall clock, which alternates on its own.
+    """
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        try:
+            with open(STATE, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        count = int(state.get(key, 0)) + 1
+        state[key] = count
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp, STATE)
+        return count
+    except OSError:
+        return int(time.time() // 20)
+
+
+def rtt(dest: str, ttl: int, probe: int, base: float, minute: int) -> float:
+    rng = random.Random(f"{dest}|{ttl}|{probe}|{minute}")
+    spread = max(0.05, base * 0.12)
+    return max(0.02, base + rng.uniform(-spread, spread))
+
+
+def probe_text(value: float) -> str:
+    return f"{value:.3f} ms"
+
+
+def emit_hop(parts: list[str], ttl: int) -> None:
+    print(f"{ttl:2d}  " + "  ".join(parts))
+
+
+def run(host: str, opts: dict) -> None:
+    max_hops = opts["m"]
+    probes = opts["q"]
+    minute = int(time.time() // 60)
+
+    print(f"traceroute to {host} ({host}), {max_hops} hops max, 60 byte packets")
+
+    if host.startswith("127."):
+        parts = []
+        for probe in range(probes):
+            parts.append(probe_text(rtt(host, 1, probe, 0.048, minute)))
+        emit_hop([host] + parts, 1)
+        return
+
+    routes = load_routes()
+    route = routes.get(host)
+    if route is None or route.get("kind") == "dead" or not route.get("hops"):
+        for ttl in range(1, max_hops + 1):
+            emit_hop(["*"] * probes, ttl)
+        return
+
+    hops = route.get("hops") or []
+    alt_hops = route.get("alt_hops") or {}
+    annotate = route.get("annotate") or {}
+    loss_probes = route.get("loss_probes") or {}
+    stop_after = route.get("stop_after") or len(hops)
+
+    use_alt = False
+    show_both = False
+    if route.get("kind") == "routechange":
+        count = bump_counter(host)
+        # Three invocations on one path, three on the other.
+        use_alt = (count // 3) % 2 == 1
+        show_both = count % 7 == 0
+
+    last_ttl = min(len(hops), stop_after, max_hops)
+    for ttl in range(1, last_ttl + 1):
+        entry = hops[ttl - 1]
+        addr = entry[0] if entry else None
+        base = entry[1] if entry and len(entry) > 1 else None
+        if addr is None or base is None:
+            emit_hop(["*"] * probes, ttl)
+            continue
+
+        alt = alt_hops.get(str(ttl))
+        if alt and use_alt and not show_both:
+            addr, base = alt[0], alt[1]
+
+        code = annotate.get(str(ttl), "")
+        lost = int(loss_probes.get(str(ttl), 0))
+        # Lose the middle probe first: a hop that drops its first probe reads
+        # as a cold ARP cache rather than as steady-state loss.
+        lost_index = {1} if lost == 1 else set(range(probes - lost, probes))
+
+        parts: list[str] = []
+        current = None
+        for probe in range(probes):
+            if probe in lost_index:
+                parts.append("*")
+                continue
+            this_addr, this_base = addr, base
+            if alt and show_both and probe == 1:
+                this_addr, this_base = alt[0], alt[1]
+            if this_addr != current:
+                parts.append(this_addr)
+                current = this_addr
+            text = probe_text(rtt(host, ttl, probe, this_base, minute))
+            parts.append(f"{text} {code}" if code else text)
+        emit_hop(parts, ttl)
+
+
+def main() -> int:
+    host, opts = parse_args(sys.argv[1:])
+    if not host:
+        sys.stderr.write("Usage: traceroute [-n] [-q nqueries] [-m max_ttl] "
+                         "[-w waittime] host [packetlen]\n")
+        return 0
+    run(host, opts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

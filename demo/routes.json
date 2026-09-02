@@ -1,0 +1,104 @@
+{
+  "_doc": {
+    "what": "Scripted traceroute paths for demo/bin/traceroute and demo/bin/ping.",
+    "schema": {
+      "<dest-ip>": {
+        "kind": "multihop | routechange | refused | silent | dead | degraded",
+        "hops": "[[addr, base_rtt_ms], ...] in TTL order, index 0 == TTL 1. addr null means the hop never answers (prints '* * *'); base_rtt_ms is the median RTT the shim jitters around.",
+        "alt_hops": "optional {\"<ttl>\": [addr, base_rtt_ms]} - routechange swaps these in on alternate runs, and occasionally prints both the primary and the alternate on one hop line.",
+        "annotate": "optional {\"<ttl>\": \"!X\"} - ICMP unreachable annotation printed after every probe RTT at that TTL. The trace stops after an annotated hop, exactly as traceroute(8) does.",
+        "loss_probes": "optional {\"<ttl>\": N} - N of the -q probes at that TTL print '*' instead of an RTT.",
+        "stop_after": "optional 1-based TTL after which no further hop lines are printed (used by 'refused').",
+        "notes": "free text, for humans reading the file"
+      },
+      "kinds": {
+        "multihop": "clean path, destination answers at the final hop",
+        "routechange": "hop 2 flips between two addresses across invocations, so TraceResult.path_signature() changes",
+        "refused": "a router answers with an ICMP administratively-prohibited annotation and the trace ends there; never reached",
+        "silent": "one mid-path hop is fully silent ('* * *') but the destination still answers",
+        "dead": "nothing answers at any TTL, up to -m",
+        "degraded": "destination answers, but with high RTT and one lost probe of three"
+      },
+      "conventions": [
+        "Every destination is a numeric IP because netpath.tracer.run_trace() resolves the host with gethostbyname() before running the binary.",
+        "Any 127.x.y.z destination is handled without a routes.json entry: a single hop that is the destination itself.",
+        "A destination not listed here behaves like 'dead'.",
+        "RTT jitter is seeded from int(time.time() // 60), so repeated runs inside a minute are identical and consecutive minutes look alive but similar.",
+        "demo/bin/ping answers for every non-null hop address that appears below, and for 127.x; everything else is 100% loss with exit status 1."
+      ]
+    }
+  },
+
+  "10.0.0.1": {
+    "kind": "multihop",
+    "hops": [
+      ["10.255.0.1", 0.9],
+      ["10.254.0.1", 2.6],
+      ["10.0.5.1", 5.4],
+      ["10.0.0.1", 7.1]
+    ],
+    "notes": "Healthy four-hop path to the core. The baseline every other destination is compared against."
+  },
+
+  "10.0.0.2": {
+    "kind": "routechange",
+    "hops": [
+      ["10.255.0.1", 0.9],
+      ["10.254.0.1", 2.7],
+      ["10.0.5.1", 6.0],
+      ["10.0.0.2", 7.8]
+    ],
+    "alt_hops": {
+      "2": ["10.254.0.9", 3.4]
+    },
+    "notes": "Equal-cost pair at TTL 2. Flips every 3 invocations, and every 7th invocation prints both addresses on the one hop line the way traceroute does when probes land on different routers."
+  },
+
+  "10.0.0.3": {
+    "kind": "refused",
+    "hops": [
+      ["10.255.0.1", 0.9],
+      ["10.254.0.1", 2.8],
+      ["10.0.5.1", 5.6],
+      ["10.0.9.1", 1.2]
+    ],
+    "annotate": {
+      "4": "!X"
+    },
+    "stop_after": 4,
+    "notes": "A firewall at 10.0.9.1 answers with administratively-prohibited. reached=False, unreachable_code='!X', unreachable_from='10.0.9.1'."
+  },
+
+  "10.0.0.4": {
+    "kind": "silent",
+    "hops": [
+      ["10.255.0.1", 1.0],
+      ["10.254.0.1", 2.9],
+      [null, null],
+      ["10.0.5.1", 6.2],
+      ["10.0.7.1", 7.4],
+      ["10.0.0.4", 9.1]
+    ],
+    "notes": "A transit router with ICMP TTL-exceeded rate-limited off. Hop 3 is '* * *' but the destination still answers at hop 6, so reached=True with a gap in the middle."
+  },
+
+  "10.0.0.5": {
+    "kind": "dead",
+    "hops": [],
+    "notes": "Nothing answers anywhere. Every TTL up to -m prints '* * *'; reached=False and there is no unreachable code to explain it."
+  },
+
+  "10.0.0.6": {
+    "kind": "degraded",
+    "hops": [
+      ["10.255.0.1", 1.0],
+      ["10.254.0.1", 3.1],
+      ["10.0.5.1", 6.8],
+      ["10.0.0.6", 181.0]
+    ],
+    "loss_probes": {
+      "4": 1
+    },
+    "notes": "Reached, but the destination hop is ~180 ms and drops one probe of three - enough for netpath_latency_high without ever looking unreachable."
+  }
+}
