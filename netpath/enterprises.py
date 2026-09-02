@@ -54,6 +54,7 @@ VERIFIED: dict[int, tuple[str, str]] = {
     6574: ("synology", "Synology"),
     6876: ("vmware", "VMware"),
     8072: ("netSnmp", "Net-SNMP (agent)"),
+    8691: ("moxa", "Moxa"),                # MOXA-GENERAL-MIB: moxa ::= { enterprises 8691 }
     8741: ("sonicwall", "SonicWall"),
     11863: ("tpLink", "TP-Link"),
     12276: ("f5Networks", "F5 Networks"),
@@ -118,7 +119,6 @@ CURATED: dict[int, tuple[str, str]] = {
     6889: ("avaya", "Avaya"),
     7367: ("draytek", "DrayTek"),
     7779: ("infoblox", "Infoblox"),
-    8691: ("moxa", "Moxa"),
     8744: ("colubris", "Colubris / HP"),
     10297: ("dellPowerConnect", "Dell PowerConnect"),
     10418: ("avocent", "Avocent"),

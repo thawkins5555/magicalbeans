@@ -25,8 +25,12 @@ Listed newest first. Version numbers are build order, not dates.
   database" trace.
 - `python3 tests/run_all.py` runs them all and reports PASS/FAIL per file;
   `tests/README.md` says what each one proves. Standard library only, no
-  network, no `ping` binary, no root, temporary databases. No application
-  code changed in this release.
+  network, no `ping` binary, no root, temporary databases.
+- One consistency fix found while merging: 4.33.0 added Moxa (arc 8691) to
+  the well-known sysObjectID table and shipped a Moxa MIB bundle read from
+  MOXA-GENERAL-MIB, but the arc was still listed as curated-from-memory in
+  the enterprise table. It is now in the verified list, as every well-known
+  root and every bundle arc must be.
 
 ### 4.33.0 — How long it was down, loss you can see, and paths that alert
 
