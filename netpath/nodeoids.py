@@ -168,6 +168,7 @@ SYSDESCR_VENDORS: tuple[tuple[str, str], ...] = (
     ("phoenix contact", "phoenixContact"),
     ("phoenixcontact", "phoenixContact"),
     ("allied telesis", "alliedTelesis"),
+    ("rockwell automation", "rockwellAutomation"),
     ("check point", "checkPoint"),
     ("palo alto", "paloAlto"),
     ("tp-link", "tpLink"),
@@ -231,6 +232,29 @@ def vendor_from_descr(sys_descr: str) -> str:
 # the class the sysDescr fallback exists for. Still used as a last resort,
 # since "net-snmp" beats nothing at all.
 GENERIC_AGENT_VENDORS = frozenset({"netSnmp", "ucdavis"})
+
+
+# Proprietary scalars that PROVE a vendor when they answer, for gear whose
+# sysObjectID names only the SNMP agent it runs. (oid, needle, vendor): the
+# answer is matched case-insensitively against the needle, so an object that
+# exists but says something else proves nothing.
+#
+# Read in a SEPARATE best-effort GET, never merged into the identity request.
+# An SNMPv1 agent asked for an object it does not implement answers noSuchName
+# with the whole varbind list echoed back as nulls -- and nodepoll only raises
+# on authorizationError, so sysDescr, sysObjectID, sysName and sysLocation
+# would all come back blank with no exception to catch. One unanswerable OID
+# must not be able to blank a device's identity.
+# Display names live in enterprises.py, beside the arc table that already
+# carries one for every vendor named by an arc -- a second table here would
+# drift out of step with it. The KEY is still what everything that behaves
+# per-vendor compares against (ConfigRX's backup command, the Cisco per-VLAN
+# MAC read, discovery's profile suggestion), so it stays a lowercase/camelCase
+# token and is never rewritten to a pretty string.
+def vendor_label(vendor: str) -> str:
+    """A vendor key as its maker's own name, or the key unchanged."""
+    from . import enterprises
+    return enterprises.display_name(vendor or "")
 
 
 def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:

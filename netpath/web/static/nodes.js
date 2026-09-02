@@ -20,6 +20,10 @@
     timeline: null,
     // The status timeline's window, set by the range dropdown above it.
     chartRange: 3600,
+    // The packet-loss chart's window, set by its own dropdown. Deliberately
+    // separate: an outage is read over days, a lossy link over minutes.
+    loss: null,
+    lossRange: 3600,
     ifaces: [],
     ifaceSort: { key: 'if_index', descending: false },
     events: null,
@@ -146,6 +150,8 @@
       value: (r) => r._devGroupName || '',
       cell: (r) => escape(r._devGroupName || '\u2014') },
     { key: 'vendor', label: 'Vendor', width: 120, on: true,
+      // Sorted and filtered on the stored key, shown as the vendor's own
+      // name for itself where the two differ.
       value: (r) => r.vendor || '',
       cell: (r) => escape(r.vendor || '\u2014') + vendorMarker(r) },
     { key: 'response', label: 'Response', width: 90, numeric: true, on: true,
@@ -504,7 +510,7 @@
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
-    await loadStatusTimeline();
+    await Promise.all([loadStatusTimeline(), loadLossChart()]);
     drawIfaceTable();
     drawEventTable();
   }
@@ -540,13 +546,17 @@
       sys_name: () => field('sysName', d.sys_name),
       sys_object_id: () => field('sysObjectID', d.sys_object_id),
       sys_contact: () => field('contact', d.sys_contact),
-      sys_location: () => field('location', d.sys_location
-        + (d.location_oid ? ' (from a custom OID)' : '')),
+      // `|| ''` before concatenating: a device with no answer for these has
+      // null here, and `null + ''` is the string "null", which is truthy and
+      // so rendered the field with the word null in it.
+      sys_location: () => field('location', (d.sys_location || '')
+        && d.sys_location + (d.location_oid ? ' (from a custom OID)' : '')),
       // Which source spoke matters: an arc under `enterprises` is an IANA
-      // assignment, a sysDescr match is a substring guess, and a custom OID
-      // is whatever the operator pointed at. They are not equally trustworthy
-      // and the header used to present all three identically.
-      vendor: () => field('vendor', d.vendor + ({
+      // assignment, a sysDescr match is a substring guess, a vendor OID is a
+      // proprietary object this app knows names its own maker, and a custom
+      // OID is whatever the operator pointed at. They are not equally
+      // trustworthy and the header used to present them identically.
+      vendor: () => field('vendor', (d.vendor_label || d.vendor || '') && (d.vendor_label || d.vendor) + ({
         sysObjectID: ' (sysObjectID)', sysDescr: ' (sysDescr)',
         oid: ' (custom OID)', walk: ' (walk)', learned: ' (learned)',
         manual: ' (manual)',
@@ -579,10 +589,12 @@
     return [now - view.chartRange, now];
   }
 
-  /* The status timeline is the device pane's only time-series view now,
-     so it owns the range dropdown above it outright rather than sharing a
-     window with a metric chart. Per-port bandwidth still charts, in the
-     interface dialog, over its own fixed last-hour window. */
+  /* The status timeline and the packet-loss chart under it each own their
+     own range dropdown and their own window — the same fault is read over
+     completely different spans depending on which question is being asked,
+     and one shared range made every visit to the pane a compromise. Per-port
+     bandwidth still charts in the interface dialog, over its own fixed
+     last-hour window. */
   async function loadStatusTimeline() {
     if (!view.selected) return;
     // A quick run of range changes can land out of order; a ticket that
@@ -594,6 +606,54 @@
     if (requestId !== view.timelineRequestId) return;   // superseded — drop it
     view.timeline = result;
     drawStatusTimeline();
+  }
+
+  /* Packet loss over the loss chart's own window.
+
+     The samples are already there: the poller records ping_loss_pct on every
+     poll that pings, so this is two reads of endpoints that already exist
+     rather than anything new being stored. The metric row only exists once a
+     device has actually been pinged, which is a real state to render rather
+     than an error — a device polled over SNMP with pinging off has no loss to
+     show and should say so. */
+  async function loadLossChart() {
+    if (!view.selected) return;
+    const requestId = (view.lossRequestId = (view.lossRequestId || 0) + 1);
+    const deviceId = view.selected;
+    const t1 = Date.now() / 1000;
+    const t0 = t1 - view.lossRange;
+    const metric = (view.metrics || []).find((m) => m.key === 'ping_loss_pct');
+    if (!metric) {
+      view.loss = { t0, t1, unit: '%', series: [], notProbed: true };
+      drawLossChart();
+      return;
+    }
+    const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
+                                 { metric_id: metric.id, t0, t1 });
+    // Same ticket discipline as the timeline, and for a second reason here:
+    // loadDetail replaces view.metrics wholesale, so a metric id read before
+    // the selection moved belongs to a device this pane is no longer showing.
+    if (requestId !== view.lossRequestId || deviceId !== view.selected) return;
+    view.loss = { t0: result.t0, t1: result.t1, unit: '%',
+                  series: [{ label: metric.label || 'Packet loss',
+                             color: 'var(--warn)', points: result.points || [] }] };
+    drawLossChart();
+  }
+
+  function drawLossChart() {
+    const wrap = App.el('nd-loss-chart');
+    const svg = App.el('nd-loss-chart-svg');
+    if (!wrap || !svg) return;
+    drawSeriesChart(svg, wrap, view.loss, {
+      // Pinned, because loss is a percentage of a known whole and an
+      // auto-scaled axis lies about a healthy device: a flat 0% series would
+      // otherwise be drawn against a ceiling of 0.001 and read as a
+      // full-height alarm.
+      peak: 100,
+      emptyText: view.loss && view.loss.notProbed
+        ? 'This device is not being ping-probed'
+        : 'No packet-loss samples in this window',
+    });
   }
 
   function niceCeiling(value) {
@@ -686,7 +746,9 @@
       }, opts.emptyText || 'No data in this window'));
       return geo;
     }
-    const peak = niceCeiling(Math.max(...allValues, 0.001));
+    // opts.peak pins the axis for a metric with a known full scale (a
+    // percentage); everything else scales to what it actually got.
+    const peak = opts.peak || niceCeiling(Math.max(...allValues, 0.001));
     const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
     const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
 
@@ -3122,6 +3184,16 @@
       loadStatusTimeline();
     };
     App.fillRanges(App.el('nd-d-range'), 'Last hour');
+    App.el('nd-loss-range').onchange = (e) => {
+      view.lossRange = Number(e.target.value);
+      loadLossChart();
+    };
+    // Only up to three days, unlike the status timeline's full range list.
+    // A wider window reads metric samples from the hourly rollup table, and
+    // nothing populates that table, so 7 and 30 days would be two options
+    // that are permanently empty. The status timeline is built from the
+    // device event log instead, so its own dropdown keeps every range.
+    App.fillRanges(App.el('nd-loss-range'), 'Last hour', 259200);
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
     App.el('nd-remove-profile').onclick = removeProfile;
@@ -3154,7 +3226,9 @@
     // resize needs a redraw from the data already loaded — no refetch.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
-        if (App.state.tab === 'nodes') drawStatusTimeline();
+        if (App.state.tab !== 'nodes') return;
+        drawStatusTimeline();
+        drawLossChart();
       });
     }
   }

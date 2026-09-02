@@ -135,6 +135,13 @@ CLEARS = {
 }
 
 
+# The entity kinds that take part in rollup at all. A rollup pairing says
+# "this alert is implied by that one about the SAME thing", so it is only
+# meaningful where an entity can have both; listing the kinds explicitly stops
+# a future entity kind inheriting the device pairings by accident.
+ROLLUP_ENTITY_KINDS = frozenset({"device", "netpath_target"})
+
+
 # ROLLED_UP_BY: rule key -> the rule key whose open alert makes it redundant.
 #
 # A device that has stopped answering will always also look slow and lossy,
@@ -172,6 +179,13 @@ ROLLED_UP_BY = {
     # one while the device is failing, so this only catches an overrun
     # alert opened in the moments before the first poll actually failed.
     "poll_overrun": "device_down",
+    # NetPath: a destination nothing comes back from is also, necessarily, a
+    # path whose traces are not reaching it and one whose latency cannot be
+    # measured. One broken path is one alert, the same rule as an unreachable
+    # device — and the same recovery mechanism too, since all three re-derive
+    # from the next trace rather than needing to be un-suppressed.
+    "netpath_path_unstable": "netpath_unreachable",
+    "netpath_latency_high": "netpath_unreachable",
 }
 
 # The rules that roll up under a given parent, the other way round — built

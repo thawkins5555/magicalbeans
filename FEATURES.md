@@ -262,7 +262,10 @@ own subtabs.
   Arista, MikroTik, Ubiquiti, Extreme, Dell, NETGEAR, SonicWall, APC,
   Synology, VMware, Palo Alto, Check Point, WatchGuard, Sophos, F5 BIG-IP,
   Citrix NetScaler, Ruckus, Cambium, Aerohive, Zyxel, TP-Link, Eaton,
-  Vertiv/Liebert, Raritan and Rittal — 32 bundles in all. The catalog itself is static data compiled into
+  Vertiv/Liebert, Raritan, Rittal and Moxa — 33 bundles in all. The Moxa
+  bundle covers the EDS, IKS and PT switch families and the AWK access
+  point: system info and utilization, port status, PoE, Turbo Ring and
+  Turbo Chain redundancy, dual homing, fiber check and digital I/O. The catalog itself is static data compiled into
   the app, so the list is browsable with no internet access at all; only
   pressing Install fetches anything, and it fetches from the vendor's or
   the distribution's own public repository rather than from a copy held
@@ -306,6 +309,12 @@ own subtabs.
   equal: an arc match is an IANA assignment, a sysDescr match is a
   substring of text the vendor chose to write, and only the former is
   used where being wrong would matter.
+- **A vendor is shown under its own name.** Vendor keys are terse tokens
+  because everything that behaves differently per vendor matches on them —
+  ConfigRX's backup command, the Cisco per-VLAN MAC read, discovery's
+  profile suggestion — so where a key does not read as the vendor's name
+  the Vendor column shows the name instead: "Moxa", "Rockwell Automation".
+  Only the display changes; the stored key is untouched.
 - **The matching MIB is assigned to the device automatically.** Once a
   vendor is identified and an uploaded MIB describes objects under that
   vendor's arc, the device's Custom MIB override is set for it, so
@@ -387,11 +396,24 @@ not a dense per-poll sample table), so a device that's been up for a week
 with zero events still renders as one solid "up" segment rather than
 appearing to have no data. The range dropdown beside it sets the window.
 
-**Bandwidth is a per-port question, so it is asked per port** — there is
-no device-level metric chart or metric picker. Clicking an interface
-opens that port's own graph (below), which is where a traffic question
-actually gets answered; the device pane keeps the space for the
-interface and event lists instead.
+**Packet loss is charted under it, on its own time frame.** Loss is measured
+by this app's own ping probes on every poll, so unlike bandwidth it is a
+device-level fact and belongs in the device pane. It has **its own range
+dropdown**, independent of the timeline's: "how long has this been down" and
+"how lossy is this link" are asked over different spans, and one shared range
+made every visit to the pane a compromise. The axis is pinned to 0–100 %, so a
+healthy device draws a flat line along the bottom rather than an auto-scaled
+one that makes a fraction of a percent look like an outage. A device that is
+not being ping-probed says so instead of showing an empty chart. Its ranges
+stop at three days, because a wider metric window reads from an hourly rollup
+table that nothing populates — a 7-day option would be permanently empty. The
+status timeline keeps every range, since it is built from the event log rather
+than from samples.
+
+**Bandwidth is still a per-port question, so it is still asked per port** —
+there is no device-level bandwidth chart or metric picker. Clicking an
+interface opens that port's own graph (below), which is where a traffic
+question actually gets answered.
 
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out — the same way every other table in the app does. Which SNMP identity
@@ -584,6 +606,17 @@ alerts and optionally emailing about them.
   cover access points**: that alert comes from Nodes' own device polling, and
   an AP lives in the Wireless module unless it has also been added to Nodes by
   IP in its own right.
+- **A recovery says when, and for how long.** *Device recovered* used to
+  read "responding again" and leave the length of the outage to be worked
+  out from another row's timestamp; it now reads "responding again at
+  14:03:21 after 2 h 14 m down" and names the moment the outage began. The
+  start comes from the outage alert this recovery resolved — whose opened
+  time is the moment the device stopped answering — and from the device's
+  own event log when there is no such alert, because the rule was disabled,
+  the device muted, the alert held as a newly added device, or it was
+  resolved by hand. When neither knows, the duration is left out rather
+  than guessed at. Any resolved alert also shows how long it stood, in its
+  detail pane.
 - **The Object column always shows a hostname when one is known** — the
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
@@ -621,7 +654,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **27 built-in rules** ship enabled: a device not responding, a device
+- **32 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
@@ -629,8 +662,8 @@ alerts and optionally emailing about them.
   error-and-discard-rate/disk/ping-latency/packet-loss thresholds, a
   critical or cold-start SNMP trap, a linkDown trap from a device Nodes
   is not itself polling, a critical syslog line, a new IPAM address
-  conflict, an access point removed from its controller, and a DHCP
-  scope running out of leases.
+  conflict, an access point removed from its controller or gone offline, a
+  DHCP scope running out of leases, and three NetPath path rules (below).
 - **A built-in rule can be edited** (severity, enabled, which devices it
   applies to by a substring filter, its threshold/clear-threshold/
   consecutive-polls-before-firing where relevant, which template it
@@ -684,6 +717,53 @@ alerts and optionally emailing about them.
   only be open or acknowledged once at a time), not by application logic
   that could race.
 
+### NetPath destinations
+
+Three rules watch the paths NetPath traces, and all three are deliberately
+hard to trip — a path monitor that cries wolf gets turned off.
+
+| Rule | Fires when | Clears |
+| --- | --- | --- |
+| Destination unreachable | Nothing comes back from the destination on 3 consecutive traces — a quarter of an hour on the default interval | One answered probe |
+| Path repeatedly failing | Half the traces in the window did not reach the destination | The share drops back under 20% |
+| Latency far above normal | Round-trip time reaches 3x this destination's own warn threshold, on 3 consecutive traces | It falls back under 1.5x |
+
+- **Latency is measured against each destination's own warn threshold**, not a
+  fixed number of milliseconds, so one rule suits a LAN hop and a satellite
+  link. A warn threshold under 20 ms is treated as 20 ms, because three times a
+  few milliseconds is ordinary jitter rather than a degradation. A trace that
+  did not reach the destination is not measured at all — its round-trip time is
+  to whichever router refused it.
+- **The window rule needs enough traces to mean anything.** Its window is the
+  longer of an hour and six trace intervals, and it says nothing until at least
+  five traces have landed in it. It is the only one of the three that can see a
+  path which works intermittently, since counting consecutive failures by
+  definition cannot.
+- **One broken path is one alert.** An unreachable destination also has failing
+  traces and unmeasurable latency, so the unreachable alert absorbs the other
+  two for that destination, exactly as *Device not responding* absorbs the
+  alerts a dead device implies.
+- **A trace that could not run is never an outage.** A traceroute that failed
+  on this machine, and a slot skipped because the previous run was still going,
+  both record 100% loss by construction; alerting on them would report a
+  missing `traceroute` or a badly chosen interval as a network breakdown. They
+  produce no sample at all, and leave every count exactly as it was.
+- **No per-hop rule, on purpose.** Intermediate routers rate-limit ICMP as a
+  matter of policy, so their loss is not a fault signal — the same reason only
+  the destination hop decides a trace's colour. The live per-hop probe counters
+  are cumulative since the last path change, too, so a hop that was lossy last
+  week would keep any average over them high indefinitely. Per-hop figures stay
+  a diagnostic on the route graph.
+- **A destination that stops being traced resolves its alerts.** Disabling or
+  deleting one leaves nothing to re-evaluate, and an alert nothing can clear
+  would sit open forever.
+- **Consecutive traces are counted as traces.** The alert engine ticks every
+  five seconds and a destination is traced every five minutes by default, so
+  the count advances only when a new trace actually lands.
+- These alerts are visible to anyone with read access to Alerts, whatever their
+  NetPath access — the same as DHCP scopes, wireless access points and syslog
+  hosts, which also name objects from their own modules.
+
 ### Notifications
 
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
@@ -697,7 +777,13 @@ alerts and optionally emailing about them.
   dropping back below its clear value — can send its own notification,
   using the generic "device recovered" template rather than replaying
   the original problem's wording backwards; this is optional and can be
-  turned off.
+  turned off. **Every resolution notification states when the problem
+  cleared and how long it stood**, from three tokens (`recovered_time`,
+  `down_since`, `downtime`) that any template can use — a port coming back
+  and a threshold falling below its clear value now say so as plainly as a
+  device answering again does. It used to say "as of {{last_time}}", which
+  on a resolution is when the *problem* last recurred, a moment before it
+  cleared.
 - **Test sends a real email** to an address typed in, using whatever SMTP
   settings are currently in the form before they are saved — the same
   "test what's typed" idiom as IPAM's DHCP test.
@@ -722,6 +808,11 @@ alerts and optionally emailing about them.
 ## NetPath — path monitoring
 
 Runs traceroutes to destinations you add, on a schedule, and keeps every one.
+
+Destinations also feed the Alerts module: an unreachable destination, a path
+that keeps failing, and latency far above what that destination is set to warn
+at each raise an alert. The rules, their thresholds and why they are hard to
+trip are under **Alerts → NetPath destinations**.
 
 ### Destinations
 

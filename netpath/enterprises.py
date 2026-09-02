@@ -178,10 +178,22 @@ def is_verified(arc) -> bool:
         return False
 
 
+# Vendors identified by sysDescr alone, which therefore have no arc to be
+# keyed by here. Rockwell Automation is one: no Rockwell MIB was reachable to
+# read a verified arc out of, and a guessed arc silently mislabels every
+# device beneath it, so it is named by sysDescr only -- and still deserves to
+# read as its own name rather than as a camelCase token.
+ARCLESS_DISPLAY: dict[str, str] = {
+    "rockwellAutomation": "Rockwell Automation",
+}
+
 _DISPLAY: dict[str, str] = {}
 for _arc, (_key, _name) in ENTERPRISES.items():
     _DISPLAY.setdefault(_key, _name)
 del _arc, _key, _name
+for _key, _name in ARCLESS_DISPLAY.items():
+    _DISPLAY.setdefault(_key, _name)
+del _key, _name
 
 
 def display_name(key: str) -> str:

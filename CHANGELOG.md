@@ -6,7 +6,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 4.32.1 — Tests you can actually run
+### 4.33.1 — Tests you can actually run
 
 - **The end-to-end suites now live in the repository, under `tests/`, and
   every one of them passes.** Four of them had been listed as "known
@@ -27,6 +27,116 @@ Listed newest first. Version numbers are build order, not dates.
   `tests/README.md` says what each one proves. Standard library only, no
   network, no `ping` binary, no root, temporary databases. No application
   code changed in this release.
+
+### 4.33.0 — How long it was down, loss you can see, and paths that alert
+
+- **"Device recovered" now says when it recovered and how long it was down.**
+  The notice read "responding again" and nothing else, so the one question an
+  operator opens it to answer — how long was this out — had to be reconstructed
+  from the outage alert's timestamp in another row. It now reads *"responding
+  again at 14:03:21 after 2 h 14 m down"*, with the exact time the outage began
+  underneath it. The outage's start comes from the alert this recovery just
+  resolved, whose opened time **is** the moment the device stopped answering,
+  and from the device's own event log when there is no such alert — the rule
+  disabled, the device muted, the alert held as a newly added device or
+  resolved by hand. When neither knows, the clause is left out rather than
+  guessed at: an outage of unknown length is not a zero-length one. A resolved
+  alert of any kind now also carries how long it stood, in its detail pane.
+- **Fixed: the recovery email named the wrong time.** It said "is responding
+  again as of {{last_time}}", and on a resolution notification `last_time` is
+  when the *outage* last recurred — a moment before the recovery, not the
+  recovery. The template now uses three new tokens, `recovered_time`,
+  `down_since` and `downtime`, and every resolution notification carries them:
+  a port coming back, an access point returning and a threshold dropping below
+  its clear value all now state how long the problem stood, which none of them
+  did before.
+- **An upgraded install gets the new wording, unless it wrote its own.**
+  Built-in templates seed once and are then left alone, which is right for a
+  template somebody edited and wrong for one nobody has touched — that one is
+  simply the old shipped text sitting where the new shipped text belongs. The
+  upgrade now rewrites a built-in template only where it still matches, exactly,
+  what the previous release shipped. An edited template is never touched, and
+  "Reset to built-in" offers this release's wording either way.
+- **The Nodes device pane charts packet loss, on its own time frame.** Loss is
+  sampled on every poll that pings and already drives a shipped alert rule, but
+  there was nowhere to see its shape over time — bandwidth is a per-port
+  question, asked in the port dialog, and loss is not. The chart sits under the
+  status timeline with its own range dropdown: "how long has it been down" and
+  "how lossy is this link" are asked over different spans, and one shared range
+  made every visit to the pane a compromise. Its axis is pinned to 0-100 %,
+  because an auto-scaled one draws a healthy device's flat zero as a
+  full-height alarm. A device that is not being ping-probed says so rather than
+  drawing an empty grid.
+- **That chart's ranges stop at three days, deliberately.** Metric windows
+  wider than three days are read from an hourly rollup table that nothing in
+  this application has ever populated, so offering 7 and 30 days would offer
+  two views that are permanently empty. The status timeline beside it keeps
+  every range — it is built from the device event log, not from metric samples.
+- **NetPath destinations now raise alerts.** Every other module fed the alert
+  engine; traceroute results fed nothing, so a monitored path could be broken
+  for a day with nothing but a red dot on a tab to say so. Three built-in rules
+  ship, and all three are deliberately hard to trip, because a path monitor
+  that cries wolf gets turned off:
+  - **NetPath destination unreachable** — nothing at all comes back from the
+    destination, on three consecutive traces. On the shipped five-minute
+    interval that is a quarter of an hour of silence. One answered probe clears
+    it. A refusal names the router and the ICMP code that sent it.
+  - **NetPath path repeatedly failing** — half the traces in a window failed to
+    reach the destination. The window is the longer of an hour and six trace
+    intervals, and the rule says nothing until at least five traces have landed
+    in it, so a destination traced twice an hour cannot alert on one bad trace.
+    This is the only one of the three that can see a path that works
+    intermittently, which counting consecutive failures by definition cannot.
+  - **NetPath latency far above normal** — round-trip time at three times that
+    destination's **own** warn threshold, sustained for three traces. Relative
+    rather than a fixed number of milliseconds, because "slow" means nothing
+    across a LAN hop and a satellite link at once. Thresholds below 20 ms are
+    treated as 20 ms, since three times a few milliseconds is ordinary jitter,
+    and a trace that did not reach the destination is not measured at all — its
+    round-trip time is to whichever router refused it.
+- **One broken path raises one alert.** An unreachable destination is also,
+  necessarily, one whose traces are failing and whose latency cannot be
+  measured, so the unreachable alert absorbs the other two for that destination
+  the same way *Device not responding* absorbs the alerts a dead device
+  implies. Nothing needs un-suppressing: all three re-derive from the next
+  trace.
+- **A trace that could not run is not an outage.** A traceroute that failed on
+  this machine, or a slot skipped because the previous run was still going,
+  records 100 % loss by construction — and alerting on it would report a
+  missing `traceroute` binary or a badly chosen interval as a network
+  breakdown. Those statuses now produce no sample at all: they leave every
+  streak exactly as it was rather than counting as a failure. Consecutive-trace
+  counts are counted against the traces' own timestamps, too, so "three traces"
+  cannot be satisfied in fifteen seconds by an engine that ticks every five.
+- **A destination that stops being traced resolves its alerts.** A threshold
+  alert clears by being re-evaluated and found to have recovered, which cannot
+  happen for a destination that was disabled or deleted — the alert would have
+  sat open forever, and turning a destination off while working on a link is a
+  normal thing to do.
+- **A Moxa MIB bundle is in the catalog** — 25 files covering the EDS, IKS and
+  PT switch families and the AWK access point: system info and utilization,
+  port status, PoE, Turbo Ring and Turbo Chain redundancy, dual homing, fiber
+  check and digital I/O. Fetched from LibreNMS's public tree at install time
+  like every other bundle; nothing is mirrored here. 4.32.0's arc walk already
+  names a Moxa switch from arc 8691 without any MIB at all; this is what lets
+  it decode the switch's own objects once named, and what the bundle hint on a
+  `mib_missing` event points at.
+- **Rockwell Automation gear is identified from its sysDescr,** and reads as
+  "Rockwell Automation" rather than as a token. No enterprise arc is claimed
+  for it: every arc in this application was read out of that vendor's own MIB
+  text, because a wrong arc silently mislabels every device under it, and no
+  Rockwell MIB was available to read one from. It is therefore the one vendor
+  named by sysDescr with no arc to be keyed by, and carries its display name in
+  `enterprises.ARCLESS_DISPLAY` instead.
+- **Known, not fixed: SNMPv1 is never actually spoken.** The poller resolves
+  the version as `snmp_version or 1`, so a device configured for v1 (stored as
+  `0`) goes on the wire as v2c. One consequence is already guarded — a custom
+  Vendor or Location OID rides in the same request as sysDescr and sysObjectID,
+  which on a real v1 agent would null every answer in it, so those OIDs are read
+  in a separate best-effort request for a v1-configured device — but that guard
+  cannot fire while the coercion stands. Correcting it changes how every
+  v1-configured device is polled and deserves its own change with its own
+  testing, so it is recorded here rather than slipped in.
 
 ### 4.32.0 — Know what you are polling
 
