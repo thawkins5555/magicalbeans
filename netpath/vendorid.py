@@ -351,20 +351,19 @@ def poll_decision(sys_object_id: str, sys_descr: str, device_row, learned: str =
     """
     keys = device_row.keys() if hasattr(device_row, "keys") else ()
     manual = (device_row["vendor_override"] if "vendor_override" in keys else "") or ""
-    stored_source = (device_row["vendor_source"] if "vendor_source" in keys else "") or ""
     stored_for = (device_row["identified_sys_object_id"]
                   if "identified_sys_object_id" in keys else None)
     sys_arc = enterprise_arc(sys_object_id)
     real_sys_arc = sys_arc is not None and sys_arc not in GENERIC_ARCS
-    if not manual and not learned and not real_sys_arc \
-            and stored_source == "walk" and stored_for == sys_object_id:
-        evidence = _evidence_dict(device_row)
-        stored = (evidence.get("decision") or {}) if evidence else {}
-        vendor = (device_row["vendor_detected"] if "vendor_detected" in keys else "") or ""
-        if vendor:
-            return (vendor, "walk",
-                    stored.get("confidence") or
-                    ((device_row["vendor_confidence"] if "vendor_confidence" in keys else "") or "medium"),
+    if not manual and not learned and not real_sys_arc and stored_for == sys_object_id:
+        # The walk's verdict lives in the evidence, not in the row's current
+        # vendor_source: that column says what is showing NOW, and while a
+        # manual or learned vendor was in force it said so. Reading the
+        # evidence is what lets a cleared override fall back to the walk
+        # rather than to the agent's own name.
+        stored = (_evidence_dict(device_row).get("decision") or {})
+        if stored.get("source") == "walk" and stored.get("vendor"):
+            return (stored["vendor"], "walk", stored.get("confidence") or "medium",
                     stored.get("vendor_arc"))
     decision = decide(sys_object_id, sys_descr, [], [], manual=manual, learned=learned)
     return decision.vendor, decision.source, decision.confidence, decision.vendor_arc

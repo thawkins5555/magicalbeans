@@ -984,7 +984,11 @@ class NodePoller:
             if rebooted:
                 self.db.record_device_event(device_id, "rebooted", note)
 
-        self._check_vendor_mib(device_id, previous, identity)
+        walk_pending = bool(
+            snmp_ok and identity and settings.get("vendor_walk_enabled", True)
+            and config.get("snmp_enabled", True)
+            and self._identification_due(previous, identity.get("sys_object_id") or "", now))
+        self._check_vendor_mib(device_id, previous, identity, defer_assignment=walk_pending)
         if snmp_ok:
             self._maybe_identify(device_id, identity, config, settings)
 
@@ -1256,7 +1260,8 @@ class NodePoller:
 
         return identity, uptime_ticks, metrics
 
-    def _check_vendor_mib(self, device_id: int, previous, identity: dict | None) -> None:
+    def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
+                          defer_assignment: bool = False) -> None:
         """Vendor autodetection already happens on every poll
         (nodeoids.vendor_for on the device's sysObjectID). This is the
         other half the user asked for: if the vendor is identified but no
@@ -1303,7 +1308,12 @@ class NodePoller:
             return
         coverage_oid = f"{nodeoids.ENTERPRISES}.{vendor_arc}"
         covered = self.db.has_mib_covering(coverage_oid)
-        if covered:
+        # While an identification walk is still due for this device, the
+        # poll path leaves assignment to it: the walk's pick is the file that
+        # actually named this device's objects, and an assignment made here
+        # first — by "the file with the most objects under the arc" — would
+        # stand, because assignment never overrides an existing choice.
+        if covered and not defer_assignment:
             self._auto_assign_mib(device_id, coverage_oid, vendor,
                                   preferred=identity.get("preferred_mib_file_id"))
         if covered and not (was_covered is None or was_covered):

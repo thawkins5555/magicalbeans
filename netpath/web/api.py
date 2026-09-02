@@ -1615,7 +1615,9 @@ def _discovery_job_json(row) -> dict:
             "error": row["error"]}
 
 
-def _discovery_result_json(row) -> dict:
+def _discovery_result_json(row, installed=None) -> dict:
+    """`installed` is the set of MIB filenames present, passed by the caller
+    once per listing so the "install these MIBs" hint is not a query per row."""
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
@@ -1623,10 +1625,10 @@ def _discovery_result_json(row) -> dict:
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
             "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
             "promoted_device_id": row["promoted_device_id"],
-            **_discovery_identification(row)}
+            **_discovery_identification(row, installed)}
 
 
-def _discovery_identification(row) -> dict:
+def _discovery_identification(row, installed=None) -> dict:
     """What the sweep's arc hop found for a result, or blanks for a row
     written before 4.32."""
     keys = row.keys()
@@ -1637,6 +1639,9 @@ def _discovery_identification(row) -> dict:
         except (TypeError, ValueError):
             arcs = []
     bundle_key = (row["suggest_bundle"] if "suggest_bundle" in keys else None) or None
+    bundle = mibcatalog.bundle(bundle_key) if bundle_key else None
+    bundle_installed = bool(bundle) and installed is not None and \
+        all(fn in installed for fn, _url in bundle.files)
     return {
         "vendor_source": (row["vendor_source"] if "vendor_source" in keys else "") or "",
         "vendor_confidence": (row["vendor_confidence"]
@@ -1644,6 +1649,7 @@ def _discovery_identification(row) -> dict:
         "arcs": arcs,
         "arc_names": [vendorid.arc_name(a) for a in arcs],
         "suggest_bundle": bundle_key,
+        "suggest_bundle_installed": bundle_installed,
     }
 
 
@@ -2626,8 +2632,9 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     if not job:
         raise ValueError("No such discovery job")
     results = service.nodes_db.discovery_results(job_id)
+    installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r) for r in results]}
+            "results": [_discovery_result_json(r, installed) for r in results]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:

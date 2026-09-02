@@ -6,6 +6,74 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.32.0 — Know what you are polling
+
+- **A device's vendor is now identified from what it actually answers, not
+  only from its sysObjectID.** Vendor identity lives entirely under the
+  `enterprises` subtree, and the set of enterprise arcs a device populates
+  can be enumerated in (arcs + 1) GETNEXTs by *hopping*: ask for the first
+  object under `1.3.6.1.4.1`, land on arc N, ask for the first object under
+  `1.3.6.1.4.1.(N+1)` and skip the whole of arc N. A device usually answers
+  under two to six arcs, so this is cheaper than one poll — and it finds
+  vendors this app holds no MIB for. A net-snmp radio that used to show as
+  "netSnmp" now shows as Phoenix Contact, because arc 4346 is what it
+  answers under.
+- **Then the installed MIBs are scored against a bounded walk** (about 500
+  objects, 20 seconds, once per device on its first successful poll, again
+  only if its sysObjectID changes, and behind a Re-identify button). Each
+  MIB is credited with the objects it names on that device, and the file
+  that names the most becomes the device's Custom MIB — replacing the old
+  "the file with the most objects under the arc" guess, which was a guess
+  about the device made from the MIB alone. Steady-state polling adds no
+  traffic at all: once identified for its current sysObjectID, a device is
+  never walked again until somebody asks.
+- **The precedence is explicit and explained.** A vendor set by hand wins,
+  then one learned from an operator's override on a device with the same
+  sysObjectID, then a real vendor arc in the sysObjectID (an IANA
+  assignment), then the walk, then a word in the sysDescr, then the SNMP
+  agent's own name. The walk never substitutes a different arc for a real
+  vendor arc — OEM gear routinely implements the chipset vendor's arc
+  alongside its own. Every device stores the evidence: which arcs answered,
+  how many objects, which MIB named how many of them, and the sentence that
+  states the decision. The device dialog shows all of it.
+- **A confidence you can see.** The Vendor column carries one character
+  after a name that is less than certain — `?` for a guess from sysDescr,
+  `~` for probable (a curated enterprise number, or a walk with thin MIB
+  evidence), `*` for a vendor set by hand or learned — and nothing after a
+  name that came from an IANA arc or strong evidence, so the common case
+  reads clean. The title says which source spoke.
+- **Set a vendor by hand, and the fleet learns it.** A manual vendor on a
+  device is shown, acted on by ConfigRX and the Cisco MAC-table read, and —
+  when the device's sysObjectID is specific to one vendor — remembered, so
+  every other device answering the same sysObjectID follows on its next
+  poll. A generic-agent sysObjectID (net-snmp's, shared by every Linux box
+  ever built) is deliberately never learned from; the dialog says so.
+- **"This looks like a Ubiquiti — install the Ubiquiti MIBs."** Catalog
+  bundles now carry the enterprise arcs they describe, so a device answering
+  under an arc no installed MIB decodes is pointed at the bundle that would,
+  with a one-click install from the device dialog. Every arc was read out of
+  the bundle's own root file, never assumed.
+- **Arcs with no MIB still get a name.** A bundled enterprise-number list —
+  48 arcs verified from MIB text and 80 curated from memory of the IANA
+  registry, kept apart and trusted differently — names a device whose vendor
+  this app has never seen a MIB for. A curated entry decides at medium
+  confidence with the arc number in the evidence, so a wrong one is
+  auditable and scoped to devices nothing else could name.
+- **Discovery sweeps list each device's arcs too.** The identity GET gains
+  the hop's few GETNEXTs, the results table marks confidence and hints at
+  the bundle to install, and promotion carries the verdict into the device.
+  Switchable off, in which case a sweep is exactly what it was.
+- Settings → Nodes has a **Vendor identification** fieldset for the walk's
+  bounds, its concurrency (four at once, which is what throttles the
+  post-upgrade burst where every existing device is unidentified) and the
+  discovery hop. Existing devices keep their vendor on upgrade and are
+  walked once, a few at a time, as they poll.
+
+**Not done in this release:** a Phoenix Contact MIB bundle, for the same
+reason as 4.28 — the catalog's upstream ships none. The device is now named
+correctly anyway, and its `mib_missing` event says which arc a MIB would need
+to describe.
+
 ### 4.31.0 — Mute a device, sustain a threshold, find a MAC
 
 - **A poll overrun on a device that is not answering is no longer reported.**

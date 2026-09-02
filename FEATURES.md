@@ -337,6 +337,42 @@ own subtabs.
   own table objects (e.g. a vendor's per-sensor table) aren't walked by
   this feature.
 
+### Vendor identification
+
+- **The vendor is worked out from what the device answers, and the app
+  says how sure it is.** Every device is walked once — a hop across the
+  enterprise arcs it populates (a handful of requests), then a bounded walk
+  under each (about 500 objects, 20 seconds) scored against every installed
+  MIB. That happens on its first successful poll, again only if its
+  sysObjectID changes, and behind **Re-identify**; the steady-state poll
+  adds nothing. The Vendor column marks a name that is less than certain:
+  `?` a guess from a word in sysDescr, `~` probable, `*` set by hand or
+  learned. Hover for which source spoke.
+- **Precedence, in order:** a vendor set by hand; one learned from an
+  operator's override on a device with the same sysObjectID; a real vendor
+  arc in the sysObjectID; the walk; a word in the sysDescr; the SNMP agent's
+  own name. The walk never overrules a real vendor arc — OEM gear implements
+  the chipset maker's arc alongside its own — but it is what names a device
+  whose sysObjectID says only "net-snmp".
+- **The device dialog shows the evidence:** the arcs found, how many objects
+  each answered, which MIB named how many of them, the MIB that was assigned
+  because of it, and the sentence that states why. Re-identify runs the
+  walk again in front of you. A **Vendor (manual)** box overrides everything,
+  for display and for ConfigRX's command choice; when the device's
+  sysObjectID is specific to one vendor, every device with the same one
+  follows on its next poll, and the dialog says whether that applies.
+- **A bundle is suggested when it would help.** Catalog bundles know their
+  enterprise arcs, so a device answering under an arc no installed MIB
+  decodes gets "This looks like a Ubiquiti — Install the Ubiquiti MIBs"
+  with the install one click away.
+- **Arcs with no MIB still get a name** from a bundled enterprise-number
+  list; entries verified from MIB text decide at high confidence, curated
+  ones at medium, always with the arc number in the evidence.
+- **Discovery sweeps list each device's arcs** (a few extra requests per
+  device that answers SNMP, switchable off under Settings → Nodes), mark
+  confidence in the results table, hint at the bundle to install, and carry
+  the verdict into the device on promotion.
+
 ### Drill-down
 
 Selecting a device opens its identity, live status, a status timeline,

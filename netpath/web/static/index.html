@@ -89,6 +89,9 @@
     <div class="bar wrap" id="nd-bulk-bar" hidden>
       <span id="nd-bulk-count" class="hint"></span>
       <button id="nd-bulk-poll">Poll now</button>
+      <!-- data-requires-write on the button itself, never on the bar: the
+           bar's visibility is owned by the selection. -->
+      <button id="nd-bulk-identify" data-requires-write="nodes">Re-identify</button>
       <button id="nd-bulk-profile">Set profile</button>
       <button id="nd-bulk-group">Set group</button>
       <button id="nd-bulk-ungroup">Remove from group</button>
