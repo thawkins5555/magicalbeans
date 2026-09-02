@@ -310,16 +310,23 @@ class IpamDatabase:
             return self._conn.execute(
                 "SELECT * FROM subnets WHERE id=?", (subnet_id,)).fetchone()
 
+    def _rows_by_ids(self, table: str, ids: list[int]) -> list[sqlite3.Row]:
+        """`SELECT * FROM <table> WHERE id IN (...)` — the one place the
+        placeholder list is built for the *_by_ids() lookups, which otherwise
+        differ only in the table they read. `table` is always a literal at
+        the call site, never input."""
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT * FROM {table} WHERE id IN ({marks})", ids).fetchall()
+
     def subnets_by_ids(self, subnet_ids: list[int]) -> list[sqlite3.Row]:
         """subnet() for many ids in one query, for labeling a handful of
         subnets (e.g. ones currently mid-scan) without loading the whole
         table."""
-        if not subnet_ids:
-            return []
-        marks = ",".join("?" * len(subnet_ids))
-        with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM subnets WHERE id IN ({marks})", subnet_ids).fetchall()
+        return self._rows_by_ids("subnets", subnet_ids)
 
     # ----------------------------------------------------------------- scans
 
@@ -557,12 +564,7 @@ class IpamDatabase:
     def dhcp_servers_by_ids(self, server_ids: list[int]) -> list[sqlite3.Row]:
         """dhcp_server() for many ids in one query — the dhcp_servers()
         counterpart to subnets_by_ids()."""
-        if not server_ids:
-            return []
-        marks = ",".join("?" * len(server_ids))
-        with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM dhcp_servers WHERE id IN ({marks})", server_ids).fetchall()
+        return self._rows_by_ids("dhcp_servers", server_ids)
 
     def set_dhcp_poll_result(self, server_id: int, ok: bool,
                              error: str | None = None) -> None:

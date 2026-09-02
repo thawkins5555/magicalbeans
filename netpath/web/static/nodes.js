@@ -226,6 +226,14 @@
       // a freshly-replaced checkbox <input> after a cell rebuild.
       const box = tr.querySelector('.nd-check');
       if (box) {
+        // The markup diff can't be trusted for the tick itself: toggleChecked
+        // flips the live `checked` property in place without going through
+        // drawTable, so the cached markup and the real box can disagree. If
+        // the selection then flips back (Clear, select-all, a header click)
+        // the recomputed markup matches the stale cache, the cell is left
+        // alone, and the box would stay in the wrong state. Setting the
+        // property directly is cheap and always right.
+        box.checked = view.devicesChecked.has(row.id);
         box.onclick = (event) => {
           event.stopPropagation();
           toggleChecked(row.id, tr);

@@ -192,6 +192,14 @@ CREATE TABLE IF NOT EXISTS interface_events (
     detail          TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_interface_events_ts ON interface_events(ts);
+-- The interface_id counterpart to ix_device_events_device_ts above. Every
+-- per-interface read (interface_events(interface_id=...),
+-- recent_interface_events_for, interface_events_for_device's join) is
+-- keyed on it; without this SQLite scans or auto-indexes the whole table
+-- on each call, growing with the fleet's total history rather than the
+-- one device's.
+CREATE INDEX IF NOT EXISTS ix_interface_events_iface_ts
+    ON interface_events(interface_id, ts);
 
 CREATE TABLE IF NOT EXISTS mib_files (
     id              INTEGER PRIMARY KEY,
@@ -1277,11 +1285,17 @@ class NodesDatabase:
                 (int(last_id), int(limit))).fetchall()
 
     def interface_events_for_device(self, device_id: int, since_s: float | None = None,
-                                    limit: int = 2000) -> list[sqlite3.Row]:
+                                    per_interface: int = 300) -> list[sqlite3.Row]:
         """interface_events() for every interface of a device in one query,
         joined against `interfaces` (whose if_index/descr the caller wants
         alongside each event) so the per-interface fan-out of one
-        interface_events() call per port is a single round trip instead."""
+        interface_events() call per port is a single round trip instead.
+
+        The cap is per interface, not per device, on purpose: it keeps the
+        contract the fan-out had (interface_events()'s own default of the
+        newest 300 per port). A single flat LIMIT would let one port that
+        flaps continuously fill the whole result and erase every other
+        port's link history from the detail pane."""
         clauses = ["i.device_id = ?"]
         params: list = [device_id]
         if since_s is not None:
@@ -1290,11 +1304,15 @@ class NodesDatabase:
         where = " AND ".join(clauses)
         with self._lock:
             return self._conn.execute(
+                f"SELECT id, interface_id, ts, kind, detail, if_index, descr FROM ("
                 f"SELECT e.id, e.interface_id, e.ts, e.kind, e.detail,"
-                f" i.if_index, i.descr FROM interface_events e"
+                f" i.if_index, i.descr,"
+                f" ROW_NUMBER() OVER (PARTITION BY e.interface_id ORDER BY e.ts DESC) AS rn"
+                f" FROM interface_events e"
                 f" JOIN interfaces i ON i.id = e.interface_id"
-                f" WHERE {where} ORDER BY e.ts DESC LIMIT ?",
-                (*params, limit)).fetchall()
+                f" WHERE {where}"
+                f") WHERE rn <= ? ORDER BY ts DESC",
+                (*params, per_interface)).fetchall()
 
     def max_interface_event_id(self) -> int:
         with self._lock:

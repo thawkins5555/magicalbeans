@@ -77,6 +77,52 @@ cells and every other device's row completely untouched; a reorder moves
 existing nodes rather than recreating them; and device removal/re-addition
 behave correctly with no cache corruption.
 
+### Pre-merge review (2026-09-02) — 4 findings, all verified and addressed
+
+Before merging to `main` the whole branch was put through a high-effort code
+review. Each finding was checked against the code rather than taken on faith;
+all four held up.
+
+1. **Checkbox state could desync after a redraw** (`nodes.js`).
+   `toggleChecked()` flips a row's live `checked` property without going
+   through `drawTable()`, so the cached markup and the real box could
+   disagree; if the selection then flipped back (Clear, select-all), the
+   recomputed markup matched the stale cache, the cell was left alone, and
+   the box stayed in the wrong state. I had originally removed the explicit
+   `box.checked = …` sync as redundant — it wasn't. Restored, unconditionally.
+   Covered by a new Playwright test exercising both the reported case
+   (hand-tick → Clear) and its mirror (select-all → hand-untick → select-all).
+
+2. **Events endpoint silently changed contract**
+   (`interface_events_for_device`). The first version replaced "newest 300
+   per interface" with a flat "newest 2000 per device", so one continuously
+   flapping port could crowd every other port's link history out of the
+   detail pane — and both `nodes.js` callers pass no `since_s`, so that limit
+   was the only bound. Rewritten with
+   `ROW_NUMBER() OVER (PARTITION BY interface_id …)` to keep the exact
+   per-interface cap in a single query. Verified to return exactly the same
+   event ids as the old fan-out.
+
+3. **`interface_events` had no index on `interface_id`** (`nodesdb.py`).
+   `device_events` has `(device_id, ts)`; its counterpart was missing, so the
+   new join — and the pre-existing per-interface reads — scanned or
+   auto-indexed the whole table on every call. Added
+   `ix_interface_events_iface_ts`; `EXPLAIN QUERY PLAN` now shows
+   `SEARCH e USING COVERING INDEX`, no automatic index.
+
+4. **Duplicated `*_by_ids` idiom.** `subnets_by_ids`/`dhcp_servers_by_ids`
+   differed only by table name; folded into one private
+   `_rows_by_ids(table, ids)` in `IpamDatabase`. Deliberately *not* extended
+   to a cross-file helper: `db.py`/`nodesdb.py`/`ipamdb.py` share no base
+   class, and the placeholder idiom already appears ~20 times across the
+   codebase as its established convention — a shared helper would be a
+   larger refactor than a performance branch should carry. The reviewer also
+   noted an unbounded `IN (...)` list could exceed
+   `SQLITE_MAX_VARIABLE_NUMBER` for a very large bulk selection; noted, not
+   changed here, because the pre-existing `bulk_update_devices` /
+   `bulk_remove_devices` in the same bulk-selection flow have identical
+   exposure, so the new methods add no new risk.
+
 ---
 
 ## Critical Issues (Fix Before Production)
