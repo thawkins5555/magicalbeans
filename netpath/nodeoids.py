@@ -134,6 +134,7 @@ SYSDESCR_VENDORS: tuple[tuple[str, str], ...] = (
     ("phoenix contact", "phoenixContact"),
     ("phoenixcontact", "phoenixContact"),
     ("allied telesis", "alliedTelesis"),
+    ("rockwell automation", "rockwellAutomation"),
     ("check point", "checkPoint"),
     ("palo alto", "paloAlto"),
     ("tp-link", "tpLink"),
@@ -197,6 +198,61 @@ def vendor_from_descr(sys_descr: str) -> str:
 # the class the sysDescr fallback exists for. Still used as a last resort,
 # since "net-snmp" beats nothing at all.
 GENERIC_AGENT_VENDORS = frozenset({"netSnmp", "ucdavis"})
+
+
+# Proprietary scalars that PROVE a vendor when they answer, for gear whose
+# sysObjectID names only the SNMP agent it runs. (oid, needle, vendor): the
+# answer is matched case-insensitively against the needle, so an object that
+# exists but says something else proves nothing.
+#
+# Read in a SEPARATE best-effort GET, never merged into the identity request.
+# An SNMPv1 agent asked for an object it does not implement answers noSuchName
+# with the whole varbind list echoed back as nulls -- and nodepoll only raises
+# on authorizationError, so sysDescr, sysObjectID, sysName and sysLocation
+# would all come back blank with no exception to catch. One unanswerable OID
+# must not be able to blank a device's identity.
+VENDOR_PROBES: tuple[tuple[str, str, str], ...] = (
+    # Moxa's own switch tree. Moxa gear routinely answers 1.3.6.1.4.1.8072.x
+    # (net-snmp) for sysObjectID and says nothing useful in sysDescr, which is
+    # exactly the class this probe exists for.
+    ("1.3.6.1.4.1.8691.15.33.1.5.3.1.2.2", "moxa", "moxa"),
+)
+
+
+def probe_oids() -> tuple[str, ...]:
+    """Every OID in VENDOR_PROBES, in order, for one GET."""
+    return tuple(oid for oid, _needle, _vendor in VENDOR_PROBES)
+
+
+def vendor_from_probe(values: dict) -> str:
+    """Best-effort vendor from a vendor-probe GET's answers. Empty when
+    nothing answered or nothing matched -- same contract as
+    vendor_from_descr, and deliberately not a fuzzy guess."""
+    for oid, needle, vendor in VENDOR_PROBES:
+        value = (values or {}).get(oid)
+        if value is None:
+            continue
+        if needle in str(value).strip().lower():
+            return vendor
+    return ""
+
+
+# Display names for vendor keys whose token does not read as the vendor's own
+# name. The KEY is what everything that behaves per-vendor compares against --
+# ConfigRX's backup command, the Cisco per-VLAN MAC read, discovery's profile
+# suggestion -- so it stays a lowercase/camelCase token and is never rewritten
+# to a pretty string. This map is presentation only, and a key with no entry
+# falls through unchanged, so adding one moves nothing else.
+VENDOR_LABELS: dict[str, str] = {
+    "moxa": "Moxa",
+    "rockwellAutomation": "Rockwell Automation",
+}
+
+
+def vendor_label(vendor: str) -> str:
+    """The display form of a vendor key, or the key itself."""
+    key = (vendor or "").strip()
+    return VENDOR_LABELS.get(key, key)
 
 
 def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:

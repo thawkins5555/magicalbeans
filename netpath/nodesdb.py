@@ -1384,6 +1384,23 @@ class NodesDatabase:
                 f"SELECT * FROM device_events{where} ORDER BY ts DESC LIMIT ?",
                 (*params, limit)).fetchall()
 
+    def last_device_event_before(self, device_id: int, kind: str,
+                                 ts: float) -> sqlite3.Row | None:
+        """The newest event of this kind STRICTLY before `ts`, or None.
+
+        The bound is the point. "The most recent `down`" is not the same
+        question as "the `down` this `up` ended": a drain processes a batch of
+        events at once, and a device that flapped can already have recorded a
+        later outage by the time the earlier recovery is read — which would
+        pair a recovery with an outage that started after it and report a
+        negative duration.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_events WHERE device_id = ? AND kind = ?"
+                " AND ts < ? ORDER BY ts DESC LIMIT 1",
+                (device_id, kind, ts)).fetchone()
+
     # kind -> the small display-status vocabulary devices.status already
     # uses (up|down|unsupported|auth|unknown). rebooted/poll_overrun are
     # informational, not status transitions, so they don't start a new

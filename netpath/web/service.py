@@ -119,7 +119,7 @@ class Service:
         self.alert_engine = AlertEngine(
             self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
             syslog_db=self.syslog_db, ipam_db=self.ipam_db, app_db=self.app_db,
-            wireless_db=self.wireless_db, log=self.log)
+            wireless_db=self.wireless_db, netpath_db=self.db, log=self.log)
 
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),

@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
-    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'trap'|'syslog'|'ipam'
+    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'
     source_kind     TEXT,                   -- meaning depends on kind, see nodesdb/alertrules
     severity        INTEGER NOT NULL DEFAULT 4,   -- syslog 0-7 scale, shared across every module
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -203,8 +203,9 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "flap_window_s", "flap_min_transitions")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 26 built-in rules: 7 device_event + 3 interface_event + 10 threshold +
-# 3 trap + 1 syslog + 1 ipam + 1 wireless_event. Each `template` name is a
+# 32 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
+# 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
+# 3 netpath_threshold. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 5 ship; an admin can point any rule at any template.
@@ -252,10 +253,36 @@ _BUILTIN_RULES = [
     # 15 minutes by default), not engine ticks -- see
     # alertengine._evaluate_dhcp_thresholds.
     ("dhcp_scope_exhaustion", "DHCP scope running out of leases", "dhcp_threshold", "scope_utilization_pct", 3, "threshold_breach", 85.0, 75.0, 1),
+    # NetPath destinations. Their own kind for the same reason DHCP has one:
+    # the threshold evaluator reads Nodes' metrics table for a Nodes device,
+    # and a traceroute destination is neither. for_polls counts that
+    # destination's own traces (every 5 minutes by default), not engine ticks
+    # -- see alertengine._evaluate_netpath_thresholds.
+    #
+    # All three ship deliberately hard to trip, because a path monitor that
+    # cries wolf gets turned off:
+    #
+    # - Unreachable is 100% loss to the destination on three traces in a row,
+    #   which on the shipped interval is a quarter of an hour of a destination
+    #   answering nothing at all. Clearing at 50 means one answered probe out
+    #   of three ends it.
+    # - Unstable is a windowed rule, and the only one of the three that can
+    #   see a path that works intermittently -- consecutive-failure counting
+    #   by definition cannot. Half the traces in the window must have failed,
+    #   over at least five traces.
+    # - Latency is measured against the destination's OWN warn threshold
+    #   rather than a fixed millisecond figure, because "slow" means nothing
+    #   across a LAN hop and a satellite link at once: 300 is three times
+    #   whatever that destination is already configured to warn at, floored so
+    #   a destination warned at a handful of milliseconds does not alert on
+    #   ordinary jitter.
+    ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 50.0, 3),
+    ("netpath_path_unstable", "NetPath path repeatedly failing", "netpath_threshold", "trace_unreached_pct", 4, "threshold_breach", 50.0, 20.0, 1),
+    ("netpath_latency_high", "NetPath latency far above normal", "netpath_threshold", "trace_rtt_warn_pct", 4, "threshold_breach", 300.0, 150.0, 3),
 ]
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
-# all 28 rows with a column only one of them uses. Absent means NULL, which
+# all 32 rows with a column only one of them uses. Absent means NULL, which
 # evaluate_threshold reads as "count polls, don't measure time".
 #
 # Packet loss is the one threshold where a single bad sample is routine: a
@@ -267,6 +294,29 @@ _BUILTIN_FOR_SECONDS = {"packet_loss_high": 60}
 
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
                          "threshold_breach", "trap_forwarded")
+
+# Template text as shipped by the PREVIOUS release, verbatim, for every
+# built-in whose wording has since changed.
+#
+# _seed_templates inserts OR IGNORE, so an install that already has an
+# alerts.db keeps its templates forever — which is right for one an operator
+# edited and wrong for one nobody has touched, since that one is simply the
+# old shipped text sitting where the new shipped text belongs. _migrate uses
+# this to tell those two apart: a body that still matches exactly what the
+# last release shipped is one nobody has edited.
+#
+# 4.32.0: the recovery template said "is responding again as of {{last_time}}",
+# and last_time on a resolution notification is when the OUTAGE last recurred —
+# a moment before the recovery, not the recovery. It now names the recovery
+# time and how long the outage lasted.
+_PREVIOUS_BUILTIN_TEMPLATES = {
+    "device_up": {
+        "subject": "SappiWhere: {{device_name}} has recovered",
+        "body": ("{{device_name}} ({{device_ip}}) is responding again as of "
+                 "{{last_time}}.\n\n{{message}}\n\n"
+                 "-- SappiWhere, {{severity_name}}"),
+    },
+}
 
 
 class AlertsDatabase:
@@ -307,6 +357,7 @@ class AlertsDatabase:
             # one rule: every other threshold keeps counting polls.
             self._conn.execute(
                 "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
+        self._migrate_templates()
         alerts = {row["name"] for row in
                   self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
         if "rollup_note" not in alerts:
@@ -315,6 +366,37 @@ class AlertsDatabase:
             # overwrites every time the same alert recurs.
             self._conn.execute(
                 "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_templates(self) -> None:
+        """Bring a built-in template whose shipped wording changed up to date,
+        without ever overwriting an operator's own edit.
+
+        Two separate updates, and the distinction between them is the whole
+        point. `builtin_subject`/`builtin_body` are the shipped reference that
+        "Reset to built-in" restores, so they always become the new text — an
+        operator resetting a template must get this release's wording, not the
+        one they upgraded away from. The live `subject`/`body` are only
+        rewritten where they still match, character for character, what the
+        previous release shipped: anything else is an edit somebody made and
+        this migration has no business touching it.
+
+        Runs before _seed_templates, so on a fresh database there is nothing
+        to match and the new text is simply seeded.
+        """
+        from . import alertmail
+        now = time.time()
+        for key, previous in _PREVIOUS_BUILTIN_TEMPLATES.items():
+            current = alertmail.BUILTIN_TEMPLATES.get(key)
+            if not current:
+                continue
+            self._conn.execute(
+                "UPDATE templates SET builtin_subject = ?, builtin_body = ?"
+                " WHERE key = ?", (current["subject"], current["body"], key))
+            self._conn.execute(
+                "UPDATE templates SET subject = ?, body = ?, updated_ts = ?"
+                " WHERE key = ? AND subject = ? AND body = ?",
+                (current["subject"], current["body"], now, key,
+                 previous["subject"], previous["body"]))
 
     def close(self) -> None:
         with self._lock:

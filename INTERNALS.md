@@ -172,6 +172,41 @@ wrong, since an OID browser, a MIB and an agent disagree about which form you
 name. `normalize_oid()` rejects anything that is not dotted digits, so a typo
 reads as "not configured" rather than going on the wire.
 
+**Except on SNMPv1, where that merge is destructive.** By construction one of
+the two forms cannot answer. On v2c and v3 that costs nothing: the agent
+reports the missing object per-varbind as `noSuchObject` and every other answer
+in the response is intact. SNMPv1 has no per-varbind exception — it answers a
+request containing one unimplemented object with `noSuchName` and the request's
+own varbind list echoed back as nulls, and `_check_error_status` raises only on
+`authorizationError` — so the response parses cleanly and `identity` comes out
+with sysDescr, sysObjectID, sysName and sysLocation all blank. Silently. A
+device whose configured version is 0 therefore has its custom identity OIDs
+read by `_identity_extras()`, a best-effort GET of their own whose failure
+costs nothing but itself. Note that the version is read as
+`config.get("snmp_version")` directly rather than through the usual
+`int(config.get("snmp_version") or 1)`, which turns a configured 0 into 1.
+
+**Built-in vendor probes** (`nodeoids.VENDOR_PROBES`, `probe_oids()`,
+`vendor_from_probe()`) use the same separate-GET mechanism, and must: they are
+proprietary objects that by definition most devices do not implement, so
+merging one into the identity request would put the failure mode above in front
+of every device on the network. `(oid, needle, vendor)` triples, matched
+case-insensitively against the answer, currently one entry — Moxa's, under its
+own 8691 arc. The probe runs only when `identify_vendor()` returned nothing or
+returned a member of `GENERIC_AGENT_VENDORS`, which is exactly the population
+the sysDescr fallback was written for: a Moxa switch answering net-snmp's arc
+and describing itself as Linux. A device the standard sources named never pays
+the round trip. A hit sets `vendor`, `vendor_detected` and
+`vendor_source="probe"` — its own source value, because "(vendor OID)" and
+"(custom OID)" are different claims and the column exists to keep sources of
+different standing distinguishable.
+
+**Display names** (`nodeoids.VENDOR_LABELS`, `vendor_label()`) are presentation
+only, applied in `api._device_json` as a separate `vendor_label` field rather
+than by rewriting `vendor`. The key is what ConfigRX, the Cisco MAC-table gate
+and profile suggestion match on, so it stays a token; a key with no entry
+serves itself, so adding one moves nothing else.
+
 **The vendor split is the part to be careful with.** `identity["vendor"]` is
 the *displayed* name and a custom OID may supply it; `vendor_detected` is
 always what `identify_vendor()` worked out. Three readers behave differently
@@ -981,10 +1016,10 @@ group that is a name rather than a row id.
 
 ### Bundled default MIBs (`netpath/mibs/`, `Service._seed_default_mibs`)
 
-Twenty files ship under `netpath/mibs/`, about 900 KB in total. Two are
-hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
+Twenty-one files ship under `netpath/mibs/`, about 900 KB in total. Three
+are hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
 Number arcs for ~20 common vendors, matching `trapoids.WELL_KNOWN`'s own
-number-to-name table) and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
+number-to-name table), `enterprise-roots-2.mib` and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
 2863's IF-MIB covering exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE`
 already poll — kept although the full IF-MIB now ships too, because a
 device may be pinned to it by `mib_file_id`). The other eighteen are the
@@ -994,6 +1029,14 @@ UCD-SNMP-MIB, ENTITY-MIB, ENTITY-SENSOR-MIB, BRIDGE-MIB, P-BRIDGE-MIB,
 Q-BRIDGE-MIB, LLDP-MIB and POWER-ETHERNET-MIB. These are RFC text, freely
 redistributable, and no vendor-proprietary MIB is bundled — vendor MIBs
 are fetched on demand by the catalog above.
+
+An arc added after a release is a **new file**, not a new line in
+`enterprise-roots.mib`, which is why `enterprise-roots-2.mib` exists (Moxa's
+8691, added in 4.32.0). Seeding is tracked by filename, exactly so that a MIB
+an admin deleted is never resurrected — which also means an edit to an
+already-seeded file reaches no existing install. A new filename does. Vendor
+identification itself never depends on this: it reads `trapoids.WELL_KNOWN` in
+code, so only the MIB browser and upload resolution are affected.
 
 `Service._seed_default_mibs()` runs once from `start()`, before
 `_snmp_settings_with_mibs()`. It cannot use "does a `mib_files` row with
@@ -1014,6 +1057,40 @@ set is a dependency graph (Q-BRIDGE-MIB hangs off P-BRIDGE-MIB,
 ENTITY-SENSOR-MIB off ENTITY-MIB), and although one sweep in filename
 order happens to work today, a file added later would otherwise land
 half-resolved with nothing to say so.
+
+### Device packet-loss chart (`nodes.js`, `nodesdb.series`)
+
+Purely a front-end addition: `nodepoll` has recorded `ping_loss_pct` as a real
+metric since 4.25, and `/api/nodes/devices/{id}/metrics` plus
+`/api/nodes/devices/{id}/series` already serve it. `loadLossChart()` resolves
+the metric id out of `view.metrics` (loaded by `loadDetail` for the port
+dialog's benefit) and reuses `drawSeriesChart`.
+
+Three things are deliberate:
+
+- **Its own range dropdown and its own window state** (`view.lossRange`,
+  separate from `view.chartRange`). The status timeline's range is about how
+  long a device has been in a state; the loss chart's is about how a link has
+  been behaving. Sharing one made both worse.
+- **`opts.peak`**, a new option on `drawSeriesChart`, pins the Y axis to
+  0–100 %. Without it the auto-scale is `niceCeiling(max(values, 0.001))`, so a
+  device with no loss at all is drawn against a ceiling of 0.001 and its flat
+  zero reads as a full-height alarm.
+- **The range list stops at three days.** `nodesdb.series()` switches to the
+  `samples_hourly` rollup table beyond `86400 * 3`, and `compact_rollup()` —
+  the only thing that writes that table — is never called from anywhere in this
+  application. A 7- or 30-day option would therefore be permanently empty, for
+  every metric, not just this one. Wiring compaction into the maintenance loop
+  is **not** a safe drive-by fix: it deletes raw samples older than an hour, so
+  every window between one hour and three days, which reads raw samples today,
+  would empty out instead. `fillRanges()` grew an optional `maxSeconds` for
+  this; the status timeline keeps the full list because it reads
+  `device_status_segments`, not samples.
+
+The loader uses the same request-ticket discipline as the timeline, and for one
+extra reason: `loadDetail` replaces `view.metrics` wholesale, so a metric id
+read before the selection moved belongs to a device the pane is no longer
+showing. The ticket check is paired with a re-check of `view.selected`.
 
 ### Device status timeline (`nodesdb.device_status_segments`)
 
@@ -1203,6 +1280,83 @@ streak when the scope's `polled_ts` actually moves, so `for_polls` means
 DHCP polls rather than engine ticks — which matters because DHCP is polled
 every 15 minutes while the engine ticks every `TICK_S` (5 s). As of 4.31.0
 `_evaluate_thresholds` does the same thing; see below for why it had to.
+
+### NetPath destination thresholds (`alertengine._evaluate_netpath_thresholds`)
+
+A third threshold evaluator, for the same reason there is a second one: a
+traceroute destination is not a Nodes device, has no row in the Nodes `metrics`
+table, and its "poll" is its own `targets.interval_s`. Kind
+`netpath_threshold`, `entity_kind="netpath_target"`, `entity_id` the target's
+row id, and `_device_ip_for` resolves that through `db.destination_ip()` with
+the configured host as the fallback — a destination entered as a hostname has
+no address until a trace gets through.
+
+The engine reaches NetPath the way it reaches Wireless: an optional
+`netpath_db=` constructor argument (`Service` passes its own `Database`), so an
+engine built without one raises none of these rules rather than failing.
+
+`_netpath_metrics()` is the single place the three metrics are computed, and
+the single place the skip conditions live. A metric it cannot compute honestly
+is **absent** from the dict it returns, and an absent metric is skipped
+entirely — it neither fires nor clears, and does not touch that rule's streak:
+
+| `source_kind` | Value | Skipped when |
+| --- | --- | --- |
+| `trace_loss_pct` | `traces.loss_pct` — destination-hop loss on the newest trace | it is NULL |
+| `trace_unreached_pct` | share of the window's traces with `reached = 0` | fewer than `NETPATH_MIN_WINDOW_TRACES` (5) measured traces in the window |
+| `trace_rtt_warn_pct` | `100 * rtt_ms / max(warn_rtt_ms, 20)` | the trace did not reach the destination, or `warn_rtt_ms <= 0` |
+
+Three details are load-bearing:
+
+- **`status IN ('error', 'overrun')` produces no sample at all** — the whole
+  target is skipped before any metric is computed. `record_trace` stores
+  `loss_pct = 100` for a trace with no hops, so a `traceroute` binary that is
+  missing on *this* machine, or a slot skipped because the previous run was
+  still going, would otherwise be indistinguishable from a destination that
+  went silent. `monitor.classify` keeps those statuses apart from `fail` for
+  the same reason.
+- **`reached` stands in for `TraceResult.rtt_is_to_refuser`.** That flag says
+  the stored RTT is the time to a router that refused, not to the destination —
+  and it is a property of the in-memory result that is never persisted. It can
+  only be true when the destination was not reached, so `reached = 1` is a
+  strictly stronger guard and needs no schema column.
+- **Latency is relative to the destination's own `warn_rtt_ms`**, floored at
+  `NETPATH_MIN_WARN_RTT_MS`. A single millisecond figure cannot serve a LAN hop
+  and a satellite link, and three times a 5 ms warn threshold is 15 ms, which a
+  three-probe mean crosses on a busy switch for no reason at all.
+
+`_netpath_streaks` holds `(last started_ts, streak)` and advances only when the
+trace's own `started_ts` moves — the same discipline as `_dhcp_streaks`, and
+for a starker reason: the engine ticks every 5 s while a destination is traced
+every 300 s by default, so a tick-counted streak would turn "three consecutive
+traces" into fifteen seconds.
+
+Rollup needed one generalisation. `_rollup_parent` hard-required
+`entity_kind == "device"`; it now tests `alertrules.ROLLUP_ENTITY_KINDS`, which
+lists the kinds that take part rather than dropping the guard, so a future
+entity kind cannot inherit the device pairings by accident.
+`netpath_path_unstable` and `netpath_latency_high` are `ROLLED_UP_BY`
+`netpath_unreachable`, because a destination nothing comes back from is by
+construction also one whose traces are failing and whose latency is
+unmeasurable.
+
+`_sweep_netpath_alerts()` closes a hole that only threshold kinds have: a
+threshold alert clears by being re-evaluated and found to have recovered, which
+never happens for a destination that was disabled or deleted. The sweep
+resolves open netpath alerts whose entity is not in the current enabled-target
+set, with `resolved_by = "destination no longer traced"`, and sends no clear
+email — nobody needs telling that a destination they just turned off stopped
+being measured.
+
+**There is deliberately no per-hop rule.** Intermediate routers rate-limit ICMP
+as policy (`monitor.classify`'s docstring is explicit that only the destination
+hop decides a verdict), and `hop_stats` are cumulative counters reset only by a
+path change, so any average over them stays high indefinitely after one bad
+week. Per-hop MTR figures remain a route-graph diagnostic.
+
+Mutes and the newly-added-device hold do not apply: `_occurrence_device`
+returns `None` for anything that is not a Nodes device, so netpath occurrences
+are structurally outside both — the same as syslog, IPAM, DHCP and APs.
 
 ### Threshold streaks and durations (`alertengine._evaluate_thresholds`)
 
@@ -1489,6 +1643,30 @@ means it is never the address itself; an early version passed
 for a live device-down/up occurrence but produced `{{device_ip}}` →
 the device's numeric id for the synthesized "clear" notification below,
 since that occurrence has no live poll behind it to carry a real address.
+
+`down_since`, `recovered_time` and `downtime` are derived inside
+`build_context()` from the alert row itself whenever `resolved_ts` is set,
+rather than only where the engine happens to know them. A recovery sends **two**
+notifications — the "Device recovered" alert in its own right, and the
+resolution of the outage it cleared — and both render the same `device_up`
+template; the resolution one is built from a synthesized occurrence with no
+extras, so tokens threaded through the occurrence alone would render empty on
+exactly the email that is about the outage. `extra` still updates the context
+last, so the drain's own values win where it has better ones: the `up` event's
+timestamp is the moment the device answered, while `resolved_ts` is whenever
+the next tick got round to noticing. The same derivation gives interface,
+wireless and threshold clears a real duration, which none of them had.
+
+Until 4.32.0 the shipped `device_up` body said "as of `{{last_time}}`", which
+on a resolution is `alerts.last_ts` — when the *outage* last recurred, a moment
+before it cleared. Correcting a shipped template needs a migration, since
+`_seed_templates` inserts `OR IGNORE` and would leave every existing install on
+the old text forever: `_migrate_templates()` always refreshes
+`builtin_subject`/`builtin_body` (so "Reset to built-in" offers this release's
+wording) and rewrites the live `subject`/`body` only where they still match,
+character for character, `_PREVIOUS_BUILTIN_TEMPLATES` — anything else is an
+operator's edit and is left alone. It runs before `_seed_templates`, so a fresh
+database matches nothing and is simply seeded.
 
 A resolution email (`_notify_clear()`, kind `"clear"` — the
 `notifications.kind` enum value the schema already reserved for this)

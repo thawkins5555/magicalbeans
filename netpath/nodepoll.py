@@ -1022,19 +1022,57 @@ class NodePoller:
             return trial_config, identity, uptime_ticks, metrics
         raise last_error or SnmpTimeout(f"no reply from {device['ip']}")
 
+    def _identity_extras(self, device, config: dict, oids: list[str]) -> dict:
+        """Answers to identity OIDs read in a GET of their own, best-effort.
+
+        Separate from the scalar GET so that an object the device does not
+        implement can cost nothing but this request — on SNMPv1 an
+        unimplemented object in a request spoils every answer in it, and
+        identity is the one thing that must not be lost that way. Failure is
+        silent for the same reason the UCD-SNMP read below is: not answering
+        is the normal case, not an error.
+        """
+        if not oids:
+            return {}
+        try:
+            response = self._snmp_get(device, config, oids)
+        except SnmpError:
+            return {}
+        return {vb["oid"]: vb["value"] for vb in response.varbinds
+                if vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                      "endOfMibView")}
+
     def _poll_snmp_scalars(self, device, config: dict):
         oids = list(nodeoids.SYSTEM_SCALARS.values())
-        # An operator-chosen OID for vendor and/or location, read in the SAME
-        # GET as the standard scalars — no extra round trip. Both the bare and
+        # An operator-chosen OID for vendor and/or location. Both the bare and
         # the .0 instance form are asked for, because "1.3.6.1.4.1.x.y" and
         # "…y.0" are both reasonable things to type and only one of them
         # answers; whichever does is used. See nodeoids.identity_oid_variants.
+        #
+        # On v2c and v3 they ride in the SAME GET as the standard scalars, for
+        # no extra round trip: an object the agent does not implement comes
+        # back as a per-varbind noSuchObject and the rest of the response is
+        # unharmed. SNMPv1 has no such thing — it answers a request containing
+        # one unimplemented object with noSuchName and the whole varbind list
+        # echoed back as nulls, and _check_error_status raises only on
+        # authorizationError, so merging them there silently blanked sysDescr,
+        # sysObjectID, sysName and sysLocation on every v1 device with a custom
+        # identity OID set. By construction at least one of the two forms
+        # cannot answer, so on v1 they are read separately and best-effort.
+        # Read without the usual `or 1` fallback, which turns a configured 0
+        # (v1) into 1 (v2c) and would make the branch below unreachable for
+        # exactly the devices it protects.
+        configured_version = config.get("snmp_version")
+        is_v1 = configured_version is not None and int(configured_version) == 0
         custom = nodeoids.identity_oid_variants(config)
-        oids += [oid for oid in custom["all"] if oid not in oids]
+        if custom["all"] and not is_v1:
+            oids += [oid for oid in custom["all"] if oid not in oids]
         response = self._snmp_get(device, config, oids)
         values = {vb["oid"]: vb["value"] for vb in response.varbinds
                   if vb["type"] not in ("noSuchObject", "noSuchInstance",
                                         "endOfMibView")}
+        if custom["all"] and is_v1:
+            values.update(self._identity_extras(device, config, custom["all"]))
         identity = {
             "sys_descr": values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or "",
             "sys_object_id": values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or "",
@@ -1053,6 +1091,19 @@ class NodePoller:
         # nodesdb.detected_vendor).
         identity["vendor_detected"] = detected
         identity["vendor"], identity["vendor_source"] = detected, source
+
+        # A proprietary scalar that names its own maker, for gear the two
+        # standard sources cannot name. Only asked when they failed — nothing
+        # at all, or an arc that names the SNMP agent rather than the device
+        # (a Moxa switch running net-snmp is exactly this case) — so a device
+        # already identified costs no extra request, ever. Its own GET, never
+        # merged into the one above: see the note there about SNMPv1.
+        if not detected or detected in nodeoids.GENERIC_AGENT_VENDORS:
+            probed = nodeoids.vendor_from_probe(
+                self._identity_extras(device, config, list(nodeoids.probe_oids())))
+            if probed:
+                identity["vendor_detected"] = probed
+                identity["vendor"], identity["vendor_source"] = probed, "probe"
 
         custom_vendor = nodeoids.first_text(values, custom["vendor"])
         if custom_vendor:

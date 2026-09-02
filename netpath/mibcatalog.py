@@ -485,6 +485,32 @@ CATALOG: list[Bundle] = [
             "RITTAL-CMC-III-PRODUCTS-MIB", "RITTAL-CMC-TC-MIB",
         ),
     ),
+    Bundle(
+        key="moxa",
+        vendor="Moxa",
+        name="Moxa industrial Ethernet",
+        description="EDS, IKS and PT managed switches plus AWK wireless: "
+                    "system info and utilization, port status, PoE, Turbo "
+                    "Ring and Turbo Chain redundancy, dual homing, fiber "
+                    "check and digital I/O.",
+        source="librenms/librenms (mibs/moxa)",
+        # MOXA-GENERAL-MIB first: it defines the `moxa` root every other file
+        # here imports, and a dependency loaded after its dependants resolves
+        # in a later pass rather than on the first one.
+        files=_libre(
+            "moxa", "MOXA-GENERAL-MIB", "MOXA-SYSTEM-INFO-MIB",
+            "MOXA-SYSTEM-UTILIZATION-MIB", "MOXA-SWITCHING-MIB",
+            "MOXA-PORT-MIB", "MOXA-DEVICE-IO-MIB", "MOXA-FIBER-CHECK-MIB",
+            "MOXA-POE-BT-MIB", "MOXA-TCST-MIB", "MOXA-TURBORINGV2-MIB",
+            "MOXA-TURBOCHAIN-MIB", "MOXA-DUALHOMING-MIB",
+            "MOXA-EDS510E-MIB", "MOXA-EDS528E-MIB", "MOXA-EDSG508E-MIB",
+            "MOXA-EDSG512E-MIB", "MOXA-EDSG512EPoE-MIB", "MOXA-EDSG516E-MIB",
+            "MOXA-EDSP506E-MIB", "MOXA-EDSP510A8POE-MIB",
+            "MOXA-IKS6726A-MIB", "MOXA-IKS6728A-MIB",
+            "MOXA-IKS6728A-8POE-MIB", "MOXA-PT7528V2-MIB",
+            "MOXA-AWK4131A-MIB",
+        ),
+    ),
 ]
 
 BUNDLES = {bundle.key: bundle for bundle in CATALOG}

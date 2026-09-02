@@ -242,6 +242,22 @@ const App = (() => {
     return `${(seconds / 86400).toFixed(1)}d`;
   }
 
+  // Two units, for a length somebody is going to write down. span() answers
+  // "how long ago, roughly" in one unit and is what every relative timestamp
+  // in the app uses; "3.5h" is a fine answer to that and a poor answer to
+  // "how long was the outage". Kept separate rather than changing span(),
+  // which six modules render with.
+  function duration(seconds) {
+    const total = Math.round(Number(seconds) || 0);
+    if (total <= 0) return '';
+    if (total < 60) return `${total} s`;
+    const m = Math.floor(total / 60), s = total % 60;
+    if (m < 60) return `${m} m ${String(s).padStart(2, '0')} s`;
+    const h = Math.floor(m / 60), rm = m % 60;
+    if (h < 48) return `${h} h ${String(rm).padStart(2, '0')} m`;
+    return `${Math.floor(h / 24)} d ${String(h % 24).padStart(2, '0')} h`;
+  }
+
   function bytes(value) {
     let n = Number(value) || 0;
     for (const unit of ['B', 'KB', 'MB', 'GB', 'TB']) {
@@ -287,9 +303,13 @@ const App = (() => {
     ['Last 30 days', 2592000],
   ];
 
-  function fillRanges(select, defaultLabel) {
+  /* maxSeconds trims the list for a chart whose data source cannot answer
+     the wider ones — an option that is always empty is worse than an option
+     that is not offered. */
+  function fillRanges(select, defaultLabel, maxSeconds) {
     select.innerHTML = '';
     for (const [label, seconds] of RANGES) {
+      if (maxSeconds && seconds > maxSeconds) continue;
       const option = document.createElement('option');
       option.value = String(seconds);
       option.textContent = label;
@@ -1067,7 +1087,7 @@ const App = (() => {
   return {
     state, pages, start, selectTab, loadState, refreshNow, rateFor,
     get, post, put, del,
-    clock, stamp, span, bytes, rate, fillRanges, RANGES, wheelWindow,
+    clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     resetLayout,
     grid, sortRows, canRead, canWrite, accountModal,

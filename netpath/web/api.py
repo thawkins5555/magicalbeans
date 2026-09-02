@@ -27,6 +27,7 @@ from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
+from .. import nodeoids
 from .. import configrx
 from .. import nodesdb
 from .. import permissions as _permissions
@@ -1544,6 +1545,11 @@ def _device_json(row) -> dict:
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
+        # The vendor's own name for itself, where its key does not read as
+        # one ("rockwellAutomation" -> "Rockwell Automation"). Presentation
+        # only: `vendor` stays the token everything that behaves per-vendor
+        # compares against, and a key with no display name serves itself.
+        "vendor_label": nodeoids.vendor_label(row["vendor"] or ""),
         # What SNMP identification worked out, and which source spoke. Shown
         # beside the displayed vendor so an operator who has pointed vendor at
         # a custom OID can still see what the app itself detected — and can
@@ -1614,7 +1620,9 @@ def _discovery_result_json(row) -> dict:
             "community_or_user": row["community_or_user"],
             "snmp_version": row["snmp_version"], "sys_descr": row["sys_descr"],
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
-            "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
+            "vendor": row["vendor"],
+            "vendor_label": nodeoids.vendor_label(row["vendor"] or ""),
+            "suggested_group_id": row["suggested_group_id"],
             "promoted_device_id": row["promoted_device_id"]}
 
 
@@ -2958,8 +2966,8 @@ def post_alerts_rule(service, params, body) -> dict:
     if not key or not name or not kind:
         raise ValueError("key, name and kind are all required")
     if kind not in ("device_event", "interface_event", "threshold",
-                    "dhcp_threshold", "trap", "syslog", "ipam",
-                    "wireless_event"):
+                    "dhcp_threshold", "netpath_threshold", "trap", "syslog",
+                    "ipam", "wireless_event"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
@@ -3066,10 +3074,15 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
         context = alertmail.build_context(alert_row, rule_row)
     else:
         now = time.time()
+        # The sample is a RESOLVED alert, opened a couple of hours ago: the
+        # recovery template's whole subject is how long something was down,
+        # and a sample with no resolution renders that sentence as blanks and
+        # makes a correct template look broken.
         fake_alert = {"entity_label": "sample-device (10.20.3.5)",
                      "entity_id": "10.20.3.5", "message": "This is a sample alert.",
                      "detail": "", "severity": 4, "count": 1,
-                     "opened_ts": now, "last_ts": now}
+                     "opened_ts": now - 8040, "last_ts": now - 300,
+                     "resolved_ts": now}
         context = alertmail.build_context(
             fake_alert, {"name": "Sample rule"},
             extra={"metric_label": "CPU", "value": "95%", "threshold": "90%",

@@ -1,0 +1,19 @@
+SAPPIWHERE-ENTERPRISE-ROOTS-2 DEFINITIONS ::= BEGIN
+
+-- A continuation of enterprise-roots.mib, and a second file rather than more
+-- lines in the first one for a mechanical reason: bundled MIBs are seeded by
+-- FILENAME (service._seed_default_mibs records each name in `seeded_mib_files`
+-- and never re-reads a name it has already seen, so that a MIB an admin
+-- deliberately deleted is never resurrected). Editing an already-seeded file
+-- therefore reaches no existing install; a new filename does.
+--
+-- Same rules as the first file: every arc below is a public IANA-assigned
+-- Private Enterprise Number under 1.3.6.1.4.1, named here only as "this
+-- number belongs to this vendor", and each one is also in trapoids.WELL_KNOWN
+-- -- the two must be kept in step, since vendor identification reads the code
+-- table and MIB resolution reads this one.
+
+-- Read from MOXA-GENERAL-MIB's own text: moxa ::= { enterprises 8691 }.
+moxa           OBJECT IDENTIFIER ::= { enterprises 8691 }
+
+END

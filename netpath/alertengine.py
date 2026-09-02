@@ -21,8 +21,8 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import hostresolve
-from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, Occurrence, dedup_key, \
-    evaluate_flapping, evaluate_threshold, match_device
+from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
+    Occurrence, dedup_key, evaluate_flapping, evaluate_threshold, match_device
 from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
@@ -43,7 +43,7 @@ def _ago(ts: float) -> str:
 
 class AlertEngine:
     def __init__(self, db, *, nodes_db, snmp_db, syslog_db, ipam_db, app_db=None,
-                 wireless_db=None, log=None):
+                 wireless_db=None, netpath_db=None, log=None):
         self.db = db
         self.nodes_db = nodes_db
         self.snmp_db = snmp_db
@@ -53,6 +53,8 @@ class AlertEngine:
         # Optional: an engine constructed without it simply never raises
         # wireless occurrences, so existing callers keep working unchanged.
         self.wireless_db = wireless_db
+        # Same contract for NetPath's traceroute store.
+        self.netpath_db = netpath_db
         self.log = log or NullLog()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -65,6 +67,11 @@ class AlertEngine:
         # count: the engine ticks every few seconds but DHCP is polled
         # every few minutes, so for_polls must count polls, not ticks.
         self._dhcp_streaks: dict[tuple, tuple[float | None, int]] = {}
+        # And again for NetPath destinations, keyed on the trace's own
+        # started_ts: a destination is traced every five minutes by default
+        # while this engine ticks every five seconds, so a streak that
+        # advanced per tick would satisfy "three traces" in fifteen seconds.
+        self._netpath_streaks: dict[tuple, tuple[float | None, int]] = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
@@ -134,6 +141,7 @@ class AlertEngine:
         occurrences += self._drain_ap_events(settings)
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
+        occurrences += self._evaluate_netpath_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         occurrences += self._drain_pending()
         # Read once per tick rather than per occurrence, and usually empty —
@@ -292,6 +300,45 @@ class AlertEngine:
 
     # --------------------------------------------------------------- drains
 
+    def _recovery_text(self, device, row, resolved) -> tuple[str, str, dict]:
+        """(message, detail, template extras) for a device that answered again.
+
+        Says when it came back and how long it was gone, because "responding
+        again" on its own leaves both questions to be reconstructed from two
+        other timestamps in two other places.
+
+        When the device went down is taken from the outage alert this recovery
+        just resolved — its opened_ts IS the down transition — and, when there
+        is no such alert (the rule disabled, the device muted, the alert held
+        for a newly added device or resolved by hand), from the device's own
+        event log instead. When neither knows, the downtime clause is left out
+        rather than guessed at: an outage of unknown length is not a
+        zero-length one.
+
+        Recovery time is the event's own timestamp, which is the poll that saw
+        the device answer — not the moment this tick got round to it, which is
+        up to one tick later and unboundedly later after a restart.
+        """
+        recovered_ts = row["ts"]
+        down_since = resolved["opened_ts"] if resolved else None
+        if down_since is None:
+            previous = self.nodes_db.last_device_event_before(
+                device["id"], "down", recovered_ts)
+            down_since = previous["ts"] if previous else None
+        downtime = alertmail.duration_text(
+            recovered_ts - down_since) if down_since else ""
+        lead = row["detail"] or "responding again"
+        clock = alertmail.clock_text(recovered_ts)
+        message = f"{lead} at {clock}"
+        if downtime:
+            message = f"{message} after {downtime} down"
+        detail = (f"Down since {alertmail.clock_text(down_since)}."
+                  if down_since else "")
+        extra = {"recovered_time": clock,
+                 "down_since": alertmail.clock_text(down_since) if down_since else "",
+                 "downtime": downtime}
+        return message, detail, extra
+
     def _drain_device_events(self, settings) -> list[Occurrence]:
         if not self.db.has_cursor("device_events"):
             self.db.set_cursor("device_events", self.nodes_db.max_device_event_id())
@@ -307,21 +354,31 @@ class AlertEngine:
                 continue
             label = hostresolve.resolve_name(
                 self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
-            occurrence = Occurrence(
-                kind="device_event", source_kind=row["kind"], entity_kind="device",
-                entity_id=str(device["id"]), entity_label=label, ts=row["ts"],
-                message=row["detail"] or f"{label}: {row['kind']}",
-                device_name=device["name"] or "", device_ip=device["ip"])
-            occurrences.append(occurrence)
+            # The paired alert is resolved BEFORE the occurrence is built, not
+            # after: resolving is what hands back the outage's own opened_ts,
+            # and a recovery notice that cannot say how long the outage lasted
+            # is missing the one fact somebody reads it for.
+            resolved, cleared_rule = None, None
             clears_key = ("device_event", row["kind"])
             if clears_key in CLEARS:
                 cleared_rule = self.db.rule_by_key(CLEARS[clears_key])
                 if cleared_rule:
                     paired_dedup = f"{cleared_rule['key']}:device:{device['id']}"
                     resolved = self.db.resolve_by_dedup(paired_dedup, by="")
-                    if resolved:
-                        self.counters["resolved"] += 1
-                        self._notify_clear(resolved, cleared_rule, settings)
+            message = row["detail"] or f"{label}: {row['kind']}"
+            detail, extra = "", {}
+            if row["kind"] == "up":
+                message, detail, extra = self._recovery_text(device, row, resolved)
+            occurrence = Occurrence(
+                kind="device_event", source_kind=row["kind"], entity_kind="device",
+                entity_id=str(device["id"]), entity_label=label, ts=row["ts"],
+                message=message, detail=detail,
+                device_name=device["name"] or "", device_ip=device["ip"],
+                extra=extra)
+            occurrences.append(occurrence)
+            if resolved:
+                self.counters["resolved"] += 1
+                self._notify_clear(resolved, cleared_rule, settings, extra=extra)
         if max_id > cursor:
             self.db.set_cursor("device_events", max_id)
         return occurrences
@@ -676,6 +733,199 @@ class AlertEngine:
                         self._notify_clear(resolved, rule, settings)
         return occurrences
 
+    # The metrics a NetPath rule can be about, and what each one is called
+    # in the rule editor. Keyed by rules.source_kind, the same way every
+    # other threshold kind names its metric.
+    NETPATH_METRIC_LABELS = {
+        "trace_loss_pct": "packet loss to the destination",
+        "trace_unreached_pct": "traces that did not reach the destination",
+        "trace_rtt_warn_pct": "round-trip time against this destination's warn threshold",
+    }
+
+    # Below this, a "three times the warn threshold" rule is measuring
+    # ordinary jitter rather than a degradation: a destination warned at 5 ms
+    # would alert at 15 ms, which a three-probe mean crosses on a busy switch
+    # for no reason at all.
+    NETPATH_MIN_WARN_RTT_MS = 20.0
+
+    # How many traces a windowed metric needs before it means anything. A
+    # window holding two traces makes one bad trace 50%, which would fire a
+    # "half the traces failed" rule on a single event — the opposite of what
+    # a windowed rule is for.
+    NETPATH_MIN_WINDOW_TRACES = 5
+
+    def _netpath_metrics(self, target, trace) -> dict:
+        """{source_kind: (value, message, extra)} for one destination's newest
+        trace. A metric that cannot honestly be computed is absent, and an
+        absent metric neither fires nor clears its rule.
+
+        Only the destination hop is ever measured, which is the same rule the
+        route graph and the timeline follow (monitor.classify): intermediate
+        routers rate-limit ICMP as a matter of policy, so their loss says
+        nothing about the path. For the same reason there is no per-hop rule
+        here at all — and the live per-hop probe counters are cumulative since
+        the last path change, so a hop that was lossy last week would keep any
+        average over them high indefinitely.
+        """
+        host = target["host"]
+        label = target["label"] or host
+        metrics: dict = {}
+
+        loss = trace["loss_pct"]
+        if loss is not None:
+            if trace["reached"]:
+                message = f"{label}: {loss:.0f}% packet loss to {host}"
+            elif trace["icmp_code"]:
+                # A refusal names the router and the reason, which is a
+                # different conversation from silence and usually points at an
+                # ACL or a routing change.
+                message = (f"{label}: {host} unreachable — "
+                           f"{trace['icmp_code']} from {trace['icmp_from']}")
+            else:
+                message = f"{label}: no reply from {host}"
+            metrics["trace_loss_pct"] = (
+                float(loss), message,
+                {"metric_label": self.NETPATH_METRIC_LABELS["trace_loss_pct"],
+                 "value": f"{loss:.0f}", "trace_status": trace["status"],
+                 "icmp_code": trace["icmp_code"] or "",
+                 "icmp_from": trace["icmp_from"] or ""})
+
+        # A window rather than the newest trace: this is the rule that catches
+        # a path that works intermittently, which consecutive-failure counting
+        # by definition cannot see. Six intervals, or an hour, whichever is
+        # longer, so a destination traced twice an hour is judged over enough
+        # of them to mean something.
+        interval = float(target["interval_s"] or 300)
+        t1 = trace["started_ts"]
+        window = max(3600.0, 6 * interval)
+        summary = self.netpath_db.reach_summary(target["id"], t1 - window, t1)
+        if summary["measured"] >= self.NETPATH_MIN_WINDOW_TRACES:
+            share = 100.0 * summary["unreached"] / summary["measured"]
+            metrics["trace_unreached_pct"] = (
+                share,
+                f"{label}: {summary['unreached']} of the last "
+                f"{summary['measured']} traces did not reach {host} "
+                f"({share:.0f}%)",
+                {"metric_label": self.NETPATH_METRIC_LABELS["trace_unreached_pct"],
+                 "value": f"{share:.0f}",
+                 "window_traces": str(summary["measured"]),
+                 "window_minutes": f"{window / 60:.0f}"})
+
+        # Latency only on a trace that got through. rtt_ms is the destination
+        # hop's mean where there is one, but on a refusal it is the time to
+        # the router that refused — a real measurement of the wrong thing, and
+        # reached=0 is the stored fact that rules it out.
+        warn = float(target["warn_rtt_ms"] or 0)
+        rtt = trace["rtt_ms"]
+        if trace["reached"] and rtt is not None and warn > 0:
+            scale = max(warn, self.NETPATH_MIN_WARN_RTT_MS)
+            share = 100.0 * float(rtt) / scale
+            metrics["trace_rtt_warn_pct"] = (
+                share,
+                f"{label}: {float(rtt):.0f} ms to {host}, {share / 100:.1f}x "
+                f"its {warn:.0f} ms warn threshold",
+                {"metric_label": self.NETPATH_METRIC_LABELS["trace_rtt_warn_pct"],
+                 "value": f"{share:.0f}", "rtt_ms": f"{float(rtt):.0f}",
+                 "warn_rtt_ms": f"{warn:.0f}"})
+        return metrics
+
+    def _evaluate_netpath_thresholds(self, settings) -> list[Occurrence]:
+        """NetPath destinations against their threshold rules.
+
+        A third threshold evaluator for the same reason there is a second one:
+        _evaluate_thresholds iterates Nodes devices and reads the Nodes
+        metrics table, and a traceroute destination is neither. Its entity is
+        a NetPath target, its sample is a completed trace, and its "poll" is
+        that destination's own trace interval.
+
+        Which is the part that matters for noise. The engine ticks every five
+        seconds; a destination is traced every five minutes by default. A
+        streak counted in ticks would turn "three consecutive traces" into
+        fifteen seconds, so it is counted against the trace's own started_ts —
+        the same discipline the device and DHCP evaluators use, for the same
+        reason.
+
+        Statuses that record a fault in the measurement rather than in the
+        path — a traceroute that could not run, a slot skipped because the
+        previous run was still going — produce no sample at all: they leave
+        every streak exactly as it was rather than counting as a failure.
+        """
+        if self.netpath_db is None:
+            return []
+        rules = [r for r in self.db.rules()
+                 if r["enabled"] and r["kind"] == "netpath_threshold"]
+        if not rules:
+            return []
+        targets = [t for t in self.netpath_db.targets() if t["enabled"]]
+        latest = self.netpath_db.last_traces([t["id"] for t in targets])
+
+        occurrences = []
+        live = set()
+        for target in targets:
+            trace = latest.get(target["id"])
+            if trace is None:
+                continue
+            live.add(str(target["id"]))
+            if trace["status"] in ("error", "overrun"):
+                continue
+            label = target["label"] or target["host"]
+            entity_id = str(target["id"])
+            metrics = self._netpath_metrics(target, trace)
+            for rule in rules:
+                source = rule["source_kind"] or ""
+                if source not in metrics:
+                    continue
+                value, message, extra = metrics[source]
+                streak_key = (rule["id"], entity_id)
+                previous_ts, streak = self._netpath_streaks.get(streak_key, (None, 0))
+                sample_ts = trace["started_ts"]
+                threshold = rule["threshold"]
+                over = threshold is not None and value >= threshold
+                if not over:
+                    streak = 0
+                elif sample_ts != previous_ts:
+                    streak += 1
+                self._netpath_streaks[streak_key] = (sample_ts, streak)
+
+                result = evaluate_threshold(rule, value, streak)
+                occurrence = Occurrence(
+                    kind="netpath_threshold", source_kind=source,
+                    entity_kind="netpath_target", entity_id=entity_id,
+                    entity_label=label, ts=time.time(), message=message,
+                    device_name=label, device_ip=target["host"],
+                    extra={**extra, "threshold": str(threshold)})
+                if result == "breach":
+                    occurrences.append(occurrence)
+                elif result == "clear":
+                    resolved = self.db.resolve_by_dedup(
+                        dedup_key(rule, occurrence), by="")
+                    if resolved:
+                        self.counters["resolved"] += 1
+                        self._notify_clear(resolved, rule, settings)
+        self._sweep_netpath_alerts(rules, live)
+        return occurrences
+
+    def _sweep_netpath_alerts(self, rules, live: set) -> None:
+        """Resolve open NetPath alerts whose destination is no longer being
+        traced.
+
+        A threshold alert clears by being re-evaluated and found to have
+        dropped below its clear value — which cannot happen for a destination
+        that was disabled or deleted, because there is nothing left to
+        evaluate. Without this the alert would sit open forever, and disabling
+        a destination is a normal thing to do while working on a link.
+        """
+        for rule in rules:
+            for row in self.db.alerts(state="unresolved", rule_id=rule["id"]):
+                if row["entity_kind"] != "netpath_target":
+                    continue
+                if row["entity_id"] in live:
+                    continue
+                self.db.resolve(row["id"], by="destination no longer traced")
+                self.counters["resolved"] += 1
+                # No clear email: nobody needs telling that a destination they
+                # just turned off has stopped being measured.
+
     # ---------------------------------------------------------------- apply
 
     # ------------------------------------------------------------- rollup
@@ -684,7 +934,7 @@ class AlertEngine:
         """The open alert that already says what `rule` is about to say, or
         None. See alertrules.ROLLED_UP_BY for which rules have a parent."""
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
-        if not parent_key or occurrence.entity_kind != "device":
+        if not parent_key or occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
             return None
         parent_rule = self.db.rule_by_key(parent_key)
         if parent_rule is None or not parent_rule["enabled"]:
@@ -742,7 +992,8 @@ class AlertEngine:
             # always carry source_kind "", so filtering on it would silently
             # stop matching any custom rule that has one set.
             if rule["kind"] in ("device_event", "interface_event", "trap",
-                                "wireless_event", "threshold", "dhcp_threshold"):
+                                "wireless_event", "threshold", "dhcp_threshold",
+                                "netpath_threshold"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "syslog" and occurrence.severity is not None:
@@ -883,6 +1134,17 @@ class AlertEngine:
                 server = self.ipam_db.dhcp_server(
                     int(str(alert_row["entity_id"]).split(":")[0]))
                 return server["address"] if server else ""
+            elif alert_row["entity_kind"] == "netpath_target":
+                # A NetPath alert's entity_id is the destination's row id.
+                # The address actually traced to is the useful one, since the
+                # destination may have been entered as a hostname; the typed
+                # host is the fallback when nothing has got through yet.
+                if self.netpath_db is None:
+                    return ""
+                target_id = int(alert_row["entity_id"])
+                target = self.netpath_db.target(target_id)
+                return (self.netpath_db.destination_ip(target_id)
+                        or (target["host"] if target else ""))
             elif alert_row["entity_kind"] == "ap":
                 # An AP alert's entity_id is "controller_id:vdom:wtp_id";
                 # the nearest meaningful address is the controller's own.
@@ -900,7 +1162,7 @@ class AlertEngine:
         device = self.nodes_db.device(device_id)
         return device["ip"] if device else ""
 
-    def _notify_clear(self, alert_row, rule_row, settings) -> None:
+    def _notify_clear(self, alert_row, rule_row, settings, extra=None) -> None:
         """Sends a resolution notification for an alert that the CLEARS
         map (or a threshold dropping back below clear_threshold) just
         auto-resolved. Gated by notify_on_clear so an admin who only
@@ -932,6 +1194,12 @@ class AlertEngine:
             kind=rule_row["kind"], source_kind=rule_row["source_kind"] or "",
             entity_kind=alert_row["entity_kind"], entity_id=alert_row["entity_id"],
             entity_label=alert_row["entity_label"], ts=time.time(),
-            message=f"Resolved: {alert_row['message']}")
+            message=f"Resolved: {alert_row['message']}",
+            # Recovery timestamps and downtime are derived from the resolved
+            # row by alertmail.build_context, so every clear carries them
+            # whether or not its caller had anything better. A caller that
+            # does — the device drain knows the exact poll the device answered
+            # on — passes it here and it wins.
+            extra=dict(extra or {}))
         self._notify(alert_row, rule_row, occurrence, settings,
                      notify_kind="clear", template_override=template)

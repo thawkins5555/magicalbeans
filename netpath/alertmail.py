@@ -29,8 +29,13 @@ BUILTIN_TEMPLATES = {
     "device_up": {
         "name": "Device recovered",
         "subject": "SappiWhere: {{device_name}} has recovered",
+        # "has recovered" rather than "is responding again": _notify_clear
+        # renders this one template for every kind of resolution, including a
+        # port coming back and a threshold dropping below its clear value, and
+        # only some of those are a device answering again.
         "body": (
-            "{{device_name}} ({{device_ip}}) is responding again as of {{last_time}}.\n\n"
+            "{{device_name}} ({{device_ip}}) has recovered as of {{recovered_time}}.\n\n"
+            "Down since {{down_since}} — {{downtime}} in total.\n\n"
             "{{message}}\n\n"
             "-- SappiWhere, {{severity_name}}"
         ),
@@ -90,10 +95,49 @@ def render(text: str, context: dict) -> str:
     return _TOKEN.sub(lambda m: str(context.get(m.group(1), "")), text)
 
 
-def _clock(ts) -> str:
+def clock_text(ts) -> str:
+    """A timestamp as local wall-clock text, or "" for a missing one."""
     if not ts:
         return ""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+# The name this module used before the engine needed to format a timestamp
+# the same way for an alert's own message text.
+_clock = clock_text
+
+
+def duration_text(seconds) -> str:
+    """An outage's length in two units — "48 s", "14 m 09 s", "2 h 14 m",
+    "3 d 07 h".
+
+    Two units because one is not enough for the question this answers: "3.5 h"
+    is how long the console prints an uptime, but "was it a three-hour outage
+    or a three-and-a-half-hour one" is exactly what somebody writing it up
+    needs. The minor unit is zero-padded so "2 h 4 m" cannot be read as
+    "2 h 40 m".
+
+    An unknown or non-positive duration renders as "" rather than "0 s": when
+    the recovery could not be paired with an outage there is nothing to claim,
+    and a zero-length outage would be a claim.
+    """
+    try:
+        total = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    total = int(round(total))
+    if total < 60:
+        return f"{total} s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} m {secs:02d} s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours} h {minutes:02d} m"
+    days, hours = divmod(hours, 24)
+    return f"{days} d {hours:02d} h"
 
 
 def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
@@ -115,7 +159,24 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "previous_uptime": "", "current_uptime": "",
         "metric_label": "", "value": "", "threshold": "",
         "trap_name": "", "trap_oid": "", "varbinds": "",
+        "down_since": "", "recovered_time": "", "downtime": "",
     }
+    # Derived here, from the row, rather than only where the engine happens to
+    # know them: a recovery sends TWO notifications — the "Device recovered"
+    # alert in its own right, and the resolution of the outage it cleared —
+    # and both render this same template. The resolution one is built from a
+    # synthetic occurrence with no extras, so tokens threaded through the
+    # occurrence alone would render empty on exactly the email that is about
+    # the outage. A resolved alert already carries both timestamps.
+    #
+    # `extra` still updates last, so the engine's own values win where it has
+    # better ones — the up event's timestamp is the moment the device answered,
+    # while resolved_ts is whenever the engine's next tick noticed.
+    resolved_ts = alert_row["resolved_ts"] if "resolved_ts" in alert_row.keys() else None
+    if resolved_ts:
+        context["down_since"] = _clock(alert_row["opened_ts"])
+        context["recovered_time"] = _clock(resolved_ts)
+        context["downtime"] = duration_text(resolved_ts - alert_row["opened_ts"])
     if extra:
         context.update(extra)
     return context
@@ -140,6 +201,9 @@ def token_reference() -> list[dict]:
         {"token": "metric_label", "description": "The metric name (threshold rules only)"},
         {"token": "value", "description": "The metric's current value (threshold rules only)"},
         {"token": "threshold", "description": "The configured threshold (threshold rules only)"},
+        {"token": "down_since", "description": "When the problem started (resolution notifications only)"},
+        {"token": "recovered_time", "description": "When it recovered (resolution notifications only)"},
+        {"token": "downtime", "description": "How long it was down, e.g. '2 h 14 m' (resolution notifications only)"},
         {"token": "trap_name", "description": "The trap's resolved name (trap rules only)"},
         {"token": "trap_oid", "description": "The trap's OID (trap rules only)"},
         {"token": "varbinds", "description": "The trap's varbind summary (trap rules only)"},

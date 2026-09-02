@@ -315,7 +315,11 @@
       <p class="hint">Opened ${new Date(row.opened_ts * 1000).toLocaleString()} · ` +
         `last seen ${new Date(row.last_ts * 1000).toLocaleString()} · occurred ${row.count} time(s)</p>
       ${row.acked_by ? `<p class="hint">Acknowledged by ${escape(row.acked_by)}${row.ack_note ? `: ${escape(row.ack_note)}` : ''}</p>` : ''}
-      ${row.resolved_ts ? `<p class="hint">Resolved ${new Date(row.resolved_ts * 1000).toLocaleString()}${row.resolved_by ? ` by ${escape(row.resolved_by)}` : ' automatically'}</p>` : ''}
+      ${row.resolved_ts ? `<p class="hint">Resolved ${new Date(row.resolved_ts * 1000).toLocaleString()}${row.resolved_by ? ` by ${escape(row.resolved_by)}` : ' automatically'}` +
+        // How long it stood, which is the question a resolved alert is
+        // usually opened to answer. Both timestamps are already on the row,
+        // so this costs nothing.
+        `${App.duration(row.resolved_ts - row.opened_ts) ? ` · open for ${App.duration(row.resolved_ts - row.opened_ts)}` : ''}</p>` : ''}
       <div class="bar"><span class="section">NOTIFICATIONS</span></div>
       <div id="alerts-d-notifications" class="hint">Loading…</div>`;
     const resolveBtn = document.getElementById('alerts-d-resolve');
@@ -378,10 +382,14 @@
   function editRule() {
     const r = view.rules.find((x) => x.id === view.rulesSelected);
     if (!r) return;
-    // dhcp_threshold is a threshold rule in every respect the editor cares
-    // about — it just measures a DHCP scope rather than a device metric.
-    const isThreshold = r.kind === 'threshold' || r.kind === 'dhcp_threshold';
-    const pollNoun = r.kind === 'dhcp_threshold' ? 'DHCP polls' : 'polls';
+    // dhcp_threshold and netpath_threshold are threshold rules in every
+    // respect the editor cares about — they just measure a DHCP scope or a
+    // traceroute destination rather than a device metric. A kind missing from
+    // this list opens an editor with no threshold fields at all.
+    const isThreshold = r.kind === 'threshold' || r.kind === 'dhcp_threshold'
+      || r.kind === 'netpath_threshold';
+    const pollNoun = { dhcp_threshold: 'DHCP polls',
+                       netpath_threshold: 'traces' }[r.kind] || 'polls';
     // The flapping rule counts link transitions in a time window rather than
     // comparing a value to a threshold, so it gets its own two fields
     // instead of the threshold ones.
@@ -420,7 +428,24 @@
       ${r.kind === 'dhcp_threshold' ? `<p class="hint">Percentage of a scope's
         address range that is leased or reserved. Counted the same way the DHCP
         page counts it, and evaluated once per DHCP poll rather than once per
-        alert-engine tick, so "consecutive polls" means what it says.</p>` : ''}` : ''}
+        alert-engine tick, so "consecutive polls" means what it says.</p>` : ''}
+      ${r.kind === 'netpath_threshold' ? `<p class="hint">${{
+        trace_loss_pct: 'Packet loss to the destination itself, on its latest' +
+          ' trace. Intermediate routers are never measured — rate-limited ICMP' +
+          ' from a transit hop is not a fault. 100 means nothing came back at all.',
+        trace_unreached_pct: 'Share of a destination\'s recent traces that did' +
+          ' not reach it, over the longer of an hour and six trace intervals,' +
+          ' and only once at least five traces have landed in that window.' +
+          ' This is the rule that catches a path that works intermittently.',
+        trace_rtt_warn_pct: 'Round-trip time as a percentage of THIS' +
+          ' destination\'s own warn threshold, not a fixed number of' +
+          ' milliseconds — 300 means three times whatever that destination is' +
+          ' set to warn at, so one rule suits a LAN hop and a satellite link.' +
+          ' Thresholds below 20 ms are treated as 20 ms, since three times a' +
+          ' few milliseconds is ordinary jitter. Only measured on a trace that' +
+          ' reached the destination.',
+      }[r.source_kind] || 'Evaluated once per completed trace to this' +
+        ' destination, so "consecutive traces" means what it says.'}</p>` : ''}` : ''}
       `, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
@@ -468,6 +493,8 @@
         <option value="interface_event">interface_event</option>
         <option value="threshold">threshold</option>
         <option value="dhcp_threshold">dhcp_threshold</option>
+        <option value="netpath_threshold">netpath_threshold</option>
+        <option value="wireless_event">wireless_event</option>
         <option value="trap">trap</option>
         <option value="syslog">syslog</option>
         <option value="ipam">ipam</option>

@@ -113,15 +113,24 @@
             <button id="nd-remove-device">Remove</button>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
-          <!-- The range picker drives the status timeline. Per-metric
-               bandwidth charting lives in the per-port dialog (click an
-               interface below), not here. -->
+          <!-- Two time-series views, each with its own range picker, because
+               "how long has it been down" and "how lossy is this link" are
+               asked over different spans. Per-metric bandwidth charting is
+               still a per-port question and lives in the port dialog (click
+               an interface below), not here. -->
           <div class="bar">
             <span class="section">STATUS</span>
             <select id="nd-d-range"></select>
           </div>
           <div id="nd-status-timeline" class="canvas chart strip">
             <svg id="nd-status-timeline-svg"></svg>
+          </div>
+          <div class="bar">
+            <span class="section">PACKET LOSS</span>
+            <select id="nd-loss-range"></select>
+          </div>
+          <div id="nd-loss-chart" class="canvas chart small">
+            <svg id="nd-loss-chart-svg"></svg>
           </div>
           <div id="nd-d-subs">
             <nav class="subtabs">
