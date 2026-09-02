@@ -22,6 +22,7 @@ was checking. `run_all.py` shows the last lines of a failing suite's output.
 | `test_custom_mib_e2e.py` | a custom MIB uploaded through the API is polled under its own object name | `stub_agent_get_getnext.py` |
 | `test_timeout_accuracy.py` | a walk that times out mid-table is reported as such, with the identity kept | `stub_agent_partial_timeout.py` |
 | `test_wireless_poller.py` | the FortiGate AP tables land as access points and radios | `wireless_stub_agent.py` |
+| `test_series_buckets.py` | `NodesDatabase.series(..., bucket_s=...)` bucket boundaries/avg/min/max, the `/series` API's `bucket_s` param and its window/2 cap, raw rows when `bucket_s=0` | none — no SNMP involved |
 
 Adding a suite: import `_paths` first (it puts the repo root on `sys.path`),
 use `spawn_stub("<script>.py")` for an agent, and keep the file name

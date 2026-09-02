@@ -765,12 +765,6 @@ body.compact .canvas { min-height: 120px; }
    .canvas.strip) and min-height-beats-height would balloon the 28px lane
    to 120px on exactly the small screens compact mode exists for. */
 body.compact .canvas.strip { min-height: 28px; }
-/* Same trap, one panel: the Nodes packet-loss chart is a fixed 90px lane
-   under the status strip, and letting the density rule take it to 120px
-   pushes the interface table below it off exactly the small screens
-   compact mode exists for. Scoped to that chart rather than to
-   .canvas.small, so the Alerts histogram keeps whatever it has today. */
-body.compact #nd-loss-chart { min-height: 90px; }
 body.compact .sidebar { width: 240px; padding: 8px; }
 body.compact fieldset { padding: 8px 10px 10px; }
 body.compact fieldset label { margin: 5px 0; }
@@ -779,7 +773,6 @@ body.tiny .tab { padding: 5px 12px; }
 body.tiny .bar { padding: 4px 8px; gap: 6px; }
 body.tiny .canvas { min-height: 90px; }
 body.tiny .canvas.strip { min-height: 28px; }
-body.tiny #nd-loss-chart { min-height: 70px; height: 70px; }
 body.tiny .sidebar { width: 210px; }
 body.tiny .legend, body.tiny .hint.pad { display: none; }
 

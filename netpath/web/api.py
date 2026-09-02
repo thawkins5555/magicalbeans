@@ -2294,7 +2294,11 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
     if not metric_id:
         raise ValueError("metric_id is required")
     t0, t1 = _window(params)
-    points = service.nodes_db.series(device_id, int(metric_id), t0, t1)
+    bucket_s = _num(params, "bucket_s", 0)
+    if bucket_s < 0:
+        bucket_s = 0
+    bucket_s = min(bucket_s, (t1 - t0) / 2)
+    points = service.nodes_db.series(device_id, int(metric_id), t0, t1, bucket_s=bucket_s)
     return {"t0": t0, "t1": t1, "points": points}
 
 
