@@ -17,18 +17,19 @@ simply from knowing the network).
 
 from __future__ import annotations
 
+import json
 import random
 import socket
 import threading
 import time
 import traceback
 
-from . import nodeoids
+from . import mibcatalog, nodeoids, vendorid
 from .eventlog import ERROR, NullLog
 from .ipam_scan import SubnetTooLarge, sweep, usable_addresses
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
-from .snmppoll import PDU_GET, SnmpError, V2C, build_request, decode_response
+from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request, decode_response
 
 MAX_UDP = 65535
 
@@ -43,15 +44,15 @@ def _candidate_communities(text: str | None) -> list[str]:
 
 
 def _snmp_identify(ip: str, version: int, community: str, timeout_s: float,
-                   oids: list[str]):
-    """One single-shot GET, no retry (the caller already loops over
-    several community/version combinations, so a slow retry-per-guess
+                   oids: list[str], pdu: int = PDU_GET):
+    """One single-shot GET (or GETNEXT), no retry (the caller already loops
+    over several community/version combinations, so a slow retry-per-guess
     would make a subnet sweep take far too long). Returns a Response or
     raises SnmpError."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(max(0.2, timeout_s))
     try:
-        packet = build_request(version, community, PDU_GET,
+        packet = build_request(version, community, pdu,
                                random.randint(1, 2 ** 16), oids)
         sock.sendto(packet, (ip, DEFAULT_SNMP_PORT))
         data, _addr = sock.recvfrom(MAX_UDP)
@@ -62,6 +63,31 @@ def _snmp_identify(ip: str, version: int, community: str, timeout_s: float,
         raise SnmpError(str(exc)) from exc
     finally:
         sock.close()
+
+
+def _snmp_getnext_one(ip: str, version: int, community: str, timeout_s: float,
+                      retries: int, oid: str):
+    """One GETNEXT for the arc hop, with the sweep's own retry rule:
+    (oid, type, value), or None when the agent signalled the end — an
+    empty reply, endOfMibView/noSuchObject/noSuchInstance, or a non-zero
+    error-status (a v1 agent's noSuchName past its last object). Raises
+    SnmpError only when every attempt went unanswered, so the hop can say
+    'timeout' and keep the arcs it already found."""
+    last_error = None
+    for _attempt in range(1 + max(0, int(retries))):
+        try:
+            response = _snmp_identify(ip, version, community, timeout_s, [oid],
+                                      pdu=PDU_GETNEXT)
+        except SnmpError as exc:
+            last_error = exc
+            continue
+        if getattr(response, "error_status", 0) or not response.varbinds:
+            return None
+        vb = response.varbinds[0]
+        if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+            return None
+        return vb["oid"], vb["type"], vb["value"]
+    raise last_error or SnmpError(f"no reply from {ip}")
 
 
 class DiscoveryJob:
@@ -212,13 +238,50 @@ class DiscoveryJob:
                 sys_descr = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"]) or ""
                 sys_name = values.get(nodeoids.SYSTEM_SCALARS["sys_name"]) or ""
                 sys_object_id = values.get(nodeoids.SYSTEM_SCALARS["sys_object_id"]) or ""
-                return {
+                result = {
                     "community_or_user": community,
                     "snmp_version": version,
                     "sys_descr": sys_descr,
                     "sys_name": sys_name,
                     "sys_object_id": sys_object_id,
-                    "vendor": nodeoids.identify_vendor(
-                        sys_object_id, sys_descr)[0],
                 }
+                result.update(self._identify_vendor(
+                    ip, version, community, timeout_s, retries,
+                    sys_object_id, sys_descr))
+                return result
         return None
+
+    def _identify_vendor(self, ip: str, version: int, community: str,
+                         timeout_s: float, retries: int, sys_object_id: str,
+                         sys_descr: str) -> dict:
+        """The vendor half of a discovery result: the enterprise-arc hop
+        ((arcs + 1) GETNEXTs, typically three to eight) and vendorid's
+        decision over sysObjectID, the arcs and sysDescr. No MIB scoring here
+        — that needs the poller's index and happens on the device's first
+        poll after promotion. A hop that times out keeps the arcs it found;
+        an address that answered the identity GET is never lost to the hop.
+
+        Switched off by the discovery_arc_hop setting, in which case the
+        result is exactly 4.31's: identify_vendor over sysObjectID/sysDescr,
+        with nothing walked."""
+        hop = None
+        if self.settings.get("discovery_arc_hop", True):
+            hop = vendorid.hop_enterprise_arcs(
+                lambda oid: _snmp_getnext_one(ip, version, community, timeout_s,
+                                              retries, oid))
+        learned = self.db.learned_vendor(sys_object_id) \
+            if hasattr(self.db, "learned_vendor") else ""
+        decision = vendorid.decide(
+            sys_object_id, sys_descr, hop.arcs if hop else [], [],
+            learned=learned, catalog_arcs=mibcatalog.ARC_KEYS)
+        evidence = vendorid.evidence(
+            sys_object_id, "discovery", hop, {}, {}, [], decision, {},
+            catalog_arcs=mibcatalog.ARC_KEYS)
+        return {
+            "vendor": decision.vendor,
+            "vendor_source": decision.source,
+            "vendor_confidence": decision.confidence,
+            "suggest_bundle": decision.suggest_bundle,
+            "arcs": json.dumps(hop.arcs if hop else []),
+            "vendor_evidence": json.dumps(evidence),
+        }

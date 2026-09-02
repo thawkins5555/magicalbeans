@@ -309,17 +309,6 @@ own subtabs.
   equal: an arc match is an IANA assignment, a sysDescr match is a
   substring of text the vendor chose to write, and only the former is
   used where being wrong would matter.
-- **Some gear is named by a proprietary OID that says who made it.** Where
-  neither standard source names a vendor — or where the sysObjectID names
-  only an SNMP agent — a small built-in list of vendor-specific scalars is
-  read, and a device answering one with its maker's name is identified by
-  it. Moxa ships in that list. The read is a request of its own, made only
-  for a device the standard sources could not name, so an identified device
-  never pays for it: an SNMPv1 agent answers a request containing a single
-  object it does not implement by nulling every answer in it, so an
-  object most devices cannot answer must never travel with sysDescr and
-  sysObjectID. The device header says which source spoke, "(vendor OID)"
-  included.
 - **A vendor is shown under its own name.** Vendor keys are terse tokens
   because everything that behaves differently per vendor matches on them —
   ConfigRX's backup command, the Cisco per-VLAN MAC read, discovery's
@@ -356,6 +345,42 @@ own subtabs.
   silently skipped rather than failing the poll. Scalars only — a MIB's
   own table objects (e.g. a vendor's per-sensor table) aren't walked by
   this feature.
+
+### Vendor identification
+
+- **The vendor is worked out from what the device answers, and the app
+  says how sure it is.** Every device is walked once — a hop across the
+  enterprise arcs it populates (a handful of requests), then a bounded walk
+  under each (about 500 objects, 20 seconds) scored against every installed
+  MIB. That happens on its first successful poll, again only if its
+  sysObjectID changes, and behind **Re-identify**; the steady-state poll
+  adds nothing. The Vendor column marks a name that is less than certain:
+  `?` a guess from a word in sysDescr, `~` probable, `*` set by hand or
+  learned. Hover for which source spoke.
+- **Precedence, in order:** a vendor set by hand; one learned from an
+  operator's override on a device with the same sysObjectID; a real vendor
+  arc in the sysObjectID; the walk; a word in the sysDescr; the SNMP agent's
+  own name. The walk never overrules a real vendor arc — OEM gear implements
+  the chipset maker's arc alongside its own — but it is what names a device
+  whose sysObjectID says only "net-snmp".
+- **The device dialog shows the evidence:** the arcs found, how many objects
+  each answered, which MIB named how many of them, the MIB that was assigned
+  because of it, and the sentence that states why. Re-identify runs the
+  walk again in front of you. A **Vendor (manual)** box overrides everything,
+  for display and for ConfigRX's command choice; when the device's
+  sysObjectID is specific to one vendor, every device with the same one
+  follows on its next poll, and the dialog says whether that applies.
+- **A bundle is suggested when it would help.** Catalog bundles know their
+  enterprise arcs, so a device answering under an arc no installed MIB
+  decodes gets "This looks like a Ubiquiti — Install the Ubiquiti MIBs"
+  with the install one click away.
+- **Arcs with no MIB still get a name** from a bundled enterprise-number
+  list; entries verified from MIB text decide at high confidence, curated
+  ones at medium, always with the arc number in the evidence.
+- **Discovery sweeps list each device's arcs** (a few extra requests per
+  device that answers SNMP, switchable off under Settings → Nodes), mark
+  confidence in the results table, hint at the bundle to install, and carry
+  the verdict into the device on promotion.
 
 ### Drill-down
 

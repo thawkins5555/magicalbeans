@@ -6,7 +6,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 4.32.0 — How long it was down, loss you can see, and paths that alert
+### 4.33.0 — How long it was down, loss you can see, and paths that alert
 
 - **"Device recovered" now says when it recovered and how long it was down.**
   The notice read "responding again" and nothing else, so the one question an
@@ -91,45 +91,98 @@ Listed newest first. Version numbers are build order, not dates.
   happen for a destination that was disabled or deleted — the alert would have
   sat open forever, and turning a destination off while working on a link is a
   normal thing to do.
-- **Moxa switches are identified, by an OID that names Moxa.** Moxa gear
-  routinely answers the net-snmp enterprise arc for its sysObjectID and says
-  nothing useful in sysDescr, which left it in the Vendor column as a blank.
-  A proprietary Moxa scalar is now read when — and only when — the two standard
-  sources named nothing or named an SNMP agent rather than a maker, so a device
-  that is already identified costs no extra request, ever. The read is a
-  request of its own rather than an extra object on the identity request: an
-  SNMPv1 agent answers a request containing one object it does not implement by
-  nulling **every** answer in it, so an unanswerable object must never travel
-  with sysDescr and sysObjectID. Moxa's own enterprise arc (8691, read out of
-  MOXA-GENERAL-MIB) is registered too, which is what lets an installed Moxa MIB
-  auto-assign.
-- **Rockwell Automation gear is identified from its sysDescr.** No enterprise
-  arc is claimed for it: every arc in this application was read out of that
-  vendor's own MIB text, because a wrong arc silently mislabels every device
-  under it, and no Rockwell MIB was available to read one from.
-- **A vendor whose key does not read as its name now displays its name.**
-  "moxa" and "rockwellAutomation" are what the Vendor column showed; it now
-  shows "Moxa" and "Rockwell Automation". Only the display changes — the key
-  is what ConfigRX matches to pick a backup command and what discovery matches
-  to suggest a profile, so it stays exactly as it was.
 - **A Moxa MIB bundle is in the catalog** — 25 files covering the EDS, IKS and
   PT switch families and the AWK access point: system info and utilization,
   port status, PoE, Turbo Ring and Turbo Chain redundancy, dual homing, fiber
   check and digital I/O. Fetched from LibreNMS's public tree at install time
-  like every other bundle; nothing is mirrored here.
-- **Guarded, not yet fixed: a custom identity OID would blank a v1 device's
-  identity.** A device with a Vendor OID or Location OID set has it read in the
-  same request as sysDescr and sysObjectID, in both its bare and its `.0` form —
-  of which one cannot answer by construction. That is free on v2c and v3, which
-  report a missing object per-object, and would destroy the whole answer on
-  SNMPv1. A device configured for v1 now has its custom identity OIDs read in a
-  separate, best-effort request. **This guard cannot currently take effect**, and
-  the reason is worth stating plainly: the polling code resolves the SNMP version
-  as `snmp_version or 1`, so a device configured for v1 (stored as `0`) is
-  actually polled as v2c and the failure never arises. Correcting that coercion
-  changes how every v1-configured device is polled and is not being slipped into
-  a release about vendor identification; it is recorded here as a known defect,
-  and the guard is in place for when it is fixed.
+  like every other bundle; nothing is mirrored here. 4.32.0's arc walk already
+  names a Moxa switch from arc 8691 without any MIB at all; this is what lets
+  it decode the switch's own objects once named, and what the bundle hint on a
+  `mib_missing` event points at.
+- **Rockwell Automation gear is identified from its sysDescr,** and reads as
+  "Rockwell Automation" rather than as a token. No enterprise arc is claimed
+  for it: every arc in this application was read out of that vendor's own MIB
+  text, because a wrong arc silently mislabels every device under it, and no
+  Rockwell MIB was available to read one from. It is therefore the one vendor
+  named by sysDescr with no arc to be keyed by, and carries its display name in
+  `enterprises.ARCLESS_DISPLAY` instead.
+- **Known, not fixed: SNMPv1 is never actually spoken.** The poller resolves
+  the version as `snmp_version or 1`, so a device configured for v1 (stored as
+  `0`) goes on the wire as v2c. One consequence is already guarded — a custom
+  Vendor or Location OID rides in the same request as sysDescr and sysObjectID,
+  which on a real v1 agent would null every answer in it, so those OIDs are read
+  in a separate best-effort request for a v1-configured device — but that guard
+  cannot fire while the coercion stands. Correcting it changes how every
+  v1-configured device is polled and deserves its own change with its own
+  testing, so it is recorded here rather than slipped in.
+
+### 4.32.0 — Know what you are polling
+
+- **A device's vendor is now identified from what it actually answers, not
+  only from its sysObjectID.** Vendor identity lives entirely under the
+  `enterprises` subtree, and the set of enterprise arcs a device populates
+  can be enumerated in (arcs + 1) GETNEXTs by *hopping*: ask for the first
+  object under `1.3.6.1.4.1`, land on arc N, ask for the first object under
+  `1.3.6.1.4.1.(N+1)` and skip the whole of arc N. A device usually answers
+  under two to six arcs, so this is cheaper than one poll — and it finds
+  vendors this app holds no MIB for. A net-snmp radio that used to show as
+  "netSnmp" now shows as Phoenix Contact, because arc 4346 is what it
+  answers under.
+- **Then the installed MIBs are scored against a bounded walk** (about 500
+  objects, 20 seconds, once per device on its first successful poll, again
+  only if its sysObjectID changes, and behind a Re-identify button). Each
+  MIB is credited with the objects it names on that device, and the file
+  that names the most becomes the device's Custom MIB — replacing the old
+  "the file with the most objects under the arc" guess, which was a guess
+  about the device made from the MIB alone. Steady-state polling adds no
+  traffic at all: once identified for its current sysObjectID, a device is
+  never walked again until somebody asks.
+- **The precedence is explicit and explained.** A vendor set by hand wins,
+  then one learned from an operator's override on a device with the same
+  sysObjectID, then a real vendor arc in the sysObjectID (an IANA
+  assignment), then the walk, then a word in the sysDescr, then the SNMP
+  agent's own name. The walk never substitutes a different arc for a real
+  vendor arc — OEM gear routinely implements the chipset vendor's arc
+  alongside its own. Every device stores the evidence: which arcs answered,
+  how many objects, which MIB named how many of them, and the sentence that
+  states the decision. The device dialog shows all of it.
+- **A confidence you can see.** The Vendor column carries one character
+  after a name that is less than certain — `?` for a guess from sysDescr,
+  `~` for probable (a curated enterprise number, or a walk with thin MIB
+  evidence), `*` for a vendor set by hand or learned — and nothing after a
+  name that came from an IANA arc or strong evidence, so the common case
+  reads clean. The title says which source spoke.
+- **Set a vendor by hand, and the fleet learns it.** A manual vendor on a
+  device is shown, acted on by ConfigRX and the Cisco MAC-table read, and —
+  when the device's sysObjectID is specific to one vendor — remembered, so
+  every other device answering the same sysObjectID follows on its next
+  poll. A generic-agent sysObjectID (net-snmp's, shared by every Linux box
+  ever built) is deliberately never learned from; the dialog says so.
+- **"This looks like a Ubiquiti — install the Ubiquiti MIBs."** Catalog
+  bundles now carry the enterprise arcs they describe, so a device answering
+  under an arc no installed MIB decodes is pointed at the bundle that would,
+  with a one-click install from the device dialog. Every arc was read out of
+  the bundle's own root file, never assumed.
+- **Arcs with no MIB still get a name.** A bundled enterprise-number list —
+  48 arcs verified from MIB text and 80 curated from memory of the IANA
+  registry, kept apart and trusted differently — names a device whose vendor
+  this app has never seen a MIB for. A curated entry decides at medium
+  confidence with the arc number in the evidence, so a wrong one is
+  auditable and scoped to devices nothing else could name.
+- **Discovery sweeps list each device's arcs too.** The identity GET gains
+  the hop's few GETNEXTs, the results table marks confidence and hints at
+  the bundle to install, and promotion carries the verdict into the device.
+  Switchable off, in which case a sweep is exactly what it was.
+- Settings → Nodes has a **Vendor identification** fieldset for the walk's
+  bounds, its concurrency (four at once, which is what throttles the
+  post-upgrade burst where every existing device is unidentified) and the
+  discovery hop. Existing devices keep their vendor on upgrade and are
+  walked once, a few at a time, as they poll.
+
+**Not done in this release:** a Phoenix Contact MIB bundle, for the same
+reason as 4.28 — the catalog's upstream ships none. The device is now named
+correctly anyway, and its `mib_missing` event says which arc a MIB would need
+to describe.
 
 ### 4.31.0 — Mute a device, sustain a threshold, find a MAC
 

@@ -283,6 +283,19 @@ CREATE TABLE IF NOT EXISTS discovery_results (
 );
 CREATE INDEX IF NOT EXISTS ix_discovery_results_job ON discovery_results(job_id);
 
+-- Fleet learning: an operator's manual vendor override, remembered against
+-- the device's sysObjectID so every other device answering the same
+-- sysObjectID is classified the same way on its next poll. Never written
+-- for a generic-agent sysObjectID (net-snmp's 8072.x is shared by every
+-- Linux box) — see set_vendor_override.
+CREATE TABLE IF NOT EXISTS vendor_learned (
+    sys_object_id    TEXT PRIMARY KEY,
+    vendor           TEXT NOT NULL,
+    set_by           TEXT,
+    set_ts           REAL NOT NULL,
+    source_device_id INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -356,6 +369,16 @@ DEFAULTS = {
     # entries, and after this they are dropped rather than answering
     # searches with a table nobody has confirmed since.
     "mac_table_retention_days": 7.0,
+    # Vendor identification (vendorid.py). The bounded enterprises-only walk
+    # that runs once per device on its first successful poll, again when its
+    # sysObjectID changes, and behind Re-identify — never on the steady-state
+    # poll cycle. The arc hop in a discovery sweep is separate and cheap
+    # ((arcs + 1) GETNEXTs per device that answers SNMP).
+    "vendor_walk_enabled": True,
+    "vendor_walk_max_objects": 500,
+    "vendor_walk_budget_s": 20.0,
+    "vendor_walk_parallel": 4,
+    "discovery_arc_hop": True,
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -372,8 +395,10 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
                    "mac_table_interval_s")
 
+# vendor_override is deliberately NOT an _OVERRIDE_COLUMNS entry: a vendor is a
+# fact about one box, not something a polling profile should hand down.
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
-                    "enabled") + _OVERRIDE_COLUMNS
+                    "enabled", "vendor_override") + _OVERRIDE_COLUMNS
 
 
 # The separators a MAC address is written with in the wild. '.' covers the
@@ -519,6 +544,15 @@ class NodesDatabase:
             # or deleted), rather than keying off sysObjectID changes.
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN mib_covered INTEGER")
+        # Vendor identification (4.32): the operator's own answer, how sure
+        # the automatic one is, the stored explanation, and which sysObjectID
+        # it was worked out for — so the walk runs once, not once per poll,
+        # and again only when the device's identity actually changes.
+        for column, kind in (("vendor_override", "TEXT"), ("vendor_confidence", "TEXT"),
+                             ("vendor_evidence", "TEXT"), ("identified_ts", "REAL"),
+                             ("identified_sys_object_id", "TEXT")):
+            if column not in devices:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} {kind}")
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
@@ -561,6 +595,15 @@ class NodesDatabase:
             self._conn.execute(
                 "ALTER TABLE discovery_jobs ADD COLUMN reviewed INTEGER"
                 " NOT NULL DEFAULT 1")
+        results = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(discovery_results)").fetchall()}
+        # What the sweep's arc hop found (4.32), carried into the device on
+        # promotion so its first poll starts from the same evidence.
+        for column in ("arcs", "vendor_source", "vendor_confidence",
+                       "suggest_bundle", "vendor_evidence"):
+            if column not in results:
+                self._conn.execute(
+                    f"ALTER TABLE discovery_results ADD COLUMN {column} TEXT")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -905,11 +948,17 @@ class NodesDatabase:
 
     def seed_identity(self, device_id: int, *, sys_descr: str = "",
                       sys_name: str = "", sys_object_id: str = "",
-                      vendor: str = "") -> None:
+                      vendor: str = "", vendor_source: str = "",
+                      vendor_confidence: str = "",
+                      vendor_evidence: str | None = None) -> None:
         """Pre-fills the identity columns from a discovery result so a
         just-promoted device shows its sysName immediately instead of a
         bare IP until its first poll (which overwrites these with the same
-        values anyway)."""
+        values anyway).
+
+        identified_ts is deliberately left NULL: the sweep's arc hop names a
+        vendor, but scoring the MIB corpus and assigning a MIB need the
+        poller, so the first poll still runs the full fingerprint."""
         with self._lock:
             # vendor_detected too: discovery identified this from SNMP, so it
             # is a detected value by definition, and leaving it NULL until the
@@ -917,9 +966,12 @@ class NodesDatabase:
             # to a blank vendor on a device that was just identified.
             self._conn.execute(
                 "UPDATE devices SET sys_descr = ?, sys_name = ?,"
-                " sys_object_id = ?, vendor = ?, vendor_detected = ?"
+                " sys_object_id = ?, vendor = ?, vendor_detected = ?,"
+                " vendor_source = ?, vendor_confidence = ?, vendor_evidence = ?"
                 " WHERE id = ?",
-                (sys_descr, sys_name, sys_object_id, vendor, vendor, device_id))
+                (sys_descr, sys_name, sys_object_id, vendor, vendor,
+                 vendor_source or "", vendor_confidence or "", vendor_evidence,
+                 device_id))
             self._conn.commit()
 
     def update_device(self, device_id: int, **fields) -> None:
@@ -1091,6 +1143,7 @@ class NodesDatabase:
                     "vendor": identity.get("vendor"),
                     "vendor_detected": identity.get("vendor_detected"),
                     "vendor_source": identity.get("vendor_source"),
+                    "vendor_confidence": identity.get("vendor_confidence") or "",
                 })
             if uptime_ticks is not None:
                 fields["last_uptime_ticks"] = uptime_ticks
@@ -1707,6 +1760,202 @@ class NodesDatabase:
                 "SELECT oid, name FROM mib_objects WHERE oid IS NOT NULL"
             ).fetchall()
         return "\n".join(f"{row['oid']} = {row['name']}" for row in rows)
+
+    def enterprise_objects(self) -> list[tuple[int, str]]:
+        """(mib_file_id, oid) for every resolved object under `enterprises`,
+        for vendorid.build_mib_index. A range predicate rather than LIKE:
+        SQLite's LIKE is case-insensitive by default and does not use
+        ix_mib_objects_oid, which is fine for has_mib_covering's single row
+        and not for the tens of thousands this returns."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mib_file_id, oid FROM mib_objects"
+                " WHERE oid >= '1.3.6.1.4.1.' AND oid < '1.3.6.1.4.1/'").fetchall()
+        return [(row["mib_file_id"], row["oid"]) for row in rows]
+
+    def mib_generation(self) -> tuple:
+        """Changes whenever the MIB corpus does — an upload, a delete, a
+        catalog install or a resolve-all rewrite — so the poller can keep
+        one built index until it is actually stale."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT (SELECT MAX(id) FROM mib_objects) AS top,"
+                " (SELECT COUNT(*) FROM mib_objects) AS n_objects,"
+                " (SELECT COUNT(*) FROM mib_files) AS n_files").fetchone()
+        return (row["top"], row["n_objects"], row["n_files"])
+
+    # ------------------------------------------------ vendor identification
+
+    def record_identification(self, device_id: int, decision, evidence: dict,
+                              sys_object_id: str) -> None:
+        """Persist what vendorid decided for a device, and that it was decided
+        for THIS sysObjectID, so the walk is not repeated until the identity
+        changes. `vendor`/`vendor_source`/`vendor_confidence` are left alone
+        while a custom vendor OID owns the display value (source 'oid');
+        vendor_detected is always written, because it is what ConfigRX and
+        the Cisco MAC read act on."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT vendor_source FROM devices WHERE id = ?", (device_id,)).fetchone()
+            if row is None:
+                return
+            fields = {
+                "vendor_detected": decision.vendor,
+                "vendor_evidence": json.dumps(evidence),
+                "identified_ts": time.time(),
+                "identified_sys_object_id": sys_object_id or "",
+            }
+            if (row["vendor_source"] or "") != "oid":
+                fields.update({"vendor": decision.vendor,
+                               "vendor_source": decision.source,
+                               "vendor_confidence": decision.confidence})
+            clauses = ", ".join(f"{key} = ?" for key in fields)
+            self._conn.execute(f"UPDATE devices SET {clauses} WHERE id = ?",
+                               (*fields.values(), device_id))
+            self._conn.commit()
+
+    def clear_identification(self, device_id: int) -> None:
+        """Forget that a device was identified, so its next poll walks it
+        again — Re-identify's first step."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET identified_ts = NULL,"
+                " identified_sys_object_id = NULL WHERE id = ?", (device_id,))
+            self._conn.commit()
+
+    def learned_vendor(self, sys_object_id: str) -> str:
+        if not sys_object_id:
+            return ""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT vendor FROM vendor_learned WHERE sys_object_id = ?",
+                (sys_object_id,)).fetchone()
+        return (row["vendor"] if row else "") or ""
+
+    def learned_vendors(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM vendor_learned ORDER BY set_ts DESC").fetchall()
+
+    def learned_row(self, sys_object_id: str) -> sqlite3.Row | None:
+        if not sys_object_id:
+            return None
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM vendor_learned WHERE sys_object_id = ?",
+                (sys_object_id,)).fetchone()
+
+    def learn_vendor(self, sys_object_id: str, vendor: str, set_by: str = "",
+                     device_id: int | None = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO vendor_learned(sys_object_id, vendor, set_by, set_ts,"
+                " source_device_id) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(sys_object_id) DO UPDATE SET vendor=excluded.vendor,"
+                " set_by=excluded.set_by, set_ts=excluded.set_ts,"
+                " source_device_id=excluded.source_device_id",
+                (sys_object_id, vendor, set_by, time.time(), device_id))
+            self._conn.commit()
+
+    def forget_learned(self, sys_object_id: str,
+                       only_from_device: int | None = None) -> bool:
+        sql = "DELETE FROM vendor_learned WHERE sys_object_id = ?"
+        args: list = [sys_object_id]
+        if only_from_device is not None:
+            sql += " AND source_device_id = ?"
+            args.append(only_from_device)
+        with self._lock:
+            cur = self._conn.execute(sql, args)
+            self._conn.commit()
+        return bool(cur.rowcount)
+
+    @staticmethod
+    def _learnable(sys_object_id: str) -> tuple[bool, str]:
+        """Whether a manual vendor on a device with this sysObjectID should
+        teach the fleet. A generic-agent arc (net-snmp, UCD) is shared by
+        every Linux box ever built, and a sysObjectID outside enterprises
+        says nothing about the maker — learning either would mislabel
+        every unrelated device that shares it."""
+        from . import nodeoids, vendorid
+        if not sys_object_id:
+            return False, "the device has no sysObjectID yet"
+        arc = nodeoids.enterprise_arc(sys_object_id)
+        if arc is None:
+            return False, "its sysObjectID is outside the enterprises tree"
+        if arc in vendorid.GENERIC_ARCS:
+            return False, ("its sysObjectID names only the SNMP agent, which "
+                           "every device running that agent shares")
+        return True, ""
+
+    def set_vendor_override(self, device_id: int, vendor: str | None,
+                            set_by: str = "") -> dict:
+        """Set or clear an operator's vendor for one device.
+
+        Set: the device shows and *acts* on this vendor (vendor_detected is
+        written too — the operator is asserting the real maker, unlike a
+        display-only custom vendor OID), and, when the sysObjectID is
+        specific enough, the pairing is learned so every device answering
+        the same sysObjectID follows on its next poll.
+
+        Clear: the override goes, the learned row goes too when this device
+        was its source, and the row is re-decided at once from what is
+        stored so it does not sit on a stale 'manual' until the next poll.
+        """
+        from . import vendorid
+        device = self.device(device_id)
+        if device is None:
+            raise ValueError("No such device")
+        sys_object_id = device["sys_object_id"] or ""
+        vendor = (vendor or "").strip()
+        result = {"vendor": vendor, "learned": False, "learn_reason": ""}
+        if vendor:
+            learnable, why = self._learnable(sys_object_id)
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE devices SET vendor_override = ?, vendor = ?,"
+                    " vendor_detected = ?, vendor_source = 'manual',"
+                    " vendor_confidence = 'high' WHERE id = ?",
+                    (vendor, vendor, vendor, device_id))
+                self._conn.commit()
+            if learnable:
+                self.learn_vendor(sys_object_id, vendor, set_by, device_id)
+                result["learned"] = True
+            else:
+                result["learn_reason"] = why
+            self.record_device_event(
+                device_id, "vendor_set",
+                f"Vendor set to {vendor} by {set_by or 'an operator'}"
+                + (f"; devices with sysObjectID {sys_object_id} will follow"
+                   if learnable else f" (this device only: {why})"))
+        elif device["vendor_override"] is None:
+            # Nothing to clear: an edit form that never had an override must
+            # not record a "cleared" event or re-decide anything.
+            result.update({"vendor": device["vendor"] or "",
+                           "source": device["vendor_source"] or ""})
+        else:
+            forgot = self.forget_learned(sys_object_id, only_from_device=device_id)
+            fresh = self.device(device_id)
+            detected, source, confidence, _arc = vendorid.poll_decision(
+                sys_object_id, fresh["sys_descr"] or "",
+                dict(fresh, vendor_override=""), self.learned_vendor(sys_object_id))
+            keeps_display = (fresh["vendor_source"] or "") == "oid"
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE devices SET vendor_override = NULL, vendor_detected = ?,"
+                    " vendor = CASE WHEN ? THEN vendor ELSE ? END,"
+                    " vendor_source = CASE WHEN ? THEN vendor_source ELSE ? END,"
+                    " vendor_confidence = ? WHERE id = ?",
+                    (detected, keeps_display, detected, keeps_display, source,
+                     confidence, device_id))
+                self._conn.commit()
+            self.record_device_event(
+                device_id, "vendor_cleared",
+                f"Manual vendor cleared by {set_by or 'an operator'}; now "
+                f"{detected or 'unidentified'}"
+                + (f" via {source}" if source else "")
+                + ("; the learned pairing was forgotten" if forgot else ""))
+            result.update({"vendor": detected, "source": source})
+        return result
 
     # ------------------------------------------------------------- discovery
 

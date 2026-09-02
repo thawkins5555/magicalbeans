@@ -121,6 +121,7 @@ ROUTES = [
     ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/bulk-poll$", api.post_nodes_devices_bulk_poll, ("nodes", W)),
+    ("POST", r"^/api/nodes/devices/bulk-identify$", api.post_nodes_devices_bulk_identify, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),
@@ -131,6 +132,11 @@ ROUTES = [
     ("POST", r"^/api/nodes/devices/(\d+)/oid-walk$", api.post_nodes_device_oid_walk, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/oid-walk$", api.get_nodes_device_oid_walk, ("nodes", R)),
     ("DELETE", r"^/api/nodes/devices/(\d+)/oid-walk$", api.delete_nodes_device_oid_walk, ("nodes", W)),
+    # Vendor identification: starting or cancelling the walk is a live SNMP
+    # job, so it needs write access; reading the verdict does not.
+    ("POST", r"^/api/nodes/devices/(\d+)/identify$", api.post_nodes_device_identify, ("nodes", W)),
+    ("GET", r"^/api/nodes/devices/(\d+)/identify$", api.get_nodes_device_identify, ("nodes", R)),
+    ("DELETE", r"^/api/nodes/devices/(\d+)/identify$", api.delete_nodes_device_identify, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/test$", api.post_nodes_device_test, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),

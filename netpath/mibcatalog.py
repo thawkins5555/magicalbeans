@@ -51,6 +51,16 @@ class Bundle:
     description: str
     source: str                       # human-readable upstream, shown in the UI
     files: list[tuple[str, str]] = field(default_factory=list)   # (filename, url)
+    # The enterprise arcs this bundle's MIBs describe, each read from the
+    # bundle's own root/SMI file ("::= { enterprises N }"), so vendor
+    # identification can say "this device answers under an arc the Ubiquiti
+    # bundle would decode — install it". Never guessed: a wrong arc would
+    # suggest the wrong bundle for every device under it.
+    arcs: tuple[int, ...] = ()
+    # The canonical vendor key (trapoids.WELL_KNOWN / enterprises.py
+    # spelling) behind the display label in `vendor`, so the UI, ConfigRX
+    # and the identification evidence all compare one string.
+    vendor_key: str = ""
 
     @property
     def file_count(self) -> int:
@@ -70,6 +80,8 @@ def _libre(vendor_dir: str, *names: str) -> list[tuple[str, str]]:
 CATALOG: list[Bundle] = [
     Bundle(
         key="cisco-core",
+        arcs=(9,),
+        vendor_key="cisco",
         vendor="Cisco",
         name="Cisco IOS / IOS-XE core",
         description="CPU, memory, environment sensors, FRU/entity, CDP, VTP, "
@@ -91,6 +103,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="cisco-wireless",
+        arcs=(9, 14179),
+        vendor_key="cisco",
         vendor="Cisco",
         name="Cisco wireless (LWAPP / AireOS)",
         description="Access points, radios, WLANs and mobility on a Cisco "
@@ -106,6 +120,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="fortinet",
+        arcs=(12356,),
+        vendor_key="fortinet",
         vendor="Fortinet",
         name="Fortinet FortiGate / FortiAP / FortiSwitch",
         description="The full FORTINET-FORTIGATE-MIB the Wireless module "
@@ -122,6 +138,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="juniper",
+        arcs=(2636,),
+        vendor_key="juniper",
         vendor="Juniper",
         name="Juniper JUNOS",
         description="The Juniper enterprise tree, chassis and routing "
@@ -135,6 +153,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="aruba-wireless",
+        arcs=(14823,),
+        vendor_key="aruba",
         vendor="Aruba / HPE",
         name="Aruba ArubaOS wireless",
         description="ArubaOS controllers and access points: WLANs, radios, "
@@ -149,6 +169,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="aruba-cx",
+        arcs=(47196,),
+        vendor_key="arubaCx",
         vendor="Aruba / HPE",
         name="Aruba CX switches",
         description="AOS-CX chassis, modules, fans, power supplies, "
@@ -165,6 +187,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="hp-procurve",
+        arcs=(11,),
+        vendor_key="hp",
         vendor="HP / HPE",
         name="HP ProCurve / Aruba switches (ICF)",
         description="The HP ICF tree used by ProCurve and older Aruba wired "
@@ -179,6 +203,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="arista",
+        arcs=(30065,),
+        vendor_key="arista",
         vendor="Arista",
         name="Arista EOS",
         description="Arista's enterprise tree, entity sensors and interface "
@@ -191,6 +217,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="mikrotik",
+        arcs=(14988,),
+        vendor_key="mikrotik",
         vendor="MikroTik",
         name="MikroTik RouterOS",
         description="RouterOS health, wireless and storage objects.",
@@ -199,6 +227,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="ubiquiti",
+        arcs=(41112,),
+        vendor_key="ubiquiti",
         vendor="Ubiquiti",
         name="Ubiquiti UniFi / EdgeMAX / airMAX",
         description="UniFi access points, EdgeRouter/EdgeSwitch and airMAX "
@@ -212,6 +242,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="extreme",
+        arcs=(1916,),
+        vendor_key="extremeNetworks",
         vendor="Extreme Networks",
         name="Extreme EXOS",
         description="EXOS system health, ports, FDB, VLANs, PoE and stacking.",
@@ -225,6 +257,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="dell-networking",
+        arcs=(6027,),
+        vendor_key="dellNetworking",
         vendor="Dell",
         name="Dell Networking / OS10",
         description="Dell Networking (Force10) chassis, system components and "
@@ -240,6 +274,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="netgear",
+        arcs=(4526, 4413),
+        vendor_key="netgear",
         vendor="NETGEAR",
         name="NETGEAR smart switches",
         description="NETGEAR's smart-switching tree, including box services "
@@ -252,6 +288,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="sonicwall",
+        arcs=(8741,),
+        vendor_key="sonicwall",
         vendor="SonicWall",
         name="SonicWall firewalls",
         description="SonicOS firewall statistics and SSL-VPN objects.",
@@ -263,6 +301,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="apc-ups",
+        arcs=(318,),
+        vendor_key="apc",
         vendor="APC / Schneider",
         name="APC PowerNet (UPS and rack PDU)",
         description="APC's PowerNet MIB: UPS battery, load, runtime and rack "
@@ -272,6 +312,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="synology",
+        arcs=(6574,),
+        vendor_key="synology",
         vendor="Synology",
         name="Synology NAS",
         description="Synology system health, disks and RAID volumes.",
@@ -283,6 +325,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="vmware",
+        arcs=(6876,),
+        vendor_key="vmware",
         vendor="VMware",
         name="VMware ESXi",
         description="ESXi host resources, environment sensors and guest "
@@ -296,6 +340,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="paloalto",
+        arcs=(25461,),
+        vendor_key="paloAlto",
         vendor="Palo Alto Networks",
         name="Palo Alto PAN-OS",
         description="PAN-OS firewalls and Panorama: system state, sessions, "
@@ -309,6 +355,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="checkpoint",
+        arcs=(2620,),
+        vendor_key="checkPoint",
         vendor="Check Point",
         name="Check Point firewalls",
         description="Check Point's enterprise tree: firewall, VPN, cluster "
@@ -318,6 +366,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="watchguard",
+        arcs=(3097,),
+        vendor_key="watchguard",
         vendor="WatchGuard",
         name="WatchGuard Firebox",
         description="Firebox system statistics, policies, high availability "
@@ -333,6 +383,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="sophos",
+        arcs=(2604,),
+        vendor_key="sophos",
         vendor="Sophos",
         name="Sophos XG / SFOS firewalls",
         description="SFOS firewall system health, licensing and service "
@@ -342,6 +394,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="f5",
+        arcs=(3375, 12276),
+        vendor_key="f5",
         vendor="F5",
         name="F5 BIG-IP",
         description="BIG-IP system, local traffic (virtual servers, pools, "
@@ -356,6 +410,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="citrix",
+        arcs=(5951,),
+        vendor_key="citrix",
         vendor="Citrix",
         name="Citrix NetScaler / ADC",
         description="NetScaler ADC virtual servers, services and system "
@@ -367,6 +423,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="ruckus",
+        arcs=(25053,),
+        vendor_key="ruckus",
         vendor="Ruckus / CommScope",
         name="Ruckus wireless (ZoneDirector, SmartZone, Unleashed)",
         description="Ruckus controllers and access points across all three "
@@ -382,6 +440,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="cambium",
+        arcs=(161, 17713),
+        vendor_key="cambium",
         vendor="Cambium Networks",
         name="Cambium PMP / PTP / cnPilot",
         description="Point-to-multipoint access points and subscriber "
@@ -396,6 +456,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="aerohive",
+        arcs=(26928,),
+        vendor_key="aerohive",
         vendor="Aerohive / Extreme",
         name="Aerohive HiveOS access points",
         description="HiveOS access point system, interface and mesh "
@@ -408,6 +470,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="zyxel",
+        arcs=(890,),
+        vendor_key="zyxel",
         vendor="Zyxel",
         name="Zyxel switches and firewalls",
         description="Zyxel managed switches (hardware monitor, stacking, "
@@ -422,6 +486,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="tplink",
+        arcs=(11863,),
+        vendor_key="tpLink",
         vendor="TP-Link",
         name="TP-Link JetStream switches",
         description="System information and monitoring, PoE, VLANs, LLDP "
@@ -437,6 +503,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="eaton",
+        arcs=(534, 705),
+        vendor_key="eaton",
         vendor="Eaton",
         name="Eaton UPS and rack PDU",
         description="Eaton and MGE UPS battery, load and alarm objects, "
@@ -450,6 +518,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="liebert",
+        arcs=(476,),
+        vendor_key="vertiv",
         vendor="Vertiv / Liebert",
         name="Vertiv Liebert UPS and cooling",
         description="Liebert GP agent objects: UPS power, PDU, environmental "
@@ -464,6 +534,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="raritan",
+        arcs=(13742,),
+        vendor_key="raritan",
         vendor="Raritan / Legrand",
         name="Raritan PX rack PDU",
         description="Raritan PDU inlets, outlets, sensors and the KVM "
@@ -475,6 +547,8 @@ CATALOG: list[Bundle] = [
     ),
     Bundle(
         key="rittal",
+        arcs=(2606,),
+        vendor_key="rittal",
         vendor="Rittal",
         name="Rittal CMC III",
         description="CMC III rack monitoring: temperature, humidity, access "
@@ -494,6 +568,11 @@ CATALOG: list[Bundle] = [
                     "Ring and Turbo Chain redundancy, dual homing, fiber "
                     "check and digital I/O.",
         source="librenms/librenms (mibs/moxa)",
+        # Read from MOXA-GENERAL-MIB's own text: moxa ::= { enterprises 8691 }.
+        # Never guessed -- this is what makes the arc walk able to say "this
+        # device answers under an arc the Moxa bundle would decode".
+        arcs=(8691,),
+        vendor_key="moxa",
         # MOXA-GENERAL-MIB first: it defines the `moxa` root every other file
         # here imports, and a dependency loaded after its dependants resolves
         # in a later pass rather than on the first one.
@@ -514,6 +593,24 @@ CATALOG: list[Bundle] = [
 ]
 
 BUNDLES = {bundle.key: bundle for bundle in CATALOG}
+
+# arc -> bundle, first bundle in CATALOG order winning (cisco-core before
+# cisco-wireless, so a plain IOS box is pointed at the core bundle).
+BUNDLES_BY_ARC: dict[int, "Bundle"] = {}
+for _bundle in CATALOG:
+    for _arc in _bundle.arcs:
+        BUNDLES_BY_ARC.setdefault(_arc, _bundle)
+del _bundle, _arc
+
+# arc -> bundle key, the shape vendorid.decide() takes.
+ARC_KEYS: dict[int, str] = {arc: bundle.key for arc, bundle in BUNDLES_BY_ARC.items()}
+
+
+def bundle_for_arc(arc) -> "Bundle | None":
+    try:
+        return BUNDLES_BY_ARC.get(int(arc))
+    except (TypeError, ValueError):
+        return None
 
 
 def bundle(key: str) -> Bundle | None:

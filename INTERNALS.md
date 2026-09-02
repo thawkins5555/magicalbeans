@@ -151,6 +151,88 @@ bit — matching the trap receiver's own inbound-decryption deferral;
 `nodesdb`'s schema has no privacy-protocol column at all, so the UI never
 offers configuring it in the first place.
 
+### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll.py`)
+
+**The arc hop.** Vendor identity lives entirely under `1.3.6.1.4.1`. A
+GETNEXT at `1.3.6.1.4.1` lands on the first object under the first populated
+enterprise arc N; a GETNEXT at `1.3.6.1.4.1.(N+1)` skips arc N entirely and
+lands on the next. `vendorid.hop_enterprise_arcs(getnext)` enumerates every
+arc a device populates in (arcs + 1) requests — typically three to eight —
+which is why it is affordable inside a discovery sweep and finds vendors this
+app holds no MIB for. Two loop guards end it: the reply must be strictly
+greater than the probe (`nodeoids.oid_key`, moved there from nodepoll so both
+import it) and its arc must exceed the last one recorded. `getnext` is
+injected: the poller's wrapper (`_getnext_one`) and discovery's
+(`_snmp_getnext_one`) both check `error_status`, because `_snmp_get_next`
+never did and a v1 agent answers a probe past its last object with
+`noSuchName` and the request OID echoed — which would read as a loop.
+
+**The fingerprint.** `build_mib_index` turns `nodesdb.enterprise_objects()`
+(a range predicate, `oid >= '1.3.6.1.4.1.' AND oid < '1.3.6.1.4.1/'`, so
+`ix_mib_objects_oid` is used — `LIKE` is case-insensitive and skips it) into
+object → *set of files*, so two MIBs defining the same object both get the
+credit, unlike `_oid_name_table`'s arbitrary winner. A file whose every
+enterprise object is the bare seven-part arc is root-only (the bundled
+`enterprise-roots.mib`) and never scores, the same "strictly below the arc"
+rule `has_mib_covering` applies. `fingerprint` credits each file with the
+walked objects it names under each arc and ranks by `(named / seen, named)`.
+The poller caches the index against `nodesdb.mib_generation()` and rebuilds
+only when the corpus changes.
+
+**Precedence** is `vendorid.decide`, in one place: manual > learned > a real
+vendor arc in sysObjectID (`trapoids.WELL_KNOWN` at high, the enterprise list
+at high if verified else medium) > the walk (an arc an installed MIB names
+objects under, by score; then a catalog arc; then any named arc — high with
+score ≥ 0.5 and ≥ 10 named, else medium) > a sysDescr word at low > the
+generic agent's own name at low. A real vendor arc is never replaced by a
+walked one: OEM gear implements the chipset vendor's arc alongside its own.
+`vendor_source` gained `walk`, `learned` and `manual`; `vendor_confidence` is
+new. The MIB to assign and the bundle to suggest follow the *decided* arc,
+never another. `poll_decision` is the zero-SNMP per-poll form: the same rule
+with the walk replaced by the stored walk verdict *for this sysObjectID*, so
+a walk-identified device stays stable between identifications and a manual or
+learned vendor takes effect on the next poll without a walk.
+
+**The walk runs off the poll pool** (`_VendorIdJob`, the `_OidWalkJob`
+shape): up to ~565 requests and 20 s by budget, but a device that stops
+answering half way pays its timeout per request on top, and on a 60 s
+profile that is an overrun parked on one of four workers. `_maybe_identify`
+starts one when `_identification_due` says so — never identified, identified
+for a different sysObjectID, or the last run failed and an hour has passed
+(at most three attempts) — and skips when `vendor_walk_parallel` jobs are
+already running, which is what throttles the post-upgrade burst. A hop that
+times out with no arcs is an error, not a verdict. The fingerprint walk runs
+with `snmp_retries = 0`; the hop keeps the device's retries because a missed
+hop loses an arc. Once `identified_ts` is set for the current sysObjectID,
+`_identification_due` returns False before any I/O: the steady-state cost is
+zero.
+
+**Coverage and assignment key on the decided arc.** `_check_vendor_mib`
+reads `vendor_detected` and `vendor_arc` from `poll_decision`, so a net-snmp
+device the walk identified as Phoenix Contact records `mib_missing` for arc
+4346 rather than silently passing on arc 8072. While a walk is still due the
+poll path defers assignment (`defer_assignment`), because assignment never
+overrides an existing choice and the walk's pick — the file that actually
+named this device's objects — must not lose to "the file with the most
+objects under the arc" merely by arriving second.
+
+**Learning.** `set_vendor_override` writes `vendor_detected` as well as
+`vendor` (the operator is asserting the real maker, so ConfigRX and the Cisco
+MAC read follow — unlike `vendor_oid`, which stays display-only) and upserts
+`vendor_learned` keyed on sysObjectID. `_learnable` refuses a generic-agent
+arc or a sysObjectID outside enterprises: `8072.3.2.10` is every Linux box.
+Clearing deletes the learned row only when this device made it, then
+re-decides the row at once.
+
+**`enterprises.py`** keeps VERIFIED (read from MIB text: every WELL_KNOWN
+root plus the catalog arcs checked for 4.32 — 6027, 14179, 47196, 4413, 3375,
+17713, 705, 534) apart from CURATED (from memory; the IANA registry is not
+reachable from the build environment). `vendor_for` falls back to it after
+WELL_KNOWN misses, so `identify_vendor`, `suggest_group` and `browse_bases`
+inherit the names; `_arc_confidence` checks the tables directly because
+`vendor_for` can no longer tell the two apart. `mibcatalog.Bundle.arcs` and
+`vendor_key` join the catalog to the same vocabulary.
+
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
 `vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`
@@ -198,20 +280,15 @@ release that added this note: it changes how every v1-configured device is
 polled, and deserves its own change with its own testing rather than riding
 along with vendor identification.
 
-**Built-in vendor probes** (`nodeoids.VENDOR_PROBES`, `probe_oids()`,
-`vendor_from_probe()`) use the same separate-GET mechanism, and must: they are
-proprietary objects that by definition most devices do not implement, so
-merging one into the identity request would put the failure mode above in front
-of every device on the network. `(oid, needle, vendor)` triples, matched
-case-insensitively against the answer, currently one entry — Moxa's, under its
-own 8691 arc. The probe runs only when `identify_vendor()` returned nothing or
-returned a member of `GENERIC_AGENT_VENDORS`, which is exactly the population
-the sysDescr fallback was written for: a Moxa switch answering net-snmp's arc
-and describing itself as Linux. A device the standard sources named never pays
-the round trip. A hit sets `vendor`, `vendor_detected` and
-`vendor_source="probe"` — its own source value, because "(vendor OID)" and
-"(custom OID)" are different claims and the column exists to keep sources of
-different standing distinguishable.
+**A per-vendor probe OID was tried here and removed.** An earlier cut of this
+work read one proprietary Moxa scalar in a separate GET when the standard
+sources named nothing, which worked but scaled by hand: one hardcoded OID per
+vendor, each needing that vendor's MIB to find. The enterprise-arc walk in
+`vendorid.py` answers the same question generically — it enumerates the arcs a
+device actually populates, so it names Moxa from arc 8691 with no per-vendor
+knowledge at all, and names vendors this application holds no MIB for. The
+probe table, `probe_oids()`, `vendor_from_probe()` and the `vendor_source`
+value `"probe"` are all gone; `walk` is the source value that replaced it.
 
 **Display names** (`nodeoids.VENDOR_LABELS`, `vendor_label()`) are presentation
 only, applied in `api._device_json` as a separate `vendor_label` field rather

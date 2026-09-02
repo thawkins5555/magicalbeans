@@ -89,6 +89,30 @@ def enum_text(key: str, value) -> str:
 ENTERPRISES = "1.3.6.1.4.1"
 
 
+def oid_key(oid: str) -> tuple:
+    """An OID as a tuple of ints, so "…1.10" orders after "…1.9" rather than
+    between "…1.1" and "…1.2" the way string comparison would put it. A
+    malformed arc sorts as a string after every numeric one — the callers
+    only ever ask "did the walk advance?", and a garbled answer did not.
+
+    Lives here rather than in nodepoll because vendorid needs it too, and
+    nodepoll imports vendorid."""
+    return tuple((0, int(arc)) if arc.isdigit() else (1, arc)
+                 for arc in str(oid).split("."))
+
+
+def enterprise_arc(oid: str) -> int | None:
+    """The enterprise number of an OID under `enterprises`, or None for
+    anything outside it: '1.3.6.1.4.1.9.1.1208' -> 9."""
+    root = enterprise_root(oid)
+    if not root:
+        return None
+    try:
+        return int(root.split(".")[6])
+    except (IndexError, ValueError):
+        return None
+
+
 def enterprise_root(sys_object_id: str) -> str:
     """'1.3.6.1.4.1.9.1.1208' -> '1.3.6.1.4.1.9' (the vendor's own arc).
     Empty for anything outside the enterprises subtree — a device whose
@@ -107,7 +131,11 @@ def enterprise_root(sys_object_id: str) -> str:
 
 def vendor_for(sys_object_id: str) -> str:
     """Longest-prefix match against trapoids.WELL_KNOWN's vendor-root
-    entries, reused rather than duplicated."""
+    entries, reused rather than duplicated; then, for an arc that table
+    does not name, the bundled enterprise-number list (enterprises.py) —
+    so a device under an arc this app holds no MIB for still gets a name
+    rather than a number. Callers that need to know how much to trust the
+    name ask enterprises.is_verified()."""
     from .trapoids import WELL_KNOWN
     if not sys_object_id:
         return ""
@@ -117,6 +145,12 @@ def vendor_for(sys_object_id: str) -> str:
         name = WELL_KNOWN.get(".".join(parts[:cut]))
         if name:
             return name
+    arc = enterprise_arc(oid)
+    if arc is not None:
+        from . import enterprises
+        hit = enterprises.lookup(arc)
+        if hit:
+            return hit[0]
     return ""
 
 
@@ -211,65 +245,16 @@ GENERIC_AGENT_VENDORS = frozenset({"netSnmp", "ucdavis"})
 # on authorizationError, so sysDescr, sysObjectID, sysName and sysLocation
 # would all come back blank with no exception to catch. One unanswerable OID
 # must not be able to blank a device's identity.
-VENDOR_PROBES: tuple[tuple[str, str, str], ...] = (
-    # Moxa's own switch tree. Moxa gear routinely answers 1.3.6.1.4.1.8072.x
-    # (net-snmp) for sysObjectID and says nothing useful in sysDescr, which is
-    # exactly the class this probe exists for.
-    ("1.3.6.1.4.1.8691.15.33.1.5.3.1.2.2", "moxa", "moxa"),
-)
-
-
-def probe_oids() -> tuple[str, ...]:
-    """Every OID in VENDOR_PROBES, in order, for one GET."""
-    return tuple(oid for oid, _needle, _vendor in VENDOR_PROBES)
-
-
-def probe_arc(vendor: str) -> str:
-    """The enterprise arc of the probe OID that names `vendor`, or "".
-
-    A probe exists precisely because the device's sysObjectID does NOT name
-    its maker -- Moxa gear answers the net-snmp arc -- so once a probe has
-    identified one, the sysObjectID is the wrong OID to ask coverage
-    questions about: no Moxa MIB will ever describe objects under
-    1.3.6.1.4.1.8072, and a mib_missing alert raised against it could never
-    be cleared by installing the Moxa bundle. The probe OID sits inside the
-    vendor's own tree, so its arc is the right question to ask instead.
-    """
-    for oid, _needle, probe_vendor in VENDOR_PROBES:
-        if probe_vendor == vendor:
-            return enterprise_root(oid)
-    return ""
-
-
-def vendor_from_probe(values: dict) -> str:
-    """Best-effort vendor from a vendor-probe GET's answers. Empty when
-    nothing answered or nothing matched -- same contract as
-    vendor_from_descr, and deliberately not a fuzzy guess."""
-    for oid, needle, vendor in VENDOR_PROBES:
-        value = (values or {}).get(oid)
-        if value is None:
-            continue
-        if needle in str(value).strip().lower():
-            return vendor
-    return ""
-
-
-# Display names for vendor keys whose token does not read as the vendor's own
-# name. The KEY is what everything that behaves per-vendor compares against --
-# ConfigRX's backup command, the Cisco per-VLAN MAC read, discovery's profile
-# suggestion -- so it stays a lowercase/camelCase token and is never rewritten
-# to a pretty string. This map is presentation only, and a key with no entry
-# falls through unchanged, so adding one moves nothing else.
-VENDOR_LABELS: dict[str, str] = {
-    "moxa": "Moxa",
-    "rockwellAutomation": "Rockwell Automation",
-}
-
-
+# Display names live in enterprises.py, beside the arc table that already
+# carries one for every vendor named by an arc -- a second table here would
+# drift out of step with it. The KEY is still what everything that behaves
+# per-vendor compares against (ConfigRX's backup command, the Cisco per-VLAN
+# MAC read, discovery's profile suggestion), so it stays a lowercase/camelCase
+# token and is never rewritten to a pretty string.
 def vendor_label(vendor: str) -> str:
-    """The display form of a vendor key, or the key itself."""
-    key = (vendor or "").strip()
-    return VENDOR_LABELS.get(key, key)
+    """A vendor key as its maker's own name, or the key unchanged."""
+    from . import enterprises
+    return enterprises.display_name(vendor or "")
 
 
 def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:

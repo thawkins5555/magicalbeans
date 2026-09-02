@@ -29,6 +29,7 @@ from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
 from .. import nodeoids
 from .. import configrx
+from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
 
@@ -1542,6 +1543,12 @@ def _device_json(row) -> dict:
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
+        # Vendor identification (4.32): keyed defensively for a row handed
+        # in from an older-shaped source.
+        "vendor_confidence": (row["vendor_confidence"] or ""
+                              if "vendor_confidence" in row.keys() else ""),
+        "vendor_override": (row["vendor_override"]
+                            if "vendor_override" in row.keys() else None),
         "sys_descr": row["sys_descr"], "sys_name": row["sys_name"],
         "sys_object_id": row["sys_object_id"], "sys_contact": row["sys_contact"],
         "sys_location": row["sys_location"], "vendor": row["vendor"],
@@ -1614,16 +1621,42 @@ def _discovery_job_json(row) -> dict:
             "error": row["error"]}
 
 
-def _discovery_result_json(row) -> dict:
+def _discovery_result_json(row, installed=None) -> dict:
+    """`installed` is the set of MIB filenames present, passed by the caller
+    once per listing so the "install these MIBs" hint is not a query per row."""
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
             "snmp_version": row["snmp_version"], "sys_descr": row["sys_descr"],
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
-            "vendor": row["vendor"],
-            "vendor_label": nodeoids.vendor_label(row["vendor"] or ""),
-            "suggested_group_id": row["suggested_group_id"],
-            "promoted_device_id": row["promoted_device_id"]}
+            "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
+            "promoted_device_id": row["promoted_device_id"],
+            **_discovery_identification(row, installed)}
+
+
+def _discovery_identification(row, installed=None) -> dict:
+    """What the sweep's arc hop found for a result, or blanks for a row
+    written before 4.32."""
+    keys = row.keys()
+    arcs = []
+    if "arcs" in keys and row["arcs"]:
+        try:
+            arcs = [int(a) for a in json.loads(row["arcs"])]
+        except (TypeError, ValueError):
+            arcs = []
+    bundle_key = (row["suggest_bundle"] if "suggest_bundle" in keys else None) or None
+    bundle = mibcatalog.bundle(bundle_key) if bundle_key else None
+    bundle_installed = bool(bundle) and installed is not None and \
+        all(fn in installed for fn, _url in bundle.files)
+    return {
+        "vendor_source": (row["vendor_source"] if "vendor_source" in keys else "") or "",
+        "vendor_confidence": (row["vendor_confidence"]
+                              if "vendor_confidence" in keys else "") or "",
+        "arcs": arcs,
+        "arc_names": [vendorid.arc_name(a) for a in arcs],
+        "suggest_bundle": bundle_key,
+        "suggest_bundle_installed": bundle_installed,
+    }
 
 
 _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
@@ -1633,7 +1666,8 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
-                         "vendor_oid", "location_oid", "mac_table_interval_s")
+                         "vendor_oid", "location_oid", "mac_table_interval_s",
+                         "vendor_override")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
@@ -1780,7 +1814,41 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     device["polling"] = device_id in service.node_poller.worker_state()
     mute = service.alerts_db.mute_row("device", str(device_id))
     device["muted_until"] = mute["until_ts"] if mute else None
+    device.update(_identification_json(service, row))
     return {"device": device}
+
+
+def _identification_json(service, row) -> dict:
+    """The vendor identification detail for one device: the stored evidence
+    (parsed), whether a walk is running, where a learned vendor came from,
+    and the catalog bundle to suggest, resolved to something a button can
+    install."""
+    keys = row.keys()
+    evidence = vendorid._evidence_dict(row) if "vendor_evidence" in keys else {}
+    learned_from = None
+    if (row["vendor_source"] or "") == "learned":
+        learned = service.nodes_db.learned_row(row["sys_object_id"] or "")
+        if learned is not None:
+            learned_from = {"device_id": learned["source_device_id"],
+                            "set_by": learned["set_by"], "set_ts": learned["set_ts"]}
+    suggest = None
+    key = evidence.get("suggest_bundle")
+    if key:
+        bundle = mibcatalog.bundle(key)
+        if bundle is not None:
+            have = {mib["filename"] for mib in service.nodes_db.mib_files()}
+            suggest = {"key": bundle.key, "name": bundle.name, "vendor": bundle.vendor,
+                       "installed": all(fn in have for fn, _url in bundle.files)}
+    learnable, learn_reason = service.nodes_db._learnable(row["sys_object_id"] or "")
+    return {
+        "vendor_evidence": evidence,
+        "identified_ts": row["identified_ts"] if "identified_ts" in keys else None,
+        "identifying": service.node_poller.identifying(row["id"]),
+        "learned_from": learned_from,
+        "suggest_bundle": suggest,
+        "vendor_display": enterprises.display_name(row["vendor_detected"] or row["vendor"] or ""),
+        "learnable": learnable, "learn_reason": learn_reason,
+    }
 
 
 def _check_display_name_source(body) -> None:
@@ -1794,8 +1862,21 @@ def put_nodes_device(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     _check_display_name_source(body)
     fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
-    service.nodes_db.update_device(device_id, **fields)
-    return {"ok": True}
+    result = {"ok": True}
+    if "vendor_override" in fields:
+        # Not a plain column write: setting a vendor by hand also teaches
+        # the fleet (when the sysObjectID is specific enough) and clearing
+        # it re-decides the row, both of which nodesdb.set_vendor_override
+        # owns. Everything else in the body still goes the ordinary way.
+        value = fields.pop("vendor_override")
+        value = str(value or "").strip()
+        if len(value) > 64:
+            raise ValueError("A vendor name is at most 64 characters")
+        result["vendor"] = service.nodes_db.set_vendor_override(
+            device_id, value or None, params.get("_username", ""))
+    if fields:
+        service.nodes_db.update_device(device_id, **fields)
+    return result
 
 
 def delete_nodes_device(service, params, body, device_id) -> dict:
@@ -1988,6 +2069,56 @@ def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
 
 def delete_nodes_device_oid_walk(service, params, body, device_id) -> dict:
     return {"cancelled": service.node_poller.cancel_oid_walk(int(device_id))}
+
+
+def post_nodes_device_identify(service, params, body, device_id) -> dict:
+    """Re-identify: start the bounded vendor walk now, or report the one
+    already running. A job, not a synchronous answer — the walk is up to
+    20 s, the page refreshes every few seconds, and bulk cannot wait."""
+    return {"job": service.node_poller.start_identify(int(device_id), trigger="manual")}
+
+
+def get_nodes_device_identify(service, params, body, device_id) -> dict:
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    return {"job": service.node_poller.identify_status(int(device_id)),
+            "result": {"vendor": row["vendor"], "vendor_detected": row["vendor_detected"],
+                       "vendor_source": row["vendor_source"] or "",
+                       "vendor_confidence": (row["vendor_confidence"] or ""
+                                             if "vendor_confidence" in row.keys() else ""),
+                       **_identification_json(service, row)}}
+
+
+def delete_nodes_device_identify(service, params, body, device_id) -> dict:
+    return {"cancelled": service.node_poller.cancel_identify(int(device_id))}
+
+
+def post_nodes_devices_bulk_identify(service, params, body) -> dict:
+    """Re-identify every ticked device. Id lists back, the bulk-poll shape:
+    an operator who ticked twelve switches deserves to know which three
+    were skipped and why."""
+    device_ids = _bulk_device_ids(body)
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(device_ids)}
+    queued, running, snmp_off, missing = [], [], [], []
+    for device_id in device_ids:
+        row = rows.get(device_id)
+        if row is None:
+            missing.append(device_id)
+            continue
+        if not service.nodes_db.effective_config(row).get("snmp_enabled", True):
+            snmp_off.append(device_id)
+            continue
+        if service.node_poller.identifying(device_id):
+            running.append(device_id)
+            continue
+        service.node_poller.start_identify(device_id, trigger="manual")
+        queued.append(device_id)
+    if queued:
+        service.log.add(NODES_CATEGORY,
+                        f"Re-identify requested for {len(queued)} device(s)")
+    return {"ok": True, "queued": queued, "already_running": running,
+            "snmp_disabled": snmp_off, "missing": missing}
 
 
 def _oid_walk_filename(status) -> str:
@@ -2507,8 +2638,9 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     if not job:
         raise ValueError("No such discovery job")
     results = service.nodes_db.discovery_results(job_id)
+    installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r) for r in results]}
+            "results": [_discovery_result_json(r, installed) for r in results]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -2687,6 +2819,7 @@ def get_nodes_mib_catalog(service, params, body) -> dict:
             "file_count": bundle.file_count, "present": present,
             "installed": present == bundle.file_count,
             "files": [filename for filename, _ in bundle.files],
+            "arcs": list(bundle.arcs), "vendor_key": bundle.vendor_key,
         })
     return {"bundles": bundles, "job": service.mib_install_status()}
 
