@@ -46,6 +46,11 @@ netpath/
     api.py         JSON endpoint handlers, one function per route
     server.py      HTTP(S) server, routing, sessions, static files
     static/        the browser interface
+tests/
+  run_all.py       runs every tests/test_*.py as its own process, PASS/FAIL per file
+  _paths.py        repo root on sys.path, free ports, spawn_stub() for a child stub agent
+  stubs/           minimal UDP SNMP agents the end-to-end suites talk to
+  test_*.py        the suites themselves (see tests/README.md)
 ```
 
 ## Process model
@@ -3377,3 +3382,37 @@ above — `selectTab`/`master()`/the reload-restores-tab logic all key off
 `pages[name]` existing, so a tab with no module registered would either
 throw or silently never refresh. `page-dashboard`'s markup in
 `index.html` is static content, no chart or table of its own yet.
+
+## Tests (`tests/`)
+
+The end-to-end suites are plain scripts, standard library only like the rest
+of the application, run one per process by `tests/run_all.py`. They are not a
+unit-test layer: each one drives a real `NodePoller`, `DiscoveryJob`,
+`WirelessPoller` or the whole `Service` + `WebServer` against a **stub SNMP
+agent** — a few dozen lines of UDP socket that answers GET/GETNEXT for a
+fixed OID table using `snmppoll`/`trapdecode`'s own encoders, so the wire
+format under test is the application's own on both ends.
+
+The one rule that makes them repeatable: **a suite owns its stub.**
+`_paths.spawn_stub("<script>.py")` picks a free loopback UDP port, starts
+`tests/stubs/<script>` as a child process with that port as `argv[1]`, and
+returns only after reading the stub's one-line "listening" banner from its
+stdout — so the socket is bound before the first request, with no sleep to
+guess at. The suite then points the module under test at the port by
+patching its port constant (`nodepoll.DEFAULT_SNMP_PORT`,
+`nodediscover.DEFAULT_SNMP_PORT`, `fortipoll.SNMP_PORT`) and kills the child
+in a `finally` or an `atexit` hook. Two suites (`test_nodepoll_e2e.py`,
+`test_nodediscover_e2e.py`) use an in-process `StubAgent` thread instead,
+for the cases that need to mutate the agent mid-test (an interface flapping,
+a reboot, the agent going dark). Databases go to `tempfile.mkdtemp()`; ports
+are never fixed; suites can run in parallel.
+
+Two of the suites encode rules that are easy to mistake for bugs when read
+cold. Discovery gets its community list only from the polling profile the
+job was started with (`api._discovery_communities_for_group` →
+`discovery_communities` override → `nodediscover._candidate_communities`,
+"no fallback guess"), so a `DiscoveryJob` started from Python with no
+override attempts no SNMP at all. And `NodePoller.promote` leaves a
+promoted device's manual name as the IP on purpose and seeds `sys_name`
+into the identity instead, so the display name follows the device and a
+later rename is never shadowed by a copied sysName.
