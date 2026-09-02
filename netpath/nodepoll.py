@@ -1062,6 +1062,16 @@ class NodePoller:
         # Read without the usual `or 1` fallback, which turns a configured 0
         # (v1) into 1 (v2c) and would make the branch below unreachable for
         # exactly the devices it protects.
+        #
+        # KNOWN, and the reason this split currently protects nobody: _snmp_get
+        # applies that very fallback (`int(config.get("snmp_version") or 1)`),
+        # so a device configured for v1 is actually polled as v2c and the
+        # noSuchName case above cannot arise as things stand. The split is kept
+        # because it is correct the moment that coercion is fixed, and costs one
+        # extra GET only on v1-configured devices that set a custom identity
+        # OID. Fixing the coercion is a separate change: it alters how every
+        # v1-configured device is polled, which is not something to slip into a
+        # release about vendor identification.
         configured_version = config.get("snmp_version")
         is_v1 = configured_version is not None and int(configured_version) == 0
         custom = nodeoids.identity_oid_variants(config)
@@ -1164,8 +1174,19 @@ class NodePoller:
         # reported as missing a "system MIB" that does not exist.
         vendor = identity.get("vendor") or nodeoids.identify_vendor(
             sys_object_id, identity.get("sys_descr") or "")[0]
-        applicable = bool(sys_object_id) and \
-            bool(nodeoids.enterprise_root(sys_object_id)) and bool(vendor)
+        # Coverage is asked about the vendor's OWN arc, which is not always the
+        # sysObjectID's. A probe-identified device is by definition one whose
+        # sysObjectID names something else -- Moxa gear answers the net-snmp
+        # arc -- so asking whether an uploaded MIB describes 1.3.6.1.4.1.8072
+        # would report "no Moxa MIB" forever, and installing the Moxa bundle
+        # (rooted at 8691) could never clear the alert it raised.
+        coverage_oid = sys_object_id
+        if identity.get("vendor_source") == "probe":
+            arc = nodeoids.probe_arc(vendor)
+            if arc:
+                coverage_oid = arc
+        applicable = bool(coverage_oid) and \
+            bool(nodeoids.enterprise_root(coverage_oid)) and bool(vendor)
         was_covered = previous["mib_covered"]      # None / 0 / 1
         if not applicable:
             # The coverage question doesn't apply (no identity yet, a
@@ -1174,21 +1195,21 @@ class NodePoller:
             if was_covered is not None:
                 self.db.set_mib_covered(device_id, None)
             return
-        covered = self.db.has_mib_covering(sys_object_id)
+        covered = self.db.has_mib_covering(coverage_oid)
         if covered:
-            self._auto_assign_mib(device_id, sys_object_id, vendor)
+            self._auto_assign_mib(device_id, coverage_oid, vendor)
         if covered and not (was_covered is None or was_covered):
             # uncovered -> covered: the MIB arrived. CLEARS resolves the
             # standing mib_missing alert off this event.
             self.db.record_device_event(
                 device_id, "mib_present",
                 f"An uploaded MIB now describes {vendor} objects "
-                f"({sys_object_id}); vendor-specific data can be decoded.")
+                f"({coverage_oid}); vendor-specific data can be decoded.")
         elif not covered and (was_covered is None or was_covered):
             # first verdict, or covered -> uncovered (a MIB was deleted).
             self.db.record_device_event(
                 device_id, "mib_missing",
-                f"No uploaded MIB describes {vendor} objects ({sys_object_id}). "
+                f"No uploaded MIB describes {vendor} objects ({coverage_oid}). "
                 f"Upload the {vendor} MIB under Nodes → Profiles & MIBs to decode "
                 f"this device's vendor-specific data.")
         if was_covered is None or bool(was_covered) != covered:

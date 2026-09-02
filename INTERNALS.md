@@ -186,6 +186,18 @@ costs nothing but itself. Note that the version is read as
 `config.get("snmp_version")` directly rather than through the usual
 `int(config.get("snmp_version") or 1)`, which turns a configured 0 into 1.
 
+**That guard is, as things stand, unreachable — a known defect.** `_snmp_get()`
+resolves the version with exactly the `or 1` fallback described above, so a
+device configured for SNMPv1 (`snmp_version = 0`) is put on the wire as v2c and
+the `noSuchName` case never occurs. SNMPv1 is therefore never actually spoken by
+the poller, whatever the profile says. The separate-GET split above is kept
+because it becomes correct the instant that coercion is fixed, and because its
+only cost meanwhile is one extra GET on v1-configured devices that also set a
+custom identity OID. Fixing the coercion is deliberately out of scope of the
+release that added this note: it changes how every v1-configured device is
+polled, and deserves its own change with its own testing rather than riding
+along with vendor identification.
+
 **Built-in vendor probes** (`nodeoids.VENDOR_PROBES`, `probe_oids()`,
 `vendor_from_probe()`) use the same separate-GET mechanism, and must: they are
 proprietary objects that by definition most devices do not implement, so

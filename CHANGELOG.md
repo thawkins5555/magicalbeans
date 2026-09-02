@@ -117,12 +117,19 @@ Listed newest first. Version numbers are build order, not dates.
   port status, PoE, Turbo Ring and Turbo Chain redundancy, dual homing, fiber
   check and digital I/O. Fetched from LibreNMS's public tree at install time
   like every other bundle; nothing is mirrored here.
-- **Fixed: a custom identity OID could blank a v1 device's identity.** A device
-  with a Vendor OID or Location OID set had it read in the same request as
-  sysDescr and sysObjectID, in both its bare and its `.0` form — of which one
-  cannot answer by construction. That is free on v2c and v3, which report a
-  missing object per-object, and destroys the whole answer on SNMPv1. A device
-  configured for v1 now has its custom identity OIDs read separately.
+- **Guarded, not yet fixed: a custom identity OID would blank a v1 device's
+  identity.** A device with a Vendor OID or Location OID set has it read in the
+  same request as sysDescr and sysObjectID, in both its bare and its `.0` form —
+  of which one cannot answer by construction. That is free on v2c and v3, which
+  report a missing object per-object, and would destroy the whole answer on
+  SNMPv1. A device configured for v1 now has its custom identity OIDs read in a
+  separate, best-effort request. **This guard cannot currently take effect**, and
+  the reason is worth stating plainly: the polling code resolves the SNMP version
+  as `snmp_version or 1`, so a device configured for v1 (stored as `0`) is
+  actually polled as v2c and the failure never arises. Correcting that coercion
+  changes how every v1-configured device is polled and is not being slipped into
+  a release about vendor identification; it is recorded here as a known defect,
+  and the guard is in place for when it is fixed.
 
 ### 4.31.0 — Mute a device, sustain a threshold, find a MAC
 

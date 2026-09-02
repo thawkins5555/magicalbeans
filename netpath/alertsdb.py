@@ -264,8 +264,17 @@ _BUILTIN_RULES = [
     #
     # - Unreachable is 100% loss to the destination on three traces in a row,
     #   which on the shipped interval is a quarter of an hour of a destination
-    #   answering nothing at all. Clearing at 50 means one answered probe out
-    #   of three ends it.
+    #   answering nothing at all. It clears at 100 rather than at some lower
+    #   figure because loss is quantised by the probe count and the clear test
+    #   is `value < clear_threshold`: with the default 3 probes the only values
+    #   are 0, 33.3, 66.7 and 100, so a clear of 50 left one answered probe
+    #   (66.7) neither breaching nor clearing -- the alert stayed open, still
+    #   labelled unreachable, while the destination was answering, and its
+    #   rollup kept "path repeatedly failing" suppressed behind it. Clearing at
+    #   100 means ANY answered probe ends it, at any probe count, which is what
+    #   "unreachable" is supposed to mean. That leaves no hysteresis gap, and
+    #   needs none: this metric does not drift around a threshold the way a
+    #   continuous one does, and the three-trace streak is the anti-flap.
     # - Unstable is a windowed rule, and the only one of the three that can
     #   see a path that works intermittently -- consecutive-failure counting
     #   by definition cannot. Half the traces in the window must have failed,
@@ -276,7 +285,7 @@ _BUILTIN_RULES = [
     #   whatever that destination is already configured to warn at, floored so
     #   a destination warned at a handful of milliseconds does not alert on
     #   ordinary jitter.
-    ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 50.0, 3),
+    ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 100.0, 3),
     ("netpath_path_unstable", "NetPath path repeatedly failing", "netpath_threshold", "trace_unreached_pct", 4, "threshold_breach", 50.0, 20.0, 1),
     ("netpath_latency_high", "NetPath latency far above normal", "netpath_threshold", "trace_rtt_warn_pct", 4, "threshold_breach", 300.0, 150.0, 3),
 ]

@@ -315,6 +315,16 @@ class AlertEngine:
         rather than guessed at: an outage of unknown length is not a
         zero-length one.
 
+        The event-log fallback needs one more bound than "the newest down
+        before this up", because an `up` event is NOT written only after a
+        `down`: nodepoll records one on any non-up to up transition, an
+        `unsupported` status and a credential failure included. So a device
+        that went down last Tuesday, recovered, and today came back from a
+        broken community string would pair today's recovery with Tuesday's
+        outage and report a multi-day downtime that never happened. A `down`
+        only counts when no `up` sits between it and this one — i.e. when it
+        is the transition THIS recovery ends.
+
         Recovery time is the event's own timestamp, which is the poll that saw
         the device answer — not the moment this tick got round to it, which is
         up to one tick later and unboundedly later after a restart.
@@ -325,6 +335,11 @@ class AlertEngine:
             previous = self.nodes_db.last_device_event_before(
                 device["id"], "down", recovered_ts)
             down_since = previous["ts"] if previous else None
+            if down_since is not None:
+                recovered_before = self.nodes_db.last_device_event_before(
+                    device["id"], "up", recovered_ts)
+                if recovered_before and recovered_before["ts"] >= down_since:
+                    down_since = None
         downtime = alertmail.duration_text(
             recovered_ts - down_since) if down_since else ""
         lead = row["detail"] or "responding again"
@@ -754,10 +769,16 @@ class AlertEngine:
     # a windowed rule is for.
     NETPATH_MIN_WINDOW_TRACES = 5
 
-    def _netpath_metrics(self, target, trace) -> dict:
+    def _netpath_metrics(self, target, trace, wants_window: bool = True) -> dict:
         """{source_kind: (value, message, extra)} for one destination's newest
         trace. A metric that cannot honestly be computed is absent, and an
         absent metric neither fires nor clears its rule.
+
+        `wants_window` is False when no enabled rule consumes the windowed
+        share, which skips the only query here that is not already in hand:
+        reach_summary reads a whole window per destination, changes only
+        when a trace lands, and would otherwise run twelve times a minute
+        per destination under the lock Monitor writes traces with.
 
         Only the destination hop is ever measured, which is the same rule the
         route graph and the timeline follow (monitor.classify): intermediate
@@ -798,7 +819,8 @@ class AlertEngine:
         interval = float(target["interval_s"] or 300)
         t1 = trace["started_ts"]
         window = max(3600.0, 6 * interval)
-        summary = self.netpath_db.reach_summary(target["id"], t1 - window, t1)
+        summary = (self.netpath_db.reach_summary(target["id"], t1 - window, t1)
+                   if wants_window else {"measured": 0, "unreached": 0})
         if summary["measured"] >= self.NETPATH_MIN_WINDOW_TRACES:
             share = 100.0 * summary["unreached"] / summary["measured"]
             metrics["trace_unreached_pct"] = (
@@ -823,7 +845,15 @@ class AlertEngine:
             metrics["trace_rtt_warn_pct"] = (
                 share,
                 f"{label}: {float(rtt):.0f} ms to {host}, {share / 100:.1f}x "
-                f"its {warn:.0f} ms warn threshold",
+                # `scale`, not `warn`: below the floor the two differ, and
+                # printing the multiple against one while computing it against
+                # the other renders "1.5x its 5 ms warn threshold" for a 30 ms
+                # reading. Where the floor applied, say so rather than quoting a
+                # threshold the number was not measured against.
+                + (f"its {warn:.0f} ms warn threshold"
+                   if scale == warn else
+                   f"the {scale:.0f} ms floor (its {warn:.0f} ms warn "
+                   f"threshold is below it)"),
                 {"metric_label": self.NETPATH_METRIC_LABELS["trace_rtt_warn_pct"],
                  "value": f"{share:.0f}", "rtt_ms": f"{float(rtt):.0f}",
                  "warn_rtt_ms": f"{warn:.0f}"})
@@ -856,6 +886,8 @@ class AlertEngine:
                  if r["enabled"] and r["kind"] == "netpath_threshold"]
         if not rules:
             return []
+        wants_window = any((r["source_kind"] or "") == "trace_unreached_pct"
+                          for r in rules)
         targets = [t for t in self.netpath_db.targets() if t["enabled"]]
         latest = self.netpath_db.last_traces([t["id"] for t in targets])
 
@@ -870,10 +902,20 @@ class AlertEngine:
                 continue
             label = target["label"] or target["host"]
             entity_id = str(target["id"])
-            metrics = self._netpath_metrics(target, trace)
+            metrics = self._netpath_metrics(target, trace, wants_window)
             for rule in rules:
                 source = rule["source_kind"] or ""
                 if source not in metrics:
+                    # Drop the streak rather than leaving it standing. A metric
+                    # goes absent when it cannot be computed honestly -- the
+                    # window fell below its sample floor, or the destination
+                    # was not reached so latency is unmeasurable -- and that is
+                    # a break in the consecutive run, not a pause in it.
+                    # Leaving it would let two breaching traces, a half-hour
+                    # outage, and one more breaching trace add up to the three
+                    # in a row this rule asks for. _evaluate_thresholds drops
+                    # its streak on a missing sample for the same reason.
+                    self._netpath_streaks.pop((rule["id"], entity_id), None)
                     continue
                 value, message, extra = metrics[source]
                 streak_key = (rule["id"], entity_id)

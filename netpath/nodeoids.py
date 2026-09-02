@@ -224,6 +224,23 @@ def probe_oids() -> tuple[str, ...]:
     return tuple(oid for oid, _needle, _vendor in VENDOR_PROBES)
 
 
+def probe_arc(vendor: str) -> str:
+    """The enterprise arc of the probe OID that names `vendor`, or "".
+
+    A probe exists precisely because the device's sysObjectID does NOT name
+    its maker -- Moxa gear answers the net-snmp arc -- so once a probe has
+    identified one, the sysObjectID is the wrong OID to ask coverage
+    questions about: no Moxa MIB will ever describe objects under
+    1.3.6.1.4.1.8072, and a mib_missing alert raised against it could never
+    be cleared by installing the Moxa bundle. The probe OID sits inside the
+    vendor's own tree, so its arc is the right question to ask instead.
+    """
+    for oid, _needle, probe_vendor in VENDOR_PROBES:
+        if probe_vendor == vendor:
+            return enterprise_root(oid)
+    return ""
+
+
 def vendor_from_probe(values: dict) -> str:
     """Best-effort vendor from a vendor-probe GET's answers. Empty when
     nothing answered or nothing matched -- same contract as

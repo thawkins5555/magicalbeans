@@ -35,7 +35,13 @@ BUILTIN_TEMPLATES = {
         # only some of those are a device answering again.
         "body": (
             "{{device_name}} ({{device_ip}}) has recovered as of {{recovered_time}}.\n\n"
-            "Down since {{down_since}} — {{downtime}} in total.\n\n"
+            # One token, not "Down since {{down_since}} — {{downtime}} in
+            # total.": templates have no conditionals, so a recovery whose
+            # outage start is unknown rendered the literal text
+            # "Down since  —  in total." The whole sentence, trailing blank
+            # line included, is built in build_context and is "" when there
+            # is nothing honest to say.
+            "{{downtime_line}}"
             "{{message}}\n\n"
             "-- SappiWhere, {{severity_name}}"
         ),
@@ -160,6 +166,7 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "metric_label": "", "value": "", "threshold": "",
         "trap_name": "", "trap_oid": "", "varbinds": "",
         "down_since": "", "recovered_time": "", "downtime": "",
+        "downtime_line": "",
     }
     # Derived here, from the row, rather than only where the engine happens to
     # know them: a recovery sends TWO notifications — the "Device recovered"
@@ -179,6 +186,15 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         context["downtime"] = duration_text(resolved_ts - alert_row["opened_ts"])
     if extra:
         context.update(extra)
+    # After the update, never before: the engine supplies down_since and
+    # downtime through `extra`, and the sentence has to describe whichever
+    # values actually won.
+    since = str(context.get("down_since") or "")
+    length = str(context.get("downtime") or "")
+    if since and length:
+        context["downtime_line"] = f"Down since {since} — {length} in total.\n\n"
+    elif since:
+        context["downtime_line"] = f"Down since {since}.\n\n"
     return context
 
 
@@ -204,6 +220,7 @@ def token_reference() -> list[dict]:
         {"token": "down_since", "description": "When the problem started (resolution notifications only)"},
         {"token": "recovered_time", "description": "When it recovered (resolution notifications only)"},
         {"token": "downtime", "description": "How long it was down, e.g. '2 h 14 m' (resolution notifications only)"},
+        {"token": "downtime_line", "description": "The whole 'Down since … — … in total.' sentence, or nothing when the outage start is unknown"},
         {"token": "trap_name", "description": "The trap's resolved name (trap rules only)"},
         {"token": "trap_oid", "description": "The trap's OID (trap rules only)"},
         {"token": "varbinds", "description": "The trap's varbind summary (trap rules only)"},
