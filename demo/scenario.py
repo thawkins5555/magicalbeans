@@ -385,14 +385,24 @@ class Scenario:
                 time.sleep(5)
                 continue
             up = sum(1 for d in devices if d.get("status") == "up")
+            polled = sum(1 for d in devices if d.get("last_poll_ts"))
             best = max(best, up)
             fraction = up / max(len(devices), 1)
-            self.log("[poll] %d/%d up (%.0f%%)" % (up, len(devices), fraction * 100))
-            if fraction >= 0.95:
+            self.log("[poll] %d/%d up (%.0f%%), %d polled at least once"
+                     % (up, len(devices), fraction * 100, polled))
+            # 95% up is the target, but the fleet deliberately contains
+            # devices that can never come up (personas.SPECIALS: wrong
+            # community, auth failure, scheduled-dark), so every device
+            # having been polled once also counts as the first full cycle.
+            full_cycle = devices and polled == len(devices)
+            if fraction >= 0.95 or full_cycle:
                 elapsed = round(time.time() - started, 1)
-                self.log("[ok] first full poll cycle after %.1fs" % elapsed)
-                return {"reached_95pct": True, "seconds": elapsed, "up": up,
-                        "total": len(devices)}
+                self.log("[ok] first full poll cycle after %.1fs (%s)"
+                         % (elapsed, "95%% up" if fraction >= 0.95
+                            else "every device polled once"))
+                return {"reached_95pct": fraction >= 0.95,
+                        "full_cycle": bool(full_cycle), "seconds": elapsed,
+                        "up": up, "polled": polled, "total": len(devices)}
             time.sleep(10)
         elapsed = round(time.time() - started, 1)
         self.notes.append("the fleet never reached 95%% up (best %d) in %.0fs"

@@ -689,12 +689,22 @@ def step_users(client: Client, log: SeedLog, base: str, creds_path: str) -> dict
     out = {}
     for username, grants in wanted.items():
         key = "%s_password" % username
-        if username in existing and creds.get(key):
-            out[username] = {"created": False, "grants": grants}
+        if username in existing:
             # Keep the grants current even for an account we did not create.
+            # An admin reset would re-arm must_change, so the password is left
+            # alone; without creds.txt it simply is not recoverable.
             client.post("/api/users/permissions",
                         {"username": username, "grants": grants})
-            print("[9] user %s already exists; grants refreshed" % username)
+            known = bool(creds.get(key))
+            out[username] = {"created": False, "grants": grants,
+                             "password_known": known}
+            print("[9] user %s already exists; grants refreshed%s"
+                  % (username, "" if known else
+                     " (password not in creds.txt — it cannot be recovered, "
+                     "delete the account to re-seed it)"))
+            if not known:
+                log.note("9-users", "%s exists but its password is not in "
+                                    "creds.txt" % username)
             continue
         temp = strong_password(username)
         status, payload, _ = client.raw("POST", "/api/users", {
