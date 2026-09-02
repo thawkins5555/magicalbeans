@@ -255,7 +255,7 @@ class Scenario:
         deadline = time.time() + seconds
         elapsed_values: list[float] = []
         busy: list[int] = []
-        interval = max(2.0, seconds / 20.0)
+        interval = max(1.0, seconds / 40.0)
         while time.time() < deadline:
             time.sleep(min(interval, max(0.2, deadline - time.time())))
             try:
@@ -757,7 +757,16 @@ class Scenario:
             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         lines.extend(rows)
-        lines.append("")
+        lines.extend([
+            "",
+            "Poll counts are deltas of `/api/debug`'s `node_counters` across the "
+            "step. Poll latency is sampled from `/api/debug`'s in-flight "
+            "`node_workers` about once a second, so a small fleet whose polls "
+            "finish between samples reads 0 — the counters above are the "
+            "reliable signal at that size. CPU% is the app process's own "
+            "utime+stime over the step; RSS is its VmRSS at the end of it.",
+            "",
+        ])
         seed = extra.get("seed", {}).get("summary", {})
         devices = seed.get("devices", {})
         if devices:
