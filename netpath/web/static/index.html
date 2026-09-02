@@ -111,9 +111,16 @@
             <span id="nd-d-name" class="section"></span>
             <span class="grow"></span>
             <button id="nd-poll-now">Poll now</button>
-            <button id="nd-browse-oids">Browse OIDs</button>
-            <button id="nd-edit-device">Edit</button>
-            <button id="nd-remove-device">Remove</button>
+            <button id="nd-browse-oids" data-requires-write="nodes">Browse OIDs</button>
+            <button id="nd-edit-device" data-requires-write="nodes">Edit</button>
+            <!-- Opens the SSH window (ssh.html) on its own permission
+                 module: ConfigRX write means "may back this device up",
+                 which is a far narrower thing than an interactive shell.
+                 Removing a device now lives inside the Edit dialog. The
+                 "?" is wired by nodes.js's help entry and sits outside any
+                 label, as App.helpLink documents. -->
+            <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
+            <span id="nd-ssh-help" data-requires-write="ssh"></span>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The status timeline, with its own range picker: "how long has

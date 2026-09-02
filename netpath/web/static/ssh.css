@@ -1,0 +1,108 @@
+/* The SSH window: a standalone popup, so it loads app.css for the palette
+   and the shared widgets (.bar, button, input, .hint, .err) and adds only
+   what a terminal window needs on top. Nothing here is used by the main
+   application page. */
+
+body.ssh-page {
+  /* app.css already makes <body> a column flexbox that never scrolls; the
+     terminal takes whatever the header leaves and scrolls inside itself. */
+  background: var(--bg);
+}
+
+#ssh-bar {
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+}
+.ssh-ip {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  flex: none;
+}
+/* The one place the connection state is spelled out. Its colour is the
+   state: connected is unremarkable, anything else asks to be read. */
+.ssh-status {
+  font-size: 12px;
+  color: var(--muted);
+  flex: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ssh-status.is-connected { color: var(--ok); }
+.ssh-status.is-connecting { color: var(--warn); }
+.ssh-status.is-closed { color: var(--muted); }
+.ssh-status.is-error { color: var(--fail); }
+
+.ssh-notice {
+  margin: 0;
+  padding: 5px 12px;
+  flex: none;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ssh-notice.is-warn { color: var(--warn); }
+.ssh-notice.is-error { color: var(--fail); }
+
+/* min-height:0 or the terminal's own scrollback grows this flex item
+   instead of scrolling inside it. */
+.ssh-term {
+  flex: 1;
+  min-height: 0;
+  padding: 4px 6px 4px 10px;
+  background: var(--bg);
+}
+
+/* ------------------------------------------------------------- overlays */
+.ssh-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+.ssh-panel {
+  width: 460px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 20px 22px 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.ssh-panel h2 { margin: 0 0 12px; font-size: 15px; }
+.ssh-panel p { margin: 0 0 10px; line-height: 1.45; }
+.ssh-panel label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  margin-top: 10px;
+}
+.ssh-panel input { width: 100%; padding: 7px 9px; font-size: 14px; }
+.ssh-panel .row { margin-top: 16px; }
+.ssh-panel .row button { flex: 1; padding: 8px; }
+
+.ssh-keys { border-collapse: collapse; margin: 0 0 10px; width: 100%; }
+.ssh-keys th {
+  text-align: left;
+  vertical-align: top;
+  padding: 3px 10px 3px 0;
+  color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.ssh-keys td { padding: 3px 0; }
+.ssh-fp { font-family: var(--mono); font-size: 12px; word-break: break-all; }

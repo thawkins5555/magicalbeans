@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Replaced by ssh.js with "SSH — <name> (<ip>)" once the device is known;
+     the ?name= in the URL is only so the window has a usable title before
+     the first API call comes back. -->
+<title>SSH — SappiWhere</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="stylesheet" href="/ssh.css">
+</head>
+<body class="ssh-page">
+
+<div class="bar" id="ssh-bar">
+  <span id="ssh-name" class="section"></span>
+  <span id="ssh-ip" class="ssh-ip"></span>
+  <span class="grow"></span>
+  <span id="ssh-status" class="ssh-status">starting…</span>
+  <button id="ssh-reconnect">Reconnect</button>
+  <button id="ssh-disconnect">Disconnect</button>
+</div>
+
+<!-- One line, above the terminal rather than inside it, for things the
+     operator should see but that are not device output: the host key stored
+     on a first connection, or the reason a session ended. -->
+<p id="ssh-notice" class="ssh-notice" hidden></p>
+
+<div id="ssh-term" class="ssh-term"></div>
+
+<!-- Overlays are this page's own markup, not App.modal: nothing else of the
+     application is loaded here. Both sit over the terminal and are hidden
+     until the server asks for them. -->
+<div id="ssh-creds" class="ssh-overlay" hidden>
+  <form class="ssh-panel" id="ssh-creds-form" autocomplete="off">
+    <h2>Sign in to <span id="ssh-creds-host"></span></h2>
+    <p id="ssh-creds-why" class="hint"></p>
+    <label for="ssh-user">Username</label>
+    <input id="ssh-user" name="ssh-user" autocomplete="off" spellcheck="false">
+    <label for="ssh-pass">Password</label>
+    <input id="ssh-pass" name="ssh-pass" type="password" autocomplete="off">
+    <p class="hint">Used for this session only. It is never stored and never
+      written to a log.</p>
+    <div class="row">
+      <button type="submit" class="primary" id="ssh-creds-connect">Connect</button>
+    </div>
+  </form>
+</div>
+
+<div id="ssh-hostkey" class="ssh-overlay" hidden>
+  <div class="ssh-panel">
+    <h2 class="warn-text">The host key for <span id="ssh-hk-ip"></span> has CHANGED</h2>
+    <p>The device is presenting a different key from the one stored when it
+      was first connected to. That happens after a legitimate rebuild or key
+      regeneration — and it is also exactly what a machine impersonating this
+      address looks like. Nothing has been sent to it.</p>
+    <table class="ssh-keys">
+      <tr><th>Stored key</th><td id="ssh-hk-old" class="ssh-fp"></td></tr>
+      <tr><th>First seen</th><td id="ssh-hk-since"></td></tr>
+      <tr><th>Now offered</th><td id="ssh-hk-new" class="ssh-fp"></td></tr>
+    </table>
+    <p class="hint">Only trust the new key if you know why it changed.</p>
+    <div class="row">
+      <button type="button" id="ssh-hk-cancel">Cancel</button>
+      <button type="button" class="primary" id="ssh-hk-trust">Trust the new key</button>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/ssh.js"></script>
+</body>
+</html>

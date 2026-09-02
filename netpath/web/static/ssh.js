@@ -1,0 +1,450 @@
+/* The SSH window.
+
+   A standalone page like login.html: it shares app.css and nothing else, so
+   none of the application's own machinery (boot.js, app.js, the refresh
+   loop, App.modal) is loaded into a window that exists to hold one terminal.
+   Everything below talks to one WebSocket, whose protocol is documented in
+   INTERNALS: text frames are JSON control messages in both directions,
+   binary frames are terminal bytes.
+
+   xterm.js and its fit addon are vendored under /vendor/ (see
+   vendor/README.txt) — the CSP here is `default-src 'self'` and appliances
+   are routinely installed with no route out, so a CDN is not an option. */
+(() => {
+  'use strict';
+
+  const params = new URLSearchParams(window.location.search);
+  const deviceId = Number(params.get('device')) || 0;
+  /* The opener passes the display name so the window has a title and a
+     header before the first API call answers; displayName() itself is
+     private to nodes.js and the precedence it encodes is not worth
+     duplicating here. Whatever the API returns wins once it arrives. */
+  const openerName = params.get('name') || '';
+
+  const el = (id) => document.getElementById(id);
+  const nameEl = el('ssh-name');
+  const ipEl = el('ssh-ip');
+  const statusEl = el('ssh-status');
+  const noticeEl = el('ssh-notice');
+  const termEl = el('ssh-term');
+  const reconnectBtn = el('ssh-reconnect');
+  const disconnectBtn = el('ssh-disconnect');
+  const credsBox = el('ssh-creds');
+  const credsForm = el('ssh-creds-form');
+  const hostkeyBox = el('ssh-hostkey');
+
+  let term = null;
+  let fitAddon = null;
+  let socket = null;
+  let device = null;          // {id, ip, name, sys_name, display_name_source}
+  let storedUsername = '';
+  let lastSize = { cols: 0, rows: 0 };
+  const encoder = new TextEncoder();
+
+  /* Close codes the server uses (INTERNALS: the WebSocket protocol).
+     Anything else is reported by number, which is more use to whoever is
+     reading it than a flat "connection lost". */
+  const CLOSE_WORDS = {
+    1000: '',
+    1001: 'the window is closing',
+    1006: 'the connection to the server was lost',
+    1011: 'the server hit an internal error',
+    4401: 'you are not signed in',
+    4408: 'the session was idle for too long',
+    4429: 'too many SSH sessions are already open',
+  };
+
+  // -------------------------------------------------------------- chrome
+
+  function setStatus(kind, text) {
+    statusEl.textContent = text;
+    statusEl.className = 'ssh-status is-' + kind;
+    disconnectBtn.disabled = !(socket && socket.readyState === WebSocket.OPEN);
+  }
+
+  function setNotice(text, kind) {
+    noticeEl.textContent = text || '';
+    noticeEl.className = 'ssh-notice' + (kind ? ' is-' + kind : '');
+    noticeEl.hidden = !text;
+  }
+
+  function setTitle() {
+    const shown = nameEl.textContent || openerName || 'device';
+    const ip = device ? device.ip : '';
+    document.title = ip ? `SSH — ${shown} (${ip})` : `SSH — ${shown}`;
+  }
+
+  function show(box, visible) {
+    box.hidden = !visible;
+  }
+
+  /* Written into the terminal rather than onto the one-line notice: connect
+     failures carry ConfigRX's guidance text, which runs to several lines and
+     matters more than it fits. */
+  function writeMessage(text, colour) {
+    if (!term || !text) return;
+    const colourOn = colour === 'error' ? '\u001b[31m' : '\u001b[33m';
+    term.write('\r\n' + colourOn + text.replace(/\n/g, '\r\n') + '\u001b[0m\r\n');
+  }
+
+  // ------------------------------------------------------------ terminal
+
+  function cssVar(name, fallback) {
+    const value = getComputedStyle(document.documentElement)
+      .getPropertyValue(name).trim();
+    return value || fallback;
+  }
+
+  /* The palette is the application's, read from the CSS variables rather
+     than copied, so the terminal keeps matching the rest of the product if
+     those ever move. */
+  function theme() {
+    const fg = cssVar('--text', '#DCE3EA');
+    return {
+      background: cssVar('--bg', '#0E1116'),
+      foreground: fg,
+      cursor: cssVar('--accent', '#7AA2F7'),
+      cursorAccent: cssVar('--bg', '#0E1116'),
+      selectionBackground: cssVar('--checked-strong', '#2E4470'),
+      black: cssVar('--nodata', '#1E242D'),
+      red: cssVar('--fail', '#F85149'),
+      green: cssVar('--ok', '#3FB950'),
+      yellow: cssVar('--warn', '#E3B341'),
+      blue: cssVar('--accent', '#7AA2F7'),
+      magenta: cssVar('--error', '#A371F7'),
+      cyan: cssVar('--overrun', '#4DB6AC'),
+      white: fg,
+      brightBlack: cssVar('--faint', '#4C5561'),
+      brightWhite: '#FFFFFF',
+    };
+  }
+
+  function buildTerminal() {
+    if (!window.Terminal) {
+      setStatus('error', 'The terminal library did not load');
+      return false;
+    }
+    term = new window.Terminal({
+      fontFamily: cssVar('--mono', 'monospace'),
+      fontSize: 13,
+      theme: theme(),
+      cursorBlink: true,
+      scrollback: 5000,
+      // The device decides what a newline means; translating here would
+      // corrupt anything full-screen (a vendor menu, top, vi).
+      convertEol: false,
+    });
+    if (window.FitAddon && window.FitAddon.FitAddon) {
+      fitAddon = new window.FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+    }
+    term.open(termEl);
+    /* Keystrokes go out as binary frames exactly as typed; the server
+       forwards them to the channel without looking at them. */
+    term.onData((data) => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(encoder.encode(data));
+      }
+    });
+    fit();
+    return true;
+  }
+
+  function fit() {
+    if (!fitAddon) return;
+    try {
+      fitAddon.fit();
+    } catch (error) {
+      return;      // the window can still be 0x0 while it is opening
+    }
+    const cols = term.cols;
+    const rows = term.rows;
+    if (cols === lastSize.cols && rows === lastSize.rows) return;
+    lastSize = { cols, rows };
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      send({ type: 'resize', cols, rows });
+    }
+  }
+
+  let fitTimer = null;
+  window.addEventListener('resize', () => {
+    window.clearTimeout(fitTimer);
+    fitTimer = window.setTimeout(fit, 80);
+  });
+
+  // ----------------------------------------------------------- transport
+
+  function send(message) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  }
+
+  function socketUrl() {
+    const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${scheme}//${window.location.host}/api/ssh/devices/${deviceId}/socket`;
+  }
+
+  function connect() {
+    closeSocket(1000, 'reconnecting');
+    show(credsBox, false);
+    show(hostkeyBox, false);
+    setStatus('connecting', 'Connecting…');
+    let ws;
+    try {
+      ws = new WebSocket(socketUrl());
+    } catch (error) {
+      setStatus('error', 'Could not open the connection');
+      return;
+    }
+    socket = ws;
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      if (socket !== ws) return;
+      // Fit before the first message: the server sizes the pty from the
+      // cols/rows in `open`, and a wrong size there is a wrapped prompt for
+      // the life of the session.
+      fit();
+      send({ type: 'open', cols: lastSize.cols || 80, rows: lastSize.rows || 24 });
+      setStatus('connecting', 'Opening the session…');
+    };
+
+    ws.onmessage = (event) => {
+      if (socket !== ws) return;
+      if (typeof event.data === 'string') {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch (error) {
+          return;
+        }
+        handleControl(message);
+        return;
+      }
+      if (term) term.write(new Uint8Array(event.data));
+    };
+
+    ws.onerror = () => {
+      if (socket !== ws) return;
+      // onclose always follows, and carries the code worth reporting.
+      setStatus('error', 'Connection error');
+    };
+
+    ws.onclose = (event) => {
+      if (socket !== ws) return;
+      socket = null;
+      if (event.code === 4401) {
+        window.location.href = '/login';
+        return;
+      }
+      const words = CLOSE_WORDS[event.code];
+      const why = words !== undefined ? words
+        : `the connection closed (code ${event.code})`;
+      setStatus('closed', why ? `Disconnected — ${why}` : 'Disconnected');
+      if (why) setNotice(`Disconnected — ${why}.`, event.code >= 4400 ? 'warn' : '');
+    };
+  }
+
+  function closeSocket(code, reason) {
+    if (!socket) return;
+    const ws = socket;
+    socket = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    try {
+      ws.close(code, reason);
+    } catch (error) { /* already gone; nothing to be done about it */ }
+  }
+
+  function handleControl(message) {
+    switch (message.type) {
+      case 'status':
+        if (message.state === 'connected') {
+          show(credsBox, false);
+          show(hostkeyBox, false);
+          setStatus('connected', message.message || 'Connected');
+          if (term) term.focus();
+        } else if (message.state === 'connecting') {
+          setStatus('connecting', message.message || 'Connecting…');
+        } else {
+          setStatus('closed', message.message || 'Disconnected');
+        }
+        break;
+
+      case 'need-credentials':
+        askForCredentials(message);
+        break;
+
+      case 'hostkey':
+        if (message.event === 'changed') {
+          showHostKeyWarning(message);
+        } else {
+          setNotice(`Host key ${message.fingerprint}` +
+            (message.key_type ? ` (${message.key_type})` : '') +
+            ' stored on this first connection.');
+        }
+        break;
+
+      case 'error':
+        setStatus('error', firstLine(message.message) || 'Failed');
+        writeMessage(message.message, 'error');
+        break;
+
+      default:
+        break;      // an unknown control message is not worth a failure
+    }
+  }
+
+  function firstLine(text) {
+    return (text || '').split('\n')[0].trim();
+  }
+
+  // ------------------------------------------------------------ overlays
+
+  const CRED_REASONS = {
+    'none-stored': 'No SSH credential is stored for this device in ConfigRX.',
+    'auth-failed': 'The stored credential was refused by the device.',
+    'decrypt-failed': 'The stored password could not be decrypted on this machine.',
+  };
+
+  function askForCredentials(message) {
+    el('ssh-creds-host').textContent = device ? device.ip : '';
+    el('ssh-creds-why').textContent =
+      CRED_REASONS[message.reason] || 'The device is asking for credentials.';
+    const user = el('ssh-user');
+    const pass = el('ssh-pass');
+    storedUsername = message.username || storedUsername;
+    user.value = storedUsername;
+    pass.value = '';
+    show(credsBox, true);
+    setStatus('connecting', 'Waiting for credentials');
+    (storedUsername ? pass : user).focus();
+  }
+
+  credsForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const user = el('ssh-user');
+    const pass = el('ssh-pass');
+    if (!user.value.trim()) {
+      user.focus();
+      return;
+    }
+    send({ type: 'auth', username: user.value.trim(), password: pass.value });
+    // Nothing typed here is kept: the field is emptied the moment it has
+    // been sent, and the page never puts it anywhere else.
+    pass.value = '';
+    show(credsBox, false);
+    setStatus('connecting', 'Signing in…');
+  });
+
+  function showHostKeyWarning(message) {
+    el('ssh-hk-ip').textContent = device ? device.ip : '';
+    el('ssh-hk-old').textContent = message.old_fingerprint || 'unknown';
+    el('ssh-hk-new').textContent = message.fingerprint || 'unknown';
+    el('ssh-hk-since').textContent = message.old_first_seen
+      ? new Date(message.old_first_seen * 1000).toLocaleString() : 'unknown';
+    show(hostkeyBox, true);
+    setStatus('error', 'Host key changed — nothing was sent');
+    setNotice('The host key for this device has changed. The connection was ' +
+      'refused.', 'error');
+  }
+
+  el('ssh-hk-trust').addEventListener('click', () => {
+    show(hostkeyBox, false);
+    setNotice('');
+    setStatus('connecting', 'Trusting the new key…');
+    send({ type: 'trust' });
+  });
+
+  el('ssh-hk-cancel').addEventListener('click', () => {
+    show(hostkeyBox, false);
+    closeSocket(1000, 'host key not trusted');
+    setStatus('closed', 'Disconnected — the new host key was not trusted');
+  });
+
+  // -------------------------------------------------------------- header
+
+  reconnectBtn.addEventListener('click', () => {
+    setNotice('');
+    if (device) connect();
+    else load();
+  });
+
+  disconnectBtn.addEventListener('click', () => {
+    closeSocket(1000, 'closed by the operator');
+    setStatus('closed', 'Disconnected');
+    setNotice('');
+  });
+
+  /* A closed window must not leave a session (and an SSH channel into the
+     device) open behind it: the server tears the session down when the
+     socket closes, so closing it here is the whole cleanup. */
+  window.addEventListener('beforeunload', () => {
+    closeSocket(1000, 'window closed');
+  });
+
+  // ---------------------------------------------------------------- boot
+
+  async function load() {
+    setStatus('connecting', 'Looking the device up…');
+    let response;
+    try {
+      response = await fetch(`/api/ssh/devices/${deviceId}`,
+        { headers: { Accept: 'application/json' } });
+    } catch (error) {
+      setStatus('error', 'The server did not answer. It may have stopped.');
+      return;
+    }
+    if (response.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 403) {
+      setStatus('error', 'Your account has no SSH access');
+      setNotice('Your account has no SSH access. An administrator grants it ' +
+        'under Settings, as write on the SSH module.', 'warn');
+      return;
+    }
+    if (!response.ok) {
+      // This also covers the route being absent altogether (an older server,
+      // or one whose SSH service failed to start): a connection problem,
+      // said in the one place this window says connection problems.
+      const detail = payload.error ? `${payload.error} (HTTP ${response.status})`
+        : `HTTP ${response.status}`;
+      setStatus('error', `Could not reach the SSH service — ${detail}`);
+      setNotice(`Could not reach the SSH service — ${detail}.`, 'error');
+      return;
+    }
+
+    device = payload.device || { id: deviceId, ip: '' };
+    nameEl.textContent = device.display_name_source === 'manual'
+      ? (device.name || device.ip)
+      : (device.sys_name || device.name || device.ip || openerName);
+    ipEl.textContent = device.ip ? `${device.ip}:${payload.ssh_port || 22}` : '';
+    setTitle();
+
+    const paramiko = payload.paramiko || {};
+    if (!paramiko.available) {
+      setStatus('error', 'SSH is unavailable on this server');
+      setNotice(paramiko.message || 'The paramiko library is not installed.',
+        'error');
+      return;
+    }
+    if (!payload.has_credential) {
+      setNotice('No SSH credential is stored for this device; you will be ' +
+        'asked for one.');
+    }
+    connect();
+  }
+
+  nameEl.textContent = openerName;
+  setTitle();
+  if (!deviceId) {
+    setStatus('error', 'No device was named in the address');
+  } else if (buildTerminal()) {
+    load();
+  }
+})();
