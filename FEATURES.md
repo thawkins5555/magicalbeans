@@ -468,17 +468,26 @@ switch and one port, that port's dialog opens; when it resolves to
 several, they are listed as a shortlist to pick from rather than one
 being chosen for you — a MAC seen on an uplink is on every switch between
 here and the host, which is the normal case, and guessing which one was
-meant sends someone to the wrong place.
+meant sends someone to the wrong place. **A MAC no switch is holding right
+now** is not a dead end: the search says where and when it was last seen —
+"last seen on *switch* · *port* at *time*" — from forwarding-table history
+kept for the retention window, so an address that has gone quiet or moved
+still points somewhere.
 
 **Learning MAC addresses is off by default and separately paced.** A
-forwarding table is hundreds to thousands of rows per switch, so it is
-never read on the poll cycle. A polling profile (or a single device) sets
-**Learn MAC addresses every N seconds**; 0 means never, and 0 is the
-shipped value, so this costs nothing until you switch it on for the
-switches you actually trace hosts through. Fifteen minutes is a sensible
-starting point. A switch that is down or whose last poll failed is not
-walked, and entries no walk has refreshed for a week are dropped, so a MAC
-that moved does not go on answering from two places forever.
+forwarding table is still read on its own schedule, not the poll cycle,
+but it is no longer expensive: table walks use GETBULK, so a table that
+once cost a hundred SNMP round trips now costs about five, and it can be
+refreshed far more often for the same load. A polling profile (or a single
+device) sets **Learn MAC addresses every N seconds**; 0 means never, and 0
+is the shipped value, so this costs nothing until you switch it on for the
+switches you actually trace hosts through. Five minutes is a fine starting
+point now. A switch that is down or whose last poll failed is not walked.
+A MAC that leaves a port is not erased on the next walk: it is kept, marked
+absent, with the time it was last confirmed, so the Find box can still say
+where it was; entries no walk has refreshed for the retention window (a
+week by default, **Alerts** aside, set under **Nodes → Settings**) are then
+dropped.
 
 **Vendor and Location can be read from an OID you choose.** Vendor is
 normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr

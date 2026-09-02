@@ -348,9 +348,10 @@ rather than filtered in the alert engine, the same shape as
 opened in the moments before the first poll actually failed.
 
 **MAC-table walks have their own cadence** (`_maybe_walk_mac_table`, called
-once per device per `_loop` pass). A forwarding table is hundreds to
-thousands of OIDs per switch, which does not belong on a 60-second poll, so
-`mac_table_interval_s` is a separate interval — an override column on both
+once per device per `_loop` pass). A forwarding table is thousands of rows
+per switch, and although GETBULK (below) has cut the request count roughly
+twenty-fold, that is still not per-poll work, so `mac_table_interval_s` is a
+separate interval — an override column on both
 `devices` and `groups`, resolved by `effective_config` like every other
 override, defaulting to **0 (never)** rather than to a global setting, so an
 upgrade adds no SNMP load anywhere until a profile opts in. A device's first
@@ -1284,12 +1285,40 @@ an engineer to the core switch for an access-port problem. `nodes.js`
 decides from the count: exactly one (device, port) opens that port's
 dialog, several are listed as clickable hits.
 
-`replace_mac_entries` replaces a device's table wholesale rather than
-merging, so a MAC that aged out of the switch ages out here too — a stale
-row is worse than no answer. `prune_mac_entries` (a week by default, from
-`mac_table_retention_days`) runs in `Service.run_maintenance` and drops
-entries no walk has refreshed, so a switch taken out of the walk schedule
-stops answering searches from a table nobody has confirmed since.
+`replace_mac_entries` no longer deletes and reinserts a device's table on
+each walk. It marks every stored row for the device `present = 0`, then
+upserts this walk's rows back to `present = 1` with a fresh `seen_ts`
+(`ON CONFLICT(device_id, if_index, mac, vlan)`); `first_seen_ts` is stamped
+once, the first time a key is ever stored, and never touched again. A MAC
+that steps off a port keeps its row — `present = 0`, `seen_ts` frozen at its
+last confirmed sighting — so a search can still say where and when it was
+last seen instead of finding nothing. `mac_locations` returns `present`,
+`seen_ts` and `first_seen_ts` and orders present rows before stale ones;
+`nodes.js` renders a present hit as before and a stale-only result as "last
+seen on … at …". `prune_mac_entries` (a week by default, from
+`mac_table_retention_days`) runs in `Service.run_maintenance` and deletes by
+age regardless of the flag — a present row's `seen_ts` is refreshed on every
+confirming walk, so in practice it reclaims only genuinely stale rows and
+devices dropped from the schedule entirely. The old rule that a failed walk
+(a `None` return) leaves the stored table untouched still holds.
+
+**GETBULK table walks** (`nodepoll._walk_column`, `_session_for`,
+`_walk_request`). One table column is walked over a single shared UDP
+socket rather than a fresh socket per row, and on v2c/v3 with GETBULK —
+`non_repeaters = 0`, `max_repetitions = settings["snmp_bulk_max_repetitions"]`
+(default 40; 0 disables it and falls back to GETNEXT). A 90-row forwarding
+table drops from ~100 requests to about 5. v1 has no GETBULK PDU and always
+uses GETNEXT, still on the shared socket; the choice keys on the raw
+configured version, deliberately not the `version or 1` coercion used only
+for framing. Each response's varbinds are accepted in order until one leaves
+the base OID's subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`,
+or is not lexicographically after the last accepted OID (a looping agent),
+and the next request resumes from there. `error_status == 1` (tooBig) halves
+`max_repetitions` and retries, falling back to GETNEXT at one repetition
+rather than looping. The old hardcoded 512-row ceiling is now
+`settings["snmp_walk_max_rows"]` (default 16384), logged once when hit.
+`_walk_indexes` and so interface discovery share this walker and the same
+reduction.
 
 The lookup runs only on a deliberate search — Enter in the Find box sets
 `view.macSearchPending`, which `refresh()` consumes once — never on the

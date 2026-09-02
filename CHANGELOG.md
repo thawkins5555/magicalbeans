@@ -47,6 +47,25 @@ Listed newest first. Version numbers are build order, not dates.
   capped at three days, for the reason 4.33.0 gave), its pinned 0–100 % axis
   and its "not being ping-probed" message, and refreshes every fifteen
   seconds while the dialog is open. The pane keeps the status timeline.
+- **MAC forwarding tables cost a fraction of what they did, and remember
+  where a MAC went.** A switch's forwarding table was read one SNMP request
+  per row — hundreds to thousands per switch — which is why learning MAC
+  addresses had to be a rare, opt-in thing. Table walks now use GETBULK: a
+  ninety-row table that cost about a hundred requests costs about five, and
+  interface discovery, which shares the same walker, got the same drop. So a
+  forwarding table can be refreshed far more often for the same load — five
+  minutes is now a fine interval where fifteen was the old suggestion. Every
+  walk also runs on one socket instead of opening a fresh one per row, honours
+  a configurable row cap in place of the old silent 512 limit, and backs off
+  automatically from an agent that answers "too big".
+- **A MAC that leaves a switch is no longer forgotten.** The forwarding table
+  used to be erased and rewritten on every walk, so an address that moved or
+  went quiet simply vanished from search. Entries are now kept when they
+  disappear, marked absent with the time they were last confirmed, so the
+  Find box answers a search for an absent MAC with where and when it was last
+  seen — on which switch and which port — for as long as the retention window
+  (a week by default). A MAC that moved between ports shows the port it is on
+  now first, and where it used to be underneath.
 ### 4.33.1 — Tests you can actually run
 
 - **The end-to-end suites now live in the repository, under `tests/`, and
