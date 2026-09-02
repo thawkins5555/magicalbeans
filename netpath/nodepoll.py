@@ -976,12 +976,34 @@ class NodePoller:
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
-        if snmp_ok is False and snmp_error and isinstance(snmp_error, str) and \
-           "auth" in snmp_error.lower():
+        # Both of these are TRANSITIONS, the same discipline as the up/down
+        # events above, and for the same reason: a device event is a fact
+        # about a change, and an alert an operator resolved by hand must not
+        # be re-opened by the next poll simply repeating what the last one
+        # said. Recorded on every failing poll, "SNMP authentication failing"
+        # came back within a poll interval however often it was resolved.
+        #
+        # The previous poll's state is read from the device row, where SQLite
+        # stores 1, 0 or NULL — never a Python False. `is False` therefore
+        # never matched anything, which is why the auth_ok clear had never
+        # once fired: `== 0` is the comparison this column needs (None == 0
+        # is False, so a device that has never been polled is not a clear).
+        auth_failing = bool(snmp_ok is False and isinstance(snmp_error, str)
+                            and "auth" in snmp_error.lower())
+        keys = previous.keys()
+        previous_snmp_ok = previous["snmp_ok"] if "snmp_ok" in keys else None
+        previous_error = (previous["snmp_error"] or "") if "snmp_error" in keys else ""
+        was_auth_failing = (previous_snmp_ok == 0 and "auth" in previous_error.lower())
+        if auth_failing and not (was_auth_failing and previous_error == snmp_error):
+            # A different auth error than last time is a new fact worth
+            # recording — a second credential failing where the first one
+            # was, say — so only an identical repeat is suppressed.
             self.db.record_device_event(device_id, "auth_fail", snmp_error)
-        elif snmp_ok:
-            if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
-                self.db.record_device_event(device_id, "auth_ok", "")
+        elif snmp_ok and previous_snmp_ok == 0:
+            # SNMP works again after a poll where it did not, whatever the
+            # reason it did not: the credentials are demonstrably good now,
+            # which is exactly what device_auth_fail's CLEARS pair means.
+            self.db.record_device_event(device_id, "auth_ok", "")
 
         if uptime_ticks is not None:
             rebooted, note = detect_reboot(
