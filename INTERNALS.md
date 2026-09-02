@@ -3730,3 +3730,64 @@ because a click inside a label activates the label's control, and a "?" that
 also ticked the checkbox would be worse than no help. The first entries are
 the profile editor's Ping and SNMP checkboxes and the device form's matching
 selectors, sharing the same two keys.
+
+### The SSH window (`static/ssh.html`, `ssh.js`, `ssh.css`)
+
+A standalone page in `login.html`'s shape: it loads `app.css` for the
+palette and the shared widgets and nothing else of the application — no
+`boot.js`, no `app.js`, no refresh loop, no `App.modal`. It is not in
+`PUBLIC_PATHS`, so a signed-out popup gets the same 302 to `/login` every
+other page does. `ssh.js` first fetches `GET /api/ssh/devices/<id>` for the
+header: 401 sends the window to `/login`, 403 says the account has no SSH
+access, a missing paramiko shows its own message, and any other failure is
+reported in the status line. Then it opens the WebSocket, built from
+`location` so `https` gives `wss:`. Text frames are the JSON control
+protocol (below, under `sshterm.py`), binary frames are terminal bytes in
+both directions: `open` carries the fitted cols/rows before anything else,
+because the server sizes the pty from them and a wrong size there is a
+wrapped prompt for the life of the session; a debounced window resize
+re-fits and sends `resize` only when the grid actually changed;
+`term.onData` sends keystrokes verbatim. The two overlays are the page's
+own markup — a credentials form filled from `need-credentials` (the
+password field is emptied the moment it has been sent, and the page keeps
+it nowhere else) and the host-key warning, which shows both fingerprints
+and when the stored key was first seen behind **Trust the new key** and
+**Cancel**. `beforeunload` closes the socket, which is the whole client-side
+cleanup: the server tears the session down when the socket goes.
+
+### Vendored frontend libraries (`static/vendor/`)
+
+The CSP is `default-src 'self'` and these installs routinely have no route
+to the internet, so a CDN is not an option; third-party browser libraries
+are checked in as the publisher's own UMD bundle, byte for byte, and served
+from `/vendor/` like any other static file — `_static` already resolves
+nested paths and types them from the extension. Today that is xterm.js
+5.5.0 (`window.Terminal`) and `@xterm/addon-fit` 0.10.0
+(`window.FitAddon.FitAddon`), with their MIT licence as `LICENSE-xterm.txt`
+and `README.txt` recording the versions and where they came from. There is
+no build step and no local patching: a fix applied to a vendored file is
+invisible to the next update and would be silently lost, so anything that
+needs changing is worked around in first-party code. Updating one means
+dropping in the new release's bundle and editing the version in the README.
+xterm injects its own `<style>` at runtime, which the CSP's `style-src
+'self' 'unsafe-inline'` already allowed.
+
+### Opening the window, and Remove's new home (`nodes.js`)
+
+`sshDevice()` is the application's only `window.open`. A shell is not a
+dialog — it is kept open beside the rest of the product, resized and lived
+in — so it gets a window: `window.open('/ssh.html?device=<id>&name=<encoded
+display name>', 'ssh-<id>', 'width=1000,height=640,noopener')`. The window
+name is keyed to the device, so a second SSH click on the same device
+raises the window it already has rather than starting a rival session;
+`noopener` keeps the popup from reaching back into the opener. The display
+name rides in the query string because `displayName()`'s precedence is
+private to `nodes.js`; it only has to hold until the API answers. The
+button is `data-requires-write="ssh"` in the markup and `sshDevice()`
+re-checks `App.canWrite('ssh')` itself, since `applyPermissions` only ever
+hides. Single-device removal moved out of the pane header and into the Edit
+dialog, beside Clear credential, on `App.confirmDestructive` — the body
+names the collateral (interfaces, metric history, events, and the ConfigRX
+settings, credential and stored backups that `delete_nodes_device` drops
+through `forget_device`); like Clear credential it passes `afterClose` to
+reopen the editor when the operator backs out. Bulk Delete is untouched.
