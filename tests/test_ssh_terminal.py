@@ -257,6 +257,12 @@ def call(method, path, body=None, token=None):
 
 
 def login(username, password) -> str:
+    # 4.37 refuses every API route for an account whose password must still
+    # be changed, so clear the flag rather than re-password every account
+    # this suite creates. The stored hash goes back unchanged.
+    row = service.app_db.user(username)
+    if row is not None and row["must_change"]:
+        service.app_db.set_password(username, row["password"], must_change=False)
     conn = http.client.HTTPConnection("127.0.0.1", web_port, timeout=20)
     conn.request("POST", "/api/login",
                  body=json.dumps({"username": username, "password": password}).encode(),

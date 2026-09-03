@@ -260,6 +260,16 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
 PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css", "/favicon.ico"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
+# What an account whose password must still be changed may reach. Everything
+# else under /api/ is refused until it has been: the seeded admin/admin
+# account is a way in, not an account, and the flag saying so was enforced
+# only by the bundled UI (app.js) — anything talking to the API directly was
+# exempt, so a fresh install was owned by whoever reached the port first.
+# Static files are untouched: the browser has to be able to load the app in
+# order to show the change-password dialog at all.
+MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state",
+                   "/api/heartbeat", "/api/password"}
+
 SESSION_COOKIE = "sw_session"
 
 
@@ -486,6 +496,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(302, b"", "text/plain", {"Location": "/login"})
             return
+
+        # The flag on the account, not on the session: a reset takes effect
+        # for a session that is already open, and the check costs one indexed
+        # lookup on a table with one row per operator.
+        if session and path.startswith("/api/") and path not in MUST_CHANGE_API:
+            row = self.service.app_db.user(session["username"])
+            if row is not None and row["must_change"]:
+                self._json({"error": "password change required"}, 403)
+                return
 
         # A cross-site form can send a POST but cannot set this content type
         # without a preflight the browser will refuse. With SameSite=Strict on
