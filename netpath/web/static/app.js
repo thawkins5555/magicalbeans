@@ -388,6 +388,90 @@ const App = (() => {
     if (idleBanner) idleBanner.hidden = true;
   }
 
+  /* ------------------------------------------- out-of-app notification
+
+     Two signals that reach an operator who is not looking at this tab: the
+     open-alert count in the browser tab's title, and — only if they ask for
+     it — a desktop notification for a new alert of severity 1 or 2.
+
+     The desktop toggle is per browser, not per account: notification
+     permission is granted by this browser to this origin, so a preference
+     stored on the server would promise something a different machine cannot
+     keep. localStorage is the honest place for it. */
+  const NOTIFY_KEY = 'sappiwhere.notify.desktop';
+  const NOTIFY_SEVERITY = 2;       // 1 and 2 only; 3+ is not worth a popup
+  const BASE_TITLE = 'SappiWhere';
+  // Alert ids already notified about, so a re-render or a second tab poll
+  // does not raise the same popup twice. Bounded: the last few hundred.
+  const notified = new Set();
+  let lastOpenCount = null;
+
+  function desktopNotifyEnabled() {
+    try { return localStorage.getItem(NOTIFY_KEY) === 'on'; }
+    catch (error) { return false; }
+  }
+
+  /* Returns what actually happened, so the settings dialog can say
+     "blocked in this browser" rather than silently doing nothing. */
+  async function setDesktopNotify(on) {
+    try {
+      localStorage.setItem(NOTIFY_KEY, on ? 'on' : 'off');
+    } catch (error) { /* private browsing: the toggle lasts this session */ }
+    if (!on) return 'off';
+    if (typeof Notification === 'undefined') return 'unsupported';
+    if (Notification.permission === 'granted') return 'on';
+    if (Notification.permission === 'denied') return 'blocked';
+    try {
+      const result = await Notification.requestPermission();
+      return result === 'granted' ? 'on' : 'blocked';
+    } catch (error) {
+      return 'blocked';
+    }
+  }
+
+  function titleForAlerts(openCount) {
+    return openCount > 0 ? `(${openCount}) ${BASE_TITLE}` : BASE_TITLE;
+  }
+
+  /* Called from loadState with the alerts block every poll already fetches.
+     The list of open alerts is only pulled when the count has actually gone
+     up and the operator asked for popups — never on the ordinary path. */
+  async function alertsChanged(openCount) {
+    document.title = titleForAlerts(openCount);
+    const previous = lastOpenCount;
+    lastOpenCount = openCount;
+    if (!desktopNotifyEnabled()) return;
+    if (typeof Notification === 'undefined'
+        || Notification.permission !== 'granted') return;
+    if (previous === null || openCount <= previous) return;
+    let payload;
+    try {
+      payload = await get('/api/alerts', { state: 'open', limit: 50 });
+    } catch (error) {
+      return;                       // connected() already reports the outage
+    }
+    for (const alert of payload.alerts || []) {
+      if (Number(alert.severity) > NOTIFY_SEVERITY) continue;
+      if (notified.has(alert.id)) continue;
+      notified.add(alert.id);
+      if (notified.size > 500) {
+        // Oldest first: a Set iterates in insertion order.
+        const oldest = notified.values().next().value;
+        notified.delete(oldest);
+      }
+      try {
+        const popup = new Notification(
+          `${alert.entity_label || alert.entity_id || 'Alert'}`,
+          { body: alert.message || alert.rule_name || 'New alert',
+            tag: `sappiwhere-alert-${alert.id}` });
+        popup.onclick = () => {
+          window.focus();
+          window.location.hash = `#/alerts/${alert.id}`;
+        };
+      } catch (error) { /* the browser refused it; nothing more to do */ }
+    }
+  }
+
   /* ------------------------------------------------------- formatting */
 
   const pad = (n) => String(n).padStart(2, '0');
@@ -1384,12 +1468,15 @@ const App = (() => {
     state.permissions = payload.permissions || {};
     state.serverState = payload;
     applyPermissions();
+    const openCount = (payload.alerts || {}).open_count || 0;
     const alertsBadge = document.getElementById('alerts-tab-badge');
     if (alertsBadge) {
-      const openCount = (payload.alerts || {}).open_count || 0;
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
     }
+    // Deliberately not awaited: the title is set synchronously inside, and
+    // the (rare) alert fetch behind it must not hold up the poll.
+    alertsChanged(openCount);
     if (payload.session) {
       state.session = payload.session;
       applySessionIdle(payload.session);
@@ -1606,7 +1693,7 @@ const App = (() => {
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
-    announce,
+    announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, a11yTable, sortRows, canRead, canWrite, accountModal,

@@ -742,6 +742,16 @@
           When the device comes back, any metric that is genuinely still
           breaching re-opens on the next poll by itself.</p>
       </fieldset>
+      <fieldset><legend>THIS BROWSER</legend>
+        ${check('as-desktop', 'Show a desktop notification for a new alert of ' +
+                'severity 1 or 2', App.desktopNotifyEnabled())}
+        <p class="hint" id="as-desktop-status">Off by default. This one setting
+          is remembered by this browser rather than by your account, because
+          the permission that makes it work is granted by this browser to this
+          address — an account setting would promise something a different
+          machine could not keep. The browser asks for permission the first
+          time you turn it on.</p>
+      </fieldset>
       ${App.columnPickerFieldset('ALERT LIST COLUMNS', 'alerts', COLUMNS,
                                  s.table_columns)}
       <fieldset><legend>TEST</legend>
@@ -773,6 +783,17 @@
             box.querySelector('#as-cred-status').textContent = error.message;
             return;
           }
+        }
+        // Per browser, so it is stored (and its permission asked for) here
+        // rather than travelling to the server with the rest.
+        const notifyState = await App.setDesktopNotify(on('#as-desktop'));
+        if (notifyState === 'blocked' || notifyState === 'unsupported') {
+          box.querySelector('#as-desktop-status').textContent =
+            notifyState === 'blocked'
+              ? 'Desktop notifications are blocked for this address in this ' +
+                'browser — everything else below was saved.'
+              : 'This browser does not support desktop notifications — ' +
+                'everything else below was saved.';
         }
         await App.post('/api/settings', { scope: 'alerts', values: {
           enabled: on('#as-enabled'), min_severity: Number(box.querySelector('#as-minsev').value),
