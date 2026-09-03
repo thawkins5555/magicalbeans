@@ -430,6 +430,12 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end; it assigns from script, which fires no event. */
+    const CONTROLS = ['wl-q', 'wl-controller', 'wl-state'];
+    App.rememberControls('wireless', CONTROLS);
     App.el('wl-apply').onclick = () => App.refreshNow('wireless');
     App.el('wl-q').onkeydown = (event) => {
       if (event.key === 'Enter') App.refreshNow('wireless');
@@ -470,9 +476,7 @@
 
     // Last thing in init(): refresh() reads all three straight off the DOM,
     // so the first search already carries them.
-    const CONTROLS = ['wl-q', 'wl-controller', 'wl-state'];
     App.restoreControls('wireless', CONTROLS);
-    App.rememberControls('wireless', CONTROLS);
   }
 
   App.pages.wireless = { init, refresh, fastTick: drawStatus };

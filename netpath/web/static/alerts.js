@@ -69,11 +69,12 @@
     return {
       state: App.el('alerts-filter-state').value,
       severity: App.el('alerts-filter-sev').value,
-      // The rule list is filled by the refresh below, so on the load after
-      // a reload the restored choice is not on the element yet; the first
-      // fetch has to honour it or the list contradicts the filter for a tick.
-      rule_id: App.el('alerts-filter-rule').value ||
-        App.savedControl('alerts', 'alerts-filter-rule') || '',
+      // The rule list is filled by the refresh below, so on the load after a
+      // reload the restored choice is not on the element yet; the first fetch
+      // has to honour it or the list contradicts the filter for a tick. Once
+      // the list exists the control answers for itself — including "any rule",
+      // which the old `value || saved` form could not express.
+      rule_id: App.controlOrSaved('alerts', 'alerts-filter-rule'),
       device: App.el('alerts-filter-device').value.trim(),
       q: App.el('alerts-filter-text').value.trim(),
     };
@@ -298,21 +299,55 @@
     App.refreshNow('alerts');
   }
 
+  /* One line at the top of the detail pane saying an action on THIS alert
+     failed. The counters line says so too, but that is at the other end of
+     the page and expires after a few seconds; the operator's eyes are on the
+     button they just pressed. Cleared on the next success and wiped by the
+     next full rebuild of the pane — which the signature guard skips while
+     nothing about the alert has changed, so a failure that changed nothing
+     leaves the line standing. */
+  function detailError(text) {
+    const pane = document.getElementById('alerts-detail');
+    if (!pane) return;
+    let line = document.getElementById('alerts-d-error');
+    if (!text) {
+      if (line) line.remove();
+      return;
+    }
+    if (!line) {
+      line = document.createElement('p');
+      line.id = 'alerts-d-error';
+      line.className = 'hint';
+      line.style.color = 'var(--fail)';
+      pane.insertBefore(line, pane.firstChild);
+    }
+    line.textContent = text;
+  }
+
   /* Every single-row action in the detail pane goes through here. Each one
      used to `await App.post` bare, so a 403 (an account whose grant changed
      under an open page) or a 500 left the button looking as though it had
-     worked and the alert unchanged. The failure lands on the engine counters
-     line, the same place the bulk actions report theirs, and the pane is
-     refreshed either way so what is on screen is what the server holds. */
+     worked and the alert unchanged. A failure now lands in three places that
+     matter: the engine counters line, where the bulk actions report theirs;
+     the detail pane itself, where the button is; and nowhere at all in the
+     console, because the refresh is awaited inside its own try. */
   async function detailAction(label, run) {
     try {
       await run();
+      detailError('');
     } catch (error) {
-      view.bulkNotice = { text: `${label} failed: ${error.message}`,
-                          until: Date.now() + 6000 };
+      const text = `${label} failed: ${error.message}`;
+      view.bulkNotice = { text, until: Date.now() + 6000 };
       drawStatus();
+      detailError(text);
     }
-    App.refreshNow('alerts');
+    // Awaited, and its own failure caught: an un-awaited refresh left the
+    // button looking as though the action had worked while the pane still
+    // showed the old state, and a refresh that itself failed threw out of an
+    // event handler into the console.
+    try {
+      await App.refreshNow('alerts');
+    } catch (error) { /* the notice above already says what happened */ }
   }
 
   function showDetail(row) {
@@ -932,6 +967,15 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back. Listeners run in registration order. restoreControls
+       stays at the end, after the range and severity lists exist; it assigns
+       from script, which fires no event. */
+    const CONTROLS = ['alerts-filter-sev', 'alerts-filter-state',
+      'alerts-filter-rule', 'alerts-filter-device', 'alerts-filter-text',
+      'alerts-range'];
+    App.rememberControls('alerts', CONTROLS);
     for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
       btn.onclick = () => {
         App.rememberSub('alerts', btn.dataset.subtab);
@@ -1011,11 +1055,7 @@
     // Last thing in init(): the range and severity lists above are filled
     // and nothing has been fetched, so the first refresh reads these back
     // out of the DOM the way it reads the markup defaults.
-    const CONTROLS = ['alerts-filter-sev', 'alerts-filter-state',
-      'alerts-filter-rule', 'alerts-filter-device', 'alerts-filter-text',
-      'alerts-range'];
     App.restoreControls('alerts', CONTROLS);
-    App.rememberControls('alerts', CONTROLS);
     selectSub(App.recallSub('alerts', 'current'));
   }
 

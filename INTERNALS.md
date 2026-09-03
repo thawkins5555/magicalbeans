@@ -3763,13 +3763,38 @@ kind of per-browser state, beside the layout (splitters, widths) and the
 tab. Until 4.37.0 none of it survived a reload: every filter's "current
 value" was the DOM element itself, read at fetch time, and every sort a
 `view.*Sort` literal, so a reload gave the markup defaults. One key now
-holds it, shape `{sort: {gridName: {key, descending}}, pages: {page:
-{controls: {elementId: value}, sub: name}}}`, with the same private-browsing
-try/catch every other `localStorage` write carries. Per browser, never sent
-to the server; written on change only, read once at init. `Reset panel
-sizes` leaves it alone: it means "put the furniture back".
+holds it, shape `{user: username, sort: {gridName: {key, descending}},
+pages: {page: {controls: {elementId: value}, sub: name}}}`, with the same
+private-browsing try/catch every other `localStorage` write carries. Per
+browser, never sent to the server. `Reset panel sizes` leaves it alone: it
+means "put the furniture back".
 
-Four helpers, and the whole write path for sort is one line: `App.grid`'s
+Nine of the twelve pages opt in — Nodes, Alerts, Syslog, SNMP Trap,
+NetFlow, IPAM, Wireless, ConfigRX and Debug, the ones with filter bars and
+sortable grids. Dashboard and Settings have nothing of this kind to keep,
+and NetPath deliberately keeps its own per-destination time windows in its
+module state rather than in this store, because "what window am I looking
+at" there is per destination and not per page.
+
+It is **not** read once at init. The fill functions write to it (a stored
+choice the list can no longer offer is dropped, below), `rememberControl`
+writes on every keystroke in a filter box, and the fetch path reads it on
+every tick that still has a late-filled select — twice a tick on Nodes,
+once each on Alerts and ConfigRX. So the parsed store is cached in memory
+(`viewCache`): `loadView()` returns the cache, `saveView` writes through it,
+and the window `storage` event drops it, which is the browser telling this
+tab that *another* tab wrote the key (it does not fire in the tab that
+wrote, which is exactly the invalidation rule wanted).
+
+The store also records the username it belongs to (`store.user`, set from
+`loadState()`, which `start()` awaits before any module's `init()` runs). A
+different operator signing in on the same browser discards the whole store
+before anything restores from it, and signing out removes the key: a filter
+bar holds the previous operator's own search terms and device names, which
+is their work rather than a shared setting, and a NOC workstation gets used
+by whoever is on shift.
+
+The write path for sort is one line: `App.grid`'s
 header-click handler calls `rememberSort(name, sort)` before `onSort`, so
 every grid records its sort under the name it already passes for widths,
 and a module opts in by seeding its state field with
@@ -3780,10 +3805,23 @@ table is rebuilt over a different device each time it opens. Filters use
 (the ranges and severity lists are filled by then and nothing has been
 fetched, so the first fetch reads the restored values out of the DOM
 exactly as it reads the markup defaults) and `App.rememberControls(page,
-ids)` beside the handler wiring — `input` for text boxes, because `change`
-only fires on blur and a reload with the cursor still in the field is the
-case this exists for. Sub-views go through `App.recallSub`/`rememberSub`,
-honoured only while a button for the stored name is still on the page.
+ids)` at the **start** of it — `input` for text boxes, because `change` only
+fires on blur and a reload with the cursor still in the field is the case
+this exists for. The start matters: listeners run in registration order, so
+registering the store's before the module's own `onchange` is what makes the
+store current by the time the refresh those handlers kick off reads it back.
+`restoreControls` at the end is safe beside it because assigning a value
+from script fires no event at all.
+
+That last point is also why a **Clear** button needs `App.syncControls(page,
+ids)`: `nf-clear`, `sl-clear`, `sn-clear` and Debug's All/None set `.value`
+or `.checked` directly, so nothing hears them, and the store would keep
+exactly the filters the operator has just cleared. Sub-views go through
+`App.recallSub(page, fallback, scope)`/`rememberSub`, honoured only while a
+button for the stored name is still on the page — validated inside one nav,
+the section's first `.subtabs` or the `scope` element's, since Nodes carries
+a second nav inside the device pane and a name checked against the whole
+page could match the wrong one.
 
 **The late-filled selects.** Seven dropdowns are populated after `init()`
 from fetched data (the Nodes profile and device-group filters, the Alerts
@@ -3791,13 +3829,21 @@ rule filter, the ConfigRX vendor filter, the Wireless controller list, the
 NetFlow exporter list, the Debug target list). Assigning a stored value to
 an empty `<select>` selects nothing, so each fill function falls back to
 `App.savedControl(page, id)` when nothing is chosen yet, and — because the
-first fetch happens *before* the fill — the fetch path does the same, so a
-restored dropdown filters the very first request rather than showing the
-right label over an unfiltered list for a tick. A stored choice the list
-can no longer offer (a deleted rule, a vendor with no devices left) is
+first fetch happens *before* the fill — the fetch path does the same through
+`App.controlOrSaved(page, id)`, so a restored dropdown filters the very
+first request rather than showing the right label over an unfiltered list
+for a tick. `controlOrSaved` hands the element the answer as soon as its
+option list exists (more than the one "any" placeholder, for a `<select>`),
+and only stands in for it before that: reading `select.value || saved`
+instead meant an empty choice was indistinguishable from no answer, so
+picking "any" re-sent the id just cleared for one cycle. A stored choice the
+list can no longer offer (a deleted rule, a vendor with no devices left) is
 dropped from the store by `App.rememberControl` rather than applied, so the
 table recovers on the next refresh instead of staying empty behind an
-invisible filter.
+invisible filter. Debug's target list is the exception: it is built
+incrementally from the event stream and only ever grows, so a stored
+destination the current batch has not mentioned is *appended as an option*
+and selected rather than forgotten.
 
 **Deliberately not stored:** the Live/Follow checkboxes on Syslog, Traps,
 NetFlow and Debug — "Live off" remembered across a reload is a page that
