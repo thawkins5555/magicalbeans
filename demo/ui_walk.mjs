@@ -412,8 +412,20 @@ async function measure(page, recorder) {
     await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
     await settle(page, 800);
     const expected = await page.evaluate(async () => {
-      const state = await App.get('/api/state');
-      return (state.nodes && state.nodes.device_count) || 0;
+      // The app cancels an in-flight GET when a newer one for the same URL
+      // starts, and the master timer polls /api/state on its own schedule,
+      // so a walk that asks for it can lose the race. That is not a
+      // failure -- the newer request is the answer -- so ask again.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const state = await App.get('/api/state');
+          return (state.nodes && state.nodes.device_count) || 0;
+        } catch (error) {
+          if (!(error && error.superseded)) throw error;
+          await new Promise((done) => setTimeout(done, 250));
+        }
+      }
+      return 0;
     });
     metrics.device_count = expected;
     const started = Date.now();
