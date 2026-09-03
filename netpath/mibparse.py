@@ -20,10 +20,14 @@ framing:
     etc.) beyond pulling SYNTAX's textual type name, an INTEGER enum
     table when present, and DESCRIPTION's quoted text — everything else
     in an OBJECT-TYPE clause is ignored.
-  - TEXTUAL-CONVENTION clauses are recognized only in that they still
-    match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE regex when they
-    themselves define an object; a bare `Foo ::= TEXTUAL-CONVENTION ...`
-    type alias (no trailing `{ parent number }`) is not modeled at all.
+  - A bare `Foo ::= TEXTUAL-CONVENTION ...` type alias is counted
+    (ParseResult.textual_conventions) but not modeled: it names a type,
+    not an OID, so there is nothing in it to resolve or poll. The count
+    is there so a module that is nothing else — SNMPv2-TC is exactly
+    that, 16 conventions and no objects — reports what it is rather than
+    "nothing was recognized in this file", which reads as a failed
+    import. TEXTUAL-CONVENTION clauses that do define an object still
+    match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE scan as before.
 
 Why every scan below is written as "find the next landmark, then look
 forward a bounded distance" rather than as one regex per clause: a lazy
@@ -101,6 +105,12 @@ class ParseResult:
     objects: list[ParsedObject]
     imports: dict[str, str] = field(default_factory=dict)   # symbol -> FROM module
     notes: list[str] = field(default_factory=list)
+    # `Foo ::= TEXTUAL-CONVENTION ...` type aliases. Counted, never turned
+    # into objects: a textual convention names a *type*, not an OID, so there
+    # is nothing here to resolve or poll. The count exists so a module that is
+    # nothing but textual conventions — SNMPv2-TC is exactly that — can say so
+    # instead of reporting that nothing was recognized in it.
+    textual_conventions: int = 0
 
 
 # The only two spans that get blanked: a quoted string and an ASN.1 comment.
@@ -187,6 +197,10 @@ _MODULE_IDENTITY_HEAD_RE = re.compile(
     r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b"
     + _MACRO_DEFN_TAIL)
 _OID_ASSIGN_RE = re.compile(r"::=\s*\{([^{}]*)\}")
+# `DisplayString ::= TEXTUAL-CONVENTION`. The MACRO definition SNMPv2-TC
+# opens with reads the other way round ("TEXTUAL-CONVENTION MACRO ::=") and
+# is correctly not counted.
+_TEXTUAL_CONVENTION_RE = re.compile(r"\b[A-Za-z][\w-]*\s*::=\s*TEXTUAL-CONVENTION\b")
 
 _SYNTAX_RE = re.compile(r"\bSYNTAX\s+([A-Za-z][\w-]*)")
 _SYNTAX_ENUM_RE = re.compile(r"\bSYNTAX\s+INTEGER\s*\{([^{}]*)\}")
@@ -432,13 +446,25 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
             description=(desc_match.group(1).strip() if desc_match else ""),
             is_notification=True)
 
+    textual_conventions = len(_TEXTUAL_CONVENTION_RE.findall(masked))
     if not objects:
-        notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, MODULE-IDENTITY, "
-                     "or NOTIFICATION-TYPE definitions were recognized in "
-                     "this file.")
+        if textual_conventions:
+            # SNMPv2-TC and its vendor equivalents are nothing but type
+            # definitions. Saying "nothing was recognized" about a file that
+            # imported perfectly reads as a failed import, and the obvious
+            # response is to delete it and try again.
+            notes.append(f"{textual_conventions} textual convention(s) and no "
+                         "objects, which is what this module is: it defines "
+                         "SNMP types, not OIDs, so there is nothing here to "
+                         "resolve or poll. The import succeeded.")
+        else:
+            notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, MODULE-IDENTITY, "
+                         "or NOTIFICATION-TYPE definitions were recognized in "
+                         "this file.")
 
     return ParseResult(module=module, objects=list(objects.values()),
-                       imports=imports, notes=notes)
+                       imports=imports, notes=notes,
+                       textual_conventions=textual_conventions)
 
 
 def resolve(objects: list[ParsedObject], known: dict[str, str]) -> tuple[int, list[str]]:

@@ -364,6 +364,36 @@ check("a file that cannot be parsed gets a note saying so",
       f"{summary['files_failed']} failed, note={note[:70]!r}")
 
 
+# ------------------------------------ H4: a pure textual-convention module
+
+print("H4  SNMPv2-TC reports what it is instead of looking like a failed import")
+
+with open(os.path.join(MIB_DIR, "SNMPv2-TC.mib"), encoding="utf-8") as fh:
+    tc = mibparse.parse(fh.read(), max_bytes=MB)
+check("SNMPv2-TC's textual conventions are counted",
+      tc.textual_conventions == 16, str(tc.textual_conventions))
+check("...and none of them is turned into an object", tc.objects == [])
+note = " ".join(tc.notes)
+check("...and the note says the import succeeded, not that nothing was found",
+      "16 textual convention(s)" in note and "The import succeeded." in note
+      and "No OBJECT-TYPE" not in note, note)
+
+# A file with neither objects nor conventions still says so plainly.
+empty = mibparse.parse("just some prose, no MIB syntax at all", max_bytes=MB)
+check("a file with nothing in it at all still reports that",
+      empty.objects == [] and empty.textual_conventions == 0
+      and any("No OBJECT-TYPE" in n for n in empty.notes), str(empty.notes))
+
+# A module with both is unchanged: no note at all, and the objects are real.
+mixed = mibparse.parse("M DEFINITIONS ::= BEGIN\n"
+                       "Foo ::= TEXTUAL-CONVENTION STATUS current\n"
+                       "m OBJECT IDENTIFIER ::= { enterprises 3 }\nEND",
+                       max_bytes=MB)
+check("a module with both conventions and objects is unchanged",
+      mixed.textual_conventions == 1 and [o.name for o in mixed.objects] == ["m"]
+      and mixed.notes == [], str(mixed.notes))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
