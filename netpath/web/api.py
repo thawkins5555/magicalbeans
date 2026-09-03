@@ -1756,17 +1756,37 @@ def _tri(value):
     return None if value is None else bool(value)
 
 
-def _device_json(row) -> dict:
+# The community string travels in the clear in every packet the protocol
+# defines, so it is not a secret in the sense a password is — and it is
+# still the only access control on many industrial devices, where the v2c
+# community is what a PLC or RTU checks before answering, and sometimes
+# before accepting a write. Handing every community in the estate to every
+# read-only Nodes account is a lateral-movement gift regardless of what the
+# wire already leaks. The value is shown to callers who could change it
+# anyway (module WRITE); everyone else gets `has_community`, the same
+# reduction `v3_auth_pass_enc` already gets.
+def _community_fields(row, reveal: bool) -> dict:
+    community = row["community"]
+    fields = {"has_community": bool(community)}
+    if reveal:
+        fields["community"] = community
+    return fields
+
+
+def _may_read_secrets(service, params, module: str) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get(module), _permissions.WRITE)
+
+
+def _device_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
         "group_id": row["group_id"], "device_group_id": row["device_group_id"],
         "display_name_source": row["display_name_source"],
         "enabled": bool(row["enabled"]),
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
-        # The community string is not a secret — it travels in the clear in
-        # every packet the protocol defines — so it is shown as typed. Only
-        # the v3 auth password is ever redacted down to has_credential.
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "poll_interval_s": row["poll_interval_s"],
         "snmp_timeout_s": row["snmp_timeout_s"],
@@ -1809,10 +1829,11 @@ def _device_json(row) -> dict:
     }
 
 
-def _group_json(service, row) -> dict:
+def _group_json(service, row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "name": row["name"], "snmp_version": row["snmp_version"],
-        "community": row["community"], "v3_user": row["v3_user"],
+        **_community_fields(row, reveal),
+        "v3_user": row["v3_user"],
         "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "poll_interval_s": row["poll_interval_s"],
@@ -1830,15 +1851,16 @@ def _group_json(service, row) -> dict:
         # "primary" credential — always present, always tried first. This
         # is every ADDITIONAL credential the poller falls back to in
         # order when the primary doesn't work for a given device.
-        "credentials": [_group_credential_json(r)
+        "credentials": [_group_credential_json(r, reveal)
                         for r in service.nodes_db.group_credentials(row["id"])],
     }
 
 
-def _group_credential_json(row) -> dict:
+def _group_credential_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "group_id": row["group_id"], "label": row["label"],
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "created_ts": row["created_ts"],
@@ -1958,9 +1980,10 @@ def get_nodes_devices(service, params, body) -> dict:
     # operator who silenced a device an hour ago and then wonders why it
     # is quiet should be able to see why without opening Alerts.
     muted = service.alerts_db.muted_entity_ids("device")
+    reveal = _may_read_secrets(service, params, "nodes")
     devices = []
     for row in rows:
-        device = _device_json(row)
+        device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
         devices.append(device)
@@ -2041,10 +2064,13 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     row = service.nodes_db.device(device_id)
     if not row:
         raise ValueError("No such device")
-    device = _device_json(row)
+    reveal = _may_read_secrets(service, params, "nodes")
+    device = _device_json(row, reveal)
+    # effective_config resolves the profile's own community into the
+    # device's, so it carries one too and follows the same rule.
     device["effective_config"] = {
         k: v for k, v in service.nodes_db.effective_config(row).items()
-        if k != "v3_auth_pass_enc"}
+        if k != "v3_auth_pass_enc" and (reveal or k != "community")}
     device["group_name"] = None
     if row["group_id"]:
         group = service.nodes_db.group(row["group_id"])
@@ -2643,7 +2669,9 @@ def delete_nodes_device_group(service, params, body, device_group_id) -> dict:
 
 
 def get_nodes_groups(service, params, body) -> dict:
-    return {"groups": [_group_json(service, r) for r in service.nodes_db.groups()]}
+    reveal = _may_read_secrets(service, params, "nodes")
+    return {"groups": [_group_json(service, r, reveal)
+                       for r in service.nodes_db.groups()]}
 
 
 def post_nodes_group(service, params, body) -> dict:
@@ -3612,11 +3640,12 @@ def post_alerts_engine(service, params, body) -> dict:
 
 # ---------------------------------------------------------------- wireless
 
-def _controller_json(row) -> dict:
+def _controller_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "name": row["name"], "ip": row["ip"],
         "enabled": bool(row["enabled"]),
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         # Same has_credential convention as Nodes' device v3 password —
         # the encrypted blob itself is never sent to the browser.
@@ -3722,7 +3751,9 @@ def _ap_json(service, row) -> dict:
 
 def get_wireless_overview(service, params, body) -> dict:
     return {
-        "controllers": [_controller_json(r) for r in service.wireless_db.controllers()],
+        "controllers": [_controller_json(r, _may_read_secrets(
+            service, params, "wireless"))
+            for r in service.wireless_db.controllers()],
         "ap_counts": service.wireless_db.ap_counts(),
         "poller": {
             "running": service.wireless.running,
@@ -3733,7 +3764,9 @@ def get_wireless_overview(service, params, body) -> dict:
 
 
 def get_wireless_controllers(service, params, body) -> dict:
-    return {"controllers": [_controller_json(r) for r in service.wireless_db.controllers()]}
+    reveal = _may_read_secrets(service, params, "wireless")
+    return {"controllers": [_controller_json(r, reveal)
+                            for r in service.wireless_db.controllers()]}
 
 
 _CONTROLLER_EDITABLE_BODY = ("name", "ip", "enabled", "snmp_version",

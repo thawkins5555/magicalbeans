@@ -849,6 +849,45 @@ def main() -> int:
     check("D9 …while an account holding those modules still does",
           {"configrx", "nodes"} <= categories, str(sorted(categories)))
 
+    # ------------------------------------------------- D10 community strings
+    group_id = SERVICE.nodes_db.ensure_default_group()
+    SERVICE.nodes_db.update_group(group_id, community="pr0file-community")
+    device_id = SERVICE.nodes_db.add_device("10.77.0.1", name="plc-1",
+                                            group_id=group_id)
+    SERVICE.nodes_db.update_device(device_id, community="s3cret-community")
+    controller_id = SERVICE.wireless_db.add_controller(
+        "wlc-b", "10.77.0.2", community="wl4n-community")
+
+    reader = make_user("nodesreader", {"nodes": "read", "wireless": "read"})
+
+    def community_values(cookie):
+        found = []
+        for path, key in (("/api/nodes/devices", "devices"),
+                          ("/api/nodes/groups", "groups"),
+                          ("/api/wireless/controllers", "controllers")):
+            _s, _h, out = req("GET", path, cookie=cookie)
+            found.append((path, [row.get("community") for row in out.get(key, [])],
+                          [row.get("has_community") for row in out.get(key, [])]))
+        _s, _h, out = req("GET", f"/api/nodes/devices/{device_id}", cookie=cookie)
+        found.append(("device", [out.get("device", {}).get("community")],
+                      [out.get("device", {}).get("has_community")]))
+        found.append(("effective", [out.get("device", {})
+                                    .get("effective_config", {}).get("community")],
+                      [True]))
+        return found
+
+    for path, values, flags in community_values(reader):
+        check(f"D10 a read-only caller sees no community in {path}",
+              all(v is None for v in values), f"{values}")
+        if path != "effective":
+            check(f"D10 …but is told one exists in {path}", any(flags), str(flags))
+
+    for path, values, _flags in community_values(admin_cookie):
+        if path == "effective":
+            continue
+        check(f"D10 a write caller still sees the community in {path}",
+              any(v for v in values), str(values))
+
     return 0
 
 
