@@ -1437,51 +1437,74 @@ class NodesDatabase:
             self._conn.commit()
         return cur.rowcount or 0
 
-    def replace_interfaces(self, device_id: int, rows: list[dict]) -> dict:
+    def replace_interfaces(self, device_id: int, rows: list[dict],
+                           allow_delete: bool = True) -> dict:
         """Wholesale replace of a device's interface table each poll cycle.
         Matches existing rows by if_index to carry forward
         last_in_octets/last_out_octets/last_sample_ts so a rate calc isn't
         lost across a routine poll; inserts new ones; deletes vanished
-        ones."""
+        ones.
+
+        `allow_delete=False` keeps every stored row the walk did not see.
+        A walk that was cut short — a timeout half way down the ifTable —
+        is not evidence that the interfaces it never reached are gone, and
+        deleting them takes their link-event history with them (the FK
+        cascade) and re-creates them with no counters on the next poll.
+
+        The returned dict carries `ids`: {if_index: interfaces.id} for
+        every row this device now has, because the caller needs those ids
+        to record link events and every row is already read here — one
+        SELECT per interface afterwards was pure duplication.
+        """
         now = time.time()
         with self._lock:
             existing = {row["if_index"]: row for row in self._conn.execute(
                 "SELECT * FROM interfaces WHERE device_id = ?", (device_id,)).fetchall()}
             seen_indexes = set()
             added, removed, reindexed = [], [], []
+            inserts, updates = [], []
             for row in rows:
                 if_index = row["if_index"]
                 seen_indexes.add(if_index)
                 prior = existing.get(if_index)
                 if prior is None:
                     added.append(if_index)
-                    self._conn.execute(
-                        "INSERT INTO interfaces(device_id, if_index, descr, alias,"
-                        " phys_addr, speed_bps, admin_status, oper_status,"
-                        " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                    inserts.append(
                         (device_id, if_index, row.get("descr"), row.get("alias"),
                          row.get("phys_addr"), row.get("speed_bps"),
                          row.get("admin_status"), row.get("oper_status"), now))
                 else:
                     if prior["descr"] != row.get("descr"):
                         reindexed.append(if_index)
-                    self._conn.execute(
-                        "UPDATE interfaces SET descr=?, alias=?, phys_addr=?,"
-                        " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
-                        " WHERE device_id=? AND if_index=?",
+                    updates.append(
                         (row.get("descr"), row.get("alias"), row.get("phys_addr"),
                          row.get("speed_bps"), row.get("admin_status"),
                          row.get("oper_status"), now, device_id, if_index))
-            for if_index in existing:
-                if if_index not in seen_indexes:
-                    removed.append(if_index)
+            if inserts:
+                self._conn.executemany(
+                    "INSERT INTO interfaces(device_id, if_index, descr, alias,"
+                    " phys_addr, speed_bps, admin_status, oper_status,"
+                    " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?)", inserts)
+            if updates:
+                self._conn.executemany(
+                    "UPDATE interfaces SET descr=?, alias=?, phys_addr=?,"
+                    " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
+                    " WHERE device_id=? AND if_index=?", updates)
+            if allow_delete:
+                for if_index in existing:
+                    if if_index not in seen_indexes:
+                        removed.append(if_index)
             if removed:
                 marks = ",".join("?" * len(removed))
                 self._conn.execute(
                     f"DELETE FROM interfaces WHERE device_id=? AND if_index IN ({marks})",
                     (device_id, *removed))
+            ids = {row["if_index"]: row["id"] for row in self._conn.execute(
+                "SELECT id, if_index FROM interfaces WHERE device_id = ?",
+                (device_id,)).fetchall()}
             self._conn.commit()
-        return {"added": added, "removed": removed, "reindexed": reindexed}
+        return {"added": added, "removed": removed, "reindexed": reindexed,
+                "ids": ids}
 
     def update_interface_rate(self, device_id: int, if_index: int, *,
                               in_octets: int | None, out_octets: int | None,
@@ -1490,41 +1513,127 @@ class NodesDatabase:
                               in_bps: float | None, out_bps: float | None,
                               in_error_rate: float | None, out_error_rate: float | None,
                               ts: float) -> None:
+        """One interface's counters and rates. A one-row wrapper around
+        update_interface_rates for callers outside the poll loop."""
+        self.update_interface_rates(device_id, [{
+            "if_index": if_index, "in_octets": in_octets, "out_octets": out_octets,
+            "in_errors": in_errors, "out_errors": out_errors,
+            "in_bps": in_bps, "out_bps": out_bps,
+            "in_error_rate": in_error_rate, "out_error_rate": out_error_rate,
+            "ts": ts}])
+
+    _RATE_COLUMNS = ("last_in_octets", "last_out_octets", "last_in_errors",
+                     "last_out_errors", "last_in_discards", "last_out_discards",
+                     "last_sample_ts", "in_bps", "out_bps", "in_error_rate",
+                     "out_error_rate", "in_discard_rate", "out_discard_rate",
+                     "discontinuity_ts")
+
+    def update_interface_rates(self, device_id: int, rows: list[dict]) -> None:
+        """Every interface's counters and computed rates for one poll, in
+        one statement and one commit.
+
+        One UPDATE per interface with its own commit is what made a
+        500-port chassis cost hundreds of transactions per poll; the values
+        are all known at the same moment, so they belong in one.
+        """
+        if not rows:
+            return
+        columns = self._RATE_COLUMNS
+        clauses = ", ".join(f"{name}=?" for name in columns)
+        params = [tuple([row.get("in_octets"), row.get("out_octets"),
+                         row.get("in_errors"), row.get("out_errors"),
+                         row.get("in_discards"), row.get("out_discards"),
+                         row.get("ts"), row.get("in_bps"), row.get("out_bps"),
+                         row.get("in_error_rate"), row.get("out_error_rate"),
+                         row.get("in_discard_rate"), row.get("out_discard_rate"),
+                         row.get("discontinuity_ts"),
+                         device_id, row["if_index"]])
+                  for row in rows]
         with self._lock:
-            self._conn.execute(
-                "UPDATE interfaces SET last_in_octets=?, last_out_octets=?,"
-                " last_in_errors=?, last_out_errors=?,"
-                " last_sample_ts=?, in_bps=?, out_bps=?, in_error_rate=?,"
-                " out_error_rate=? WHERE device_id=? AND if_index=?",
-                (in_octets, out_octets, in_errors, out_errors, ts, in_bps,
-                 out_bps, in_error_rate, out_error_rate, device_id, if_index))
-            self._conn.commit()
+            try:
+                self._conn.executemany(
+                    f"UPDATE interfaces SET {clauses}"
+                    f" WHERE device_id=? AND if_index=?", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
 
     # ---------------------------------------------------------------- metrics
 
-    def record_metric_sample(self, device_id: int, key: str, label: str,
-                             unit: str, kind: str, ts: float, value: float | None) -> int:
+    def record_metric_samples(self, device_id: int, rows: list) -> dict:
+        """Every metric one poll produced, in one transaction.
+
+        `rows` is a sequence of (key, label, unit, kind, ts, value). The
+        whole poll's samples used to go through record_metric_sample one at
+        a time, each with its own commit: a 500-port chassis is ~2,000
+        fsyncs per poll, and the review measured 2,181 rows/s that way
+        against 150,832/s batched. Here it is one SELECT of the device's
+        existing metric ids, one INSERT for keys never seen before, one
+        UPDATE of the current values, and one INSERT for the samples.
+
+        `kind` is written only when the metric row is created. Changing a
+        metric's kind under a chart that has months of history in the other
+        unit is not something a poll should do silently, and the poller
+        never means to: the kind is a property of the OID, not of a
+        reading. A value of None updates last_ts and stores no sample —
+        "polled, no answer" is not a zero.
+
+        Returns {key: metric_id} for every row, so a caller that needs an
+        id (a chart link, a threshold) does not have to read them back.
+        """
+        latest: dict[str, tuple] = {}
+        for row in rows or ():
+            key, label, unit, kind, ts, value = row
+            latest[key] = (label, unit, kind, ts, value)
+        if not latest:
+            return {}
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM metrics WHERE device_id=? AND key=?",
-                (device_id, key)).fetchone()
-            if row is None:
-                cur = self._conn.execute(
-                    "INSERT INTO metrics(device_id, key, label, unit, kind,"
-                    " last_value, last_ts) VALUES (?,?,?,?,?,?,?)",
-                    (device_id, key, label, unit, kind, value, ts))
-                metric_id = cur.lastrowid
-            else:
-                metric_id = row["id"]
-                self._conn.execute(
+            try:
+                ids = {r["key"]: r["id"] for r in self._conn.execute(
+                    "SELECT id, key FROM metrics WHERE device_id = ?",
+                    (device_id,)).fetchall()}
+                missing = [(device_id, key, label, unit, kind)
+                           for key, (label, unit, kind, _ts, _value) in latest.items()
+                           if key not in ids]
+                if missing:
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO metrics(device_id, key, label, unit,"
+                        " kind) VALUES (?,?,?,?,?)", missing)
+                    marks = ",".join("?" * len(missing))
+                    for r in self._conn.execute(
+                            f"SELECT id, key FROM metrics WHERE device_id = ?"
+                            f" AND key IN ({marks})",
+                            (device_id, *[m[1] for m in missing])).fetchall():
+                        ids[r["key"]] = r["id"]
+                self._conn.executemany(
                     "UPDATE metrics SET last_value=?, last_ts=?, label=?, unit=?"
-                    " WHERE id=?", (value, ts, label, unit, metric_id))
-            if value is not None:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
-                    " VALUES (?,?,?)", (metric_id, ts, value))
-            self._conn.commit()
-            return metric_id
+                    " WHERE id=?",
+                    [(value, ts, label, unit, ids[key])
+                     for key, (label, unit, _kind, ts, value) in latest.items()
+                     if key in ids])
+                samples = [(ids[key], ts, value)
+                           for key, (_label, _unit, _kind, ts, value) in latest.items()
+                           if value is not None and key in ids]
+                if samples:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
+                        " VALUES (?,?,?)", samples)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+        return {key: ids[key] for key in latest if key in ids}
+
+    def record_metric_sample(self, device_id: int, key: str, label: str,
+                             unit: str, kind: str, ts: float,
+                             value: float | None) -> int:
+        """One metric sample — a one-row wrapper around
+        record_metric_samples, kept for the callers (tests, on-demand
+        reads) that genuinely have exactly one."""
+        ids = self.record_metric_samples(
+            device_id, [(key, label, unit, kind, ts, value)])
+        return ids[key]
 
     def metrics(self, device_id: int) -> list[sqlite3.Row]:
         with self._lock:

@@ -923,17 +923,20 @@ class NodePoller:
         else:
             status = device["status"] if device["status"] in ("up", "down") else "unknown"
 
-        # Recorded before record_poll so a device that goes on to be marked
-        # down still leaves the loss sample that explains why.
+        # Every sample this poll produced, written in ONE transaction at the
+        # end (see the T4 block below) rather than one commit each. A device
+        # that goes on to be marked down still leaves the loss sample that
+        # explains why: the flush is unconditional, not part of the success
+        # path.
+        samples: list[tuple] = []   # (key, label, unit, kind, ts, value)
         if ping_loss_pct is not None:
-            self.db.record_metric_sample(
-                device_id, "ping_loss_pct", "Packet loss", "%", "gauge",
-                now, ping_loss_pct)
+            samples.append(("ping_loss_pct", "Packet loss", "%", "gauge",
+                            now, ping_loss_pct))
         if ping_rtt_ms is not None:
-            self.db.record_metric_sample(
-                device_id, "ping_rtt_ms", "Ping response time", "ms", "gauge",
-                now, ping_rtt_ms)
+            samples.append(("ping_rtt_ms", "Ping response time", "ms", "gauge",
+                            now, ping_rtt_ms))
 
+        # T1 — the device row.
         previous = self.db.record_poll(
             device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,
             snmp_error=snmp_error, identity=identity, uptime_ticks=uptime_ticks,
@@ -1006,7 +1009,11 @@ class NodePoller:
             # read would always compare the new value to itself and never
             # detect a link_up/link_down transition.
             existing = {row["if_index"]: row for row in self.db.interfaces(device_id)}
+            # T2 — the interface table. Its `ids` map replaces one
+            # interface_id_for() SELECT per port below.
             result = self.db.replace_interfaces(device_id, interfaces)
+            interface_ids = result["ids"]
+            rate_rows: list[dict] = []
             for row in interfaces:
                 if_index = row["if_index"]
                 prior = existing.get(if_index)
@@ -1034,13 +1041,15 @@ class NodePoller:
                     out_err_rate = counter_rate(
                         prior["last_out_errors"], prior["last_sample_ts"] or 0,
                         row.get("out_errors"), sample_ts, 32)
-                self.db.update_interface_rate(
-                    device_id, if_index, in_octets=row.get("in_octets"),
-                    out_octets=row.get("out_octets"),
-                    in_errors=row.get("in_errors"), out_errors=row.get("out_errors"),
-                    in_bps=in_bps, out_bps=out_bps,
-                    in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=sample_ts)
-                interface_id = self.db.interface_id_for(device_id, if_index)
+                rate_rows.append({
+                    "if_index": if_index, "in_octets": row.get("in_octets"),
+                    "out_octets": row.get("out_octets"),
+                    "in_errors": row.get("in_errors"),
+                    "out_errors": row.get("out_errors"),
+                    "in_bps": in_bps, "out_bps": out_bps,
+                    "in_error_rate": in_err_rate, "out_error_rate": out_err_rate,
+                    "ts": sample_ts})
+                interface_id = interface_ids.get(if_index)
                 if interface_id is not None and prior is not None:
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
                         kind = "link_up" if row.get("oper_status") == "up" else "link_down"
@@ -1056,12 +1065,16 @@ class NodePoller:
                         ("out_err", "err/s", out_err_rate),
                     ):
                         if value is not None:
-                            self.db.record_metric_sample(
-                                device_id, f"if_{suffix}.{if_index}",
-                                f"{label} {suffix}", unit, "gauge", now, value)
+                            samples.append((f"if_{suffix}.{if_index}",
+                                            f"{label} {suffix}", unit, "gauge",
+                                            now, value))
+            # T3 — every interface's counters and rates.
+            self.db.update_interface_rates(device_id, rate_rows)
 
-        for key, label, unit, kind, value in metrics:
-            self.db.record_metric_sample(device_id, key, label, unit, kind, now, value)
+        samples.extend((key, label, unit, kind, now, value)
+                       for key, label, unit, kind, value in metrics)
+        # T4 — every sample this poll produced, in one transaction.
+        self.db.record_metric_samples(device_id, samples)
 
     def working_config(self, device) -> dict:
         """The config an *on-demand* read should use — effective_config()
