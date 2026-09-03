@@ -24,10 +24,13 @@ INCREMENTAL = 2
 def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool:
     """Switch ``conn``'s database to incremental auto-vacuum.
 
-    A new (empty) database takes the pragma directly.  An existing database
-    created with ``auto_vacuum=NONE`` needs one ``VACUUM`` to rebuild the
-    page map — a one-time cost at startup that is logged.  Returns True when
-    the database is in incremental mode afterwards.
+    A database with no pages yet takes the pragma directly.  Any database
+    that already has a page — including an *empty* one that a
+    ``PRAGMA journal_mode=WAL`` has already touched, which is every caller
+    that goes through ``dbopen.connect`` — needs one ``VACUUM`` to rebuild
+    the page map, instant on an empty file and a one-time startup cost on a
+    populated one, logged either way.  Returns True when the database is in
+    incremental mode afterwards.
     """
     try:
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
@@ -38,7 +41,7 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
     try:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         pages = conn.execute("PRAGMA page_count").fetchone()[0]
-        if pages > 1:
+        if pages > 0:
             started = time.monotonic()
             conn.execute("VACUUM")
             log.info("%s: converted to incremental auto-vacuum in %.1f s",

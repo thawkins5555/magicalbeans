@@ -177,10 +177,14 @@ class Agent:
         return []
 
     def write_stats(self) -> None:
+        """Rewritten atomically: the test reads this file while the stub is
+        still serving, and a half-written one is not valid JSON."""
         if not self.stats_path:
             return
-        with open(self.stats_path, "w") as handle:
+        temporary = self.stats_path + ".tmp"
+        with open(temporary, "w") as handle:
             json.dump(dict(self.counts, engine_boots=self.engine_boots), handle)
+        os.replace(temporary, self.stats_path)
 
     # ---------------------------------------------------------------- values
 

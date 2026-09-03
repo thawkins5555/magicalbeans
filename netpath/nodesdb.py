@@ -21,6 +21,8 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint, dbopen
+
 log = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -541,12 +543,20 @@ class NodesDatabase:
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
         self._warned_no_window = False
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # dbopen.connect narrows the file (and its -wal/-shm companions) to
+        # the owner: nodes.db holds every profile's community string and
+        # every stored v3 credential blob.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            # Before the schema runs: auto_vacuum can be set with a plain
+            # pragma only while the database is still empty, so a new
+            # nodes.db takes it for free and only an existing one pays the
+            # one-time VACUUM that converts it (logged).
+            dbmaint.enable_incremental_vacuum(self._conn, "nodes")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -2655,9 +2665,24 @@ class NodesDatabase:
             removed += cursor.rowcount or 0
             self._conn.commit()
         removed += self.cap_samples_per_metric(max_samples_per_metric)
+        if removed:
+            # Freed pages go back to the operating system in short steps
+            # with the lock released between them, rather than through a
+            # VACUUM that rewrites the whole file under an exclusive lock.
+            dbmaint.reclaim(self._conn, self._lock, label="nodes")
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest raw samples until the file is back under its
+        cap.
+
+        The deletes are the same as before; what changed is how the space
+        comes back. This used to run VACUUM inside the module lock, up to
+        six times — the review measured 6.49 s per VACUUM at 2 million rows
+        and a 38.9 s stall for the whole call, during which every poll
+        worker, the alert tick and every HTTP handler waited. dbmaint's
+        incremental reclaim frees pages in short steps, releasing the lock
+        between them, so nothing waits longer than one step."""
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -2675,6 +2700,5 @@ class NodesDatabase:
                     " ORDER BY ts ASC LIMIT ?)", (chunk,))
                 removed += cursor.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dbmaint.reclaim(self._conn, self._lock, label="nodes")
         return removed

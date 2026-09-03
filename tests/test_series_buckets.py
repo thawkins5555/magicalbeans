@@ -293,5 +293,72 @@ print(f"PASS: rollup_days prunes samples_hourly ({after_rows} -> {left} rows)")
 
 roll_db.close()
 
+# ------------------------------------------------- space, without a VACUUM
+#
+# §4.5 F5: trim_to_size ran VACUUM inside the module lock up to six times —
+# 6.49 s per VACUUM at 2 million rows, a 38.9 s stall for the whole call,
+# during which every poll worker, the alert tick and every HTTP handler
+# waited on the same lock. dbmaint frees pages in short steps instead.
+
+trim_path = os.path.join(TMPDIR, "trim.db")
+trim_db = NodesDatabase(trim_path)
+with trim_db._lock:
+    mode = trim_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+assert mode == 2, f"a fresh nodes.db should be in incremental auto-vacuum, got {mode}"
+print("PASS: a fresh database opens in incremental auto-vacuum mode")
+
+trim_group = trim_db.ensure_default_group()
+trim_device = trim_db.add_device("127.0.0.5", name="trim-test", group_id=trim_group)
+# 300 metrics x 60 timestamps: one batched write per timestamp, the shape
+# a poll actually produces. record_metric_samples keeps one row per key, so
+# the timestamps have to come from separate calls.
+for t in range(60):
+    trim_db.record_metric_samples(
+        trim_device,
+        [(f"bulk.{j}", "bulk", "u", "gauge", float(t), float(t * j))
+         for j in range(300)])
+with trim_db._lock:
+    trim_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+before_bytes = os.path.getsize(trim_path)
+
+# Deliberately below the current size, so the trim loop actually runs.
+blocked = []
+
+
+def poll_writer(db, stop):
+    """A poll worker's write path, timed. Nothing it does should ever wait
+    more than a fraction of a second on the trim."""
+    while not stop.is_set():
+        started = _time.monotonic()
+        db.record_metric_samples(
+            trim_device, [("concurrent", "concurrent", "u", "gauge",
+                           _time.time(), 1.0)])
+        blocked.append(_time.monotonic() - started)
+        _time.sleep(0.005)
+
+
+stop = threading.Event()
+writer_thread = threading.Thread(target=poll_writer, args=(trim_db, stop))
+writer_thread.start()
+trim_removed = trim_db.trim_to_size(before_bytes // 2)
+stop.set()
+writer_thread.join(timeout=10)
+assert not writer_thread.is_alive(), "the writer thread never finished"
+
+with trim_db._lock:
+    trim_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+after_bytes = os.path.getsize(trim_path)
+print(f"trim removed {trim_removed} sample(s); file {before_bytes:,} -> "
+      f"{after_bytes:,} bytes; {len(blocked)} writes, worst wait "
+      f"{max(blocked or [0]):.3f}s")
+assert trim_removed > 0, "the trim removed nothing"
+assert after_bytes < before_bytes, (before_bytes, after_bytes)
+print("PASS: the file shrinks without a VACUUM")
+assert blocked, "the writer never ran"
+assert max(blocked) < 0.5, f"a writer waited {max(blocked):.2f}s during the trim"
+print("PASS: a writer is never blocked for more than a step of the reclaim")
+
+trim_db.close()
+
 nodes_db.close()
 print("ALL SERIES-BUCKET ASSERTIONS PASSED")
