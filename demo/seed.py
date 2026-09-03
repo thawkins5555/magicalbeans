@@ -522,6 +522,45 @@ def step_devices(client: Client, log: SeedLog, plan, site_ids, profile_ids) -> d
             "ids_by_name": by_name, "first_error": first_error}
 
 
+def step_topology(client: Client, log: SeedLog, plan, device_ids: dict) -> dict:
+    """3b. Point every Site-A device at the core switch.
+
+    `upstream_id` is what lets the alert engine roll a site's outage up into
+    one alert instead of one per device, and nothing else in this demo sets
+    it, so without this step the feature is only ever exercised by unit
+    tests. The core is index 0 of the plan and is left with no upstream of
+    its own; the wireless controller and the access switches behind it get
+    it. Devices at the other sites are left alone deliberately, so one run
+    shows both behaviours: Site-A rolled up, Site-B and Site-C not.
+    """
+    client.step = "3b-topology"
+    core_name = next((e.get("name") for e in plan if e.get("index") == 0), "")
+    core_id = device_ids.get(core_name)
+    if not core_id:
+        print("[3b] no core device in the plan; upstream_id left unset")
+        return {"core": "", "linked": 0}
+    linked = failed = 0
+    for entry in plan:
+        if entry.get("index") == 0 or (entry.get("site") or "") != "Site-A":
+            continue
+        device_id = device_ids.get(entry.get("name") or "")
+        if not device_id:
+            continue
+        status, payload, _ = client.raw(
+            "PUT", "/api/nodes/devices/%d" % device_id, {"upstream_id": core_id})
+        if status == 200:
+            linked += 1
+        else:
+            failed += 1
+    print("[3b] topology: %d Site-A devices point at %s (id %d)%s"
+          % (linked, core_name, core_id,
+             "; %d failed" % failed if failed else ""))
+    log.note("3b-topology", "upstream_id set", core=core_name, core_id=core_id,
+             linked=linked, failed=failed)
+    return {"core": core_name, "core_id": core_id, "linked": linked,
+            "failed": failed}
+
+
 def step_netpath(client: Client, log: SeedLog) -> dict:
     """4. NetPath targets, including the six scripted shim destinations."""
     client.step = "4-netpath"
@@ -853,6 +892,10 @@ def main(argv=None) -> int:
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers to set; 0 leaves the default. "
                              "Ignored with --defaults")
+    parser.add_argument("--topology", action="store_true",
+                        help="point every Site-A device at the core switch "
+                             "(upstream_id), so a site outage rolls up into "
+                             "one alert instead of one per device")
     parser.add_argument("--defaults", action="store_true",
                         help="seed the fleet without tuning anything the "
                              "application ships: 120 s poll interval, 3.0 s "
@@ -890,6 +933,9 @@ def main(argv=None) -> int:
         summary["groups"] = ids
         summary["devices"] = step_devices(client, log, plan, ids["sites"],
                                           ids["profiles"])
+        if args.topology:
+            summary["topology"] = step_topology(
+                client, log, plan, summary["devices"]["ids_by_name"])
         summary["netpath"] = step_netpath(client, log)
         summary["ipam"] = step_ipam(client, log)
         summary["wireless"] = step_wireless(client, log)

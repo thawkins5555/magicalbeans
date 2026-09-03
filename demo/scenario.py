@@ -206,6 +206,17 @@ def terminate(process, name: str, log) -> None:
 
 # ------------------------------------------------------------------ runner
 
+def _suffix(args) -> str:
+    """What to append to this run's database and results names, so runs of
+    the same size in different configurations do not overwrite each other."""
+    parts = []
+    if getattr(args, "defaults", False):
+        parts.append("-defaults")
+    if getattr(args, "topology", False):
+        parts.append("-topology")
+    return "".join(parts)
+
+
 class Scenario:
     def __init__(self, args):
         self.args = args
@@ -217,8 +228,7 @@ class Scenario:
         # configuration of the same fleet, and mixing the two would make
         # the retention and alert figures unreadable.
         self.data_dir = os.path.join(
-            self.out, "data-%d%s" % (self.count,
-                                     "-defaults" if getattr(args, "defaults", False) else ""))
+            self.out, "data-%d%s" % (self.count, _suffix(args)))
         self.mail_log = os.path.join(self.out, "mail-%d.log" % self.count)
         self.app_log = os.path.join(self.out, "app-%d.log" % self.count)
         self.fleet_log = os.path.join(self.out, "fleet-%d.log" % self.count)
@@ -349,6 +359,8 @@ class Scenario:
         argv = [sys.executable, "-u", seed, "--base", self.base,
                 "--count", str(self.count), "--out", self.out,
                 "--workers", str(self.args.workers)]
+        if getattr(self.args, "topology", False):
+            argv.append("--topology")
         if getattr(self.args, "defaults", False):
             # A run at shipped settings: seed.py then makes none of the
             # campaign's overrides, so the numbers can be read beside a
@@ -743,7 +755,7 @@ class Scenario:
         payload = {"count": self.count, "fast": self.args.fast,
                    "base": self.base, "generated": time.time(),
                    "notes": self.notes, "steps": self.steps, **extra}
-        json_path = os.path.join(self.out, "results-%d%s.json" % (self.count, "-defaults" if getattr(self.args, "defaults", False) else ""))
+        json_path = os.path.join(self.out, "results-%d%s.json" % (self.count, _suffix(self.args)))
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=1, default=str)
 
@@ -832,7 +844,7 @@ class Scenario:
             lines.extend("- %s" % note for note in self.notes)
             lines.append("")
 
-        md_path = os.path.join(self.out, "results-%d%s.md" % (self.count, "-defaults" if getattr(self.args, "defaults", False) else ""))
+        md_path = os.path.join(self.out, "results-%d%s.md" % (self.count, _suffix(self.args)))
         with open(md_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines))
         self.log("[ok] wrote %s and %s"
@@ -896,6 +908,9 @@ def main(argv=None) -> int:
                         help="do not run demo/ui_walk.mjs at the end")
     parser.add_argument("--fast", action="store_true",
                         help="scale every wait down 4x for a dry run")
+    parser.add_argument("--topology", action="store_true",
+                        help="set upstream_id on the Site-A devices, so the "
+                             "outage step shows the alert rollup")
     parser.add_argument("--defaults", action="store_true",
                         help="seed with the shipped settings: no threshold, "
                              "grace, interval, worker or mail-cap overrides")
