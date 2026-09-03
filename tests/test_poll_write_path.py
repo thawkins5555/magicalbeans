@@ -158,6 +158,108 @@ def v3_engine_time():
         proc.kill()
 
 
+def ipv6_polling():
+    """§4.1 N3: AF_INET was hardcoded in _Session and in the discovery
+    probe, and tracer.resolve used the IPv4-only gethostbyname, so an
+    IPv6 management plane could not be polled, discovered or traced."""
+    print("\n-- IPv6")
+    import socket as _socket
+    from netpath import ipam_scan, tracer
+
+    # resolve() answers for a v6 literal and a v6-only name.
+    check(tracer.resolve("::1") == "::1",
+          f"tracer.resolve returns an IPv6 literal unchanged "
+          f"(got {tracer.resolve('::1')!r})")
+    check(tracer.resolve("127.0.0.1") == "127.0.0.1",
+          "…and an IPv4 literal, as before")
+    check(tracer.resolve("localhost") in ("127.0.0.1", "::1"),
+          f"…and a name (got {tracer.resolve('localhost')!r})")
+    check(tracer.resolve("no-such-host.invalid") is None,
+          "…and None for a name that does not resolve")
+
+    # usable_addresses takes a v6 prefix, and still refuses a huge one.
+    small = ipam_scan.usable_addresses("2001:db8::/126", 1024)
+    check(small == ["2001:db8::", "2001:db8::1", "2001:db8::2", "2001:db8::3"],
+          f"an IPv6 /126 enumerates its four addresses ({small})")
+    check(ipam_scan.subnet_size("2001:db8::/126") == 4,
+          "…and subnet_size agrees with it")
+    refused = False
+    try:
+        ipam_scan.usable_addresses("2001:db8::/64", 1024)
+    except ipam_scan.SubnetTooLarge:
+        refused = True
+    check(refused, "…while a /64 is refused rather than enumerated")
+    check(len(ipam_scan.usable_addresses("192.168.4.0/24", 1024)) == 254,
+          "…and IPv4 is unchanged")
+
+    # The family is chosen from the address itself. Asserted by recording
+    # what _Session asks socket.socket for, so it holds on a host with no
+    # IPv6 stack at all (this container has none).
+    from netpath.nodepoll import _Session
+    asked = []
+    real_socket = _socket.socket
+
+    def recording_socket(family, kind, *rest):
+        asked.append(family)
+        return real_socket(_socket.AF_INET, kind, *rest)
+
+    nodepoll_mod.socket.socket = recording_socket
+    try:
+        _Session("10.0.0.1", 161, 1.0, 0).close()
+        _Session("2001:db8::1", 161, 1.0, 0).close()
+    finally:
+        nodepoll_mod.socket.socket = real_socket
+    check(asked == [_socket.AF_INET, _socket.AF_INET6],
+          f"_Session opens AF_INET6 for a v6 address and AF_INET for a v4 one "
+          f"({asked})")
+
+    from netpath import nodediscover
+    asked = []
+    nodediscover.socket.socket = recording_socket
+    try:
+        for target in ("10.0.0.1", "2001:db8::1"):
+            try:
+                nodediscover._snmp_identify(target, 1, "public", 0.2, ["1.3.6.1.2.1.1.1.0"])
+            except Exception:
+                pass
+    finally:
+        nodediscover.socket.socket = real_socket
+    check(asked == [_socket.AF_INET, _socket.AF_INET6],
+          f"…and so does the discovery probe ({asked})")
+
+    try:
+        probe = _socket.socket(_socket.AF_INET6, _socket.SOCK_DGRAM)
+        probe.bind(("::1", 0))
+        probe.close()
+    except OSError as exc:
+        print(f"      (no IPv6 loopback on this host: {exc}); skipping the poll")
+        return
+
+    proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--host", "::1")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "ipv6.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "::1", "v6-switch", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        device = db.device(device_id)
+        check(device["status"] == "up",
+              f"a device on an IPv6 address polls (status={device['status']!r}, "
+              f"error={device['snmp_error']!r})")
+        check(device["sys_name"] == "iftable-stub",
+              "…with its identity read")
+        check(len(db.interfaces(device_id)) == 2,
+              f"…and its interfaces ({len(db.interfaces(device_id))})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def vendor_health():
     """§4.1 S9: the poller read no vendor health at all, so cpu_high,
     mem_high and disk_high could only ever fire on a device running
@@ -551,6 +653,7 @@ def main():
     reboot_suppression()
     interface_reads()
     vendor_health()
+    ipv6_polling()
     request_matching()
     v3_engine_time()
 

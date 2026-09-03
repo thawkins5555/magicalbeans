@@ -48,7 +48,8 @@ Modes:
                    started, so a test can put the restart between two
                    polls without counting requests.
 
-Options: --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
+Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
+AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
 --bump-boots-at SECONDS, --stats PATH (a JSON counter file the test reads).
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
@@ -83,12 +84,14 @@ class Agent:
     def __init__(self, port: int, mode: str = "ok", interfaces: int = 2,
                  reboot_after: int = 2, window: float = 1.0,
                  bump_boots_at: float = 0.0, stats_path: str = "",
-                 dark_after: int = 0):
+                 dark_after: int = 0, host: str = "127.0.0.1"):
         self.mode = mode
         self.n_interfaces = interfaces
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", port))
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.sock = socket.socket(family, socket.SOCK_DGRAM)
+        self.sock.bind((host, port))
         self.port = self.sock.getsockname()[1]
+        self.host = host
         self.walked = False          # dark_after_walk: has the ifIndex walk run?
         self.in_octets = 1_000_000
         self.reboot_after = reboot_after
@@ -447,7 +450,7 @@ class Agent:
         return []
 
     def serve(self):
-        print(f"listening on 127.0.0.1:{self.port} ({self.mode})", flush=True)
+        print(f"listening on {self.host}:{self.port} ({self.mode})", flush=True)
         while True:
             data, addr = self.sock.recvfrom(65535)
             try:
@@ -469,6 +472,7 @@ def main(argv):
     bump_boots_at = 0.0
     stats_path = ""
     dark_after = 0
+    host = "127.0.0.1"
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
@@ -484,10 +488,12 @@ def main(argv):
             stats_path = rest.pop(0)
         elif item == "--dark-after":
             dark_after = int(rest.pop(0))
+        elif item == "--host":
+            host = rest.pop(0)
         else:
             mode = item
     Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
-          stats_path, dark_after).serve()
+          stats_path, dark_after, host).serve()
 
 
 if __name__ == "__main__":

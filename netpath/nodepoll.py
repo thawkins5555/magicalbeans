@@ -165,7 +165,13 @@ class _Session:
         self.port = port
         self.timeout_s = max(0.2, float(timeout_s))
         self.retries = max(0, int(retries))
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # A device on an IPv6 management plane needs an AF_INET6 socket;
+        # AF_INET was hardcoded, so every such device timed out on every
+        # poll. A literal address is unambiguous — a colon cannot appear in
+        # a dotted-quad — and the port is separate, so there is nothing to
+        # parse.
+        self.family = socket.AF_INET6 if ":" in str(ip) else socket.AF_INET
+        self.sock = socket.socket(self.family, socket.SOCK_DGRAM)
         self.sock.settimeout(self.timeout_s)
         # Request ids for this session's own exchanges. A counter from a
         # random start rather than random.randint per request: two requests
@@ -188,11 +194,23 @@ class _Session:
         """Whether a datagram came from the device we asked. `addr` is
         (host, port[, flow, scope]) — only the host is compared, because a
         few agents answer from an ephemeral port rather than 161, which is
-        odd but not forgery."""
+        odd but not forgery. IPv6 literals are compared after normalising
+        both sides, since 'fe80::1' and 'fe80:0:0:0:0:0:0:1' are the same
+        address written two ways."""
         try:
-            return addr[0] == self.ip
+            source = addr[0]
         except (TypeError, IndexError):
             return False
+        if source == self.ip:
+            return True
+        if self.family != socket.AF_INET6:
+            return False
+        try:
+            packed = socket.inet_pton(socket.AF_INET6, source.split("%")[0])
+            mine = socket.inet_pton(socket.AF_INET6, self.ip.split("%")[0])
+        except (OSError, AttributeError):
+            return False
+        return packed == mine
 
     def request(self, packet: bytes, expect_request_id: int | None = None) -> Response:
         """Send, wait for OUR reply, decode it.
