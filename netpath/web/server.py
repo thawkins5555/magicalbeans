@@ -247,7 +247,13 @@ ROUTES = [
     ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
-    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
+    # The backup's CONTENT, not its metadata: even after the redaction pass
+    # a captured config is a map of the device — interfaces, ACLs, VPN
+    # peers, management addresses — so downloading one is a ConfigRX write's
+    # privilege. The listing (dates, sizes, hashes, whether it was redacted)
+    # stays a read, which is what a read-only operator needs to answer "has
+    # this switch changed".
+    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),

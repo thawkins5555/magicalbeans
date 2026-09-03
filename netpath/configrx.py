@@ -35,6 +35,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
+from . import configrx_redact
 from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
 from .hostkeys import HostKeyChanged, HostKeyStore
@@ -734,7 +735,19 @@ class ConfigRxWorker:
                                 f"read ended on '{ended}'.")
             return
 
-        backup_id, _digest = self.db.add_backup(device_id, cleaned)
+        # Redaction happens here, before anything is stored: what reaches
+        # configrx.db is what an operator will be able to download, so the
+        # secrets have to be gone by this line and not merely hidden by the
+        # endpoint that serves it. Per-device opt-out, off by default.
+        store_secrets = bool(config["store_secrets"]
+                             if "store_secrets" in config.keys() else False)
+        if store_secrets:
+            redacted_count = 0
+        else:
+            cleaned, redacted_count = configrx_redact.redact(cleaned)
+
+        backup_id, _digest = self.db.add_backup(
+            device_id, cleaned, redacted=not store_secrets)
         # Only when a key was actually stored, and said once: the note used to
         # be appended to every backup, because the accepted key was thrown
         # away with the connection and every device was unknown again next
@@ -743,7 +756,12 @@ class ConfigRxWorker:
         if backup_id is not None:
             self.counters["changed"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
-            self.log.add(CONFIGRX, f"Stored a changed config backup for {device['ip']}")
+            self.log.add(
+                CONFIGRX, f"Stored a changed config backup for {device['ip']}",
+                detail=(f"{redacted_count} secret-bearing line(s) redacted "
+                        f"before storage" if not store_secrets else
+                        "Stored verbatim: this device has \"keep secrets in "
+                        "backups\" switched on"))
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

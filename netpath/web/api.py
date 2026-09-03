@@ -3958,6 +3958,10 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
         "effective_vendor": override or nodesdb.detected_vendor(device_row) or "",
         "vendor_is_override": bool(override),
         "backup_enabled": bool(config["backup_enabled"]) if config else False,
+        # Whether this device's captures are stored verbatim rather than
+        # redacted (configrx_redact.py). Off unless somebody turned it on.
+        "store_secrets": bool(config["store_secrets"]) if (
+            config and "store_secrets" in config.keys()) else False,
         "ssh_port": config["ssh_port"] if config else 22,
         "ssh_username": (config["ssh_username"] if config else "") or "",
         # Same has_credential convention as every other stored password in
@@ -3973,8 +3977,13 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
 
 
 def _configrx_backup_json(row) -> dict:
+    keys = row.keys()
     return {"id": row["id"], "device_id": row["device_id"], "ts": row["ts"],
-            "sha256": row["sha256"], "size_bytes": row["size_bytes"]}
+            "sha256": row["sha256"], "size_bytes": row["size_bytes"],
+            # So the UI can say whether what it is about to show has had
+            # its secrets taken out. Keyed defensively for a row handed in
+            # from an older-shaped source, as the device rows are.
+            "redacted": bool(row["redacted"]) if "redacted" in keys else False}
 
 
 def delete_configrx_backup(service, params, body, backup_id) -> dict:
@@ -4046,7 +4055,14 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
     fields = {k: v for k, v in body.items()
-             if k in ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")}
+             if k in ("backup_enabled", "ssh_port", "ssh_username",
+                      "vendor_override", "store_secrets")}
+    if "store_secrets" in fields:
+        fields["store_secrets"] = 1 if fields["store_secrets"] else 0
+        _audit(service, params,
+               "configrx.store_secrets", target=str(device_id),
+               detail="on — captures will be stored verbatim"
+                      if fields["store_secrets"] else "off")
     service.configrx_db.update_device_config(device_id, **fields)
     return {"ok": True}
 

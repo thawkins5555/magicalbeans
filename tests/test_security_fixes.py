@@ -888,6 +888,150 @@ def main() -> int:
         check(f"D10 a write caller still sees the community in {path}",
               any(v for v in values), str(values))
 
+    # ---------------------------------------------------- D11 backup secrets
+    from netpath import configrx, configrx_redact
+
+    CISCO = """!
+hostname core-sw-1
+!
+enable secret 5 $1$mERr$Nv1KcQ9E6ZmM0pT7yzUq/1
+enable password 7 070C285F4D06
+!
+username operator privilege 15 secret 5 $1$abcd$0123456789abcdefghij0
+username backup password 7 104D000A0618
+!
+snmp-server community pl4nt-r34d RO 20
+snmp-server community pl4nt-wr1te RW
+snmp-server user netops NETOPS v3 auth sha AuthPassPhrase priv aes 128 PrivPassPhrase
+!
+tacacs-server host 10.1.1.1 key 7 05080F1C2243
+radius-server host 10.1.1.2 key R4diusSh4red
+tacacs server ISE
+ address ipv4 10.1.1.3
+ key 7 121A0C0411045D
+!
+key chain EIGRP-KEYS
+ key 1
+  key-string eigrpSh4redKey
+!
+crypto isakmp key MyPreSharedKey address 198.51.100.7
+crypto ikev2 keyring KR
+ peer BRANCH
+  pre-shared-key local Br4nchLocalKey
+  pre-shared-key remote Br4nchRemoteKey
+!
+router bgp 65001
+ neighbor 203.0.113.9 password 7 060506324F41
+!
+interface Dialer1
+ ppp chap password 7 02050D480809
+!
+banner motd ^ No enable secret is configured on guest kit ^
+description uplink to the tacacs-server room
+!
+end
+"""
+
+    FORTIOS = """config system admin
+    edit "admin"
+        set password ENC AK1qL2mN3oP4qR5sT6uV7wX8yZ==
+        set accprofile "super_admin"
+    next
+end
+config user local
+    edit "svc-radius"
+        set passwd ENC ZZ9yX8wV7uT6sR5qP4oN3mL2kJ==
+    next
+end
+config vpn ipsec phase1-interface
+    edit "to-branch"
+        set psksecret ENC QQ1aB2cD3eF4gH5iJ6kL7mN8oP==
+        set remote-gw 198.51.100.8
+    next
+end
+config system snmp community
+    edit 1
+        set name "public"
+    next
+end
+config log syslogd setting
+    set status enable
+end
+"""
+
+    for label, text, expected in (("Cisco IOS", CISCO, [
+            "$1$mERr", "070C285F4D06", "$1$abcd", "104D000A0618",
+            "pl4nt-r34d", "pl4nt-wr1te", "PrivPassPhrase",
+            "05080F1C2243", "R4diusSh4red", "121A0C0411045D",
+            "eigrpSh4redKey", "MyPreSharedKey", "Br4nchLocalKey",
+            "Br4nchRemoteKey", "060506324F41", "02050D480809"]),
+            ("FortiOS", FORTIOS, [
+                "AK1qL2mN3oP4qR5sT6uV7wX8yZ==",
+                "ZZ9yX8wV7uT6sR5qP4oN3mL2kJ==",
+                "QQ1aB2cD3eF4gH5iJ6kL7mN8oP=="])):
+        out, count = configrx_redact.redact(text)
+        leaked = [secret for secret in expected if secret in out]
+        check(f"D11 every {label} secret is replaced", not leaked, str(leaked))
+        check(f"D11 …and the {label} pass reports what it did", count >= len(expected),
+              f"{count} replacements for {len(expected)} secrets")
+
+    check("D11 the structure of a redacted line survives",
+          "snmp-server community <redacted> RO 20" in
+          configrx_redact.redact(CISCO)[0]
+          and "crypto isakmp key <redacted> address 198.51.100.7" in
+          configrx_redact.redact(CISCO)[0])
+    check("D11 …and FortiOS quoting is kept",
+          'set psksecret ENC "<redacted>"' in configrx_redact.redact(FORTIOS)[0]
+          or "set psksecret ENC <redacted>" in configrx_redact.redact(FORTIOS)[0],
+          configrx_redact.redact(FORTIOS)[0])
+    check("D11 text that only mentions a keyword is left alone",
+          "No enable secret is configured on guest kit"
+          in configrx_redact.redact(CISCO)[0]
+          and "description uplink to the tacacs-server room"
+          in configrx_redact.redact(CISCO)[0])
+    check("D11 a config with no secrets is returned unchanged",
+          configrx_redact.redact("hostname edge-1\n!\nend\n")
+          == ("hostname edge-1\n!\nend\n", 0))
+
+    # Through the worker's own storage path, with the device's opt-out.
+    backup_device = SERVICE.nodes_db.add_device("10.77.0.9", name="cfg-sw",
+                                                group_id=group_id)
+    SERVICE.configrx_db.update_device_config(backup_device, backup_enabled=1)
+    text, n = configrx_redact.redact(CISCO)
+    stored_id, _digest = SERVICE.configrx_db.add_backup(backup_device, text,
+                                                        redacted=True)
+    row = SERVICE.configrx_db.backup(stored_id)
+    check("D11 the stored row records that it was redacted", bool(row["redacted"]))
+    content = SERVICE.configrx_db.backup_content(stored_id)
+    check("D11 …and the stored bytes carry no secret",
+          "pl4nt-wr1te" not in content and "<redacted>" in content)
+
+    status, _h, payload = req("POST", f"/api/configrx/devices/{backup_device}/config",
+                              {"store_secrets": True}, cookie=admin_cookie)
+    check("D11 the per-device opt-out is settable", status == 200, str(status))
+    check("D11 …and is reported back",
+          req("GET", f"/api/configrx/devices/{backup_device}",
+              cookie=admin_cookie)[2]["device"]["store_secrets"] is True)
+    SERVICE.configrx_db.update_device_config(backup_device, store_secrets=0)
+
+    # Content needs ConfigRX write; the listing does not.
+    cx_reader = make_user("cxreader", {"configrx": "read"})
+    status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
+                              cookie=cx_reader)
+    check("D11 a read-only ConfigRX account cannot download a backup",
+          status == 403, f"{status} {payload}")
+    status, _h, payload = req("GET",
+                              f"/api/configrx/devices/{backup_device}/backups",
+                              cookie=cx_reader)
+    check("D11 …but still sees the listing, with the redacted flag",
+          status == 200 and payload["backups"][0]["redacted"] is True,
+          f"{status} {payload}")
+    status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
+                              cookie=admin_cookie)
+    check("D11 a ConfigRX write account can still download it",
+          status == 200 and "<redacted>" in payload.get("content", ""),
+          str(status))
+
     return 0
 
 

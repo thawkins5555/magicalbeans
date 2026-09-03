@@ -47,7 +47,13 @@ CREATE TABLE IF NOT EXISTS device_config (
     vendor_override       TEXT,
     last_backup_ts        REAL,
     last_backup_status    TEXT,
-    last_backup_error     TEXT
+    last_backup_error     TEXT,
+    -- Store this device's config verbatim, secrets and all, instead of
+    -- running the redaction pass (configrx_redact.py) over it first. Off,
+    -- and per device rather than global: turning it on is a decision about
+    -- one switch, taken by someone who knows what that switch's config
+    -- contains.
+    store_secrets         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS backups (
@@ -56,7 +62,13 @@ CREATE TABLE IF NOT EXISTS backups (
     ts           REAL NOT NULL,
     content_gz   BLOB NOT NULL,
     sha256       TEXT NOT NULL,
-    size_bytes   INTEGER NOT NULL
+    size_bytes   INTEGER NOT NULL,
+    -- Whether the secrets in this row were replaced before it was stored.
+    -- Recorded per row, not inferred from the device's current setting:
+    -- the setting can be changed afterwards, and what matters when reading
+    -- a backup is what happened to THAT capture. Rows stored before 4.37
+    -- are 0, which is true of them.
+    redacted     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_backups_device ON backups(device_id, ts);
 
@@ -126,7 +138,8 @@ DEFAULTS = {
     "table_columns_backups": "",
 }
 
-DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")
+DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username",
+                          "vendor_override", "store_secrets")
 
 
 class ConfigRxDatabase:
@@ -144,7 +157,26 @@ class ConfigRxDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Adds columns a database created by an older build predates. Same
+        shape as nodesdb._migrate and wirelessdb._migrate: diff PRAGMA
+        table_info against what the CREATE TABLE above declares and ALTER
+        TABLE in what is missing, never rewrite the CREATE. Idempotent, so
+        it runs on every open."""
+        wanted = {
+            "device_config": [("store_secrets", "INTEGER NOT NULL DEFAULT 0")],
+            "backups": [("redacted", "INTEGER NOT NULL DEFAULT 0")],
+        }
+        for table, columns in wanted.items():
+            present = {row["name"] for row in
+                       self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, declaration in columns:
+                if name not in present:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def close(self) -> None:
         with self._lock:
@@ -306,11 +338,20 @@ class ConfigRxDatabase:
                 (device_id,)).fetchone()
         return row["sha256"] if row else None
 
-    def add_backup(self, device_id: int, content: str) -> tuple[int | None, str]:
+    def add_backup(self, device_id: int, content: str,
+                   redacted: bool = False) -> tuple[int | None, str]:
         """Stores `content` as a new backup unless it is byte-identical to
         the device's most recent one, in which case nothing is written —
         the caller still records the poll itself via record_backup_attempt.
-        Returns (backup_id or None, sha256)."""
+        Returns (backup_id or None, sha256).
+
+        `redacted` records whether the caller took the secrets out before
+        handing the text over; it is stored on the row rather than looked
+        up from the device's current setting, because the setting can be
+        changed after the fact and what matters is what happened to THIS
+        capture. The hash is of the text as stored, so turning the setting
+        on or off makes the next capture differ from the last one and be
+        kept — which is right: it genuinely is a different document."""
         raw = content.encode("utf-8")
         digest = hashlib.sha256(raw).hexdigest()
         if digest == self.latest_backup_hash(device_id):
@@ -318,23 +359,25 @@ class ConfigRxDatabase:
         compressed = zlib.compress(raw)
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO backups(device_id, ts, content_gz, sha256, size_bytes)"
-                " VALUES (?,?,?,?,?)",
-                (device_id, time.time(), compressed, digest, len(raw)))
+                "INSERT INTO backups(device_id, ts, content_gz, sha256,"
+                " size_bytes, redacted) VALUES (?,?,?,?,?,?)",
+                (device_id, time.time(), compressed, digest, len(raw),
+                 1 if redacted else 0))
             self._conn.commit()
             return cur.lastrowid, digest
 
     def backups_for(self, device_id: int, limit: int = 200) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
-                "SELECT id, device_id, ts, sha256, size_bytes FROM backups"
+                "SELECT id, device_id, ts, sha256, size_bytes, redacted FROM backups"
                 " WHERE device_id = ? ORDER BY ts DESC LIMIT ?",
                 (device_id, limit)).fetchall()
 
     def backup(self, backup_id: int) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(
-                "SELECT id, device_id, ts, sha256, size_bytes FROM backups WHERE id = ?",
+                "SELECT id, device_id, ts, sha256, size_bytes, redacted FROM backups"
+                " WHERE id = ?",
                 (backup_id,)).fetchone()
 
     def backup_content(self, backup_id: int) -> str | None:
