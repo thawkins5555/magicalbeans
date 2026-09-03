@@ -50,6 +50,13 @@ IFX_TABLE = {   # ifXTable, preferred when present (RFC 2863)
     "if_high_speed":    "1.3.6.1.2.1.31.1.1.1.15",   # Mbps, use *1e6 over if_speed
     "if_hc_in_octets":  "1.3.6.1.2.1.31.1.1.1.6",    # 64-bit
     "if_hc_out_octets": "1.3.6.1.2.1.31.1.1.1.10",
+    # ifCounterDiscontinuityTime: the sysUpTime at which this interface's
+    # counters were last discontinuous (a card reseat, a counter reset, a
+    # module reload). A rate computed across one of those is fiction — the
+    # counters went backwards for a reason that has nothing to do with a
+    # 32-bit wrap — so the poller stores it and drops that interface's
+    # rates for the one poll where it changed.
+    "if_discontinuity": "1.3.6.1.2.1.31.1.1.1.19",
 }
 
 # Best-effort scalars: near-universal across net-snmp/Linux and many

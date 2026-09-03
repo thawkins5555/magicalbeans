@@ -158,6 +158,119 @@ def v3_engine_time():
         proc.kill()
 
 
+def _poll_once(poller, db, device_id):
+    device = db.device(device_id)
+    poller._poll_device(device, db.effective_config(device))
+
+
+def interface_reads():
+    """The three ways reading a device's interfaces used to go wrong: an
+    SNMPv1 agent answering noSuchName for the whole PDU, a device that
+    stops answering half way down the table, and one malformed index."""
+
+    # ---------------------------------------------------- SNMPv1 gets rows
+    print("\n-- SNMPv1 interfaces")
+    proc, port = spawn_stub("stub_agent_iftable.py", "v1_nosuchname",
+                            "--interfaces", "3")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "v1.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "v1-switch", group_id=group_id,
+            snmp_version=0, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        device = db.device(device_id)
+        check(device["status"] == "up" and device["sys_name"] == "iftable-stub",
+              f"a v1 device polls (status={device['status']!r}, "
+              f"sys_name={device['sys_name']!r})")
+        ifaces = {r["if_index"]: r for r in db.interfaces(device_id)}
+        check(set(ifaces) == {1, 2, 3},
+              f"every interface on a v1 device is discovered ({sorted(ifaces)})")
+        check(all(r["descr"] for r in ifaces.values()),
+              f"…with its description "
+              f"({[r['descr'] for r in ifaces.values()]})")
+        check(ifaces[1]["speed_bps"] == 1_000_000_000,
+              f"…and its speed ({ifaces[1]['speed_bps']})")
+        time.sleep(1.05)
+        _poll_once(poller, db, device_id)
+        ifaces = {r["if_index"]: r for r in db.interfaces(device_id)}
+        check(ifaces[1]["in_bps"] is not None and ifaces[1]["in_bps"] > 0,
+              f"…and a real counter rate on the next poll "
+              f"(in_bps={ifaces[1]['in_bps']})")
+        check(ifaces[1]["last_in_discards"] is not None,
+              "ifInDiscards is stored")
+        metrics = {r["key"] for r in db.metrics(device_id)}
+        check("if_in_util_pct" in metrics and "if_in_error_rate" in metrics
+              and "if_in_discard_rate" in metrics,
+              f"the device-level keys the shipped threshold rules read now "
+              f"exist ({sorted(k for k in metrics if not k[-2:].isdigit())})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    # ------------------------------------------- a device that goes quiet
+    print("\n-- a device that stops answering mid-table")
+    proc, port = spawn_stub("stub_agent_iftable.py", "dark_after_walk",
+                            "--interfaces", "40", "--dark-after", "3")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "dark.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "dark-switch", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=0.3, snmp_retries=1)
+        poller = NodePoller(db)
+        # An interface stored by an earlier poll that this one will not
+        # reach. A partial read is not evidence that it is gone.
+        db.replace_interfaces(device_id, [{"if_index": 99, "descr": "Gi9/99"}])
+        started = time.monotonic()
+        _poll_once(poller, db, device_id)
+        elapsed = time.monotonic() - started
+        # 39 unanswered interfaces at 0.3 s x 2 attempts is 23 s; the
+        # give-up-after-three rule should cost under two.
+        print(f"      the poll took {elapsed:.1f}s for 40 interfaces")
+        check(elapsed < 6.0,
+              f"a device that goes quiet does not hold the worker for "
+              f"N x timeout x retries (took {elapsed:.1f}s)")
+        ifaces = {r["if_index"]: r for r in db.interfaces(device_id)}
+        check(99 in ifaces,
+              f"an interface the partial read never reached is kept "
+              f"({sorted(ifaces)})")
+        check(1 in ifaces, "…alongside the ones it did read")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    # ------------------------------------------------ one malformed index
+    print("\n-- a malformed ifIndex")
+    proc, port = spawn_stub("stub_agent_iftable.py", "nonnumeric",
+                            "--interfaces", "3")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "nonnumeric.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "odd-switch", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        ifaces = {r["if_index"] for r in db.interfaces(device_id)}
+        check(ifaces == {1, 2, 3},
+              f"one unparseable index no longer truncates the table "
+              f"({sorted(ifaces)})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def request_matching():
     """A reply is only an answer when it came from the device we asked and
     carries the request id we sent. The stub sends a late answer to
@@ -363,6 +476,7 @@ def main():
         proc.kill()
 
     reboot_suppression()
+    interface_reads()
     request_matching()
     v3_engine_time()
 

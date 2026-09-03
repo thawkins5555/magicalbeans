@@ -16,9 +16,9 @@ Modes:
                    first offender, and the request's varbind list echoed
                    back as nulls. This is what makes every interface on a
                    v1 device come back blank.
-  dark_after_walk  answers the ifIndex walk, then stops replying to
-                   anything — the device that holds a poll worker for
-                   N x timeout x retries.
+  dark_after_walk  answers the ifIndex walk and the first --dark-after
+                   GETs, then stops replying — the device that holds a
+                   poll worker for N x timeout x retries.
   nonnumeric       the ifIndex column carries one non-numeric index suffix
                    between two numeric ones.
   reboot           sysUpTime counts up for the first --reboot-after reads
@@ -42,7 +42,7 @@ Modes:
                    started, so a test can put the restart between two
                    polls without counting requests.
 
-Options: --interfaces N, --reboot-after N, --window SECONDS,
+Options: --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
 --bump-boots-at SECONDS, --stats PATH (a JSON counter file the test reads).
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
@@ -76,7 +76,8 @@ USM_UNKNOWN_ENGINE_IDS = "1.3.6.1.6.3.15.1.1.4.0"
 class Agent:
     def __init__(self, port: int, mode: str = "ok", interfaces: int = 2,
                  reboot_after: int = 2, window: float = 1.0,
-                 bump_boots_at: float = 0.0, stats_path: str = ""):
+                 bump_boots_at: float = 0.0, stats_path: str = "",
+                 dark_after: int = 0):
         self.mode = mode
         self.n_interfaces = interfaces
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -88,6 +89,8 @@ class Agent:
         self.uptime_reads = 0
         self.sys_name = "iftable-stub"
         self.window = window
+        self.dark_after = dark_after
+        self.gets = 0
         self.bump_boots_at = bump_boots_at
         self.bumped = False
         self.started_at = time.monotonic()
@@ -359,9 +362,11 @@ class Agent:
         req = decode_response(data)
         if self.mode == "v3":
             return self._v3_handle(req, self._msg_id(data))
+        if req.pdu_tag == PDU_GET:
+            self.gets += 1
         if self.mode == "dark_after_walk" and self.walked and \
-                req.pdu_tag == PDU_GET:
-            return []                        # answered the walk, now silent
+                req.pdu_tag == PDU_GET and self.gets > self.dark_after:
+            return []                        # answered its share, now silent
         if req.pdu_tag == PDU_GET:
             if self.mode == "stale_id":
                 # The late answer to somebody else's attempt, first, with
@@ -408,6 +413,7 @@ def main(argv):
     window = 1.0
     bump_boots_at = 0.0
     stats_path = ""
+    dark_after = 0
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
@@ -421,10 +427,12 @@ def main(argv):
             bump_boots_at = float(rest.pop(0))
         elif item == "--stats":
             stats_path = rest.pop(0)
+        elif item == "--dark-after":
+            dark_after = int(rest.pop(0))
         else:
             mode = item
     Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
-          stats_path).serve()
+          stats_path, dark_after).serve()
 
 
 if __name__ == "__main__":
