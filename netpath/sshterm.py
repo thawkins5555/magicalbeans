@@ -19,7 +19,9 @@ The shape:
   request that opened it by hours, so being authorised at the upgrade is not
   enough — signing out, a session expiring, an account deleted or the `ssh`
   permission taken away all close the shell (4401), and every failed login
-  is counted and audited so the page cannot be used as a password oracle.
+  is counted — against the account and the device, not against the socket,
+  which is free to open again — and audited, so the page cannot be used as
+  a password oracle.
 * The credential is ConfigRX's stored one for that device when there is one
   — decrypted at connect time and dropped immediately, exactly as the backup
   path does — and otherwise typed into the page and sent once over the
@@ -72,11 +74,21 @@ MAX_SESSIONS = 16
 # otherwise lock every other operator out. Four terminals is more than anyone
 # watches at once.
 MAX_SESSIONS_PER_USER = 4
-# Failed logins allowed on one socket. Without a cap the page is an
-# unthrottled password oracle against every device this app can reach; five
-# is the room a mistyped password needs and no more. Every failure is
-# audited, and the cap ends the session.
+# Failed logins allowed per signed-in account and device. Not per socket:
+# a socket is free to open, so a per-socket cap is no cap at all — close
+# the window, open another, and the counter starts again. Without a real
+# one the page is an unthrottled password oracle against every device this
+# app can reach; five is the room a mistyped password needs and no more.
+# Every failure is audited, and the cap ends the session.
 MAX_AUTH_ATTEMPTS = 5
+# How long a refused login is remembered against that pair. Once the cap is
+# spent the account cannot try this device again until the newest failure
+# has aged out, and a new socket is refused before the device is contacted
+# at all. Five minutes is a cooling-off an operator who mistyped notices
+# and a guessing loop cannot outrun. A successful login clears the count:
+# the pair has proved itself, and the operator who fumbled four passwords
+# should not be locked out an hour later.
+AUTH_FAILURE_WINDOW_S = 300
 # How often keystrokes refresh the *web* session. A shell being typed into is
 # presence by the same rule server.py applies to a POST, but a touch per
 # keystroke would be a write per character; twice a minute is plenty.
@@ -134,6 +146,15 @@ class SshSessionRegistry:
         self._lock = threading.Lock()
         self._sessions: set = set()
         self._stopping = False
+        # Refused logins, keyed by (app user, device id) rather than by
+        # socket — see MAX_AUTH_ATTEMPTS. Each entry is the timestamps still
+        # inside the window (at most the cap's worth is kept) and whether the
+        # refusal that follows has already been audited, so a client that
+        # reconnects in a loop leaves one line rather than one per socket.
+        # Entries whose failures have all aged out are dropped, so this does
+        # not grow with the devices an account has ever mistyped a password
+        # for.
+        self._auth_failures: dict = {}
 
     @property
     def count(self) -> int:
@@ -167,6 +188,58 @@ class SshSessionRegistry:
         finally:
             with self._lock:
                 self._sessions.discard(session)
+
+    # ------------------------------------------------------ refused logins
+
+    def _fresh_failures(self, key) -> list:
+        """The failure times still inside the window for one (account,
+        device) pair, dropping every entry — this one included — that has
+        aged out entirely. Called under the lock."""
+        now = time.time()
+        spent = []
+        for other, entry in self._auth_failures.items():
+            entry["times"] = [when for when in entry["times"]
+                              if now - when < AUTH_FAILURE_WINDOW_S]
+            if not entry["times"]:
+                spent.append(other)
+        for other in spent:
+            del self._auth_failures[other]
+        entry = self._auth_failures.get(key)
+        return entry["times"] if entry else []
+
+    def record_auth_failure(self, app_user: str, device_id: int) -> int:
+        """Count one refused login against this account and device, and
+        return how many now stand within the window. That number is what
+        the audit line says, so a pattern spread over several sockets reads
+        as one run of attempts rather than as five ones."""
+        key = (app_user or "", int(device_id))
+        with self._lock:
+            times = self._fresh_failures(key)
+            times.append(time.time())
+            del times[:-MAX_AUTH_ATTEMPTS]      # only the cap's worth matters
+            self._auth_failures[key] = {"times": times, "announced": False}
+            return len(times)
+
+    def clear_auth_failures(self, app_user: str, device_id: int) -> None:
+        """A login this device accepted: the pair has proved itself."""
+        with self._lock:
+            self._auth_failures.pop((app_user or "", int(device_id)), None)
+
+    def auth_cooldown(self, app_user: str, device_id: int) -> tuple[float, bool]:
+        """How long this account must wait before trying this device again,
+        and whether this refusal is the first to be audited — a client
+        reconnecting in a loop should leave one line, not one per socket.
+        (0.0, False) when there is nothing to wait for."""
+        key = (app_user or "", int(device_id))
+        with self._lock:
+            times = self._fresh_failures(key)
+            if len(times) < MAX_AUTH_ATTEMPTS:
+                return 0.0, False
+            left = max(0.0, AUTH_FAILURE_WINDOW_S - (time.time() - times[-1]))
+            entry = self._auth_failures[key]
+            first = not entry["announced"]
+            entry["announced"] = True
+            return left, first
 
     @staticmethod
     def _refuse(ws, message: str) -> None:
@@ -319,6 +392,14 @@ class SshSession:
         reason = self._load_stored_credential(config)
 
         while not self._stopped.is_set():
+            # Checked before the credentials are even asked for, so a socket
+            # opened after the cap was spent — this one or any other — is
+            # refused without the device hearing about it.
+            cooling, first = self.registry.auth_cooldown(self.app_user,
+                                                         self.device_id)
+            if cooling > 0:
+                self._refuse_after_failures(cooling, first)
+                return
             if self._password is None:
                 if not self._ask_for_credentials(reason):
                     return
@@ -339,6 +420,24 @@ class SshSession:
                     return
                 continue
             return                                    # reported already
+
+    def _refuse_after_failures(self, seconds: float, announce: bool) -> None:
+        """This account has spent its refused logins against this device —
+        on this socket or on one it has since closed. Say how long the wait
+        is, close 4429 (the code the page's table already means "too many"),
+        and audit the refusal *itself* once per cooling-off period: a
+        reconnecting client should read as one line, not as five hundred
+        refused logins."""
+        minutes = max(1, -(-int(seconds) // 60))
+        self._error(f"Too many failed logins for this device. Try again in "
+                    f"about {minutes} minute(s).")
+        if announce:
+            self._audit(
+                f"SSH login refused before it was attempted: "
+                f"{MAX_AUTH_ATTEMPTS} recent failures for {self.app_user} "
+                f"on this device (from {self.client_ip})",
+                f"No connection was made; about {minutes} minute(s) to wait.")
+        self.ws.close(CLOSE_TOO_MANY, "Too many failed logins")
 
     def _ask_for_credentials(self, reason: str) -> bool:
         """Ask the page for a username and password and wait for them.
@@ -454,6 +553,11 @@ class SshSession:
             self.client = None
             return "failed", None
         self.channel.settimeout(None)
+        # The device accepted this account's credential, so the refused
+        # logins standing against the pair are spent: an operator who
+        # fumbled four passwords and then got in must not be locked out an
+        # hour later by the count they left behind.
+        self.registry.clear_auth_failures(self.app_user, self.device_id)
         self._status("connected", f"Connected to {self.host}:{self.port}")
         self._audit_open()
         return "connected", None
@@ -660,8 +764,11 @@ class SshSession:
     def _audit_auth_failure(self) -> None:
         """A refused login, counted and recorded. The SSH username is named
         (it is what was tried), the password never is — and the count is
-        what turns a stream of these into something an operator can see."""
-        self._auth_failures += 1
+        what turns a stream of these into something an operator can see.
+        The count comes from the registry, keyed by account and device, so
+        it does not start again with every new socket."""
+        self._auth_failures = self.registry.record_auth_failure(
+            self.app_user, self.device_id)
         self._audit(
             f"SSH login as {self._username or '(no user)'} refused "
             f"(attempt {self._auth_failures} of {MAX_AUTH_ATTEMPTS}; requested "

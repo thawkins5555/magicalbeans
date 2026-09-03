@@ -587,6 +587,112 @@ try:
         stub_module._Server.check_auth_password = accept_password
     wait_idle()
 
+    # --------------------------- and the cap follows the account, not the socket
+
+    # A socket is free to open, so a per-socket counter is no counter at
+    # all: close the window, open another, and the guessing carries on. The
+    # cap is per account and device, across sockets, with a cooling-off —
+    # and the socket that runs into it never reaches the device.
+    stub4 = StubDevice(mode="slow", pause_s=0.05, host="127.0.0.4")
+    guessed = service.nodes_db.add_device("127.0.0.4", name="guess-target",
+                                          group_id=group_id)
+    service.configrx_db.update_device_config(guessed, ssh_port=stub4.port)
+    tried = []
+    stub_module._Server.check_auth_password = (
+        lambda self, username, password: (tried.append(username),
+                                          paramiko.AUTH_FAILED)[1])
+    try:
+        def guess(client, times: int) -> None:
+            """Answer `need-credentials` `times` over. Each answer is sent
+            only once the ask for it has arrived, so the failures are in
+            order rather than raced."""
+            for _ in range(times):
+                assert client.next_control("need-credentials", timeout=30)
+                client.send_json({"type": "auth", "username": "wrong",
+                                  "password": "guess"})
+
+        def error_saying(client, needle: str, timeout: float = 30.0) -> dict:
+            """The next error frame that says `needle` — a refused login
+            sends its own error first, and it is not the one being asserted."""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                message = client.next_control(timeout=timeout)
+                assert message is not None, f"the socket closed before {needle!r}"
+                if message["type"] == "error" and needle in message["message"]:
+                    return message
+            raise AssertionError(f"no error saying {needle!r}")
+
+        first = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        first.send_json({"type": "open", "cols": 80, "rows": 24})
+        guess(first, 3)
+        assert first.next_control("need-credentials", timeout=30)
+        first.close()
+        wait_idle()
+        assert len(tried) == 3, tried
+
+        # A brand-new socket: the counter does not start again with it.
+        second = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        second.send_json({"type": "open", "cols": 80, "rows": 24})
+        guess(second, 2)
+        error_saying(second, "Too many failed logins")
+        assert second.wait_closed(10) == 1000, second.close_code
+        second.close()
+        wait_idle()
+        assert len(tried) == sshterm.MAX_AUTH_ATTEMPTS, tried
+        print("PASS: five refusals spread over two sockets spend the cap — "
+              "reconnecting does not reset it")
+
+        numbered = [e["detail"] for e in service.nodes_db.device_events(
+            guessed, kinds=["ssh"]) if "refused (attempt" in e["detail"]]
+        assert len(numbered) == sshterm.MAX_AUTH_ATTEMPTS, numbered
+        assert any("attempt 4 of 5" in d for d in numbered), numbered
+        assert any("attempt 5 of 5" in d for d in numbered), numbered
+        print("PASS: the device events count 1..5 across both sockets, so the "
+              "pattern is visible instead of reading as two fresh starts")
+
+        # The sixth attempt: refused here, and the device never hears it.
+        third = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        third.send_json({"type": "open", "cols": 80, "rows": 24})
+        message = error_saying(third, "Too many failed logins for this device")
+        assert "minute" in message["message"], message
+        assert third.wait_closed(10) == 4429, third.close_code
+        third.close()
+        wait_idle()
+        assert len(tried) == sshterm.MAX_AUTH_ATTEMPTS, tried
+        print("PASS: the sixth attempt is refused with 4429 and a cooling-off "
+              "period, without the device being contacted at all")
+
+        refusals = [e["detail"] for e in service.nodes_db.device_events(
+            guessed, kinds=["ssh"]) if "refused before it was attempted" in
+            e["detail"]]
+        assert len(refusals) == 1 and DEFAULT_USER in refusals[0], refusals
+        print("PASS: the refusal to start is audited once, not once per socket")
+
+        # A cooling-off that has passed lets the account try again, and a
+        # login the device accepts clears what is standing against the pair.
+        original_window = sshterm.AUTH_FAILURE_WINDOW_S
+        sshterm.AUTH_FAILURE_WINDOW_S = 0.5
+        try:
+            time.sleep(0.6)
+            stub_module._Server.check_auth_password = accept_password
+            again = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+            again.send_json({"type": "open", "cols": 80, "rows": 24})
+            assert again.next_control("need-credentials", timeout=30)
+            again.send_json({"type": "auth", "username": "operator",
+                             "password": PASSWORD})
+            until_connected(again)
+            again.close()
+            wait_idle()
+        finally:
+            sshterm.AUTH_FAILURE_WINDOW_S = original_window
+        assert service.ssh_sessions.auth_cooldown(DEFAULT_USER, guessed) == (0.0, False)
+        print("PASS: the count decays with its window, and a login the device "
+              "accepts clears it")
+    finally:
+        stub_module._Server.check_auth_password = accept_password
+        stub4.close()
+    wait_idle()
+
     # ------------------------------------- a shell is only as live as its session
 
     status, payload = call("POST", "/api/users",
