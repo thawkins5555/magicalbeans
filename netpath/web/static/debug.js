@@ -11,6 +11,9 @@
 
   const view = {
     seq: 0, events: [], paused: false, selected: null, targets: new Set(),
+    // The seq of the last row painted, so an ordinary poll appends only
+    // what arrived instead of rebuilding two thousand rows.
+    drawnSeq: null,
     workers: [], cells: [], fetchedAt: 0,
     dnsWorkers: [], dnsCells: [], dnsFetchedAt: 0,
     ipamWorkers: [], ipamCells: [], ipamFetchedAt: 0,
@@ -256,29 +259,102 @@
   }
 
   const EVENT_COLUMNS = ['Time', 'Category', 'Destination', 'Event'];
+  const EVENT_ROW_CAP = 2000;
 
-  function drawEvents() {
+  /* One row, built with createElement and textContent rather than parsed
+     from a markup string. Beyond being cheaper, this is the one place in the
+     application where a row is built per poll from server text, so it is the
+     one place where "escaped everywhere" is worth not relying on. */
+  function eventRow(event) {
+    const tr = document.createElement('tr');
+    tr.className = 'clickable' + (view.selected === event.seq ? ' selected' : '');
+    const time = document.createElement('td');
+    time.textContent = event.clock;
+    const category = document.createElement('td');
+    category.className = `cat-${event.category}`;
+    category.textContent = CATEGORY_LABEL[event.category] || event.category;
+    const target = document.createElement('td');
+    target.textContent = event.target || '\u2014';
+    const message = document.createElement('td');
+    if (event.category === 'error') message.style.color = 'var(--fail)';
+    message.textContent = event.message;
+    tr.append(time, category, target, message);
+    tr.onclick = () => {
+      const previous = view.selected;
+      view.selected = event.seq;
+      // Repaint two rows, not two thousand: the one losing the highlight and
+      // the one taking it.
+      for (const row of eventsBody().children) {
+        if (Number(row.dataset.seq) === previous) row.classList.remove('selected');
+      }
+      tr.classList.add('selected');
+      showDetail(event);
+    };
+    tr.dataset.seq = event.seq;
+    return tr;
+  }
+
+  function eventsBody() {
     const table = App.el('dbg-events');
-    table.innerHTML =
-      `<caption class="sr-only">Service events</caption><thead><tr>${EVENT_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
-    const body = document.createElement('tbody');
-    const visible = view.events.filter(passes);
-    for (const event of visible.slice(-2000)) {
-      const tr = document.createElement('tr');
-      tr.className = 'clickable' + (view.selected === event.seq ? ' selected' : '');
-      tr.innerHTML =
-        `<td>${event.clock}</td>` +
-        `<td class="cat-${event.category}">${CATEGORY_LABEL[event.category] || event.category}</td>` +
-        `<td>${escape(event.target || '—')}</td>` +
-        `<td${event.category === 'error' ? ' style="color:var(--fail)"' : ''}>${escape(event.message)}</td>`;
-      tr.onclick = () => { view.selected = event.seq; showDetail(event); drawEvents(); };
-      body.appendChild(tr);
+    let node = table.querySelector('tbody');
+    if (!node) {
+      node = document.createElement('tbody');
+      table.appendChild(node);
     }
-    table.appendChild(body);
+    return node;
+  }
+
+  /* The table was rebuilt from scratch — up to 2,000 rows, each parsed
+     through innerHTML — on every poll, every category tick and every
+     keystroke in the search box: an eight-character filter parsed 16,000
+     table rows, on the page an operator opens when the system is already
+     struggling.
+
+     The head is built once. A poll that only appends (the common case, since
+     the log is a tail) appends only the new rows and trims the front;
+     anything that changes which events match — a filter, a search, a clear —
+     rebuilds, and that rebuild is debounced. */
+  function drawEvents(options = {}) {
+    const table = App.el('dbg-events');
+    if (!table.querySelector('thead')) {
+      table.innerHTML =
+        `<caption class="sr-only">Service events</caption><thead><tr>${
+          EVENT_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
+    }
+    const tbody = eventsBody();
+    const visible = view.events.filter(passes).slice(-EVENT_ROW_CAP);
+
+    if (options.append && view.drawnSeq != null) {
+      const fresh = visible.filter((e) => e.seq > view.drawnSeq);
+      // A row that scrolled out of the 2,000-row window is dropped from the
+      // front rather than triggering a rebuild of the whole table.
+      if (fresh.length) {
+        const frag = document.createDocumentFragment();
+        for (const event of fresh) frag.appendChild(eventRow(event));
+        tbody.appendChild(frag);
+        while (tbody.children.length > EVENT_ROW_CAP) {
+          tbody.removeChild(tbody.firstChild);
+        }
+      }
+    } else {
+      const frag = document.createDocumentFragment();
+      for (const event of visible) frag.appendChild(eventRow(event));
+      tbody.replaceChildren(frag);
+    }
+    view.drawnSeq = visible.length ? visible[visible.length - 1].seq : null;
+
     if (App.el('dbg-follow').checked) {
       const wrap = table.parentElement;
       wrap.scrollTop = wrap.scrollHeight;
     }
+  }
+
+  /* Typing eight characters used to mean eight full rebuilds. One is enough,
+     and 150 ms is short enough that it still feels immediate. */
+  let searchTimer = null;
+  function drawEventsDebounced() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { searchTimer = null; drawEvents(); }, 150);
   }
 
   function showDetail(event) {
@@ -359,7 +435,9 @@
           select.appendChild(option);
         }
       }
-      drawEvents();
+      // Only new rows are appended; nothing about which events match has
+      // changed, so there is nothing to rebuild.
+      drawEvents({ append: true });
     }
   }
 
@@ -375,7 +453,7 @@
     }
     App.el('dbg-target').innerHTML = '<option value="">All destinations</option>';
     App.el('dbg-target').onchange = drawEvents;
-    App.el('dbg-search').oninput = drawEvents;
+    App.el('dbg-search').oninput = drawEventsDebounced;
     App.el('dbg-pause').onclick = (event) => {
       view.paused = !view.paused;
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
@@ -400,6 +478,7 @@
           view.seq = payload.last_seq;
           view.events = [];
           view.selected = null;
+          view.drawnSeq = null;
           App.el('dbg-detail').textContent = '';
           drawEvents();
         });
