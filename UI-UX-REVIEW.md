@@ -4,7 +4,7 @@
 **Reviewers:** two Fable-class specialist agents (graphic/UI design; UX and information architecture), two Opus auditors (accessibility and performance; consistency and content), three explorers, one evidence agent, one benchmark agent — orchestrated by Claude Code  
 **Branch:** claude/ui-ux-opus-review-sxcoai  
 **Build reviewed:** 4.36.1 (`netpath/web/static/*`, `netpath/web/server.py`, `netpath/theme.py`)  
-**Companion:** an HTML artifact with the 63 captures, wireframes and three visual directions (link in the pull request or session).
+**Companion:** HTML artifact with the 63 captures, wireframes and three visual directions — https://claude.ai/code/artifact/2f796a44-d79d-447b-890a-c3f0f7d1c4f7 (private to the account that ran the review; share from the page).
 
 ---
 
