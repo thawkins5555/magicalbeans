@@ -135,6 +135,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) view.cells.push(row.children[3]);
   }
 
@@ -157,6 +158,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.dnsCells.push(row.children[1]);
     }
@@ -182,6 +184,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.ipamCells.push(row.children[1]);
     }
@@ -207,6 +210,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.nodeCells.push(row.children[1]);
     }
@@ -234,6 +238,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 3) view.discCells.push(row.children[3]);
     }
@@ -279,6 +284,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     if (App.el('dbg-follow').checked) {
       const wrap = table.parentElement;
       wrap.scrollTop = wrap.scrollHeight;

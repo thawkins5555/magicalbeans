@@ -207,6 +207,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function subnetForm(subnet) {
@@ -345,6 +346,7 @@
       view.hostSort.key, view.hostSort.descending, columns);
     App.drawRows(body, rows, columns);
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-hosts-count').textContent = `${rows.length} of ${view.hosts.length}`;
   }
 
@@ -388,6 +390,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-conflicts-count').textContent =
       `${view.conflicts.length} ${App.el('ipam-show-resolved').checked ? '' : 'open '}conflict(s)`;
   }
@@ -660,6 +663,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* The larger chart for whichever scope is currently selected, above its
@@ -869,6 +873,7 @@
       view.leaseSort.descending, columns);
     App.drawRows(body, rows, columns);
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;
   }
 

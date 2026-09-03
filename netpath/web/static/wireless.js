@@ -156,6 +156,7 @@
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('wl-count').textContent = `${rows.length} AP(s)`;
     drawApActions();
   }

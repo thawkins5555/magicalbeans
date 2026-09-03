@@ -360,6 +360,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
 
     const sessions = payload.sessions || [];
     App.el('sessions-line').textContent = sessions.length

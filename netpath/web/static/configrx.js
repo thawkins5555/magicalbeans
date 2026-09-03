@@ -76,7 +76,9 @@
 
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
-      cell: (r) => `<input type="checkbox" class="cx-check"${
+      // See the Nodes device list.
+      cell: (r) => `<input type="checkbox" class="cx-check" aria-label="Select ${
+        escape(r.name || r.ip || 'device')}"${
         view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'backup_enabled', label: '', width: 28, on: true, sortable: false,
       cell: (r) => (r.backup_enabled ? statusDot(r.last_backup_status) : '') },
@@ -152,6 +154,7 @@
       tr.onclick = () => selectDevice(row.id);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('cx-device-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
   }
@@ -394,6 +397,7 @@
       tr.onclick = () => selectBackup(row.id);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     drawBackupBulkBar();
   }
 

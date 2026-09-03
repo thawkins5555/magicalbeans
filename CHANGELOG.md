@@ -52,6 +52,35 @@ nine things are made to work.
   with the other five showing their raw keys; and a session about to hit
   its twelve-hour ceiling now says so a minute beforehand, where it used to
   arrive as a sudden return to the sign-in page.
+- **The keyboard reaches the tables.** Selecting a row to fill a detail
+  pane is the central gesture of most of this application and it answered
+  only a pointer: no row anywhere carried a tab stop, a role or a key
+  handler. Rows now take focus, answer Enter and Space with the behaviour
+  they already had, and move under the arrow keys. One row per table is in
+  the tab order at a time, so a three-hundred-row Syslog table does not put
+  three hundred stops in front of whatever follows it.
+- **Focus is visible, and survives a refresh.** The stylesheet said
+  `outline: none` on inputs and left everything else to the browser's own
+  ring, which measures 1.01:1 against this background — tabbing through the
+  application showed nothing moving. There is now one ring, drawn for the
+  keyboard and not for the mouse. Separately, every table is rebuilt on its
+  poll tick, which used to throw the focused row away and drop the keyboard
+  back at the top of the page every few seconds; the row at that position
+  now takes it back.
+- **Dialogs behave like dialogs.** The one every module uses had no role and
+  no name, and Tab walked straight out of it into the page behind the
+  scrim — where a screen reader would read a form nobody could see. It is
+  now announced as a dialog, named by its own heading, holds the keyboard
+  until it is answered, switches the page behind it off rather than merely
+  covering it, and hands focus back to whatever opened it. The help panel
+  had all of this already; this is the same treatment for the rest.
+- **Controls say what they are.** Fifty-nine row checkboxes were announced
+  as "checkbox" with nothing to tell them apart, so choosing a row meant
+  counting; each is now named after the device or alert it selects. The ten
+  zoom and pan buttons that read as "−", "+", "‹" and "›" have names, as do
+  nine time-window and row-limit menus that had none. Anything that changes
+  a status line is also announced once, through a live region the next pass
+  will build its notifications on.
 - **Tests.** `tests/test_web_gates.py` covers the three halves a browser
   must not be trusted with: the must-change gate, device address
   validation, and the shape of `/api/state` for each permission set — the

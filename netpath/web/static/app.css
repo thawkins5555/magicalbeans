@@ -11,6 +11,10 @@
   --muted: #7C8794;
   --faint: #4C5561;
   --accent: #7AA2F7;
+  /* Light enough to read as a ring against every surface in this palette
+     (9.6:1 on --bg) and distinct from --accent, so a focused primary button
+     does not draw a ring in its own fill colour. */
+  --focus: #9EC1FF;
   --ok: #3FB950;
   --warn: #E3B341;
   --fail: #F85149;
@@ -232,7 +236,34 @@ input, select, textarea {
   padding: 4px 8px;
   font: 13px var(--ui);
 }
-input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+/* Focus you can see. This rule used to say `outline: none` and replace the
+   ring with a one-pixel border-colour change; buttons, tabs and table rows
+   had nothing of their own at all and fell back to the user agent's ring,
+   which measures 1.01:1 against this background — present, and invisible.
+   Tabbing through the application showed nothing moving anywhere.
+
+   :focus-visible rather than :focus, so the ring answers the keyboard and
+   does not draw itself around every button somebody clicks. */
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+/* Inside a table the offset would draw the ring over the neighbouring rows,
+   and on a full-bleed pane it would fall outside the scroll box entirely. */
+tr:focus-visible, td:focus-visible, .table-wrap:focus-visible { outline-offset: -2px; }
+
+/* Announcements for screen readers: present in the accessibility tree,
+   absent from the page. Not `display: none`, which would take it out of
+   both. */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
 input[readonly] { color: var(--muted); }
 label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 label.check { cursor: pointer; }

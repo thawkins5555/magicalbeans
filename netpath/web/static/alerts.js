@@ -139,7 +139,10 @@
     // highlight, so a bulk action then acts on far fewer rows than the
     // operator believes they picked.
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
-      cell: (r) => `<input type="checkbox" class="alerts-check"${
+      // See the Nodes device list: an unlabelled box in a row is only
+      // identifiable by counting rows.
+      cell: (r) => `<input type="checkbox" class="alerts-check" aria-label="Select alert on ${
+        escape(r.entity_label || r.object || 'this object')}"${
         view.checked.has(r.id) ? ' checked' : ''}>` },
     { key: 'severity', label: 'Sev', width: 60, numeric: true, on: true,
       cell: (r) => `<span class="sev sev-${r.severity}">${r.severity}</span>` },
@@ -210,6 +213,7 @@
       };
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('alerts-count').textContent = `${view.alerts.length} shown`;
     drawBulkBar();
   }
@@ -389,6 +393,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function templateOptionsHtml(selectedId) {
@@ -573,6 +578,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function editTemplate(id) {

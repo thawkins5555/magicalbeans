@@ -127,8 +127,11 @@
 
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
-      cell: (r) => `<input type="checkbox" class="nd-check"${
-        view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
+      // Named, because a column of identical unlabelled checkboxes is
+      // announced as "checkbox, checkbox, checkbox" and picking the right
+      // row means counting. The device is what the box is about.
+      cell: (r) => `<input type="checkbox" class="nd-check" aria-label="Select ${
+        escape(displayName(r))}"${view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'status', label: 'Status', width: 90, on: true,
       value: (r) => r.status || '',
       cell: (r) => `<span class="dot" style="background:${
@@ -300,6 +303,12 @@
       if (!seen.has(id)) rowCache.delete(id);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
+    // This table builds its own rows rather than going through
+    // App.drawRows, so it asks for the keyboard behaviour explicitly. Safe
+    // to call on every draw: the wiring is idempotent, and the position of
+    // the one tabbable row is recomputed from the current selection.
+    App.wireRowKeyboard(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
   }
@@ -906,6 +915,7 @@
       tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* ---------------------------------------------- device drill-down */
@@ -1322,6 +1332,7 @@
         body.appendChild(tr);
       }
       table.appendChild(body);
+      App.wireRowKeyboard(body);
     }
 
     async function walk(base) {
@@ -1747,6 +1758,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* -------------------------------------------------------------- CRUD */
@@ -2176,6 +2188,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* --------------------------------------------------- additional credentials
@@ -2616,6 +2629,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   async function loadDiscResults() {
@@ -2642,7 +2656,8 @@
       const selectable = !promoted && (r.snmp_ok || allowPingOnly);
       const checked = view.discChecked.has(r.id);
       const box = selectable
-        ? `<input type="checkbox" class="${cls}" data-result="${r.id}" ${checked ? 'checked' : ''}>`
+        ? `<input type="checkbox" class="${cls}" data-result="${r.id}" aria-label="Select ${
+            escape(r.ip || 'result')}" ${checked ? 'checked' : ''}>`
         : (promoted ? '' : '<span class="hint" title="Only devices identified over SNMP can be added from this scan">—</span>');
       return `<tr><td>${box}</td>` +
         `<td>${escape(r.ip)}</td><td>${r.ping_ok ? 'yes' : 'no'}</td>` +
@@ -2912,6 +2927,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* --------------------------------------------------------- MIB catalog */

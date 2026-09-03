@@ -472,6 +472,7 @@
       tr.addEventListener('mouseleave', App.hideTooltip);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* ---------------------------------------------------------- settings */

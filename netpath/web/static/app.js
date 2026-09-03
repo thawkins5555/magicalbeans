@@ -158,10 +158,27 @@ const App = (() => {
   const put = (path, body) => call(path, { method: 'PUT', body });
   const del = (path, body) => call(path, { method: 'DELETE', body });
 
+  /* Says something once, out loud, to whoever is listening. Everything in
+     this application reported outcomes by mutating a button label or a
+     status line, which a screen reader has no reason to re-read — so an
+     action could succeed, or fail, entirely silently. One region, because
+     several would compete and the last writer would win.
+
+     Repeating the same string does not re-announce it, so a poll that
+     reports the same failure every two seconds says it once. */
+  let lastAnnouncement = '';
+  function announce(message) {
+    const el = document.getElementById('live');
+    if (!el || message === lastAnnouncement) return;
+    lastAnnouncement = message;
+    el.textContent = message;
+  }
+
   function connected(ok, message) {
     const el = document.getElementById('conn');
     el.textContent = ok ? '' : (message || 'server unreachable');
     el.classList.toggle('bad', !ok);
+    announce(ok ? '' : `Server unreachable: ${message || 'no answer'}`);
   }
 
   /* --------------------------------------------------------- idle sign-out
@@ -447,14 +464,62 @@ const App = (() => {
 
   /* ------------------------------------------------------------ modals */
 
+  /* What a dialog has to be, beyond looking like one: announced as a
+     dialog, named by its own heading, holding the keyboard until it is
+     answered, and handing focus back where it came from. The help panel
+     (showHelp, below) already did all of this; the dialog every module
+     actually uses did none of it — no role, no name, and Tab walked
+     straight out of it into the page behind the scrim, where a screen
+     reader then read a form the operator could not see.
+
+     The focus trap is deliberately a cycle rather than a barrier: Tab off
+     the last control returns to the first, so the dialog is a closed loop
+     and nothing outside it can be reached until it closes. */
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),' +
+    ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  let modalReturnFocus = null;
+
+  function trapFocus(box, event) {
+    if (event.key !== 'Tab') return;
+    const stops = [...box.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+    if (!stops.length) return;
+    const first = stops[0], last = stops[stops.length - 1];
+    // Focus can also be outside the box entirely — the page behind it still
+    // has its own tab order — so anything not in `stops` is pulled back in.
+    if (event.shiftKey && (document.activeElement === first || !box.contains(document.activeElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || !box.contains(document.activeElement))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  /* The page behind an open dialog is not merely covered, it is switched
+     off: `inert` takes it out of the tab order, out of the accessibility
+     tree and out of reach of a click, which is what the scrim only ever
+     implied visually. */
+  function setBackgroundInert(on) {
+    for (const el of document.querySelectorAll('#tabs, section.page')) {
+      el.inert = on;
+    }
+  }
+
   function modal(title, bodyHtml, buttons, options = {}) {
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
+    // Remembered before anything moves: closing hands the keyboard back to
+    // the control that opened the dialog, rather than dropping it on <body>
+    // and sending the next Tab to the top of the page.
+    if (wrap.hidden) modalReturnFocus = document.activeElement;
     // Long forms put their buttons at the top, so Save is reachable without
     // scrolling past every field first.
     box.innerHTML = options.buttonsTop
-      ? `<h2>${title}</h2><div class="row top"></div>${bodyHtml}`
-      : `<h2>${title}</h2>${bodyHtml}<div class="row"></div>`;
+      ? `<h2 id="modal-title">${title}</h2><div class="row top"></div>${bodyHtml}`
+      : `<h2 id="modal-title">${title}</h2>${bodyHtml}<div class="row"></div>`;
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'modal-title');
     const row = box.querySelector('.row');
     for (const spec of buttons) {
       const button = document.createElement('button');
@@ -464,14 +529,29 @@ const App = (() => {
       row.appendChild(button);
     }
     wrap.hidden = false;
-    const first = box.querySelector('input, select, textarea');
+    setBackgroundInert(true);
+    wrap.onkeydown = (event) => trapFocus(box, event);
+    // A dialog with no field to fill still has to take the keyboard, or the
+    // trap has nothing to hold and Escape is the only way to answer it.
+    const first = box.querySelector('input, select, textarea')
+      || box.querySelector('.row button');
     if (first) first.focus();
     return box;
   }
 
   const closeModal = () => {
     if (state.modalLocked) return;
-    document.getElementById('modal').hidden = true;
+    const wrap = document.getElementById('modal');
+    wrap.hidden = true;
+    wrap.onkeydown = null;
+    setBackgroundInert(false);
+    // Back to whatever opened it, but only if that is still on the page: a
+    // row the refresh has since replaced would otherwise take the focus
+    // with it into the garbage.
+    if (modalReturnFocus && document.contains(modalReturnFocus)) {
+      modalReturnFocus.focus();
+    }
+    modalReturnFocus = null;
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
@@ -731,6 +811,12 @@ const App = (() => {
 
   /* ------------------------------------------------------- table columns */
 
+  /* Set by grid() when it is about to wipe a table that holds the focused
+     row, read by the wireRowKeyboard call that fills the same table. A
+     single slot rather than a map: the two always run in sequence for one
+     table, and a stale value is discarded by the guards at the point of use. */
+  let pendingRowFocus = -1;
+
   const COLUMN_KEY = 'sappiwhere.columns';
 
   function loadColumns() {
@@ -855,6 +941,16 @@ const App = (() => {
     });
     head.appendChild(row);
 
+    // Rebuilding the head wipes the body with it, and with the body goes
+    // whichever row had the keyboard. The position is handed to the next
+    // wireRowKeyboard call, which is drawRows filling this same table a
+    // moment later, so a keyboard user keeps their place across a refresh
+    // instead of being returned to the top of the page every poll.
+    const focused = document.activeElement;
+    pendingRowFocus = (focused && focused.tagName === 'TR' && table.contains(focused))
+      ? [...focused.parentElement.rows].indexOf(focused)
+      : -1;
+
     table.innerHTML = '';
     table.appendChild(colgroup);
     table.appendChild(head);
@@ -933,7 +1029,85 @@ const App = (() => {
       if (onRow) onRow(tr, row);
       tbody.appendChild(tr);
     }
+    wireRowKeyboard(tbody);
     return tbody;
+  }
+
+  /* A row a mouse can open has to be a row a keyboard can open.
+
+     Every module attaches its row behaviour as `tr.onclick` inside the
+     onRow callback above, so the keyboard half is added once here rather
+     than ten times across nine files: Enter and Space run the handler the
+     row already has, and the arrows move between rows. Selecting a row to
+     fill a detail pane is the core gesture of most of this application and
+     it was reachable only with a pointer.
+
+     Only one row per table sits in the tab order at a time, moved by the
+     arrows. Making all of them tabbable would put three hundred stops
+     between the Syslog table and anything after it — reachable, but not
+     usable, which is the failure mode this is meant to fix.
+
+     No role is imposed on the row: a <tr> told it is a button stops being
+     a row, and the table's own semantics are worth more than the label.
+     Exported, so the tables that build their own bodies can call it too. */
+  function wireRowKeyboard(tbody) {
+    const rows = [...tbody.rows].filter((tr) => tr.onclick);
+    if (!rows.length) return;
+
+    /* Every table here is rebuilt from scratch on its poll tick, so a row
+       that had the keyboard simply stopped existing — focus fell back to
+       <body> and the next Tab started again from the top of the page. A
+       keyboard user could not hold a row for longer than one refresh
+       interval, which on Syslog is ten seconds.
+
+       grid() records the row's position just before it wipes the table;
+       this puts the keyboard back on the row now at that position, once
+       the new body is actually in the document. */
+    const restoreIndex = pendingRowFocus;
+    pendingRowFocus = -1;
+    if (restoreIndex >= 0 && restoreIndex < rows.length) {
+      requestAnimationFrame(() => {
+        // Only if nothing else has claimed the keyboard in the meantime —
+        // an operator who tabbed away during the redraw keeps where they went.
+        if (document.activeElement !== document.body || !tbody.isConnected) return;
+        for (const other of rows) other.tabIndex = -1;
+        rows[restoreIndex].tabIndex = 0;
+        rows[restoreIndex].focus();
+      });
+    }
+
+    // The open row is where the keyboard should land; failing that, the first.
+    const landing = rows.find((tr) => tr.classList.contains('selected')) || rows[0];
+    for (const tr of rows) {
+      tr.tabIndex = tr === landing ? 0 : -1;
+      // The Nodes table reuses its row elements across refreshes rather than
+      // rebuilding them, so this can be called repeatedly on the same <tr>.
+      // The position above is recomputed every time; the listeners are
+      // attached once, or they would stack up one deep per poll.
+      if (tr.dataset.keyboardWired) continue;
+      tr.dataset.keyboardWired = '1';
+      tr.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();     // Space would scroll the pane instead
+          tr.click();
+          return;
+        }
+        const step = event.key === 'ArrowDown' ? 1
+          : event.key === 'ArrowUp' ? -1 : 0;
+        if (!step) return;
+        const next = rows[rows.indexOf(tr) + step];
+        if (!next) return;
+        event.preventDefault();
+        tr.tabIndex = -1;
+        next.tabIndex = 0;
+        next.focus();
+      });
+      // A row picked with the mouse becomes the one the keyboard returns to,
+      // so Tab does not send focus back to the top of a long table.
+      tr.addEventListener('mousedown', () => {
+        for (const other of rows) other.tabIndex = other === tr ? 0 : -1;
+      });
+    }
   }
 
   /* The checkbox block for a settings dialog. `fixed` columns (a row's
@@ -1264,7 +1438,7 @@ const App = (() => {
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
-    grid, sortRows, canRead, canWrite, accountModal,
+    grid, sortRows, canRead, canWrite, accountModal, wireRowKeyboard, announce,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };

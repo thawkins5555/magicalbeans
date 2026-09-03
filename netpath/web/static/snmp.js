@@ -203,6 +203,7 @@
       tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function showDetail(row) {
