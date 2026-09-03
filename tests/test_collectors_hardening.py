@@ -21,7 +21,7 @@ from _paths import free_udp_port, tmpdir
 
 TMPDIR = tmpdir("collectors_hardening_")
 
-from netpath import hostresolve, nfdecode, tracer, trapdecode, udpsock
+from netpath import hostresolve, nfdecode, tracer, trapdecode, trapoids, udpsock
 from netpath.db import Database as NetPathDb
 from netpath.monitor import HopProber
 from netpath.tracer import PingResult
@@ -1479,6 +1479,88 @@ def test_c10_exporter_versions_and_per_sampler_rates() -> None:
     upgraded.close()
 
 
+# ---------------------------------------------------------------------- C11
+
+def v2c_trap(trap_oid: str, varbinds: bytes, community: str = "public") -> bytes:
+    """An SNMPv2c trap carrying the mandatory pair plus `varbinds`."""
+    mandatory = (_tlv(0x30, _oid_tlv("1.3.6.1.2.1.1.3.0")
+                      + _tlv(0x43, b"\x00\x01\x00\x00"))
+                 + _tlv(0x30, _oid_tlv("1.3.6.1.6.3.1.1.4.1.0")
+                        + _oid_tlv(trap_oid)))
+    pdu = _tlv(0xA7, _int_tlv(1) + _int_tlv(0) + _int_tlv(0)
+               + _tlv(0x30, mandatory + varbinds))
+    return _tlv(0x30, _int_tlv(1) + _tlv(0x04, community.encode()) + pdu)
+
+
+def test_c11_bgp_oids_and_visible_truncation() -> None:
+    """trapoids labelled 1.3.6.1.2.1.15.3.1.7 as bgpPeerState and hung the
+    state enum off it. It is bgpPeerRemoteAddr; the state is .1.2. A real
+    bgpBackwardTransition therefore rendered as
+    "bgpPeerState.198.51.100.75=198.51.100.75" — a peer stuck in a state that
+    does not exist, with the state that does nowhere to be seen. Separately,
+    trapdecode counted the varbinds it had to throw away and nothing showed
+    the figure."""
+    print("C11: BGP trap OIDs, and truncation that is visible")
+
+    check(trapoids.WELL_KNOWN["1.3.6.1.2.1.15.3.1.7"] == "bgpPeerRemoteAddr",
+          "1.3.6.1.2.1.15.3.1.7 is bgpPeerRemoteAddr")
+    check(trapoids.WELL_KNOWN["1.3.6.1.2.1.15.3.1.2"] == "bgpPeerState",
+          "and bgpPeerState is 1.3.6.1.2.1.15.3.1.2")
+    check("1.3.6.1.2.1.15.3.1.2" in trapoids.ENUMS
+          and "1.3.6.1.2.1.15.3.1.7" not in trapoids.ENUMS,
+          "the state enum moved with it")
+
+    decoder = trapdecode.Decoder()
+    peer = "198.51.100.75"
+    varbinds = (
+        # bgpPeerRemoteAddr.198.51.100.75 = 198.51.100.75  (IpAddress)
+        _tlv(0x30, _oid_tlv("1.3.6.1.2.1.15.3.1.7." + peer)
+             + _tlv(0x40, bytes(int(part) for part in peer.split("."))))
+        # bgpPeerLastError.198.51.100.75 = 06 04
+        + _tlv(0x30, _oid_tlv("1.3.6.1.2.1.15.3.1.14." + peer)
+               + _tlv(0x04, b"\x06\x04"))
+        # bgpPeerState.198.51.100.75 = idle (1)
+        + _tlv(0x30, _oid_tlv("1.3.6.1.2.1.15.3.1.2." + peer) + _int_tlv(1))
+    )
+    trap = decoder.decode(v2c_trap("1.3.6.1.2.1.15.7.2", varbinds), "10.0.0.1")
+    check(trap is not None and trap.trap_name == "bgpBackwardTransition",
+          f"a real bgpBackwardTransition decodes ({trap.trap_name if trap else None})")
+    names = {vb["name"]: vb["text"] for vb in trap.varbinds}
+    check(f"bgpPeerRemoteAddr.{peer}" in names,
+          f"the peer address is named as the address it is ({sorted(names)})")
+    state = names.get(f"bgpPeerState.{peer}")
+    check(state == "idle (1)",
+          f"and the state renders by name rather than as a bare number "
+          f"({state!r})")
+    check(f"bgpPeerRemoteAddr.{peer}={peer}" in trap.varbind_text,
+          f"the flattened text agrees ({trap.varbind_text})")
+
+    # --- truncation is counted where an operator can see it ---------------
+    trap_db = SnmpTrapDatabase(db_path("c11-traps.db"))
+    traps = TrapCollector(trap_db)
+    port = free_udp_port()
+    assert traps.start({"port": port, "bind_address": "127.0.0.1",
+                        "max_varbinds": 8})
+    try:
+        many = b"".join(
+            _tlv(0x30, _oid_tlv(f"1.3.6.1.2.1.2.2.1.1.{index}") + _int_tlv(index))
+            for index in range(200))
+        send_udp(port, v2c_trap("1.3.6.1.6.3.1.1.5.3", many))
+        check(wait_for(lambda: traps.counters["too_many_varbinds"] >= 1, 8.0),
+              f"a trap with more varbinds than the cap is counted as truncated "
+              f"({traps.counters['too_many_varbinds']})")
+        check("truncated" in traps.status_text(),
+              f"and the status strip says so ({traps.status_text()})")
+        check(wait_for(lambda: trap_db.max_id() >= 1, 8.0),
+              "the trap itself is still stored")
+        row = trap_db.traps_since(0)[0]
+        check(row["varbind_n"] == 8,
+              f"with the varbinds it kept ({row['varbind_n']})")
+    finally:
+        traps.stop()
+        trap_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -1491,6 +1573,7 @@ TESTS = [
     test_c8_device_correlation_through_aliases,
     test_c9_netpath_probing_tracing_and_v6_listeners,
     test_c10_exporter_versions_and_per_sampler_rates,
+    test_c11_bgp_oids_and_visible_truncation,
 ]
 
 

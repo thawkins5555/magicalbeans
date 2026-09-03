@@ -60,7 +60,8 @@ class TrapCollector:
         self.counters = {"packets": 0, "traps": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "bad_community": 0, "undecodable": 0,
                          "filtered": 0, "informs_acked": 0, "errors": 0,
-                         "bad_auth": 0, "unverified": 0, "last_trap": 0.0}
+                         "bad_auth": 0, "unverified": 0, "too_many_varbinds": 0,
+                         "last_trap": 0.0}
         # A receive thread must never die on packet content; failures are
         # counted here and _crash records a thread that ended anyway so the
         # status strip does not read like a deliberate stop.
@@ -318,6 +319,10 @@ class TrapCollector:
 
         self.counters["traps"] += 1
         self.counters["last_trap"] = time.time()
+        # The decoder has always counted traps it had to truncate, and nothing
+        # showed the figure: a 10,000-varbind trap arrived as 64 varbinds with
+        # no indication anywhere that the rest had been thrown away.
+        self.counters["too_many_varbinds"] = self.decoder.stats["too_many_varbinds"]
         self._learn_agent_address(trap)
         if self._first_from(source):
             self.log.add(SNMP, f"First SNMP trap from {source} "
@@ -463,5 +468,12 @@ class TrapCollector:
         last = self.counters["last_trap"]
         text = (f"{base} · last trap {_ago(last)}" if last
                 else f"{base} · waiting for traps")
+        parts = [text]
         lost = self.counters.get("kernel_dropped", 0)
-        return f"{text} · {lost} dropped by the kernel" if lost else text
+        if lost:
+            parts.append(f"{lost} dropped by the kernel")
+        if self.counters["bad_auth"]:
+            parts.append(f"{self.counters['bad_auth']} failed authentication")
+        if self.counters["too_many_varbinds"]:
+            parts.append(f"{self.counters['too_many_varbinds']} truncated")
+        return " · ".join(parts)
