@@ -9,14 +9,13 @@ so the receive path does nothing but read, parse and enqueue.
 from __future__ import annotations
 
 import collections
-import os
 import queue
 import socket
 import threading
 import time
 import traceback
 
-from . import kerneldrops
+from . import udpsock
 from .eventlog import ERROR, NullLog, SYSTEM
 from .syslogdb import SyslogDatabase
 from .syslogparse import parse
@@ -55,6 +54,7 @@ class SyslogCollector:
         self._queue: queue.Queue = queue.Queue(maxsize=100_000)
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
         self.counters = {"messages": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "filtered": 0, "errors": 0,
                          "throttled": 0, "tcp_refused": 0, "tcp_clients": 0,
@@ -64,7 +64,7 @@ class SyslogCollector:
         # status strip does not read like a deliberate stop.
         self._last_error_log = 0.0
         self._crash: str | None = None
-        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops: udpsock.KernelDrops | None = None
         self._drops_logged = False
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
@@ -146,8 +146,8 @@ class SyslogCollector:
             self.error = "Neither UDP nor TCP is enabled"
             return False
 
-        self._drops = (kerneldrops.KernelDrops(port)
-                       if self._udp is not None and kerneldrops.supported() else None)
+        self._drops = (udpsock.KernelDrops(port)
+                       if self._udp is not None and udpsock.supported() else None)
         self._drops_logged = False
         if self._drops is not None:
             self.counters["kernel_dropped"] = 0
@@ -166,18 +166,9 @@ class SyslogCollector:
         return True
 
     def _bind(self, kind, address: str, port: int, buffer_bytes: int):
-        sock = socket.socket(socket.AF_INET, kind)
-        if os.name == "nt":
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            except (AttributeError, OSError):
-                pass
-        else:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock, self.family = udpsock.bind(kind, address, port, buffer_bytes)
         try:
-            option = socket.SO_RCVBUF
-            sock.setsockopt(socket.SOL_SOCKET, option, buffer_bytes)
-            granted = sock.getsockopt(socket.SOL_SOCKET, option)
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             if kind == socket.SOCK_DGRAM and granted < buffer_bytes:
                 # Linux reports back twice what it granted, so a readback
                 # below the request means net.core.rmem_max clamped it — the
@@ -190,8 +181,6 @@ class SyslogCollector:
                                     "two agree.")
         except OSError:
             pass
-        sock.bind((address, port))
-        sock.settimeout(0.5)
         return sock
 
     def _spawn(self, target, name: str) -> None:
@@ -368,7 +357,7 @@ class SyslogCollector:
             except OSError:
                 break
             try:
-                self._enqueue(data, address[0])
+                self._enqueue(data, udpsock.normalise_source(address[0]))
             except Exception as exc:
                 self._note_error(exc)
 
@@ -385,6 +374,7 @@ class SyslogCollector:
             # grew: a device that reconnects per message, or a scanner,
             # exhausted threads and then memory. Dead ones are reaped on every
             # accept and the live ones are capped.
+            address = (udpsock.normalise_source(address[0]),) + tuple(address[1:])
             self._clients = [t for t in self._clients if t.is_alive()]
             self.counters["tcp_clients"] = len(self._clients)
             if len(self._clients) >= self._max_tcp_clients:

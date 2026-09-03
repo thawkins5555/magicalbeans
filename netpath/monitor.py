@@ -561,6 +561,15 @@ class HopProber:
         self._enabled: set[int] = set()
         self._hops: dict[int, set[str]] = {}
         self._lock = threading.Lock()
+        # A hop whose previous probe has not come back must not be probed
+        # again: ThreadPoolExecutor's work queue is unbounded, so submitting a
+        # fresh round every interval against a slower drain rate grew it for
+        # ever — memory climbed and probes ran against a schedule minutes
+        # stale. Monitor has tracked its own in-flight set since 4.30; this is
+        # the same idea for the hop prober.
+        self._inflight: set[tuple[int, str]] = set()
+        self._pending: list[tuple[int, str, object]] = []
+        self.overruns = 0
 
     @property
     def running(self) -> bool:
@@ -639,15 +648,58 @@ class HopProber:
             for target_id, ip in jobs:
                 if self._stop.is_set():
                     break
+                key = (target_id, ip)
+                with self._lock:
+                    if key in self._inflight:
+                        self.overruns += 1
+                        continue
+                    self._inflight.add(key)
                 try:
                     self._executor.submit(self._probe_one, target_id, ip)
                 except RuntimeError:
+                    with self._lock:
+                        self._inflight.discard(key)
                     break
+            self._flush()
             self._stop.wait(self.interval_s)
+        self._flush()
 
     def _probe_one(self, target_id: int, ip: str) -> None:
         try:
             result = ping(ip, timeout_s=self.timeout_s)
-            self.db.record_hop_probe(target_id, ip, result)
+        except Exception:
+            result = None
+        finally:
+            with self._lock:
+                self._inflight.discard((target_id, ip))
+        if result is not None:
+            with self._lock:
+                self._pending.append((target_id, ip, result))
+
+    def _flush(self) -> None:
+        """Write a round's results in one transaction.
+
+        record_hop_probe did a SELECT, an UPSERT and a commit per probe, on
+        the same database and lock the trace scheduler writes traces to.
+        """
+        with self._lock:
+            batch, self._pending = self._pending, []
+        if not batch:
+            return
+        try:
+            self.db.record_hop_probes(batch)
         except Exception:
             pass
+
+    def status_text(self) -> str:
+        with self._lock:
+            inflight = len(self._inflight)
+            hops = sum(len(ips) for target_id, ips in self._hops.items()
+                       if target_id in self._enabled)
+        if not self.running:
+            return "Continuous hop probing is off"
+        text = (f"Probing {hops} hop(s) every {self.interval_s:.0f}s "
+                f"({inflight} in flight)")
+        if self.overruns:
+            text += f" \u00b7 {self.overruns} probe(s) skipped, still running"
+        return text

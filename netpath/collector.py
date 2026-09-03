@@ -10,14 +10,13 @@ no retransmission.
 from __future__ import annotations
 
 import collections
-import os
 import queue
 import socket
 import threading
 import time
 import traceback
 
-from . import kerneldrops
+from . import udpsock
 from .eventlog import ERROR, NETFLOW, NullLog
 from .flowdb import FlowDatabase
 from .nfdecode import IPFIX, V5, V9, Decoder
@@ -55,6 +54,7 @@ class Collector:
         self.decoder = Decoder()
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
         self.rcvbuf = 0
         self.started_at = 0.0
         self.counters = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
@@ -66,7 +66,7 @@ class Collector:
         self._loop_errors = 0
         self._last_error_log = 0.0
         self._crash: str | None = None
-        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops: udpsock.KernelDrops | None = None
         self._drops_logged = False
         self._settings: dict = {}
         self._allowed: set[str] = set()
@@ -105,30 +105,14 @@ class Collector:
 
         address = settings.get("bind_address", "0.0.0.0")
         port = int(settings.get("port", 2055))
+        wanted = int(settings.get("socket_buffer_kb", 4096)) * 1024
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            if os.name == "nt":
-                # SO_REUSEADDR on Windows lets a second process bind the same
-                # UDP port and quietly take delivery of the datagrams, so a
-                # leftover instance silently steals every packet while this one
-                # looks healthy. SO_EXCLUSIVEADDRUSE makes the second bind fail
-                # loudly instead, which is the error we want to show.
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET,
-                                    socket.SO_EXCLUSIVEADDRUSE, 1)
-                except (AttributeError, OSError):
-                    pass
-            else:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            wanted = int(settings.get("socket_buffer_kb", 4096)) * 1024
+            sock, self.family = udpsock.bind(socket.SOCK_DGRAM, address, port,
+                                             wanted)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, wanted)
                 self.rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             except OSError:
                 self.rcvbuf = 0
-            sock.bind((address, port))
-            sock.settimeout(0.5)
         except OSError as exc:
             hint = ""
             if getattr(exc, "errno", None) in (48, 98, 10048):
@@ -148,7 +132,7 @@ class Collector:
                          f"(asked for {wanted})",
                          detail="Raise net.core.rmem_max on this host, or lower "
                                 "the buffer size in Settings so the two agree.")
-        self._drops = kerneldrops.KernelDrops(port) if kerneldrops.supported() else None
+        self._drops = udpsock.KernelDrops(port) if udpsock.supported() else None
         self._drops_logged = False
         if self._drops is not None:
             self.counters["kernel_dropped"] = 0
@@ -278,7 +262,7 @@ class Collector:
                 self._note_error(exc)
 
     def _handle(self, data: bytes, address) -> None:
-        exporter = address[0]
+        exporter = udpsock.normalise_source(address[0])
         if self._allowed and exporter not in self._allowed:
             self.counters["rejected"] += 1
             return

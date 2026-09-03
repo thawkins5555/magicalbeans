@@ -8,14 +8,13 @@ in practice.
 from __future__ import annotations
 
 import collections
-import os
 import queue
 import socket
 import threading
 import time
 import traceback
 
-from . import kerneldrops
+from . import udpsock
 from .eventlog import ERROR, NullLog, SNMP
 from .snmptrapdb import SnmpTrapDatabase
 from .trapdecode import Decoder, VERSION_NAMES, build_inform_response
@@ -57,6 +56,7 @@ class TrapCollector:
         self._queue: queue.Queue = queue.Queue(maxsize=50_000)
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
         self.counters = {"packets": 0, "traps": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "bad_community": 0, "undecodable": 0,
                          "filtered": 0, "informs_acked": 0, "errors": 0,
@@ -66,7 +66,7 @@ class TrapCollector:
         # status strip does not read like a deliberate stop.
         self._last_error_log = 0.0
         self._crash: str | None = None
-        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops: udpsock.KernelDrops | None = None
         self._drops_logged = False
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
@@ -143,7 +143,7 @@ class TrapCollector:
             self.stop()
             return False
 
-        self._drops = kerneldrops.KernelDrops(port) if kerneldrops.supported() else None
+        self._drops = udpsock.KernelDrops(port) if udpsock.supported() else None
         self._drops_logged = False
         if self._drops is not None:
             self.counters["kernel_dropped"] = 0
@@ -157,20 +157,9 @@ class TrapCollector:
         return True
 
     def _bind(self, address, port, buffer_bytes):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if os.name == "nt":
-            # Two processes can silently share a UDP port under SO_REUSEADDR
-            # on Windows, and one of them swallows the traps while both look
-            # healthy. SO_EXCLUSIVEADDRUSE makes a duplicate bind fail loudly
-            # instead.
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            except (AttributeError, OSError):
-                pass
-        else:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock, self.family = udpsock.bind(socket.SOCK_DGRAM, address, port,
+                                         buffer_bytes)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_bytes)
             granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             if granted < buffer_bytes:
                 # Linux reports back twice what it granted, so a readback
@@ -184,8 +173,6 @@ class TrapCollector:
                                     "two agree.")
         except OSError:
             pass
-        sock.bind((address, port))
-        sock.settimeout(0.5)          # so the loop can notice the stop event
         return sock
 
     def _spawn(self, target, name: str) -> None:
@@ -308,7 +295,7 @@ class TrapCollector:
                 self._note_error(exc)
 
     def _enqueue(self, data: bytes, address) -> None:
-        source = address[0]
+        source = udpsock.normalise_source(address[0])
         self.counters["packets"] += 1
         # The source check happens before decoding — a rejected packet is
         # never parsed, exactly as syslog does it.

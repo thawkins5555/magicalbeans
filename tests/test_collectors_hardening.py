@@ -21,7 +21,10 @@ from _paths import free_udp_port, tmpdir
 
 TMPDIR = tmpdir("collectors_hardening_")
 
-from netpath import hostresolve, kerneldrops, nfdecode, trapdecode
+from netpath import hostresolve, nfdecode, tracer, trapdecode, udpsock
+from netpath.db import Database as NetPathDb
+from netpath.monitor import HopProber
+from netpath.tracer import PingResult
 from netpath.collector import Collector
 from netpath.flowdb import FlowDatabase
 from netpath.snmptrapd import TrapCollector
@@ -76,6 +79,19 @@ def check(condition: bool, message: str) -> None:
     else:
         print(f"  FAIL: {message}")
         FAILURES.append(message)
+
+
+def has_ipv6() -> bool:
+    """Whether this host has an IPv6 stack at all. A container built without
+    one is the case the dual-stack bind must fall back from."""
+    if not socket.has_ipv6:
+        return False
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    probe.close()
+    return True
 
 
 def db_path(name: str) -> str:
@@ -312,7 +328,7 @@ def test_c3_kernel_drops_are_visible() -> None:
     of /proc/net/udp{,6} for the bound port."""
     print("C3: kernel socket-buffer drops are counted and shown")
 
-    if not kerneldrops.supported():
+    if not udpsock.supported():
         # Not Linux (or no /proc): the key must simply be absent rather than
         # reporting a guessed zero.
         syslog_db = SyslogDatabase(db_path("c3-syslog.db"))
@@ -329,7 +345,7 @@ def test_c3_kernel_drops_are_visible() -> None:
     victim.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     victim.bind(("127.0.0.1", 0))
     victim_port = victim.getsockname()[1]
-    reader = kerneldrops.KernelDrops(victim_port, interval_s=0.0)
+    reader = udpsock.KernelDrops(victim_port, interval_s=0.0)
     check(reader.poll(force=True) == 0, "a freshly bound port starts at zero drops")
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     for _ in range(5000):
@@ -338,7 +354,7 @@ def test_c3_kernel_drops_are_visible() -> None:
     drops = reader.poll(force=True)
     check(drops is not None and drops > 0,
           f"an undrained socket reports {drops} kernel drops")
-    check(kerneldrops.KernelDrops(free_udp_port(), interval_s=0.0).poll(force=True) is None,
+    check(udpsock.KernelDrops(free_udp_port(), interval_s=0.0).poll(force=True) is None,
           "an unbound port reports None (unknown), not zero")
     victim.close()
 
@@ -1093,6 +1109,210 @@ def test_c4b_trim_never_holds_the_lock(self_check=None) -> None:
     small.close()
 
 
+# ----------------------------------------------------------------------- C9
+
+class SlowPing:
+    """A ping that never returns until released, so a probe can be held in
+    flight across a whole round."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, ip, timeout_s=1.5):
+        with self._lock:
+            self.calls += 1
+        self.release.wait(10)
+        return PingResult(ip, 1, 0, 1.0)
+
+
+def test_c9_netpath_probing_tracing_and_v6_listeners() -> None:
+    """HopProber submitted a fresh round of ping subprocesses every four
+    seconds with no completion tracking, into an unbounded work queue, and
+    committed to netpath.db once per probe. The traceroute budget assumed
+    serial probes, `reached` was decided against this process's own DNS
+    answer, a non-English tracert lost the refusing hop entirely, and all
+    three listeners were IPv4-only."""
+    print("C9: hop probing, trace parsing and dual-stack listeners")
+
+    # --- in-flight tracking, and one write per round ----------------------
+    netpath_db = NetPathDb(db_path("c9-netpath.db"))
+    target_id = netpath_db.add_target("10.0.0.1", label="core")
+    prober = HopProber(netpath_db, workers=4, interval_s=0.1, log=None)
+    slow = SlowPing()
+    import netpath.monitor as monitor_mod
+    real_ping = monitor_mod.ping
+    monitor_mod.ping = slow
+    try:
+        prober._enabled = {target_id}
+        prober._hops = {target_id: {"10.0.0.254", "10.0.0.253"}}
+        prober._stop.clear()
+        thread = threading.Thread(target=prober._loop, daemon=True)
+        thread.start()
+        time.sleep(0.8)                       # eight rounds at 0.1 s
+        held = slow.calls
+        check(held == 2,
+              f"each hop is probed once while its previous probe is still "
+              f"running ({held} probe(s) started, not one per round)")
+        check(prober.overruns > 0,
+              f"the skipped rounds are counted ({prober.overruns} overruns)")
+        check("in flight" in prober.status_text() or not prober.running,
+              "the prober can say how many probes are in flight")
+        slow.release.set()
+        time.sleep(0.5)
+        prober._stop.set()
+        thread.join(timeout=5)
+    finally:
+        monitor_mod.ping = real_ping
+        slow.release.set()
+
+    # A round is one transaction, not one per probe.
+    commits = [0]
+
+    class CountingConn:
+        """Counts commits without touching the read-only attribute."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def commit(self):
+            commits[0] += 1
+            return self._conn.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_conn = netpath_db._conn
+    netpath_db._conn = CountingConn(real_conn)
+    batch = [(target_id, f"10.0.0.{index}", PingResult(f"10.0.0.{index}", 1, 0, 2.0))
+             for index in range(1, 16)]
+    netpath_db.record_hop_probes(batch)
+    netpath_db._conn = real_conn
+    check(commits[0] == 1,
+          f"fifteen hops are one commit, not fifteen ({commits[0]})")
+    stats = netpath_db.hop_stats_for_target(target_id)
+    check(len(stats) >= 15 and stats["10.0.0.1"]["probes"] >= 1,
+          "and every hop's counters are stored")
+
+    # Repeated probes of the same hop in one round accumulate.
+    netpath_db.record_hop_probes([
+        (target_id, "10.0.0.1", PingResult("10.0.0.1", 1, 1, None)),
+        (target_id, "10.0.0.1", PingResult("10.0.0.1", 1, 0, 8.0)),
+    ])
+    row = netpath_db.hop_stats_for_target(target_id)["10.0.0.1"]
+    check(row["probes"] == 3 and row["lost"] == 1 and row["rtt_max"] == 8.0,
+          f"counters accumulate across a batch (probes={row['probes']}, "
+          f"lost={row['lost']}, max={row['rtt_max']})")
+
+    # prune only reclaims when it removed something.
+    removed = netpath_db.prune(older_than_days=3650)
+    check(removed == 0, "prune of an empty window removes nothing (and so "
+                        "does no reclamation work)")
+    netpath_db.close()
+
+    # --- the traceroute budget matches the binary's own parallelism -------
+    serial = tracer.expected_budget(30, 3, 2.0, parallel=1)
+    parallel = tracer.expected_budget(30, 3, 2.0, parallel=16)
+    check(serial == 30 * 3 * 2.0 + 15,
+          f"a strictly serial traceroute keeps the old budget ({serial:.0f}s)")
+    check(parallel < serial / 5,
+          f"sixteen probes at a time needs {parallel:.0f}s, not {serial:.0f}s")
+    if not tracer.IS_WINDOWS and tracer.IS_LINUX:
+        command = tracer._build_command("example.com", 30, 3, 2.0)
+        check("-N" in command and command[command.index("-N") + 1] == "16",
+              f"and the parallelism is asked for explicitly ({' '.join(command[1:])})")
+
+    # --- a refusal is recognised by shape, not by English -----------------
+    german = ("Routenverfolgung zu 10.0.0.9\n"
+              "  1     1 ms     1 ms     1 ms  10.0.0.254\n"
+              "  2     2 ms     2 ms     2 ms  192.168.1.1\n"
+              "  3  192.168.1.1  meldet: Zielhost nicht erreichbar.\n")
+    hops = tracer._parse_windows(german)
+    check(len(hops) == 3,
+          f"a localised tracert keeps the refusing hop ({len(hops)} hops)")
+    check(hops[-1].annotations.get("192.168.1.1") == "!",
+          f"annotated as an unreachable ({hops[-1].annotations})")
+    english = ("Tracing route to 10.0.0.9\n"
+               "  1     1 ms     1 ms     1 ms  10.0.0.254\n"
+               "  2  192.168.1.1  reports: Destination host unreachable.\n")
+    hops = tracer._parse_windows(english)
+    check(hops[-1].annotations.get("192.168.1.1") == "!H",
+          "and the English phrase still gives the specific code")
+    check(tracer.unreachable_text("!") == "unreachable, reason not stated",
+          "the generic code has readable text")
+
+    # --- reached agrees with the address the binary resolved --------------
+    output = ("traceroute to www.example.com (93.184.216.34), 30 hops max\n"
+              " 1  10.0.0.254  1.0 ms\n"
+              " 2  93.184.216.34  9.0 ms\n")
+    match = tracer._UNIX_HEADER.search(output)
+    check(match is not None and match.group(1) == "93.184.216.34",
+          "the traceroute header line names the address the binary resolved")
+    win = "Tracing route to www.example.com [93.184.216.34]\n"
+    match = tracer._WIN_HEADER.search(win)
+    check(match is not None and match.group(1) == "93.184.216.34",
+          "and so does tracert's")
+
+    # --- dual-stack listeners --------------------------------------------
+    check(udpsock.normalise_source("::ffff:10.1.2.3") == "10.1.2.3",
+          "an IPv4-mapped source address folds back to its dotted quad")
+    check(udpsock.normalise_source("2001:db8::1") == "2001:db8::1",
+          "a real IPv6 source is left alone")
+    check(udpsock.normalise_source("10.1.2.3") == "10.1.2.3",
+          "and so is a plain IPv4 one")
+
+    syslog_db = SyslogDatabase(db_path("c9-syslog.db"))
+    syslog = SyslogCollector(syslog_db)
+    port = free_udp_port()
+    assert syslog.start({"port": port, "bind_address": "0.0.0.0",
+                         "collapse_repeats_s": 0})
+    try:
+        if has_ipv6():
+            check(syslog.family == socket.AF_INET6,
+                  "a wildcard bind is dual-stack")
+            sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock6.sendto(b"<134>from an IPv6 management address", ("::1", port))
+            sock6.close()
+            check(wait_for(lambda: syslog_db.max_id() >= 1, 8.0),
+                  "a message from ::1 is received")
+        else:
+            # This host has no IPv6 stack at all, which is the fallback the
+            # bind helper exists to make safe: an IPv4 listener, exactly as
+            # before, rather than a collector that refuses to start.
+            check(syslog.family == socket.AF_INET,
+                  "a host without IPv6 falls back to an IPv4 listener")
+        before = syslog_db.max_id()
+        send_udp(port, b"<134>from a legacy IPv4 device")
+        check(wait_for(lambda: syslog_db.max_id() > before, 8.0),
+              "and the same socket still receives IPv4")
+        sources = {row["source"] for row in syslog_db.rows_since(0, limit=None)}
+        check("127.0.0.1" in sources,
+              f"whose source is recorded as a dotted quad, not ::ffff: "
+              f"({sorted(sources)})")
+    finally:
+        syslog.stop()
+        syslog_db.close()
+
+    # A literal IPv4 bind address still binds IPv4 only.
+    flow_db = FlowDatabase(db_path("c9-flows.db"))
+    collector = Collector(flow_db)
+    assert collector.start({"port": free_udp_port(), "bind_address": "127.0.0.1"})
+    check(collector.family == socket.AF_INET,
+          "a literal IPv4 bind address is still an IPv4 socket")
+    collector.stop()
+    flow_db.close()
+
+    trap_db = SnmpTrapDatabase(db_path("c9-traps.db"))
+    traps = TrapCollector(trap_db)
+    assert traps.start({"port": free_udp_port(), "bind_address": "0.0.0.0"})
+    expected = socket.AF_INET6 if has_ipv6() else socket.AF_INET
+    check(traps.family == expected,
+          "the trap receiver binds the same way")
+    traps.stop()
+    trap_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -1103,6 +1323,7 @@ TESTS = [
     test_c6_forged_v3_traps_are_dropped,
     test_c7_syslog_robustness,
     test_c8_device_correlation_through_aliases,
+    test_c9_netpath_probing_tracing_and_v6_listeners,
 ]
 
 

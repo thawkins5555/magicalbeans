@@ -469,28 +469,59 @@ class Database:
         """Upsert running probe counters for one hop. Never stores per-probe
         rows — probes/lost/rtt_sum/rtt_min/rtt_max are cumulative counters, so
         a target probed every few seconds for days does not bloat the table."""
+        self.record_hop_probes([(target_id, ip, result)])
+
+    def record_hop_probes(self, probes) -> int:
+        """Fold a whole round of hop probes into hop_stats in one transaction.
+
+        One SELECT + UPSERT + commit per probe meant ten opted-in targets with
+        fifteen hops each committing 150 times every four seconds, on the same
+        database and the same lock the trace scheduler writes traces to. A
+        round is a batch: one read of the rows it touches, one executemany,
+        one commit.
+        """
+        wanted = {(target_id, ip) for target_id, ip, _ in probes}
+        if not wanted:
+            return 0
         with self._lock:
-            row = self._conn.execute(
-                "SELECT probes, lost, rtt_sum, rtt_min, rtt_max FROM hop_stats"
-                " WHERE target_id=? AND ip=?", (target_id, ip)).fetchone()
-            probes = (row["probes"] if row else 0) + result.sent
-            lost = (row["lost"] if row else 0) + result.lost
-            rtt_sum = (row["rtt_sum"] if row else 0.0) + (result.rtt_ms or 0.0)
-            prev_min = row["rtt_min"] if row else None
-            prev_max = row["rtt_max"] if row else None
-            rtt_min = result.rtt_ms if result.rtt_ms is not None and (
-                prev_min is None or result.rtt_ms < prev_min) else prev_min
-            rtt_max = result.rtt_ms if result.rtt_ms is not None and (
-                prev_max is None or result.rtt_ms > prev_max) else prev_max
-            self._conn.execute(
+            existing = {}
+            for target_id, ip in wanted:
+                row = self._conn.execute(
+                    "SELECT probes, lost, rtt_sum, rtt_min, rtt_max FROM hop_stats"
+                    " WHERE target_id=? AND ip=?", (target_id, ip)).fetchone()
+                if row is not None:
+                    existing[(target_id, ip)] = (row["probes"], row["lost"],
+                                                 row["rtt_sum"], row["rtt_min"],
+                                                 row["rtt_max"])
+            now = time.time()
+            merged: dict[tuple[int, str], list] = {}
+            for target_id, ip, result in probes:
+                key = (target_id, ip)
+                current = merged.get(key)
+                if current is None:
+                    base = existing.get(key, (0, 0, 0.0, None, None))
+                    current = [base[0], base[1], base[2], base[3], base[4]]
+                    merged[key] = current
+                current[0] += result.sent
+                current[1] += result.lost
+                current[2] += result.rtt_ms or 0.0
+                if result.rtt_ms is not None:
+                    current[3] = (result.rtt_ms if current[3] is None
+                                  else min(current[3], result.rtt_ms))
+                    current[4] = (result.rtt_ms if current[4] is None
+                                  else max(current[4], result.rtt_ms))
+            self._conn.executemany(
                 "INSERT INTO hop_stats(target_id, ip, probes, lost, rtt_sum,"
                 " rtt_min, rtt_max, updated_ts) VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(target_id, ip) DO UPDATE SET probes=excluded.probes,"
                 " lost=excluded.lost, rtt_sum=excluded.rtt_sum,"
                 " rtt_min=excluded.rtt_min, rtt_max=excluded.rtt_max,"
                 " updated_ts=excluded.updated_ts",
-                (target_id, ip, probes, lost, rtt_sum, rtt_min, rtt_max, time.time()))
+                [(target_id, ip, values[0], values[1], values[2], values[3],
+                  values[4], now)
+                 for (target_id, ip), values in merged.items()])
             self._conn.commit()
+        return len(merged)
 
     def hop_stats_for_target(self, target_id: int) -> dict[str, sqlite3.Row]:
         with self._lock:
