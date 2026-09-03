@@ -574,19 +574,38 @@ class Handler(BaseHTTPRequestHandler):
                     (time.perf_counter() - started) * 1000,
                     self.headers.get("User-Agent", "")[:120])
 
-    def _same_origin(self) -> bool:
-        """Whether a state-changing request came from this server's own
-        pages. The same rule the terminal's WebSocket upgrade already
-        applies, with one difference that matters here.
+    def _origin_matches(self, origin: str) -> bool:
+        """Whether `origin` is this server's own origin — scheme, host and
+        port, all three.
 
-        A browser always sends `Origin` on an upgrade, so the socket refuses
-        a missing one. It does NOT always send it on a same-origin fetch,
-        and nothing outside a browser sends it at all — the demo harness and
-        every script that drives this API through http.client included — so
-        an absent `Origin` is allowed. That is not a hole: the attack this
-        closes is a page on another origin using the operator's cookie, and
-        a browser doing that always labels it. `Sec-Fetch-Site` is checked
-        the same way: honoured when the browser sends it, absent otherwise.
+        Comparing the netloc alone accepted `https://host:8443` against a
+        plain-HTTP listener on that host and port, and vice versa. The hole
+        is narrow (a page at `http://host:8443` cannot exist while
+        `https://host:8443` is what is listening) but an origin is defined
+        as the triple and there is no reason to compare two thirds of it.
+        The scheme comes from whether a certificate is configured, which is
+        the same thing the cookie's `Secure` flag is decided by.
+        """
+        parsed = urlparse(origin)
+        expected_scheme = "https" if getattr(self.server, "is_tls", False) else "http"
+        host = (self.headers.get("Host") or "").strip().lower()
+        return (parsed.scheme.lower() == expected_scheme
+                and parsed.netloc.lower() == host)
+
+    def _same_origin(self, require_origin: bool = False) -> bool:
+        """Whether a request came from this server's own pages.
+
+        One rule, used by both the state-changing methods and the
+        terminal's WebSocket upgrade, with `require_origin` the single
+        difference between them. A browser always sends `Origin` on an
+        upgrade, so the socket refuses a missing one. It does NOT always
+        send it on a same-origin fetch, and nothing outside a browser sends
+        it at all — the demo harness and every script that drives this API
+        through http.client included — so for POST/PUT/DELETE an absent
+        `Origin` is allowed. That is not a hole: the attack this closes is a
+        page on another origin using the operator's cookie, and a browser
+        doing that always labels it. `Sec-Fetch-Site` is checked the same
+        way: honoured when the browser sends it, absent otherwise.
 
         `SameSite=Strict` on the cookie is not enough on its own, because
         "site" is registrable-domain-scoped: another port on this host or a
@@ -594,10 +613,11 @@ class Handler(BaseHTTPRequestHandler):
         attacker can put a page on one.
         """
         origin = (self.headers.get("Origin") or "").strip()
-        if origin:
-            host = (self.headers.get("Host") or "").strip().lower()
-            if urlparse(origin).netloc.lower() != host:
+        if not origin:
+            if require_origin:
                 return False
+        elif not self._origin_matches(origin):
+            return False
         site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if site and site not in ("same-origin", "none"):
             return False
@@ -700,12 +720,13 @@ class Handler(BaseHTTPRequestHandler):
                     # sibling subdomain is "same site" and its page could
                     # otherwise open this socket with the operator's cookie
                     # and drive a shell. A browser always sends Origin on an
-                    # upgrade, so a missing one is refused too; it is a check
-                    # about who is asking, which is this layer's business,
-                    # not the framing's.
-                    origin = (self.headers.get("Origin") or "").strip()
-                    host = (self.headers.get("Host") or "").strip().lower()
-                    if not origin or urlparse(origin).netloc.lower() != host:
+                    # upgrade, so a missing one is refused too (hence
+                    # require_origin); it is a check about who is asking,
+                    # which is this layer's business, not the framing's.
+                    # Same helper as the POST/PUT/DELETE rule above, so the
+                    # two cannot drift — and it compares the scheme as well
+                    # as the netloc, which this check used not to.
+                    if not self._same_origin(require_origin=True):
                         self._json({"error": "Cross-origin WebSocket refused"}, 403)
                         return
                     try:

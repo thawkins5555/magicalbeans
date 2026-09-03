@@ -1129,6 +1129,50 @@ end
     finally:
         mibcatalog.urllib.request.urlopen = real_urlopen
 
+    # ------------------------------------------------- D13 the origin scheme
+    # This listener is plain HTTP, so an https:// origin naming the same
+    # host and port is a different origin and must be refused. It used to
+    # be accepted, on the state-changing methods and on the WebSocket
+    # upgrade alike, because only the netloc was compared.
+    status, _h, payload = req("POST", "/api/maintenance", {"action": "redns"},
+                              cookie=admin_cookie,
+                              headers={"Origin": f"https://127.0.0.1:{PORT}"})
+    check("D13 an https origin against an http listener is refused",
+          status == 403, f"{status} {payload}")
+    status, _h, _p = req("POST", "/api/maintenance", {"action": "redns"},
+                         cookie=admin_cookie,
+                         headers={"Origin": f"HTTP://127.0.0.1:{PORT}"})
+    check("D13 …while the scheme comparison stays case-insensitive",
+          status == 200, str(status))
+
+    def upgrade(origin):
+        """A WebSocket upgrade, far enough to see the status line."""
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        headers = {"Upgrade": "websocket", "Connection": "Upgrade",
+                   "Sec-WebSocket-Version": "13",
+                   "Sec-WebSocket-Key": base64.b64encode(b"0123456789abcdef").decode(),
+                   "Cookie": admin_cookie}
+        if origin:
+            headers["Origin"] = origin
+        try:
+            conn.request("GET", f"/api/ssh/devices/{device_id}/socket",
+                         headers=headers)
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    check("D13 an upgrade with no Origin is still refused",
+          upgrade(None) == 403, str(upgrade(None)))
+    check("D13 an upgrade with a mismatched scheme is refused",
+          upgrade(f"https://127.0.0.1:{PORT}") == 403,
+          str(upgrade(f"https://127.0.0.1:{PORT}")))
+    check("D13 an upgrade from another host is refused",
+          upgrade("http://evil.example") == 403,
+          str(upgrade("http://evil.example")))
+    check("D13 …and the app's own origin still upgrades",
+          upgrade(f"http://127.0.0.1:{PORT}") == 101,
+          str(upgrade(f"http://127.0.0.1:{PORT}")))
+
     return 0
 
 
