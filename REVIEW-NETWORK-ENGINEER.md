@@ -1051,31 +1051,80 @@ belongs to the documentation-truth table. It is now U-F36.
 
 Three findings the reviewers raised are absent from §4 and are recorded here
 rather than lost: `namelookup.reverse` mutating the process-global socket
-timeout from eight threads (PLAUSIBLE, `namelookup.py`); the traceroute
-worst-case guidance being calibrated for serial probes (PLAUSIBLE); and
-`performance` F17's `/api/state` fan-out, which *is* carried as X-F17. The first
-two are read-only observations with no reproduction and no owner; they belong to
-the fresh-eyes pass below.
+timeout from eight threads; the traceroute worst-case guidance being calibrated
+for serial probes (PLAUSIBLE, still unowned); and `performance` F17's
+`/api/state` fan-out, which *is* carried as X-F17. The first of those was picked
+up and **reproduced** by the fresh-eyes pass below — it is G-18, and the timeout
+is left set permanently rather than merely raced on, which is worse than the
+collectors reviewer's version of it.
 
-### Files this review never read
+### Files this review never read, and what was in them
 
 The report's 395 `file:line` references touch most of the package and miss
-twenty-five files entirely. Four of them did not exist when the review started
-and are the most security-relevant code in the product — an interactive shell
-carried over a WebSocket. The table is filled in from the fresh-eyes pass.
+twenty-five files entirely, including four that did not exist when the review
+started and are the most security-relevant code in the product — an interactive
+shell carried over a WebSocket. A seventh reviewer went through all of them
+read-only, with the same rule: CONFIRMED only after reproduction. It found
+**33 defects**, thirty-one of them reproduced.
 
-| File | Why it matters | Findings |
-|---|---|---|
-| `netpath/sshterm.py` | new in 4.36.0; PTY-backed SSH sessions, per-account caps | *pending* |
-| `netpath/web/wsock.py` | new in 4.36.0; the WebSocket upgrade, Origin check and framing | *pending* |
-| `netpath/hostkeys.py` | new in 4.36.0; the host-key store both SSH paths trust | *pending* |
-| `netpath/web/static/ssh.js` | new in 4.36.0; terminal front end and vendored xterm.js | *pending* |
-| `netpath/mibparse.py` | a parser reachable from `POST /api/nodes/mibs`, never fuzzed | *pending* |
-| `netpath/snmptrapdb.py` | same FTS-rebuild shape as `syslogdb`? (§4.2 C-B4) | *pending* |
-| `netpath/ipamdb.py`, `netpath/ipam_worker.py` | the IPAM write path and its sweep worker | *pending* |
-| `netpath/appdb.py` | users, sessions, hostname cache | *pending* |
-| `netpath/vendorid.py`, `netpath/enterprises.py` | praised in §8 without being read | *pending* |
-| `netpath/console.py`, `netpath/analysis.py`, `netpath/namelookup.py` | unreviewed | *pending* |
-| `netpath/web/static/netpath.js` | the largest JS file, absent from the ARIA audit | *pending* |
-| `netpath/web/static/netflow.js`, `snmp.js`, `syslog.js`, `debug.js` | unreviewed | *pending* |
-| `netpath/mibs/*.mib` | shipped content, never validated | *pending* |
+**The headline is the one this review most obviously should have caught.** A
+single authenticated 32 KB MIB upload freezes the entire application for
+**17 seconds** — every poll, every collector write, every open browser — because
+`mibparse._IMPORT_GROUP_RE` is quadratic in the size of an `IMPORTS` block and
+four more macro regexes rescan the whole file from every candidate start
+(G-10, G-11). `POST /api/nodes/mibs` is reachable by any account with `nodes:
+write`, `max_mib_bytes` defaults to 8 MB, and nothing bounds the parse. The
+original review never opened `mibparse.py`, so it graded the upload path on the
+strength of the SNMP decoders beside it. It is the clearest single argument for
+this appendix existing: six careful reviewers reading 90% of a codebase
+produced a report whose worst omission was in the 10% nobody read.
+
+Two secondary lessons. `vendorid.py` and `enterprises.py` were **praised in §8
+without being read** — and `enterprises.VERIFIED`, whose name asserts
+provenance, turns out to carry entries the repository itself contradicts
+(G-15), which is exactly the kind of claim §8 was recommending other people
+trust. And `snmptrapdb.py` and `ipamdb.py` carry the same VACUUM-under-the-lock
+shape as §4.5 X-F5, which the report had guessed at ("Same shape in five other
+DB modules") without checking: it is there, in both (G-24).
+
+| id | Where | Sev | Tag | What | Owner |
+|---|---|---|---|---|---|
+| G-1 | `web/wsock.py:347-360` | high | CONFIRMED | An idle terminal burns a whole CPU core once the socket's fd is ≥ 1024 | D |
+| G-2 | `sshterm.py:271-294` | high | CONFIRMED | A socket that never sends `open` holds a session slot, a thread and its authorisation forever | D |
+| G-3 | `sshterm.py:540-569` | medium | PLAUSIBLE | One exception kills the watchdog, and with it every limit on a live shell | D |
+| G-4 | `sshterm.py:170-180` | medium | PLAUSIBLE | Shutting the service down can take minutes because sessions are stopped one at a time | D |
+| G-5 | `sshterm.py:71, 296-316` | medium | CONFIRMED | The failed-login cap is per socket, so the page is still a password oracle | D |
+| G-6 | `sshterm.py:415-434` | low | CONFIRMED | The terminal never records that a remembered host key was presented again | D |
+| G-7 | `web/server.py:546-550` | low | CONFIRMED | The WebSocket Origin check ignores the scheme | D |
+| G-8 | `web/wsock.py:244-263` | low | CONFIRMED | Reserved WebSocket opcodes are accepted as data | D |
+| G-9 | `sshterm.py:243, 483` | low | CONFIRMED | Any frame refreshes the idle timer, so a shell need never be typed at | D |
+| G-10 | `mibparse.py:105, 169-172` | **critical** | CONFIRMED | `_IMPORT_GROUP_RE` is quadratic: one 32 KB upload freezes the whole application for 17 seconds | B (+ D) |
+| G-11 | `mibparse.py:107-123` | **critical** | CONFIRMED | The four macro regexes rescan the whole file from every candidate start | B (+ D) |
+| G-12 | `mibparse.py:288-299, 344-353` | high | CONFIRMED | `resolve()` is O(n²) in the number of objects, and `resolve_all()` runs it eight times over every file | B |
+| G-13 | `mibparse.py:77-100` | medium | CONFIRMED | `_strip_comments_and_strings` costs nine bytes of memory per input byte | B |
+| G-14 | `mibparse.py:185, 338-339` | low | CONFIRMED | An enum value with more than 4,300 digits raises Python's integer guard out of `parse()` | B |
+| G-15 | `enterprises.py:1-19, 24-77` | medium | PLAUSIBLE | `enterprises.VERIFIED` claims a provenance the repository contradicts | F (+ B) |
+| G-16 | `enterprises.py:66, 73, 102, 110, 124, 129` | low | CONFIRMED | One vendor, several keys — the vendor filter splits a fleet across rows | B |
+| G-17 | `enterprises.py:184-187`, `nodeoids.py:171` | low | CONFIRMED | Nothing can identify Rockwell Automation / Allen-Bradley gear | B |
+| G-18 | `namelookup.py:283-292` | high | CONFIRMED | `reverse()` sets a process-global socket timeout, and concurrent resolver workers leave it set permanently | C |
+| G-19 | `namelookup.py:107, 116-123, 151-167` | medium | CONFIRMED | The raw PTR/TXT resolver accepts an answer from any host and has no overall deadline | C |
+| G-20 | `namelookup.py:263-265` | low | PLAUSIBLE | `nslookup` arguments are not validated | C |
+| G-21 | `eventlog.py:60, 70-71, 91-93` | medium | CONFIRMED | `EventLog` remembers every target it has ever seen, and `clear()` does not clear them | C |
+| G-22 | `web/server.py:297-305`, `console.py:569-581` | medium | CONFIRMED | `AccessLog.clients` grows one entry per source address forever, and the console re-sorts it every second | D (+ E) |
+| G-23 | `web/server.py:8`, `console.py:524`, `__main__.py:177` | medium | CONFIRMED | Three shipped places tell the operator there is no authentication | F (+ D, E) |
+| G-24 | `snmptrapdb.py:375-395`, `ipamdb.py:715-747` | high | CONFIRMED | `trim_to_size()` runs VACUUM up to six times while holding the write lock — §4.5 X-F5's guess, confirmed | C |
+| G-25 | `ipam_worker.py:96-131` | high | CONFIRMED | Every enabled subnet scans at once on the first tick, each with 64 ping subprocesses | C |
+| G-26 | `ipam_scan.py:180-185` | low | CONFIRMED | `read_arp_table` does not catch the timeout it sets | C |
+| G-27 | `analysis.py:278-284`, `web/api.py:50-55, 290-308` | high | CONFIRMED | One GET allocates a bucket per time slot from two unclamped query parameters | D |
+| G-28 | `web/static/app.js:100-117, 1038-1086` | medium | CONFIRMED | A 10 Hz timer that never stops, and not one fetch that can be cancelled | E |
+| G-29 | `web/static/debug.js:21, 117-127` | low | CONFIRMED | `escape()` leaves single quotes alone, and two server fields skip it entirely | E |
+| G-30 | `web/static/debug.js:258-275, 386-388` | low | CONFIRMED | The debug event table re-renders 2,000 rows on every keystroke | E |
+| G-31 | `services.py:18-69` | low | CONFIRMED | Duplicate keys and editorial labels in `PORTS` | C |
+| G-32 | `netpath/mibs/*.mib` | low | CONFIRMED | No attribution or licence notice for any of the 21 bundled MIBs | F |
+| G-33 | `netpath/mibs/SNMPv2-TC.mib` | low | CONFIRMED | `SNMPv2-TC.mib` is shipped, seeded, and yields nothing | B |
+
+The full write-ups, with the reproduction script for each CONFIRMED row, are
+the seventh reviewer's own report. Findings are routed to the workstream that
+owns the file; `mibparse.py`, `ipam_worker.py`, `namelookup.py`, `eventlog.py`,
+`console.py` and `analysis.py` had no owner in the plan at all, which is
+another way of saying the same thing this appendix says.
