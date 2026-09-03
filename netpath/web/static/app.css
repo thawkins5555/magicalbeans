@@ -422,6 +422,20 @@ button.module-settings {
   padding: 5px 14px;
 }
 button.module-settings:hover { background: var(--accent); color: #0E1116; }
+/* Same source-order trap as button.primary above: this rule set follows
+   button:disabled at equal specificity, so a gear the account may not use
+   kept its full accent outline and read as the most prominent control on
+   a bar of dead buttons. */
+button.module-settings:disabled {
+  background: var(--raised);
+  border-color: var(--grid);
+  color: var(--muted);
+}
+button.module-settings:disabled:hover {
+  background: var(--raised);
+  border-color: var(--grid);
+  color: var(--muted);
+}
 
 input, select, textarea {
   background: var(--raised);

@@ -1042,6 +1042,13 @@ const App = (() => {
       missing.push(label);
       node.setAttribute('aria-invalid', 'true');
       node.classList.add('invalid');
+      // The mark comes off as soon as the operator answers it, rather than
+      // waiting for the next press: a field still outlined in red while it
+      // is being typed into reads as a second, different complaint.
+      node.addEventListener('input', () => {
+        node.removeAttribute('aria-invalid');
+        node.classList.remove('invalid');
+      }, { once: true });
       if (!firstEmpty) firstEmpty = node;
     }
     if (!missing.length) return true;
