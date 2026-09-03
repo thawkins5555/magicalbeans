@@ -727,8 +727,19 @@ class Service:
                                      f"{cap // 1048576} MB cap: removed "
                                      f"{removed} oldest scan records")
 
+        # Before the prune, not after: compact_rollup summarises complete
+        # hours of raw samples into samples_hourly, and pruning first would
+        # delete an hour before it had been summarised. A chart wider than
+        # three days reads only the rollups, so this is what puts anything
+        # in a month- or year-wide window at all — it was written in 4.24
+        # and never called from anywhere until now.
+        written = self.nodes_db.compact_rollup()
+        if written:
+            self.log.add(SYSTEM, f"Nodes: summarised {written} metric-hour(s) "
+                                 f"into the hourly rollups")
         self.nodes_db.prune(
-            sample_days=float(self.nodes_settings.get("sample_retention_days", 400)),
+            sample_days=float(self.nodes_settings.get("sample_retention_days", 3)),
+            rollup_days=float(self.nodes_settings.get("rollup_retention_days", 400)),
             event_days=float(self.nodes_settings.get("event_retention_days", 180)),
             discovery_days=float(self.nodes_settings.get("discovery_retention_days", 30)),
             max_samples_per_metric=int(

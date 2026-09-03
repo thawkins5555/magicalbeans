@@ -205,6 +205,11 @@ CREATE TABLE IF NOT EXISTS samples (
     value           REAL,
     PRIMARY KEY (metric_id, ts)
 );
+-- The primary key leads on metric_id, so the two queries that ask about
+-- time across every metric — compact_rollup's per-hour aggregate and
+-- prune's delete by age — scanned the whole table without this. On the
+-- largest table in the database that was seconds of held lock per pass.
+CREATE INDEX IF NOT EXISTS ix_samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS samples_hourly (
     metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
     hour            INTEGER NOT NULL,
@@ -363,7 +368,14 @@ DEFAULTS = {
     # keep loss sampling steady on a device polled rarely, or to ping less
     # often than a fast focus poll would.
     "ping_interval_s": 0,
-    "sample_retention_days": 400,    # raw samples; hourly rollups are never pruned by age
+    # Raw samples are the expensive table — the review measured 9.1 GB a day
+    # at 2,000 devices with 48 ports each — and are what series() reads for
+    # a window up to three days wide. Anything wider reads samples_hourly,
+    # which compact_rollup fills, so keeping months of raw points bought
+    # nothing but disk. Three days of raw, and the rollups carry the long
+    # history at about a thousandth of the size.
+    "sample_retention_days": 3,
+    "rollup_retention_days": 400,    # hourly rollups; what a year-wide chart reads
     # Per metric, not across the whole table: the old whole-table 50,000
     # left a 2,000-device fleet with a third of a sample per metric. At the
     # shipped 120 s interval this is about seven days of raw points for one
@@ -381,7 +393,6 @@ DEFAULTS = {
     "max_mib_bundle_bytes": 64 * 1024 * 1024,
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
-    "rollup_enabled": True,
     "detail_fields": "sys_descr,vendor,snmp_version",  # identity fields shown in
                                                        # the device detail header
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
@@ -436,6 +447,12 @@ DEFAULTS = {
     "vendor_walk_parallel": 4,
     "discovery_arc_hop": True,
 }
+
+# How wide a chart window still reads raw samples. Wider than this reads
+# samples_hourly instead — which is why sample_retention_days defaults to
+# the same three days: raw points older than the widest raw window can
+# answer nothing a rollup does not.
+RAW_WINDOW_S = 3 * 86400
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
@@ -747,6 +764,29 @@ class NodesDatabase:
                 except (ValueError, TypeError):
                     pass
         return values
+
+    def _private_setting(self, key: str, default=None):
+        """A settings row this module keeps for itself. Not in DEFAULTS, so
+        settings() never returns it and save_settings() cannot be made to
+        overwrite it from the settings dialog — it is bookkeeping, not a
+        preference."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return default
+
+    def _set_private_setting(self, key: str, value) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)))
+            self._conn.commit()
 
     def save_settings(self, values: dict) -> None:
         with self._lock:
@@ -1763,7 +1803,7 @@ class NodesDatabase:
                     "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
                     (metric_id, device_id)).fetchone():
                 return []
-            if (t1 - t0) <= 86400 * 3:
+            if (t1 - t0) <= RAW_WINDOW_S:
                 if bucket_s and bucket_s > 0:
                     rows = self._conn.execute(
                         "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
@@ -1786,30 +1826,73 @@ class NodesDatabase:
             return [{"ts": row["hour"], "min": row["vmin"], "avg": row["vavg"],
                     "max": row["vmax"], "n": row["n"]} for row in rows]
 
-    def compact_rollup(self) -> int:
-        """Aggregates any raw samples older than one hour into
-        samples_hourly, min/avg/max per (metric, hour), then deletes the
-        raw rows that were just rolled up. Idempotent: an hour already
-        fully rolled up produces nothing new to aggregate."""
-        cutoff_hour = int(time.time() // 3600) * 3600 - 3600
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT metric_id, CAST(ts / 3600 AS INTEGER) * 3600 AS hour,"
-                " COUNT(*) AS n, MIN(value) AS vmin, AVG(value) AS vavg,"
-                " MAX(value) AS vmax FROM samples WHERE ts < ?"
-                " GROUP BY metric_id, hour", (cutoff_hour,)).fetchall()
-            for row in rows:
-                self._conn.execute(
-                    "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
-                    " VALUES (?,?,?,?,?,?) ON CONFLICT(metric_id, hour) DO UPDATE SET"
-                    " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
-                    " vmax=excluded.vmax",
-                    (row["metric_id"], row["hour"], row["n"], row["vmin"],
-                     row["vavg"], row["vmax"]))
-            cursor = self._conn.execute(
-                "DELETE FROM samples WHERE ts < ?", (cutoff_hour,))
-            self._conn.commit()
-            return cursor.rowcount or 0
+    _ROLLUP_WATERMARK = "rollup_watermark_hour"
+    # Hours already rolled up that are aggregated again on the next pass, so
+    # a sample that arrived after its hour was summarised is not lost. Two
+    # covers a poll that started before the hour ended and a clock that is a
+    # little behind.
+    _ROLLUP_REDO_HOURS = 2
+
+    def compact_rollup(self, max_hours: int = 48) -> int:
+        """Summarise complete hours of raw samples into samples_hourly.
+
+        Two things were wrong with the first version. It deleted every raw
+        sample older than an hour, so the raw window a chart reads (three
+        days) could never contain anything — and it was never called, which
+        is the only reason that did not destroy every short-window chart.
+        And it re-aggregated the whole history on each call.
+
+        Now: raw rows are left alone (prune and the per-metric cap own
+        their lifetime), work starts from a private watermark rather than
+        from the beginning of time, and each hour is its own transaction so
+        the lock is never held across more than one. `max_hours` bounds a
+        single pass; the watermark makes the next pass continue where this
+        one stopped, so a long backlog is worked off over several passes
+        instead of in one stall.
+
+        Returns the number of (metric, hour) rows written.
+        """
+        now = time.time()
+        # The last hour that has fully elapsed. The current hour is still
+        # collecting samples and would be summarised wrong.
+        latest_complete = int(now // 3600) * 3600 - 3600
+        watermark = self._private_setting(self._ROLLUP_WATERMARK)
+        if watermark is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MIN(ts) AS oldest FROM samples").fetchone()
+            oldest = row["oldest"] if row else None
+            if oldest is None:
+                self._set_private_setting(self._ROLLUP_WATERMARK,
+                                          latest_complete + 3600)
+                return 0
+            hour = int(float(oldest) // 3600) * 3600
+        else:
+            hour = int(watermark) - self._ROLLUP_REDO_HOURS * 3600
+        written = 0
+        processed = 0
+        while hour <= latest_complete and processed < max_hours:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
+                    " AVG(value) AS vavg, MAX(value) AS vmax FROM samples"
+                    " WHERE ts >= ? AND ts < ? AND value IS NOT NULL"
+                    " GROUP BY metric_id", (hour, hour + 3600)).fetchall()
+                if rows:
+                    self._conn.executemany(
+                        "INSERT INTO samples_hourly(metric_id, hour, n, vmin,"
+                        " vavg, vmax) VALUES (?,?,?,?,?,?)"
+                        " ON CONFLICT(metric_id, hour) DO UPDATE SET"
+                        " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
+                        " vmax=excluded.vmax",
+                        [(row["metric_id"], hour, row["n"], row["vmin"],
+                          row["vavg"], row["vmax"]) for row in rows])
+                    written += len(rows)
+                self._conn.commit()
+            hour += 3600
+            processed += 1
+        self._set_private_setting(self._ROLLUP_WATERMARK, hour)
+        return written
 
     # ----------------------------------------------------------------- events
 
@@ -2532,7 +2615,7 @@ class NodesDatabase:
                 self._conn.commit()
         return removed
 
-    def prune(self, *, sample_days: float = 400, rollup_days: float = 0,
+    def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
              event_days: float = 180, poll_days: float = 0,
              discovery_days: float = 30,
              max_samples_per_metric: int = 0) -> int:
@@ -2553,6 +2636,12 @@ class NodesDatabase:
             # do nothing, as it originally did before this fix.
             cursor = self._conn.execute(
                 "DELETE FROM samples WHERE ts < ?", (now - sample_days * 86400,))
+            removed += cursor.rowcount or 0
+            # The hourly rollups are the long history now, so they are
+            # bounded by their own retention rather than kept forever.
+            cursor = self._conn.execute(
+                "DELETE FROM samples_hourly WHERE hour < ?",
+                (now - rollup_days * 86400,))
             removed += cursor.rowcount or 0
             cursor = self._conn.execute(
                 "DELETE FROM device_events WHERE ts < ?", (now - event_days * 86400,))

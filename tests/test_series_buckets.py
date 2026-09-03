@@ -179,5 +179,119 @@ else:
     assert len(interleaved) == 20, interleaved
     print("PASS: a concurrent writer runs while the cap pass is chunking")
 
+# -------------------------------------------------------- hourly rollups
+#
+# §4.1 B2 / §4.5 F2: compact_rollup() was never called, so samples_hourly
+# was always empty and any chart window over three days returned nothing —
+# while the storage document promised rollups. And when it was called it
+# deleted every raw sample older than an hour, which would have emptied the
+# raw window a short chart reads.
+
+import time as _time
+
+roll_db = NodesDatabase(os.path.join(TMPDIR, "rollup.db"))
+roll_group = roll_db.ensure_default_group()
+roll_device = roll_db.add_device("127.0.0.4", name="rollup-test",
+                                 group_id=roll_group)
+
+# Five days of samples, six per hour, ending an hour ago so every hour in
+# the range is complete. Value = the hour index, so each hour's min/avg/max
+# is exactly that index and a wrong bucket is obvious.
+HOUR = 3600
+now_hour = int(_time.time() // HOUR) * HOUR
+first_hour = now_hour - 5 * 24 * HOUR
+roll_metric = None
+for h in range(5 * 24):
+    hour_start = first_hour + h * HOUR
+    for step in range(6):
+        roll_metric = roll_db.record_metric_sample(
+            roll_device, "cpu_pct", "CPU", "%", "gauge",
+            float(hour_start + step * 600), float(h))
+
+def raw_count(db, metric_id):
+    with db._lock:
+        return db._conn.execute(
+            "SELECT COUNT(*) AS n FROM samples WHERE metric_id = ?",
+            (metric_id,)).fetchone()["n"]
+
+
+raw_before = raw_count(roll_db, roll_metric)
+# A pass is bounded (max_hours) so a long backlog never stalls maintenance
+# in one go; the watermark makes the next pass continue where it stopped.
+passes = 0
+written = 0
+watermark = None
+while passes < 10:
+    written += roll_db.compact_rollup()
+    passes += 1
+    moved = roll_db._private_setting(roll_db._ROLLUP_WATERMARK)
+    if moved == watermark:
+        break                 # caught up: the watermark stopped advancing
+    watermark = moved
+print(f"rollup wrote {written} metric-hour(s) over {passes} pass(es) from "
+      f"{raw_before} raw sample(s)")
+assert passes > 1, "a 5-day backlog should take more than one bounded pass"
+assert written >= 5 * 24 - 1, written
+
+with roll_db._lock:
+    hourly = roll_db._conn.execute(
+        "SELECT hour, n, vmin, vavg, vmax FROM samples_hourly"
+        " WHERE metric_id = ? ORDER BY hour", (roll_metric,)).fetchall()
+assert len(hourly) >= 5 * 24 - 1, len(hourly)
+assert all(row["n"] == 6 for row in hourly), \
+    [row["n"] for row in hourly if row["n"] != 6]
+sample_hour = hourly[10]
+expected = (sample_hour["hour"] - first_hour) / HOUR
+assert sample_hour["vmin"] == sample_hour["vmax"] == expected, dict(sample_hour)
+print("PASS: every complete hour is summarised as n=6 with the right min/avg/max")
+
+raw_after = raw_count(roll_db, roll_metric)
+assert raw_after == raw_before, (raw_before, raw_after)
+print("PASS: the rollup leaves the raw samples alone")
+
+# A second pass re-does only the two-hour overlap, and writes nothing new.
+before_rows = len(hourly)
+written_again = roll_db.compact_rollup()
+with roll_db._lock:
+    after_rows = roll_db._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly WHERE metric_id = ?",
+        (roll_metric,)).fetchone()["n"]
+assert after_rows == before_rows, (before_rows, after_rows)
+assert written_again <= 3, written_again
+print(f"PASS: a second rollup pass adds no rows (re-did {written_again} hour(s) "
+      f"for late samples)")
+
+# A five-day window reads the hourly table; a one-day window reads raw.
+wide = roll_db.series(roll_device, roll_metric, first_hour, now_hour)
+assert len(wide) >= 5 * 24 - 1, len(wide)
+assert "n" in wide[0] and "avg" in wide[0], wide[0]
+narrow = roll_db.series(roll_device, roll_metric, now_hour - 23 * HOUR, now_hour)
+assert narrow and "value" in narrow[0], narrow[:1]
+print("PASS: a 5-day window reads hourly rollups, a 1-day window reads raw")
+
+# prune acts on the right table: raw by sample_days, rollups by rollup_days.
+roll_db.prune(sample_days=2, rollup_days=400, event_days=999,
+              discovery_days=999)
+with roll_db._lock:
+    oldest_left = roll_db._conn.execute(
+        "SELECT MIN(ts) AS t, COUNT(*) AS n FROM samples WHERE metric_id = ?",
+        (roll_metric,)).fetchone()
+assert oldest_left["n"], "pruning raw samples must not empty the table"
+assert oldest_left["t"] >= _time.time() - 2 * 86400 - HOUR, dict(oldest_left)
+with roll_db._lock:
+    still_hourly = roll_db._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
+assert still_hourly == after_rows, (still_hourly, after_rows)
+print("PASS: pruning raw samples by age leaves the rollups untouched")
+
+roll_db.prune(sample_days=999, rollup_days=1, event_days=999, discovery_days=999)
+with roll_db._lock:
+    left = roll_db._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
+assert 0 < left < after_rows, (left, after_rows)
+print(f"PASS: rollup_days prunes samples_hourly ({after_rows} -> {left} rows)")
+
+roll_db.close()
+
 nodes_db.close()
 print("ALL SERIES-BUCKET ASSERTIONS PASSED")
