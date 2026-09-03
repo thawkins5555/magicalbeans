@@ -381,3 +381,41 @@ finally:
     alertmail.send = real_send
 engine.stop()
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== A5
+print("\nA5 — traps and syslog name the device that sent them")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+add_device(nodes, "10.5.0.1", "core-sw-a")
+add_device(nodes, "10.5.0.2", "edge-sw-b")
+engine._tick()
+
+# Same rule, restricted to the core switch. Both sources send the same trap
+# and the same message, so only the device identity can tell them apart.
+trap_rule = alerts.rule_by_key("trap_cold_start")
+alerts.update_rule(trap_rule["id"], device_filter="core")
+syslog_rule = alerts.rule_by_key("syslog_critical")
+alerts.update_rule(syslog_rule["id"], device_filter="core")
+
+for ip in ("10.5.0.1", "10.5.0.2"):
+    seed_trap(snmp, ip, "1.3.6.1.6.3.1.1.5.1", "coldStart", severity=4,
+              kind="coldStart")
+    seed_syslog(syslog, ip, "%SYS-2-MALLOCFAIL: Memory allocation failed",
+                severity=2)
+engine._tick()
+
+trap_alerts = open_rows(alerts, "trap_cold_start")
+assert len(trap_alerts) == 1, [dict(a) for a in trap_alerts]
+assert "core-sw-a" in trap_alerts[0]["entity_label"], dict(trap_alerts[0])
+ok(f"device_filter matches a trap by its sender ({trap_alerts[0]['entity_label']!r})")
+
+syslog_alerts = open_rows(alerts, "syslog_critical")
+assert len(syslog_alerts) == 1, [dict(a) for a in syslog_alerts]
+assert "core-sw-a" in syslog_alerts[0]["entity_label"], dict(syslog_alerts[0])
+ok("device_filter matches a syslog message by its sender, not the other one")
+
+assert "coldStart" in trap_alerts[0]["entity_label"], dict(trap_alerts[0])
+ok("a trap alert's label names both the sender and the trap")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()

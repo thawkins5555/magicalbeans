@@ -393,6 +393,37 @@ class AlertEngine:
             except Exception:
                 pass
 
+    def _device_for_source(self, cache: dict, source: str):
+        """The managed device that sent this trap or syslog message, or None.
+
+        A per-drain dict rather than a query per row: a burst of traps is
+        overwhelmingly from a handful of sources, and a mass syslog event is
+        the same host many times. None is a real answer, cached as such —
+        "this address is not a device we poll" is exactly what
+        trap_link_down_unmanaged needs, and re-asking for it every row would
+        be the most expensive lookup of the drain.
+        """
+        if not source:
+            return None
+        if source in cache:
+            return cache[source]
+        lookup = getattr(self.nodes_db, "device_by_ip", None)
+        device = lookup(source) if lookup is not None else None
+        cache[source] = device
+        return device
+
+    def _source_name(self, device, source: str) -> str:
+        """A display name for a trap/syslog sender, given a cached device row.
+
+        nodes_db is withheld from resolve_name when the cache already
+        answered "not a device we poll", because resolve_name's own
+        device_by_ip fallback would repeat exactly the lookup that produced
+        that answer, once per row. The DNS-cache half still runs.
+        """
+        return hostresolve.resolve_name(
+            self.nodes_db if device is not None else None, self.app_db,
+            source, device=device) or source
+
     def _muted(self, occurrence: Occurrence, muted: dict) -> bool:
         """True when this occurrence is about a device an operator silenced.
 
@@ -717,13 +748,26 @@ class AlertEngine:
         cursor = self.db.cursor("traps")
         occurrences = []
         max_id = cursor
+        devices: dict = {}
         for row in self._read_forward("traps", self.snmp_db.traps_since,
                                       cursor, self.snmp_db.max_id):
             max_id = max(max_id, row["id"])
+            # A trap alert used to name only the trap ("linkDown"), because
+            # nothing on the occurrence said which box sent it: device_name
+            # was empty, so a rule's device_filter could not match a trap at
+            # all, and the label an operator read named a fault with no
+            # subject. The sending address is in hand on every row; the
+            # managed device behind it usually is too.
+            device = self._device_for_source(devices, row["source"])
+            source_label = self._source_name(device, row["source"])
+            trap_label = row["trap_name"] or row["trap_oid"] or "trap"
             occurrences.append(Occurrence(
                 kind="trap", source_kind=row["trap_kind"] or "", entity_kind="trap",
-                entity_id=row["trap_oid"] or "", entity_label=row["trap_name"] or row["trap_oid"] or row["source"],
-                ts=row["ts"], message=row["varbind_text"] or "", device_ip=row["source"],
+                entity_id=row["trap_oid"] or "",
+                entity_label=f"{source_label}: {trap_label}",
+                ts=row["ts"], message=row["varbind_text"] or "",
+                device_name=(device["name"] if device else "") or "",
+                device_ip=row["source"],
                 extra={"trap_name": row["trap_name"] or "", "trap_oid": row["trap_oid"] or "",
                       "varbinds": row["varbind_text"] or ""}))
         if max_id > cursor:
@@ -738,23 +782,30 @@ class AlertEngine:
         min_severity = int(settings.get("min_severity", 7))
         occurrences = []
         max_id = cursor
+        devices: dict = {}
         for row in self._read_forward("syslog", self.syslog_db.rows_since,
                                       cursor, self.syslog_db.max_id):
             max_id = max(max_id, row["id"])
             if row["severity"] > min_severity:
                 continue
+            device = self._device_for_source(devices, row["source"])
             # Same "don't override a real self-reported host" rule as the
             # Syslog page's own Host column, so an alert opened from a
             # message shows the same name the Syslog page shows for it.
             if row["host"] and row["host"] != row["source"]:
                 label = row["host"]
             else:
-                label = hostresolve.resolve_name(
-                    self.nodes_db, self.app_db, row["source"]) or row["source"]
+                label = self._source_name(device, row["source"])
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
                 entity_id=row["source"], entity_label=label,
-                ts=row["ts"], message=row["message"] or "", device_ip=row["source"],
+                ts=row["ts"], message=row["message"] or "",
+                # The device's own name where the sender is one we poll, so a
+                # rule's device_filter matches syslog the same way it matches
+                # a poll event; the self-reported host otherwise, which is
+                # the only name an unmanaged sender has.
+                device_name=(device["name"] if device else "") or row["host"] or "",
+                device_ip=row["source"],
                 severity=row["severity"]))
         if max_id > cursor:
             self._advance_cursor("syslog", max_id)
