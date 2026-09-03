@@ -107,5 +107,77 @@ negative = api.get_nodes_device_series(
 assert len(negative["points"]) == 60 and "value" in negative["points"][0]
 print("PASS: a negative bucket_s falls back to raw rows rather than erroring")
 
+# --------------------------------------------------- per-metric sample cap
+#
+# §4.1 B1 / §4.5 F1: sample_row_cap_per_metric counted the WHOLE samples
+# table, so at 2,000 devices and ~90 metrics each, 50,000 surviving rows is
+# 0.29 samples per metric — every chart empty and every threshold streak
+# reset — and the single DELETE of the other ~11 million rows held the
+# process lock for tens of seconds. The cap is now per metric.
+
+import sqlite3
+import threading
+
+cap_device = nodes_db.add_device("127.0.0.3", name="cap-test", group_id=group_id)
+caps = {}
+for key, count in (("busy", 100), ("medium", 50), ("quiet", 10)):
+    for i in range(count):
+        caps[key] = nodes_db.record_metric_sample(
+            cap_device, key, key, "u", "gauge", float(1000 + i), float(i))
+
+
+def stored(metric_id):
+    return nodes_db.series(cap_device, metric_id, 0, 10_000)
+
+
+removed = nodes_db.cap_samples_per_metric(40)
+window_functions = sqlite3.sqlite_version_info >= (3, 25, 0)
+if not window_functions:
+    print(f"SKIP: SQLite {sqlite3.sqlite_version} has no window functions")
+else:
+    counts = {key: len(stored(metric_id)) for key, metric_id in caps.items()}
+    print(f"after capping at 40: {counts}, {removed} row(s) removed")
+    assert counts == {"busy": 40, "medium": 40, "quiet": 10}, counts
+    # 60 from `busy`, 10 from `medium`, and 20 from the 60-sample
+    # if_in_bps.1 metric this file created earlier: the cap is per metric
+    # across the whole database, not per device.
+    assert removed == 90, removed
+    assert len(nodes_db.series(device_id, metric_id, 0, 600)) == 40
+    print("PASS: the cap applies per metric, not across the whole table")
+
+    # The newest are what survive: a cap that kept the oldest 40 would leave
+    # charts showing last week and nothing since.
+    kept = stored(caps["busy"])
+    assert kept[0]["ts"] == 1060.0 and kept[-1]["ts"] == 1099.0, (kept[0], kept[-1])
+    print("PASS: the newest samples are the ones kept")
+
+    # Idempotent: a second pass at the same cap has nothing left to do.
+    assert nodes_db.cap_samples_per_metric(40) == 0
+    print("PASS: capping again removes nothing")
+
+    # A writer must not be blocked for the length of the whole pass. With
+    # 600 metrics the cap runs several chunks, releasing the lock between
+    # them; a writer on another thread gets in while it runs.
+    for i in range(600):
+        for j in range(3):
+            nodes_db.record_metric_sample(
+                cap_device, f"bulk.{i}", "bulk", "u", "gauge", float(j), float(j))
+    interleaved = []
+
+    def writer():
+        for i in range(20):
+            nodes_db.record_metric_sample(
+                cap_device, "concurrent", "concurrent", "u", "gauge",
+                float(i), float(i))
+            interleaved.append(i)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    nodes_db.cap_samples_per_metric(1, chunk=50)
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "a writer was blocked for the whole cap pass"
+    assert len(interleaved) == 20, interleaved
+    print("PASS: a concurrent writer runs while the cap pass is chunking")
+
 nodes_db.close()
 print("ALL SERIES-BUCKET ASSERTIONS PASSED")

@@ -731,7 +731,8 @@ class Service:
             sample_days=float(self.nodes_settings.get("sample_retention_days", 400)),
             event_days=float(self.nodes_settings.get("event_retention_days", 180)),
             discovery_days=float(self.nodes_settings.get("discovery_retention_days", 30)),
-            max_samples=int(self.nodes_settings.get("sample_row_cap_per_metric", 0)))
+            max_samples_per_metric=int(
+                self.nodes_settings.get("sample_row_cap_per_metric", 0)))
         # Forwarding-table entries nothing has refreshed for a while. A
         # switch taken out of the walk schedule would otherwise keep
         # answering MAC searches from a table nobody has confirmed since,

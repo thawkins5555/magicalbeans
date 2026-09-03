@@ -15,10 +15,13 @@ unbounded split `ipamdb.py`'s `scans` (pruned) vs. `subnets`/`hosts`
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
@@ -361,7 +364,12 @@ DEFAULTS = {
     # often than a fast focus poll would.
     "ping_interval_s": 0,
     "sample_retention_days": 400,    # raw samples; hourly rollups are never pruned by age
-    "sample_row_cap_per_metric": 50_000,
+    # Per metric, not across the whole table: the old whole-table 50,000
+    # left a 2,000-device fleet with a third of a sample per metric. At the
+    # shipped 120 s interval this is about seven days of raw points for one
+    # metric, well past sample_retention_days, so it is a safety net rather
+    # than the thing that decides retention.
+    "sample_row_cap_per_metric": 5_000,
     "event_retention_days": 180,
     "discovery_retention_days": 30,
     "max_mib_bytes": 8 * 1024 * 1024,
@@ -515,6 +523,7 @@ class NodesDatabase:
         # polled. The scheduler holds one merged config per device and
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
+        self._warned_no_window = False
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -2474,12 +2483,65 @@ class NodesDatabase:
                 pass
         return total
 
+    _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
+
+    def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
+        """Keep at most the newest `n` raw samples of EACH metric.
+
+        The cap this replaces counted the whole table: 50,000 rows total
+        survived every maintenance pass, which at 2,000 devices and ~90
+        metrics each is 0.29 samples per metric — every chart empty, every
+        threshold streak reset — and the single DELETE of the other ~11
+        million rows held the process lock for tens of seconds. This
+        deletes per metric with a window function, in chunks of `chunk`
+        metrics, taking the lock for each chunk and releasing it in
+        between, so a poll worker waits for one chunk at most.
+
+        Window functions need SQLite 3.25. On anything older this does
+        nothing and says so once, rather than raising in the maintenance
+        thread — the alternative would be the whole-table delete this
+        exists to remove.
+        """
+        if n <= 0:
+            return 0
+        if sqlite3.sqlite_version_info < self._CAP_MIN_SQLITE:
+            if not self._warned_no_window:
+                self._warned_no_window = True
+                log.warning(
+                    "nodes: SQLite %s cannot cap samples per metric (needs "
+                    "%s); raw samples are bounded by sample_retention_days "
+                    "alone", sqlite3.sqlite_version,
+                    ".".join(str(part) for part in self._CAP_MIN_SQLITE))
+            return 0
+        with self._lock:
+            metric_ids = [row["id"] for row in
+                          self._conn.execute("SELECT id FROM metrics").fetchall()]
+        removed = 0
+        for start in range(0, len(metric_ids), max(1, chunk)):
+            batch = metric_ids[start:start + max(1, chunk)]
+            marks = ",".join("?" * len(batch))
+            with self._lock:
+                cursor = self._conn.execute(
+                    f"DELETE FROM samples WHERE rowid IN ("
+                    f" SELECT rowid FROM ("
+                    f"  SELECT rowid, ROW_NUMBER() OVER ("
+                    f"   PARTITION BY metric_id ORDER BY ts DESC) AS rn"
+                    f"  FROM samples WHERE metric_id IN ({marks})"
+                    f" ) WHERE rn > ?)", (*batch, int(n)))
+                removed += cursor.rowcount or 0
+                self._conn.commit()
+        return removed
+
     def prune(self, *, sample_days: float = 400, rollup_days: float = 0,
              event_days: float = 180, poll_days: float = 0,
-             discovery_days: float = 30, max_samples: int = 0) -> int:
+             discovery_days: float = 30,
+             max_samples_per_metric: int = 0) -> int:
         """Trims the unbounded tables only: samples, device/interface
         events, discovery jobs. Devices, groups, interfaces and MIBs are
-        current-state tables, never pruned by age here."""
+        current-state tables, never pruned by age here.
+
+        The per-metric row cap runs after this method's own transaction,
+        in its own chunked pass — see cap_samples_per_metric."""
         removed = 0
         now = time.time()
         with self._lock:
@@ -2502,16 +2564,8 @@ class NodesDatabase:
                 "DELETE FROM discovery_jobs WHERE started_ts < ? AND state != 'running'",
                 (now - discovery_days * 86400,))
             removed += cursor.rowcount or 0
-            if max_samples:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM samples")
-                total = cursor.fetchone()["n"]
-                if total > max_samples:
-                    cursor = self._conn.execute(
-                        "DELETE FROM samples WHERE rowid IN (SELECT rowid FROM samples"
-                        " ORDER BY ts ASC LIMIT ?)", (total - max_samples,))
-                    removed += cursor.rowcount or 0
             self._conn.commit()
+        removed += self.cap_samples_per_metric(max_samples_per_metric)
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
