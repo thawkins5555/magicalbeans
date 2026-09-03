@@ -48,10 +48,13 @@
 
 <!-- =========================== DASHBOARD ============================ -->
 <section id="page-dashboard" class="page">
-  <div class="pad-x pad-b" style="padding-top:14px">
+  <div class="dash-scroll pad-x pad-b" style="padding-top:14px">
     <h2>Dashboard</h2>
-    <p class="hint">Nothing here yet — this is a placeholder for a future
-      cross-module overview.</p>
+    <p class="hint">Everything below is drawn from what your account can
+      read. Every count links through to the tab that can act on it.</p>
+    <!-- Tiles are built by dashboard.js; the grid itself is markup so the
+         page has a shape before the first fetch lands. -->
+    <div id="dash-grid" class="dash-grid"></div>
   </div>
 </section>
 

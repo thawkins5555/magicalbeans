@@ -258,6 +258,13 @@ ROUTES = [
     # Which of this host's features can work at all. No gate beyond a
     # session: it is a property of the machine, not of any module.
     ("GET", r"^/api/platform$", api.get_platform, None),
+    # The Dashboard aggregates whatever the account can already read,
+    # so like /api/state it is not gated as a whole — each section is
+    # dropped inside the handler instead. The offenders list is device
+    # data and is gated on Nodes read.
+    ("GET", r"^/api/dashboard$", api.get_dashboard, None),
+    ("GET", r"^/api/dashboard/offenders$", api.get_dashboard_offenders,
+     ("nodes", R)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)

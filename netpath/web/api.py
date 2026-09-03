@@ -4273,3 +4273,191 @@ def get_platform(service, params, body) -> dict:
             "credential_store": "Windows DPAPI" if dpapi.IS_WINDOWS else None,
         },
     }
+
+
+# --------------------------------------------------------------- dashboard
+#
+# The Dashboard was a 385-byte placeholder and `login.js` makes it the
+# landing page after every sign-in, so the screen every shift starts on said
+# "nothing here yet". These two endpoints answer the questions a tile grid
+# asks; everything else the grid needs is already on /api/state, which every
+# tab polls anyway.
+#
+# Permission-gated the way get_state is: never refused outright (the tab is
+# always reachable), but a section the signed-in account cannot read is
+# absent rather than empty, so the front end can leave the tile out instead
+# of drawing a zero that is not true.
+
+# The metric keys the "worst" lists are built from. Named here rather than in
+# the front end because they are the poller's vocabulary (nodepoll.py:1281,
+# :1284 and nodeoids.py's per-vendor tables), not the browser's.
+DASHBOARD_METRICS = (
+    ("rtt", "ping_rtt_ms", "Slowest to answer", "ms", False),
+    ("loss", "ping_loss_pct", "Worst packet loss", "%", False),
+    ("cpu", "cpu_pct", "Highest CPU", "%", False),
+)
+
+DASHBOARD_OFFENDER_N = 10
+
+
+def _dash_can(service, params, module: str) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get(module), _permissions.READ)
+
+
+def get_dashboard(service, params, body) -> dict:
+    """The cross-module numbers the tile grid shows, in one round trip."""
+    result: dict = {}
+
+    if _dash_can(service, params, "nodes"):
+        poller = service.node_poller
+        # pool_state() separates busy from queued; the old gauge added them
+        # together against the pool size and read "48 of 32 busy".
+        pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
+        result["fleet"] = {
+            "counts": service.nodes_db.device_counts(),
+            "running": poller.running,
+            "pool": pool,
+        }
+
+    if _dash_can(service, params, "alerts"):
+        summary = service.alerts_db.open_summary()
+        # One severity-1 outage must never be hidden behind forty severity-6
+        # notices, so the tile is coloured by the worst open severity and
+        # broken down by severity rather than shown as one total. There is no
+        # per-severity COUNT on alerts.db and alertsdb.py belongs to another
+        # workstream, so the breakdown is counted from the open rows up to a
+        # bound and says when the bound is what answered.
+        by_severity: dict[str, int] = {}
+        rows = service.alerts_db.alerts(state="unresolved",
+                                        limit=ALERT_TOTAL_CAP + 1)
+        for row in rows[:ALERT_TOTAL_CAP]:
+            key = str(row["severity"])
+            by_severity[key] = by_severity.get(key, 0) + 1
+        result["alerts"] = {
+            "open": summary.get("open", 0),
+            "acked": summary.get("acked", 0),
+            "worst": summary.get("worst"),
+            "by_severity": by_severity,
+            "counted_capped": len(rows) > ALERT_TOTAL_CAP,
+            "engine_running": service.alert_engine.running,
+            "counters": service.alert_engine.counters,
+        }
+
+    collectors = []
+    for module, name, obj in (
+            ("netflow", "NetFlow", getattr(service, "collector", None)),
+            ("snmp", "SNMP traps", getattr(service, "snmp", None)),
+            ("syslog", "Syslog", getattr(service, "syslog", None))):
+        if obj is None or not _dash_can(service, params, module):
+            continue
+        counters = dict(getattr(obj, "counters", {}) or {})
+        collectors.append({
+            "module": module, "name": name,
+            "running": bool(getattr(obj, "running", False)),
+            "counters": counters,
+        })
+    if collectors:
+        result["collectors"] = collectors
+
+    if _dash_can(service, params, "settings"):
+        # Headroom, not raw sizes: "which database is closest to its cap" is
+        # the question, and it is answered worst-first.
+        settings = service.settings or {}
+        stores = []
+        # Only the seven databases that actually have a cap on the Settings
+        # tab; app.db, wireless.db and configrx.db have none, so they are
+        # reported as size without a fraction rather than as 0% used.
+        for label, db, cap_key in (
+                ("NetPath", service.db, "max_trace_db_mb"),
+                ("NetFlow", service.flow_db, "max_flow_db_mb"),
+                ("Syslog", service.syslog_db, "max_syslog_db_mb"),
+                ("Traps", service.snmp_db, "max_snmp_db_mb"),
+                ("IPAM", service.ipam_db, "max_ipam_db_mb"),
+                ("Nodes", service.nodes_db, "max_nodes_db_mb"),
+                ("Alerts", service.alerts_db, "max_alerts_db_mb"),
+                ("Wireless", service.wireless_db, None),
+                ("ConfigRX", service.configrx_db, None),
+                ("Application", service.app_db, None)):
+            try:
+                used = int(db.size_bytes())
+            except Exception:                                 # noqa: BLE001
+                continue
+            cap_mb = settings.get(cap_key) if cap_key else None
+            cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
+            stores.append({
+                "label": label, "bytes": used, "cap_bytes": cap,
+                "used_fraction": (used / cap) if cap else None,
+            })
+        stores.sort(key=lambda s: (s["used_fraction"] is None,
+                                   -(s["used_fraction"] or 0)))
+        result["storage"] = stores
+
+    return {"dashboard": result}
+
+
+def get_dashboard_offenders(service, params, body) -> dict:
+    """Six short "worst ten" lists, each row linking to its device.
+
+    One query per list rather than one per device: `count_events_by_device`
+    and `top_metric` exist for exactly this.
+    """
+    if not _dash_can(service, params, "nodes"):
+        raise PermissionError("Reading devices is not permitted")
+
+    window_s = _num(params, "window_s", 86400.0) or 86400.0
+    since = time.time() - float(window_s)
+    n = int(_num(params, "n", DASHBOARD_OFFENDER_N, int) or DASHBOARD_OFFENDER_N)
+    n = max(1, min(n, 50))
+
+    def _rows(rows, value_key, unit):
+        out = []
+        for row in rows[:n]:
+            out.append({"device_id": row["device_id"],
+                        "name": row["name"] or row["ip"],
+                        "ip": row["ip"],
+                        "value": row[value_key],
+                        "unit": unit})
+        return out
+
+    lists = []
+    events = service.nodes_db.count_events_by_device(since)
+    lists.append({"key": "events", "title": "Most device events (24 h)",
+                  "unit": "", "rows": _rows(events, "n", "")})
+
+    # Interface flaps are device events too, and they are the ones an
+    # operator chases; kept as their own list rather than folded into the
+    # count above, which would hide a flapping port behind a noisy device.
+    flaps = service.nodes_db.count_events_by_device(
+        since, kinds=["interface_down", "interface_up", "interface_flapping"])
+    lists.append({"key": "interface_events", "title": "Most interface events (24 h)",
+                  "unit": "", "rows": _rows(flaps, "n", "")})
+
+    if _dash_can(service, params, "alerts"):
+        counts: dict[str, dict] = {}
+        for row in service.alerts_db.alerts(t0=since, limit=ALERT_TOTAL_CAP):
+            if row["entity_kind"] != "device":
+                continue
+            key = str(row["entity_id"])
+            entry = counts.setdefault(
+                key, {"device_id": _int_or_none(row["entity_id"]),
+                      "name": row["entity_label"] or key, "ip": "",
+                      "value": 0, "unit": ""})
+            entry["value"] += 1
+        ranked = sorted(counts.values(), key=lambda e: -e["value"])[:n]
+        lists.append({"key": "alerts", "title": "Most alerts (24 h)",
+                      "unit": "", "rows": ranked})
+
+    for key, metric, title, unit, ascending in DASHBOARD_METRICS:
+        rows = service.nodes_db.top_metric(metric, n, ascending=ascending)
+        lists.append({"key": key, "title": title, "unit": unit,
+                      "rows": _rows(rows, "last_value", unit)})
+
+    return {"window_s": window_s, "lists": lists}
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

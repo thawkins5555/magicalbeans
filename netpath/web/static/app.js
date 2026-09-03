@@ -1572,6 +1572,14 @@ const App = (() => {
   const STATE_MS = 2000;
 
   function rateFor(page) {
+    // dashboard_refresh_s does not exist on the server yet (adding a
+    // default belongs to the settings module, which another workstream
+    // owns), so an absent value falls back to 5 s here rather than to the
+    // generic 2 s: the tiles are a wall-display view, not an instrument.
+    if (page === 'dashboard') {
+      const wanted = Number(state.settings.dashboard_refresh_s);
+      return Math.max(wanted > 0 ? wanted : 5, 1) * 1000;
+    }
     const key = { netpath: 'netpath_refresh_s', netflow: 'netflow_refresh_s',
                   snmp: 'snmp_refresh_s', nodes: 'nodes_refresh_s',
                   alerts: 'alerts_refresh_s', syslog: 'syslog_refresh_s',
