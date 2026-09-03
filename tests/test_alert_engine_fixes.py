@@ -112,3 +112,74 @@ offset = time.strftime("%z", time.localtime())
 assert stamp.endswith(offset) and len(offset) == 5, (stamp, offset)
 assert alertmail.clock_text(0) == ""
 ok(f"every email timestamp carries its UTC offset ({stamp})")
+
+
+# ==================================================================== A1
+print("\nA1 — cursors advance only after the batch is applied")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+# Three identical cold-start traps from three switches. Any occurrence would
+# do; a trap is the cheapest source to seed and needs no device row.
+engine._tick()                       # seeds every cursor, evaluates nothing
+for ip in ("10.1.0.1", "10.1.0.2", "10.1.0.3"):
+    seed_trap(snmp, ip, "1.3.6.1.6.3.1.1.5.1", "coldStart", severity=4,
+              kind="coldStart")
+
+trace = []
+real_apply = engine._apply
+real_set_cursor = alerts.set_cursor
+boom = {"n": 0}
+
+
+def apply_spy(rules, occurrence, settings):
+    boom["n"] += 1
+    trace.append(("apply", occurrence.entity_id))
+    if boom["n"] == 2:
+        raise RuntimeError("boom in _apply")
+    return real_apply(rules, occurrence, settings)
+
+
+def set_cursor_spy(source, value):
+    trace.append(("set_cursor", source, value))
+    return real_set_cursor(source, value)
+
+
+engine._apply = apply_spy
+alerts.set_cursor = set_cursor_spy
+engine._tick()
+engine._apply = real_apply
+alerts.set_cursor = real_set_cursor
+
+opened = [a for a in alerts.alerts(state="unresolved")
+          if a["entity_kind"] == "trap"]
+assert engine.counters["apply_errors"] == 1, engine.counters
+assert len(opened) == 2, [dict(a) for a in opened]
+ok("one poisoned occurrence is skipped; the other two still open alerts")
+
+assert alerts.cursor("traps") == snmp.max_id() == 3, \
+    (alerts.cursor("traps"), snmp.max_id())
+ok("the cursor still reaches max_id, so the batch is never re-read")
+
+applies = [i for i, e in enumerate(trace) if e[0] == "apply"]
+cursors = [i for i, e in enumerate(trace) if e[0] == "set_cursor"]
+assert applies and cursors, trace
+assert max(applies) < min(cursors), trace
+ok("every apply precedes the first set_cursor of the tick")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# A batch bigger than one read: the drain must page forward inside one tick
+# rather than leaving the rest for later ticks.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+for i in range(2500):
+    seed_trap(snmp, "10.2.0.9", "1.3.6.1.6.3.1.1.5.1", "coldStart",
+              severity=4, kind="coldStart")
+engine._tick()
+assert alerts.cursor("traps") == snmp.max_id() == 2500, \
+    (alerts.cursor("traps"), snmp.max_id())
+assert engine.counters["backlog"] == 0, engine.counters
+ok("2,500 rows behind the cursor are drained in one tick, backlog 0")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()

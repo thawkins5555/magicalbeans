@@ -13,6 +13,7 @@ cadence rather than Monitor's per-target scheduling.
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -34,6 +35,18 @@ TICK_S = 5.0
 # observation ends suppression well before this ever matters in practice —
 # this is a backstop, not the mechanism.
 OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
+
+# How much of a source backlog one tick will work through. A collector that
+# has been storing while the engine was stopped (or a syslog burst) can leave
+# hundreds of thousands of rows behind the cursor; draining all of them in one
+# tick would hold the tick thread for minutes and starve every other source.
+# The drains therefore page forward until one of these two budgets is spent,
+# and whatever is left is reported as counters["backlog"] so an operator can
+# see the engine is behind rather than guessing from a quiet Alerts page. The
+# cursor still only advances over rows that were actually applied, so nothing
+# is skipped — the next tick simply carries on from where this one stopped.
+DRAIN_ROW_BUDGET = 5000
+DRAIN_TIME_BUDGET_S = 2.0
 
 
 def _ago(ts: float) -> str:
@@ -89,9 +102,24 @@ class AlertEngine:
         self._operator_resolves: dict[str, float] = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
+        # source -> the id this tick's drain reached. Written to `meta` by
+        # _flush_cursors AFTER every occurrence has been applied, never
+        # before: a cursor that commits at drain time is a promise the batch
+        # was handled, and an exception in the apply loop used to break that
+        # promise silently and permanently. See _advance_cursor.
+        self._cursor_advances: dict[str, int] = {}
+        # Per-tick drain budget bookkeeping, reset at the top of _tick.
+        self._drain_rows = 0
+        self._drain_deadline = 0.0
+        # Whether a reader accepts a `limit` keyword, keyed by qualified
+        # name. Every shipped source does; the fallback exists so an engine
+        # built against an older database module still drains (unlimited
+        # fetch, sliced here) rather than raising on every tick.
+        self._limit_support: dict[str, bool] = {}
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
-                         "rolled_up": 0, "muted": 0}
+                         "rolled_up": 0, "muted": 0, "apply_errors": 0,
+                         "backlog": 0}
         self.error: str | None = None
         self._last_tick_ts: float = 0.0
 
@@ -153,6 +181,10 @@ class AlertEngine:
         # already resolved by hand.
         self._operator_resolves = self.db.operator_resolved_since(
             time.time() - OPERATOR_RESOLVE_WINDOW_S)
+        self._cursor_advances.clear()
+        self._drain_rows = 0
+        self._drain_deadline = time.monotonic() + DRAIN_TIME_BUDGET_S
+        self.counters["backlog"] = 0
         occurrences = []
         occurrences += self._drain_device_events(settings)
         occurrences += self._drain_interface_events(settings)
@@ -170,11 +202,110 @@ class AlertEngine:
         muted = self.db.muted_entity_ids("device")
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
-            if self._hold_for_new_device(occurrence, settings):
-                continue
-            if muted and self._muted(occurrence, muted):
-                continue
-            self._apply(rules, occurrence, settings)
+            # Per occurrence, not per tick. The apply path is not
+            # exception-free — template lookup, context building, rendering
+            # and the rollup queries all run against SQLite, and an
+            # OperationalError (locked, disk full) can surface from any of
+            # them. One raised here used to abort the whole batch, and
+            # because the cursors had already committed, the rest of that
+            # batch was gone for good. A poisoned occurrence is now counted,
+            # logged with its traceback, and skipped; its source's cursor
+            # still advances past it, so the engine makes progress rather
+            # than re-reading the same bad row every five seconds forever.
+            try:
+                if self._hold_for_new_device(occurrence, settings):
+                    continue
+                if muted and self._muted(occurrence, muted):
+                    continue
+                self._apply(rules, occurrence, settings)
+            except Exception:
+                self.counters["apply_errors"] += 1
+                self.log.add(ERROR,
+                             f"Alert occurrence for {occurrence.entity_label} "
+                             f"could not be applied",
+                             detail=traceback.format_exc())
+        # Only now, once every occurrence above has been applied (or
+        # deliberately skipped), does any source's cursor move.
+        self._flush_cursors()
+
+    # ------------------------------------------------------- drain plumbing
+
+    def _advance_cursor(self, source: str, value: int) -> None:
+        """Remember how far `source` was drained, without writing it yet.
+
+        Deferred rather than committed inside the drain because a cursor is
+        the engine's statement that everything up to that id has been turned
+        into alerts. Writing it before the apply loop made that statement
+        early, and an exception mid-loop then discarded the rest of the
+        batch permanently — the drain would never hand those rows back.
+        _flush_cursors writes these at the end of the tick instead.
+        """
+        if value > self._cursor_advances.get(source, 0):
+            self._cursor_advances[source] = value
+
+    def _flush_cursors(self) -> None:
+        for source, value in self._cursor_advances.items():
+            if value > self.db.cursor(source):
+                self.db.set_cursor(source, value)
+        self._cursor_advances.clear()
+
+    def _accepts_limit(self, fetch) -> bool:
+        """Whether a `*_since` reader takes a `limit` keyword.
+
+        Every shipped one does. Asked rather than assumed so that an engine
+        running against a database module that predates the keyword falls
+        back to an unlimited fetch and a Python slice instead of raising on
+        every tick — the drain budget is a nicety, draining at all is not.
+        """
+        name = getattr(fetch, "__qualname__", repr(fetch))
+        known = self._limit_support.get(name)
+        if known is None:
+            try:
+                known = "limit" in inspect.signature(fetch).parameters
+            except (TypeError, ValueError):
+                known = False
+            self._limit_support[name] = known
+        return known
+
+    def _read_forward(self, source: str, fetch, cursor: int, max_id_fn=None):
+        """Yield rows newer than `cursor`, oldest first, in id order.
+
+        Pages rather than issuing one fixed-size read: a source that fell
+        behind (the engine was stopped, or a syslog burst outran the tick)
+        used to catch up at one batch per tick, which at 500 rows a batch and
+        12 ticks a minute is slower than the burst that caused it. This keeps
+        asking for the next batch until the source is caught up or the
+        per-tick budget is spent, and reports whatever is left as `backlog`
+        so being behind is visible instead of merely quiet.
+        """
+        paged = self._accepts_limit(fetch)
+        batch = 2000 if paged else DRAIN_ROW_BUDGET
+        at = cursor
+        caught_up = False
+        while True:
+            if paged:
+                rows = fetch(at, limit=batch)
+            else:
+                rows = list(fetch(at))[:batch]
+            if not rows:
+                caught_up = True
+                break
+            for row in rows:
+                yield row
+                if row["id"] > at:
+                    at = row["id"]
+            self._drain_rows += len(rows)
+            if len(rows) < batch:
+                caught_up = True
+                break
+            if (self._drain_rows >= DRAIN_ROW_BUDGET
+                    or time.monotonic() >= self._drain_deadline):
+                break
+        if not caught_up and max_id_fn is not None:
+            try:
+                self.counters["backlog"] += max(0, int(max_id_fn()) - int(at))
+            except Exception:
+                pass
 
     def _muted(self, occurrence: Occurrence, muted: dict) -> bool:
         """True when this occurrence is about a device an operator silenced.
@@ -381,9 +512,10 @@ class AlertEngine:
             return []
         cursor = self.db.cursor("device_events")
         occurrences = []
-        rows = self.nodes_db.device_events_since(cursor)
         max_id = cursor
-        for row in rows:
+        for row in self._read_forward("device_events",
+                                      self.nodes_db.device_events_since, cursor,
+                                      self.nodes_db.max_device_event_id):
             max_id = max(max_id, row["id"])
             device = self.nodes_db.device(row["device_id"])
             if device is None:
@@ -416,7 +548,7 @@ class AlertEngine:
                 self.counters["resolved"] += 1
                 self._notify_clear(resolved, cleared_rule, settings, extra=extra)
         if max_id > cursor:
-            self.db.set_cursor("device_events", max_id)
+            self._advance_cursor("device_events", max_id)
         return occurrences
 
     def _drain_interface_events(self, settings) -> list[Occurrence]:
@@ -424,11 +556,12 @@ class AlertEngine:
             self.db.set_cursor("interface_events", self.nodes_db.max_interface_event_id())
             return []
         cursor = self.db.cursor("interface_events")
-        rows = self.nodes_db.interface_events_since(cursor)
         occurrences = []
         max_id = cursor
         touched_interfaces: set[int] = set()
-        for row in rows:
+        for row in self._read_forward("interface_events",
+                                      self.nodes_db.interface_events_since, cursor,
+                                      self.nodes_db.max_interface_event_id):
             max_id = max(max_id, row["id"])
             touched_interfaces.add(row["interface_id"])
             interface = self.nodes_db.interface_by_id(row["interface_id"])
@@ -488,7 +621,7 @@ class AlertEngine:
                 ts=time.time(), message=f"{label} is flapping",
                 device_name=device["name"] or "", device_ip=device["ip"]))
         if max_id > cursor:
-            self.db.set_cursor("interface_events", max_id)
+            self._advance_cursor("interface_events", max_id)
         return occurrences
 
     def _drain_traps(self, settings) -> list[Occurrence]:
@@ -496,10 +629,10 @@ class AlertEngine:
             self.db.set_cursor("traps", self.snmp_db.max_id())
             return []
         cursor = self.db.cursor("traps")
-        rows = self.snmp_db.traps_since(cursor)
         occurrences = []
         max_id = cursor
-        for row in rows:
+        for row in self._read_forward("traps", self.snmp_db.traps_since,
+                                      cursor, self.snmp_db.max_id):
             max_id = max(max_id, row["id"])
             occurrences.append(Occurrence(
                 kind="trap", source_kind=row["trap_kind"] or "", entity_kind="trap",
@@ -508,7 +641,7 @@ class AlertEngine:
                 extra={"trap_name": row["trap_name"] or "", "trap_oid": row["trap_oid"] or "",
                       "varbinds": row["varbind_text"] or ""}))
         if max_id > cursor:
-            self.db.set_cursor("traps", max_id)
+            self._advance_cursor("traps", max_id)
         return occurrences
 
     def _drain_syslog(self, settings) -> list[Occurrence]:
@@ -517,10 +650,10 @@ class AlertEngine:
             return []
         cursor = self.db.cursor("syslog")
         min_severity = int(settings.get("min_severity", 7))
-        rows = self.syslog_db.rows_since(cursor)
         occurrences = []
         max_id = cursor
-        for row in rows:
+        for row in self._read_forward("syslog", self.syslog_db.rows_since,
+                                      cursor, self.syslog_db.max_id):
             max_id = max(max_id, row["id"])
             if row["severity"] > min_severity:
                 continue
@@ -538,7 +671,7 @@ class AlertEngine:
                 ts=row["ts"], message=row["message"] or "", device_ip=row["source"],
                 severity=row["severity"]))
         if max_id > cursor:
-            self.db.set_cursor("syslog", max_id)
+            self._advance_cursor("syslog", max_id)
         return occurrences
 
     def _drain_ipam_conflicts(self, settings) -> list[Occurrence]:
@@ -563,7 +696,7 @@ class AlertEngine:
                         f"{row['mac_a']} and {row['mac_b']}",
                 device_ip=row["ip"]))
         if max_id > cursor:
-            self.db.set_cursor("ipam_conflicts", max_id)
+            self._advance_cursor("ipam_conflicts", max_id)
         return occurrences
 
     def _drain_ap_events(self, settings) -> list[Occurrence]:
@@ -578,7 +711,9 @@ class AlertEngine:
             self.db.set_cursor("ap_events", self.wireless_db.max_ap_event_id())
             return []
         cursor = self.db.cursor("ap_events")
-        rows = self.wireless_db.ap_events_since(cursor)
+        rows = list(self._read_forward("ap_events",
+                                       self.wireless_db.ap_events_since, cursor,
+                                       self.wireless_db.max_ap_event_id))
         occurrences = []
         max_id = cursor
         # One controllers query per drain, not one per event row: a burst
@@ -609,7 +744,7 @@ class AlertEngine:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, cleared_rule, settings)
         if max_id > cursor:
-            self.db.set_cursor("ap_events", max_id)
+            self._advance_cursor("ap_events", max_id)
         return occurrences
 
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
