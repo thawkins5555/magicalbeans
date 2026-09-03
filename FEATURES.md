@@ -2028,10 +2028,16 @@ ConfigRX, SSH, Settings, Debug and — new in 4.39.0 — Admin, set from
 **Settings → Users** (itself gated on Admin write access). Write implies
 read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
-bar, and a write-gated control (add/edit/delete buttons, a module's
-Settings gear) is hidden within a tab the account can only read — both
-purely client-side conveniences, since the server enforces the identical
-check on every route regardless of what the browser shows. The Dashboard
+bar. A write-gated control within a tab the account *can* read — an
+add/edit/delete button, a module's Settings gear — is **disabled and says
+why**, in the control's tooltip and in one line under the bar it sits in.
+It is not hidden: a control that is silently absent reads as a feature the
+install does not have, which turned permission questions into support
+calls about missing features. Both are purely client-side conveniences,
+since the server enforces the identical check on every route regardless of
+what the browser shows. Because it is a disable rather than a hide, it is
+re-evaluated on every poll, so a grant given or taken away mid-session
+takes effect within a couple of seconds instead of waiting for a reload. The Dashboard
 tab is the one exception: it's always visible and simply omits whatever
 sections the signed-in account can't read, rather than being gated as a
 whole.

@@ -82,6 +82,87 @@ const App = (() => {
     return box;
   }
 
+  /* The module names as an operator would say them, for the sentence
+     below. A key missing here is a bug in the markup rather than a reason
+     to say nothing, so the raw key is the fallback. */
+  const MODULE_NAMES = {
+    nodes: 'Nodes', alerts: 'Alerts', netpath: 'NetPath', netflow: 'NetFlow',
+    snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'Wireless',
+    configrx: 'ConfigRX', settings: 'Settings', ssh: 'SSH',
+  };
+
+  function writeDeniedReason(module) {
+    if (module === 'admin') {
+      return 'Administrator access is needed to change this.';
+    }
+    const name = MODULE_NAMES[module] || module;
+    return `Your account can read ${name} but not change it.`;
+  }
+
+  /* Buttons, inputs, selects, textareas and <fieldset> all honour the
+     `disabled` attribute; a <div> or a <span> does not, so those are made
+     `inert` — out of the tab order, out of reach of a click, still on the
+     page and still readable, which is the whole point. */
+  const GATEABLE = new Set(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'FIELDSET']);
+
+  function applyWriteGate(el, allowed) {
+    const reason = writeDeniedReason(el.dataset.requiresWrite);
+    if (GATEABLE.has(el.tagName)) {
+      // Only ever touched when this function is the one that turned it off,
+      // so a button held down for an in-flight request is left alone.
+      if (!allowed) {
+        el.disabled = true;
+        el.dataset.writeDenied = '1';
+        if (!el.title) el.title = reason;
+      } else if (el.dataset.writeDenied) {
+        el.disabled = false;
+        delete el.dataset.writeDenied;
+        if (el.title === reason) el.removeAttribute('title');
+      }
+    } else if (!allowed) {
+      el.inert = true;
+      el.dataset.writeDenied = '1';
+    } else if (el.dataset.writeDenied) {
+      el.inert = false;
+      delete el.dataset.writeDenied;
+    }
+    el.classList.toggle('write-denied', !allowed);
+  }
+
+  /* One sentence per bar, not per button. Nine dead buttons in a row want
+     one line saying why, and the line goes at the end of the container they
+     are in so it reads as a note about that group. */
+  let deniedSignature = null;
+
+  function explainDeniedGroups(denied) {
+    // applyPermissions runs on every loadState, twice a minute at the
+    // slowest and every two seconds at the fastest. Rebuilding these notes
+    // each time would churn the DOM for nothing, so they are rebuilt only
+    // when the set of denied controls actually changes.
+    const signature = denied.map((el) => el.id || el.dataset.requiresWrite).join('|');
+    if (signature === deniedSignature) return;
+    deniedSignature = signature;
+    for (const stale of document.querySelectorAll('.write-denied-why')) {
+      stale.remove();
+    }
+    const groups = new Map();
+    for (const el of denied) {
+      const host = el.closest('.bar, .strip, .row, fieldset') || el.parentElement;
+      if (!host) continue;
+      if (!groups.has(host)) groups.set(host, el.dataset.requiresWrite);
+    }
+    for (const [host, module] of groups) {
+      const note = document.createElement('p');
+      note.className = 'hint write-denied-why';
+      note.textContent = writeDeniedReason(module);
+      // A bar is a flex row: the sentence goes UNDER it rather than
+      // becoming another item squeezed into it. A fieldset is a box, so
+      // the sentence belongs inside, with the fields it is about.
+      if (host.tagName === 'FIELDSET') host.appendChild(note);
+      else host.insertAdjacentElement('afterend', note);
+    }
+  }
+
   function applyPermissions() {
     // 'dashboard' is always shown — it aggregates whatever the user can
     // already read, rather than being its own gated module.
@@ -90,18 +171,35 @@ const App = (() => {
       if (module === 'dashboard') continue;
       tab.hidden = !canRead(module);
     }
-    // One-way on purpose: permission gating only ever HIDES. Writing
-    // hidden=false here made this function a second owner of .hidden for
-    // any element whose visibility also depends on app state (a bulk bar
-    // shown by selection, say), and every loadState() un-hid what feature
-    // code had hidden — the flicker bug. The page reloads on login, so
-    // there is nothing this would ever need to un-hide; a permission
-    // granted mid-session takes effect on the next reload, which is the
-    // safer direction to be lazy in. Feature code that dynamically shows
-    // a write-gated control must still check canWrite itself.
+    /* A control the account may not use is DISABLED and says why, rather
+       than being deleted from the page.
+
+       Hiding taught a read-only operator that their install simply does not
+       have the feature: Nodes with no Add device, no Settings and no way to
+       tell whether that was a permission or a build. Support calls came in
+       for features that were there all along. Worse, hiding was one-way —
+       it could never un-hide, because writing hidden=false made this
+       function a second owner of .hidden for every bar whose visibility
+       belongs to app state (a bulk bar shown by selection), and every
+       loadState() then un-hid what feature code had just hidden.
+
+       Disabling has neither problem. `disabled` on a control is owned by
+       this function alone; nothing else in the app enables a control it did
+       not itself disable for an in-flight request. It is re-applied on
+       every loadState(), so a permission that changes mid-session settles
+       within one poll in both directions instead of waiting for a reload.
+
+       The pattern is the one alerts.js already shipped for the mute button:
+       disabled, plus a title, plus one visible line under the bar — because
+       a disabled control with only a tooltip is unreadable on a touch
+       screen and invisible to anyone who does not think to hover it. */
+    const denied = [];
     for (const el of document.querySelectorAll('[data-requires-write]')) {
-      if (!canWrite(el.dataset.requiresWrite)) el.hidden = true;
+      const allowed = canWrite(el.dataset.requiresWrite);
+      applyWriteGate(el, allowed);
+      if (!allowed) denied.push(el);
     }
+    explainDeniedGroups(denied);
     // The open tab can stop being showable underneath the operator — access
     // revoked, or its module hidden after a failed init — so move off it
     // rather than leaving an empty page behind a still-highlighted tab.
@@ -369,6 +467,48 @@ const App = (() => {
     if (!live) return;
     if (live.textContent === message) live.textContent = '';
     live.textContent = message;
+  }
+
+  /* The visible half of announce().
+
+     announce() has been the whole of it: a screen reader heard that a bulk
+     acknowledge had affected eleven alerts, and a sighted operator heard
+     nothing at all. Everything else in the product said it by rewriting a
+     label in place — five hand-written `settle()` copies across nodes.js
+     and configrx.js — or by calling native alert(), which stops the world
+     for a sentence and cannot be styled, positioned or read by anything
+     that is not in front of the browser.
+
+     One region, bottom right, above the modal layer (z-index 20) because a
+     dialog's action is the commonest thing that has something to report.
+     `aria-hidden` on the region is deliberate and not an oversight: the
+     text has already gone through announce() into #live, and a second copy
+     in the accessibility tree would say everything twice.
+
+     `tone` is the meaning, matching App.statusMark: ok, warn, fail, info.
+     A failure stays up longer than a confirmation, because it is the one
+     the operator may need to read twice or copy into a ticket. */
+  const TOAST_MS = { fail: 12000, warn: 9000, ok: 5000, info: 6000 };
+
+  function toast(message, tone = 'info') {
+    announce(message);
+    let region = document.getElementById('toasts');
+    if (!region) {
+      region = document.createElement('div');
+      region.id = 'toasts';
+      region.className = 'toasts';
+      region.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(region);
+    }
+    const node = document.createElement('div');
+    node.className = `toast ${tone}`;
+    node.textContent = message;
+    // Clicking one dismisses it early; there is nothing else to do with it,
+    // so the whole surface is the dismiss target rather than a 12px x.
+    node.onclick = () => node.remove();
+    region.appendChild(node);
+    window.setTimeout(() => node.remove(), TOAST_MS[tone] || TOAST_MS.info);
+    return node;
   }
 
   /* --------------------------------------------------------- idle sign-out
@@ -757,6 +897,13 @@ const App = (() => {
      hide the first, it replaces its contents. */
   let modalGeneration = 0;
 
+  /* Whether the operator has typed into the open dialog. Set by the
+     dialog's own input/change listeners (see modal()) and read by
+     requestCloseModal, which is the only path that can throw an edit away
+     without the operator having asked for it. */
+  let modalDirty = false;
+
+
   function modalToken() {
     const box = document.getElementById('modal-box');
     return box ? box.dataset.modalGen : null;
@@ -811,6 +958,122 @@ const App = (() => {
     }
   }
 
+  /* ------------------------------------------------- what a dialog says
+     when its action fails
+
+     Every dialog carries one of these paragraphs under its form, and the
+     button wiring below fills it in, so a handler that simply lets its
+     Save throw gets the failure reported in the right place without
+     writing a line for it.
+
+     This is the half that was missing. `button.onclick = () =>
+     spec.onClick(box, button)` threw the returned promise away: twenty-nine
+     async primary handlers had no error path at all, and a Save the server
+     refused looked exactly like one that worked — the dialog closed, the
+     table redrew from the unchanged server state, and nothing anywhere said
+     no. `confirmDestructive` was the one place that got this right; it is
+     now the general case rather than the exception. */
+  function clearModalError(box) {
+    const node = box && box.querySelector('.modal-error');
+    if (node) { node.textContent = ''; node.hidden = true; }
+    if (!box) return;
+    for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
+      field.removeAttribute('aria-invalid');
+      field.classList.remove('invalid');
+    }
+  }
+
+  function showModalError(box, message) {
+    const node = box && box.querySelector('.modal-error');
+    if (!node) return false;
+    node.textContent = message;
+    node.hidden = false;
+    announce(message);
+    return true;
+  }
+
+  /* Server refusals arrive as an Error whose message is the server's own
+     sentence ("that address is already in use"); anything else is a bug or
+     a dropped connection and arrives as whatever it arrived as. Either way
+     the operator gets a sentence rather than nothing. */
+  function failureText(error) {
+    const raw = error && error.message ? String(error.message) : String(error || '');
+    return raw ? `Failed: ${raw}` : 'Failed, and the reason was not reported.';
+  }
+
+  function releaseModalButton(box, generation, button) {
+    if (!modalIsCurrent(generation) || !box.contains(button)) return;
+    button.disabled = false;
+  }
+
+  function reportActionFailure(box, generation, button, error) {
+    const message = failureText(error);
+    console.error('dialog action failed', error);
+    // Still the same dialog on screen: say it where the operator is
+    // looking, and give the button back so it can be tried again.
+    if (modalIsCurrent(generation) && showModalError(box, message)) {
+      if (box.contains(button)) button.disabled = false;
+      return;
+    }
+    // The handler closed the dialog, or opened another over it, before it
+    // failed. The failure still has to be said out loud somewhere.
+    toast(message, 'fail');
+  }
+
+  /* "A name is required", said once, in the place every dialog already
+     says what went wrong.
+
+     Six dialogs checked their required fields and, finding one empty,
+     simply `return`ed — the button did nothing, twice, and the operator was
+     left to guess which of twenty-five fields it meant. Two others called
+     native alert(), which says it in a box that cannot say WHICH field and
+     stops the browser to do it.
+
+     `fields` is [selector, label] pairs in form order. Returns true when
+     they are all filled in; when they are not, it names them, marks them
+     aria-invalid (the marks are cleared on the next press) and moves focus
+     to the first, so the caller reads `if (!App.requireFields(...)) return;`. */
+  function requireFields(box, fields) {
+    const missing = [];
+    let firstEmpty = null;
+    for (const [selector, label] of fields) {
+      const node = box.querySelector(selector);
+      if (!node || String(node.value || '').trim()) continue;
+      missing.push(label);
+      node.setAttribute('aria-invalid', 'true');
+      node.classList.add('invalid');
+      if (!firstEmpty) firstEmpty = node;
+    }
+    if (!missing.length) return true;
+    const names = missing.length === 1
+      ? missing[0]
+      : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
+    showModalError(box, missing.length === 1
+      ? `${names} is required.`
+      : `${names} are required.`);
+    if (firstEmpty) firstEmpty.focus();
+    return false;
+  }
+
+  function runModalAction(spec, box, button) {
+    const generation = box.dataset.modalGen;
+    clearModalError(box);
+    let result;
+    try {
+      result = spec.onClick(box, button);
+    } catch (error) {
+      reportActionFailure(box, generation, button, error);
+      return;
+    }
+    if (!result || typeof result.then !== 'function') return;
+    // A handler that talks to the server holds its own button down while it
+    // does, so a slow Save cannot be pressed twice.
+    button.disabled = true;
+    result.then(
+      () => releaseModalButton(box, generation, button),
+      (error) => reportActionFailure(box, generation, button, error));
+  }
+
   function modal(title, bodyHtml, buttons, options = {}) {
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
@@ -831,17 +1094,66 @@ const App = (() => {
       ? String(title.html) : escapeHtml(title);
     // Long forms put their buttons at the top, so Save is reachable without
     // scrolling past every field first.
+    /* The body and the buttons go inside a real <form>.
+
+       Enter did nothing in any of the fifty-odd dialogs in this product
+       before that: the box was an <h2>, some markup and a row of <button>s
+       with onclick handlers, and a form field with no form around it has
+       nowhere to submit to. The primary button below is the form's submit
+       button, which is what makes implicit submission work — a form with no
+       submit button only submits on Enter when it has exactly one field,
+       and every dialog here has more.
+
+       `novalidate` because the messages this app shows for a bad value are
+       its own (showModalError, and the inline field errors beside the
+       field), and the browser's native bubble would fight with them.
+
+       The button row carries its own class rather than being found as
+       '.row': three dialog bodies lay out checkboxes in a <div class="row">
+       of their own (netflow.js, snmp.js, syslog.js), and only the fact that
+       all three happen to pass {buttonsTop} keeps the buttons out of them
+       today. */
+    const errorHtml = '<p class="modal-error" hidden></p>';
+    const openForm = '<form class="modal-form" novalidate>';
     box.innerHTML = options.buttonsTop
-      ? `<h2 id="modal-title">${heading}</h2><div class="row top"></div>${bodyHtml}`
-      : `<h2 id="modal-title">${heading}</h2>${bodyHtml}<div class="row"></div>`;
-    const row = box.querySelector('.row');
+      ? `<h2 id="modal-title">${heading}</h2>${openForm}` +
+        `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`
+      : `<h2 id="modal-title">${heading}</h2>${openForm}` +
+        `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`;
+    const form = box.querySelector('form.modal-form');
+    const row = box.querySelector('.modal-buttons');
     for (const spec of buttons) {
       const button = document.createElement('button');
       button.textContent = spec.label;
+      // Only the primary submits; everything else is type=button so a
+      // Cancel or a Copy can never submit the form by accident.
+      button.type = spec.primary ? 'submit' : 'button';
       if (spec.primary) button.className = 'primary';
-      button.onclick = () => spec.onClick(box, button);
+      button.onclick = () => {
+        // A click on the submit button raises submit, which runs the
+        // handler there. Running it here as well would run it twice.
+        if (button.type !== 'submit') runModalAction(spec, box, button);
+      };
       row.appendChild(button);
     }
+    const primarySpec = buttons.find((spec) => spec.primary);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const button = row.querySelector('button.primary');
+      if (primarySpec && button && !button.disabled) {
+        runModalAction(primarySpec, box, button);
+      }
+    });
+    /* Dirtiness is recorded from the operator's own keystrokes rather than
+       by comparing the fields against a snapshot: several dialogs redraw
+       their own contents from a poll while they are open, and a snapshot
+       would call that redraw an unsaved edit and start asking to discard
+       changes nobody made. A programmatic value change fires no `input`
+       event, so this counts only what was actually typed or picked. */
+    modalDirty = false;
+    const markDirty = () => { modalDirty = true; };
+    form.addEventListener('input', markDirty);
+    form.addEventListener('change', markDirty);
     // The semantics the help panel already had ten lines away: a dialog,
     // modal, named by its own heading.
     box.setAttribute('role', 'dialog');
@@ -866,6 +1178,7 @@ const App = (() => {
     const wrap = document.getElementById('modal');
     const wasOpen = wrap && !wrap.hidden;
     if (wrap) wrap.hidden = true;
+    modalDirty = false;
     setBackgroundInert(false);
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
@@ -877,6 +1190,56 @@ const App = (() => {
     }
     modalTrigger = null;
   };
+
+  /* Escape and a click on the backdrop come here rather than going straight
+     to closeModal.
+
+     Both used to discard a half-filled twenty-five-field Add device dialog
+     without a word — Escape is a reflex, and the backdrop is most of the
+     screen, so this was not a rare accident. A Cancel button still means
+     cancel and still goes straight to closeModal: the operator who presses
+     it has said what they want.
+
+     The question is asked inside the dialog rather than in a second dialog
+     over it, because there is exactly one #modal-box in this product and
+     opening a confirmation in it would destroy the very edits it is asking
+     about. Keep editing is the emphasised answer, and it is the one Escape
+     repeats: nothing here can throw work away by reflex. */
+  function requestCloseModal() {
+    if (state.modalLocked) return;
+    const wrap = document.getElementById('modal');
+    if (!wrap || wrap.hidden) return;
+    if (!modalDirty) { closeModal(); return; }
+    const box = document.getElementById('modal-box');
+    if (!box) { closeModal(); return; }
+    const open = box.querySelector('.discard-prompt');
+    if (open) {                       // already asking; Escape re-asks nothing
+      const keep = open.querySelector('.discard-keep');
+      if (keep) keep.focus();
+      return;
+    }
+    const prompt = document.createElement('div');
+    prompt.className = 'discard-prompt';
+    prompt.innerHTML =
+      '<p>This dialog has changes that have not been saved.</p>' +
+      '<div class="row">' +
+      '<button type="button" class="discard-go">Discard them</button>' +
+      '<button type="button" class="primary discard-keep">Keep editing</button>' +
+      '</div>';
+    box.appendChild(prompt);
+    prompt.querySelector('.discard-go').onclick = () => {
+      modalDirty = false;
+      closeModal();
+    };
+    prompt.querySelector('.discard-keep').onclick = () => {
+      prompt.remove();
+      const first = box.querySelector('.modal-form input, .modal-form select,'
+        + ' .modal-form textarea');
+      if (first) first.focus();
+    };
+    prompt.querySelector('.discard-keep').focus();
+    announce('This dialog has changes that have not been saved.');
+  }
 
   /* ------------------------------------------------------------ help
      A "?" beside a setting opens a short explanation of what it controls.
@@ -961,24 +1324,17 @@ const App = (() => {
       closeModal();
       if (afterClose) afterClose(confirmed);
     };
-    return modal(title, `${bodyHtml}<p id="confirm-error" hidden></p>`, [
+    return modal(title, bodyHtml, [
       { label: 'Cancel', onClick: () => done(false) },
-      { label: confirmLabel, primary: true, onClick: async (box, button) => {
-        const failed = box.querySelector('#confirm-error');
-        failed.hidden = true;
-        button.disabled = true;          // a slow delete must not run twice
-        try {
-          await onConfirm();
-        } catch (error) {
-          // A refused or failed delete leaves the dialog open saying why.
-          // Closing it regardless would report success for something that
-          // did not happen — the one outcome a confirmation must never do.
-          failed.textContent = `Failed: ${error.message}`;
-          failed.style.color = 'var(--fail)';
-          failed.hidden = false;
-          button.disabled = false;
-          return;
-        }
+      { label: confirmLabel, primary: true, onClick: async () => {
+        // No try/catch and no button juggling here any more: this dialog
+        // used to be the only one in the product that held its button down
+        // while the request ran and stayed open saying why when the request
+        // was refused, and modal() now does both for every dialog. The
+        // rule it exists to keep is unchanged — done() runs only after the
+        // await resolves, so a delete that did not happen is never
+        // reported as one that did.
+        await onConfirm();
         done(true);
       } },
     ]);
@@ -2317,7 +2673,7 @@ const App = (() => {
     const accountBtn = document.getElementById('account-btn');
     if (accountBtn) accountBtn.onclick = accountModal;
     document.getElementById('modal').onclick = (event) => {
-      if (event.target.id === 'modal') closeModal();
+      if (event.target.id === 'modal') requestCloseModal();
     };
     document.addEventListener('keydown', trapTab);
 
@@ -2359,7 +2715,7 @@ const App = (() => {
       // the operator was reading the help for.
       if (event.key !== 'Escape') return;
       if (helpOpen()) closeHelp();
-      else closeModal();
+      else requestCloseModal();
     });
     document.addEventListener('click', (event) => {
       const link = event.target.closest && event.target.closest('.help-link');
@@ -2460,7 +2816,8 @@ const App = (() => {
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,
-    closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    closeModal, requestCloseModal, confirmDestructive, el, svgNode,
+    tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,

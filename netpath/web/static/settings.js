@@ -420,22 +420,19 @@
   }
 
   function confirmRemove(username) {
-    App.modal('Remove user',
+    // A refusal — the last administrator, an account that has gone since
+    // the page was drawn — used to close the dialog and leave the reason on
+    // the page behind it. It now stays where it was asked.
+    App.confirmDestructive('Remove user',
       `<p>Remove <b>${escape(username)}</b>? Any session they have open ends ` +
-      'immediately.</p>', [
-        { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove', primary: true, onClick: async () => {
-          try {
-            await App.del('/api/users', { username });
-            App.closeModal();
-            await loadUsers();
-            usersStatus(`Removed ${username}`, 'var(--muted)');
-          } catch (error) {
-            App.closeModal();
-            usersStatus(error.message, 'var(--fail)');
-          }
-        } },
-      ]);
+      'immediately.</p>',
+      'Remove',
+      () => App.del('/api/users', { username }),
+      async (confirmed) => {
+        if (!confirmed) return;
+        await loadUsers();
+        usersStatus(`Removed ${username}`, 'var(--muted)');
+      });
   }
 
   function usersStatus(message, colour) {

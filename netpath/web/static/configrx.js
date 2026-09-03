@@ -250,7 +250,9 @@
         const vendor = m.querySelector('#cx-bulk-vendor').value.trim();
         const port = m.querySelector('#cx-bulk-port').value.trim();
         if (password && !username) {
-          alert('A username is required with a password.');
+          App.showModalError(m, 'A username is required with a password: the pair'
+            + ' is what gets encrypted, and half of one would lock the batch out.');
+          m.querySelector('#cx-bulk-username').focus();
           return;
         }
         const fields = { device_ids: ids };
@@ -287,7 +289,12 @@
     const settle = (text) => {
       button.disabled = false;
       button.textContent = text;
+      // The label IS the result — 'Queued for 12 devices', 'Failed' —
+      // and a label rewritten in place is a silent DOM mutation to a
+      // screen reader, so the result is said once as well. Inside the
+      // branch, because the resting label is not a result.
       if (text !== 'Back up selected') {
+        App.announce(text);
         setTimeout(() => {
           if (button.textContent === text) button.textContent = 'Back up selected';
         }, 4000);
@@ -303,7 +310,7 @@
       // The worker being stopped is one fact about the server, and the API
       // says it once for the whole request rather than per device.
       settle('Failed');
-      alert(error.message);
+      App.toast(`Could not queue the backup: ${error.message}`, 'fail');
       return;
     }
     const queued = (result.queued || []).length;
@@ -768,7 +775,12 @@
       const settle = (text) => {
         button.disabled = false;
         button.textContent = text;
+        // The label IS the result — 'Queued for 12 devices', 'Failed' —
+        // and a label rewritten in place is a silent DOM mutation to a
+        // screen reader, so the result is said once as well. Inside the
+        // branch, because the resting label is not a result.
         if (text !== 'Back up now') {
+          App.announce(text);
           setTimeout(() => {
             if (button.textContent === text) button.textContent = 'Back up now';
           }, 3000);

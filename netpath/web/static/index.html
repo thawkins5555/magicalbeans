@@ -100,14 +100,17 @@
     <div class="bar wrap" id="nd-mac-note" hidden></div>
     <div class="bar wrap" id="nd-bulk-bar" hidden>
       <span id="nd-bulk-count" class="hint"></span>
-      <button id="nd-bulk-poll">Poll now</button>
-      <!-- data-requires-write on the button itself, never on the bar: the
-           bar's visibility is owned by the selection. -->
+      <!-- data-requires-write on the buttons themselves, never on the bar:
+           the bar's visibility is owned by the selection. Every one of these
+           writes, and only Re-identify said so — a read-only account could
+           press Delete on forty devices and get a 403 with nothing to
+           explain it. -->
+      <button id="nd-bulk-poll" data-requires-write="nodes">Poll now</button>
       <button id="nd-bulk-identify" data-requires-write="nodes">Re-identify</button>
-      <button id="nd-bulk-profile">Set profile</button>
-      <button id="nd-bulk-group">Set group</button>
-      <button id="nd-bulk-ungroup">Remove from group</button>
-      <button id="nd-bulk-delete">Delete</button>
+      <button id="nd-bulk-profile" data-requires-write="nodes">Set profile</button>
+      <button id="nd-bulk-group" data-requires-write="nodes">Set group</button>
+      <button id="nd-bulk-ungroup" data-requires-write="nodes">Remove from group</button>
+      <button id="nd-bulk-delete" data-requires-write="nodes">Delete</button>
       <span class="grow"></span>
       <button id="nd-bulk-clear">Clear selection</button>
     </div>
@@ -122,7 +125,7 @@
           <div class="bar">
             <span id="nd-d-name" class="section"></span>
             <span class="grow"></span>
-            <button id="nd-poll-now">Poll now</button>
+            <button id="nd-poll-now" data-requires-write="nodes">Poll now</button>
             <button id="nd-browse-oids">Browse OIDs</button>
             <button id="nd-edit-device" data-requires-write="nodes">Edit</button>
             <!-- Opens the SSH window (ssh.html) on its own permission
@@ -169,7 +172,7 @@
       <label>Target <input id="disc-target" size="22" placeholder="10.20.3.0/24 or 10.20.3.7"></label>
       <label>Profile <select id="disc-group"></select></label>
       <label class="check"><input type="checkbox" id="disc-pingonly"> Also offer ping-only devices (no SNMP)</label>
-      <button id="disc-start" class="primary">Start</button>
+      <button id="disc-start" data-requires-write="nodes" class="primary">Start</button>
       <span id="disc-status" class="hint"></span>
     </div>
     <div class="cols" data-splitter="nodes-discovery">
@@ -179,7 +182,7 @@
       <div class="divider"></div>
       <div class="pane pad-x pad-b" data-grow="2">
         <div class="bar"><span class="section">RESULTS</span><span class="grow"></span>
-          <button id="disc-promote" class="primary">Promote selected</button></div>
+          <button id="disc-promote" data-requires-write="nodes" class="primary">Promote selected</button></div>
         <div class="table-wrap"><table id="disc-results-table"></table></div>
       </div>
     </div>
@@ -190,10 +193,10 @@
       <div class="pane pad-x pad-b" data-grow="1">
         <div class="bar"><span class="section">POLLING PROFILES</span>
           <span class="grow"></span>
-          <button id="nd-default-profile">Set default</button>
-          <button id="nd-edit-profile">Edit</button>
-          <button id="nd-remove-profile">Remove</button>
-          <button id="nd-add-profile" class="primary">Add</button></div>
+          <button id="nd-default-profile" data-requires-write="nodes">Set default</button>
+          <button id="nd-edit-profile" data-requires-write="nodes">Edit</button>
+          <button id="nd-remove-profile" data-requires-write="nodes">Remove</button>
+          <button id="nd-add-profile" data-requires-write="nodes" class="primary">Add</button></div>
         <div class="table-wrap"><table id="nd-profiles-table"></table></div>
         <p class="hint" id="nd-profile-status"></p>
       </div>
@@ -202,8 +205,8 @@
         <div class="bar"><span class="section">VENDOR MIBS</span>
           <span class="grow"></span>
           <button id="nd-mib-catalog">MIB catalog</button>
-          <button id="nd-resolve-all">Resolve all</button>
-          <button id="nd-upload-mib" class="primary">Upload MIB</button></div>
+          <button id="nd-resolve-all" data-requires-write="nodes">Resolve all</button>
+          <button id="nd-upload-mib" data-requires-write="nodes" class="primary">Upload MIB</button></div>
         <div class="table-wrap"><table id="nd-mibs-table"></table></div>
       </div>
     </div>
@@ -269,16 +272,16 @@
     <div class="cols" data-splitter="alerts-rules">
       <div class="pane pad-x pad-b" data-grow="3">
         <div class="bar"><span class="section">RULES</span><span class="grow"></span>
-          <button id="alerts-edit-rule">Edit</button>
-          <button id="alerts-remove-rule">Remove</button>
-          <button id="alerts-add-rule" class="primary">Add rule</button></div>
+          <button id="alerts-edit-rule" data-requires-write="alerts">Edit</button>
+          <button id="alerts-remove-rule" data-requires-write="alerts">Remove</button>
+          <button id="alerts-add-rule" data-requires-write="alerts" class="primary">Add rule</button></div>
         <div class="table-wrap"><table id="alerts-rules-table"></table></div>
       </div>
       <div class="divider"></div>
       <aside class="pane pad-x pad-b" data-grow="2">
         <div class="bar"><span class="section">EMAIL TEMPLATES</span><span class="grow"></span>
-          <button id="alerts-edit-template">Edit</button>
-          <button id="alerts-add-template" class="primary">Add</button></div>
+          <button id="alerts-edit-template" data-requires-write="alerts">Edit</button>
+          <button id="alerts-add-template" data-requires-write="alerts" class="primary">Add</button></div>
         <div class="table-wrap"><table id="alerts-templates-table"></table></div>
         <p class="hint">A built-in template can be edited freely and reset to
           its shipped text, but not deleted — a rule that references it
@@ -295,11 +298,11 @@
     <h2>Destinations</h2>
     <ul id="target-list" class="target-list"></ul>
     <div class="row">
-      <button id="target-add" class="primary">Add</button>
-      <button id="target-edit">Edit</button>
-      <button id="target-remove">Remove</button>
+      <button id="target-add" class="primary" data-requires-write="netpath">Add</button>
+      <button id="target-edit" data-requires-write="netpath">Edit</button>
+      <button id="target-remove" data-requires-write="netpath">Remove</button>
     </div>
-    <button id="target-trace">Trace now</button>
+    <button id="target-trace" data-requires-write="netpath">Trace now</button>
     <div class="card">
       <h3>Window summary</h3>
       <div class="stat" id="stat-healthy">Healthy   —</div>
@@ -571,9 +574,9 @@
       <div class="bar">
         <span class="section">SUBNETS</span>
         <span class="grow"></span>
-        <button id="ipam-scan-now">Scan now</button>
-        <button id="ipam-edit-subnet">Edit</button>
-        <button id="ipam-add-subnet" class="primary">Add</button>
+        <button id="ipam-scan-now" data-requires-write="ipam">Scan now</button>
+        <button id="ipam-edit-subnet" data-requires-write="ipam">Edit</button>
+        <button id="ipam-add-subnet" class="primary" data-requires-write="ipam">Add</button>
       </div>
       <div class="table-wrap"><table id="ipam-subnet-table"></table></div>
       <p class="hint pad-x" style="padding-top:8px">
@@ -625,9 +628,9 @@
       <select id="ipam-dhcp-server-select" aria-label="DHCP server"></select>
       <span id="ipam-dhcp-server-status" class="hint"></span>
       <span class="grow"></span>
-      <button id="ipam-poll-now">Poll now</button>
-      <button id="ipam-edit-dhcp">Edit</button>
-      <button id="ipam-add-dhcp" class="primary">Add</button>
+      <button id="ipam-poll-now" data-requires-write="ipam">Poll now</button>
+      <button id="ipam-edit-dhcp" data-requires-write="ipam">Edit</button>
+      <button id="ipam-add-dhcp" class="primary" data-requires-write="ipam">Add</button>
     </div>
     <p class="hint pad-x">Read-only: scopes and leases only, never a write. Authenticates as
       whichever Windows account runs SappiWhere, or a matching Windows Credential Manager entry
@@ -706,8 +709,8 @@
            canWrite itself (applyPermissions only ever hides, and a
            one-shot hide can't gate a control that feature code shows
            later). -->
-      <button id="wl-oos" hidden>Mark out of service</button>
-      <button id="wl-remove-ap" hidden>Remove</button>
+      <button id="wl-oos" data-requires-write="wireless" hidden>Mark out of service</button>
+      <button id="wl-remove-ap" data-requires-write="wireless" hidden>Remove</button>
     </header>
     <pre id="wl-detail" class="detail">Select an AP to see its per-radio detail.</pre>
    </div>
@@ -936,7 +939,7 @@
         <input id="new-password" type="password" placeholder="initial password" size="22">
       </div>
       <div id="new-user-grid"></div>
-      <div class="row"><button id="add-user">Add user</button></div>
+      <div class="row"><button id="add-user" data-requires-write="admin">Add user</button></div>
       <p class="hint" id="users-status">A new user must change the initial password when they
         first sign in, and starts with whatever access is set above — write implies read, and
         nothing checked means no access to that module at all.</p>
@@ -992,7 +995,7 @@
   <div class="bar footer">
     <span id="set-status" class="hint"></span>
     <span class="grow"></span>
-    <button id="set-revert">Revert</button>
+    <button id="set-revert" data-requires-write="settings">Revert</button>
     <button id="set-apply" class="primary" data-requires-write="settings">Apply changes</button>
   </div>
 </section>
@@ -1002,6 +1005,10 @@
      several would compete, and a screen reader would read whichever
      changed last rather than what just happened. -->
 <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+<!-- The visible half of the line above. App.toast writes here; the same
+     text has already gone through App.announce into #live, so this copy is
+     hidden from assistive technology rather than being read out twice. -->
+<div id="toasts" class="toasts" aria-hidden="true"></div>
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 

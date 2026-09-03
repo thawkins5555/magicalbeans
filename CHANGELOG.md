@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.41.0 — A dialog that says no](#4410--a-dialog-that-says-no)
 - [4.40.0 — The update button works again](#4400--the-update-button-works-again)
 - [4.39.0](#4390)
 - [4.37.1 — Review of 4.37.0](#4371--review-of-4370)
@@ -103,6 +104,74 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.41.0 — A dialog that says no
+
+Every dialog in this product had the same hole in it: the button ran your
+handler and threw away the promise it returned. A Save the server refused
+looked exactly like one that worked — the dialog closed, the table redrew
+from the unchanged server state, and nothing anywhere said no. Twenty-nine
+async handlers had no error path at all. This release closes that, and the
+five other ways a dialog could lose an operator's work or their intent.
+
+- **A refused action is reported, everywhere, without a caller writing a
+  line for it.** `App.modal` now runs its buttons through one place that
+  holds the button down while the request is in flight, catches what the
+  handler throws, and renders it under the form the operator is looking at.
+  Where the handler had already closed the dialog before it failed, the
+  reason goes to a toast instead of nowhere. `confirmDestructive` was the
+  one dialog in the app that got this right; it is now the general case,
+  and it lost its own copy of the machinery in the process.
+- **A destructive confirmation waits for the answer before it claims one.**
+  Bulk delete closed the dialog and *then* awaited the request, so a refusal
+  reported the removal of up to forty devices that were all still there. All
+  seven hand-rolled confirmations — devices, profiles, alert rules, NetPath
+  destinations, users, wireless controllers and access points — are now
+  `confirmDestructive`, which closes only after the server has answered.
+- **Enter submits a dialog.** The body and buttons are wrapped in a real
+  `<form>` with the primary button as its submit button. Fifty-odd dialogs
+  had form fields with no form around them, so Enter did nothing in any of
+  them and one page re-implemented it by hand.
+- **Escape and the backdrop ask before discarding an edit.** Both used to
+  throw away a half-filled twenty-five-field Add device dialog without a
+  word. The question is asked inside the dialog, not in a second one over
+  it — there is a single `#modal-box`, and a confirmation opened in it would
+  destroy the edits it was asking about. Cancel still means cancel.
+  Dirtiness is recorded from the operator's own keystrokes, so a dialog that
+  redraws itself from a poll is not mistaken for one that was typed in.
+- **A required field that is empty says which one.** Six dialogs checked
+  their required fields and simply returned — the button did nothing, twice,
+  with no clue which of twenty-five fields was meant. Two others called
+  native `alert()`, which cannot name a field and stops the browser to say
+  so. `App.requireFields` names them, marks them, and moves focus to the
+  first. The last two `alert()` calls in the product are gone.
+- **Results are said out loud as well as shown.** `App.toast` is the visible
+  half of the live region 4.36.2 added, and every button that reports by
+  rewriting its own label — Poll now, Re-identify, Back up selected, Back up
+  now — announces its result as well. 4.36.2's entry claimed this had
+  already been done; it had not, and that entry now says so.
+- **A control your account may not use is disabled and says why, instead of
+  vanishing.** Hiding taught a read-only operator that their install did not
+  have the feature: Nodes with no Add device, no Settings, and no way to
+  tell a permission from a build. It also could never un-hide, so a
+  permission granted mid-session waited for a reload. Gating now disables,
+  carries the reason in the control's title, and puts one line under the bar
+  saying the same thing where a tooltip cannot be reached — the pattern
+  Alerts already shipped for its Mute button. It re-applies on every poll,
+  so a permission that changes settles in both directions.
+- **Eighteen write controls that were never gated at all now are.** NetPath
+  Add, Edit, Remove and Trace now; every IPAM Scan, Edit, Add and Poll now;
+  the Nodes bulk bar's Delete, Set profile, Set group, Remove from group and
+  Poll now; discovery Start and Promote; the profile and MIB buttons; the
+  alert rule and template buttons; the wireless AP actions; Add user; and
+  Settings' Revert. A read-only account could press Delete on forty devices
+  and get a 403 with nothing to explain it.
+- **A disabled button is readable, and a disabled primary looks disabled.**
+  Disabled labels were drawn in `--faint` at 2.5:1 — a button that says why
+  it is disabled has to be legible to be worth saying. And `button.primary`
+  was declared after `button:disabled` at equal specificity, so a disabled
+  primary kept its full accent fill: the most emphatic control on the bar
+  was also the one that did nothing.
 
 ### 4.40.0 — The update button works again
 
@@ -836,9 +905,13 @@ nine things are made to work.
   as "checkbox" with nothing to tell them apart, so choosing a row meant
   counting; each is now named after the device or alert it selects. The ten
   zoom and pan buttons that read as "−", "+", "‹" and "›" have names, as do
-  nine time-window and row-limit menus that had none. Anything that changes
-  a status line is also announced once, through a live region the next pass
-  will build its notifications on.
+  nine time-window and row-limit menus that had none. A live region was
+  added for the results that have no element of their own, and the bulk
+  alert actions announce through it. (This entry originally read "anything
+  that changes a status line is also announced", which was never true: the
+  region was built, one caller used it, and every other status line in the
+  product stayed silent to a screen reader. 4.41.0 is where that is made
+  good.)
 - **State is no longer carried by colour alone.** A green dot and a red dot
   are the same dot to a colour-blind operator, and the same grey in the
   screenshot somebody pastes into a ticket. Every status now has a shape as

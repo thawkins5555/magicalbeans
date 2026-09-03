@@ -3534,20 +3534,37 @@ storage hygiene, not a parser, so it never raises.
 manual name showed a stale/blank one here instead of its live SNMP
 hostname.
 
-**One owner per `.hidden`.** `applyPermissions()` in `app.js` originally
-wrote `el.hidden = !canWrite(...)` — bidirectionally — on every
+**Gating disables; it never hides.** `applyPermissions()` in `app.js`
+originally wrote `el.hidden = !canWrite(...)` — bidirectionally — on every
 `[data-requires-write]` element, so for an account *with* write access it
 un-hid the ConfigRX bulk bar on every `loadState()` while `drawBulkBar()`
 hid it again from the selection count: "Set SSH credential" flickered in
-and out with the page shifting under it. It now only ever *hides* (the
-page reloads on login, so there is nothing it needs to un-hide; a grant
-mid-session waits for the next reload). Two conventions still stand:
-`data-requires-write` goes on the buttons, not on a container something
-else shows and hides (a read-only account's one-shot hide would otherwise
-stick to a bar the selection should later show), and feature code that
-dynamically shows a write-gated control — the wireless AP action buttons —
-checks `canWrite` itself, since a hide applied once at load can't gate a
-later show.
+and out with the page shifting under it. The first fix made it one-way,
+hide-only, which stopped the flicker and created a worse problem: a
+read-only operator saw Nodes with no Add device, no Settings and no way to
+tell a missing permission from a missing feature, and a grant made
+mid-session waited for a reload because nothing could ever un-hide.
+
+4.41.0 changes the mechanism rather than its direction. `applyWriteGate()`
+sets `disabled` on a control (or `inert` on a `<div>`/`<span>`, which do
+not honour `disabled`), records `dataset.writeDenied` so it only ever
+re-enables what it itself disabled, and puts the reason in the control's
+`title`. `explainDeniedGroups()` then adds **one** `.write-denied-why` line
+per bar — not per button, or nine dead buttons would carry nine copies —
+because a disabled control with only a tooltip is unreadable on a touch
+screen and invisible to anyone who does not think to hover it. It is
+rebuilt only when the set of denied controls actually changes, since
+`applyPermissions` runs on every `loadState()`.
+
+`disabled` has no second owner the way `.hidden` did: nothing in the app
+enables a control it did not itself disable for an in-flight request, and
+a denied control cannot be pressed to start one. So the gate is applied on
+every poll and a permission that changes settles within one cycle in both
+directions. The convention about placement still stands — `data-requires-
+write` goes on the buttons, not on a container something else shows and
+hides — but the reason is now only tidiness rather than correctness: the
+wireless AP action buttons carry both `hidden` (owned by the selection)
+and the gate (owned by this), and the two no longer fight.
 
 **Bulk edit** (`post_configrx_devices_bulk_config`/
 `post_configrx_devices_bulk_credential`): the same `_bulk_device_ids(body)`
@@ -3755,14 +3772,55 @@ setting — has elapsed. One shared heartbeat rather than one
 against each other while still letting NetPath poll every 2 seconds and
 NetFlow's aggregations poll every 30.
 
-`App.modal()` is the one dialog primitive every page uses — it fills
-`#modal-box`'s `innerHTML` and appends a row of buttons, each wired to
-call the caller's `onClick(box, button)`. `App.state.modalLocked` (added
-for the update-restart dialog) makes the backdrop-click and Escape-key
-close handlers no-ops while set, so a restart in progress can't be
-dismissed by accident — every other modal in the app ignores the second
-`button` argument and the lock entirely, so this was additive rather than
-a rewrite.
+`App.modal()` is the one dialog primitive every page uses. It fills
+`#modal-box`'s `innerHTML` with a heading and a `<form class="modal-form">`
+holding the body, an empty `.modal-error` paragraph and a
+`.modal-buttons` row.
+
+Three things about that shape are load-bearing:
+
+* **It is a real form**, and the primary button is its `type="submit"`.
+  That is what makes Enter submit a dialog — a form with no submit button
+  only submits implicitly when it has exactly one field, and every dialog
+  here has more. Before this the whole product had two `<form>` elements,
+  both on pages that do not use `App.modal`, and Enter did nothing in any
+  of the fifty-odd dialogs. Non-primary buttons are `type="button"` so a
+  Cancel or a Copy can never submit by accident, and clicking the primary
+  raises `submit`, which is where the handler runs — running it from the
+  click as well would run it twice.
+* **The button row is found by `.modal-buttons`, not `.row`.** Three
+  dialog bodies (netflow.js, snmp.js, syslog.js) lay out checkboxes in a
+  `<div class="row">` of their own, and only the accident that all three
+  pass `{buttonsTop}` kept the buttons out of them.
+* **`runModalAction()` owns every press.** It clears the error slot, calls
+  the handler, and — this is the part that was missing — keeps the promise
+  the handler returns. It holds the button down while the request is in
+  flight, and on rejection renders the reason into `.modal-error` and
+  hands the button back. If the handler closed the dialog before it
+  failed, the reason goes to `App.toast` instead of nowhere. What it
+  replaced was `button.onclick = () => spec.onClick(box, button)`, which
+  discarded the promise: twenty-nine async handlers had no error path, and
+  a refused Save was indistinguishable from one that worked.
+
+`App.requireFields(box, [[selector, label], …])` is the empty-field half:
+it names the empty fields in `.modal-error`, marks them `aria-invalid`
+(cleared on the next press) and moves focus to the first. Six dialogs used
+to `return` silently instead, and two called native `alert()`.
+
+`App.state.modalLocked` (added for the update-restart dialog) makes the
+backdrop-click and Escape-key close handlers no-ops while set, so a
+restart in progress can't be dismissed by accident.
+
+`requestCloseModal()` is what Escape and the backdrop call. `closeModal()`
+still closes unconditionally and is what a Cancel button uses — an
+operator who presses Cancel has said what they want. `requestCloseModal`
+asks first when the dialog is dirty, and asks *inside* the dialog (a
+`.discard-prompt` appended to the box) rather than in a second dialog over
+it: there is one `#modal-box`, so a confirmation opened in it would
+destroy the very edits it is asking about. Dirtiness is tracked from the
+operator's own `input`/`change` events rather than by diffing a snapshot,
+because several dialogs redraw their contents from a poll while open and a
+snapshot would call that redraw an unsaved edit.
 
 `App.tooltip(content, event)` takes either a string — assigned with
 `textContent`, which is what every caller that has one still does — or an array
@@ -3777,15 +3835,24 @@ index through the sort — pairing row N with series N after sorting gives every
 line the wrong colour, which looks plausible and is wrong.
 
 `App.confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
-afterClose)` is the one confirmation shape, matching the eight
-hand-written confirms that already existed — Cancel first, the
-destructive verb as the primary button, a body naming the collateral
-damage. Because there is only one `#modal-box`, a confirm raised from
-inside another dialog *replaces* it; such callers pass `afterClose
-(confirmed)` to reopen their parent, and are told whether the action ran
-so they can reopen on cancel only rather than rebuilding from data the
-action just invalidated. The primary button disables itself for the
-duration so a slow delete cannot run twice.
+afterClose)` is the one confirmation shape — Cancel first, the destructive
+verb as the primary button, a body naming the collateral damage. Because
+there is only one `#modal-box`, a confirm raised from inside another
+dialog *replaces* it; such callers pass `afterClose(confirmed)` to reopen
+their parent, and are told whether the action ran so they can reopen on
+cancel only rather than rebuilding from data the action just invalidated.
+
+The rule it exists to keep is that `afterClose` runs only *after* the
+awaited `onConfirm` resolves. Seven dialogs hand-rolled their own
+Cancel/Remove pair on `App.modal` instead, and one of them —
+`bulkDeleteDevices` — closed the dialog and then awaited the request, so a
+refusal reported the removal of up to forty devices that were all still
+there. All seven are now `confirmDestructive`, and
+`tests/test_frontend_contracts.py` fails if an eighth appears.
+
+It no longer holds its own try/catch or button juggling: `runModalAction`
+above does both for every dialog, so this one stopped being the exception
+that got it right.
 
 `closeModal()` dispatches a `modal-closed` window event. Anything a
 dialog starts and must stop — a refresh interval, a poll of an install
@@ -4400,8 +4467,9 @@ raises the window it already has rather than starting a rival session;
 name rides in the query string because `displayName()`'s precedence is
 private to `nodes.js`; it only has to hold until the API answers. The
 button is `data-requires-write="ssh"` in the markup and `sshDevice()`
-re-checks `App.canWrite('ssh')` itself, since `applyPermissions` only ever
-hides. Single-device removal moved out of the pane header and into the Edit
+re-checks `App.canWrite('ssh')` itself — belt and braces now that
+`applyPermissions` disables rather than hides, and still worth keeping
+because the check is what stops a keyboard or scripted activation. Single-device removal moved out of the pane header and into the Edit
 dialog, beside Clear credential, on `App.confirmDestructive` — the body
 names the collateral (interfaces, metric history, events, and the ConfigRX
 settings, credential and stored backups that `delete_nodes_device` drops

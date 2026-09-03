@@ -314,16 +314,15 @@
   async function removeTarget() {
     const target = view.targets.find((t) => t.id === view.targetId);
     if (!target) return;
-    App.modal('Remove destination',
-      `<p>Remove <b>${escape(target.label)}</b> and all of its stored traces?</p>`, [
-        { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove', primary: true, onClick: async () => {
-          await App.del(`/api/netpath/targets/${target.id}`);
-          view.targetId = null;
-          App.closeModal();
-          await refresh();
-        } },
-      ]);
+    App.confirmDestructive('Remove destination',
+      `<p>Remove <b>${escape(target.label)}</b> and all of its stored traces?</p>`,
+      'Remove',
+      () => App.del(`/api/netpath/targets/${target.id}`),
+      (confirmed) => {
+        if (!confirmed) return;
+        view.targetId = null;
+        refresh();
+      });
   }
 
   async function netpathSettings() {

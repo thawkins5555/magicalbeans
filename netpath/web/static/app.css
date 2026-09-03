@@ -386,9 +386,33 @@ button {
   cursor: pointer;
 }
 button:hover { border-color: var(--accent); }
-button:disabled { color: var(--faint); border-color: var(--grid); cursor: default; }
+/* --muted, not --faint: a disabled button that says WHY it is disabled has
+   to be readable to be worth saying, and --faint is 2.5:1. Dimmer than an
+   active button, above the AA floor, which is the whole distinction a
+   disabled state has to carry. */
+button:disabled { color: var(--muted); border-color: var(--grid); cursor: default; }
+button:disabled:hover { border-color: var(--grid); }
 button.primary { background: var(--accent); color: #0E1116; border: none; font-weight: 600; }
 button.primary:hover { background: #97B6FF; }
+/* Declared after .primary on purpose. The two rules have equal specificity,
+   so the earlier button:disabled lost on source order and a disabled
+   primary kept its full accent fill — the most emphatic control on the bar
+   was also the one that did nothing. */
+button.primary:disabled {
+  background: var(--grid);
+  color: var(--muted);
+  border: 1px solid var(--grid);
+}
+button.primary:disabled:hover { background: var(--grid); }
+
+/* A control the account may not use (App.applyPermissions). It is disabled
+   and carries the reason in its title; one line under the bar says the same
+   thing where a tooltip cannot be reached. Nothing is hidden — the operator
+   can see the feature exists and what it would need. */
+/* No opacity here, deliberately: dimming a control that is already drawn in
+   the disabled tone would take that tone back below the contrast floor, and
+   the reason for disabling it is a sentence, not a shade. */
+.write-denied-why { margin: 4px 0 0; }
 button.icon { width: 32px; padding: 5px 0; text-align: center; }
 button.module-settings {
   background: var(--raised);
@@ -1090,7 +1114,10 @@ body.login-page {
 .help-body p { margin: 0 0 10px; line-height: 1.45; }
 .help-body ul { margin: 0 0 10px 18px; padding: 0; }
 .help-body li { margin: 4px 0; line-height: 1.4; }
-.modal-box.wide > label { display: flex; }
+/* The body of every dialog is wrapped in <form class="modal-form"> so that
+   Enter submits it (see App.modal), which put one element between
+   .modal-box and the labels this rule reaches. */
+.modal-box.wide > .modal-form > label { display: flex; }
 .modal-box h2 { margin: 0 0 12px; font-size: 15px; }
 /* The interface dialog's parent device name: its own line above the port
    name and inside the same h2, so it is the same size rather than dropping
@@ -1113,5 +1140,78 @@ body.login-page {
   white-space: pre-wrap;
 }
 .modal-box fieldset { margin-bottom: 10px; }
+
+/* What a dialog says when its action fails, sitting between the form and
+   the button that was pressed — the two places the operator is already
+   looking. Hidden until there is something to say; App.modal clears it on
+   every press, so a retry does not read as a second failure. */
+.modal-error {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--fail);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+}
+.modal-box .row.top + .modal-error { margin: 0 0 12px; }
+/* A field App.requireFields found empty. The border alone would be colour
+   on its own; the sentence in .modal-error names the field as well, and
+   focus lands on the first one, so this mark is the third signal rather
+   than the only one. */
+.modal-form .invalid,
+.modal-form [aria-invalid="true"] { border-color: var(--fail); }
+
+/* Escape and the backdrop ask before discarding a half-filled dialog, and
+   they ask here rather than in a second dialog: there is one #modal-box,
+   so a confirmation opened in it would destroy the edits it is asking
+   about. Separated from the form by a rule so it reads as a question about
+   the dialog rather than another field in it. */
+.discard-prompt {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+.discard-prompt p { margin: 0 0 10px; font-size: 12px; }
+.discard-prompt .row { justify-content: flex-end; }
+.discard-prompt .row button { flex: none; }
+
+/* Toasts: the visible half of App.announce.
+
+   Bottom right, above the modal layer (z-index 20) because a dialog's own
+   action is the commonest thing with something to report, and clear of the
+   tab strip and the filter bars at the top where the eye is already busy.
+   `pointer-events` is off on the stack and back on for each toast, so the
+   empty column does not swallow clicks on the page beneath it. */
+.toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  cursor: pointer;
+  max-width: 460px;
+  padding: 10px 14px;
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--muted);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+.toast.ok { border-left-color: var(--ok); }
+.toast.warn { border-left-color: var(--warn); }
+.toast.fail { border-left-color: var(--fail); }
+.toast.info { border-left-color: var(--accent); }
 .err { color: var(--fail); }
 .warn-text { color: var(--warn); }

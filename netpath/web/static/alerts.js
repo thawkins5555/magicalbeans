@@ -703,9 +703,10 @@
         event is momentary and nothing will ever arrive to clear it.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (box) => {
+        if (!App.requireFields(box, [['#ar-key', 'Key'],
+                                     ['#ar-name', 'Name']])) return;
         const key = box.querySelector('#ar-key').value.trim();
         const name = box.querySelector('#ar-name').value.trim();
-        if (!key || !name) return;
         const values = {
           key, name, kind: box.querySelector('#ar-kind').value,
           source_kind: box.querySelector('#ar-source').value.trim(),
@@ -731,15 +732,15 @@
   function removeRule() {
     const r = view.rules.find((x) => x.id === view.rulesSelected);
     if (!r || r.is_builtin) return;
-    App.modal('Remove rule', `<p>Remove <b>${escape(r.name)}</b>?</p>`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Remove', primary: true, onClick: async () => {
-        await App.del(`/api/alerts/rules/${r.id}`);
-        App.closeModal();
+    App.confirmDestructive('Remove rule',
+      `<p>Remove <b>${escape(r.name)}</b>?</p>`,
+      'Remove',
+      () => App.del(`/api/alerts/rules/${r.id}`),
+      (confirmed) => {
+        if (!confirmed) return;
         view.rulesSelected = null;
         App.refreshNow('alerts');
-      } },
-    ]);
+      });
   }
 
   /* ----------------------------------------------------------- templates */

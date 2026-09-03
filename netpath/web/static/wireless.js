@@ -273,9 +273,10 @@
       { label: 'Cancel', onClick: App.closeModal },
       ...(c ? [{ label: 'Remove', onClick: () => confirmRemoveController(c) }] : []),
       { label: c ? 'Save' : 'Add', primary: true, onClick: async (m) => {
+        if (!App.requireFields(m, [['#wc-name', 'Name'],
+                                   ['#wc-ip', 'IP address']])) return;
         const name = m.querySelector('#wc-name').value.trim();
         const ip = m.querySelector('#wc-ip').value.trim();
-        if (!name || !ip) { alert('A name and IP address are required'); return; }
         const fields = {
           name, ip, enabled: m.querySelector('#wc-enabled').checked,
           snmp_version: Number(m.querySelector('#wc-version').value),
@@ -305,16 +306,15 @@
   }
 
   function confirmRemoveController(c) {
-    App.modal('Remove controller',
-      `<p>Remove <b>${escape(c.name)}</b>? Its APs are removed too.</p>`, [
-        { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove', primary: true, onClick: async () => {
-          await App.del(`/api/wireless/controllers/${c.id}`);
-          App.closeModal();
-          await App.refreshNow('wireless');
-          controllersModal();
-        } },
-      ]);
+    App.confirmDestructive('Remove controller',
+      `<p>Remove <b>${escape(c.name)}</b>? Its APs are removed too.</p>`,
+      'Remove',
+      () => App.del(`/api/wireless/controllers/${c.id}`),
+      async (confirmed) => {
+        if (!confirmed) return;
+        await App.refreshNow('wireless');
+        controllersModal();
+      });
   }
 
   function controllersModal() {
@@ -474,18 +474,17 @@
     App.el('wl-remove-ap').onclick = () => {
       const ap = selectedAp();
       if (!ap) return;
-      App.modal('Remove access point',
+      App.confirmDestructive('Remove access point',
         `<p>Remove <b>${escape(ap.name || ap.wtp_id)}</b> from the list?</p>
          <p class="hint">If its controller still reports this AP, the next poll
-           adds it back — removing is for an AP that is genuinely gone.</p>`, [
-          { label: 'Cancel', onClick: App.closeModal },
-          { label: 'Remove', primary: true, onClick: async () => {
-            await App.del(`/api/wireless/aps/${ap.id}`);
-            App.closeModal();
-            view.selected = null;
-            await App.refreshNow('wireless');
-          } },
-        ]);
+           adds it back — removing is for an AP that is genuinely gone.</p>`,
+        'Remove',
+        () => App.del(`/api/wireless/aps/${ap.id}`),
+        (confirmed) => {
+          if (!confirmed) return;
+          view.selected = null;
+          App.refreshNow('wireless');
+        });
     };
     App.el('wl-toggle').onclick = async () => {
       const running = (App.state.serverState.wireless || {}).running;

@@ -379,7 +379,12 @@
     const settle = (text) => {
       button.disabled = false;
       button.textContent = text;
+      // The label IS the result — 'Queued for 12 devices', 'Failed' —
+      // and a label rewritten in place is a silent DOM mutation to a
+      // screen reader, so the result is said once as well. Inside the
+      // branch, because the resting label is not a result.
       if (text !== 'Poll now') {
+        App.announce(text);
         setTimeout(() => {
           if (button.textContent === text) button.textContent = 'Poll now';
         }, 3000);
@@ -417,7 +422,12 @@
     const settle = (text) => {
       button.disabled = false;
       button.textContent = text;
+      // The label IS the result — 'Queued for 12 devices', 'Failed' —
+      // and a label rewritten in place is a silent DOM mutation to a
+      // screen reader, so the result is said once as well. Inside the
+      // branch, because the resting label is not a result.
       if (text !== 'Re-identify') {
+        App.announce(text);
         setTimeout(() => {
           if (button.textContent === text) button.textContent = 'Re-identify';
         }, 4000);
@@ -487,18 +497,23 @@
     const list = names.length <= 10
       ? `<ul>${names.map((n) => `<li>${escape(n)}</li>`).join('')}</ul>`
       : `<p>${names.length} devices.</p>`;
-    App.modal('Delete devices',
+    // This closed the dialog and THEN awaited the delete, so a refusal —
+    // a permission the account does not have, a server that has gone away —
+    // reported the removal of up to forty devices that are all still there.
+    // confirmDestructive is the shape that cannot do that: it closes only
+    // after the request has come back, and leaves the dialog open saying
+    // why when it does not.
+    App.confirmDestructive('Delete devices',
       `<p>Remove <b>${ids.length}</b> device(s)? This deletes their interfaces, ` +
-      `metric history and events.</p>${list}`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Delete', primary: true, onClick: async () => {
-        App.closeModal();
-        await App.post('/api/nodes/devices/bulk-delete', { device_ids: ids });
+      `metric history and events.</p>${list}`,
+      'Delete',
+      () => App.post('/api/nodes/devices/bulk-delete', { device_ids: ids }),
+      (confirmed) => {
+        if (!confirmed) return;
         if (view.selected && ids.includes(view.selected)) view.selected = null;
         view.devicesChecked.clear();
         App.refreshNow('nodes');
-      } },
-    ]);
+      });
   }
 
   function selectDevice(id) {
@@ -2710,24 +2725,21 @@
   function removeProfile() {
     const g = view.groups.find((x) => x.id === view.groupSelected);
     if (!g) return;
-    App.modal('Remove profile', `<p>Remove <b>${escape(g.name)}</b>?${g.is_default
-      ? ' It is currently the default profile — another remaining profile becomes default in its place.'
-      : ' Devices using it fall back to the Default profile.'}</p>`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Remove', primary: true, onClick: async () => {
-        try {
-          await App.del(`/api/nodes/groups/${g.id}`);
-        } catch (error) {
-          App.closeModal();
-          profileStatus(error.message, true);
-          return;
-        }
-        App.closeModal();
+    // The refusal used to close the dialog and put the reason on the page
+    // behind it, where a profile the operator had just been editing was no
+    // longer on screen. It now stays in the dialog that asked.
+    App.confirmDestructive('Remove profile',
+      `<p>Remove <b>${escape(g.name)}</b>?${g.is_default
+        ? ' It is currently the default profile — another remaining profile becomes default in its place.'
+        : ' Devices using it fall back to the Default profile.'}</p>`,
+      'Remove',
+      () => App.del(`/api/nodes/groups/${g.id}`),
+      (confirmed) => {
+        if (!confirmed) return;
         profileStatus('');
         view.groupSelected = null;
         App.refreshNow('nodes');
-      } },
-    ]);
+      });
   }
 
   async function setDefaultProfile() {
@@ -3863,7 +3875,12 @@
       const settle = (text) => {
         button.disabled = false;
         button.textContent = text;
+        // The label IS the result — 'Queued for 12 devices', 'Failed' —
+        // and a label rewritten in place is a silent DOM mutation to a
+        // screen reader, so the result is said once as well. Inside the
+        // branch, because the resting label is not a result.
         if (text !== 'Poll now') {
+          App.announce(text);
           setTimeout(() => {
             if (button.textContent === text) button.textContent = 'Poll now';
           }, 2500);
