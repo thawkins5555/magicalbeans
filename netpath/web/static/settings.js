@@ -296,7 +296,7 @@
         `<td>${radio('read', 'Read')}</td>` +
         `<td>${radio('write', 'Write')}</td></tr>`;
     }).join('');
-    return `<table><thead><tr><th>Module</th><th></th><th></th><th></th></tr></thead>
+    return `<table><caption class="sr-only">Module permissions</caption><thead><tr><th scope="col">Module</th><th scope="col"></th><th scope="col"></th><th scope="col"></th></tr></thead>
       <tbody>${rows}</tbody></table>`;
   }
 
@@ -334,8 +334,9 @@
     App.el('new-user-grid').innerHTML = permissionGridHtml('nu', {});
     const table = App.el('users-table');
     const me = (App.state.session || {}).username;
-    table.innerHTML = '<thead><tr><th>User</th><th>Created</th>' +
-      '<th>Last sign-in</th><th>State</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">User accounts</caption><thead><tr>' +
+      '<th scope="col">User</th><th scope="col">Created</th>' +
+      '<th scope="col">Last sign-in</th><th scope="col">State</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
 
     for (const user of payload.users) {

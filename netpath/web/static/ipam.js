@@ -171,7 +171,7 @@
 
   function renderSubnets() {
     const table = App.el('ipam-subnet-table');
-    table.innerHTML = '';
+    table.innerHTML = '<caption class="sr-only">Subnets</caption>';
     const body = document.createElement('tbody');
     for (const subnet of view.subnets) {
       const tr = document.createElement('tr');
@@ -337,7 +337,8 @@
   function drawHosts() {
     const columns = hostColumns();
     const table = App.grid(App.el('ipam-hosts-table'),
-      { name: 'ipam-hosts', columns, sort: view.hostSort, onSort: onHostSort });
+      { name: 'ipam-hosts', caption: 'IPAM addresses', columns,
+        sort: view.hostSort, onSort: onHostSort });
     const body = document.createElement('tbody');
     const aliveOnly = App.el('ipam-alive-only').checked;
     const rows = App.sortRows(
@@ -363,9 +364,10 @@
 
   function drawConflicts() {
     const table = App.el('ipam-conflicts-table');
-    table.innerHTML = '<thead><tr><th>IP address</th><th>First MAC</th>' +
-      '<th>Second MAC</th><th>Source</th><th>Detected</th><th>Last seen</th>' +
-      '<th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Address conflicts</caption><thead><tr>' +
+      '<th scope="col">IP address</th><th scope="col">First MAC</th>' +
+      '<th scope="col">Second MAC</th><th scope="col">Source</th><th scope="col">Detected</th><th scope="col">Last seen</th>' +
+      '<th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const c of view.conflicts) {
       const tr = document.createElement('tr');
@@ -855,7 +857,8 @@
   function drawLeases() {
     const columns = leaseColumns();
     const table = App.grid(App.el('ipam-dhcp-lease-table'),
-      { name: 'ipam-leases', columns, sort: view.leaseSort, onSort: onLeaseSort });
+      { name: 'ipam-leases', caption: 'DHCP leases', columns,
+        sort: view.leaseSort, onSort: onLeaseSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.dhcpLeases, view.leaseSort.key,
       view.leaseSort.descending, columns);
@@ -1037,8 +1040,8 @@
       `<td class="hint">${escape(r.sources.join(', '))}</td>` +
       `</tr>`).join('');
     return `<div class="table-wrap" style="max-height:50vh">
-      <table><thead><tr><th>Hostname</th><th>IP</th><th>MAC</th>
-      <th>Status</th><th>Subnet</th><th>Source</th></tr></thead>
+      <table><caption class="sr-only">Search results</caption><thead><tr><th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">MAC</th>
+      <th scope="col">Status</th><th scope="col">Subnet</th><th scope="col">Source</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   }
 

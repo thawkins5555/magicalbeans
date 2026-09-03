@@ -424,7 +424,8 @@
     view.records = records;
     const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
-                           { name: 'nf-records', columns, sort, onSort });
+                           { name: 'nf-records', caption: 'NetFlow records',
+                             columns, sort, onSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(records, sort.key, sort.descending, columns);
     App.drawRows(body, rows, columns, (tr, record) => {

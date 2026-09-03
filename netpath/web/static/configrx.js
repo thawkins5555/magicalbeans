@@ -121,7 +121,7 @@
     const columns = deviceColumns();
     const checked = view.devicesChecked;
     const table = App.grid(App.el('cx-devices'), {
-      name: 'configrx-devices', columns,
+      name: 'configrx-devices', caption: 'ConfigRX devices', columns,
       sort: view.deviceSort, onSort: onDeviceSort,
       selectAll: {
         key: 'check',
@@ -359,7 +359,7 @@
     const columns = backupColumns();
     const checked = view.backupsChecked;
     const table = App.grid(App.el('cx-backups'), {
-      name: 'configrx-backups', columns,
+      name: 'configrx-backups', caption: 'Stored backups', columns,
       sort: view.backupSort, onSort: onBackupSort,
       selectAll: {
         key: 'check',

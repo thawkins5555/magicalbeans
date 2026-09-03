@@ -697,6 +697,15 @@ const App = (() => {
     table.dataset.grid = name;
     table.classList.add('grid');
 
+    /* A screen reader announces a table by its caption; without one, 29
+       identically-shaped grids are all "table". The caller passes the panel
+       heading it sits under; the humanised grid name is the fallback so a
+       caller that forgets still says something specific. */
+    const caption = document.createElement('caption');
+    caption.className = 'sr-only';
+    caption.textContent = options.caption
+      || String(name || 'table').replace(/[-_]/g, ' ');
+
     const colgroup = document.createElement('colgroup');
     for (const column of columns) {
       const col = document.createElement('col');
@@ -712,6 +721,11 @@ const App = (() => {
     const row = document.createElement('tr');
     columns.forEach((column, index) => {
       const th = document.createElement('th');
+      // `scope` is what lets assistive tech say which column a cell belongs
+      // to; `columnheader` is the implicit role but stated so the sortable
+      // headers below (which take a tabindex) keep it once focusable.
+      th.scope = 'col';
+      th.setAttribute('role', 'columnheader');
       // A select-all checkbox belongs directly above the boxes it governs,
       // not in a filter bar several controls away — that is the only place
       // it reads as "these rows". Rendered here rather than per module so
@@ -726,6 +740,11 @@ const App = (() => {
         // about it. It cannot be set from markup, only from script.
         box.indeterminate = !selectAll.checked && !!selectAll.some;
         box.title = selectAll.checked ? 'Clear selection' : 'Select all';
+        // The header cell is a checkbox with no visible text, so it needs
+        // its own name; `title` alone is not reliably announced.
+        box.setAttribute('aria-label',
+                         selectAll.label || (selectAll.checked ? 'Clear selection'
+                                                              : 'Select all rows'));
         box.onclick = (event) => {
           event.stopPropagation();
           selectAll.onToggle(box.checked);
@@ -747,21 +766,44 @@ const App = (() => {
         // A caret is rendered for every sortable column so the header width
         // never changes as the sort moves; only the sorted one is visible.
         caret.textContent = sorted && sort.descending ? '\u25BC' : '\u25B2';
+        // Decoration: the direction is announced by aria-sort, and a caret
+        // read out as "black down-pointing triangle" is noise.
+        caret.setAttribute('aria-hidden', 'true');
         th.appendChild(caret);
         if (sorted) {
           th.classList.add(sort.descending ? 'sort-desc' : 'sort-asc');
         }
+        // Sorting was mouse-only: the headers carried a click handler and
+        // nothing else, so a keyboard operator could not bring the down
+        // devices to the top of any table in the product.
+        th.tabIndex = 0;
+        th.setAttribute('aria-sort',
+                        sorted ? (sort.descending ? 'descending' : 'ascending')
+                               : 'none');
+        const doSort = () => {
+          const same = sort && sort.key === column.key;
+          onSort(column.key, same ? !sort.descending : !!column.descendingFirst);
+        };
         th.addEventListener('click', (event) => {
           // A click that ends a drag is not a click on the header.
           if (th.dataset.dragged) { delete th.dataset.dragged; return; }
           if (event.target.classList.contains('grip')) return;
-          const same = sort && sort.key === column.key;
-          onSort(column.key, same ? !sort.descending : !!column.descendingFirst);
+          doSort();
+        });
+        th.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') {
+            return;
+          }
+          // Space would otherwise scroll the pane out from under the table.
+          event.preventDefault();
+          doSort();
         });
       }
       if (index < columns.length - 1) {
         const grip = document.createElement('span');
         grip.className = 'grip';
+        // A mouse-only resize handle: not focusable, and not announced.
+        grip.setAttribute('aria-hidden', 'true');
         grip.addEventListener('mousedown', (event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -791,8 +833,29 @@ const App = (() => {
     head.appendChild(row);
 
     table.innerHTML = '';
+    table.appendChild(caption);
     table.appendChild(colgroup);
     table.appendChild(head);
+    return table;
+  }
+
+  /* The same three things for a table this module did not build: the ~20
+     grids that are still a `<thead>` written as markup by their own module.
+     Idempotent, so a render that runs on every poll can just call it. */
+  function a11yTable(table, caption) {
+    if (!table) return table;
+    for (const th of table.querySelectorAll('thead th, tr:first-child > th')) {
+      if (!th.getAttribute('scope')) th.scope = 'col';
+    }
+    if (caption) {
+      let node = table.querySelector(':scope > caption');
+      if (!node) {
+        node = document.createElement('caption');
+        node.className = 'sr-only';
+        table.insertBefore(node, table.firstChild);
+      }
+      if (node.textContent !== caption) node.textContent = caption;
+    }
     return table;
   }
 
@@ -1169,7 +1232,7 @@ const App = (() => {
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
-    grid, sortRows, canRead, canWrite, accountModal,
+    grid, a11yTable, sortRows, canRead, canWrite, accountModal,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };

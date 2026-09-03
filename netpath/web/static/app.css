@@ -43,6 +43,23 @@
 }
 
 * { box-sizing: border-box; }
+
+/* Text that only assistive technology reads: table captions naming the panel
+   a grid belongs to, the skip link, the word behind a status dot. Clipped
+   rather than `display:none`, which screen readers skip entirely. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* A class selector beats the user agent's [hidden] rule, so any element given
    display by a class of its own stays visible when hidden. The modal did
    exactly that and covered the page with a click-blocking overlay. */

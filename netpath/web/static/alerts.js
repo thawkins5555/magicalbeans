@@ -174,7 +174,7 @@
     const columns = alertColumns();
     const checked = view.checked;
     const table = App.grid(App.el('alerts-table'), {
-      name: 'alerts', columns,
+      name: 'alerts', caption: 'Alerts', columns,
       sort: view.alertSort, onSort: onAlertSort,
       selectAll: {
         key: 'check',
@@ -376,7 +376,8 @@
 
   function drawRulesTable() {
     const table = App.el('alerts-rules-table');
-    table.innerHTML = '<thead><tr><th>Name</th><th>Kind</th><th>Sev</th><th>On</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Alert rules</caption><thead><tr><th scope="col">Name</th>' +
+      '<th scope="col">Kind</th><th scope="col">Sev</th><th scope="col">On</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const r of view.rules) {
       const tr = document.createElement('tr');
@@ -562,7 +563,7 @@
 
   function drawTemplatesTable() {
     const table = App.el('alerts-templates-table');
-    table.innerHTML = '<thead><tr><th>Name</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Notification templates</caption><thead><tr><th scope="col">Name</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const t of view.templates) {
       const tr = document.createElement('tr');
@@ -674,7 +675,7 @@
         <td>${escape(addr)}</td>
         <td><button type="button" class="as-to-remove" data-index="${index}">Remove</button></td>
       </tr>`).join('');
-    return `<table><tbody>${rows}</tbody></table>`;
+    return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
   }
 
   function settingsDialog() {

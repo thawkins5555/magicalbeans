@@ -201,7 +201,7 @@
     const columns = deviceColumns();
     const checked = view.devicesChecked;
     const table = App.grid(App.el('nodes-table'), {
-      name: 'nodes-devices', columns,
+      name: 'nodes-devices', caption: 'Devices', columns,
       sort: view.deviceSort, onSort: onDeviceSort,
       selectAll: {
         key: 'check',
@@ -896,6 +896,7 @@
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
     const table = App.grid(target, { name: 'nodes-ifaces', columns,
+      caption: 'Interfaces',
       sort: view.ifaceSort,
       onSort: el ? null : onIfaceSort });
     const body = document.createElement('tbody');
@@ -1071,7 +1072,7 @@
         `${confidence ? ` · ${escape(confidence)} confidence` : ''}</span>`
       : '<b>Not identified</b>';
     const why = decision.reason || ev.error || '';
-    const arcLines = arcs.length ? `<table class="nd-arcs">${arcs.map((a) => {
+    const arcLines = arcs.length ? `<table class="nd-arcs"><caption class="sr-only">Enterprise arcs seen in this device\u2019s sysObjectID</caption>${arcs.map((a) => {
       const name = a.display || a.name || `enterprise ${a.arc}`;
       const mib = a.mib_file_id
         ? `${escape(a.module)} names ${a.named} of ${a.objects} (${Math.round((a.score || 0) * 100)}%)`
@@ -1202,7 +1203,7 @@
     const row = (label, val) =>
       `<tr><td class="hint" style="padding-right:14px">${label}</td><td>${val}</td></tr>`;
     const num = (v) => v != null ? Number(v).toLocaleString() : '—';
-    return `<table>${[
+    return `<table><caption class="sr-only">Interface facts</caption>${[
       row('Admin / Oper', `${escape(r.admin_status || '—')} / ${escape(r.oper_status || '—')}`),
       row('Speed', r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'),
       row('MAC address', escape(r.phys_addr || '—')),
@@ -1219,7 +1220,7 @@
     const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
-    return `<div class="table-wrap" style="max-height:120px"><table>` +
+    return `<div class="table-wrap" style="max-height:120px"><table><caption class="sr-only">Recent events on this port</caption>` +
       events.map((e) => `<tr><td>${App.clock(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
       '</table></div>';
@@ -1296,7 +1297,8 @@
 
     function draw() {
       const table = App.grid(box.querySelector('#oid-table'),
-        { name: 'nodes-oids', columns: COLS, sort, onSort: (key, descending) => {
+        { name: 'nodes-oids', caption: 'OID walk results',
+          columns: COLS, sort, onSort: (key, descending) => {
           sort = { key, descending }; draw();
         } });
       const body = document.createElement('tbody');
@@ -1690,7 +1692,7 @@
           dom.innerHTML = '<p class="hint">No DOM/sensor data available from this device for this port.</p>';
           return;
         }
-        dom.innerHTML = '<table><tr><th>Sensor</th><th>Value</th><th>Status</th></tr>' +
+        dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
           r.sensors.map((s) =>
             `<tr><td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</table>';
@@ -1716,8 +1718,8 @@
         // The VLAN column only earns its place when the source actually knew
         // one: dot1dTpFdbTable has no VLAN in it at all.
         const anyVlan = r.macs.some((m) => m.vlan);
-        mac.innerHTML = `<table><tr><th>MAC address</th>${
-          anyVlan ? '<th>VLAN</th>' : ''}</tr>` +
+        mac.innerHTML = `<table><caption class="sr-only">MAC addresses learned on this port</caption><tr><th scope="col">MAC address</th>${
+          anyVlan ? '<th scope="col">VLAN</th>' : ''}</tr>` +
           r.macs.map((m) => `<tr><td>${escape(m.mac)}</td>${
             anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
           '</table>';
@@ -1734,7 +1736,7 @@
   function drawEventTable(el, payload) {
     const table = el || App.el('nd-ev-table');
     const events = payload || view.events || {};
-    table.innerHTML = '<thead><tr><th>Time</th><th>Kind</th><th>Detail</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Device events</caption><thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col">Detail</th></tr></thead>';
     const body = document.createElement('tbody');
     const all = [...(events.device_events || []).map((e) => ({ ...e, scope: 'device' })),
                 ...(events.interface_events || []).map((e) => ({ ...e, scope: `if ${e.if_index}` }))]
@@ -2018,7 +2020,7 @@
         <td><button type="button" class="devgroup-save">Save</button></td>
         <td><button type="button" class="devgroup-remove">Remove</button></td>
       </tr>`).join('');
-    return `<table><thead><tr><th>Name</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<table><caption class="sr-only">Device groups</caption><thead><tr><th scope="col">Name</th><th scope="col"></th><th scope="col"></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   function wireDeviceGroupRows(box) {
@@ -2144,7 +2146,7 @@
 
   function drawProfilesTable() {
     const table = App.el('nd-profiles-table');
-    table.innerHTML = '<thead><tr><th>Name</th><th>Version</th><th>Credentials</th><th>Interval</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Polling profiles</caption><thead><tr><th scope="col">Name</th><th scope="col">Version</th><th scope="col">Credentials</th><th scope="col">Interval</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const g of view.groups) {
       const tr = document.createElement('tr');
@@ -2184,7 +2186,7 @@
         <td>${c.snmp_version === 3 ? (c.has_credential ? 'password stored' : 'no password yet') : ''}</td>
         <td><button type="button" class="cred-remove" data-cred-id="${c.id}">Remove</button></td>
       </tr>`).join('');
-    return `<table><thead><tr><th>Label</th><th>Credential</th><th></th><th></th></tr></thead>
+    return `<table><caption class="sr-only">Stored credentials</caption><thead><tr><th scope="col">Label</th><th scope="col">Credential</th><th scope="col"></th><th scope="col"></th></tr></thead>
       <tbody>${rows}</tbody></table>`;
   }
 
@@ -2557,7 +2559,7 @@
 
   function drawDiscJobsTable() {
     const table = App.el('disc-jobs-table');
-    table.innerHTML = '<thead><tr><th>Target</th><th>State</th><th>Found</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Discovery jobs</caption><thead><tr><th scope="col">Target</th><th scope="col">State</th><th scope="col">Found</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const job of view.discJobs) {
       const tr = document.createElement('tr');
@@ -2675,7 +2677,7 @@
   function drawDiscResultsTable() {
     const table = App.el('disc-results-table');
     const job = view.discJobs.find((j) => j.id === view.discSelected);
-    table.innerHTML = '<thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>' +
+    table.innerHTML = '<caption class="sr-only">Discovery results</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>' +
       `<tbody>${discResultRowsHtml(view.discResults, job, 'disc-check')}</tbody>`;
     for (const box of table.querySelectorAll('.disc-check')) {
       box.onchange = () => {
@@ -2823,7 +2825,7 @@
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
       <div class="table-wrap" style="max-height:50vh">
-        <table><thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>
+        <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
         <tbody>${(() => {
           const saved = view.discChecked; view.discChecked = checked;
           const html = discResultRowsHtml(found, job, 'disc-approve');
@@ -2867,7 +2869,7 @@
 
   function drawMibsTable() {
     const table = App.el('nd-mibs-table');
-    table.innerHTML = '<thead><tr><th>File</th><th>Module</th><th>Objects</th><th>Unresolved</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Loaded MIB files</caption><thead><tr><th scope="col">File</th><th scope="col">Module</th><th scope="col">Objects</th><th scope="col">Unresolved</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const f of view.mibFiles) {
       const tr = document.createElement('tr');
@@ -2927,8 +2929,8 @@
         network, download the files yourself and use Upload MIB, which accepts a
         zip.</p>
       <p id="nd-cat-status" class="hint"></p>
-      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table">
-        <thead><tr><th>Bundle</th><th>State</th><th></th></tr></thead>
+      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
+        <thead><tr><th scope="col">Bundle</th><th scope="col">State</th><th scope="col"></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });

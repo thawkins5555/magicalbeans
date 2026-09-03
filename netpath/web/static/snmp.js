@@ -194,7 +194,8 @@
   function drawTable() {
     const columns = trapColumns();
     const table = App.grid(App.el('snmp-table'),
-      { name: 'snmp-traps', columns, sort: view.trapSort, onSort: onTrapSort });
+      { name: 'snmp-traps', caption: 'SNMP traps', columns,
+        sort: view.trapSort, onSort: onTrapSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.traps, view.trapSort.key,
                               view.trapSort.descending, columns);

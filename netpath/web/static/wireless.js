@@ -148,7 +148,8 @@
   function drawTable() {
     const columns = activeColumns();
     const table = App.grid(App.el('wireless-table'),
-      { name: 'wireless-aps', columns, sort: view.apSort, onSort: onApSort });
+      { name: 'wireless-aps', caption: 'Wireless access points', columns,
+        sort: view.apSort, onSort: onApSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.aps, view.apSort.key, view.apSort.descending, columns);
     App.drawRows(body, rows, columns, (tr, row) => {
@@ -311,8 +312,8 @@
           <button data-poll="${c.id}">Poll now</button></td>
       </tr>`).join('');
     const box = App.modal('Wireless controllers', `
-      <table class="table-wrap"><thead><tr>
-        <th>Name</th><th>IP</th><th>State</th><th>Last poll</th><th></th>
+      <table class="table-wrap"><caption class="sr-only">Wireless controllers</caption><thead><tr>
+        <th scope="col">Name</th><th scope="col">IP</th><th scope="col">State</th><th scope="col">Last poll</th><th scope="col"></th>
       </tr></thead><tbody>${rows || '<tr><td colspan="5">No controllers configured</td></tr>'}</tbody></table>`,
       [
         { label: 'Close', onClick: App.closeModal },

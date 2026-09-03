@@ -109,7 +109,7 @@
     view.cells = [];
     const table = App.el('dbg-workers');
     table.innerHTML =
-      `<thead><tr>${WORKER_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">NetPath tracer workers</caption><thead><tr>${WORKER_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     for (const worker of workers) {
       const { text: elapsed, colour } = elapsedText(worker, 0);
@@ -138,7 +138,7 @@
     view.dnsCells = [];
     const table = App.el('dbg-dns');
     table.innerHTML =
-      `<thead><tr>${DNS_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">Name-lookup workers</caption><thead><tr>${DNS_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
       body.innerHTML = '<tr><td colspan="2" class="hint">Nothing pending — every known address is already named or not due for a re-check</td></tr>';
@@ -162,7 +162,7 @@
     view.ipamCells = [];
     const table = App.el('dbg-ipam');
     table.innerHTML =
-      `<thead><tr>${IPAM_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">IPAM workers</caption><thead><tr>${IPAM_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
       body.innerHTML = '<tr><td colspan="2" class="hint">Nothing running — no subnet scan or DHCP poll in progress right now</td></tr>';
@@ -187,7 +187,7 @@
     view.nodeCells = [];
     const table = App.el('dbg-nodes');
     table.innerHTML =
-      `<thead><tr>${NODE_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">Poller workers</caption><thead><tr>${NODE_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
       body.innerHTML = '<tr><td colspan="2" class="hint">Nothing polling right now</td></tr>';
@@ -212,7 +212,7 @@
     view.discCells = [];
     const table = App.el('dbg-disc');
     table.innerHTML =
-      `<thead><tr>${DISC_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">Discovery scans</caption><thead><tr>${DISC_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!scans.length) {
       body.innerHTML = '<tr><td colspan="4" class="hint">No discovery scan running right now</td></tr>';
@@ -256,7 +256,7 @@
   function drawEvents() {
     const table = App.el('dbg-events');
     table.innerHTML =
-      `<thead><tr>${EVENT_COLUMNS.map((c) => `<th>${c}</th>`).join('')}</tr></thead>`;
+      `<caption class="sr-only">Service events</caption><thead><tr>${EVENT_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     const visible = view.events.filter(passes);
     for (const event of visible.slice(-2000)) {

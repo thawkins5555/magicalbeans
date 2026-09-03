@@ -183,7 +183,7 @@
   function drawTable() {
     const columns = messageColumns();
     const table = App.grid(App.el('syslog-table'),
-      { name: 'syslog-messages', columns,
+      { name: 'syslog-messages', caption: 'Syslog messages', columns,
         sort: view.messageSort, onSort: onMessageSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.messages, view.messageSort.key,
