@@ -33,15 +33,15 @@ The Nodes tab still renders, the web interface is fine, but nothing is being
 polled. The Dashboard's poller tile shows no busy workers.
 
 **What it usually is.** One unhandled exception in the scheduler thread. Until
-4.37.0 that thread had no guard: a single transient database error killed it
-permanently and silently, with nothing on any screen saying so. From 4.37.0 the
+4.38.0 that thread had no guard: a single transient database error killed it
+permanently and silently, with nothing on any screen saying so. From 4.38.0 the
 loop is guarded, sets `poller.error`, and the Nodes tab and the Debug tab both
 show the message.
 
 **Checks, in order.**
 
 1. **Nodes tab, poller status line.** If it names an error, that is your
-   answer; go to step 4. If the application is older than 4.37.0 it will say
+   answer; go to step 4. If the application is older than 4.38.0 it will say
    nothing useful — go to step 2.
 2. **Debug tab**, filter to Nodes. Look for a traceback. The last event before
    polling stopped is the interesting one, not the newest.
@@ -52,7 +52,7 @@ show the message.
      under the data directory. Check free space, check the mount. SQLite over
      NFS or SMB is a bad idea and this is how it announces itself.
    - *"unable to open database file"* — permissions. The data directory is
-     `0700` and its files `0600` from 4.37.0; if the service account changed,
+     `0700` and its files `0600` from 4.38.0; if the service account changed,
      it no longer owns them.
    - *A traceback in the polling code* — capture it, then restart.
 5. **Restart the service.** The poller re-seeds each device's due time from its
@@ -68,10 +68,10 @@ device you select drops to the fast cadence and updates.
 **Symptom.** The NetFlow, SNMP Trap or Syslog tab shows the listener stopped,
 with a reason, and the packet counter is frozen.
 
-**What it usually is.** One malformed datagram. Before 4.37.0 the receive
+**What it usually is.** One malformed datagram. Before 4.38.0 the receive
 threads had no exception guard and a decoder that raised took the listener with
 it — an 18-byte NetFlow packet was enough — and the status read "Collector
-stopped", indistinguishable from an operator stopping it. From 4.37.0 the
+stopped", indistinguishable from an operator stopping it. From 4.38.0 the
 receive loops count the error, log the first one per minute, keep running, and
 the status distinguishes *stopped* from *stopped unexpectedly: <reason>*.
 
@@ -102,7 +102,7 @@ it rises.
 **What it means, precisely.** Messages arrived at this host and the *kernel*
 discarded them because the socket's receive buffer was full before this
 application read from it. They were never seen by any code here and cannot be
-recovered. This counter is new in 4.37.0; before it, this loss was completely
+recovered. This counter is new in 4.38.0; before it, this loss was completely
 invisible — a measured 300,000 syslog messages at 38,000/s stored 93,000 and
 reported zero dropped.
 
@@ -141,7 +141,7 @@ after the event that caused them.
 per tick. Its drain used to be capped at 500 rows per source per five-second
 tick — 100 rows a second — against an ingest that can exceed 10,000 a second,
 so a busy hour put it permanently behind with nothing indicating it. From
-4.37.0 it loops to catch up within a per-tick budget and exposes how far behind
+4.38.0 it loops to catch up within a per-tick budget and exposes how far behind
 it is.
 
 **Checks.** A backlog that falls steadily needs nothing; it is catching up.
@@ -159,7 +159,7 @@ section, and check the Debug tab for the alert engine's own errors.
 minutes, or a window wider than a few days is blank.
 
 **What it usually is, on 4.36.x and earlier.** Two defects that are fixed in
-4.37.0 and worth recognising if you are running an older build:
+4.38.0 and worth recognising if you are running an older build:
 
 - **The row cap was applied to the whole table, not per metric.** Fifty
   thousand sample rows survived each fifteen-minute maintenance pass no matter
@@ -169,7 +169,7 @@ minutes, or a window wider than a few days is blank.
 - **The hourly rollup never ran.** `samples_hourly` was always empty, so any
   chart window wider than the raw retention returned no points at all.
 
-**On 4.37.0.** Check, in order:
+**On 4.38.0.** Check, in order:
 
 1. **`sample_retention_days`** (Nodes → Settings), default 3. A window wider
    than this reads hourly rollups, not raw samples; the dialog says so.
@@ -208,7 +208,7 @@ in the log.
    Check the Debug tab for errors from the maintenance pass, and check that
    nothing has the database locked.
 5. **Reclaiming space.** Deleting rows does not shrink the file by itself.
-   From 4.37.0 the databases run in incremental-vacuum mode and free pages are
+   From 4.38.0 the databases run in incremental-vacuum mode and free pages are
    returned a few thousand at a time after each trim, with the WAL truncated
    afterwards, so this happens on its own without the long lock-holding
    `VACUUM` earlier releases used. To force it: **Settings → Maintenance**.
@@ -222,7 +222,7 @@ in the log.
 
 **Symptom.** No alert mail, or an `smtp_failing` alert on the Alerts tab.
 
-**What `smtp_failing` means.** From 4.37.0 mail is sent by a queue thread with
+**What `smtp_failing` means.** From 4.38.0 mail is sent by a queue thread with
 a circuit breaker: five consecutive failures open it for fifteen minutes, and
 opening it raises this alert. The point is that "the monitor cannot tell you
 anything" is precisely the failure that cannot be delivered by email, so it is
@@ -305,7 +305,7 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    separate problem.
 2. **Is one device eating a worker?** A device with hundreds of interfaces
    that stops answering part-way through its interface walk used to hold a
-   worker for over an hour; from 4.37.0 there is a wall-clock deadline of half
+   worker for over an hour; from 4.38.0 there is a wall-clock deadline of half
    the poll interval and it gives up after three consecutive timeouts, logging
    "read N of M". Look for that message.
 3. **Raise the interval before raising the workers.** Going from 60 to 120
@@ -331,7 +331,7 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    it — on the device form — and the next outage is one alert. This is the
    single most valuable field in the product for anyone with more than a rack.
 2. **Onboarding.** Adding devices raises `mib_missing` on every device with a
-   recognised vendor and no uploaded MIB. From 4.37.0 that rule does not email
+   recognised vendor and no uploaded MIB. From 4.38.0 that rule does not email
    and auto-resolves; on earlier builds every one of them arrived titled
    "<device> is not responding", which it was not.
 3. **A device in a trap or syslog loop.** One device, one message repeated.
@@ -339,7 +339,7 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    the damage at ingest, and a line a device repeats is collapsed into one row
    with a repeat count rather than filling the table.
 4. **A rule that is too broad.** `trap_critical` matched every trap of any
-   severity before 4.37.0, so a config-save trap opened a severity-2 "Critical
+   severity before 4.38.0, so a config-save trap opened a severity-2 "Critical
    SNMP trap". If you are on an older build, either disable that rule or raise
    its severity gate.
 
@@ -354,7 +354,7 @@ says so.
 
 1. **Is the service running?** `systemctl status sappiwhere`. If the browser
    shows a connection error rather than a sign-in page, this is the answer.
-2. **Locked out after failed attempts?** From 4.37.0 an account is locked for a
+2. **Locked out after failed attempts?** From 4.38.0 an account is locked for a
    period after twenty failures in fifteen minutes and returns 429. It clears
    itself; wait, or restart the service.
 3. **Stuck on "you must change your password"?** That is the server refusing

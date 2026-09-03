@@ -7,8 +7,9 @@
 
   const view = {
     // Newest first, matching the order the server already returns them
-    // in, so the first draw looks the same as it always did.
-    messageSort: { key: 'ts', descending: true },
+    // in, so the first draw looks the same as it always did — until the
+    // operator clicks a heading, which is remembered per browser.
+    messageSort: App.recallSort('syslog-messages', { key: 'ts', descending: true }),
     t0: Date.now() / 1000 - 86400,
     t1: Date.now() / 1000,
     follow: true,
@@ -421,6 +422,14 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end, after the severity, facility and range lists exist;
+       it assigns from script, which fires no event. Live is not restored. */
+    const CONTROLS = ['sl-q', 'sl-severity', 'sl-facility', 'sl-source', 'sl-host',
+      'sl-app', 'sl-range', 'sl-limit', 'sl-show-hostname'];
+    App.rememberControls('syslog', CONTROLS);
     App.fillRanges(App.el('sl-range'), 'Last 24 hours');
     const severity = App.el('sl-severity');
     severity.innerHTML = '<option value="">Any severity</option>';
@@ -441,11 +450,13 @@
 
     App.el('sl-apply').onclick = () => App.refreshNow('syslog');
     App.el('sl-clear').onclick = () => {
-      for (const id of ['sl-q', 'sl-source', 'sl-host', 'sl-app']) {
-        App.el(id).value = '';
-      }
-      App.el('sl-severity').value = '';
-      App.el('sl-facility').value = '';
+      const cleared = ['sl-q', 'sl-source', 'sl-host', 'sl-app',
+        'sl-severity', 'sl-facility'];
+      for (const id of cleared) App.el(id).value = '';
+      // Assigning .value from script fires no event, so without this the
+      // store would keep every filter Clear has just removed and a reload
+      // would come back filtered by them.
+      App.syncControls('syslog', cleared);
       App.refreshNow('syslog');
     };
     for (const id of ['sl-q', 'sl-source', 'sl-host', 'sl-app']) {
@@ -478,6 +489,15 @@
         if (App.state.tab === 'syslog') drawHistogram();
       });
     }
+
+    // Last thing in init(): the severity, facility and range lists above are
+    // filled, so a restored choice has an option to land on. Live is not
+    // restored — a page that came back already frozen would give the
+    // operator no clue why nothing moves.
+    App.restoreControls('syslog', CONTROLS);
+    // The box is the setting's only home on a fresh load, but the table
+    // reads view.showHostname, so the two have to start out agreeing.
+    view.showHostname = App.el('sl-show-hostname').checked;
   }
 
   /* #/syslog/<id>: select the row a link names, once refresh() has

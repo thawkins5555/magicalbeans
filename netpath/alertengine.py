@@ -23,9 +23,9 @@ from dataclasses import asdict
 from . import alertmail
 from . import hostresolve
 from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
-    UNMANAGED_ONLY_RULES, Occurrence, dedup_key, evaluate_flapping, \
-    evaluate_threshold, match_device, syslog_signature
-from .eventlog import ALERTS, ERROR, NullLog
+    UNMANAGED_ONLY_RULES, Occurrence, dedup_key, device_id_for, \
+    evaluate_flapping, evaluate_threshold, match_device, syslog_signature
+from .eventlog import ALERTS, ERROR, NODES, NullLog
 
 TICK_S = 5.0
 
@@ -94,10 +94,13 @@ class AlertEngine:
         # ticks; the first breach ts is what lets for_seconds measure a
         # duration. See _evaluate_thresholds.
         self._breach_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
-        # DHCP scopes keep (last polled_ts, streak) rather than a bare
-        # count: the engine ticks every few seconds but DHCP is polled
-        # every few minutes, so for_polls must count polls, not ticks.
-        self._dhcp_streaks: dict[tuple, tuple[float | None, int]] = {}
+        # DHCP scopes keep (last polled_ts, streak, first breach ts) rather
+        # than a bare count: the engine ticks every few seconds but DHCP is
+        # polled every few minutes, so for_polls must count polls, not
+        # ticks — and the first breach ts is what tells one breach run from
+        # the next, so a scope alert an operator resolved by hand stays
+        # resolved while the scope stays full.
+        self._dhcp_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
         # And again for NetPath destinations, keyed on the trace's own
         # started_ts: a destination is traced every five minutes by default
         # while this engine ticks every five seconds, so a streak that
@@ -110,6 +113,27 @@ class AlertEngine:
         # whose first_breach_ts is at or before this timestamp is the same
         # run an operator already resolved, and does not re-open.
         self._operator_resolves: dict[str, float] = {}
+        # Rollup PARENT dedup keys this engine has seen resolved by hand while
+        # the parent's condition was still true, and when the cover started.
+        # _operator_resolves only reaches back OPERATOR_RESOLVE_WINDOW_S, so
+        # without this a device hand-resolved and left down went quiet for
+        # exactly seven days and then opened every still-breaching child in a
+        # single tick — one row and one email per rule per device, a week
+        # after anybody did anything. A cover ends when the device answers
+        # (_still_true false), never on a clock. In memory, so a restart
+        # forgets it exactly as the threshold gate already documents.
+        self._parent_covers: dict[str, float] = {}
+        # rule key -> the enabled rule row, rebuilt once per tick from the
+        # rules _tick already reads. _parent_operator_resolved needs a
+        # rollup parent's rule for its dedup key on every suppressed
+        # occurrence, and a rule_by_key() query per occurrence would be one
+        # more read on the hot path for a table that cannot change mid-tick.
+        self._rules_by_key: dict = {}
+        # dedup-key-shaped ("<entity_kind>:<entity_id>") -> whether that
+        # entity's rollup parent condition still holds, memoised for the
+        # duration of one tick so N children of one dead device cost one
+        # device read rather than N.
+        self._parent_conditions: dict = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
         # source -> the id this tick's drain reached. Written to `meta` by
@@ -200,15 +224,20 @@ class AlertEngine:
         if not settings.get("enabled", True):
             return
         # One indexed query per tick, not one per breaching rule/device:
-        # _evaluate_thresholds and _evaluate_netpath_thresholds both consult
-        # this cache to decide whether a breach is the same run an operator
-        # already resolved by hand.
+        # _evaluate_thresholds, _evaluate_dhcp_thresholds,
+        # _evaluate_netpath_thresholds and _parent_operator_resolved all
+        # consult this cache to decide whether a breach is the same run an
+        # operator already resolved by hand. Read here, at the top of the
+        # tick and before anything is applied, so a resolve that landed a
+        # moment ago is already in hand on the FIRST tick after the click —
+        # which is the tick a bulk resolve has to survive.
         self._operator_resolves = self.db.operator_resolved_since(
             time.time() - OPERATOR_RESOLVE_WINDOW_S)
         self._cursor_advances.clear()
         self._drain_rows = 0
         self._drain_deadline = time.monotonic() + DRAIN_TIME_BUDGET_S
         self.counters["backlog"] = 0
+        self._parent_conditions = {}
         occurrences = []
         occurrences += self._drain_device_events(settings)
         occurrences += self._drain_interface_events(settings)
@@ -221,6 +250,7 @@ class AlertEngine:
         occurrences += self._evaluate_dhcp_thresholds(settings)
         occurrences += self._evaluate_netpath_thresholds(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
+        self._rules_by_key = {r["key"]: r for r in rules if r["key"]}
         occurrences += self._drain_pending()
         # Read once per tick rather than per occurrence, and usually empty —
         # when nothing is muted the gate below costs one dict truth test.
@@ -462,16 +492,10 @@ class AlertEngine:
         runs inside the drains — before _tick reads that dict — and a clear
         is rare enough that one query costs nothing.
         """
-        try:
-            if alert_row["entity_kind"] == "device":
-                device_id = str(int(alert_row["entity_id"]))
-            elif alert_row["entity_kind"] == "interface":
-                device_id = str(int(str(alert_row["entity_id"]).split(":")[0]))
-            else:
-                return False
-        except (TypeError, ValueError):
+        device_id = device_id_for(alert_row["entity_kind"], alert_row["entity_id"])
+        if device_id is None:
             return False
-        return self.db.mute_row("device", device_id) is not None
+        return self.db.mute_row("device", str(device_id)) is not None
 
     # ------------------------------------------- newly added device hold
 
@@ -498,16 +522,10 @@ class AlertEngine:
         they can never be held back. That is a property of the lookup rather
         than a list of exemptions somebody has to remember to update.
         """
-        try:
-            if occurrence.entity_kind == "device":
-                return self.nodes_db.device(int(occurrence.entity_id))
-            if occurrence.entity_kind == "interface":
-                # "<device_id>:<if_index>"
-                return self.nodes_db.device(
-                    int(str(occurrence.entity_id).split(":")[0]))
-        except (TypeError, ValueError):
+        device_id = device_id_for(occurrence.entity_kind, occurrence.entity_id)
+        if device_id is None:
             return None
-        return None
+        return self.nodes_db.device(device_id)
 
     def _hold_for_new_device(self, occurrence: Occurrence, settings) -> bool:
         """True when this occurrence was held back rather than applied.
@@ -1005,6 +1023,15 @@ class AlertEngine:
         observation resets first_breach_ts (above), so the very next breach
         is a new run and opens normally.
 
+        That gate is keyed on the alert's OWN dedup key, which is the whole
+        of it: an operator who resolves a rollup PARENT — "Device not
+        responding" for a device that is still down — never touched the
+        children's keys, and the engine writes '' when it absorbs a child
+        precisely so children stay free to re-open. Covering those is
+        _parent_operator_resolved's job, applied in _apply where rollup is
+        decided rather than here, since a suppressed child never reaches an
+        alert row at all.
+
         This is in-memory state, so a restart forgets it: the first tick
         after restart rebuilds every streak from scratch, first_breach_ts
         becomes "since restart", and a still-breaching alert an operator had
@@ -1062,17 +1089,31 @@ class AlertEngine:
                 over = (value is not None and threshold is not None
                         and value >= threshold)
                 if not over:
-                    streak, first_breach_ts = 0, None
+                    streak = 0
                 elif sample_ts != previous_ts:
                     streak += 1
                     if first_breach_ts is None:
                         first_breach_ts = sample_ts
-                live_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
                 # Sample time, not wall-clock: a device that stopped being
                 # polled must not accumulate breach seconds while silent.
                 breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
                                   else max(0.0, sample_ts - first_breach_ts))
                 result = evaluate_threshold(rule, value, streak, breach_seconds)
+                if result == "clear":
+                    # The run ends on an OBSERVED CLEAR, not on the first
+                    # sample under the threshold. Between clear_threshold and
+                    # threshold is the hysteresis band, which exists precisely
+                    # because a value wobbling around the limit has not
+                    # recovered — resetting the run there let a CPU that dipped
+                    # from 92 % to 85 % and back re-open an alert an operator
+                    # had resolved by hand, as a brand new run. The streak
+                    # still resets above on any sample under the threshold:
+                    # for_polls means consecutive polls OVER it.
+                    first_breach_ts = None
+                # Into the per-tick dict, which replaces the stored one at the
+                # end of the pass: state kept per (rule, device) forever leaked
+                # an entry for every deleted device.
+                live_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
                 if result == "":
                     continue
                 if label is None:
@@ -1090,10 +1131,7 @@ class AlertEngine:
                         device_name=device["name"] or "", device_ip=device["ip"],
                         extra={"metric_label": metric["label"] if metric else rule["source_kind"],
                               "value": str(value), "threshold": str(rule["threshold"])})
-                    key = dedup_key(rule, occurrence)
-                    resolved_ts = self._operator_resolves.get(key)
-                    if (resolved_ts is not None and first_breach_ts is not None
-                            and first_breach_ts <= resolved_ts):
+                    if self._operator_resolved(rule, occurrence, first_breach_ts):
                         # An operator resolved this exact breach run by hand;
                         # it stays closed until a clear observation (which
                         # resets first_breach_ts above) is followed by a new
@@ -1150,6 +1188,14 @@ class AlertEngine:
         seconds, so counting ticks would make for_polls=2 mean "10 seconds"
         rather than "two polls". The streak therefore only advances when a
         scope's polled_ts actually moves.
+
+        It carries first_breach_ts for the same reason _evaluate_thresholds
+        does, and applies the same operator gate: a scope that is full is
+        still full at the next poll, so an alert an operator resolved by
+        hand came straight back — this was the one threshold evaluator that
+        never got the 4.34.0 gate. A poll that finds the scope back under
+        its clear threshold ends the run, and the next breach opens
+        normally.
         """
         if self.ipam_db is None:
             return []
@@ -1185,7 +1231,8 @@ class AlertEngine:
 
             for rule in rules:
                 streak_key = (rule["id"], entity_id)
-                previous_ts, streak = self._dhcp_streaks.get(streak_key, (None, 0))
+                previous_ts, streak, first_breach_ts = self._dhcp_streaks.get(
+                    streak_key, (None, 0, None))
                 polled_ts = scope["polled_ts"]
                 threshold = rule["threshold"]
                 over = threshold is not None and value >= threshold
@@ -1193,9 +1240,18 @@ class AlertEngine:
                     streak = 0
                 elif polled_ts != previous_ts:
                     streak += 1
-                self._dhcp_streaks[streak_key] = (polled_ts, streak)
+                    if first_breach_ts is None:
+                        first_breach_ts = polled_ts
 
                 result = evaluate_threshold(rule, value, streak)
+                if result == "clear":
+                    # Only a poll that finds the scope back under its clear
+                    # threshold ends the run — see the same reasoning in
+                    # _evaluate_thresholds. A scope that drops from 90 % to
+                    # 80 % is still nearly full, and treating that as a
+                    # recovery re-opened an alert an operator had resolved.
+                    first_breach_ts = None
+                self._dhcp_streaks[streak_key] = (polled_ts, streak, first_breach_ts)
                 occurrence = Occurrence(
                     kind="dhcp_threshold", source_kind=rule["source_kind"],
                     entity_kind="dhcp_scope", entity_id=entity_id,
@@ -1212,6 +1268,16 @@ class AlertEngine:
                            "total": str(total),
                            "available": str(max(0, total - used))})
                 if result == "breach":
+                    if self._operator_resolved(rule, occurrence, first_breach_ts):
+                        # The same run an operator already resolved by hand.
+                        # A scope at 96 % is still at 96 % on the next DHCP
+                        # poll, so without this the alert an operator closed
+                        # came back at the next tick — the same defect as the
+                        # device thresholds, in the one evaluator that never
+                        # got the gate. A poll that finds the scope back
+                        # under its clear threshold resets first_breach_ts
+                        # above, so the next breach is a new run and opens.
+                        continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     resolved = self.db.resolve_by_dedup(
@@ -1403,14 +1469,19 @@ class AlertEngine:
                 threshold = rule["threshold"]
                 over = threshold is not None and value >= threshold
                 if not over:
-                    streak, first_breach_ts = 0, None
+                    streak = 0
                 elif sample_ts != previous_ts:
                     streak += 1
                     if first_breach_ts is None:
                         first_breach_ts = sample_ts
-                self._netpath_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
 
                 result = evaluate_threshold(rule, value, streak)
+                if result == "clear":
+                    # An observed clear ends the run, the same rule as the
+                    # other two evaluators — a trace that got through, not
+                    # merely one that was less bad than the last.
+                    first_breach_ts = None
+                self._netpath_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
                 occurrence = Occurrence(
                     kind="netpath_threshold", source_kind=source,
                     entity_kind="netpath_target", entity_id=entity_id,
@@ -1418,9 +1489,7 @@ class AlertEngine:
                     device_name=label, device_ip=target["host"],
                     extra={**extra, "threshold": str(threshold)})
                 if result == "breach":
-                    resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
-                    if (resolved_ts is not None and first_breach_ts is not None
-                            and first_breach_ts <= resolved_ts):
+                    if self._operator_resolved(rule, occurrence, first_breach_ts):
                         # Same breach run an operator already resolved by
                         # hand; see the matching check in
                         # _evaluate_thresholds.
@@ -1462,6 +1531,22 @@ class AlertEngine:
                 # No clear email: nobody needs telling that a destination they
                 # just turned off has stopped being measured.
 
+    def _operator_resolved(self, rule, occurrence: Occurrence,
+                          first_breach_ts) -> bool:
+        """True when an operator resolved THIS breach run by hand, so it must
+        not re-open as a new row.
+
+        The one gate all three threshold evaluators ask, rather than the three
+        verbatim copies they had (and the fourth that was missed for a whole
+        release, leaving DHCP scope alerts re-opening five seconds after every
+        hand resolve). `_operator_resolves` is the per-tick
+        `operator_resolved_since` cache; a resolve at or after the run began is
+        a resolve OF that run, since a run only ends on an observed clear.
+        """
+        resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
+        return (resolved_ts is not None and first_breach_ts is not None
+                and first_breach_ts <= resolved_ts)
+
     # ---------------------------------------------------------------- apply
 
     # ------------------------------------------------------------- rollup
@@ -1492,28 +1577,75 @@ class AlertEngine:
             return None
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
         if parent_key:
-            parent_rule = self.db.rule_by_key(parent_key)
-            if parent_rule is None or not parent_rule["enabled"]:
+            # The per-tick snapshot _tick builds from the rules it has
+            # already read, not a rule_by_key() query per suppressed
+            # occurrence: the rules table cannot change mid-tick, and
+            # _parent_operator_resolved has always used the snapshot —
+            # reading the two from different places let one see a rule the
+            # other did not. _rules_by_key holds only ENABLED rules, which is
+            # exactly the `parent_rule["enabled"]` test this made by hand.
+            parent_rule = self._rules_by_key.get(parent_key)
+            if parent_rule is None:
                 return None
             parent = self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
             if parent is not None:
                 return parent
-            if parent_key == "device_down":
-                device = self._occurrence_device(occurrence)
-                if device is not None and device["status"] == "down":
-                    return SUPPRESSED
+            if parent_key == "device_down" and self._parent_still_failing(
+                    occurrence):
+                # No open parent alert, but the outage behind it is still
+                # real — the same cover _parent_operator_resolved applies to
+                # a hand-resolved parent, asked through the one predicate.
+                return SUPPRESSED
             return None
         if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
             return self._upstream_outage(rule, occurrence)
         return None
 
+    def _parent_still_failing(self, occurrence: Occurrence,
+                              entity_id=None) -> bool:
+        """Whether the device this occurrence rolls up to is still down.
+
+        The one predicate behind every kind of outage suppression, memoised
+        per tick so N children of one dead device cost one device read:
+
+        - a parent alert that is open (`_rollup_parent`);
+        - a parent an operator resolved by hand while the device was still
+          down (`_parent_operator_resolved`, which adds the cover that
+          outlives the resolve window);
+        - a parent that never opened an alert at all, and an upstream
+          ancestor in another device's outage (`_upstream_outage`).
+
+        All four used to ask the question their own way — two of them by
+        reading `device["status"]`, which is the poller's last written state
+        rather than the rule's own predicate. `_still_true` re-evaluates the
+        `down` condition itself, so a device the poller has not reached yet
+        does not read as recovered.
+        """
+        entity_id = occurrence.entity_id if entity_id is None else entity_id
+        cache_key = ("device_down", occurrence.entity_kind, str(entity_id))
+        if cache_key not in self._parent_conditions:
+            probe = Occurrence(
+                kind="device_event", source_kind="down",
+                entity_kind=occurrence.entity_kind, entity_id=entity_id,
+                entity_label=occurrence.entity_label, ts=occurrence.ts,
+                message="")
+            self._parent_conditions[cache_key] = self._still_true(probe)
+        return self._parent_conditions[cache_key]
+
     def _upstream_outage(self, rule, occurrence: Occurrence):
-        """The open `device_down` of the nearest ancestor that is also down.
+        """The outage of the nearest ancestor that is also down.
 
         Walks upwards rather than checking only the immediate upstream: in a
         site outage the whole chain goes at once, and whichever device the
         engine happened to see first is the one holding the open alert. The
         walk is cycle-safe and depth-capped in nodesdb.upstream_chain.
+
+        An ancestor with an open outage alert returns that alert, so the
+        child is absorbed into it and says so in its rollup note. An ancestor
+        that is still down but whose alert an operator resolved by hand
+        returns SUPPRESSED instead — the same cover `_parent_operator_resolved`
+        applies within one device, applied up the chain, so resolving a site's
+        outage does not re-open every switch behind it on the next tick.
 
         getattr rather than a direct call so an engine running against a
         database module without the topology columns behaves exactly as it
@@ -1526,11 +1658,122 @@ class AlertEngine:
             device_id = int(occurrence.entity_id)
         except (TypeError, ValueError):
             return None
+        covered = None
         for ancestor_id in chain_of(device_id):
             parent = self.db.open_by_dedup(f"{rule['key']}:device:{ancestor_id}")
             if parent is not None:
                 return parent
-        return None
+            if covered is None and self._parent_still_failing(
+                    occurrence, entity_id=ancestor_id):
+                covered = SUPPRESSED
+        return covered
+
+    def _parent_operator_resolved(self, rule, occurrence: Occurrence) -> bool:
+        """True when an operator resolved this occurrence's rollup PARENT by
+        hand and the parent's condition still holds.
+
+        The gap this closes. A rollup child is suppressed only while its
+        parent alert is open or acknowledged (_rollup_parent ->
+        open_by_dedup), because a resolved parent must not suppress anything
+        forever. But an operator resolving "Device not responding" for a
+        device that is still down released, in the same breath, every alert
+        that outage was hiding: a dead device reports 100 % packet loss on
+        every poll, so "Packet loss to device high" was guaranteed to be
+        breaching and opened again on the very next tick — one new row and
+        one new email per device, five seconds after "Resolved N of N".
+        Acknowledge did not do this, which is what made the difference look
+        arbitrary. The 4.34.0 operator-resolve gate could not see it either:
+        that one is keyed on the CHILD's own dedup key, and nobody ever
+        resolved the child — the engine absorbs children with resolved_by ''
+        precisely so they stay free to re-open.
+
+        So the rule is: an operator's resolve of a parent covers the children
+        it was hiding, for as long as the parent's condition still holds.
+        "Still holds" is asked of current state, never of the resolve:
+
+        - `device_down`: the device's status is still "down" — exactly
+          _still_true's predicate for a held `down` occurrence, and the same
+          question the outage alert itself answers. The moment the device
+          answers again the suppression ends by itself, and a child that is
+          still breaching on its own account (a device that is up but lossy)
+          opens normally. Once a cover has taken effect its parent key is
+          remembered in _parent_covers, so it outlives the hand resolve
+          falling out of OPERATOR_RESOLVE_WINDOW_S: a device that is still
+          down is still down, whatever the calendar says, and the alternative
+          was every child of a long-dead device opening at once exactly seven
+          days after somebody resolved its outage.
+        - a parent with no such state to re-read (`netpath_unreachable`): the
+          child's own breach run must have begun at or before the resolve —
+          the same first_breach_ts <= resolved_ts test the threshold gate
+          uses. A trace that gets through resets that run, so the next
+          breach is a new one and opens.
+
+        Costs no query at all: the parent rule comes from the per-tick
+        _rules_by_key map, the hand resolve from the per-tick
+        _operator_resolves cache, and the device read behind the condition is
+        memoised per tick in _parent_conditions, so N children of one dead
+        device ask once.
+        """
+        parent_key = ROLLED_UP_BY.get(rule["key"] or "")
+        if not parent_key or occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
+            return False
+        parent_rule = self._rules_by_key.get(parent_key)
+        if parent_rule is None:
+            # Absent from the per-tick map means disabled or gone, which is
+            # what _rollup_parent's own enabled test means: a rule that is
+            # not running cannot be suppressing anything.
+            return False
+        parent_dedup = dedup_key(parent_rule, occurrence)
+        resolved_ts = self._operator_resolves.get(parent_dedup)
+        if parent_key == "device_down":
+            # A cover this engine already established outlives the resolve's
+            # seven-day window: the question "is this device still down"
+            # answers itself from current state, and the answer does not
+            # become less true with age.
+            covered_since = self._parent_covers.get(parent_dedup)
+            if resolved_ts is None and covered_since is None:
+                return False
+            if not self._parent_still_failing(occurrence):
+                # The device answered. The cover is over — a child still
+                # breaching on its own account opens on this very tick.
+                self._parent_covers.pop(parent_dedup, None)
+                return False
+            if covered_since is None:
+                self._parent_covers[parent_dedup] = resolved_ts or time.time()
+                # One line, the first time a device's cover takes effect, so
+                # the silence that follows has a trace somebody can find. In
+                # NODES rather than ALERTS because the question it answers —
+                # "why is this dead device not alerting?" — is asked from the
+                # Nodes page, where the device is visibly down.
+                self.log.add(NODES,
+                            f"{occurrence.entity_label}: outage alert resolved "
+                            f"by hand while the device is still down — the "
+                            f"alerts that outage implies stay suppressed until "
+                            f"it answers again",
+                            target=occurrence.device_ip)
+            return True
+        if resolved_ts is None:
+            return False
+        first_breach_ts = self._child_first_breach_ts(rule, occurrence)
+        return first_breach_ts is not None and first_breach_ts <= resolved_ts
+
+    def _child_first_breach_ts(self, rule, occurrence: Occurrence):
+        """When the breach run behind this threshold occurrence began, out of
+        the streak state its evaluator already keeps, or None for an
+        occurrence that is an event rather than a run."""
+        if occurrence.kind == "threshold":
+            try:
+                streak_key = (rule["id"], int(occurrence.entity_id))
+            except (TypeError, ValueError):
+                return None
+            entry = self._breach_streaks.get(streak_key)
+        elif occurrence.kind == "netpath_threshold":
+            entry = self._netpath_streaks.get((rule["id"], str(occurrence.entity_id)))
+        elif occurrence.kind == "dhcp_threshold":
+            entry = self._dhcp_streaks.get((rule["id"], str(occurrence.entity_id)))
+        else:
+            return None
+        return entry[2] if entry else None
 
     def _absorb_subordinates(self, parent_rule, occurrence: Occurrence,
                              parent_row) -> None:
@@ -1674,6 +1917,15 @@ class AlertEngine:
                     self.db.add_rollup_note(
                         parent["id"],
                         f"Suppressed “{rule['name']}” — implied by this outage")
+                    continue
+                if self._parent_operator_resolved(rule, occurrence):
+                    # The parent was resolved by hand while its condition
+                    # still holds, so this child is still implied by it and
+                    # still suppressed — see _parent_operator_resolved. Only
+                    # counted, not noted: there is no open parent row to
+                    # write a rollup note onto, and the resolved one is
+                    # finished work an operator should not see growing.
+                    self.counters["rolled_up"] += 1
                     continue
             row, is_new = self.db.open_or_increment(
                 rule["id"], key, occurrence.entity_kind, occurrence.entity_id,

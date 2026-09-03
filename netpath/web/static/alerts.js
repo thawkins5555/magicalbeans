@@ -12,8 +12,9 @@
     selected: null,
     checked: new Set(),
     // Set by bulkAction right after a resolve/acknowledge completes ("Resolved
-    // 3 of 3"): shown on the engine counters line for a few seconds, then
-    // dropped by the first drawStatus after it expires. Not in the bulk bar:
+    // 3 of 3"), and by detailAction when a single-row action fails: shown on
+    // the engine counters line for a few seconds, then dropped by the first
+    // drawStatus after it expires. Not in the bulk bar:
     // that bar hides the instant the selection clears, and the refresh the
     // action triggers runs synchronously, so nothing put there would paint.
     bulkNotice: null,
@@ -22,10 +23,11 @@
     alertTotal: null,
     // {ruleId: {auto_resolve_after_s, notify}} from /api/alerts/rules/extras.
     ruleExtras: {},
-    // Per session only, like every other table's sort: a saved sort order is
-    // a different feature from saved columns, and mixing the two storage
-    // models is how Reset layout ends up eating a settings choice.
-    alertSort: { key: 'last_ts', descending: true },
+    // Newest first until the operator clicks a heading. That click is
+    // remembered per browser (App.recallSort) — separately from the column
+    // *choice*, which is an account setting: mixing the two storage models
+    // is how Reset layout ends up eating a settings choice.
+    alertSort: App.recallSort('alerts', { key: 'last_ts', descending: true }),
     rules: [],
     rulesSelected: null,
     templates: [],
@@ -40,9 +42,18 @@
 
   const MUTE_HOURS = [1, 6, 12, 24];
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
+  /* How the detail pane names an alert's object when it has to explain why
+     Mute is unavailable. Only the kinds that do NOT resolve to a device need
+     a phrase here; device and interface both do, so they never reach it. */
+  const KIND_LABELS = {
+    trap: 'an SNMP trap', syslog: 'a syslog source', ipam: 'an IPAM address',
+    ap: 'a wireless access point', dhcp_scope: 'a DHCP scope',
+    netpath_target: 'a NetPath destination',
+  };
+
+  // One implementation, in app.js. This was twelve copies of the same three
+  // lines, which is how one of them came to be missing a character while the
+  // others were not — this copy omitted the apostrophe.
   const escape = App.escapeHtml;
 
   function ago(ts) {
@@ -65,7 +76,12 @@
     return {
       state: App.el('alerts-filter-state').value,
       severity: App.el('alerts-filter-sev').value,
-      rule_id: App.el('alerts-filter-rule').value,
+      // The rule list is filled by the refresh below, so on the load after a
+      // reload the restored choice is not on the element yet; the first fetch
+      // has to honour it or the list contradicts the filter for a tick. Once
+      // the list exists the control answers for itself — including "any rule",
+      // which the old `value || saved` form could not express.
+      rule_id: App.controlOrSaved('alerts', 'alerts-filter-rule'),
       device: App.el('alerts-filter-device').value.trim(),
       q: App.el('alerts-filter-text').value.trim(),
     };
@@ -323,6 +339,57 @@
     App.refreshNow('alerts');
   }
 
+  /* One line at the top of the detail pane saying an action on THIS alert
+     failed. The counters line says so too, but that is at the other end of
+     the page and expires after a few seconds; the operator's eyes are on the
+     button they just pressed. Cleared on the next success and wiped by the
+     next full rebuild of the pane — which the signature guard skips while
+     nothing about the alert has changed, so a failure that changed nothing
+     leaves the line standing. */
+  function detailError(text) {
+    const pane = document.getElementById('alerts-detail');
+    if (!pane) return;
+    let line = document.getElementById('alerts-d-error');
+    if (!text) {
+      if (line) line.remove();
+      return;
+    }
+    if (!line) {
+      line = document.createElement('p');
+      line.id = 'alerts-d-error';
+      line.className = 'hint';
+      line.style.color = 'var(--fail)';
+      pane.insertBefore(line, pane.firstChild);
+    }
+    line.textContent = text;
+  }
+
+  /* Every single-row action in the detail pane goes through here. Each one
+     used to `await App.post` bare, so a 403 (an account whose grant changed
+     under an open page) or a 500 left the button looking as though it had
+     worked and the alert unchanged. A failure now lands in three places that
+     matter: the engine counters line, where the bulk actions report theirs;
+     the detail pane itself, where the button is; and nowhere at all in the
+     console, because the refresh is awaited inside its own try. */
+  async function detailAction(label, run) {
+    try {
+      await run();
+      detailError('');
+    } catch (error) {
+      const text = `${label} failed: ${error.message}`;
+      view.bulkNotice = { text, until: Date.now() + 6000 };
+      drawStatus();
+      detailError(text);
+    }
+    // Awaited, and its own failure caught: an un-awaited refresh left the
+    // button looking as though the action had worked while the pane still
+    // showed the old state, and a refresh that itself failed threw out of an
+    // event handler into the console.
+    try {
+      await App.refreshNow('alerts');
+    } catch (error) { /* the notice above already says what happened */ }
+  }
+
   function showDetail(row) {
     App.el('alerts-detail-empty').hidden = true;
     const el = App.el('alerts-detail');
@@ -333,37 +400,64 @@
     // half way through choosing a duration, and re-fetch the notification
     // list for nothing. So the pane is rebuilt only when something it
     // actually displays has changed.
+    // device_id is the API's resolution of this alert to a Nodes device by
+    // the same rule the engine's mute check uses: a device alert is its own
+    // device, an interface alert is the switch the port is on, and anything
+    // outside Nodes (a trap from an unpolled host, a DHCP scope, an AP) is
+    // null. It is in the signature because the mute area is drawn from it.
+    const deviceId = row.device_id ? String(row.device_id) : '';
+    const mutedUntil = deviceId ? (view.mutes.get(deviceId) || null) : null;
     const signature = [row.id, row.state, row.count, row.last_ts,
                        row.acked_by, row.resolved_ts, row.rollup_note,
-                       view.mutes.get(String(row.entity_id)) || ''].join('|');
+                       deviceId, mutedUntil || ''].join('|');
     if (view.detailSignature === signature) return;
     view.detailSignature = signature;
     const rows = view.rules.length ? view.rules : [];
     const rule = rows.find((r) => r.id === row.rule_id);
-    // Only a Nodes device can be muted; entity_id is already its device id.
     // Checked against canWrite here rather than tagged data-requires-write,
     // because applyPermissions only ever runs over markup that already
     // exists — see the note on it in app.js.
-    const muteable = row.entity_kind === 'device' && row.entity_id
-      && App.canWrite('alerts');
-    const mutedUntil = row.entity_kind === 'device'
-      ? view.mutes.get(String(row.entity_id)) : null;
-    let muteHtml = '';
+    const writable = App.canWrite('alerts');
+    const muteable = Boolean(deviceId) && writable;
+    // The mute area is always drawn, disabled with a reason rather than
+    // absent: a control that silently is not there reads as a missing
+    // feature, which is exactly how "Mute Device is gone" was reported.
+    // A device or interface alert whose device has since been removed from
+    // Nodes resolves to nothing either, and saying so beats naming a kind
+    // that plainly is muteable everywhere else on the page.
+    const wasDevice = row.entity_kind === 'device' || row.entity_kind === 'interface';
+    const why = deviceId
+      ? 'Muting a device needs Alerts write'
+      : (wasDevice
+        ? 'The device this alert is about is no longer in Nodes'
+        : `Mute is for device alerts; this one is about ` +
+          `${KIND_LABELS[row.entity_kind] || 'an object outside Nodes'}`);
+    let muteHtml;
     if (mutedUntil) {
-      muteHtml = `<span class="hint" id="alerts-d-muted">Muted until ` +
-        `${escape(new Date(mutedUntil * 1000).toLocaleTimeString())}</span>` +
-        (muteable ? `<button id="alerts-d-unmute">Lift mute</button>` : '');
+      const until = escape(new Date(mutedUntil * 1000).toLocaleTimeString());
+      muteHtml = `<span class="hint" id="alerts-d-muted">Muted until ${until}</span>` +
+        (muteable
+          ? `<button id="alerts-d-unmute">Lift mute</button>`
+          : `<button disabled title="${escape(why)}">Lift mute</button>`);
     } else if (muteable) {
-      muteHtml = `<select id="alerts-d-mute-hours" title="How long to silence new alerts for this device">` +
+      muteHtml = `<select id="alerts-d-mute-hours" class="fixed" title="How long to silence new alerts for this device">` +
         MUTE_HOURS.map((h) => `<option value="${h}">${h} hour${h === 1 ? '' : 's'}</option>`).join('') +
         `</select><button id="alerts-d-mute">Mute device</button>`;
+    } else {
+      muteHtml = `<button id="alerts-d-mute" disabled title="${escape(why)}">Mute device</button>`;
     }
+    // One line under the bar saying why the button is dead, because a
+    // disabled control with only a tooltip is unreadable on a touch screen
+    // and invisible to anyone who does not think to hover it.
+    const muteHint = muteable
+      ? '' : `<p class="hint" id="alerts-d-mute-why">${escape(why)}</p>`;
     el.innerHTML = `
-      <div class="bar"><span class="section sev sev-${row.severity}">${escape(row.severity_name)}</span>
+      <div class="bar wrap"><span class="section sev sev-${row.severity}">${escape(row.severity_name)}</span>
         <span class="grow"></span>
         ${muteHtml}
-        ${row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
-        ${row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}</div>
+        ${writable && row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
+        ${writable && row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}</div>
+      ${muteHint}
       <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
       <p>${escape(row.message)}</p>
       ${row.detail ? `<p class="hint">${escape(row.detail)}</p>` : ''}
@@ -380,28 +474,20 @@
       <div class="bar"><span class="section">NOTIFICATIONS</span></div>
       <div id="alerts-d-notifications" class="hint">Loading…</div>`;
     const resolveBtn = document.getElementById('alerts-d-resolve');
-    if (resolveBtn) resolveBtn.onclick = async () => {
-      await App.post(`/api/alerts/${row.id}/resolve`, {});
-      App.refreshNow('alerts');
-    };
+    if (resolveBtn) resolveBtn.onclick = () =>
+      detailAction('Resolve', () => App.post(`/api/alerts/${row.id}/resolve`, {}));
     const ackBtn = document.getElementById('alerts-d-ack');
-    if (ackBtn) ackBtn.onclick = async () => {
-      await App.post(`/api/alerts/${row.id}/ack`, {});
-      App.refreshNow('alerts');
-    };
-    const muteBtn = document.getElementById('alerts-d-mute');
-    if (muteBtn) muteBtn.onclick = async () => {
+    if (ackBtn) ackBtn.onclick = () =>
+      detailAction('Acknowledge', () => App.post(`/api/alerts/${row.id}/ack`, {}));
+    const muteBtn = muteable ? document.getElementById('alerts-d-mute') : null;
+    if (muteBtn) muteBtn.onclick = () => detailAction('Mute', () => {
       const hours = Number(App.el('alerts-d-mute-hours').value) || 1;
-      await App.post('/api/alerts/mute', {
-        entity_kind: 'device', entity_id: String(row.entity_id), hours });
-      App.refreshNow('alerts');
-    };
+      return App.post('/api/alerts/mute',
+                      { entity_kind: 'device', entity_id: deviceId, hours });
+    });
     const unmuteBtn = document.getElementById('alerts-d-unmute');
-    if (unmuteBtn) unmuteBtn.onclick = async () => {
-      await App.del('/api/alerts/mute', {
-        entity_kind: 'device', entity_id: String(row.entity_id) });
-      App.refreshNow('alerts');
-    };
+    if (unmuteBtn) unmuteBtn.onclick = () => detailAction('Lift mute', () =>
+      App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId }));
     App.get(`/api/alerts/${row.id}`).then((full) => {
       const box = document.getElementById('alerts-d-notifications');
       if (!box) return;
@@ -1017,17 +1103,39 @@
     drawTemplatesTable();
   }
 
+  /* Filled from the refresh, after init() — so a restored choice arrives
+     from the store here rather than from restoreControls. A rule that has
+     since been deleted matches no option, which selects nothing at all:
+     snap back to "any rule" rather than show a blank filter. */
   function fillRuleFilter() {
     const select = App.el('alerts-filter-rule');
-    const current = select.value;
+    const current = select.value || App.savedControl('alerts', 'alerts-filter-rule') || '';
     select.innerHTML = '<option value="">any rule</option>' +
       view.rules.map((r) => `<option value="${r.id}">${escape(r.name)}</option>`).join('');
     select.value = current;
+    // Dropped from the store as well as from the control: while it is stored,
+    // filters() above would go on sending a rule id that matches nothing.
+    if (select.selectedIndex < 0) {
+      select.value = '';
+      App.rememberControl('alerts', 'alerts-filter-rule', '');
+    }
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back. Listeners run in registration order. restoreControls
+       stays at the end, after the range and severity lists exist; it assigns
+       from script, which fires no event. */
+    const CONTROLS = ['alerts-filter-sev', 'alerts-filter-state',
+      'alerts-filter-rule', 'alerts-filter-device', 'alerts-filter-text',
+      'alerts-range'];
+    App.rememberControls('alerts', CONTROLS);
     for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
-      btn.onclick = () => selectSub(btn.dataset.subtab);
+      btn.onclick = () => {
+        App.rememberSub('alerts', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
     }
     App.fillRanges(App.el('alerts-range'), 'Last 24 hours');
     const sev = App.el('alerts-filter-sev');
@@ -1102,6 +1210,12 @@
         if (App.state.tab === 'alerts') drawHistogram();
       });
     }
+
+    // Last thing in init(): the range and severity lists above are filled
+    // and nothing has been fetched, so the first refresh reads these back
+    // out of the DOM the way it reads the markup defaults.
+    App.restoreControls('alerts', CONTROLS);
+    selectSub(App.recallSub('alerts', 'current'));
   }
 
   function selectSub(name) {

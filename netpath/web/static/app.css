@@ -447,6 +447,10 @@ body.tiny .terms { display: none; }
    The title is the part that gives way; the controls keep their size. */
 .bar > .section { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar > button { flex: none; }
+/* Opt-in for a select that must keep its width when a bar wraps: in the
+   alert detail's 30 % pane a shrinking duration picker collapsed to a
+   sliver of arrow with no readable value. Only the selects that ask. */
+.bar > select.fixed { flex: none; }
 .row { display: flex; gap: 6px; }
 .row button { flex: 1; }
 .row button.half { flex: 0 1 50%; }

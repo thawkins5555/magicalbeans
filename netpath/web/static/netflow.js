@@ -103,7 +103,12 @@
       dst: App.el('nf-dst').value.trim(),
       port: App.el('nf-port').value.trim(),
       protocol: App.el('nf-protocol').value,
-      exporter: App.el('nf-exporter').value,
+      // The exporter list is filled from the response below, so on the load
+      // after a reload the restored choice is not on the element yet and the
+      // first fetch would ignore it. Once the list exists the control answers
+      // for itself, "All exporters" included — the old `value || saved` form
+      // read an empty choice as "no answer" and re-sent the previous one.
+      exporter: App.controlOrSaved('netflow', 'nf-exporter'),
     };
   }
 
@@ -412,7 +417,7 @@
   /* Which column the table is ordered by. Separate from the selector above it:
      that one decides which records the server sends back, this one decides how
      the returned records are arranged. */
-  let sort = { key: 'bytes', descending: true };
+  let sort = App.recallSort('nf-records', { key: 'bytes', descending: true });
 
   function onSort(key, descending) {
     sort = { key, descending };
@@ -687,6 +692,18 @@
         exporter.appendChild(option);
       }
     }
+    // The one late-filled control on this page: a restored exporter can only
+    // be selected once the option it names exists. An exporter that has
+    // stopped sending never appears, and the filter stays on "All".
+    if (!exporter.value) {
+      exporter.value = App.savedControl('netflow', 'nf-exporter') || '';
+      // Nothing to select it on: drop it, rather than let filters() keep
+      // asking the server for an exporter this page cannot show as chosen.
+      if (exporter.selectedIndex < 0) {
+        exporter.value = '';
+        App.rememberControl('netflow', 'nf-exporter', '');
+      }
+    }
 
     view.fetchedAt = Date.now();
     drawChart();
@@ -696,9 +713,21 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end, after the dimension, protocol and range lists exist;
+       it assigns from script, which fires no event. Follow is deliberately
+       not restored. */
+    const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
+      'nf-protocol', 'nf-exporter', 'nf-order'];
+    App.rememberControls('netflow', CONTROLS);
     App.fillRanges(App.el('nf-range'), 'Last hour');
     const dimension = App.el('nf-dimension');
-    for (const name of App.state.dimensions) {
+    // /api/state sends the dimension list only to an account with NetFlow
+    // read; init() runs for every page regardless, so an account without it
+    // must not throw here and take the rest of the boot down with it.
+    for (const name of App.state.dimensions || []) {
       const option = document.createElement('option');
       option.value = name;
       option.textContent = name;
@@ -759,11 +788,13 @@
     }
     App.el('nf-apply').onclick = () => App.refreshNow('netflow');
     App.el('nf-clear').onclick = () => {
-      App.el('nf-src').value = '';
-      App.el('nf-dst').value = '';
-      App.el('nf-port').value = '';
-      App.el('nf-protocol').value = '';
-      App.el('nf-exporter').value = '';
+      const cleared = ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'];
+      for (const id of cleared) App.el(id).value = '';
+      // Assigning .value from script fires no event, so the store would keep
+      // every value Clear has just removed — and the exporter fallback in
+      // filters() would go on asking the server for one this bar no longer
+      // shows, which is what made Clear unable to clear the exporter at all.
+      App.syncControls('netflow', cleared);
       App.refreshNow('netflow');
     };
     for (const id of ['nf-src', 'nf-dst', 'nf-port']) {
@@ -771,7 +802,9 @@
         if (event.key === 'Enter') App.refreshNow('netflow');
       };
     }
-    App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
+    // Same rule as the dimension list above: flow settings are only in the
+    // state of an account that may read NetFlow.
+    App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
     App.el('nf-resolve').onchange = async (event) => {
       await App.post('/api/settings', {
         scope: 'netflow', values: { resolve_addresses: event.target.checked },
@@ -794,6 +827,12 @@
         if (App.state.tab === 'netflow') drawChart();
       });
     }
+
+    // Restored before resetWindow(), which reads the range straight off
+    // nf-range to size the first window — after it, the window would be
+    // built from the markup default and only correct itself on the next
+    // change.
+    App.restoreControls('netflow', CONTROLS);
     resetWindow();
   }
 

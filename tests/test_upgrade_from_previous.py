@@ -94,6 +94,47 @@ AlertsDatabase(alerts_path).close()
 check("alerts.db opens twice (its 4.34 index is migration-only)",
       AlertsDatabase(alerts_path).close() is None)
 
+# 4.37.0 replaces the alerts index that backs the engine's per-tick hand-
+# resolve lookup: ix_alerts_dedup_state led with dedup_key, which that query
+# does not constrain, so it could not range-scan `state='resolved' AND
+# resolved_ts >= ?`. The swap happens in _migrate, so an existing alerts.db
+# is where it has to be proved — a fresh one has never had the old index at
+# all. The fixture is put back into the 4.36 shape by hand for that reason.
+conn = sqlite3.connect(alerts_path)
+conn.executescript("""
+    DROP INDEX IF EXISTS ix_alerts_state_resolved;
+    CREATE INDEX IF NOT EXISTS ix_alerts_dedup_state
+        ON alerts(dedup_key, state, resolved_ts);
+""")
+conn.commit()
+old_idx = {r[1] for r in conn.execute("PRAGMA index_list(alerts)")}
+conn.close()
+check("the fixture really is the 4.36 index shape",
+      "ix_alerts_dedup_state" in old_idx
+      and "ix_alerts_state_resolved" not in old_idx, old_idx)
+
+alerts_db = AlertsDatabase(alerts_path)
+new_idx = {r["name"] for r in
+           alerts_db._conn.execute("PRAGMA index_list(alerts)").fetchall()}
+check("...and the migration creates the index the per-tick query needs",
+      "ix_alerts_state_resolved" in new_idx, new_idx)
+check("...and drops the one it replaces",
+      "ix_alerts_dedup_state" not in new_idx, new_idx)
+# The predicate comes from the database class itself rather than being
+# spelled out again here: a copy would go on passing after the real one
+# changed, which is the one thing this check exists to catch.
+plan = " ".join(str(r[-1]) for r in alerts_db._conn.execute(
+    "EXPLAIN QUERY PLAN SELECT dedup_key, MAX(resolved_ts) FROM alerts"
+    f" WHERE state = 'resolved' AND {AlertsDatabase._OPERATOR_RESOLVE_SQL}"
+    " AND resolved_ts >= 0 GROUP BY dedup_key").fetchall())
+# The index has to be USED; whether the planner calls that SEARCH or
+# "SCAN ... USING INDEX" (a covering-index scan is a perfectly good plan for
+# this GROUP BY) varies by SQLite build, and asserting one of those spellings
+# made the test a report on the local sqlite3 rather than on the schema.
+check("...and the hand-resolve query is served by it",
+      "ix_alerts_state_resolved" in plan, plan)
+alerts_db.close()
+
 # ------------------------------------------- part 2: the previous release
 old = os.path.join(work, "old")
 os.makedirs(old, exist_ok=True)

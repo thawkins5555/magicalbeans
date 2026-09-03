@@ -7,8 +7,9 @@
   const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
-    // Newest first, the order the server already returns.
-    trapSort: { key: 'ts', descending: true },
+    // Newest first, the order the server already returns — until the
+    // operator clicks a heading, which is remembered per browser.
+    trapSort: App.recallSort('snmp-traps', { key: 'ts', descending: true }),
     t0: Date.now() / 1000 - 86400,
     t1: Date.now() / 1000,
     follow: true,
@@ -476,6 +477,14 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end, after the severity, trap-kind and range lists exist;
+       it assigns from script, which fires no event. Live is not restored. */
+    const CONTROLS = ['sn-q', 'sn-severity', 'sn-kind', 'sn-version', 'sn-source',
+      'sn-oid', 'sn-range', 'sn-limit', 'sn-show-hostname'];
+    App.rememberControls('snmp', CONTROLS);
     App.fillRanges(App.el('sn-range'), 'Last 24 hours');
     const severity = App.el('sn-severity');
     severity.innerHTML = '<option value="">Any severity</option>';
@@ -502,12 +511,13 @@
 
     App.el('sn-apply').onclick = () => App.refreshNow('snmp');
     App.el('sn-clear').onclick = () => {
-      for (const id of ['sn-q', 'sn-source', 'sn-oid']) {
-        App.el(id).value = '';
-      }
-      App.el('sn-severity').value = '';
-      App.el('sn-kind').value = '';
-      App.el('sn-version').value = '';
+      const cleared = ['sn-q', 'sn-source', 'sn-oid',
+        'sn-severity', 'sn-kind', 'sn-version'];
+      for (const id of cleared) App.el(id).value = '';
+      // Assigning .value from script fires no event, so without this the
+      // store would keep every filter Clear has just removed and a reload
+      // would come back filtered by them.
+      App.syncControls('snmp', cleared);
       App.refreshNow('snmp');
     };
     for (const id of ['sn-q', 'sn-source', 'sn-oid']) {
@@ -540,6 +550,15 @@
         if (App.state.tab === 'snmp') drawHistogram();
       });
     }
+
+    // Last thing in init(): the severity, trap-kind and range lists above
+    // are filled, so a restored choice has an option to land on. Live is
+    // not restored — a page that came back already frozen would give the
+    // operator no clue why nothing moves.
+    App.restoreControls('snmp', CONTROLS);
+    // The box is the setting's only home on a fresh load, but the table
+    // reads view.showHostname, so the two have to start out agreeing.
+    view.showHostname = App.el('sn-show-hostname').checked;
   }
 
   /* #/snmp/<id>: select the row a link names, once refresh() has

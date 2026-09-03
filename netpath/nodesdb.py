@@ -1090,15 +1090,29 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM devices WHERE ip = ?", (ip,)).fetchone()
 
-    def devices_by_ids(self, device_ids: list[int]) -> list[sqlite3.Row]:
-        """device() for many ids in one query. Order is unspecified — callers
-        needing a particular order build a dict keyed by id from the result."""
-        if not device_ids:
+    # How many ids go into one IN (...) list. SQLite builds before 3.32 cap
+    # SQLITE_MAX_VARIABLE_NUMBER at 999 bind parameters, and the callers here
+    # are page-sized rather than small: an alert list is up to 2000 rows, each
+    # of which can name a device. 500 keeps every statement well inside the
+    # oldest limit and still asks at most a handful of questions.
+    _IDS_PER_QUERY = 500
+
+    def devices_by_ids(self, device_ids) -> list[sqlite3.Row]:
+        """device() for many ids, in as few queries as the bind-parameter
+        limit allows. Order is unspecified — callers needing a particular
+        order build a dict keyed by id from the result. Duplicate ids are
+        collapsed, so a caller may hand this a list straight off its rows."""
+        ids = list(dict.fromkeys(device_ids))
+        if not ids:
             return []
-        marks = ",".join("?" * len(device_ids))
+        rows: list[sqlite3.Row] = []
         with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM devices WHERE id IN ({marks})", device_ids).fetchall()
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    f"SELECT * FROM devices WHERE id IN ({marks})", chunk).fetchall()
+        return rows
 
     def upstream_chain(self, device_id: int, max_depth: int = 8) -> list[int]:
         """Device ids above this one, nearest first.

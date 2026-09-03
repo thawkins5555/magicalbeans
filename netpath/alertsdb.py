@@ -546,13 +546,28 @@ class AlertsDatabase:
             # overwrites every time the same alert recurs.
             self._conn.execute(
                 "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
-        # Backs operator_resolved_ts/operator_resolved_since: both filter on
-        # (state, resolved_by) and group by dedup_key, so an index leading
-        # with dedup_key and covering state and resolved_ts serves the exact
-        # query the engine runs once per tick.
+        # Backs operator_resolved_since, which the engine runs once per tick:
+        # state = 'resolved' AND resolved_ts >= ?, grouped by dedup_key. That
+        # is a range scan, and a range scan needs the equality column first
+        # and the ranged one second — ix_alerts_dedup_state led with
+        # dedup_key, the column this query does not constrain at all, so
+        # SQLite had to walk every resolved alert ever recorded and test each
+        # one. Leading with (state, resolved_ts) seeks straight to the recent
+        # hand resolves, and carrying dedup_key as the third column keeps the
+        # whole query inside the index. ix_alerts_dedup_state is dropped
+        # rather than kept alongside: operator_resolved_since is the only
+        # caller that asks about resolved rows at all, ux_alerts_active_dedup
+        # is a PARTIAL index over open/acked and so can never serve them, and
+        # a second index leading with dedup_key would be write cost for a
+        # query nothing makes.
+        #
+        # In _migrate rather than SCHEMA on purpose — see INTERNALS' rule
+        # about indexes and migrated columns, and the 4.34.0 start-up failure
+        # that produced it.
+        self._conn.execute("DROP INDEX IF EXISTS ix_alerts_dedup_state")
         self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_alerts_dedup_state"
-            " ON alerts(dedup_key, state, resolved_ts)")
+            "CREATE INDEX IF NOT EXISTS ix_alerts_state_resolved"
+            " ON alerts(state, resolved_ts, dedup_key)")
 
     # Post-seed migrations, in the order they were introduced. A migration
     # belongs here rather than in _migrate() when it has to read or rewrite
@@ -1270,29 +1285,24 @@ class AlertsDatabase:
     # resolve triggered by a person goes through the API with a real,
     # non-empty session username (write endpoints require a session), so
     # this predicate is exactly "resolved by hand".
-    _OPERATOR_RESOLVE_SQL = "resolved_by NOT IN ('', 'engine')"
-
-    def operator_resolved_ts(self, dedup_key: str) -> float | None:
-        """The latest resolved_ts of a `resolved` alert with this dedup_key
-        that an operator resolved by hand, or None when the alert has never
-        been resolved or was only ever auto-resolved by the engine.
-
-        Used by AlertEngine to decide whether a still-breaching (or still
-        down) condition is the SAME run an operator already resolved --
-        see operator_resolved_since for the per-tick bulk form of this same
-        query, which is what the engine actually calls on its hot path.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT MAX(resolved_ts) AS ts FROM alerts WHERE dedup_key = ?"
-                f" AND state = 'resolved' AND {self._OPERATOR_RESOLVE_SQL}",
-                (dedup_key,)).fetchone()
-        return row["ts"] if row and row["ts"] is not None else None
+    #
+    # The COALESCE changes nothing about the one query that uses this. A NULL
+    # resolved_by makes `NULL NOT IN ('', 'engine')` evaluate to NULL, and a
+    # WHERE clause discards NULL exactly as it discards false — which is the
+    # answer wanted, since a row with no resolved_by is not an operator
+    # resolve. It is written out anyway because the predicate reads as a
+    # statement about the data ("resolved by a person") rather than as a
+    # filter that happens to work, and because a future caller that asks it
+    # the other way round (NOT (...), or in a CASE) would get NULL where it
+    # wanted true. Rows with a NULL resolved_by exist: a much older build, or
+    # a hand edit in sqlite3.
+    _OPERATOR_RESOLVE_SQL = "COALESCE(resolved_by, '') NOT IN ('', 'engine')"
 
     def operator_resolved_since(self, cutoff_ts: float) -> dict[str, float]:
         """dedup_key -> latest resolved_ts, for every dedup_key an operator
         resolved by hand at or after cutoff_ts. One indexed query
-        (ix_alerts_dedup_state) rather than one per breaching rule/device;
+        (ix_alerts_state_resolved, whose leading (state, resolved_ts) is
+        exactly this range scan) rather than one per breaching rule/device;
         AlertEngine runs this once per tick and caches the result."""
         with self._lock:
             rows = self._conn.execute(

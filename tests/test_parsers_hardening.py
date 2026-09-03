@@ -41,7 +41,7 @@ def timed(fn, *args, **kwargs):
 
 # ------------------------------------------------------- H1: parse() is linear
 #
-# Every shape below made parse() quadratic before 4.37.0. The numbers in the
+# Every shape below made parse() quadratic before 4.38.0. The numbers in the
 # comments are what the unfixed parser measured on this hardware; `re` holds
 # the GIL while it matches, so each of those seconds was a second in which
 # the whole appliance answered nothing.

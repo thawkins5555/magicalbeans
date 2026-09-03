@@ -435,22 +435,58 @@
           select.appendChild(option);
         }
       }
-      // Only new rows are appended; nothing about which events match has
-      // changed, so there is nothing to rebuild.
-      drawEvents({ append: true });
+      const selectedBefore = select.value;
+      /* Late-filled: destinations are discovered from the event stream, so a
+         restored choice may name one this batch simply has not mentioned yet
+         — the list only ever grows, and a quiet destination can be several
+         batches away. So the choice is OFFERED rather than forgotten: it goes
+         in as an option of its own and is selected, and the batch that does
+         name it finds it already in view.targets and adds nothing. Forgetting
+         it instead is what dropped a restored destination on the first tick
+         after a reload. */
+      if (!select.value) {
+        const saved = App.savedControl('debug', 'dbg-target') || '';
+        if (saved) {
+          if (!view.targets.has(saved)) {
+            view.targets.add(saved);
+            const option = document.createElement('option');
+            option.value = saved;
+            option.textContent = saved;
+            select.appendChild(option);
+          }
+          select.value = saved;
+        }
+      }
+            // Only new rows are appended: nothing about which events match
+      // has changed, so there is nothing to rebuild — unless the
+      // restore above just changed which destination is selected.
+      drawEvents(selectedBefore === select.value
+        ? { append: true } : undefined);
     }
   }
 
   function init() {
     const cats = App.el('dbg-categories');
+    // Each box gets an id so the shared control store can carry it: the set
+    // of categories comes from the server, so the stored keys stay bounded
+    // by what this build knows about.
     for (const category of App.state.categories) {
       const label = document.createElement('label');
       label.className = 'check';
       label.innerHTML =
-        `<input type="checkbox" value="${category}" checked> ${CATEGORY_LABEL[category] || category}`;
-      label.querySelector('input').onchange = drawEvents;
+        `<input type="checkbox" id="dbg-cat-${category}" value="${category}" checked>` +
+        ` ${CATEGORY_LABEL[category] || category}`;
       cats.appendChild(label);
     }
+    /* The category boxes have to exist before the store can listen to them,
+       so this is as early as it goes — but still before every handler of this
+       module's own, so a change writes the store before anything reacting to
+       it reads back. restoreControls stays at the end of init(); it assigns
+       from script, which fires no event. */
+    const CONTROLS = ['dbg-target', 'dbg-search'].concat(
+      App.state.categories.map((category) => `dbg-cat-${category}`));
+    App.rememberControls('debug', CONTROLS);
+    for (const input of cats.querySelectorAll('input')) input.onchange = drawEvents;
     App.el('dbg-target').innerHTML = '<option value="">All destinations</option>';
     App.el('dbg-target').onchange = drawEvents;
     App.el('dbg-search').oninput = drawEventsDebounced;
@@ -459,10 +495,16 @@
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
     };
     /* Ticking every category back on one at a time is the reason "None" on
-       its own would be a trap, so both directions are offered. Nothing is
-       stored: categoriesOn() reads the boxes live on every draw. */
+       its own would be a trap, so both directions are offered. categoriesOn()
+       reads the boxes live on every draw, so nothing here has to be kept in
+       step with them — but the store does, since setting .checked from script
+       is silent (see below). */
     const setAllCategories = (on) => {
       for (const input of cats.querySelectorAll('input')) input.checked = on;
+      // Setting .checked from script fires no event, so without this the
+      // store would keep the boxes as they were: None followed by a reload
+      // used to come back with every category ticked again.
+      App.syncControls('debug', App.state.categories.map((c) => `dbg-cat-${c}`));
       drawEvents();
     };
     App.el('dbg-cats-all').onclick = () => setAllCategories(true);
@@ -484,6 +526,11 @@
         });
     };
     App.el('dbg-export').onclick = exportLog;
+
+    // Last thing in init(): the category boxes above exist, and nothing has
+    // been drawn — the first drawEvents reads all of these live. Follow is
+    // deliberately not restored.
+    App.restoreControls('debug', CONTROLS);
   }
 
   App.pages.debug = { init, refresh, fastTick };

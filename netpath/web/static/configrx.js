@@ -9,10 +9,10 @@
     devices: [],
     selectedDeviceId: null,
     devicesChecked: new Set(),
-    deviceSort: { key: 'name', descending: false },
+    deviceSort: App.recallSort('configrx-devices', { key: 'name', descending: false }),
     backups: [],
     backupsChecked: new Set(),
-    backupSort: { key: 'ts', descending: true },
+    backupSort: App.recallSort('configrx-backups', { key: 'ts', descending: true }),
     selectedBackupId: null,
     backupContent: '',
   };
@@ -679,9 +679,14 @@
     if (App.state.tab !== 'configrx') return;
     drawStatus();
     const vendorSelect = App.el('cx-filter-vendor');
+    // The vendor list is built from this very response, so on the load after
+    // a reload the restored choice is not on the element yet; the fetch has
+    // to read it from the store or the list would contradict the filter. Once
+    // the list exists the control answers for itself, "All vendors" included.
+    const vendor = App.controlOrSaved('configrx', 'cx-filter-vendor');
     const params = { q: App.el('cx-q').value.trim() };
     if (App.el('cx-enabled-only').checked) params.enabled_only = 1;
-    if (vendorSelect.value) params.vendor = vendorSelect.value;
+    if (vendor) params.vendor = vendor;
     const result = await App.get('/api/configrx/devices', params);
     view.devices = result.devices;
     drawVendorFilter(result.devices, vendorSelect);
@@ -695,17 +700,38 @@
      the current choice is kept in the list — otherwise picking one would
      immediately empty the control that made the choice. */
   function drawVendorFilter(devices, select) {
-    const current = select.value;
+    const fromSelect = select.value;
+    const current = fromSelect ||
+      App.savedControl('configrx', 'cx-filter-vendor') || '';
     const seen = new Set(devices.map((d) => d.effective_vendor || '(none)'));
-    if (current) seen.add(current);
+    // A choice made ON the control is kept in the list whatever the response
+    // holds — the response only holds that vendor, so dropping it would empty
+    // the control that made the choice. A choice restored from the STORE is
+    // kept only if some device really has that vendor: re-adding it
+    // unconditionally is what left a device list permanently empty behind a
+    // filter naming a vendor nothing carried any more.
+    if (current && (fromSelect || seen.has(current))) seen.add(current);
     const options = [...seen].sort();
     select.innerHTML = '<option value="">All vendors</option>' +
       options.map((v) =>
         `<option value="${escape(v)}">${escape(v)}</option>`).join('');
     select.value = current;
+    // Dropped from the store as well as from the control: while it is stored,
+    // refresh() above would go on filtering by a vendor with no devices and
+    // no way to clear it, since the filter shows blank rather than the value.
+    if (select.selectedIndex < 0) {
+      select.value = '';
+      App.rememberControl('configrx', 'cx-filter-vendor', '');
+    }
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end and assigns from script, which fires no event. */
+    const CONTROLS = ['cx-q', 'cx-filter-vendor', 'cx-enabled-only'];
+    App.rememberControls('configrx', CONTROLS);
     App.el('cx-apply').onclick = () => App.refreshNow('configrx');
     App.el('cx-q').onkeydown = (event) => {
       if (event.key === 'Enter') App.refreshNow('configrx');
@@ -791,6 +817,11 @@
       await App.loadState();
       App.refreshNow('configrx');
     };
+
+    // Last thing in init(): refresh() reads the search and the tickbox
+    // straight off the DOM, so the first search already carries them. The
+    // vendor list is late-filled — see drawVendorFilter.
+    App.restoreControls('configrx', CONTROLS);
   }
 
   /* #/configrx/device/<id> and .../backup/<bid>. Runs after refresh(), so

@@ -55,7 +55,7 @@ the network described above, for four structural reasons:
    Juniper, Fortinet or Palo Alto health OIDs, environment sensors, PoE, LLDP,
    ARP, BGP, firewall sessions or wireless RF metrics. Seven of the 32 built-in
    alert rules can never fire because nothing produces their metric key.
-   *(4.37.0 ships 35 built-in rules and all seven of those are live; see §9
+   *(4.38.0 ships 35 built-in rules and all seven of those are live; see §9
    A-F1 and P-S9.)*
 3. **A site outage is N alerts, not one.** Rollup is same-device only
    (`netpath/alertrules.py:142-189`); there is no topology, no upstream field,
@@ -501,7 +501,7 @@ rollup running, cached settings in the scheduler, one keyed alert query, and
 GETBULK for the interface columns) plus concurrent pings with back-off for
 failing devices (§4.5 X-F15) are what move that ceiling; none of them is large.
 
-### 3.5 After the fixes — the same campaign re-run on 4.37.0
+### 3.5 After the fixes — the same campaign re-run on 4.38.0
 
 Everything in §3.1–§3.4 was measured against 4.35.0. The campaign was re-run
 after all eight workstreams merged, on the same machine, with the same fleet
@@ -1023,7 +1023,7 @@ says which half.
 The documentation-truth rows at the end of §4.6 (D1–D28) are not repeated here:
 all twenty-eight are closed by the documentation workstream, in `35e5a2d`,
 `1c52ac5`, `c90b5fa`, `e9da3d6`, `fbead48` and `07317d3`, and the
-`CHANGELOG.md` 4.37.0 Documentation block lists them one by one.
+`CHANGELOG.md` 4.38.0 Documentation block lists them one by one.
 
 Suites named `§X` refer to the section marker of that name inside the file;
 `tests/test_poll_write_path.py` is organised as named functions instead.
@@ -1415,11 +1415,11 @@ trust. And `snmptrapdb.py` and `ipamdb.py` carry the same VACUUM-under-the-lock
 shape as §4.5 X-F5, which the report had guessed at ("Same shape in five other
 DB modules") without checking: it is there, in both (G-24).
 
-The last column records what 4.37.0 did with each row. Thirty-two of the
+The last column records what 4.38.0 did with each row. Thirty-two of the
 thirty-three are closed in this release; only G-26 is not, and §9's Deferred
 list says why. §9 carries the commit and the test for every one of them.
 
-| id | Where | Sev | Tag | What | Owner | Fixed in 4.37.0 |
+| id | Where | Sev | Tag | What | Owner | Fixed in 4.38.0 |
 |---|---|---|---|---|---|---|
 | G-1 | `web/wsock.py:347-360` | high | CONFIRMED | An idle terminal burns a whole CPU core once the socket's fd is ≥ 1024 | D | yes — I1 |
 | G-2 | `sshterm.py:271-294` | high | CONFIRMED | A socket that never sends `open` holds a session slot, a thread and its authorisation forever | D | yes — I2 |

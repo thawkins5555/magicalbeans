@@ -315,7 +315,7 @@ def main():
     # --- a device that answers ping but whose SNMP agent has died.
     #     unreachable_ping_only (the default) rightly keeps it out of
     #     device_down — it is reachable and broken, not down — and before
-    #     4.37.0 nothing else said anything at all, so a dead agent on a
+    #     4.38.0 nothing else said anything at all, so a dead agent on a
     #     live switch was invisible. It records an `snmp_error` event per
     #     failing poll, which the snmp_failing_ping_ok rule watches.
     if shutil.which("ping") is None:
@@ -350,6 +350,81 @@ def main():
             "a reachable device must not record a new down event"
         print(f"ping-ok: {len(events)} snmp_error event(s) recorded while status "
               f"stayed {device['status']!r} OK")
+
+    # --- polls 9-15: SNMP authentication events are TRANSITIONS
+    # A credential that is wrong stays wrong on every poll, so recording
+    # auth_fail each time meant "SNMP authentication failing" re-opened
+    # within a poll interval however often an operator resolved it. The
+    # transition is held in the poller (NodePoller._auth_failing), not read
+    # back off the device row, because the row cannot answer the question:
+    # any SNMP failure recovering looked like an auth recovery, and a profile
+    # with several candidate credentials re-raises the LAST candidate's
+    # error, so the recorded error alternates between an auth string and a
+    # timeout while nothing about the device has changed. The failures are
+    # injected at the credential call rather than in the stub agent, because
+    # the event logic under test is in _poll_device and this keeps the stub
+    # what workstream A shipped.
+    from netpath.nodepoll import _AuthFailure, SnmpTimeout
+
+    real_scalars = poller._poll_snmp_scalars_with_credential
+    next_error = [_AuthFailure("authentication failure (wrong community)")]
+
+    def failing_snmp(device, config):
+        raise next_error[0]
+
+    def auth_kinds():
+        return [e["kind"] for e in db.device_events(device_id)
+                if e["kind"] in ("auth_fail", "auth_ok")]
+
+    before = auth_kinds()
+    poller._poll_snmp_scalars_with_credential = failing_snmp
+    do_poll()
+    do_poll()
+    after = auth_kinds()
+    assert after.count("auth_fail") == before.count("auth_fail") + 1, \
+        f"two failing polls must record ONE auth_fail, got {after}"
+    print("poll 9-10: two identical auth failures record one auth_fail OK")
+
+    # The multi-credential case: the error alternates auth -> timeout -> auth
+    # without the device changing at all. Comparing this poll's error text
+    # with the last one's read that as a new fact every other poll, which is
+    # the de-duplication defeating itself.
+    next_error[0] = SnmpTimeout("timed out")
+    do_poll()
+    next_error[0] = _AuthFailure("authentication failure (wrong v3 user)")
+    do_poll()
+    alternating = auth_kinds()
+    assert alternating.count("auth_fail") == after.count("auth_fail"), \
+        f"an alternating auth/timeout error is still the same failure: {alternating}"
+    assert alternating.count("auth_ok") == before.count("auth_ok"), \
+        f"and a timeout in the middle of it is not a recovery: {alternating}"
+    print("poll 11-12: auth, timeout, a different auth error -> still one "
+          "auth_fail and no auth_ok OK")
+
+    poller._poll_snmp_scalars_with_credential = real_scalars
+    do_poll()
+    cleared = auth_kinds()
+    assert cleared.count("auth_ok") == before.count("auth_ok") + 1, \
+        f"SNMP working again after a failure must record one auth_ok, got {cleared}"
+    do_poll()
+    assert auth_kinds().count("auth_ok") == cleared.count("auth_ok"), \
+        "auth_ok is a transition too: a second good poll records nothing"
+    print("poll 13-14: SNMP works again -> exactly one auth_ok OK")
+
+    # A device that was never failing on AUTH recovering from a timeout is
+    # not an auth recovery. A WAN device that times out one poll in ten used
+    # to write an auth_ok on every recovery, and every one of them became an
+    # engine occurrence against device_auth_fail's CLEARS pair.
+    settled = auth_kinds()
+    next_error[0] = SnmpTimeout("timed out")
+    poller._poll_snmp_scalars_with_credential = failing_snmp
+    do_poll()
+    poller._poll_snmp_scalars_with_credential = real_scalars
+    do_poll()
+    assert auth_kinds() == settled, \
+        f"a timeout and its recovery must record no auth event at all: " \
+        f"{auth_kinds()} vs {settled}"
+    print("poll 15-16: a timeout that recovers records no auth event OK")
 
     poller.shutdown()
     agent.stop()

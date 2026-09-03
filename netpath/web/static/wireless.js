@@ -19,7 +19,7 @@
     selected: null,
     controllerFilter: '',
     lastReportedTs: null,
-    apSort: { key: 'name', descending: false },
+    apSort: App.recallSort('wireless-aps', { key: 'name', descending: false }),
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -399,11 +399,20 @@
     const overview = await App.get('/api/wireless/overview', {});
     view.controllers = overview.controllers;
 
+    // Late-filled: the controller list arrives with this response, so a
+    // restored choice comes from the store the first time round rather than
+    // from restoreControls. A controller that has since been removed matches
+    // no option, which selects nothing at all — snap back to "All".
     const filterSelect = App.el('wl-controller');
-    const current = filterSelect.value;
+    const current = filterSelect.value ||
+      App.savedControl('wireless', 'wl-controller') || '';
     filterSelect.innerHTML = '<option value="">All controllers</option>' +
       view.controllers.map((c) => `<option value="${c.id}">${escape(c.name)}</option>`).join('');
     filterSelect.value = current;
+    if (filterSelect.selectedIndex < 0) {
+      filterSelect.value = '';
+      App.rememberControl('wireless', 'wl-controller', '');
+    }
 
     const search = await App.get('/api/wireless/aps', {
       q: App.el('wl-q').value.trim(),
@@ -431,6 +440,12 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end; it assigns from script, which fires no event. */
+    const CONTROLS = ['wl-q', 'wl-controller', 'wl-state'];
+    App.rememberControls('wireless', CONTROLS);
     App.el('wl-apply').onclick = () => App.refreshNow('wireless');
     App.el('wl-q').onkeydown = (event) => {
       if (event.key === 'Enter') App.refreshNow('wireless');
@@ -468,6 +483,10 @@
       await App.loadState();
       App.refreshNow('wireless');
     };
+
+    // Last thing in init(): refresh() reads all three straight off the DOM,
+    // so the first search already carries them.
+    App.restoreControls('wireless', CONTROLS);
   }
 
   /* #/wireless/<id>: select the row a link names, once refresh() has

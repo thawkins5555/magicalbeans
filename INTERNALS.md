@@ -481,7 +481,7 @@ already key off `reachable` rather than the status label.
 tuple per device needing v3, kept for the process lifetime, and
 `current()` returns `engine_time + (now - learned_at)` rather than the
 value learned at discovery. That last part matters and was missing until
-4.37.0: an agent accepts a message only inside a ±150 second window around
+4.38.0: an agent accepts a message only inside a ±150 second window around
 its own clock, so replaying the *discovered* `engine_time` on every
 subsequent request meant a device drifted out of its own window after
 about two and a half minutes and rejected roughly every third poll with a
@@ -596,9 +596,10 @@ unticking everything would leave a table of nothing but checkboxes, the one
 state with no way out. Storage is a `table_columns` key in the owning
 module's own settings scope (`/api/settings`, nine scopes), never
 `localStorage`, for the reason `wirelessdb.py:95` gives: Reset layout clears
-per-browser *widths* and must not eat a settings choice. Sort state is the
-opposite — a per-session `view.*Sort` object, deliberately not persisted,
-because mixing the two storage models is how that bug happens.
+per-browser *widths* and must not eat a settings choice. Sort state lives on
+a `view.*Sort` object per table and, since 4.37.0, is seeded from the
+per-browser view store (`App.recallSort`, below) — still a different key
+from the layout, so Reset layout cannot eat it either.
 
 `App.grid` gained a `selectAll: {key, checked, some, onToggle}` option that
 renders the checkbox into the named column's header cell, with
@@ -1560,9 +1561,13 @@ unmeasurable.
 threshold alert clears by being re-evaluated and found to have recovered, which
 never happens for a destination that was disabled or deleted. The sweep
 resolves open netpath alerts whose entity is not in the current enabled-target
-set, with `resolved_by = "destination no longer traced"`, and sends no clear
-email — nobody needs telling that a destination they just turned off stopped
-being measured.
+set and sends no clear email — nobody needs telling that a destination they
+just turned off stopped being measured. It writes `resolved_by = ''`, the
+same marker every other engine auto-resolve uses: the descriptive string it
+used to write ("destination no longer traced") read to
+`operator_resolved_since` as a hand resolve, which would have kept a
+destination that is re-enabled and breaching the same rule again suppressed
+for the whole seven-day window. See "Operator resolves stick" below.
 
 **There is deliberately no per-hop rule.** Intermediate routers rate-limit ICMP
 as policy (`monitor.classify`'s docstring is explicit that only the destination
@@ -1645,6 +1650,41 @@ housekeeping pass so the table does not grow a row per mute ever set.
 `MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
 silence a device until next year.
 
+**The page is told which device an alert is about.** Since 4.37.0 every
+alert row the API returns carries `device_id` — and, since 4.37.1, only
+that: `device_name` went with it for a release and the page never once read
+it, since the row already carries the engine's own `entity_label`. The rule
+itself is `alertrules.device_id_for(entity_kind, entity_id)`, one function
+in the dependency-free module both the engine and the API already import,
+where it used to be three copies (`api._alert_device_id`,
+`alertengine._occurrence_device`, `alertengine._muted_alert`): a device
+alert is its own device, an interface alert (`entity_id` of the form
+`<device_id>:<if_index>`) is the switch the port is on, and every other kind
+is null — as is a device that has since been removed from Nodes, so the page
+never offers a mute the API would refuse.
+
+"Has since been removed" is one `devices_by_ids` query per page, returning
+a **set of ids that still exist**; `_alert_json(row, present_ids)` takes it
+as a required argument, because when it was optional a caller that forgot
+it got every alert on the page silently reported as being about no device —
+the Mute control greyed out everywhere for no visible reason. The set is
+unsorted (it feeds an `IN (...)` list, which has no order to respect), and
+`NodesDatabase.devices_by_ids` chunks it 500 ids to a statement: an alert
+list is up to 2000 rows, and SQLite builds before 3.32 cap a statement at
+999 bind parameters. `alerts.js showDetail` draws the mute area
+from that field alone: enabled (the 1/6/12/24 h picker, or "Muted until … /
+Lift mute" looked up in `view.mutes` by the same id) when it is set and the
+account holds alerts write, otherwise disabled with a `title` and a `.hint`
+line naming the reason. Before this the page tested `entity_kind ===
+'device'`, which excluded every interface alert; that, the missing write
+gate on the detail's own Resolve/Acknowledge, and a `bar` without `wrap`
+inside an `overflow:hidden` pane were the three things reported as "the
+Mute button disappeared". The detail bar's rebuild guard
+(`detailSignature`) includes the device id and the mute state so a refresh
+does not churn the pane under an open dropdown, and every single-row
+action goes through `detailAction`, which paints a failure on the counters
+line the way the bulk actions do.
+
 The Nodes device list and single-device endpoints carry `muted_until`
 from `alerts_db`, because a mute nobody can see is a mute somebody will
 spend an afternoon looking for.
@@ -1711,18 +1751,105 @@ opened again as a new row on the next tick — new id, unticked, a fresh
 notification. "Bulk resolve does nothing" was this, five seconds later.
 
 The rule now: **an operator's resolve closes the breach run it was made
-in.** Both `_evaluate_thresholds` and `_evaluate_netpath_thresholds` keep
-`first_breach_ts` in their streak state (the NetPath streak gained it for
-this), and once per tick the engine loads
+in.** All three threshold evaluators — `_evaluate_thresholds`,
+`_evaluate_dhcp_thresholds` and `_evaluate_netpath_thresholds` — keep
+`first_breach_ts` in their streak state (the NetPath streak gained it in
+4.34.0, the DHCP streak in 4.37.0), and once per tick the engine loads
 `AlertsDatabase.operator_resolved_since(cutoff)` — `dedup_key → latest
 resolved_ts` over resolved rows whose `resolved_by` is neither `''` nor
 `'engine'`, within `OPERATOR_RESOLVE_WINDOW_S` (seven days), served by
-`ix_alerts_dedup_state (dedup_key, state, resolved_ts)`. A breach whose
+`ix_alerts_state_resolved (state, resolved_ts, dedup_key)`. A breach whose
 `first_breach_ts` is at or before that timestamp is the run the operator
-already closed and produces no occurrence. A clear observation resets
-`first_breach_ts`, so the next breach is a new run and opens normally.
+already closed and produces no occurrence. All three ask it through one
+helper, `_operator_resolved(rule, occurrence, first_breach_ts)`; it was
+three verbatim copies until 4.37.1, and the DHCP evaluator spent a release
+without the copy at all.
+
+**A run ends on an observed clear, not on the first sample under the
+threshold** (4.37.1). `evaluate_threshold` only reports `clear` below
+`clear_threshold`; the gap up to `threshold` is the hysteresis band, which
+exists precisely because a value wobbling around the limit has not
+recovered. Every evaluator nevertheless reset `first_breach_ts` on `not
+over`, so a CPU that dipped from 99 % to 85 % (`cpu_high` clears at 80) and
+went back up counted as a new run — and the alert an operator had resolved
+came back, the 4.34.0 complaint reached through the band instead of through
+a poll. `first_breach_ts` is now cleared only when the evaluator's own
+`result == "clear"`. The *streak* still resets on any sample under the
+threshold: `for_polls` means consecutive polls over it, which is a different
+question.
+
 Every resolve a person makes goes through the API with a session username,
-so "non-empty and not `engine`" is exactly "resolved by hand".
+so "non-empty and not `engine`" is exactly "resolved by hand" — written
+`COALESCE(resolved_by, '') NOT IN ('', 'engine')`. The COALESCE changes
+nothing for that WHERE clause (a NULL `resolved_by` makes the predicate
+NULL, which WHERE discards exactly as it discards false, which is the
+wanted answer); it is written out because the predicate reads as a
+statement about the data rather than as a filter that happens to work, and
+because asking it the other way round — `NOT (...)`, or inside a CASE —
+would otherwise yield NULL where it wanted true. Rows with a NULL
+`resolved_by` do exist: a much older build, or a hand edit in `sqlite3`.
+
+That index leads with `(state, resolved_ts)` because this is a range scan
+over recent resolves. Its predecessor `ix_alerts_dedup_state` led with
+`dedup_key`, the one column the query does not constrain, so SQLite walked
+every resolved alert in the table on every tick. `_migrate` drops the old
+index and creates the new one — an index, never in `SCHEMA`; see the
+storage-layer rule above. Nothing else reads resolved rows by dedup key:
+`ux_alerts_active_dedup` is a *partial* index over `open`/`acked` and so
+can never serve them, and the single-key `operator_resolved_ts` that might
+have wanted a second index was deleted in 4.37.1 with no callers ever
+having existed.
+
+**A resolve of a rollup parent covers the children it was hiding**
+(`_parent_operator_resolved`, 4.37.0). A child is suppressed only while its
+parent is open or acknowledged (`_rollup_parent` → `open_by_dedup`), so
+resolving "Device not responding" for a device that is still down released
+every alert that outage was covering: a dead device records
+`ping_loss_pct = 100` on every poll, so "Packet loss to device high" was
+guaranteed to be breaching and opened one new row and one new email per
+device on the next tick. The gate above could not see it — it is keyed on
+the *child's* dedup key, which no person ever resolved, and the engine
+deliberately absorbs children with `resolved_by = ''` so they stay free to
+re-open. `_apply` therefore asks, when `_rollup_parent` finds nothing and
+`ROLLED_UP_BY` names a parent, whether that parent's dedup key is in the
+per-tick `_operator_resolves` cache and whether its condition still holds:
+for `device_down` that the device's `status` is still `"down"` (exactly
+`_still_true`'s predicate for a held `down` occurrence), and for a parent
+with no such state to re-read (`netpath_unreachable`) that the child's own
+`first_breach_ts` is at or before the resolve. If so the occurrence is
+counted `rolled_up` and dropped, with no rollup note — there is no open
+parent row to write one onto. Widening `open_by_dedup` to resolved rows was
+rejected: that would suppress children forever. This ends by itself, the
+moment the device answers again, and a child still breaching on its own
+account (a device that is up but lossy) opens normally.
+
+**The cover ends when the device answers, not when the resolve gets old**
+(`_parent_covers`, 4.37.1). `_operator_resolves` only reaches back
+`OPERATOR_RESOLVE_WINDOW_S`, so a device hand-resolved and left down was
+covered right up to the moment the resolve fell out of that window — and
+then every still-breaching child opened in a single tick, one row and one
+email per rule per device, seven days after anybody did anything.
+`_parent_covers` is `parent dedup key → when the cover started`: the engine
+records the key the first time it suppresses on the strength of a hand
+resolve, and from then on the key counts as resolved whether or not
+`_operator_resolves` can still see it. The entry is dropped on the tick
+`_still_true` says the device is answering, which is the moment the cover
+was always meant to end. In memory, so a restart forgets it — the same
+tradeoff the threshold gate documents, and a restart re-derives the outage
+alert anyway. The first time a device's cover takes effect the engine
+writes one `NODES` line saying so, so the silence that follows can be
+found from the Nodes page, where the device is visibly down; it is not
+repeated per tick.
+
+It costs no query. The parent's rule comes from `_rules_by_key`, rebuilt
+once per tick from the rule list `_tick` already reads — `_rollup_parent`
+reads the same snapshot as of 4.37.1, where it used to run a
+`rule_by_key()` query per suppressed occurrence per tick and could see a
+different rule set from the check beside it. (`_rules_by_key` holds only
+*enabled* rules, which is exactly the `enabled` test `_rollup_parent` made
+by hand.) The hand resolve comes from the per-tick `_operator_resolves`
+cache, and the device read behind the condition is memoised per tick in
+`_parent_conditions`, so N children of one dead device ask once.
 
 Two engine paths used to write descriptive strings into `resolved_by` —
 the NetPath sweep for a destination no longer traced, and a child alert
@@ -1737,6 +1864,36 @@ after a restart every streak rebuilds from scratch, `first_breach_ts`
 becomes "since restart", and a still-breaching alert an operator resolved
 before the restart re-opens once. The seven-day window is a backstop, not
 the mechanism — a clear ends suppression long before it matters.
+
+**Device events are transitions, and `auth_fail` had stopped being one**
+(`nodepoll._poll_device`). The up/down/unsupported events are recorded on a
+change of state; `auth_fail` was recorded on *every* poll that failed with
+an authentication error, so "SNMP authentication failing" re-opened within
+a poll interval however often it was resolved — the credentials are wrong
+until somebody fixes them, and the poller was reporting that as news each
+minute.
+
+The transition is held by the poller, in `NodePoller._auth_failing`
+(a `set[int]` of device ids, mutated under the poller's own `_lock` since
+polls run on a `ThreadPoolExecutor`): **entering the set records
+`auth_fail`, leaving it — SNMP actually working — records `auth_ok`, and
+nothing else records anything.** 4.37.0 derived both from the previous
+poll's `snmp_ok`/`snmp_error` on the device row, which cannot answer
+either question:
+
+- `snmp_ok == 0` last poll and working now is not "the credentials were
+  rejected and are now accepted". A device on a lossy WAN link that times
+  out one poll in ten wrote an `auth_ok` on every recovery, and every one
+  became an engine occurrence against `device_auth_fail`'s CLEARS pair.
+- `_poll_snmp_scalars_with_credential` re-raises the *last* candidate's
+  error, so a profile with several credentials can alternate the recorded
+  error between an auth string and a timeout while nothing about the device
+  changed. "A different auth error is a new fact" then re-recorded
+  `auth_fail` every other poll — the de-duplication defeating itself.
+
+`_auth_failing` is in memory and process-lifetime only, like `_credentials`
+beside it: a restart re-records one `auth_fail` per still-failing device,
+which is one event, not one per poll.
 
 ### Newly added device hold (`alertengine.py`, `alertsdb.py`)
 
@@ -3535,6 +3692,40 @@ The logic was correct, so none of it changed. What changed is that it now says
 connection's Debug event. A diagnosis nobody can check is not much better than
 no diagnosis.
 
+### The Discovery results grid (`nodes.js DISC_COLUMNS`, `drawDiscResultsTable`)
+
+Until 4.37.0 the results pane under Nodes → Discovery was the last table in
+the app written as one string of markup — no sorting, no widths, a bespoke
+select-all — in the server's `ORDER BY ip`, which is text, so `.100` sorted
+before `.9`. It now goes through the shared facility like every other list:
+a `DISC_COLUMNS` catalogue in the shape `configrx.js` uses (a fixed `check`
+column whose cell is the box, the em-dash hint for a result no credential
+identified, or nothing for one already promoted; `ip` sorted as the dotted
+string, which `App.sortRows`' numeric collation orders correctly; `ping_ok`
+and `snmp_ok` with a `value` of 1/0 so they sort on the flag rather than
+the word; `sys_name`; `vendor` with its marker, MIB hint and "(added)" tag,
+the arc explanation on a `<span title>` because `App.drawRows` owns the
+`<td>`), `App.grid` under the name `nodes-discovery` (so widths persist and
+the sort is remembered like any other grid), `App.sortRows` into a copy —
+never in place, because `view.discResults` is what the next fetch replaces
+and what the approval dialog reads — and `App.drawRows`. Select-all is the
+grid's own, computed over the *selectable* subset only; a single row's
+toggle corrects the header box through `App.refreshSelectAll` rather than
+redrawing. Ticks (`view.discChecked`) are keyed by result id, never by
+position, so a re-sort carries them and Promote posts the same ids.
+
+**A running sweep is followed.** `loadDiscJobsIfNeeded`, already called once
+per Nodes tick, re-fetches the selected job's results while that job's state
+is `running` and the Discovery sub-view is on screen, with one last fetch
+on the tick it stops (a module-level `discPrevState` holds last tick's
+`id:state`) and none after. Before this the results pane was refreshed only
+by a job click or a promote, which is exactly what would have made a new
+sort look as though it broke the live update. The draw saves and restores
+the pane's `scrollTop`. The approval dialog keeps its plain string builder
+but is handed its checked set explicitly instead of swapping
+`view.discChecked` in and out of the module global for the length of one
+build.
+
 ### Bulk selection (`nodes.js`, `alerts.js`, `configrx.js`)
 
 All three selectable tables use one shape: a checkbox first column whose
@@ -3614,6 +3805,102 @@ Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+### The view store (`app.js` `sappiwhere.view`)
+
+What the operator has a page *set to* — the column each table is sorted by,
+what is typed in the filter bars, which sub-view is open — is the third
+kind of per-browser state, beside the layout (splitters, widths) and the
+tab. Until 4.37.0 none of it survived a reload: every filter's "current
+value" was the DOM element itself, read at fetch time, and every sort a
+`view.*Sort` literal, so a reload gave the markup defaults. One key now
+holds it, shape `{user: username, sort: {gridName: {key, descending}},
+pages: {page: {controls: {elementId: value}, sub: name}}}`, with the same
+private-browsing try/catch every other `localStorage` write carries. Per
+browser, never sent to the server. `Reset panel sizes` leaves it alone: it
+means "put the furniture back".
+
+Nine of the twelve pages opt in — Nodes, Alerts, Syslog, SNMP Trap,
+NetFlow, IPAM, Wireless, ConfigRX and Debug, the ones with filter bars and
+sortable grids. Dashboard and Settings have nothing of this kind to keep,
+and NetPath deliberately keeps its own per-destination time windows in its
+module state rather than in this store, because "what window am I looking
+at" there is per destination and not per page.
+
+It is **not** read once at init. The fill functions write to it (a stored
+choice the list can no longer offer is dropped, below), `rememberControl`
+writes on every keystroke in a filter box, and the fetch path reads it on
+every tick that still has a late-filled select — twice a tick on Nodes,
+once each on Alerts and ConfigRX. So the parsed store is cached in memory
+(`viewCache`): `loadView()` returns the cache, `saveView` writes through it,
+and the window `storage` event drops it, which is the browser telling this
+tab that *another* tab wrote the key (it does not fire in the tab that
+wrote, which is exactly the invalidation rule wanted).
+
+The store also records the username it belongs to (`store.user`, set from
+`loadState()`, which `start()` awaits before any module's `init()` runs). A
+different operator signing in on the same browser discards the whole store
+before anything restores from it, and signing out removes the key: a filter
+bar holds the previous operator's own search terms and device names, which
+is their work rather than a shared setting, and a NOC workstation gets used
+by whoever is on shift.
+
+The write path for sort is one line: `App.grid`'s
+header-click handler calls `rememberSort(name, sort)` before `onSort`, so
+every grid records its sort under the name it already passes for widths,
+and a module opts in by seeding its state field with
+`App.recallSort(gridName, fallback)` — twelve grids do, including
+`nodes-discovery`. `UNSAVED_SORTS` exempts the OID-browser modal, whose
+table is rebuilt over a different device each time it opens. Filters use
+`App.restoreControls(page, ids)` at the **end** of each module's `init()`
+(the ranges and severity lists are filled by then and nothing has been
+fetched, so the first fetch reads the restored values out of the DOM
+exactly as it reads the markup defaults) and `App.rememberControls(page,
+ids)` at the **start** of it — `input` for text boxes, because `change` only
+fires on blur and a reload with the cursor still in the field is the case
+this exists for. The start matters: listeners run in registration order, so
+registering the store's before the module's own `onchange` is what makes the
+store current by the time the refresh those handlers kick off reads it back.
+`restoreControls` at the end is safe beside it because assigning a value
+from script fires no event at all.
+
+That last point is also why a **Clear** button needs `App.syncControls(page,
+ids)`: `nf-clear`, `sl-clear`, `sn-clear` and Debug's All/None set `.value`
+or `.checked` directly, so nothing hears them, and the store would keep
+exactly the filters the operator has just cleared. Sub-views go through
+`App.recallSub(page, fallback, scope)`/`rememberSub`, honoured only while a
+button for the stored name is still on the page — validated inside one nav,
+the section's first `.subtabs` or the `scope` element's, since Nodes carries
+a second nav inside the device pane and a name checked against the whole
+page could match the wrong one.
+
+**The late-filled selects.** Seven dropdowns are populated after `init()`
+from fetched data (the Nodes profile and device-group filters, the Alerts
+rule filter, the ConfigRX vendor filter, the Wireless controller list, the
+NetFlow exporter list, the Debug target list). Assigning a stored value to
+an empty `<select>` selects nothing, so each fill function falls back to
+`App.savedControl(page, id)` when nothing is chosen yet, and — because the
+first fetch happens *before* the fill — the fetch path does the same through
+`App.controlOrSaved(page, id)`, so a restored dropdown filters the very
+first request rather than showing the right label over an unfiltered list
+for a tick. `controlOrSaved` hands the element the answer as soon as its
+option list exists (more than the one "any" placeholder, for a `<select>`),
+and only stands in for it before that: reading `select.value || saved`
+instead meant an empty choice was indistinguishable from no answer, so
+picking "any" re-sent the id just cleared for one cycle. A stored choice the
+list can no longer offer (a deleted rule, a vendor with no devices left) is
+dropped from the store by `App.rememberControl` rather than applied, so the
+table recovers on the next refresh instead of staying empty behind an
+invisible filter. Debug's target list is the exception: it is built
+incrementally from the event stream and only ever grows, so a stored
+destination the current batch has not mentioned is *appended as an option*
+and selected rather than forgotten.
+
+**Deliberately not stored:** the Live/Follow checkboxes on Syslog, Traps,
+NetFlow and Debug — "Live off" remembered across a reload is a page that
+has silently stopped moving with nothing on screen to say why; which
+columns a table shows (an account setting, above); and the widths and
+splitters (their own keys).
 
 Because a stored splitter width beats the shipped `data-grow` on every
 load, changing a shipped default is invisible to anyone who ever dragged
@@ -4036,7 +4323,7 @@ write guards. `configrxdb.forget_device` therefore takes only the device
 id.
 
 **What the terminal does with it.** The same `prepare` / `policy` /
-`connect` sequence, and — from 4.37.0 — the `record_seen(host, port)` that
+`connect` sequence, and — from 4.38.0 — the `record_seen(host, port)` that
 closes it. A terminal connection that paramiko accepted against the stored
 key now touches that row's `last_seen_ts`, so the fingerprint line in
 ConfigRX's device dialog reports when the device last presented the key

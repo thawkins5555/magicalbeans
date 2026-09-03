@@ -68,7 +68,7 @@ in the clear.
 
 The databases are created on first start, ten of them, in
 `~/.local/share/netpath-monitor/` (or `%APPDATA%\netpath-monitor\` on Windows).
-From 4.37.0 that directory is created mode `0700` and each database `0600`.
+From 4.38.0 that directory is created mode `0700` and each database `0600`.
 
 Leave it running in a terminal for now. `README.md` covers running it as a
 systemd unit or a Windows service, which is what you want before you rely on
@@ -79,7 +79,7 @@ it.
 Open `http://127.0.0.1:8443/`. Sign in as **`admin` / `admin`**.
 
 The application will make you change the password before it lets you do
-anything else — and from 4.37.0 it means it: the server refuses every API call
+anything else — and from 4.38.0 it means it: the server refuses every API call
 except sign-out, session state and the password change itself while
 `must_change` is set on your account. In earlier releases that gate was in the
 browser only, so the default password was a real hole. Pick something long; the
@@ -156,7 +156,7 @@ and an interface count. If it does not, in this order:
    v1 agent rejects a whole request containing one object it does not
    implement.
 5. **A `mib_missing` alert** — the device's vendor is recognised and no MIB for
-   it has been uploaded. It is a notice, not a fault, and from 4.37.0 it does
+   it has been uploaded. It is a notice, not a fault, and from 4.38.0 it does
    not email. Ignore it or upload the vendor MIB under Nodes → MIBs.
 
 Open the device's detail pane and look at an interface: you should see

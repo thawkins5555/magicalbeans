@@ -30,7 +30,7 @@ Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
 and **Settings**, which stay rightmost so adding a module never moves
 them. Dashboard aggregates whatever other modules the signed-in account
 can read — see Permissions, under Settings — rather than holding data of
-its own; from 4.37.0 it is a real page rather than a placeholder, and it
+its own; from 4.38.0 it is a real page rather than a placeholder, and it
 is described under **Dashboard** below. A tab the signed-in account has no
 read access to is hidden from the tab bar entirely.
 
@@ -41,7 +41,7 @@ them all. The chrome also tightens automatically below 900 pixels of viewport
 height, and again below 700, so a laptop gets a usable layout before anything
 is dragged.
 
-**Every selection has a URL.** From 4.37.0 the address bar carries the
+**Every selection has a URL.** From 4.38.0 the address bar carries the
 open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 `#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
 `#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
@@ -51,13 +51,27 @@ and a link pasted into a ticket or an email opens what it names for
 anybody who can sign in and read that module. A route naming something the
 account cannot read, or that no longer exists, falls back to the tab.
 
-**Reloading the page returns to whichever tab was open**, then, from its
-URL; where there is no URL to read — a bookmark to the bare address —
-the browser's remembered last tab is used, the same way it remembers panel
-sizes and column widths, per browser rather than per account. **Signing in
-always opens on Dashboard**: a fresh login is a new visit, not a reload,
-so it starts from the same place every time rather than wherever a
-previous session happened to leave off.
+**Reloading the page returns to whichever tab was open**, not back to
+NetPath — the browser remembers the last tab the same way it remembers
+panel sizes and column widths, per browser rather than per account. **It
+also keeps the view itself**: the column a table was sorted on and which
+way, whatever was typed into a search box, every dropdown filter, and the
+sub-tab a page was on (Devices or Discovery, Subnets or DHCP) all come back
+as they were. That covers the nine pages that have filters and sortable
+tables — Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless,
+ConfigRX and Debug. Dashboard and Settings have nothing of the kind to
+keep, and NetPath keeps its own time window per destination instead, since
+there the window belongs to the destination rather than to the page. What
+is deliberately *not* remembered is the Live / follow switch on the
+streaming pages: a page that came back with its updates quietly switched
+off would read as broken, so those start on every load. It is also *per
+person*, not just per browser: signing out clears it, and a different
+account signing in on the same browser starts with clean filters rather
+than inheriting the last operator's searches. **Reset panel sizes** on the
+Settings tab resets panel sizes and nothing else. **Signing in always opens
+on Dashboard**, though: a fresh login is a new visit, not a reload, so it
+starts from the same place every time rather than wherever a previous
+session happened to leave off.
 
 ## How it runs
 
@@ -109,7 +123,7 @@ rather than records to work through.
 
 ## Dashboard — the screen a shift starts on
 
-The landing page after every sign-in. Until 4.37.0 it said "nothing here
+The landing page after every sign-in. Until 4.38.0 it said "nothing here
 yet" — which it had said for several releases while being the first thing
 every operator saw. It now answers "what should I look at first" from data
 the application already had, refreshed on the interval in
@@ -153,7 +167,7 @@ own subtabs.
   CPU and memory came from **UCD-SNMP-MIB only** — `ssCpuRawIdle`,
   `memAvailReal`, `memTotalReal`, `laLoad` — which in practice means
   net-snmp on a Linux or BSD host and nothing else. HOST-RESOURCES-MIB was
-  named here and never actually read. From 4.37.0 both are true: a
+  named here and never actually read. From 4.38.0 both are true: a
   best-effort vendor-health GET rides the same poll and reads
   `hrProcessorLoad` and `hrStorageTable` where they answer, plus Cisco
   (`cpmCPUTotal5minRev`, `ciscoMemoryPool`), Fortinet (`fgSysCpuUsage`,
@@ -310,6 +324,14 @@ own subtabs.
   entirely. Any scan that is no longer running can be removed from the
   jobs list with its Remove button. Running scans are visible on the
   Debug page (DISCOVERY SCANS RUNNING) with live progress.
+- **Results are a sortable table.** Click a heading to sort — IP addresses
+  in numeric order, so .9 comes before .100 — drag the column edges, and
+  use the header box to select every result the scan is allowed to add.
+  Ticks belong to rows, not positions, so a re-sort carries them along and
+  Promote adds exactly the devices that were ticked. While a scan is
+  running its results fill in as they are found, keeping the sort and the
+  ticks; the fetching stops when the sweep ends or the Discovery view is
+  left.
 - **Promotion is idempotent**: a result already promoted is a no-op to
   promote again, not a duplicate-IP error. Discovery suggests a polling
   profile from the device's vendor OID root where one matches, falling
@@ -700,6 +722,18 @@ alerts and optionally emailing about them.
   the one not acted on. A restart of the application forgets which breach
   runs were resolved by hand, so a still-breaching alert can re-open once
   after one.
+- **Resolving an outage covers the alerts it was hiding.** "Device not
+  responding" absorbs the packet-loss, response-time, CPU, memory,
+  interface-counter and poll-overrun alerts of a device that is down. A
+  hand resolve of that outage, single or bulk, keeps those covered for as
+  long as the device is still down — they used to come straight back on
+  the next tick, one new alert and one new email per device, which is what
+  made bulk Resolve look as though it did nothing. The cover ends by itself
+  when the device answers again, so a device that is up but lossy raises
+  its packet-loss alert normally. Acknowledge keeps them covered exactly as
+  before. The same discipline now holds for "SNMP authentication failing",
+  recorded once when it starts and cleared when SNMP works again, and for
+  a DHCP scope alert resolved by hand while the scope stays full.
 - **A newly added device is given five minutes before it can raise an
   alert.** A device added a moment ago is usually still being set up —
   wrong community, not cabled yet, still booting — and the alerts that
@@ -775,10 +809,17 @@ alerts and optionally emailing about them.
   recording events, so the alerts simply come back. The mute is shown in
   the Nodes device list and in the device's detail header as well as in
   Alerts — a mute nobody can see is a mute somebody will spend an
-  afternoon looking for. Only Nodes devices can be muted; syslog, traps,
-  IPAM conflicts, DHCP scopes and wireless APs are structurally outside
-  it. Muting requires write access to Alerts; a read-only account can see
-  what is muted but cannot mute.
+  afternoon looking for. The button is offered on every alert that is
+  about a device — a device alert, or an interface alert, which mutes the
+  switch the port is on. It is always in the bar: when the alert is about
+  something outside Nodes (a syslog source, a trap from an unpolled host,
+  an IPAM conflict, a DHCP scope, a wireless AP) or its device has since
+  been removed, or the account lacks write access to Alerts, the button is
+  disabled with a line under the bar saying which, rather than absent — a
+  control that is silently not there reads as a feature that has gone. A
+  read-only account can see what is muted but cannot mute, and sees no
+  Resolve or Acknowledge in the detail either, the same gate the bulk
+  buttons carry.
 - **A poll overrun on a device that is not answering is not reported at
   all.** "Poll taking longer than its interval" is recorded when the
   previous poll is still running as the next falls due — which is exactly
@@ -805,11 +846,11 @@ alerts and optionally emailing about them.
   conflict, an access point removed from its controller or gone offline, a
   DHCP scope running out of leases, and three NetPath path rules (below).
   Seven of the interface and disk thresholds among those could never fire
-  before 4.37.0, because nothing wrote the metric key they read: the poller
+  before 4.38.0, because nothing wrote the metric key they read: the poller
   now records `if_in_util_pct`, `if_out_util_pct`, `if_in_error_rate`,
   `if_out_error_rate`, `if_in_discard_rate`, `if_out_discard_rate` and
   `disk_pct`, both per port and as a device-level maximum, so they are live.
-- **Three of those 35 are new in 4.37.0**, and each one reports a failure
+- **Three of those 35 are new in 4.38.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
   the case where a switch sat green with no counters behind it.
@@ -975,7 +1016,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
   off is a deliberate, explicit opt-out, never a silent downgrade). A
   rate limit caps emails per hour; past it, sending is suspended for the
   rest of that hour and logged once, not per suppressed alert.
-- **Mail is sent off the engine's tick.** From 4.37.0 a notification is
+- **Mail is sent off the engine's tick.** From 4.38.0 a notification is
   handed to a queue drained by its own thread, so a relay that has stopped
   answering delays mail and nothing else: the rule engine keeps evaluating,
   opening and resolving at its normal cadence. Five consecutive failures
@@ -1328,7 +1369,7 @@ been wrong for several releases: **Nodes** polls with GET and GETBULK, and
 **Alerts** is a rule engine over device events, traps, syslog, IPAM conflicts
 and thresholds. Traps reaching this receiver are evaluated by it.)
 
-From 4.37.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
+From 4.38.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
 stored. The digest was always computed and counted; it was never enforced, so a
 forged v3 trap was stored and could open an alert. The `reject_failed_auth`
 setting controls this and defaults to on; traps that cannot be verified at all
@@ -1983,7 +2024,7 @@ password ends every session on that account, this one included.
 
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
-ConfigRX, SSH, Settings, Debug and — new in 4.37.0 — Admin, set from
+ConfigRX, SSH, Settings, Debug and — new in 4.38.0 — Admin, set from
 **Settings → Users** (itself gated on Admin write access). Write implies
 read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
@@ -1995,7 +2036,7 @@ tab is the one exception: it's always visible and simply omits whatever
 sections the signed-in account can't read, rather than being gated as a
 whole.
 
-**Administering the application is its own grant, from 4.37.0.** Settings
+**Administering the application is its own grant, from 4.38.0.** Settings
 write used to be root by accident: it could grant itself every other
 module, reset anybody's password and make the host replace its own code.
 **Admin** now covers exactly that work — adding, editing and removing
@@ -2097,7 +2138,7 @@ moves its settings, accounts and name cache into it on the first start.
   therefore polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a
   server that does not require authentication, and does not run config
   backups. The forms concerned say this before you type into them rather
-  than after you submit. A portable secret store was considered for 4.37.0
+  than after you submit. A portable secret store was considered for 4.38.0
   and deliberately deferred — `CREDENTIAL-SECURITY.md` sets out what it
   would have to promise and why a weak version of it is worse than an
   honest refusal.

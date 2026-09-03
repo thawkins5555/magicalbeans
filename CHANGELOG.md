@@ -4,7 +4,9 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
-- [4.37.0 — unreleased](#4370-unreleased)
+- [4.38.0 — unreleased](#4380-unreleased)
+- [4.37.1 — Review of 4.37.0](#4371--review-of-4370)
+- [4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves](#4370--views-that-survive-a-reload-mute-where-it-belongs-bulk-resolve-that-resolves)
 - [4.36.1 — Review of the SSH terminal](#4361-review-of-the-ssh-terminal)
 - [4.36.0 — SSH from the device pane, with host keys that are remembered](#4360-ssh-from-the-device-pane-with-host-keys-that-are-remembered)
 - [4.35.0 — A question mark beside the setting](#4350-a-question-mark-beside-the-setting)
@@ -100,7 +102,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 4.37.0 — unreleased
+### 4.38.0 — unreleased
 
 Two reviews, implemented. The first is the network-engineer review in
 `REVIEW-NETWORK-ENGINEER.md` — a fortnight of a very large mixed fleet held
@@ -593,6 +595,105 @@ Nine changes are not, and an operator should read them before updating.
 - **`netpath/mibs/NOTICE.md`.** Eighteen of the twenty-one bundled MIB modules are other people's work — IETF standards-track modules redistributed under the Simplified BSD terms of BCP 78, IEEE Std 802.1AB, IANA's `IANAifType-MIB`, and Net-SNMP's `UCD-SNMP-MIB` — and they shipped with no attribution or licence notice of any kind, while the vendored xterm.js beside them correctly ships its MIT licence. Three of them carry no copyright block inside the file either. `INTERNALS.md` now points at the notice from the same paragraph that covers xterm.js.
 - **What "high confidence" means in vendor identification, corrected.** `enterprises.VERIFIED`'s docstring claimed every arc was read from the vendor's own MIB text; the repository contains vendor MIB text for exactly one of its 53 arcs, and that claim is what `confidence: high` in the device pane rests on. `INTERNALS.md` and `FEATURES.md` now say what the two tiers actually rest on — both hand-authored from IANA's public registry, high meaning cross-checked against a real device's sysObjectID or a bundled MIB, medium meaning not — and why the arc number is always shown beside the name.
 - **A third "there is no authentication yet".** The review found the two in `__main__.py` and `web/server.py`; there is another in `console.py`, under the listener card, repainted every second. All three are recorded in the report's documentation-truth table; the strings themselves belong to the modules that print them.
+### 4.37.1 — Review of 4.37.0
+
+- **A hand-resolved outage keeps covering its alerts until the device answers,
+  not for seven days.** 4.37.0 covered a device's implied alerts while its
+  outage was hand-resolved and the device stayed down, but the cover was read
+  from a seven-day window of hand resolves, so a decommissioned device that
+  was never deleted released every implied alert at once exactly seven days
+  later, with no outage alert beside them. The cover now persists for as long
+  as the device stays down, and one line in the Nodes log says when it takes
+  effect. Two more ways a hand resolve came back are closed: a breach run now
+  ends only on a real clear, so a value dipping into the hysteresis band and
+  back no longer re-opens a resolved alert (device thresholds, DHCP scopes,
+  NetPath); and SNMP authentication events are true transitions — one
+  "authentication failing" while the credentials stay wrong even when the
+  recorded error alternates with a timeout, one "authentication OK" when SNMP
+  works again, and nothing at all for a timeout that recovers.
+- **Clearing a filter bar clears what the page remembers.** The Clear buttons
+  on Syslog, Traps and NetFlow and the All / None category buttons on Debug
+  set their controls directly, which the view store did not see: NetFlow's
+  exporter could not be cleared at all (the request kept naming it and the
+  dropdown snapped back), and the others came back after a reload. Choosing
+  "any" in a late-filled dropdown no longer sends the previous choice on the
+  very next request; a stored Debug destination the log has not mentioned yet
+  is kept rather than forgotten; and a stored ConfigRX vendor with no devices
+  left is dropped instead of filtering the list to nothing forever.
+- **What the browser remembers is per account.** On a shared workstation one
+  operator's searches no longer pre-fill the next operator's filter bars: the
+  store is discarded when a different account signs in, and sign-out clears
+  it.
+- **Discovery's live results are cheaper and more careful.** A running sweep's
+  results are fetched only when its progress counters move, the table is
+  rebuilt only when a row changed, a job click while a fetch is in flight can
+  no longer paint the other job's rows and ticks, devices found after the job
+  was opened arrive pre-ticked like the ones found before it, and a sweep that
+  finishes while another sub-tab is open shows its final results on the way
+  back. A job with nothing to add no longer paints a select-all box, and the
+  enterprise-arc explanation is back on the whole Vendor cell.
+- **A failed single-row Resolve, Acknowledge or Mute says so in the detail
+  pane itself**, not only on the counters line above the table.
+- Under the hood: the entity-to-device rule the engine and the API both apply
+  lives in one function; the three copies of the operator-resolve gate are
+  one; the rollup parent lookup no longer costs a query per suppressed
+  occurrence; alert rows carry `device_id` only (the page never read the
+  name) and a page-sized list resolves its devices in chunked queries; a dead
+  database method and two misleading index comments are gone.
+
+### 4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves
+
+- **Reloading a page keeps what you had on screen.** Column sorts, search
+  boxes, dropdown filters and sub-tabs on the nine pages that have them —
+  Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless, ConfigRX and
+  Debug — now come back the way they were, the same way the tab, panel sizes
+  and column widths already did, instead of snapping to their defaults. The
+  browser remembers them, per browser rather than per account, under one key
+  beside the others. NetPath is not among them: it keeps its own time window
+  per destination, which is not a page-wide filter. Deliberately not
+  remembered: the Live / follow switches, because coming back to a page that
+  had quietly stopped updating is worse than coming back to one that starts
+  fresh. **Reset panel sizes** still means panel sizes and leaves these
+  alone.
+- **Mute device is offered on every alert that is about a device, and says
+  why when it cannot be.** The button had never left the alert detail — it
+  was hidden whenever the selected alert was not a *device* alert, which
+  ruled out the commonest alert there is, a port down on a switch, even
+  though muting a switch has always silenced its ports. An interface alert
+  now mutes its parent switch. When an alert is about something that cannot
+  be muted (a trap from an unpolled host, a syslog source, a DHCP scope, an
+  access point) or the account lacks Alerts write, the button is there but
+  disabled with a line saying which. The detail's Resolve and Acknowledge
+  now honour the same write permission the bulk buttons do, the button row
+  wraps in a narrow pane instead of clipping, and a single-row action that
+  fails says so on the counters line instead of silently doing nothing.
+- **Bulk Resolve on several outages no longer brings the alerts straight
+  back.** Resolving "Device not responding" for a device that is still down
+  used to release, on the next tick, every alert that outage was hiding —
+  packet loss above all, which a dead device reports at 100 % on every poll —
+  so "Resolved 3 of 3" was followed within five seconds by three new alerts
+  and three new emails. 4.34.0's rule covered an alert's own breach run but
+  not the alerts implied by a parent. A hand-resolved outage now covers its
+  children for as long as the device is still down; the moment it answers
+  again the cover ends by itself, so a device that is up but lossy alerts
+  normally. Acknowledge behaves as it always did. Three more ways a hand
+  resolve came back are closed with it: "SNMP authentication failing" is now
+  recorded when it starts and cleared when SNMP works again (the clear had
+  never fired), a resolved DHCP scope alert stays resolved while the scope
+  stays full, and the index behind the per-tick hand-resolve lookup is
+  replaced with one that can actually be range-scanned.
+- **Nodes → Discovery → Results is a real table.** Click a heading to sort —
+  IP addresses in numeric order, so .9 comes before .100 where the old
+  text order did not — drag the column edges, and use the header box to
+  select everything the scan is allowed to add. Ticks follow their rows
+  through a re-sort, so Promote adds the devices that were ticked. A scan
+  that is still running now fills its results in as it goes rather than
+  sitting frozen until the job is clicked again, keeping the sort and the
+  ticks, and stops fetching when the sweep ends or you leave the view.
+- **Fixed: an account without NetFlow access hit a script error on every
+  sign-in.** The NetFlow page's set-up iterated a dimension list the server
+  only sends to accounts that may read NetFlow; it now tolerates its
+  absence.
 
 ### 4.36.1 — Review of the SSH terminal
 

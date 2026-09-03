@@ -58,7 +58,7 @@ USM_STATS = {
 
 # The per-interface metric keys one poll emits, in the order they are
 # recorded. `in_bps`/`out_bps` and the two `*_err` keys keep the names the
-# charts and any stored history already use; the rest are new in 4.37.0.
+# charts and any stored history already use; the rest are new in 4.38.0.
 def _INTERFACE_METRICS(in_bps, out_bps, in_err_rate, out_err_rate,
                        in_disc_rate, out_disc_rate, in_util, out_util):
     return (
@@ -701,6 +701,19 @@ class NodePoller:
         # so a device that is simply down does not re-sweep its profile's
         # candidates on every dialog a human opens. See working_config().
         self._credential_probe_failed: dict[int, float] = {}
+        # device_id set: the devices whose SNMP is currently failing on
+        # AUTHENTICATION, as this process has observed it. auth_fail is
+        # recorded on entering the set and auth_ok only on leaving it, which
+        # is what makes both of them transitions. Reading the previous poll's
+        # snmp_ok/snmp_error off the device row could not do that: any failure
+        # recovering looked like an auth recovery (a WAN device that times out
+        # one poll in ten wrote an auth_ok on every recovery), and a
+        # multi-credential profile whose recorded error alternates between an
+        # auth string and a timeout re-recorded auth_fail every other poll.
+        # In memory and process-lifetime only, like _credentials above: a
+        # restart re-records one auth_fail per still-failing device, which is
+        # one event, not one per poll.
+        self._auth_failing: set[int] = set()
         # (device_id, expires_ts, interval_s): the device currently selected
         # in a browser polls at interval_s until expires_ts. Renewed by the
         # frontend every refresh tick while selected, so it self-expires
@@ -1327,26 +1340,69 @@ class NodePoller:
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
-        auth_failed = (snmp_ok is False and snmp_error
-                       and isinstance(snmp_error, str)
-                       and "auth" in snmp_error.lower())
-        if auth_failed:
-            self.db.record_device_event(device_id, "auth_fail", snmp_error)
-        elif snmp_ok is False and ping_ok and not snmp_unsupported:
-            # A switch whose SNMP agent has died but which still answers
-            # ICMP is reachable and broken, so `unreachable_ping_only`
-            # rightly keeps it out of device_down — and nothing else said
-            # anything at all. This is the event the `snmp_failing_ping_ok`
-            # rule watches. Recorded per failing poll, so the alert's
-            # occurrence count is how long it has been failing; the rule
-            # auto-resolves when the events stop.
+        # Both of these are TRANSITIONS, the same discipline as the up/down
+        # events above, and for the same reason: a device event is a fact
+        # about a change, and an alert an operator resolved by hand must not
+        # be re-opened by the next poll simply repeating what the last one
+        # said. Recorded on every failing poll, "SNMP authentication failing"
+        # came back within a poll interval however often it was resolved.
+        #
+        # The transition is held HERE, in _auth_failing, rather than derived
+        # from the device row's previous snmp_ok/snmp_error. That row cannot
+        # answer the question:
+        #
+        # - "SNMP failed last poll and works now" is not "the credentials
+        #   were rejected and are now accepted". A device on a lossy WAN link
+        #   that times out one poll in ten recovered into an auth_ok every
+        #   time, and every one of those became an alert occurrence.
+        # - A profile with several candidate credentials re-raises the LAST
+        #   candidate's error, so the recorded error can alternate between an
+        #   auth string and a timeout while nothing about the device changed.
+        #   Comparing this poll's error text with the last one's then read as
+        #   "a different auth error, a new fact" every other poll — exactly
+        #   the repeat this is supposed to suppress.
+        #
+        # So: entering the set records auth_fail, leaving it (SNMP actually
+        # working) records auth_ok, and everything else — a timeout while
+        # already failing, a second identical auth failure, a different auth
+        # error for the same broken profile — records nothing at all. A
+        # timeout recovery for a device that was never failing on auth is not
+        # an auth recovery and records nothing.
+        auth_failing = bool(snmp_ok is False and isinstance(snmp_error, str)
+                            and "auth" in snmp_error.lower())
+        with self._lock:
+            if auth_failing and device_id not in self._auth_failing:
+                self._auth_failing.add(device_id)
+                auth_event = ("auth_fail", snmp_error)
+            elif snmp_ok and device_id in self._auth_failing:
+                self._auth_failing.discard(device_id)
+                auth_event = ("auth_ok", "")
+            else:
+                auth_event = None
+        if auth_event is not None:
+            self.db.record_device_event(device_id, auth_event[0], auth_event[1])
+
+        # A switch whose SNMP agent has died but which still answers ICMP is
+        # reachable and broken, so `unreachable_ping_only` rightly keeps it
+        # out of device_down — and before this nothing else said anything at
+        # all, so a dead agent on a live switch was invisible. This is the
+        # event the `snmp_failing_ping_ok` rule watches.
+        #
+        # Unlike the auth events above this one is recorded on EVERY failing
+        # poll, and deliberately: the rule carries `auto_resolve_after_s`,
+        # which measures from the alert's last occurrence, so the repeats are
+        # what keep it open while the agent is still dead and their stopping
+        # is what closes it. Recording it as a transition instead would
+        # freeze `last_ts` and the alert would announce an all-clear an hour
+        # later with the agent still down — a false all-clear, which is worse
+        # than the repeat this discipline otherwise avoids. An auth failure
+        # has its own event above and is excluded here.
+        if (not auth_failing and snmp_ok is False and ping_ok
+                and not snmp_unsupported):
             self.db.record_device_event(
                 device_id, "snmp_error",
                 f"SNMP is not answering but the device replies to ping: "
                 f"{snmp_error}")
-        if snmp_ok:
-            if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
-                self.db.record_device_event(device_id, "auth_ok", "")
 
         # Hoisted out of the branch below: the interface block needs it too.
         # A device that has just restarted has restarted its interface
