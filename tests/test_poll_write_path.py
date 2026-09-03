@@ -12,6 +12,7 @@ Also asserts that the batched writers store the same values the one-row
 writers did, since record_metric_sample and update_interface_rate are now
 wrappers around them.
 """
+import json
 import os
 import sys
 import time
@@ -59,6 +60,102 @@ class CommitCounter:
         self.statements += 1
         if statement.strip().upper().startswith("COMMIT"):
             self.commits += 1
+
+
+def v3_engine_time():
+    """SNMPv3 engineTime was learned at discovery and sent back unchanged
+    for the life of the process, so an agent enforcing RFC 3414 §3.2's
+    time window started rejecting every request as soon as the cached
+    value drifted past it. The stub enforces a deliberately tight ±1 s
+    window so the drift shows up in seconds rather than in minutes.
+    """
+    print("\n-- SNMPv3 engine time and Report handling")
+    stats = os.path.join(TMPDIR, "v3.json")
+    proc, port = spawn_stub("stub_agent_iftable.py", "v3",
+                            "--window", "1", "--stats", stats)
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "v3.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "v3-test", group_id=group_id,
+            snmp_version=3, v3_user="poller", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+
+        def poll():
+            device = db.device(device_id)
+            poller._poll_device(device, db.effective_config(device))
+            return db.device(device_id)
+
+        device = poll()
+        check(device["status"] == "up",
+              f"a v3 device polls (status={device['status']!r}, "
+              f"error={device['snmp_error']!r})")
+        with open(stats) as handle:
+            after_first = json.load(handle)
+        check(after_first["discoveries"] == 1,
+              "the first poll discovers the engine exactly once")
+
+        # Long enough that an engineTime frozen at discovery is now outside
+        # the stub's window, while one that advanced with the clock is not.
+        time.sleep(2.5)
+        counted = after_first["reports"]
+        device = poll()
+        with open(stats) as handle:
+            after_second = json.load(handle)
+        check(device["status"] == "up",
+              f"…and the poll 2.5 s later still succeeds "
+              f"(status={device['status']!r}, error={device['snmp_error']!r})")
+        check(after_second["reports"] == counted,
+              f"…with no Report-PDU: engineTime advanced with the clock "
+              f"(reports {counted} -> {after_second['reports']})")
+        check(poller.counters["auth_fail"] == 0,
+              "no spurious auth_fail was counted")
+        check(not db.device_events(device_id, kinds=["auth_fail"]),
+              "…and no spurious auth_fail event was recorded")
+
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    # A restarted agent: engineBoots increments, so every cached parameter
+    # is stale. One Report, learned from, and the poll still succeeds.
+    stats = os.path.join(TMPDIR, "v3boots.json")
+    proc, port = spawn_stub("stub_agent_iftable.py", "v3", "--window", "1",
+                            "--bump-boots-at", "1", "--stats", stats)
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "v3boots.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "v3-boots", group_id=group_id,
+            snmp_version=3, v3_user="poller", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        device = db.device(device_id)
+        poller._poll_device(device, db.effective_config(device))   # discovery
+        with open(stats) as handle:
+            before = json.load(handle)
+        time.sleep(1.2)                        # the agent restarts in here
+        device = db.device(device_id)
+        poller._poll_device(device, db.effective_config(device))   # boots bump
+        device = db.device(device_id)
+        with open(stats) as handle:
+            after = json.load(handle)
+        check(after["engine_boots"] == before["engine_boots"] + 1,
+              "the stub agent restarted between the two polls")
+        check(after["reports"] - before["reports"] == 1,
+              f"the restart costs exactly one Report-PDU "
+              f"(got {after['reports'] - before['reports']})")
+        check(device["status"] == "up",
+              f"…and the poll recovers within itself instead of failing "
+              f"(status={device['status']!r}, error={device['snmp_error']!r})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
 
 
 def request_matching():
@@ -267,6 +364,7 @@ def main():
 
     reboot_suppression()
     request_matching()
+    v3_engine_time()
 
     print()
     if FAILURES:

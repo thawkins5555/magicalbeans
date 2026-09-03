@@ -34,6 +34,39 @@ from .trapdecode import localized_key
 
 MAX_UDP = 65535
 
+# RFC 3414 §5's usmStats counters, the objects an agent names in the
+# Report-PDU it answers a v3 request it would not process with. Reported by
+# name, because "engine resync required" told an operator nothing about
+# whether the password was wrong, the clock was out, or the security level
+# was refused — three different problems with three different fixes.
+USM_STATS = {
+    "1.3.6.1.6.3.15.1.1.1": ("unsupportedSecLevels",
+                             "the device refused this security level "
+                             "(authPriv is not supported by this poller)"),
+    "1.3.6.1.6.3.15.1.1.2": ("notInTimeWindows",
+                             "the device rejected the message's engine time"),
+    "1.3.6.1.6.3.15.1.1.3": ("unknownUserNames",
+                             "the device does not know this SNMPv3 user"),
+    "1.3.6.1.6.3.15.1.1.4": ("unknownEngineIDs",
+                             "the device did not recognise the engine id"),
+    "1.3.6.1.6.3.15.1.1.5": ("wrongDigests",
+                             "the authentication password or protocol is wrong"),
+    "1.3.6.1.6.3.15.1.1.6": ("decryptionErrors",
+                             "the device could not decrypt the message"),
+}
+
+
+def report_reason(response) -> tuple[str, str]:
+    """(usmStats name, plain explanation) for a Report-PDU, or ("", "")
+    when it names nothing this table knows."""
+    for vb in getattr(response, "varbinds", None) or ():
+        oid = str(vb.get("oid") or "")
+        # The instance is the counter's OID with .0 appended.
+        known = USM_STATS.get(oid) or USM_STATS.get(oid.rsplit(".", 1)[0])
+        if known:
+            return known
+    return "", ""
+
 
 class EngineCache:
     """One entry per device needing v3: device_id -> (engine_id, boots,
@@ -53,6 +86,26 @@ class EngineCache:
         with self._lock:
             return self._entries.get(device_id)
 
+    def current(self, device_id: int):
+        """(engine_id, boots, engine_time) with engineTime advanced to now.
+
+        engineTime is the agent's own clock in seconds, and RFC 3414 §3.2
+        rejects an authenticated message whose engineTime is more than 150
+        seconds from the agent's. Sending back the value learned at
+        discovery — as this did — means every v3 device starts failing 150
+        seconds after its first poll and keeps failing until something
+        invalidates the entry, which the review saw as a spurious
+        auth_fail roughly every third poll. The elapsed wall time since
+        the value was learned is added instead.
+        """
+        with self._lock:
+            entry = self._entries.get(device_id)
+        if entry is None:
+            return None
+        engine_id, boots, engine_time, learned_at = entry
+        elapsed = max(0.0, time.time() - learned_at)
+        return engine_id, boots, engine_time + int(elapsed)
+
     def set(self, device_id: int, engine_id: bytes, boots: int, engine_time: int) -> None:
         with self._lock:
             self._entries[device_id] = (engine_id, boots, engine_time, time.time())
@@ -60,6 +113,16 @@ class EngineCache:
     def invalidate(self, device_id: int) -> None:
         with self._lock:
             self._entries.pop(device_id, None)
+
+    def forget(self, device_ids) -> None:
+        """Drop entries for devices that no longer exist. The cache is
+        keyed by device id and kept for the process lifetime, so without
+        this a long-running install accumulates one entry per device ever
+        deleted."""
+        keep = set(device_ids)
+        with self._lock:
+            for device_id in [k for k in self._entries if k not in keep]:
+                self._entries.pop(device_id, None)
 
 
 class _Session:
@@ -925,6 +988,13 @@ class NodePoller:
 
         snmp_ok = None
         snmp_error = ""
+        # Whether SNMP failed because the device refuses something this
+        # poller does not speak, rather than because it is unreachable.
+        # Decided by exception type: the old test looked for the substring
+        # "unsupported" in the message, and no message this raises has ever
+        # contained it, so the whole `unsupported` status, its device event
+        # and the rule that watches for it were unreachable code.
+        snmp_unsupported = False
         identity = None
         uptime_ticks = None
         interfaces: list[dict] = []
@@ -942,6 +1012,7 @@ class NodePoller:
             except SnmpUnsupported as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
+                snmp_unsupported = True
                 self.counters["unsupported"] += 1
             except SnmpTimeout as exc:
                 snmp_ok = False
@@ -978,7 +1049,7 @@ class NodePoller:
             ping_only_ok = bool(config.get("unreachable_ping_only", True))
             reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
 
-        if snmp_ok is False and snmp_error and "unsupported" in snmp_error.lower():
+        if snmp_unsupported:
             status = "unsupported"
         elif reachable:
             status = "up"
@@ -1225,29 +1296,69 @@ class NodePoller:
                 self._check_error_status(response)
                 return response
 
-            identity, auth_proto, password = credential_for(config)
-            engine = self._engines.get(device["id"])
-            if engine is None:
-                engine = self._discover_engine(session, device)
-            engine_id, boots, engine_time, _learned_at = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            request_id = session.next_request_id()
-            packet = build_v3_request(
-                session.next_request_id(), request_id, PDU_GET, oids,
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet, request_id)
-            if response.pdu_tag == PDU_REPORT:
-                # Out of time window, or unknown engine: refresh and fail
-                # this attempt cleanly; the next poll re-discovers.
-                self._engines.invalidate(device["id"])
-                raise _AuthFailure(f"{device['ip']}: engine resync required "
-                                   f"(received a Report-PDU)")
+            response = self._v3_exchange(session, device, config, PDU_GET, oids)
             self._check_error_status(response)
             return response
         finally:
             session.close()
+
+    def _v3_exchange(self, session: _Session, device, config: dict, pdu_tag: int,
+                     oids: list[str], max_repetitions: int = 0) -> Response:
+        """One authenticated v3 round trip, with the engine resync RFC 3414
+        §3.2 actually prescribes.
+
+        Every v3 caller went through its own copy of "build the message,
+        send it, and if a Report comes back give up" — so a device whose
+        engineBoots had incremented (a restart) failed every poll until
+        something else invalidated the cache, and the operator was told
+        only "engine resync required". Here a Report is what it is: the
+        agent telling us its current boots/time. Those are learned, the
+        request is retried once with them, and only a second Report is an
+        error — named after the usmStats counter the agent pointed at, so
+        a wrong password reads differently from a wrong clock. A refused
+        security level is raised as SnmpUnsupported, which the poll path
+        classifies as status 'unsupported' rather than as an auth failure.
+        """
+        identity, auth_proto, password = credential_for(config)
+        last: Response | None = None
+        for attempt in (0, 1):
+            engine = self._engines.current(device["id"])
+            if engine is None:
+                engine = self._discover_engine(session, device)
+            engine_id, boots, engine_time = engine
+            auth_key = localized_key(auth_proto, password, engine_id) \
+                if auth_proto and password else None
+            request_id = session.next_request_id()
+            packet = build_v3_request(
+                session.next_request_id(), request_id, pdu_tag, oids,
+                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+                user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
+                max_repetitions=max_repetitions)
+            response = session.request(packet, request_id)
+            if response.pdu_tag != PDU_REPORT:
+                return response
+            last = response
+            name, explanation = report_reason(response)
+            if name == "unsupportedSecLevels":
+                raise SnmpUnsupported(f"{device['ip']}: {explanation}")
+            if attempt == 0:
+                # The Report carries the agent's own authoritative engine
+                # id, boots and time — which is exactly what the retry
+                # needs. Learn them rather than throwing the answer away
+                # and rediscovering on the next poll.
+                self._engines.invalidate(device["id"])
+                if response.engine_id:
+                    self._engines.set(device["id"], response.engine_id,
+                                      response.engine_boots, response.engine_time)
+                continue
+            self._engines.invalidate(device["id"])
+            raise _AuthFailure(
+                f"{device['ip']}: SNMPv3 request refused"
+                + (f" ({explanation})" if explanation
+                   else " (the device answered with a Report-PDU)")
+                + (f" [usmStats{name[0].upper()}{name[1:]}]" if name else ""))
+        raise _AuthFailure(f"{device['ip']}: SNMPv3 request refused"
+                           + (" (a Report-PDU, twice)" if last else ""))
 
     def _discover_engine(self, session: _Session, device) -> tuple:
         probe = discovery_probe()
@@ -1256,7 +1367,7 @@ class NodePoller:
             raise SnmpError(f"{device['ip']}: no engine id in discovery reply")
         self._engines.set(device["id"], response.engine_id, response.engine_boots,
                           response.engine_time)
-        return self._engines.get(device["id"])
+        return self._engines.current(device["id"])
 
     @staticmethod
     def _check_error_status(response: Response) -> None:
@@ -2535,19 +2646,7 @@ class NodePoller:
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
                                        request_id, [oid])
                 return session.request(packet, request_id)
-            identity, auth_proto, password = credential_for(config)
-            engine = self._engines.get(device["id"])
-            if engine is None:
-                engine = self._discover_engine(session, device)
-            engine_id, boots, engine_time, _learned_at = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            request_id = session.next_request_id()
-            packet = build_v3_request(
-                session.next_request_id(), request_id, PDU_GETNEXT, [oid],
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            return session.request(packet, request_id)
+            return self._v3_exchange(session, device, config, PDU_GETNEXT, [oid])
         finally:
             session.close()
 
@@ -2576,20 +2675,8 @@ class NodePoller:
                                    request_id, [oid],
                                    max_repetitions=max_repetitions)
             return session.request(packet, request_id)
-        identity, auth_proto, password = credential_for(config)
-        engine = self._engines.get(device["id"])
-        if engine is None:
-            engine = self._discover_engine(session, device)
-        engine_id, boots, engine_time, _learned_at = engine
-        auth_key = localized_key(auth_proto, password, engine_id) \
-            if auth_proto and password else None
-        request_id = session.next_request_id()
-        packet = build_v3_request(
-            session.next_request_id(), request_id, pdu_tag, [oid],
-            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-            user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
-            max_repetitions=max_repetitions)
-        return session.request(packet, request_id)
+        return self._v3_exchange(session, device, config, pdu_tag, [oid],
+                                 max_repetitions=max_repetitions)
 
 
 class _AuthFailure(SnmpError):

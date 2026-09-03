@@ -30,13 +30,29 @@ Modes:
                    the first datagram off the socket stores the wrong
                    answer — which is what a late reply to a previous
                    attempt does on a real network.
+  v3               speaks SNMPv3 noAuthNoPriv with an authoritative engine
+                   id, engineBoots and a real engineTime clock, and applies
+                   an RFC 3414 §3.2 time window of --window seconds:
+                   a request whose msgAuthoritativeEngineTime is outside it
+                   is answered with a Report-PDU naming
+                   usmStatsNotInTimeWindows, exactly as an agent does to a
+                   poller whose cached engineTime has stopped advancing.
+                   --bump-boots-at SECONDS restarts the engine (boots + 1,
+                   engineTime back to 0) that many seconds after the stub
+                   started, so a test can put the restart between two
+                   polls without counting requests.
+
+Options: --interfaces N, --reboot-after N, --window SECONDS,
+--bump-boots-at SECONDS, --stats PATH (a JSON counter file the test reads).
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
 spawn_stub waits for.
 """
+import json
 import os
 import socket
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
@@ -44,18 +60,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 from netpath import nodeoids
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
-    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, T_COUNTER32, T_COUNTER64,
-    T_END_OF_MIB_VIEW, T_GAUGE32, T_NO_SUCH_OBJECT, T_NULL, T_SEQUENCE,
-    T_TIMETICKS, _tlv, enc_int, enc_octets, enc_unsigned, enc_varbind,
+    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, PDU_RESPONSE, T_COUNTER32,
+    T_COUNTER64, T_END_OF_MIB_VIEW, T_GAUGE32, T_NO_SUCH_OBJECT, T_NULL,
+    T_INTEGER, T_OCTET_STRING, T_SEQUENCE, T_TIMETICKS, V3, Reader, _signed,
+    _tlv, enc_int, enc_octets, enc_unsigned, enc_varbind,
 )
 
 COMMUNITY = "public"
 UPTIME_TICKS = 987_654
+ENGINE_ID = b"\x80\x00\x1f\x88\x80stub-engine"
+USM_NOT_IN_TIME_WINDOWS = "1.3.6.1.6.3.15.1.1.2.0"
+USM_UNKNOWN_ENGINE_IDS = "1.3.6.1.6.3.15.1.1.4.0"
 
 
 class Agent:
     def __init__(self, port: int, mode: str = "ok", interfaces: int = 2,
-                 reboot_after: int = 2):
+                 reboot_after: int = 2, window: float = 1.0,
+                 bump_boots_at: float = 0.0, stats_path: str = ""):
         self.mode = mode
         self.n_interfaces = interfaces
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -66,6 +87,97 @@ class Agent:
         self.reboot_after = reboot_after
         self.uptime_reads = 0
         self.sys_name = "iftable-stub"
+        self.window = window
+        self.bump_boots_at = bump_boots_at
+        self.bumped = False
+        self.started_at = time.monotonic()
+        self.stats_path = stats_path
+        self.engine_boots = 3
+        self.engine_epoch = time.monotonic()
+        self.counts = {"requests": 0, "reports": 0, "discoveries": 0,
+                       "responses": 0}
+
+    # ------------------------------------------------------------- SNMPv3
+
+    @staticmethod
+    def _msg_id(data: bytes) -> int:
+        """The request's msgID, echoed back the way a real agent does.
+        decode_response does not surface it, so it is read here."""
+        top = Reader(data)
+        body_s, body_e = top.expect(T_SEQUENCE)
+        msg = Reader(data, body_s, body_e)
+        msg.expect(T_INTEGER)                      # version
+        hs, he = msg.expect(T_SEQUENCE)            # msgGlobalData
+        header = Reader(data, hs, he)
+        s, e = header.expect(T_INTEGER)
+        return _signed(data, s, e)
+
+    def engine_time(self) -> int:
+        return int(time.monotonic() - self.engine_epoch)
+
+    def _bump_boots(self) -> None:
+        """The agent restarted: engineBoots increments and engineTime goes
+        back to zero, so every cached engine parameter a poller holds is
+        now wrong and it must resync off our Report."""
+        self.engine_boots += 1
+        self.engine_epoch = time.monotonic()
+
+    def _v3_message(self, msg_id: int, pdu: bytes) -> bytes:
+        header = _tlv(T_SEQUENCE, enc_int(msg_id) + enc_int(65507) +
+                      _tlv(T_OCTET_STRING, bytes([0])) + enc_int(3))
+        usm_body = (enc_octets(ENGINE_ID) + enc_int(self.engine_boots) +
+                    enc_int(self.engine_time()) + enc_octets("") +
+                    _tlv(T_OCTET_STRING, b"") + _tlv(T_OCTET_STRING, b""))
+        sec = _tlv(T_OCTET_STRING, _tlv(T_SEQUENCE, usm_body))
+        scoped = _tlv(T_SEQUENCE, enc_octets(ENGINE_ID) + enc_octets("") + pdu)
+        return _tlv(T_SEQUENCE, enc_int(V3) + header + sec + scoped)
+
+    @staticmethod
+    def _pdu(tag: int, request_id: int, varbinds: bytes) -> bytes:
+        return _tlv(tag, enc_int(request_id) + enc_int(0) + enc_int(0) +
+                    _tlv(T_SEQUENCE, varbinds))
+
+    def _report(self, msg_id: int, request_id: int, oid: str) -> bytes:
+        self.counts["reports"] += 1
+        body = enc_varbind(oid, enc_unsigned(T_COUNTER32, self.counts["reports"]))
+        return self._v3_message(msg_id, self._pdu(PDU_REPORT, request_id, body))
+
+    def _v3_handle(self, req, msg_id: int) -> list:
+        self.counts["requests"] += 1
+        if self.bump_boots_at and not self.bumped and \
+                time.monotonic() - self.started_at >= self.bump_boots_at:
+            self.bumped = True
+            self._bump_boots()
+        if not req.engine_id:
+            # Engine discovery: an unauthenticated, empty, reportable GET.
+            self.counts["discoveries"] += 1
+            return [self._report(msg_id, req.request_id,
+                                 USM_UNKNOWN_ENGINE_IDS)]
+        if req.engine_id != ENGINE_ID or req.engine_boots != self.engine_boots \
+                or abs(req.engine_time - self.engine_time()) > self.window:
+            return [self._report(msg_id, req.request_id,
+                                 USM_NOT_IN_TIME_WINDOWS)]
+        self.counts["responses"] += 1
+        if req.pdu_tag == PDU_GET:
+            body = b""
+            for vb in req.varbinds:
+                value = self.value_for(vb["oid"])
+                body += enc_varbind(vb["oid"], value if value is not None
+                                    else _tlv(T_NO_SUCH_OBJECT, b""))
+            return [self._v3_message(
+                msg_id, self._pdu(PDU_RESPONSE, req.request_id, body))]
+        if req.pdu_tag in (PDU_GETNEXT, PDU_GETBULK):
+            oid, value = self._next_after(req.varbinds[0]["oid"])
+            return [self._v3_message(
+                msg_id, self._pdu(PDU_RESPONSE, req.request_id,
+                                  enc_varbind(oid, value)))]
+        return []
+
+    def write_stats(self) -> None:
+        if not self.stats_path:
+            return
+        with open(self.stats_path, "w") as handle:
+            json.dump(dict(self.counts, engine_boots=self.engine_boots), handle)
 
     # ---------------------------------------------------------------- values
 
@@ -245,6 +357,8 @@ class Agent:
         """Every datagram this agent wants to send back, in order. A list
         because a misbehaving agent sends more than one."""
         req = decode_response(data)
+        if self.mode == "v3":
+            return self._v3_handle(req, self._msg_id(data))
         if self.mode == "dark_after_walk" and self.walked and \
                 req.pdu_tag == PDU_GET:
             return []                        # answered the walk, now silent
@@ -283,6 +397,7 @@ class Agent:
                 continue
             for reply in replies or ():
                 self.sock.sendto(reply, addr)
+            self.write_stats()
 
 
 def main(argv):
@@ -290,6 +405,9 @@ def main(argv):
     mode = "ok"
     interfaces = 2
     reboot_after = 2
+    window = 1.0
+    bump_boots_at = 0.0
+    stats_path = ""
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
@@ -297,9 +415,16 @@ def main(argv):
             interfaces = int(rest.pop(0))
         elif item == "--reboot-after":
             reboot_after = int(rest.pop(0))
+        elif item == "--window":
+            window = float(rest.pop(0))
+        elif item == "--bump-boots-at":
+            bump_boots_at = float(rest.pop(0))
+        elif item == "--stats":
+            stats_path = rest.pop(0)
         else:
             mode = item
-    Agent(port, mode, interfaces, reboot_after).serve()
+    Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
+          stats_path).serve()
 
 
 if __name__ == "__main__":
