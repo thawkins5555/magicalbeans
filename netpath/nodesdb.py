@@ -511,6 +511,10 @@ class NodesDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
+        # Bumped by every write that could change what or how a device is
+        # polled. The scheduler holds one merged config per device and
+        # rebuilds it only when this moves — see config_generation().
+        self._config_generation = 0
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -745,6 +749,7 @@ class NodesDatabase:
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, json.dumps(value)))
             self._conn.commit()
+            self._config_generation += 1
 
     # ----------------------------------------------------------------- groups
 
@@ -771,6 +776,7 @@ class NodesDatabase:
             cur = self._conn.execute(
                 f"INSERT INTO groups({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def update_group(self, group_id: int, **fields) -> None:
@@ -783,6 +789,7 @@ class NodesDatabase:
                 f"UPDATE groups SET {clauses} WHERE id = ?",
                 (*allowed.values(), group_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_group_credential(self, group_id: int, user: str, auth_proto: str,
                              password_enc: bytes) -> None:
@@ -791,12 +798,14 @@ class NodesDatabase:
                 "UPDATE groups SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
                 " WHERE id=?", (user, auth_proto, password_enc, group_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_group_credential(self, group_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE groups SET v3_auth_pass_enc=NULL WHERE id=?", (group_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def device_count_for_group(self, group_id: int) -> int:
         with self._lock:
@@ -829,6 +838,7 @@ class NodesDatabase:
                         "UPDATE groups SET is_default = 1 WHERE id = ?",
                         (successor["id"],))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_default_group(self, group_id: int) -> None:
         with self._lock:
@@ -836,6 +846,7 @@ class NodesDatabase:
             self._conn.execute("UPDATE groups SET is_default = 1 WHERE id = ?",
                                (group_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     # ----------------------------------------------------- group credentials
 
@@ -863,6 +874,7 @@ class NodesDatabase:
                 (group_id, label, snmp_version, community, v3_user, v3_auth_proto,
                  time.time()))
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def update_group_credential(self, credential_id: int, **fields) -> None:
@@ -876,6 +888,7 @@ class NodesDatabase:
                 f"UPDATE group_credentials SET {clauses} WHERE id = ?",
                 (*allowed.values(), credential_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_group_credential_password(self, credential_id: int, user: str,
                                       auth_proto: str, password_enc: bytes) -> None:
@@ -885,6 +898,7 @@ class NodesDatabase:
                 " v3_auth_pass_enc=? WHERE id=?",
                 (user, auth_proto, password_enc, credential_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_group_credential_password(self, credential_id: int) -> None:
         with self._lock:
@@ -892,12 +906,14 @@ class NodesDatabase:
                 "UPDATE group_credentials SET v3_auth_pass_enc=NULL WHERE id=?",
                 (credential_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def remove_group_credential(self, credential_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM group_credentials WHERE id = ?", (credential_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     # ---------------------------------------------------------- device groups
     #
@@ -1032,6 +1048,7 @@ class NodesDatabase:
             cur = self._conn.execute(
                 f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def seed_identity(self, device_id: int, *, sys_descr: str = "",
@@ -1072,6 +1089,7 @@ class NodesDatabase:
                 f"UPDATE devices SET {clauses} WHERE id = ?",
                 (*allowed.values(), device_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def bulk_update_devices(self, device_ids: list[int], **fields) -> None:
         """The same field allow-list as update_device, applied to many rows
@@ -1088,6 +1106,7 @@ class NodesDatabase:
                 f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
                 (*allowed.values(), *device_ids))
             self._conn.commit()
+            self._config_generation += 1
 
     def bulk_remove_devices(self, device_ids: list[int]) -> int:
         if not device_ids:
@@ -1097,6 +1116,7 @@ class NodesDatabase:
             cursor = self._conn.execute(
                 f"DELETE FROM devices WHERE id IN ({marks})", device_ids)
             self._conn.commit()
+            self._config_generation += 1
             return cursor.rowcount or 0
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
@@ -1106,23 +1126,69 @@ class NodesDatabase:
                 "UPDATE devices SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
                 " WHERE id=?", (user, auth_proto, password_enc, device_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_device_credential(self, device_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET v3_auth_pass_enc=NULL WHERE id=?", (device_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def remove_device(self, device_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
             self._conn.commit()
+            self._config_generation += 1
+
+    def config_generation(self) -> int:
+        """A counter that moves whenever a settings, profile, credential or
+        device write could change how something is polled.
+
+        The scheduler used to re-read the whole device table and call
+        effective_config() — itself four settings reads and a group read —
+        once per device per second: 4,001 statements a second at 2,000
+        devices, under the same lock every poll worker needs. It now holds
+        the merged configs and rebuilds them only when this number changes.
+        A plain in-memory counter, not a stored value: it only has to be
+        comparable within one process, and the poller lives in the same
+        process as every writer.
+        """
+        return self._config_generation
+
+    def schedule_rows(self) -> list[sqlite3.Row]:
+        """Just the columns the scheduling loop reads, for enabled devices
+        only. `SELECT *` pulled sys_descr and every credential blob for
+        every device once a second to look at four integers."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, name, ip, status, consecutive_fail, last_poll_ts"
+                " FROM devices WHERE enabled = 1").fetchall()
+
+    def effective_configs(self) -> dict:
+        """effective_config() for every enabled device, with the settings
+        and groups tables read once between them all rather than once (four
+        times, in settings()' case) per device."""
+        settings = self.settings()
+        with self._lock:
+            groups = {row["id"]: row for row in
+                      self._conn.execute("SELECT * FROM groups").fetchall()}
+            devices = self._conn.execute(
+                "SELECT * FROM devices WHERE enabled = 1").fetchall()
+        return {row["id"]: self._merge_config(
+                    row, groups.get(row["group_id"]), settings)
+                for row in devices}
 
     def effective_config(self, device_row: sqlite3.Row) -> dict:
         """Merges a device's own non-NULL override columns over its group's
         row (or DEFAULTS if the device has no group). This is the single
         place "per device or per device group" is actually resolved."""
         group_row = self.group(device_row["group_id"]) if device_row["group_id"] else None
+        return self._merge_config(device_row, group_row, self.settings())
+
+    def _merge_config(self, device_row, group_row, settings: dict) -> dict:
+        """The merge itself, given rows already read. Split out so
+        effective_configs() can do the reads once for a whole fleet."""
         config = {}
         for key in _OVERRIDE_COLUMNS:
             value = device_row[key] if key in device_row.keys() else None
@@ -1131,7 +1197,6 @@ class NodesDatabase:
             config[key] = value
         if config.get("snmp_version") is None:
             config["snmp_version"] = 1
-        settings = self.settings()  # fetched once; every fallback below reuses it
         if config.get("poll_interval_s") is None:
             config["poll_interval_s"] = settings.get("default_interval_s", 120)
         if config.get("snmp_timeout_s") is None:

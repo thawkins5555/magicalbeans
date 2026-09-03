@@ -647,6 +647,11 @@ class NodePoller:
         self._vendor_ids: dict[int, "_VendorIdJob"] = {}
         self._mib_index: tuple | None = None       # (generation, MibIndex)
         self._last_completed: float = 0.0
+        # The merged per-device configs the scheduling pass reads, and the
+        # nodesdb config generation and wall time they were built at.
+        self._configs: dict | None = None
+        self._configs_generation: int = -1
+        self._configs_loaded: float = 0.0
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
         # mixed-vendor subnet, say) costs one extra request only on a
@@ -846,38 +851,78 @@ class NodePoller:
 
     # ------------------------------------------------------------------ loop
 
+    # A backstop behind the generation counter: a config change made
+    # outside this process (a second copy of the app on the same file)
+    # would not bump it, so the merged configs are rebuilt at least this
+    # often regardless.
+    _CONFIG_REFRESH_S = 60.0
+
     def _loop(self) -> None:
+        """The scheduling thread. Every pass is guarded: this thread dying
+        silently — which one transient database error was enough to do —
+        stopped all polling with `poller.error` still None and the status
+        strip still reading "Polling N devices". Now the failure is
+        recorded, shown, and the thread keeps going."""
         while not self._stop.is_set():
-            now = time.time()
-            focus = self._focus
-            for device in self.db.devices():
-                if not device["enabled"]:
-                    continue
-                config = self.db.effective_config(device)
-                interval = config["poll_interval_s"]
-                # The device selected in a browser polls faster (SNMP
-                # devices only — a fast ping-only cadence shows nothing
-                # new) until its focus TTL lapses.
-                focused = (focus is not None and device["id"] == focus[0]
-                           and now < focus[1] and config.get("snmp_enabled", True))
-                if focused:
-                    interval = min(interval, focus[2])
-                due = self._next_run.get(device["id"])
-                if due is None:
-                    due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
-                    self._next_run[device["id"]] = due
-                if now >= due:
-                    self._next_run[device["id"]] = now + interval
-                    if device["id"] in self._started or device["id"] in self._queued:
-                        # A poll slower than the fast focus cadence is
-                        # expected, not an overrun worth logging — only
-                        # blowing the device's own profile interval is.
-                        if not (focused and interval < config["poll_interval_s"]):
-                            self._record_overrun(device, now)
-                    else:
-                        self._submit(device["id"])
-                self._maybe_walk_mac_table(device, config, now)
+            try:
+                self._schedule_pass()
+                if self.error:
+                    self.log.add(NODES, "Polling scheduling recovered")
+                    self.error = None
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                self.error = f"Poller scheduling failed: {message}"
+                self.counters["errors"] += 1
+                self.log.add(ERROR, self.error, detail=traceback.format_exc())
             self._stop.wait(1.0)
+
+    def _schedule_pass(self) -> None:
+        """One pass over the fleet: whose turn is it to be polled.
+
+        Reads six columns per enabled device and nothing else. The merged
+        per-device config — which used to be recomputed here once per
+        device per second, four settings reads and a group read each — is
+        held between passes and rebuilt only when nodesdb's config
+        generation moves or the backstop expires.
+        """
+        now = time.time()
+        generation = self.db.config_generation()
+        if (self._configs is None or generation != self._configs_generation
+                or now - self._configs_loaded > self._CONFIG_REFRESH_S):
+            self._configs = self.db.effective_configs()
+            self._configs_generation = generation
+            self._configs_loaded = now
+        focus = self._focus
+        for device in self.db.schedule_rows():
+            device_id = device["id"]
+            config = self._configs.get(device_id)
+            if config is None:
+                # Added since the last rebuild; it is picked up on the next
+                # pass, because add_device bumped the generation.
+                continue
+            interval = config["poll_interval_s"]
+            # The device selected in a browser polls faster (SNMP
+            # devices only — a fast ping-only cadence shows nothing
+            # new) until its focus TTL lapses.
+            focused = (focus is not None and device_id == focus[0]
+                       and now < focus[1] and config.get("snmp_enabled", True))
+            if focused:
+                interval = min(interval, focus[2])
+            due = self._next_run.get(device_id)
+            if due is None:
+                due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
+                self._next_run[device_id] = due
+            if now >= due:
+                self._next_run[device_id] = now + interval
+                if device_id in self._started or device_id in self._queued:
+                    # A poll slower than the fast focus cadence is
+                    # expected, not an overrun worth logging — only
+                    # blowing the device's own profile interval is.
+                    if not (focused and interval < config["poll_interval_s"]):
+                        self._record_overrun(device, now, config)
+                else:
+                    self._submit(device_id)
+            self._maybe_walk_mac_table(device, config, now)
 
     def _maybe_walk_mac_table(self, device, config: dict, now: float) -> None:
         """Queue a forwarding-table walk when this device's own interval has
@@ -922,13 +967,15 @@ class NodePoller:
             self._queued[device_id] = time.time()
         try:
             self._executor.submit(self._run_one, device_id)
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
+            # The pool has shut down, or there is none (the scheduler being
+            # exercised without one). Either way the device is not queued.
             with self._lock:
                 self._queued.pop(device_id, None)
             return False
         return True
 
-    def _record_overrun(self, device, now) -> None:
+    def _record_overrun(self, device, now, config: dict | None = None) -> None:
         """Record that a poll was still running as the next one fell due.
 
         Not recorded while the device is not answering: a poll that spends
@@ -946,7 +993,9 @@ class NodePoller:
             return
         self.counters["overruns"] += 1
         running_for = now - self._started.get(device["id"], now)
-        interval = self.db.effective_config(device)["poll_interval_s"]
+        if config is None:
+            config = self.db.effective_config(device)
+        interval = config["poll_interval_s"]
         self.log.add(ERROR, f"Poll overrun for {device['name'] or device['ip']}: "
                             f"still running after {running_for:.0f}s, interval is "
                             f"{interval}s — lengthen the interval or shorten the "
