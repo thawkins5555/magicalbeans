@@ -1173,6 +1173,30 @@ end
           upgrade(f"http://127.0.0.1:{PORT}") == 101,
           str(upgrade(f"http://127.0.0.1:{PORT}")))
 
+    # ------------------------------------------------- D14 the access log
+    from netpath.web.server import AccessLog, MAX_TRACKED_CLIENTS
+
+    check("D14 the live access log has a client ceiling",
+          MAX_TRACKED_CLIENTS == 1000 and SERVER.access.max_clients == 1000,
+          str(SERVER.access.max_clients))
+
+    small = AccessLog(max_clients=10)
+    for n in range(500):
+        small.record(f"10.0.{n // 250}.{n % 250}", "GET", "/api/state", 200,
+                     1.0, "scanner/1.0")
+    check("D14 it stops growing one entry per source address",
+          len(small.clients) == 10, str(len(small.clients)))
+    check("D14 …and keeps the most recently seen",
+          f"10.0.1.249" in small.clients and "10.0.0.0" not in small.clients,
+          str(list(small.clients)[:3]))
+    small.record("10.0.0.5", "GET", "/api/state", 200, 1.0, "operator")
+    small.record("10.9.9.9", "GET", "/api/state", 200, 1.0, "operator")
+    check("D14 …evicting the quietest, not the newest",
+          "10.0.0.5" in small.clients and "10.9.9.9" in small.clients,
+          str(list(small.clients)))
+    check("D14 the snapshot still reads",
+          isinstance(small.snapshot()["clients"], dict))
+
     return 0
 
 

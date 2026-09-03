@@ -25,7 +25,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from collections import deque
+from collections import OrderedDict, deque
 
 from . import api
 from . import wsock
@@ -314,18 +314,35 @@ class LengthRequired(ValueError):
     body gets."""
 
 
+# How many source addresses the access log remembers at once. `recent` has
+# always been a bounded deque; `clients` was a plain dict with nothing
+# removing entries, so every address that ever made a request stayed for
+# the life of the process along with its user-agent string — every
+# port-scanner source, every health-check probe, every DHCP-reassigned
+# laptop. A thousand is far more than any real operator population and
+# still a bounded amount of memory and of work for the console, which
+# re-sorts this dict once a second.
+MAX_TRACKED_CLIENTS = 1000
+
+
 class AccessLog:
     """Recent requests and per-client totals, for the service console.
 
-    Bounded: this is a live view, not an audit trail. Static files are counted
-    but kept out of the recent list, which would otherwise be nothing but the
-    five scripts every page load fetches.
+    Bounded in both directions: this is a live view, not an audit trail —
+    that is what appdb's `audit` table is for, and unlike this it is never
+    trimmed. Static files are counted but kept out of the recent list,
+    which would otherwise be nothing but the five scripts every page load
+    fetches.
     """
 
-    def __init__(self, capacity: int = 400):
+    def __init__(self, capacity: int = 400,
+                 max_clients: int = MAX_TRACKED_CLIENTS):
         self._lock = threading.Lock()
         self.recent: deque = deque(maxlen=capacity)
-        self.clients: dict[str, dict] = {}
+        # Ordered by least-recently-seen, so eviction drops the address
+        # that has been quiet longest rather than an arbitrary one.
+        self.clients: "OrderedDict[str, dict]" = OrderedDict()
+        self.max_clients = max_clients
         self.total = 0
         self.errors = 0
         self.active = 0
@@ -354,6 +371,9 @@ class AccessLog:
                 info["agent"] = agent
             if status >= 400:
                 info["errors"] += 1
+            self.clients.move_to_end(client)
+            while len(self.clients) > self.max_clients:
+                self.clients.popitem(last=False)
 
     def opened(self) -> None:
         with self._lock:
