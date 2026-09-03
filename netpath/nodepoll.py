@@ -72,6 +72,16 @@ class _Session:
         self.retries = max(0, int(retries))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(self.timeout_s)
+        # Request ids for this session's own exchanges. A counter from a
+        # random start rather than random.randint per request: two requests
+        # in one walk drawing the same id by chance is exactly the
+        # confusion the id exists to prevent.
+        self._request_id = random.randint(1, 2 ** 24)
+        self.dropped = 0        # datagrams discarded as not ours
+
+    def next_request_id(self) -> int:
+        self._request_id = (self._request_id + 1) % (2 ** 31 - 1) or 1
+        return self._request_id
 
     def close(self) -> None:
         try:
@@ -79,21 +89,75 @@ class _Session:
         except OSError:
             pass
 
-    def request(self, packet: bytes) -> Response:
-        """Send, wait for a reply, decode it. Retries on timeout up to
-        self.retries times; raises SnmpTimeout if every attempt times out."""
+    def _is_peer(self, addr) -> bool:
+        """Whether a datagram came from the device we asked. `addr` is
+        (host, port[, flow, scope]) — only the host is compared, because a
+        few agents answer from an ephemeral port rather than 161, which is
+        odd but not forgery."""
+        try:
+            return addr[0] == self.ip
+        except (TypeError, IndexError):
+            return False
+
+    def request(self, packet: bytes, expect_request_id: int | None = None) -> Response:
+        """Send, wait for OUR reply, decode it.
+
+        A UDP socket accepts whatever arrives. The first reading of this
+        took the first datagram it got — so a late answer to attempt 1 was
+        consumed as the answer to attempt 2 (the review reproduced it on a
+        device that answers in 2.6 s with a 2 s timeout), and anything
+        sent from any other address could be answered with. Now a datagram
+        is dropped and the wait continues when it did not come from the
+        device, or when it carries a different request id than the one
+        sent. A Report-PDU is exempt from the id test: an agent reports an
+        engine mismatch against its own msgID, and dropping it would turn
+        one v3 resync into a timeout.
+
+        Retries on timeout up to self.retries times; raises SnmpTimeout if
+        every attempt times out.
+        """
         last_error: Exception | None = None
         for _ in range(self.retries + 1):
             try:
                 self.sock.sendto(packet, (self.ip, self.port))
-                data, _addr = self.sock.recvfrom(MAX_UDP)
-                return decode_response(data)
-            except socket.timeout:
-                last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
-                continue
             except OSError as exc:
                 last_error = SnmpError(str(exc))
                 continue
+            deadline = time.monotonic() + self.timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                    break
+                try:
+                    self.sock.settimeout(remaining)
+                    data, addr = self.sock.recvfrom(MAX_UDP)
+                except socket.timeout:
+                    last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                    break
+                except OSError as exc:
+                    last_error = SnmpError(str(exc))
+                    break
+                if not self._is_peer(addr):
+                    self.dropped += 1
+                    continue
+                try:
+                    response = decode_response(data)
+                except SnmpUnsupported:
+                    raise
+                except SnmpError as exc:
+                    # Garbage from the right address is not an answer: keep
+                    # waiting for one within this attempt's budget rather
+                    # than failing the whole request on it.
+                    self.dropped += 1
+                    last_error = exc
+                    continue
+                if (expect_request_id is not None
+                        and response.pdu_tag != PDU_REPORT
+                        and response.request_id != expect_request_id):
+                    self.dropped += 1
+                    continue
+                return response
         raise last_error or SnmpTimeout(f"no reply from {self.ip}:{self.port}")
 
 
@@ -1154,9 +1218,10 @@ class NodePoller:
         try:
             if version in (0, 1):
                 identity, _proto, _pw = credential_for(config)
+                request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GET,
-                                       random.randint(1, 2**16), oids)
-                response = session.request(packet)
+                                       request_id, oids)
+                response = session.request(packet, request_id)
                 self._check_error_status(response)
                 return response
 
@@ -1167,11 +1232,12 @@ class NodePoller:
             engine_id, boots, engine_time, _learned_at = engine
             auth_key = localized_key(auth_proto, password, engine_id) \
                 if auth_proto and password else None
+            request_id = session.next_request_id()
             packet = build_v3_request(
-                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GET, oids,
+                session.next_request_id(), request_id, PDU_GET, oids,
                 engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
                 user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet)
+            response = session.request(packet, request_id)
             if response.pdu_tag == PDU_REPORT:
                 # Out of time window, or unknown engine: refresh and fail
                 # this attempt cleanly; the next poll re-discovers.
@@ -2465,9 +2531,10 @@ class NodePoller:
         try:
             if version in (0, 1):
                 identity, _proto, _pw = credential_for(config)
+                request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                       random.randint(1, 2**16), [oid])
-                return session.request(packet)
+                                       request_id, [oid])
+                return session.request(packet, request_id)
             identity, auth_proto, password = credential_for(config)
             engine = self._engines.get(device["id"])
             if engine is None:
@@ -2475,11 +2542,12 @@ class NodePoller:
             engine_id, boots, engine_time, _learned_at = engine
             auth_key = localized_key(auth_proto, password, engine_id) \
                 if auth_proto and password else None
+            request_id = session.next_request_id()
             packet = build_v3_request(
-                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GETNEXT, [oid],
+                session.next_request_id(), request_id, PDU_GETNEXT, [oid],
                 engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
                 user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            return session.request(packet)
+            return session.request(packet, request_id)
         finally:
             session.close()
 
@@ -2503,10 +2571,11 @@ class NodePoller:
         version = int(config.get("snmp_version", 1))
         if version in (0, 1):
             identity, _proto, _pw = credential_for(config)
+            request_id = session.next_request_id()
             packet = build_request(version, identity or "public", pdu_tag,
-                                   random.randint(1, 2**16), [oid],
+                                   request_id, [oid],
                                    max_repetitions=max_repetitions)
-            return session.request(packet)
+            return session.request(packet, request_id)
         identity, auth_proto, password = credential_for(config)
         engine = self._engines.get(device["id"])
         if engine is None:
@@ -2514,12 +2583,13 @@ class NodePoller:
         engine_id, boots, engine_time, _learned_at = engine
         auth_key = localized_key(auth_proto, password, engine_id) \
             if auth_proto and password else None
+        request_id = session.next_request_id()
         packet = build_v3_request(
-            random.randint(1, 2**16), random.randint(1, 2**16), pdu_tag, [oid],
+            session.next_request_id(), request_id, pdu_tag, [oid],
             engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
             user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
             max_repetitions=max_repetitions)
-        return session.request(packet)
+        return session.request(packet, request_id)
 
 
 class _AuthFailure(SnmpError):

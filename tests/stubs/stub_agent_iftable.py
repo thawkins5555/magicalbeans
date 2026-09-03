@@ -25,6 +25,11 @@ Modes:
                    and then drops to a few seconds, and every counter
                    restarts with it — a device that rebooted between two
                    polls.
+  stale_id         answers every GET twice: first with request-id + 1 and
+                   a wrong sysName, then correctly. A receiver that takes
+                   the first datagram off the socket stores the wrong
+                   answer — which is what a late reply to a previous
+                   attempt does on a real network.
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
 spawn_stub waits for.
@@ -60,6 +65,7 @@ class Agent:
         self.in_octets = 1_000_000
         self.reboot_after = reboot_after
         self.uptime_reads = 0
+        self.sys_name = "iftable-stub"
 
     # ---------------------------------------------------------------- values
 
@@ -93,7 +99,7 @@ class Agent:
         if oid == S["sys_contact"]:
             return enc_octets("noc@example.com")
         if oid == S["sys_name"]:
-            return enc_octets("iftable-stub")
+            return enc_octets(self.sys_name)
         if oid == S["sys_location"]:
             return enc_octets("lab")
         U = nodeoids.UCD_SNMP
@@ -195,8 +201,9 @@ class Agent:
                    enc_int(error_index) + _tlv(T_SEQUENCE, varbinds))
         return _tlv(T_SEQUENCE, enc_int(version) + enc_octets(COMMUNITY) + pdu)
 
-    def _get_reply(self, req):
+    def _get_reply(self, req, request_id: int | None = None):
         oids = [vb["oid"] for vb in req.varbinds]
+        request_id = req.request_id if request_id is None else request_id
         if not self.implements_ifx():
             # A v1 agent answers the whole PDU with noSuchName as soon as
             # one named object is unimplemented, and echoes the varbind
@@ -205,14 +212,14 @@ class Agent:
                 if self.value_for(oid) is None:
                     nulls = b"".join(enc_varbind(o, _tlv(T_NULL, b""))
                                      for o in oids)
-                    return self._response(req.version, req.request_id, nulls,
+                    return self._response(req.version, request_id, nulls,
                                           error_status=2, error_index=position)
         body = b""
         for oid in oids:
             value = self.value_for(oid)
             body += enc_varbind(
                 oid, value if value is not None else _tlv(T_NO_SUCH_OBJECT, b""))
-        return self._response(req.version, req.request_id, body)
+        return self._response(req.version, request_id, body)
 
     def _next_after(self, oid: str):
         """The lexicographic successor inside the ifIndex column only —
@@ -234,17 +241,26 @@ class Agent:
         self.walked = True
         return "1.3.6.1.2.1.2.2.1.2.1", enc_octets("past-the-column")
 
-    def handle(self, data: bytes):
+    def handle(self, data: bytes) -> list:
+        """Every datagram this agent wants to send back, in order. A list
+        because a misbehaving agent sends more than one."""
         req = decode_response(data)
         if self.mode == "dark_after_walk" and self.walked and \
                 req.pdu_tag == PDU_GET:
-            return None                      # answered the walk, now silent
+            return []                        # answered the walk, now silent
         if req.pdu_tag == PDU_GET:
-            return self._get_reply(req)
+            if self.mode == "stale_id":
+                # The late answer to somebody else's attempt, first, with
+                # a value a receiver that accepts it will visibly store.
+                self.sys_name = "STALE-WRONG-ANSWER"
+                stale = self._get_reply(req, request_id=req.request_id + 1)
+                self.sys_name = "iftable-stub"
+                return [stale, self._get_reply(req)]
+            return [self._get_reply(req)]
         if req.pdu_tag == PDU_GETNEXT:
             oid, value = self._next_after(req.varbinds[0]["oid"])
-            return self._response(req.version, req.request_id,
-                                  enc_varbind(oid, value))
+            return [self._response(req.version, req.request_id,
+                                   enc_varbind(oid, value))]
         if req.pdu_tag == PDU_GETBULK:
             cursor = req.varbinds[0]["oid"]
             body = b""
@@ -253,19 +269,19 @@ class Agent:
                 body += enc_varbind(cursor, value)
                 if not cursor.startswith(nodeoids.IF_TABLE["if_index"] + "."):
                     break
-            return self._response(req.version, req.request_id, body)
-        return None
+            return [self._response(req.version, req.request_id, body)]
+        return []
 
     def serve(self):
         print(f"listening on 127.0.0.1:{self.port} ({self.mode})", flush=True)
         while True:
             data, addr = self.sock.recvfrom(65535)
             try:
-                reply = self.handle(data)
+                replies = self.handle(data)
             except Exception as exc:          # a stub must not die quietly
                 print(f"stub error: {exc}", flush=True)
                 continue
-            if reply is not None:
+            for reply in replies or ():
                 self.sock.sendto(reply, addr)
 
 

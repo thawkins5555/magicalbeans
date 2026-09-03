@@ -1,4 +1,5 @@
-"""What one poll actually writes to nodes.db.
+"""What one poll does: the transactions it writes, and the datagrams it
+is willing to believe.
 
 The review's §4.5 F3 measured one commit per metric sample — roughly 2,500
 transactions for a 500-port chassis and ~288,000 per cycle across a
@@ -58,6 +59,59 @@ class CommitCounter:
         self.statements += 1
         if statement.strip().upper().startswith("COMMIT"):
             self.commits += 1
+
+
+def request_matching():
+    """A reply is only an answer when it came from the device we asked and
+    carries the request id we sent. The stub sends a late answer to
+    somebody else's attempt first, with a visibly wrong sysName; a
+    receiver that takes the first datagram off the socket stores it."""
+    print("\n-- request matching")
+    proc, port = spawn_stub("stub_agent_iftable.py", "stale_id")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "stale.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "stale-test", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        device = db.device(device_id)
+        poller._poll_device(device, db.effective_config(device))
+        device = db.device(device_id)
+        check(device["sys_name"] == "iftable-stub",
+              f"the stale reply is ignored and the matching one is stored "
+              f"(sys_name={device['sys_name']!r})")
+        check(device["status"] == "up",
+              f"…and the poll still succeeds (status={device['status']!r})")
+
+        # Two requests in a row must not reuse an id, or the test above
+        # would pass by luck rather than by matching.
+        session = poller._session_for(device, db.effective_config(device))
+        ids = {session.next_request_id() for _ in range(200)}
+        check(len(ids) == 200, "a session's request ids do not repeat")
+        session.close()
+
+        # A datagram from any other address is not an answer.
+        from netpath.snmppoll import SnmpTimeout
+        session = poller._session_for(device, {"snmp_timeout_s": 0.4,
+                                               "snmp_retries": 0})
+        session.ip = "127.0.0.2"          # nothing is listening there
+        raised = False
+        try:
+            session.request(b"\x30\x00", 1)
+        except SnmpTimeout:
+            raised = True
+        except Exception:
+            pass
+        check(raised, "a request to an address that answers nothing times out")
+        session.close()
+
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
 
 
 def reboot_suppression():
@@ -212,6 +266,7 @@ def main():
         proc.kill()
 
     reboot_suppression()
+    request_matching()
 
     print()
     if FAILURES:
