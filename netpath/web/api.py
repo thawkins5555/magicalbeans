@@ -4461,3 +4461,55 @@ def _int_or_none(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# Two fields the database and the write paths already carry but the existing
+# serializers do not return yet, so a form has no way to show what is
+# currently set. `_device_json` and `_rule_json` live in modules another
+# workstream owns; rather than reach into them, these two small routes hand
+# the front end the missing values, and both disappear the moment the
+# serializers carry them (the front end merges whatever it is given).
+
+
+def get_nodes_device_upstream(service, params, body, device_id) -> dict:
+    """The device this one hangs off, and the devices it could hang off.
+
+    `PUT /api/nodes/devices/<id>` has accepted `upstream_id` since the
+    topology rollup landed — an outage on a core switch raises one alert
+    instead of five hundred — but nothing in the UI could set it, and
+    `_device_json` does not return it, so a form had nothing to show.
+    """
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    keys = row.keys()
+    upstream = row["upstream_id"] if "upstream_id" in keys else None
+    # Everything except this device: the server refuses self and unknown ids
+    # anyway (_clean_upstream_id), and offering them would only produce an
+    # error the operator could have been spared.
+    candidates = [
+        {"id": d["id"], "name": d["name"] or d["ip"], "ip": d["ip"]}
+        for d in service.nodes_db.devices()
+        if d["id"] != device_id
+    ]
+    candidates.sort(key=lambda d: (d["name"] or "").lower())
+    return {"upstream_id": upstream, "candidates": candidates}
+
+
+def get_alerts_rule_extras(service, params, body) -> dict:
+    """`auto_resolve_after_s` and `notify` per rule, keyed by rule id.
+
+    Both are accepted by POST and PUT /api/alerts/rules and neither is in
+    `_rule_json`, so the rule editor could set them but never show what they
+    were. There are dozens of rules, not thousands, so one flat map is the
+    whole answer.
+    """
+    extras = {}
+    for row in service.alerts_db.rules():
+        keys = row.keys()
+        extras[str(row["id"])] = {
+            "auto_resolve_after_s": (row["auto_resolve_after_s"]
+                                     if "auto_resolve_after_s" in keys else None),
+            "notify": (bool(row["notify"]) if "notify" in keys else True),
+        }
+    return {"rules": extras}

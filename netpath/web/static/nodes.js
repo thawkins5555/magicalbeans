@@ -1865,6 +1865,17 @@
       </select></label>
       <label>Polling profile <select id="nd-f-group">${groupOptionsHtml(d.group_id)}</select></label>
       <label>Group <select id="nd-f-devgroup">${deviceGroupOptionsHtml(d.device_group_id)}</select></label>
+      <!-- The topology rollup has read this since the alert engine learned
+           to fold a site's alerts under the switch that carries it; nothing
+           in the UI could set it. Options are filled in by fillUpstream()
+           once the dialog is on screen, since the list is the fleet. -->
+      <label>Upstream device <select id="nd-f-upstream">
+        <option value="">(none)</option>
+      </select></label>
+      <p class="hint">The device this one is reached through — its access
+        switch, its site router. When the upstream goes down, alerts for
+        everything behind it are folded into the upstream's own alert instead
+        of arriving as a storm. Blank means nothing is in front of it.</p>
       <fieldset><legend>OVERRIDES (blank = use the profile's value)</legend>
         <label>SNMP version <select id="nd-f-version">
           <option value="">(profile)</option>
@@ -1988,6 +1999,31 @@
      distinct from an explicit on/off — a plain checkbox cannot represent
      "inherit" at all, and would silently turn every edit into a locked
      override even when the admin only meant to change something else. */
+  /* The Upstream device list is the fleet minus this device, so it is
+     fetched when the dialog opens rather than rendered into the form: the
+     form is a template string and this is 250 options on a small install and
+     several thousand on a large one. Failure is quiet — the select stays at
+     "(none)" and the rest of the dialog still works. */
+  async function fillUpstream(box, deviceId) {
+    const select = box.querySelector('#nd-f-upstream');
+    if (!select || deviceId == null) return;
+    let payload;
+    try {
+      payload = await App.get(`/api/nodes/devices/${deviceId}/upstream`);
+    } catch (error) {
+      return;
+    }
+    if (!box.isConnected) return;        // the dialog was closed or replaced
+    const options = ['<option value="">(none)</option>'];
+    for (const c of payload.candidates || []) {
+      options.push(`<option value="${c.id}"${
+        c.id === payload.upstream_id ? ' selected' : ''}>${
+        escape(c.name)} (${escape(c.ip)})</option>`);
+    }
+    select.innerHTML = options.join('');
+    select.value = payload.upstream_id == null ? '' : String(payload.upstream_id);
+  }
+
   function triOptions(value) {
     return `<option value="" ${value == null ? 'selected' : ''}>(profile)</option>` +
       `<option value="1" ${value === true ? 'selected' : ''}>on</option>` +
@@ -2021,6 +2057,11 @@
     overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
     overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
+    // Always sent, like the tri-states: "" is how the operator clears an
+    // upstream, and the server accepts "", null and 0 as "none".
+    const upstream = box.querySelector('#nd-f-upstream');
+    if (upstream) overrides.upstream_id = upstream.value === '' ? null
+      : Number(upstream.value);
     Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
@@ -2054,6 +2095,10 @@
         App.refreshNow('nodes');
       } },
     ]);
+    // No id yet, so borrow any existing device's candidate list; the server
+    // only excludes the device asked about, and a new device is in neither.
+    const anyDevice = (view.devices || [])[0];
+    if (anyDevice) fillUpstream(box, anyDevice.id);
   }
 
   function editDevice() {
@@ -2094,6 +2139,7 @@
         App.refreshNow('nodes');
       } },
     ]);
+    fillUpstream(box, d.id);
   }
 
   /* ---------------------------------------------------------- device groups
@@ -3272,6 +3318,12 @@
                                  s.table_columns_ifaces)}
       <fieldset><legend>STORAGE</legend>
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
+        ${number('np-rollupdays', 'Keep hourly rollups for', s.rollup_retention_days, 'min=1')} days
+        <p class="hint">Raw samples are rolled up into hourly minimum, average
+          and maximum after three days and the raw rows are then dropped, so
+          this is what decides how far back a wide chart can go. The setting
+          was honoured from the first release that had it; it simply had no
+          input.</p>
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
         ${number('np-maxmib', 'Max MIB file size', Math.round((s.max_mib_bytes || 0) / 1024 / 1024), 'min=1')} MB
         <p class="hint">A chart narrower than three days is drawn from raw
@@ -3313,7 +3365,9 @@
             box.querySelector('#cols-devices'), COLUMNS),
           table_columns_ifaces: App.readColumnPicker(
             box.querySelector('#cols-ifaces'), IFACE_COLUMNS),
-          sample_retention_days: num('#np-sampledays'), event_retention_days: num('#np-eventdays'),
+          sample_retention_days: num('#np-sampledays'),
+          rollup_retention_days: num('#np-rollupdays'),
+          event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
         } });
         await App.loadState();

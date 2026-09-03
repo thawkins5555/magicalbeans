@@ -20,6 +20,8 @@
     // How many alerts match the current filters, against the capped page the
     // list is actually showing. {total, capped, cap} from /api/alerts/total.
     alertTotal: null,
+    // {ruleId: {auto_resolve_after_s, notify}} from /api/alerts/rules/extras.
+    ruleExtras: {},
     // Per session only, like every other table's sort: a saved sort order is
     // a different feature from saved columns, and mixing the two storage
     // models is how Reset layout ends up eating a settings choice.
@@ -81,6 +83,11 @@
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
       (c.send_errors ? ` · ${c.send_errors} send errors` : '') +
+      // How far behind the engine is, and how many events it could not
+      // apply: an engine that has stopped keeping up used to look exactly
+      // like one with nothing to do.
+      (c.backlog ? ` · ${Number(c.backlog).toLocaleString()} event(s) behind` : '') +
+      (c.apply_errors ? ` · ${Number(c.apply_errors).toLocaleString()} apply errors` : '') +
       (view.bulkNotice && Date.now() < view.bulkNotice.until
         ? ` · ${view.bulkNotice.text}` : '');
     if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
@@ -443,6 +450,9 @@
     // comparing a value to a threshold, so it gets its own two fields
     // instead of the threshold ones.
     const isFlapping = r.source_kind === 'flapping';
+    // auto_resolve_after_s and notify are not in the rules payload's own
+    // serializer; refresh() fetches them alongside and stashes them here.
+    const extras = (view.ruleExtras || {})[String(r.id)] || {};
     App.modal(`Edit ${r.name}`, `
       <label>Name <input id="ar-name" value="${escape(r.name)}"></label>
       <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
@@ -450,6 +460,19 @@
       <label class="check"><input type="checkbox" id="ar-enabled" ${r.enabled ? 'checked' : ''}> Enabled</label>
       <label>Device filter (substring, blank = all) <input id="ar-devfilter" value="${escape(r.device_filter || '')}"></label>
       <label>Template <select id="ar-template">${templateOptionsHtml(r.template_id)}</select></label>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never" value="${extras.auto_resolve_after_s
+          ? Math.round(extras.auto_resolve_after_s / 60) : ''}"> minutes
+        (blank = never)</label>
+      <p class="hint">For a rule that fires on something momentary — a reboot,
+        a trap, a syslog line — where nothing will ever arrive to clear it.
+        The alert resolves itself this long after its last occurrence. Blank
+        leaves it open until somebody resolves it or the condition clears.</p>
+      <label class="check"><input type="checkbox" id="ar-notify"
+        ${extras.notify !== false ? 'checked' : ''}> Send email for this rule</label>
+      <p class="hint">Off makes the rule raise alerts that appear in the list
+        and the badge but never reach a mailbox — for the noisy ones nobody
+        wants paged about, which used to mean disabling the rule outright.</p>
       ${isThreshold ? `
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
@@ -505,6 +528,12 @@
           device_filter: box.querySelector('#ar-devfilter').value.trim(),
           template_id: box.querySelector('#ar-template').value ? Number(box.querySelector('#ar-template').value) : null,
         };
+        // Blank means NULL — "never auto-resolve" — not zero, which would
+        // resolve every alert the moment it opened.
+        const autoText = box.querySelector('#ar-autoresolve').value.trim();
+        values.auto_resolve_after_s = autoText === '' || Number(autoText) === 0
+          ? null : Number(autoText) * 60;
+        values.notify = box.querySelector('#ar-notify').checked;
         if (isThreshold) {
           values.threshold = Number(box.querySelector('#ar-threshold').value);
           values.clear_threshold = Number(box.querySelector('#ar-clear').value);
@@ -553,7 +582,13 @@
         `<option value="${n}" ${n === 4 ? 'selected' : ''}>${n} ${App.state.severities?.[n] || ''}</option>`).join('')}</select></label>
       <label>Template <select id="ar-template">${templateOptionsHtml(null)}</select></label>
       <label>Threshold (threshold rules only) <input id="ar-threshold" type="number" step="0.1"></label>
-      <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>`, [
+      <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never"> minutes (blank = never)</label>
+      <label class="check"><input type="checkbox" id="ar-notify" checked>
+        Send email for this rule</label>
+      <p class="hint">A trap or syslog rule usually wants an auto-resolve: the
+        event is momentary and nothing will ever arrive to clear it.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (box) => {
         const key = box.querySelector('#ar-key').value.trim();
@@ -569,6 +604,11 @@
         const c = box.querySelector('#ar-clear').value;
         if (t) values.threshold = Number(t);
         if (c) values.clear_threshold = Number(c);
+        const autoText = box.querySelector('#ar-autoresolve').value.trim();
+        if (autoText && Number(autoText) > 0) {
+          values.auto_resolve_after_s = Number(autoText) * 60;
+        }
+        values.notify = box.querySelector('#ar-notify').checked;
         await App.post('/api/alerts/rules', values);
         App.closeModal();
         App.refreshNow('alerts');
@@ -920,13 +960,15 @@
     const span = t1 - t0;
     const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
     const f = filters();
-    const [overview, list, total, rules, templates, mutes] = await Promise.all([
+    const [overview, list, total, rules, ruleExtras, templates, mutes] =
+      await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', f),
       // Same filters, in the same round trip, so the label under the table
       // can say what fraction of the matches is on screen.
       App.get('/api/alerts/total', f),
       App.get('/api/alerts/rules'),
+      App.get('/api/alerts/rules/extras'),
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
     ]);
@@ -934,6 +976,7 @@
     view.alerts = list.alerts;
     view.alertTotal = total;
     view.rules = rules.rules;
+    view.ruleExtras = ruleExtras.rules || {};
     view.templates = templates.templates;
     // entity_id -> until_ts, for the devices with an active mute. The server
     // only ever returns unexpired ones, so presence here means muted.

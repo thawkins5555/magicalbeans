@@ -574,6 +574,35 @@
 
   /* The collector strip is read from the shared state poll, so it keeps
      ticking at the usual rate while the charts below refresh far less often. */
+
+  /* Counters the collector reports only when they are non-zero, in the order
+     an operator cares about them. `kernel_dropped` first and always: it is
+     messages the kernel discarded before this application saw them, which is
+     the number that tells the truth about an overloaded listener. */
+  const EXTRA_COUNTERS = [
+    ['kernel_dropped', 'dropped by the kernel'],
+    ['throttled', 'throttled per source'],
+    ['bad_auth', 'failed authentication'],
+    ['unverified', 'unverified'],
+    ['too_many_varbinds', 'over the varbind limit'],
+    ['tcp_refused', 'TCP connections refused'],
+    ['resampled', 'resampled'],
+  ];
+
+  function extraCounterParts(counters) {
+    const parts = [];
+    for (const [key, label] of EXTRA_COUNTERS) {
+      const n = Number(counters[key] || 0);
+      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
+    }
+    // Not a fault and not hidden when zero: an operator wants to know how
+    // many senders are connected, including none.
+    if (counters.tcp_clients != null) {
+      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
+    }
+    return parts;
+  }
+
   function drawStatus() {
     const server = App.state.serverState || {};
     const collector = server.collector || { counters: {}, decoder: {} };
@@ -601,6 +630,7 @@
     if (counters.dropped) parts.push(`${counters.dropped} dropped`);
     if (counters.errors) parts.push(`${counters.errors} decode errors`);
     if (counters.rejected) parts.push(`${counters.rejected} rejected`);
+    parts.push(...extraCounterParts(counters));
     // v9 and IPFIX stay undecodable until a template arrives, and exporters
     // resend them only every few minutes, so this is as useful as packet age.
     parts.push(counters.last_template

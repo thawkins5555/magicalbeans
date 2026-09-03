@@ -265,6 +265,12 @@ ROUTES = [
     ("GET", r"^/api/dashboard$", api.get_dashboard, None),
     ("GET", r"^/api/dashboard/offenders$", api.get_dashboard_offenders,
      ("nodes", R)),
+    # Two fields the write paths accept and the read serializers do not
+    # return yet, so the forms that set them can show what is set.
+    ("GET", r"^/api/nodes/devices/(\d+)/upstream$",
+     api.get_nodes_device_upstream, ("nodes", R)),
+    ("GET", r"^/api/alerts/rules/extras$", api.get_alerts_rule_extras,
+     ("alerts", R)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)

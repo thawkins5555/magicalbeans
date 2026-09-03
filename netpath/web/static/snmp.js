@@ -384,6 +384,35 @@
 
   /* ----------------------------------------------------------- refresh */
 
+
+  /* Counters the collector reports only when they are non-zero, in the order
+     an operator cares about them. `kernel_dropped` first and always: it is
+     messages the kernel discarded before this application saw them, which is
+     the number that tells the truth about an overloaded listener. */
+  const EXTRA_COUNTERS = [
+    ['kernel_dropped', 'dropped by the kernel'],
+    ['throttled', 'throttled per source'],
+    ['bad_auth', 'failed authentication'],
+    ['unverified', 'unverified'],
+    ['too_many_varbinds', 'over the varbind limit'],
+    ['tcp_refused', 'TCP connections refused'],
+    ['resampled', 'resampled'],
+  ];
+
+  function extraCounterParts(counters) {
+    const parts = [];
+    for (const [key, label] of EXTRA_COUNTERS) {
+      const n = Number(counters[key] || 0);
+      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
+    }
+    // Not a fault and not hidden when zero: an operator wants to know how
+    // many senders are connected, including none.
+    if (counters.tcp_clients != null) {
+      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
+    }
+    return parts;
+  }
+
   function drawStatus() {
     const server = App.state.serverState || {};
     const snmp = server.snmp || { counters: {} };
@@ -413,6 +442,7 @@
     if (c.informs_acked) parts.push(`${c.informs_acked} informs acknowledged`);
     if (d.v3_encrypted) parts.push(`${d.v3_encrypted} authPriv (not decoded)`);
     if (d.v3_auth_failed) parts.push(`${d.v3_auth_failed} failed authentication`);
+    parts.push(...extraCounterParts(c));
     App.el('sn-counters').textContent = parts.join(' · ');
   }
 
