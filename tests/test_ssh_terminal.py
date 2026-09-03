@@ -647,6 +647,60 @@ try:
             one.close()
     wait_idle()
 
+    # ------------------------------------ a socket that never sends `open`
+
+    # The slot is taken at the 101, not at `connected`: a laptop that slept
+    # with the terminal open, or a client that never intended to send
+    # `open`, holds it against both caps. Everything that bounds a
+    # terminal's life has to cover that window too.
+    original_handshake = sshterm.HANDSHAKE_TIMEOUT_S
+    original_per_user = sshterm.MAX_SESSIONS_PER_USER
+    sshterm.HANDSHAKE_TIMEOUT_S = 2
+    sshterm.MAX_SESSIONS_PER_USER = 1
+    try:
+        silent = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        assert silent.upgraded, (silent.status, silent.headers)
+        # It really is holding the slot: this account's one session is spent.
+        blocked = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        blocked.send_json({"type": "open", "cols": 80, "rows": 24})
+        message = blocked.next_control("error")
+        assert "You already have 1 SSH sessions" in message["message"], message
+        blocked.close()
+        assert silent.wait_closed(20) == 4408, silent.close_code
+        silent.close()
+        wait_idle()
+        print("PASS: a socket that upgrades and sends no 'open' loses its slot "
+              "with 4408 instead of holding it forever")
+
+        # And the cap it was spending is free again.
+        after = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        after.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(after)
+        after.close()
+        print("PASS: the per-account cap that socket was spending is released")
+    finally:
+        sshterm.HANDSHAKE_TIMEOUT_S = original_handshake
+        sshterm.MAX_SESSIONS_PER_USER = original_per_user
+    wait_idle()
+
+    # The other half: the watchdog's sign-out check covers that window too,
+    # so a socket parked before `open` does not outlive the sign-in behind
+    # it while it waits.
+    status, payload = call("POST", "/api/users",
+                           {"username": "silentuser", "password": "Corr3ct-Horse-B5t",
+                            "grants": {"ssh": "write"}}, token=token)
+    assert status == 200, (status, payload)
+    silent_token = login("silentuser", "Corr3ct-Horse-B5t")
+    waiting = WsClient(web_port, f"/api/ssh/devices/{device}/socket", silent_token)
+    assert waiting.upgraded, (waiting.status, waiting.headers)
+    status, payload = call("POST", "/api/logout", {}, token=silent_token)
+    assert status == 200, (status, payload)
+    assert waiting.wait_closed(15) == 4401, waiting.close_code
+    waiting.close()
+    print("PASS: signing out closes a socket that is still waiting for its "
+          "'open' message, with 4401")
+    wait_idle()
+
     # ------------------------------------------------- the same thing over TLS
 
     # One SSLSocket read and written at the same time is what OpenSSL does

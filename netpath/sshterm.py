@@ -50,6 +50,14 @@ from .eventlog import NODES
 # answered the TCP/banner/auth exchange in ten seconds is not reachable, and
 # an operator staring at a blank terminal wants to be told so.
 CONNECT_TIMEOUT_S = 10
+# How long a socket may sit between the 101 and its `open` message. The
+# page sends `open` from its `onopen` handler, so this is measured in
+# round trips; what it bounds is the other case — a laptop that slept with
+# the terminal open, a proxy that dropped the TCP connection without a FIN,
+# or a client that never intended to send one. Without it such a socket
+# holds its slot against both caps for the life of the process, and four of
+# them lock an account out of its own terminals.
+HANDSHAKE_TIMEOUT_S = 15
 # Idle timeout: no *keystrokes* for this long ends the session, mirroring
 # the web session's own "presence, not the tab being open" rule (auth.py's
 # SessionStore.touch). A shell left open on a switch overnight is a real
@@ -201,6 +209,14 @@ class SshSession:
         self.channel = None
         self._stopped = threading.Event()
         self._stop_lock = threading.Lock()
+        # When the slot was taken (the 101 has already been answered), and
+        # whether the `open` message that turns it into a session has
+        # arrived. The handshake deadline is measured from the first and
+        # closed by the second — from the upgrade, not from the last frame,
+        # so a client that sends anything else forever still gives the slot
+        # back.
+        self._started_at = time.time()
+        self._open_seen = False
         self._last_input = time.time()
         self._last_touch = 0.0
         self._auth_failures = 0
@@ -247,6 +263,18 @@ class SshSession:
     # ----------------------------------------------------------------- run
 
     def run(self) -> None:
+        # The watchdog starts here, not once a shell exists: from this line
+        # on the session is counted against both caps, and everything that
+        # bounds a terminal's life — the handshake deadline, the sign-out
+        # check and the permission check — has to cover the window before
+        # `open` as well. A shell can be waiting in that window across a
+        # sign-out, and a socket that never sends `open` used to hold its
+        # slot, its thread and its authorisation for the life of the
+        # process.
+        watchdog = threading.Thread(target=self._idle_watch,
+                                    name=f"ssh-idle-{self.device_id}",
+                                    daemon=True)
+        watchdog.start()
         try:
             self._run()
         except Exception as exc:                     # never leak a traceback
@@ -278,6 +306,7 @@ class SshSession:
                 self.cols = _int_in(opening.get("cols"), 20, _MAX_COLS, self.cols)
                 self.rows = _int_in(opening.get("rows"), 5, _MAX_ROWS, self.rows)
             if kind == "open":
+                self._open_seen = True       # the handshake deadline is met
                 break
 
         if not configrx.paramiko_available():
@@ -288,10 +317,6 @@ class SshSession:
         config = self.service.configrx_db.device_config(self.device_id)
         self.port = _int_in(config["ssh_port"] if config else 22, 1, 65535, 22)
         reason = self._load_stored_credential(config)
-
-        idler = threading.Thread(target=self._idle_watch,
-                                 name=f"ssh-idle-{self.device_id}", daemon=True)
-        idler.start()
 
         while not self._stopped.is_set():
             if self._password is None:
@@ -539,11 +564,14 @@ class SshSession:
 
     def _idle_watch(self) -> None:
         """The session's own heartbeat, once a second: is the person who
-        opened this still signed in, do they still hold `ssh` write, and has
-        anyone typed lately. Authorisation is not settled once at the
-        upgrade — a shell can outlive the sign-in that opened it by hours,
-        and signing out, expiring, being deleted or having the permission
-        taken away must all end it."""
+        opened this still signed in, do they still hold `ssh` write, has the
+        socket got as far as its `open` message, and has anyone typed
+        lately. Authorisation is not settled once at the upgrade — a shell
+        can outlive the sign-in that opened it by hours, and signing out,
+        expiring, being deleted or having the permission taken away must all
+        end it. It runs from the moment the slot is taken rather than from
+        the moment a shell exists, because a socket waiting for its `open`
+        message is already holding that slot."""
         ticks = 0
         while not self._stopped.wait(1.0):
             ticks += 1
@@ -558,8 +586,16 @@ class SshSession:
                     f"SSH session closed: {self.app_user} no longer holds "
                     f"SSH write access")
                 return
-            # Read the module global each time: the tests shorten it, and an
-            # operator-facing constant is worth being able to change.
+            # Read the module globals each time: the tests shorten them, and
+            # operator-facing constants are worth being able to change.
+            if not self._open_seen:
+                if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
+                    continue
+                self._status("closed", f"No terminal was opened within "
+                                       f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
+                self.ws.close(CLOSE_IDLE, "Handshake timeout")
+                self.stop()
+                return
             if time.time() - self._last_input < IDLE_TIMEOUT_S:
                 continue
             minutes = int(IDLE_TIMEOUT_S // 60) or 1
