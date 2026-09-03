@@ -214,6 +214,28 @@ button.linkish {
 }
 button.linkish:hover { color: var(--accent); }
 .conn.bad { color: var(--fail); }
+.conn.good { color: var(--ok); }
+
+/* Stale content is dimmed rather than hidden: the operator may still want to
+   read the last known state, but must never mistake it for the current one.
+   The banner sits above it at full strength. */
+body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
+.stale-banner {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 8px;
+  z-index: 40;
+  max-width: 80vw;
+  background: var(--raised);
+  border: 1px solid var(--fail);
+  border-left: 4px solid var(--fail);
+  color: var(--text);
+  padding: 9px 16px;
+  font: 600 12px/1.4 var(--ui);
+  border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
 
 .page { display: none; flex: 1; min-height: 0; }
 /* Column by default, so a new module cannot be forgotten here and end up

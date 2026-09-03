@@ -99,12 +99,72 @@ const App = (() => {
 
   /* ------------------------------------------------------------ server */
 
+  /* A request that never answers used to leave the UI frozen and looking
+     healthy: `fetch` had no deadline, so a tab pointed at a server that had
+     stopped replying sat with an in-flight request, never reached
+     connected(false), and showed stale data under a green indicator until
+     the browser's own multi-minute network timeout fired. The one honest
+     signal an operator has during an outage was the one that failed. */
+  const REQUEST_TIMEOUT_MS = 30_000;
+
+  /* In-flight GETs by URL. A page whose endpoint is slower than its refresh
+     interval would otherwise queue one request per tick behind the first;
+     the superseded one is aborted, since nothing would have painted from it
+     anyway. Only GETs — a POST must never be cancelled because a later one
+     looks like it. */
+  const inFlight = new Map();
+
   async function call(path, options = {}) {
-    const response = await fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
-      ...options,
-      body: options.body ? JSON.stringify(options.body) : undefined,
-    });
+    const method = (options.method || 'GET').toUpperCase();
+    let controller = null;
+    if (method === 'GET' && !options.signal) {
+      const previous = inFlight.get(path);
+      if (previous) previous.abort();
+      controller = new AbortController();
+      inFlight.set(path, controller);
+    }
+    // AbortSignal.any keeps the caller's own signal working alongside the
+    // deadline; where it is missing, the deadline alone still applies.
+    const deadline = AbortSignal.timeout(options.timeoutMs || REQUEST_TIMEOUT_MS);
+    let signal = deadline;
+    if (options.signal) {
+      signal = typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([options.signal, deadline]) : options.signal;
+    } else if (controller) {
+      signal = typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([controller.signal, deadline]) : controller.signal;
+    }
+    let response;
+    try {
+      response = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...options,
+        signal,
+        body: options.body ? JSON.stringify(options.body) : undefined,
+      });
+    } catch (error) {
+      // "signal is aborted without reason" and "Failed to fetch" are
+      // Chromium's words, not an operator's; connected() turns whatever
+      // comes out of here into a sentence, and this names the cases it
+      // cannot tell apart from the outside.
+      if (error && (error.name === 'TimeoutError'
+                    || (error.name === 'AbortError' && deadline.aborted))) {
+        throw new Error(`No answer within ${Math.round(
+          (options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)} seconds`);
+      }
+      // We cancelled this one ourselves because a newer request for the
+      // same URL started. That is not an outage and must never be reported
+      // as one, so it is flagged and swallowed by the refresh plumbing.
+      if (error && error.name === 'AbortError' && controller
+          && controller.signal.aborted) {
+        const superseded = new Error('Superseded by a newer request');
+        superseded.superseded = true;
+        throw superseded;
+      }
+      throw error;
+    } finally {
+      if (controller && inFlight.get(path) === controller) inFlight.delete(path);
+    }
     // A session that has timed out should land on the sign-in page rather
     // than filling the screen with failures.
     if (response.status === 401 && path !== '/api/login') {
@@ -127,10 +187,99 @@ const App = (() => {
   const put = (path, body) => call(path, { method: 'PUT', body });
   const del = (path, body) => call(path, { method: 'DELETE', body });
 
+  /* The dangerous failure this replaces: a wall display that has lost its
+     server looked exactly like a healthy fleet, distinguished only by the
+     raw Chromium string "Failed to fetch" in low-contrast grey while two
+     thousand stale rows stayed on screen unmarked. Staleness is driven by
+     what requests actually did — a run of failed polls — not by a timer,
+     so a frozen server cannot show a green light over old data.
+
+     One missed cycle is a hiccup and says so quietly; MISSED_BEFORE_STALE
+     of them dim the page and raise a banner naming the last time the data
+     was known good. */
+  const MISSED_BEFORE_STALE = 2;
+  let missedCycles = 0;
+  let lastGoodTs = null;         // seconds, like everything else here
+  let reconnectedUntil = 0;
+  let staleBanner = null;
+
+  // "14:32", the wall-clock time an operator would compare against their own
+  // watch. Seconds are noise on a banner that is about minutes of staleness.
+  function lastGoodClock() {
+    if (!lastGoodTs) return null;
+    const d = new Date(lastGoodTs * 1000);
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function lastUpdateText() {
+    const at = lastGoodClock();
+    return at ? `last update ${at}` : 'no data yet';
+  }
+
+  function showStaleBanner(text) {
+    if (!staleBanner) {
+      staleBanner = document.createElement('div');
+      staleBanner.className = 'stale-banner';
+      staleBanner.setAttribute('role', 'alert');
+      document.body.appendChild(staleBanner);
+    }
+    staleBanner.textContent = text;
+    staleBanner.hidden = false;
+  }
+
+  function hideStaleBanner() {
+    if (staleBanner) staleBanner.hidden = true;
+  }
+
   function connected(ok, message) {
     const el = document.getElementById('conn');
-    el.textContent = ok ? '' : (message || 'server unreachable');
-    el.classList.toggle('bad', !ok);
+    if (ok) {
+      const wasStale = missedCycles >= MISSED_BEFORE_STALE;
+      missedCycles = 0;
+      lastGoodTs = Date.now() / 1000;
+      document.body.classList.remove('stale');
+      hideStaleBanner();
+      if (wasStale) {
+        // A silent recovery is its own problem: the operator who saw the
+        // banner needs to be told the screen is current again.
+        reconnectedUntil = Date.now() + 5000;
+        announce('Reconnected to the SappiWhere server — data is current');
+      }
+      if (Date.now() < reconnectedUntil) {
+        el.textContent = 'reconnected — data is current';
+        el.classList.remove('bad');
+        el.classList.add('good');
+      } else {
+        el.textContent = '';
+        el.classList.remove('bad', 'good');
+      }
+      return;
+    }
+
+    missedCycles += 1;
+    reconnectedUntil = 0;
+    el.classList.remove('good');
+    el.classList.add('bad');
+    // Operator language, not the browser's. `message` still reaches the
+    // title so the underlying failure is one hover away.
+    const detail = String(message || 'no reason given');
+    if (missedCycles < MISSED_BEFORE_STALE) {
+      el.textContent = `no answer from the server — retrying (${lastUpdateText()})`;
+    } else {
+      el.textContent = `Cannot reach the SappiWhere server — ${lastUpdateText()}`;
+      if (!document.body.classList.contains('stale')) {
+        const since = lastGoodClock();
+        announce('Cannot reach the SappiWhere server. Everything on screen is '
+                 + (since ? `from ${since}` : 'not current') + '.');
+      }
+      document.body.classList.add('stale');
+      const at = lastGoodClock();
+      showStaleBanner(
+        'Cannot reach the SappiWhere server — everything below is ' +
+        (at ? `from ${at}` : 'not real data yet') +
+        ' and is not being refreshed.');
+    }
+    el.title = detail;
   }
 
   /* Say something once, to assistive technology only. The connection state,
@@ -1275,7 +1424,10 @@ const App = (() => {
                   ipam: 'ipam_refresh_s', wireless: 'wireless_refresh_s',
                   configrx: 'configrx_refresh_s', debug: 'debug_refresh_s' }[page];
     const seconds = Number(state.settings[key]);
-    return Math.max(seconds > 0 ? seconds : 2, 0.1) * 1000;
+    // The floor was 0.1 s, so one mistyped refresh setting made every open
+    // tab hit a heavy endpoint ten times a second. A second is already
+    // faster than anything here needs.
+    return Math.max(seconds > 0 ? seconds : 2, 1) * 1000;
   }
 
   async function master() {
@@ -1287,6 +1439,7 @@ const App = (() => {
         connected(true);
       }
     } catch (error) {
+      if (error && error.superseded) return;
       connected(false, String(error.message || error));
       return;
     }
@@ -1306,13 +1459,43 @@ const App = (() => {
       await page.refresh();
       connected(true);
     } catch (error) {
+      if (error && error.superseded) return;
       connected(false, String(error.message || error));
     }
   }
 
   function restartTimer() {
     if (state.timer) clearInterval(state.timer);
+    // A hidden tab polls nothing: the twelve tabs an engineer left open last
+    // week, and the laptop with the lid closed on the Nodes page, were each
+    // still fetching /api/state every two seconds and their page endpoint at
+    // its own rate, forever.
+    if (document.hidden) {
+      state.timer = null;
+      return;
+    }
     state.timer = setInterval(master, MASTER_MS);
+  }
+
+  /* Coming back to a tab that has been hidden for an hour: the data on it is
+     an hour old, so say so until the first successful poll lands, and make
+     that poll happen now rather than at the next slot. */
+  function onVisibilityChange() {
+    if (document.hidden) {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = null;
+      return;
+    }
+    // Nothing was fetched while hidden, so what is on screen is by
+    // definition not current until the next poll says otherwise.
+    if (lastGoodTs && Date.now() / 1000 - lastGoodTs > STATE_MS / 1000) {
+      document.body.classList.add('stale');
+      showStaleBanner('Paused while this tab was in the background — '
+                      + `${lastUpdateText()}. Refreshing…`);
+    }
+    restartTimer();
+    state.lastState = 0;                  // force /api/state on the next beat
+    refreshNow(state.tab);
   }
 
   /* Called when a page needs its data now rather than at its next slot. */
@@ -1320,7 +1503,18 @@ const App = (() => {
     const page = pages[name || state.tab];
     if (!page || !page.refresh) return Promise.resolve();
     page.lastFetch = Date.now();
-    return page.refresh();
+    // selectTab and the visibility handler call this without awaiting it, so
+    // a refresh that fails during an outage used to surface as an unhandled
+    // rejection in the console rather than as the offline banner. The
+    // promise still resolves for callers that do await it (the UI walk).
+    return Promise.resolve(page.refresh()).then(
+      (value) => { connected(true); return value; },
+      (error) => {
+        if (!(error && error.superseded)) {
+          connected(false, String((error && error.message) || error));
+        }
+        return undefined;
+      });
   }
 
   async function start() {
@@ -1378,6 +1572,7 @@ const App = (() => {
 
     applyDensity();
     window.addEventListener('resize', applyDensity);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     initSplitters();
 
     for (const page of Object.values(pages)) {
