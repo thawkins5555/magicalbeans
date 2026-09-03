@@ -1,16 +1,36 @@
 # Publishing a SappiWhere release
 
-The **Check for updates** button in Settings (`netpath/selfupdate.py`) installs
-a *published tag*, and refuses to install anything whose tarball does not match
-a SHA-256 the release published separately from it. A release that skips the
-steps below is simply never offered to any install; nothing breaks, and nothing
-unverified is ever installed.
+> **The updater does not read any of this today.** The **Check for updates**
+> button installs whatever is at the tip of `main`, with no tag and no digest
+> in the path — see "What the updater actually does" below, and the SECURITY
+> NOTE at the top of `netpath/selfupdate.py`. Cutting a release is still worth
+> doing: it is what gives a version a name, a changelog anchor and an archive
+> that does not move. It is just not what the button consumes.
+>
+> The verified procedure further down is kept because it is the path being
+> restored, and `latest_tag()`/`published_digest()` still implement it.
 
 Self-update is off by default (`updates_enabled`, in Settings). An install that
 leaves it off never contacts GitHub at all, and is updated by replacing the
 `netpath` directory by hand.
 
-## What the updater does
+## What the updater actually does
+
+1. `GET /repos/<owner>/<repo>/commits/main` — the current tip of the branch.
+2. If that commit is already recorded in `update_installed_commit` (app.db),
+   it stops.
+3. It downloads `https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>`,
+   capped at 64 MiB. **Nothing verifies those bytes** beyond the cap: there is
+   no published digest for a moving branch to compare them against.
+4. It unpacks (discarding the archive's own mode bits), checks the tree looks
+   like this application, stops the listener and every worker, replaces the
+   `netpath` package, records the commit, and re-execs.
+
+So whoever can push to `main` chooses what every install with the setting on
+will run. That is the accepted, temporary exposure recorded as S-B1 in
+`REVIEW-NETWORK-ENGINEER.md`.
+
+## What the updater does on the verified path (currently not in use)
 
 1. `GET /repos/<owner>/<repo>/tags` — the newest tag by version order (the run
    of numbers in the name, so `v4.39.0` beats `v4.36.1` and `v4.9.0`). Branch

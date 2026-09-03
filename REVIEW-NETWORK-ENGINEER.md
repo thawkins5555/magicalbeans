@@ -1093,7 +1093,7 @@ Suites named `§X` refer to the section marker of that name inside the file;
 | A-F24 | A11, B0 | `a77b1b7`, `2dae599` | `tests/test_alert_engine_fixes.py` §A11 |
 | A-F26 | A8 | `2557217` | `tests/test_alert_engine_fixes.py` §A8 |
 | A-F27 (the email storm; the alerts themselves still open) | A8 | `2557217` | `tests/test_alert_engine_fixes.py` §A8 |
-| S-B1 | D3 | `48ba132` | `tests/test_security_fixes.py` §D3 |
+| S-B1 | D3 — **partly reopened, see below** | `48ba132`, then the branch pull restored | `tests/test_security_fixes.py` §D3 |
 | S-B2 | D1 | `ae02159` | `tests/test_security_fixes.py` §D1 |
 | S-B3 | D2 | `fdddbf1` | `tests/test_security_fixes.py` §D2 |
 | S-S1 | D4 | `5a6eb5e` | `tests/test_security_fixes.py` §D4 |
@@ -1176,6 +1176,39 @@ Suites named `§X` refer to the section marker of that name inside the file;
 | G-31 | H11 | `0175cf5` | `tests/test_parsers_hardening.py` §H11 |
 | G-32 | F6 | `07317d3` | none — `netpath/mibs/NOTICE.md` |
 | G-33 | H4 | `eb2734b` | `tests/test_parsers_hardening.py` §H4 |
+
+### Reopened after the release: S-B1, the self-update path
+
+S-B1 was fixed by `48ba132` — newest published tag, verified against a
+`SHA256SUMS` release asset — and that fix has since been **partly withdrawn**.
+`selfupdate.apply()` follows the tip of `main` again and verifies no tag, no
+digest and no signature. Push access to this repository is once more code
+execution on every install that has self-update turned on.
+
+Why: the hardened path is gated behind the `updates_enabled` setting, which
+only exists in 4.39.0. Installs already in the field run a copy of
+`selfupdate.py` that predates it, so they could not reach 4.39.0 through the
+button at all — the update mechanism had locked itself out of the very release
+that introduced it. Restoring the branch pull is what gets the fleet to a
+version that has the setting.
+
+What still stands from the original finding, and what does not:
+
+- `updates_enabled` defaults to **off**, and is administrator-only. An install
+  that never turns it on makes no update request at all. This part of the fix
+  is intact and is the mitigation available today.
+- The archive is still size-capped, still extracted with its own mode bits
+  discarded, and still sanity-checked for shape before anything is swapped in.
+- The tag pin and the digest check are **gone from the path**. `latest_tag()`
+  and `published_digest()` remain in the module and remain tested
+  (`tests/test_security_fixes.py` §D3, the checks marked "retained"), so
+  restoring them is a change to `apply()` and its tests.
+
+To resolve: once the fleet is on a version carrying `updates_enabled`, point
+`apply()` back at `latest_tag()` + `published_digest()`. The migration problem
+that forced this will not recur, because from then on every install already has
+the setting. A signature over the tag would close what neither version closes —
+that a matching tag-and-digest pair proves what was named, not who named it.
 
 ### Deferred
 

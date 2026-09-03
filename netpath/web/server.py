@@ -801,6 +801,12 @@ class Handler(BaseHTTPRequestHandler):
                 # not a ValueError, but keeping it here says plainly that
                 # "stop" and "wrong password" are different answers.
                 self._json({"error": str(exc)}, 429)
+            except permissions.Forbidden as exc:
+                # Before the PermissionError arm below, which this subclasses:
+                # "you may not do that" leaves the session alone, where 401
+                # tells the browser to go to the sign-in page and loses the
+                # refusal on the way.
+                self._json({"error": str(exc)}, 403)
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
             except ValueError as exc:

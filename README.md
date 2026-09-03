@@ -579,8 +579,18 @@ On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
 `systemctl start sappiwhere`. There is also an in-application update path — the
 **Update** button on the Settings tab — which is **disabled by default from
 4.39.0**: it does nothing until an administrator turns on the `updates_enabled`
-setting, and it now pins to a published release tag and verifies the download's
-SHA-256 rather than pulling whatever is at the tip of a branch.
+setting.
+
+Once it is on, that button installs **whatever is at the tip of `main`**. It
+does not check a signature, a tag or a digest, so anyone who can push to this
+repository can choose the code every install runs at the next press of it, on
+hosts holding your SNMP communities and SSH credentials. This is known,
+deliberate and temporary — 4.39.0 briefly required a published, digest-verified
+release instead, which left every install already in the field unable to reach
+4.39.0 through the button at all. See the SECURITY NOTE at the top of
+`netpath/selfupdate.py` for what has to change to put the verified path back.
+If you cannot accept that exposure, leave `updates_enabled` off — the default —
+and replace the directory by hand.
 
 ### A file share, even less setup
 

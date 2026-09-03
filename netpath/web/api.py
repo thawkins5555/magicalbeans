@@ -1010,7 +1010,7 @@ def post_settings(service, params, body) -> dict:
     granted = service.app_db.permissions_for(params.get("_username", ""))
     touched = [key for key in ADMIN_ONLY_SETTINGS if key in values]
     if touched and not _may_change_admin_settings(service, params):
-        raise PermissionError(
+        raise _permissions.Forbidden(
             f"Changing {', '.join(touched)} needs administrator access")
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
@@ -1035,7 +1035,7 @@ def post_update(service, params, body) -> dict:
     # a 403 rather than a JSON error, so an operator sees a refusal rather
     # than a failed update, and nothing reaches the network at all.
     if not selfupdate.updates_enabled(service.app_db):
-        raise PermissionError(selfupdate.UPDATES_DISABLED_MESSAGE)
+        raise _permissions.Forbidden(selfupdate.UPDATES_DISABLED_MESSAGE)
     _audit(service, params, "update.requested")
     result = selfupdate.apply(service.app_db)
     if result.get("ok") and not result.get("up_to_date"):

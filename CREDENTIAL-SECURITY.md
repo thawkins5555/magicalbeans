@@ -629,20 +629,31 @@ the device.
 
   **A correction, because an earlier edition of this sentence also said "no
   update check" and that was not true.** Pressing **Update** on the Settings
-  tab calls `selfupdate.latest_tag()`, which makes an HTTPS request to
-  `api.github.com` to ask what the newest published release tag is. It is
+  tab calls `selfupdate.latest_commit()`, which makes an HTTPS request to
+  `api.github.com` to ask what commit is at the tip of `main`. It is
   operator-initiated, never scheduled and never automatic; it sends no
   identifier, no fleet data and no credential — a plain GET with a
-  `User-Agent` — and the reply is a version string. But it *is* an outbound
+  `User-Agent` — and the reply is a commit id. But it *is* an outbound
   connection to a third party, and the previous wording denied that any
   existed. From 4.39.0 the whole update path is off unless an administrator
   turns on the `updates_enabled` setting, so on a default installation the
-  button refuses before it reaches the network, and when it is on it pins to
-  a published release tag and verifies the download's SHA-256 against a
-  `SHA256SUMS` file fetched from the same tag rather than trusting whatever
-  is at the tip of a branch. In an air-gapped deployment, leave
-  `updates_enabled` off and the application makes no outbound connection at
-  all beyond the ones you configure — SNMP, SMTP, DNS, SSH.
+  button refuses before it reaches the network. In an air-gapped deployment,
+  leave `updates_enabled` off and the application makes no outbound
+  connection at all beyond the ones you configure — SNMP, SMTP, DNS, SSH.
+
+  **What that button installs is not verified, and that is the largest
+  outstanding risk in this document.** It follows a mutable branch: no tag,
+  no published digest, no signature. Whoever can push to the repository
+  chooses the code every install with the setting on will run, on the hosts
+  that hold the credentials this whole document is about. 4.39.0 had shipped
+  the verified alternative — newest published tag, checked against a
+  `SHA256SUMS` release asset — and it was withdrawn because it left installs
+  already in the field unable to reach 4.39.0 through the button at all. The
+  code for it is still present and still tested (`latest_tag()`,
+  `published_digest()`); the SECURITY NOTE at the top of
+  `netpath/selfupdate.py` records what putting it back involves. Until then,
+  an installation whose threat model includes the repository being
+  compromised should keep `updates_enabled` off and install by hand.
 
 ## 8a. The audit log
 

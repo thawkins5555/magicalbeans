@@ -44,6 +44,19 @@ WRITE = "write"
 LEVELS = (READ, WRITE)
 
 
+class Forbidden(PermissionError):
+    """A refusal about what this operator may do, not about who they are.
+
+    The distinction is not cosmetic. A bare PermissionError is answered 401,
+    which the browser side reads as "your session has gone" and follows by
+    replacing the page with the sign-in form. For a caller whose session is
+    perfectly good that is a redirect to sign-in and straight back again,
+    with the refusal — the sentence that says which setting to turn on, or
+    that the action needs an administrator — thrown away in between. This is
+    answered 403, so the message reaches the person who asked.
+    """
+
+
 def allows(granted: str | None, required: str) -> bool:
     """True if a `granted` level (None, 'read' or 'write' — whatever a user
     actually has for a module) satisfies a route's `required` level. write

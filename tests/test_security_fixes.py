@@ -217,30 +217,48 @@ def main() -> int:
     from netpath import selfupdate
 
     status, _h, payload = req("POST", "/api/update", {}, cookie=admin_cookie)
+    # 403 specifically, not "401 or 403": accepting either is what let a 401
+    # ship here, and a 401 makes the browser replace the page with the
+    # sign-in form instead of showing the operator which setting to turn on.
     check("D3 updates_enabled defaults to off and refuses the route",
-          status in (401, 403) and "switched off" in str(payload.get("error", "")),
+          status == 403 and "switched off" in str(payload.get("error", "")),
           f"{status} {payload}")
 
-    # A repository of one tag whose release publishes a digest, served
-    # entirely from memory: the two functions in selfupdate that touch the
-    # network are the only boundary, and both are replaced here.
+    # A repository served entirely from memory: the two functions in
+    # selfupdate that touch the network are the only boundary, and both are
+    # replaced here.
+    #
+    # apply() follows the tip of main — see the SECURITY NOTE in
+    # selfupdate.py for the exposure that carries and why it is accepted for
+    # now. The tag-and-digest helpers it no longer calls are still exercised
+    # directly further down, so the verified path stays covered and putting
+    # it back stays a change to apply() rather than a rewrite.
     TAG = "v9.9.9"
-    tar_bytes = io.BytesIO()
-    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
-        for name, text in (("magicalbeans-9.9.9/netpath/__init__.py", "x = 1\n"),
-                           ("magicalbeans-9.9.9/netpath/web/__init__.py", "y = 1\n")):
-            data = text.encode()
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            info.mode = 0o777          # the archive asking for more than it may have
-            tar.addfile(info, io.BytesIO(data))
-    TARBALL = tar_bytes.getvalue()
-    GOOD_DIGEST = hashlib.sha256(TARBALL).hexdigest()
+    TIP = "b" * 40
 
-    state = {"digest": GOOD_DIGEST, "tarball": TARBALL, "calls": []}
+    def build_tarball(root: str) -> bytes:
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+            for name, text in ((f"{root}/netpath/__init__.py", "x = 1\n"),
+                               (f"{root}/netpath/web/__init__.py", "y = 1\n")):
+                data = text.encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o777      # the archive asking for more than it may have
+                tar.addfile(info, io.BytesIO(data))
+        return raw.getvalue()
+
+    TARBALL = build_tarball(f"magicalbeans-{TIP}")
+    GOOD_DIGEST = hashlib.sha256(build_tarball("magicalbeans-9.9.9")).hexdigest()
+
+    state = {"digest": GOOD_DIGEST, "tarball": TARBALL, "sha": TIP,
+             "message": "The commit at the tip\n\nand its body", "calls": []}
 
     def fake_json(url, timeout=10.0):
         state["calls"].append(url)
+        if url.endswith("/commits/main"):
+            return {"sha": state["sha"],
+                    "commit": {"message": state["message"]}}
         if url.endswith("/tags"):
             return [{"name": "v9.8.0", "commit": {"sha": "a" * 40}},
                     {"name": TAG, "commit": {"sha": "b" * 40}},
@@ -296,45 +314,33 @@ def main() -> int:
     quiesced = []
     selfupdate.set_before_restart_hook(lambda: quiesced.append(True))
     try:
-        release = selfupdate.latest_tag()
-        check("D3 the newest tag is chosen by version order, not list order",
-              release["tag"] == "v9.10.0-broken", release["tag"])
-
-        # The newest tag has no SHA256SUMS: refused, nothing downloaded.
         SERVICE.app_db.save_settings({"updates_enabled": True})
-        result = selfupdate.apply(SERVICE.app_db)
-        check("D3 a release with no SHA256SUMS is refused",
-              not result.get("ok") and "SHA256SUMS" in result.get("error", ""),
-              str(result))
-        check("D3 …and nothing was swapped in", not swapped, str(swapped))
 
-        # Drop the broken tag so v9.9.9 is newest, and tamper with the archive.
-        def only_good(url, timeout=10.0):
-            payload = fake_json(url, timeout)
-            if url.endswith("/tags"):
-                return [t for t in payload if not t["name"].endswith("broken")]
-            return payload
-        selfupdate._fetch_json = only_good
-
-        state["tarball"] = TARBALL + b"tampered"
+        # The tip of main is what is installed, and it is reached without
+        # asking about tags or releases at all.
+        state["calls"].clear()
+        commit_before = SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY)
         result = selfupdate.apply(SERVICE.app_db)
-        check("D3 a tarball whose digest differs is refused",
-              not result.get("ok") and "SHA-256" in result.get("error", ""),
-              str(result))
-        check("D3 …and still nothing was swapped in", not swapped, str(swapped))
-
-        # Oversized: refused before it can be unpacked.
-        state["tarball"] = TARBALL
-        result_ok_before = SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)
-        result = selfupdate.apply(SERVICE.app_db)
-        check("D3 the matching tarball installs",
-              result.get("ok") and result.get("tag") == TAG, str(result))
+        check("D3 the tip of main installs",
+              result.get("ok") and not result.get("up_to_date")
+              and result.get("commit") == TIP[:10], str(result))
+        check("D3 …with the commit subject as its message, not its whole body",
+              result.get("message") == "The commit at the tip", str(result))
+        check("D3 …asking GitHub only for the branch tip and that tarball",
+              not any("/tags" in url or "/releases" in url
+                      for url in state["calls"]),
+              str(state["calls"]))
         check("D3 …the workers were quiesced before the swap",
               bool(quiesced) and bool(swapped), f"{quiesced} {swapped}")
-        check("D3 …and the installed tag is recorded",
-              SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY) == TAG
-              and result_ok_before is None,
-              str(SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)))
+        check("D3 …and the installed commit is recorded",
+              SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY) == TIP
+              and commit_before is None,
+              str(SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY)))
+        # A branch pull cannot honestly claim a tag, so it must not leave one
+        # behind for the Settings page to report as what is installed.
+        check("D3 …and no tag is claimed for it",
+              not SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY),
+              repr(SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)))
 
         # The unpacked tree must not carry the archive's own mode bits
         # (the tarball above asks for 0777 on every file). On POSIX this is
@@ -352,8 +358,31 @@ def main() -> int:
                   modes == [0o644], str([oct(m) for m in modes]))
 
         result = selfupdate.apply(SERVICE.app_db)
-        check("D3 the same tag again is 'up to date'",
+        check("D3 the same tip again is 'up to date'",
               result.get("ok") and result.get("up_to_date"), str(result))
+
+        # A branch tip moves, and following it is the whole point of this
+        # path: the next commit installs without anything being published.
+        MOVED = "d" * 40
+        state["sha"], state["message"] = MOVED, "A later commit"
+        state["tarball"] = build_tarball(f"magicalbeans-{MOVED}")
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 a moved tip installs the new commit",
+              result.get("ok") and not result.get("up_to_date")
+              and result.get("commit") == MOVED[:10]
+              and SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY) == MOVED,
+              str(result))
+
+        # An answer that arrived intact but carries no commit id is not a
+        # connectivity problem, and must not be reported as one — that sent
+        # an operator to the firewall for something no firewall would fix.
+        state["sha"] = ""
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 an answer with no commit id is not 'could not reach GitHub'",
+              not result.get("ok")
+              and "commit id" in result.get("error", "")
+              and "reach" not in result.get("error", ""), str(result))
+        state["sha"], state["message"] = MOVED, "A later commit"
 
         # And with the setting off again, nothing is even asked of GitHub.
         SERVICE.app_db.save_settings({"updates_enabled": False})
@@ -362,6 +391,22 @@ def main() -> int:
         check("D3 switching the setting off stops it reaching the network",
               not result.get("ok") and result.get("disabled") and not state["calls"],
               f"{result} {state['calls']}")
+
+        # The verified path apply() no longer uses, still covered so that
+        # restoring it stays a change to apply() rather than a rewrite.
+        release = selfupdate.latest_tag()
+        check("D3 (retained) the newest tag is chosen by version order",
+              release["tag"] == "v9.10.0-broken", release["tag"])
+        try:
+            selfupdate.published_digest("v9.10.0-broken")
+            refused = ""
+        except ValueError as exc:
+            refused = str(exc)
+        check("D3 (retained) a release with no SHA256SUMS is refused",
+              "SHA256SUMS" in refused, refused or "no refusal")
+        check("D3 (retained) a published digest is read from the asset list",
+              selfupdate.published_digest(TAG) == GOOD_DIGEST,
+              selfupdate.published_digest(TAG))
     finally:
         selfupdate._fetch_json, selfupdate._fetch_bytes = real_json, real_bytes
         selfupdate._swap_in, selfupdate.schedule_restart = real_swap, real_restart
@@ -715,8 +760,11 @@ def main() -> int:
     status, _h, payload = req("POST", "/api/settings",
                               {"scope": "global", "values": {"updates_enabled": True}},
                               cookie=settings_cookie)
+    # 403, not 401: the caller is signed in and stays signed in. A 401 sends
+    # the browser to the sign-in page, which bounces straight back for a
+    # valid session and loses the sentence saying what was refused and why.
     check("D8 settings:write cannot turn self-update on",
-          status == 401 and "administrator" in str(payload.get("error", "")),
+          status == 403 and "administrator" in str(payload.get("error", "")),
           f"{status} {payload}")
     check("D8 …and it stayed off",
           SERVICE.app_db.settings().get("updates_enabled") is False)

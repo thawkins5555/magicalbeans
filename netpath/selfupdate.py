@@ -10,28 +10,42 @@ The flow behind that button:
    off by default: on a change-controlled network, "this host installs
    whatever the internet offers it, when anyone presses a button" is not a
    default anyone would choose, and before 4.37 there was no way to say no.
-1. Ask GitHub's API for the newest **release tag** — not the tip of a
-   branch. A branch tip moves: whoever can push to it (the repo owner, a
-   stolen credential, a CI token, a PR merged by accident) chose the code
-   every install would run at the next press of the button. A tag is a
-   name someone deliberately published.
-2. If it matches what is already installed (`update_installed_tag` in
+1. Ask GitHub's API for the current tip of the `main` branch.
+2. If that commit is what is already installed (`update_installed_commit` in
    app.db), stop there — nothing to do.
-3. Otherwise fetch that release's `SHA256SUMS` asset, download the tag's
-   tarball (capped, and hashed as it is written), and refuse it unless its
-   digest is the one the release published. The digest comes from the
-   release's asset list rather than from inside the archive, so tampering
-   with the archive alone does not tamper with what it is checked against.
-   RELEASE.md at the repo root describes how a release publishes it.
+3. Otherwise download that commit's tarball, capped at MAX_DOWNLOAD_BYTES.
 4. Unpack into a temp directory with the archive's own mode bits discarded,
    sanity-check it looks like this application, quiesce the workers, and
    swap it in for the running `netpath` package.
 5. Re-exec the process so the swapped-in code is what actually runs next.
 
-None of this is a signature: it proves the tarball is the one the release
-named, not who named it. What it removes is the mutable-branch window and
-the silent substitution of a tarball in flight; an operator who needs more
-than that should leave `updates_enabled` off and install by hand.
+SECURITY NOTE — accepted debt, to be resolved
+---------------------------------------------
+Step 1 follows a **mutable branch**, and step 3 verifies nothing about what
+it downloads beyond the size cap and "does this look like SappiWhere".
+
+That means: whoever can push to `main` — the repo owner, a stolen GitHub
+credential, a CI token, a pull request merged by accident — chooses the code
+every install in the fleet will run at the next press of this button, on
+hosts that hold the plant's SNMP communities and SSH credentials. There is
+no tag, no digest and no signature in the path. This is the same exposure
+recorded as S-B1 in REVIEW-NETWORK-ENGINEER.md.
+
+It is deliberate and temporary. 4.39.0 had shipped the hardened version of
+this — newest published tag, verified against a `SHA256SUMS` published as a
+release asset — but that left every install already in the field unable to
+reach 4.39.0 through the button at all, since their own copy of this file
+predates the setting the hardened path is gated behind. Restoring the branch
+pull is what gets the fleet moving again.
+
+The pieces to put it back are still here and still tested: `latest_tag()`,
+`published_digest()` and `tarball_name()` below are the verified path, and
+RELEASE.md still describes how a release publishes the digest they read.
+Re-hardening is a change to `apply()` plus its tests, not a rewrite.
+
+Until then, an installation that cannot accept "whoever holds push access to
+this repository can run code here" should leave `updates_enabled` off — the
+default — and install by hand. That is the mitigation available today.
 
 The databases live outside this directory entirely (see NETWORK-AND-STORAGE-
 REQUIREMENTS.md), so none of this ever touches them. Only the `netpath`
@@ -162,11 +176,35 @@ def _version_key(tag: str) -> tuple:
     return tuple(int(part) for part in _VERSION_PART.findall(tag)) or (-1,)
 
 
+def latest_commit(timeout: float = 10.0) -> dict:
+    """The current tip of BRANCH, from GitHub's commits API.
+
+    What `apply()` installs. A branch tip moves, and nothing here proves who
+    moved it — see the SECURITY NOTE at the top of this module for what that
+    costs and what has to change to get the verified path back.
+    """
+    head = _fetch_json(
+        f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{BRANCH}",
+        timeout=timeout)
+    sha = str((head or {}).get("sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{7,40}", sha):
+        # An answer we cannot read is not a connectivity problem, and saying
+        # "could not reach GitHub" for it sends an operator to the firewall.
+        raise ValueError(f"GitHub's answer for {BRANCH} carried no commit id")
+    message = str(((head or {}).get("commit") or {}).get("message", ""))
+    return {"sha": sha, "message": message.splitlines()[0][:200] if message else ""}
+
+
 def latest_tag(timeout: float = 10.0) -> dict:
     """The newest published tag, from GitHub's tags API — the equivalent of
     `git ls-remote --tags`. Chosen by version order rather than by the
     order the API happens to return, so a tag pushed out of sequence does
-    not become "the newest"."""
+    not become "the newest".
+
+    Part of the verified path that `apply()` does not currently use; kept
+    (and kept tested) so re-hardening is a change to `apply()` rather than a
+    rewrite. See the SECURITY NOTE at the top of this module.
+    """
     tags = _fetch_json(f"https://api.github.com/repos/{OWNER}/{REPO}/tags",
                        timeout=timeout)
     named = [t for t in (tags or []) if t.get("name")]
@@ -189,6 +227,9 @@ def published_digest(tag: str, timeout: float = 10.0) -> str:
 
     Read from the release's SHA256SUMS *asset*, not from a file inside the
     archive: a digest carried by the thing it describes proves nothing.
+
+    Part of the verified path that `apply()` does not currently use. See the
+    SECURITY NOTE at the top of this module.
     """
     release = _fetch_json(
         f"https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}",
@@ -216,9 +257,16 @@ def published_digest(tag: str, timeout: float = 10.0) -> str:
     raise ValueError(f"{SUMS_ASSET} for {tag} has no entry for {wanted}")
 
 
-def _download_tarball(tag: str, dest_path: str, timeout: float = 60.0) -> str:
-    """The tag's tarball, written to `dest_path`. Returns its SHA-256."""
-    url = f"https://codeload.github.com/{OWNER}/{REPO}/tar.gz/refs/tags/{tag}"
+def _download_tarball(ref: str, dest_path: str, timeout: float = 60.0) -> str:
+    """The tarball for `ref`, written to `dest_path`. Returns its SHA-256.
+
+    `ref` is a commit id for the branch pull `apply()` does, and codeload
+    also accepts `refs/tags/<tag>` for the verified path, so one function
+    serves both. The digest is returned whether or not anything checks it:
+    it costs nothing to compute while the bytes are in hand, and it is what
+    the verified path compares.
+    """
+    url = f"https://codeload.github.com/{OWNER}/{REPO}/tar.gz/{ref}"
     raw = _fetch_bytes(url, timeout=timeout, max_bytes=MAX_DOWNLOAD_BYTES)
     with open(dest_path, "wb") as handle:
         handle.write(raw)
@@ -425,38 +473,31 @@ def apply(app_db) -> dict:
         return {"ok": False, "disabled": True, "error": UPDATES_DISABLED_MESSAGE}
 
     try:
-        release = latest_tag()
+        head = latest_commit()
     except (urllib.error.URLError, TimeoutError) as exc:
         return {"ok": False, "error": f"Could not reach GitHub: {exc}"}
     except (ValueError, KeyError) as exc:
         # GitHub answered; what it said is the problem. Reporting "could not
-        # reach GitHub" for a repository that has simply published no tags
-        # sent the operator to look at firewalls and proxies for a condition
-        # no amount of connectivity would change.
+        # reach GitHub" for an answer that arrived intact sent the operator
+        # to look at firewalls and proxies for a condition no amount of
+        # connectivity would change.
         return {"ok": False, "error": str(exc)}
 
-    tag = release["tag"]
-    if app_db.meta(INSTALLED_TAG_KEY) == tag:
-        return {"ok": True, "up_to_date": True, "tag": tag,
-                "commit": release["sha"][:10], "message": tag}
-
-    try:
-        expected = published_digest(tag)
-    except (urllib.error.URLError, ValueError, KeyError, TimeoutError) as exc:
-        return {"ok": False, "error": f"Refusing to install {tag}: {exc}"}
+    sha = head["sha"]
+    message = head["message"] or sha[:10]
+    if app_db.meta(INSTALLED_COMMIT_KEY) == sha:
+        return {"ok": True, "up_to_date": True, "commit": sha[:10],
+                "message": message}
 
     tmp_dir = tempfile.mkdtemp(prefix="sappiwhere-update-")
     try:
         archive_path = os.path.join(tmp_dir, "update.tar.gz")
         try:
-            actual = _download_tarball(tag, archive_path)
+            # Nothing checks this digest: the branch pull has no published
+            # digest to check it against. See the SECURITY NOTE at the top.
+            _download_tarball(sha, archive_path)
         except (urllib.error.URLError, ValueError, OSError) as exc:
             return {"ok": False, "error": f"Download failed: {exc}"}
-        if actual != expected:
-            return {"ok": False, "error":
-                    f"The {tag} tarball does not match the SHA-256 its "
-                    f"release published ({actual[:12]}… against "
-                    f"{expected[:12]}…) — refusing to install it."}
 
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
@@ -499,12 +540,15 @@ def apply(app_db) -> dict:
         # short-lived connection of their own rather than the handle the
         # service was using.
         from .appdb import write_meta
-        write_meta(db_path, INSTALLED_TAG_KEY, tag)
-        write_meta(db_path, INSTALLED_COMMIT_KEY, release["sha"])
+        write_meta(db_path, INSTALLED_COMMIT_KEY, sha)
         write_meta(db_path, INSTALLED_AT_KEY, str(time.time()))
+        # The tag marker is what the verified path records, and a branch
+        # pull cannot honestly claim one. Cleared rather than left behind,
+        # so a stale tag never reads as "this is what is installed".
+        write_meta(db_path, INSTALLED_TAG_KEY, "")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     schedule_restart()
-    return {"ok": True, "up_to_date": False, "tag": tag,
-            "commit": release["sha"][:10], "message": tag, "restarting": True}
+    return {"ok": True, "up_to_date": False, "commit": sha[:10],
+            "message": message, "restarting": True}
