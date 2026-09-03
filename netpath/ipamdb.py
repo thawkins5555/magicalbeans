@@ -507,6 +507,14 @@ class IpamDatabase:
                 "SELECT * FROM conflicts WHERE resolved_ts IS NULL"
                 " ORDER BY last_seen_ts DESC").fetchall()
 
+    def conflict_count(self) -> int:
+        """Open conflicts, counted in SQL. /api/state used to take len() of
+        conflicts() — every open row fetched and thrown away, twice a second
+        per open tab."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM conflicts WHERE resolved_ts IS NULL").fetchone()[0]
+
     def resolve_conflict(self, conflict_id: int) -> None:
         with self._lock:
             self._conn.execute(

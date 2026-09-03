@@ -131,8 +131,10 @@ try:
     service.app_db.set_permissions("reader", {"nodes": "read", "syslog": "read"})
     reader_token = login("reader", READER_PASSWORD)
 
-    status, reader_state, _ = call("GET", "/api/state", token=reader_token)
-    check("a limited account can read state at all", status == 200, status)
+    # Since 4.43.0 the settings blocks live on /api/config and the live
+    # blocks on /api/state; the same per-module gate applies to both.
+    status, reader_state, _ = call("GET", "/api/config", token=reader_token)
+    check("a limited account can read config at all", status == 200, status)
     check("its own modules' blocks are present",
           "nodes_settings" in reader_state and "syslog_settings" in reader_state,
           sorted(k for k in reader_state if k.endswith("_settings")))
@@ -143,9 +145,17 @@ try:
           sorted(reader_state["permissions"]) == ["nodes", "syslog"],
           reader_state["permissions"])
 
-    status, admin_state, _ = call("GET", "/api/state", token=token)
+    status, admin_config, _ = call("GET", "/api/config", token=token)
     check("an account that can read NetFlow still gets its block",
-          "dimensions" in admin_state and "flow_settings" in admin_state)
+          "dimensions" in admin_config and "flow_settings" in admin_config)
+    status, reader_live, _ = call("GET", "/api/state", token=reader_token)
+    check("live blocks it cannot read are absent too",
+          "collector" not in reader_live and "nodes" in reader_live,
+          sorted(k for k in reader_live if k in ("collector", "nodes", "syslog", "snmp")))
+    check("both halves carry the same config_version",
+          reader_live.get("config_version") == reader_state.get("config_version")
+          and isinstance(reader_live.get("config_version"), int))
+    status, admin_state, _ = call("GET", "/api/state", token=token)
 
     # Both session countdowns are sent, so the browser can warn before either
     # ends. The absolute one used to be missing entirely and arrived as a

@@ -711,9 +711,9 @@ def step_settings(client: Client, log: SeedLog, workers: int,
         "syslog_settings", {}).get("accept_tcp")
 
     if defaults:
-        # There is no GET /api/settings; /api/state carries every module's
-        # settings block (api.py get_state).
-        got = client.get("/api/state").get(
+        # There is no GET /api/settings; /api/config carries every module's
+        # settings block (api.py get_config).
+        got = client.get("/api/config").get(
             "nodes_settings", {}).get("poll_workers")
         print("[8] --defaults: poll_workers left as shipped (%s)" % got)
         results["poll_workers"] = got

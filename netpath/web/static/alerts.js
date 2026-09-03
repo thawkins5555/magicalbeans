@@ -119,11 +119,18 @@
 
   function drawHistogram() {
     const svg = App.el('alerts-hist-svg');
-    svg.innerHTML = '';
     const box = App.el('alerts-hist').getBoundingClientRect();
     const width = Math.max(box.width, 300);
     const height = Math.max(box.height, 70);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // Redrawn only when the data or the drawing area changed: this ran on
+    // every refresh and on every frame of a divider drag, tearing the SVG
+    // down and rebuilding one hit rectangle with three listeners per
+    // bucket each time, whether or not anything was different.
+    const signature = `${width}x${height}:${JSON.stringify(view.hist)}`;
+    if (svg.dataset.signature === signature) return;
+    svg.dataset.signature = signature;
+    svg.innerHTML = '';
     const data = view.hist;
     if (!data || !data.length) {
       svg.appendChild(App.svgNode('text', {

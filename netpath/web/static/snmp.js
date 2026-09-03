@@ -60,11 +60,18 @@
 
   function drawHistogram() {
     const svg = App.el('sn-hist-svg');
-    svg.innerHTML = '';
     const box = App.el('sn-hist').getBoundingClientRect();
     const width = Math.max(box.width, 300);
     const height = Math.max(box.height, 90);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // Redrawn only when the data or the drawing area changed: this ran on
+    // every refresh and on every frame of a divider drag, tearing the SVG
+    // down and rebuilding one hit rectangle with three listeners per
+    // bucket each time, whether or not anything was different.
+    const signature = `${width}x${height}:${JSON.stringify(view.hist)}`;
+    if (svg.dataset.signature === signature) return;
+    svg.dataset.signature = signature;
+    svg.innerHTML = '';
 
     const data = view.hist;
     if (!data || !data.buckets.length) {
@@ -427,8 +434,12 @@
     status.textContent = text;
     status.title = text;
     status.classList.toggle('error', failed);
-    status.onmousemove = (event) => App.tooltip(wrap(text), event);
-    status.onmouseleave = App.hideTooltip;
+    // Wired once, reading the live title, rather than a fresh closure ten
+    // times a second from fastTick.
+    if (!status.onmousemove) {
+      status.onmousemove = (event) => App.tooltip(wrap(status.title), event);
+      status.onmouseleave = App.hideTooltip;
+    }
 
     App.el('sn-dot').style.background = snmp.running
       ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');

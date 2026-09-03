@@ -149,6 +149,18 @@ class Service:
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         self.started_at = time.time()
+        # Bumped by every write to something /api/config carries — a
+        # settings block, an account's grants. The browser polls /api/state
+        # and refetches /api/config only when this number moves, so the
+        # 6-7 KB of configuration that used to ride along on every poll now
+        # crosses the wire once per change. Monotonic within a process; a
+        # restart starting again from 1 is fine, because the client compares
+        # for inequality, not order.
+        self.config_version = 1
+        # Per-poll figures that are expensive to compute and cannot usefully
+        # change faster than an operator can read them: storage sizes (30
+        # stat() calls) and the reverse-DNS cache fill (three queries).
+        self._poll_cache: dict[str, tuple[float, object]] = {}
 
     def _ensure_default_user(self) -> None:
         """Create admin/admin on a fresh install, flagged to be changed.
@@ -249,6 +261,24 @@ class Service:
 
     # ------------------------------------------------------------- settings
 
+    def bump_config(self) -> None:
+        """Say that something /api/config carries has changed."""
+        self.config_version += 1
+
+    def cached_poll(self, key: str, ttl_s: float, compute):
+        """`compute()` at most once per `ttl_s`, shared by every open tab.
+
+        /api/state ran ten databases' size_bytes() (three stat() calls each)
+        and the hostname cache's three queries on every 2-second poll of
+        every tab. Neither figure means anything at that resolution."""
+        now = time.time()
+        hit = self._poll_cache.get(key)
+        if hit and now - hit[0] < ttl_s:
+            return hit[1]
+        value = compute()
+        self._poll_cache[key] = (now, value)
+        return value
+
     def apply_global_settings(self, values: dict) -> dict:
         self.settings.update(values)
         self.app_db.save_settings(self.settings)
@@ -276,6 +306,7 @@ class Service:
             self.asn_resolver.stop()
         self.log.add(SYSTEM, "Global settings applied")
         self.run_maintenance(force=True)
+        self.bump_config()
         return self.settings
 
     def apply_netpath_settings(self, values: dict) -> dict:
@@ -290,6 +321,7 @@ class Service:
         self.db.save_settings(self.settings)
         self.monitor.set_workers(int(self.settings["trace_workers"]))
         self.log.add(SYSTEM, "NetPath settings applied")
+        self.bump_config()
         return self.settings
 
     def apply_netflow_settings(self, values: dict) -> dict:
@@ -311,6 +343,7 @@ class Service:
         if self.flow_settings.get("enabled"):
             self.collector.start(self.flow_settings)
         self.log.add(SYSTEM, "NetFlow settings applied")
+        self.bump_config()
         return self.flow_settings
 
     def apply_syslog_settings(self, values: dict) -> dict:
@@ -320,6 +353,7 @@ class Service:
         if self.syslog_settings.get("enabled"):
             self.syslog.start(self.syslog_settings)
         self.log.add(SYSTEM, "Syslog settings applied")
+        self.bump_config()
         return self.syslog_settings
 
     def apply_snmp_settings(self, values: dict) -> dict:
@@ -329,6 +363,7 @@ class Service:
         if self.snmp_settings.get("enabled"):
             self.snmp.start(self.snmp_settings)
         self.log.add(SYSTEM, "SNMP trap settings applied")
+        self.bump_config()
         return self.snmp_settings
 
     def apply_ipam_settings(self, values: dict) -> dict:
@@ -339,6 +374,7 @@ class Service:
         else:
             self.ipam.stop()
         self.log.add(SYSTEM, "IPAM settings applied")
+        self.bump_config()
         return self.ipam_settings
 
     def apply_nodes_settings(self, values: dict) -> dict:
@@ -346,6 +382,7 @@ class Service:
         self.nodes_db.save_settings(self.nodes_settings)
         self.node_poller.reconfigure(self.nodes_settings)
         self.log.add(SYSTEM, "Nodes settings applied")
+        self.bump_config()
         return self.nodes_settings
 
     def apply_alerts_settings(self, values: dict) -> dict:
@@ -353,6 +390,7 @@ class Service:
         self.alerts_db.save_settings(self.alerts_settings)
         self.alert_engine.reconfigure(self.alerts_settings)
         self.log.add(SYSTEM, "Alerts settings applied")
+        self.bump_config()
         return self.alerts_settings
 
     def apply_wireless_settings(self, values: dict) -> dict:
@@ -362,6 +400,7 @@ class Service:
         if self.wireless_settings.get("enabled", True):
             self.wireless.start(self.wireless_settings)
         self.log.add(SYSTEM, "Wireless settings applied")
+        self.bump_config()
         return self.wireless_settings
 
     def apply_configrx_settings(self, values: dict) -> dict:
@@ -371,6 +410,7 @@ class Service:
         if self.configrx_settings.get("enabled", True):
             self.configrx.start(self.configrx_settings)
         self.log.add(SYSTEM, "ConfigRX settings applied")
+        self.bump_config()
         return self.configrx_settings
 
     # -------------------------------------------------------- MIB catalog
@@ -537,6 +577,7 @@ class Service:
         """Used by the console and the command line, which set only web_* keys."""
         self.settings.update(values)
         self.app_db.save_settings(self.settings)
+        self.bump_config()
 
     def hostname_stats(self) -> dict:
         """Cache fill from app.db, pending count from the hop table."""

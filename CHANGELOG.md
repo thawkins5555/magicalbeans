@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.43.0 — Less over the wire](#4430--less-over-the-wire)
 - [4.42.0 — One place the colours live](#4420--one-place-the-colours-live)
 - [4.41.0 — A dialog that says no](#4410--a-dialog-that-says-no)
 - [4.40.0 — The update button works again](#4400--the-update-button-works-again)
@@ -105,6 +106,87 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.43.0 — Less over the wire
+
+Nothing in the server's response path had changed since the product had one
+tab: no compression, no keep-alive, an ETag made of `mtime-size`, a 304 that
+carried none of the security headers, and one 10.9 KB `/api/state` every two
+seconds of which two thirds could not have changed since the last one.
+Measured against the same seeded instance before and after, on the wire:
+
+| | before | after |
+|---|---|---|
+| cold load, 19 static requests | 800 KB, identity | 242 KB, gzip |
+| warm reload, 16 revalidations | 304s with no security headers | 304s with all of them |
+| `/api/state`, every 2 s | 10.9 KB | 1.3 KB |
+| 30 s on the Nodes tab | 335 KB | 40 KB |
+| connections per page load | ~20 (HTTP/1.0) | a handful, kept alive (HTTP/1.1) |
+
+- **gzip, negotiated in `_send`.** Every response leaves through one
+  function, so compression is decided once for all of them: text, JSON and
+  SVG above 1 KB, when the client asks for it (`gzip;q=0` is honoured), with
+  `Vary: Accept-Encoding`. Static files are compressed once per process;
+  JSON is compressed per response, which for a 10 KB poll costs far less
+  than the bytes it saves.
+- **Static files from memory, with a content-hash ETag.** `StaticCache`
+  reads `static/` once at listener start and serves from it; the ETag is a
+  SHA-256 prefix, so identical files across two deploys revalidate as
+  identical and a same-second rewrite of the same length can no longer alias.
+  A file edited while the server runs is reloaded on its next request (one
+  `stat`, where the old path did a `stat` and a read every time). HEAD no
+  longer reads a 283 KB file to discard it.
+- **The 304 is a real response.** It used to be three headers written by
+  hand — `Date`, `ETag`, `Cache-Control` — and nothing else, and since
+  revalidation is the steady state for every script and stylesheet, most
+  responses the browser received carried no CSP, no `nosniff`, no
+  `Referrer-Policy`. It now goes through `_send` like everything else.
+- **Content types are written down.** `mimetypes.guess_type` consults the
+  Windows registry, where `.js` has resolved to `text/plain`; under `nosniff`
+  that refuses the application outright. An explicit map covers every type
+  shipped, with a charset on each text type.
+- **`/api/state` is two routes.** `/api/config` carries what only an
+  operator changes — every settings block, the grants, the constant
+  vocabularies, the version — and a `config_version`; `/api/state` carries
+  what changes on its own and repeats the version. The browser fetches
+  config once and again only when the version moves, which every settings
+  save and every grant change does. On the way, the poll lost its
+  duplicated account lookup, two `SELECT *`-then-`len()` counts became
+  `COUNT(*)`, and the ten storage sizes (thirty `stat()` calls) and the
+  reverse-DNS cache figures (three queries) are computed at most every ten
+  seconds rather than on every poll of every tab.
+- **HTTP/1.1, so connections are reused.** The handler ran the library's
+  HTTP/1.0 default, closing after every response; a page load opened around
+  twenty connections, each a TLS handshake when the server has a
+  certificate. The switch exposed a real defect that the close had hidden: a
+  request refused before its handler ran — not signed in, password change
+  owed, wrong content type — was answered with its body still unread in the
+  socket, and on a persistent connection those bytes became the start of the
+  next request. `_send` now drains an unread body, or closes the connection
+  when it is too large to drain. A test sends exactly that sequence.
+- **`defer` on every module script.** The thirteen scripts download in
+  parallel and all finish before `DOMContentLoaded`, which also makes the
+  start-up order sound: `app.js` used to call `start()` synchronously while
+  the parser was still at its own tag, and the twelve modules below it had
+  not been fetched — it worked only because the first `await` inside
+  `start()` yielded long enough. `boot.js` stays blocking; its job is to run
+  before `<body>`.
+- **Less work per poll in the browser.** A table head is kept when its
+  columns, sort and select-all column are unchanged — it used to be torn
+  down and rebuilt with three listeners per column on every refresh, and the
+  body with it. Rows are built into a fragment and attached once. The
+  Syslog, SNMP and Alerts histograms and the NetFlow chart redraw only when
+  their data or drawing area changed. Splitter drags, column-grip drags and
+  the tooltip do their layout work once per frame instead of once per
+  pointer event — a drag on the NetPath divider used to tear down and redraw
+  two SVGs per `mousemove`. Permission gating runs when the grants change,
+  not every two seconds. The Nodes table asked for its keyboard wiring twice
+  per draw.
+- **New suite: `tests/test_static_headers.py`** drives a live server and pins
+  all of the above: headers on the 200 and the 304, the content types, gzip
+  and its refusal, hash ETags, HEAD, traversal, the two-route split with its
+  version bump, and three request sequences over one kept-alive connection.
+  The static handler had no test before.
 
 ### 4.42.0 — One place the colours live
 

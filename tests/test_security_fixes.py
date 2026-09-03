@@ -204,13 +204,13 @@ def main() -> int:
                       "session_idle_minutes", "dns_server", "asn_server"}),
           str(sorted(payload.get("settings", {}))[:12]))
 
-    status, _h, payload = req("GET", "/api/state", cookie=netpath_cookie)
-    check("D2 /api/state hides them too",
+    status, _h, payload = req("GET", "/api/config", cookie=netpath_cookie)
+    check("D2 /api/config hides them too",
           status == 200 and not (set(payload.get("settings", {}))
                                  & {"web_cert", "session_idle_minutes", "dns_server"}),
           str(status))
 
-    status, _h, payload = req("GET", "/api/state", cookie=admin_cookie)
+    status, _h, payload = req("GET", "/api/config", cookie=admin_cookie)
     check("D2 a Settings reader still sees them",
           "web_cert" in payload.get("settings", {})
           and "session_idle_minutes" in payload.get("settings", {}))

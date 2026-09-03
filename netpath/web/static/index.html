@@ -1022,18 +1022,23 @@
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
-<script src="/app.js"></script>
-<script src="/dashboard.js"></script>
-<script src="/nodes.js"></script>
-<script src="/alerts.js"></script>
-<script src="/netpath.js"></script>
-<script src="/netflow.js"></script>
-<script src="/snmp.js"></script>
-<script src="/syslog.js"></script>
-<script src="/ipam.js"></script>
-<script src="/wireless.js"></script>
-<script src="/configrx.js"></script>
-<script src="/debug.js"></script>
-<script src="/settings.js"></script>
+<!-- `defer` on every module script, and never on boot.js above: these
+     thirteen download in parallel while the markup parses, run in this
+     order, and all finish before DOMContentLoaded — which is also what
+     makes app.js's start-up ordering sound (see the end of app.js).
+     boot.js must keep blocking: its whole job is to run before <body>. -->
+<script src="/app.js" defer></script>
+<script src="/dashboard.js" defer></script>
+<script src="/nodes.js" defer></script>
+<script src="/alerts.js" defer></script>
+<script src="/netpath.js" defer></script>
+<script src="/netflow.js" defer></script>
+<script src="/snmp.js" defer></script>
+<script src="/syslog.js" defer></script>
+<script src="/ipam.js" defer></script>
+<script src="/wireless.js" defer></script>
+<script src="/configrx.js" defer></script>
+<script src="/debug.js" defer></script>
+<script src="/settings.js" defer></script>
 </body>
 </html>

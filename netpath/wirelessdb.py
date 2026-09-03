@@ -184,6 +184,12 @@ class WirelessDatabase:
             return self._conn.execute(
                 "SELECT * FROM controllers ORDER BY name COLLATE NOCASE").fetchall()
 
+    def controller_count(self) -> int:
+        """For /api/state, which used to fetch every controller row to count
+        them on every poll."""
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM controllers").fetchone()[0]
+
     def controller(self, controller_id: int) -> sqlite3.Row | None:
         with self._lock:
             return self._conn.execute(

@@ -314,11 +314,11 @@
       if (!seen.has(id)) rowCache.delete(id);
     }
     table.appendChild(body);
-    App.wireRowKeyboard(body);
     // This table builds its own rows rather than going through
     // App.drawRows, so it asks for the keyboard behaviour explicitly. Safe
     // to call on every draw: the wiring is idempotent, and the position of
-    // the one tabbable row is recomputed from the current selection.
+    // the one tabbable row is recomputed from the current selection. (It
+    // was called twice here; the second walk did nothing but cost.)
     App.wireRowKeyboard(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();

@@ -824,6 +824,8 @@ const App = (() => {
      cannot be styled and does not follow the cursor. The views want something
      that reads like the desktop's hover panel, so this is drawn instead. */
   let tipElement = null;
+  let tipFrame = 0;
+  let tipPointer = { x: 0, y: 0 };
 
   /* `content` is either a string — every caller that has one, unchanged —
      or an array of {text, color} rows, where a row with a colour draws a
@@ -864,15 +866,28 @@ const App = (() => {
     }
     tipElement.hidden = false;
 
-    // Flip to the other side of the cursor rather than running off the edge.
-    const box = tipElement.getBoundingClientRect();
-    const margin = 14;
-    let x = event.clientX + margin;
-    let y = event.clientY + margin;
-    if (x + box.width > window.innerWidth - 8) x = event.clientX - box.width - margin;
-    if (y + box.height > window.innerHeight - 8) y = event.clientY - box.height - margin;
-    tipElement.style.left = `${Math.max(x, 8)}px`;
-    tipElement.style.top = `${Math.max(y, 8)}px`;
+    /* Measured and placed in the next frame rather than here. Writing the
+       content and then reading getBoundingClientRect() in the same handler
+       forces a synchronous layout on every mousemove over a chart or a
+       table; deferring the read to the frame lets the browser lay out once,
+       and a pointer that has moved again meanwhile is placed from its
+       latest position. The one-frame delay is not visible. */
+    tipPointer = { x: event.clientX, y: event.clientY };
+    if (!tipFrame) {
+      tipFrame = requestAnimationFrame(() => {
+        tipFrame = 0;
+        if (!tipElement || tipElement.hidden) return;
+        // Flip to the other side of the cursor rather than running off the edge.
+        const box = tipElement.getBoundingClientRect();
+        const margin = 14;
+        let x = tipPointer.x + margin;
+        let y = tipPointer.y + margin;
+        if (x + box.width > window.innerWidth - 8) x = tipPointer.x - box.width - margin;
+        if (y + box.height > window.innerHeight - 8) y = tipPointer.y - box.height - margin;
+        tipElement.style.left = `${Math.max(x, 8)}px`;
+        tipElement.style.top = `${Math.max(y, 8)}px`;
+      });
+    }
   }
 
   function hideTooltip() {
@@ -1543,8 +1558,16 @@ const App = (() => {
 
       document.body.classList.add(vertical ? 'resizing-v' : 'resizing-h');
 
-      const move = (moveEvent) => {
-        const delta = (vertical ? moveEvent.clientY : moveEvent.clientX) - startPos;
+      /* The pointer reports far more often than the screen paints, and
+         every 'panes-resized' listener rebuilds a chart from scratch, so
+         the work is done once per frame from the latest position rather
+         than once per event. Without this a drag on the NetPath divider
+         tore down and redrew two SVGs per mousemove. */
+      let frame = 0;
+      let latest = startPos;
+      const apply = () => {
+        frame = 0;
+        const delta = latest - startPos;
         let first = beforeSize + delta;
         first = Math.max(minimum, Math.min(first, total - minimum));
         const share = first / total;
@@ -1552,10 +1575,15 @@ const App = (() => {
         after.style.flexGrow = String(growTotal * (1 - share));
         window.dispatchEvent(new Event('panes-resized'));
       };
+      const move = (moveEvent) => {
+        latest = vertical ? moveEvent.clientY : moveEvent.clientX;
+        if (!frame) frame = requestAnimationFrame(apply);
+      };
 
       const up = () => {
         document.removeEventListener('mousemove', move);
         document.removeEventListener('mouseup', up);
+        if (frame) { cancelAnimationFrame(frame); apply(); }
         document.body.classList.remove('resizing-v', 'resizing-h');
         const layout = loadLayout();
         layout[name] = panes.map((pane) => Number(pane.style.flexGrow));
@@ -1895,6 +1923,40 @@ const App = (() => {
     table.dataset.grid = name;
     table.classList.add('grid');
 
+    /* The head is kept when nothing about it changed.
+
+       This function used to tear down caption, colgroup and thead and build
+       them again on every poll — every column header with its three
+       listeners, every grip — and then wipe the body with them, which is
+       what made keyboard focus need rescuing (pendingRowFocus, below). What
+       the head depends on is the column set, the sort and whether a
+       select-all box is present; when those are the same as last time, only
+       the body is replaced. The select-all box's own ticked/indeterminate
+       state is updated in place rather than being part of the key, so a
+       tick does not cost a rebuild either. */
+    const headKey = [name, columns.map((c) => `${c.key}:${c.label}:${c.numeric ? 1 : 0}`
+      + `:${c.align || ''}:${c.sortable === false ? 0 : 1}`).join(','),
+      sort ? `${sort.key}:${sort.descending ? 1 : 0}` : '', onSort ? 1 : 0,
+      selectAll ? selectAll.key : ''].join('|');
+    if (table.dataset.headKey === headKey && table.tHead && table.querySelector('colgroup')) {
+      const box = table.querySelector('th .select-all');
+      if (box && selectAll) {
+        box.checked = !!selectAll.checked;
+        box.indeterminate = !selectAll.checked && !!selectAll.some;
+        const selectLabel = selectAll.label || 'Select all rows';
+        box.setAttribute('aria-label', selectAll.checked ? 'Clear selection' : selectLabel);
+        box.title = box.getAttribute('aria-label');
+        box.onclick = (event) => { event.stopPropagation(); selectAll.onToggle(box.checked); };
+      }
+      const focused = document.activeElement;
+      pendingRowFocus = (focused && focused.tagName === 'TR' && table.contains(focused))
+        ? [...focused.parentElement.rows].indexOf(focused)
+        : -1;
+      for (const body of [...table.tBodies]) body.remove();
+      return table;
+    }
+    table.dataset.headKey = headKey;
+
     /* A screen reader announces a table by its caption; without one, 29
        identically-shaped grids are all "table". The caller passes the panel
        heading it sits under; the humanised grid name is the fallback so a
@@ -2015,14 +2077,24 @@ const App = (() => {
           event.stopPropagation();
           const startX = event.clientX;
           const startWidth = th.getBoundingClientRect().width;
-          const move = (moveEvent) => {
-            const next = Math.max(40, startWidth + moveEvent.clientX - startX);
+          // One colgroup write per frame, not per pointer event (see
+          // wireDivider for the same reasoning).
+          let frame = 0;
+          let latestX = startX;
+          const apply = () => {
+            frame = 0;
+            const next = Math.max(40, startWidth + latestX - startX);
             colgroup.children[index].style.width = `${next}px`;
             th.dataset.dragged = '1';
+          };
+          const move = (moveEvent) => {
+            latestX = moveEvent.clientX;
+            if (!frame) frame = requestAnimationFrame(apply);
           };
           const up = () => {
             document.removeEventListener('mousemove', move);
             document.removeEventListener('mouseup', up);
+            if (frame) { cancelAnimationFrame(frame); apply(); }
             const all = loadColumns();
             all[name] = all[name] || {};
             all[name][column.key] =
@@ -2140,6 +2212,9 @@ const App = (() => {
      positional array of <td> strings against its column list, so removing one
      column silently shifted every cell after it into the wrong header. */
   function drawRows(tbody, rows, columns, onRow) {
+    // Built into a fragment and attached once: a tbody that is already in
+    // the document would otherwise lay out after each of 300 appends.
+    const fragment = document.createDocumentFragment();
     for (const row of rows) {
       const tr = document.createElement('tr');
       tr.innerHTML = columns.map((c) => {
@@ -2150,8 +2225,9 @@ const App = (() => {
           `${blank ? '\u2014' : escapeHtml(raw)}</td>`;
       }).join('');
       if (onRow) onRow(tr, row);
-      tbody.appendChild(tr);
+      fragment.appendChild(tr);
     }
+    tbody.appendChild(fragment);
     wireRowKeyboard(tbody);
     return tbody;
   }
@@ -2474,25 +2550,52 @@ const App = (() => {
 
   /* --------------------------------------------------------- lifecycle */
 
+  /* The half of the server's state that only an operator changes: every
+     settings block, the grants, the constant vocabularies, the version.
+     Fetched at start-up and again whenever /api/state reports a
+     config_version this browser has not seen. It used to ride along on
+     every two-second poll — 6-7 KB of the 10.9 KB — and applyPermissions()
+     walked all 84 gated controls on every one of those polls; both now
+     happen once per change. */
+  async function loadConfig() {
+    const config = await get('/api/config');
+    state.config = config;
+    state.configVersion = config.config_version;
+    state.settings = config.settings || {};
+    state.flowSettings = config.flow_settings;
+    state.syslogSettings = config.syslog_settings;
+    state.snmpSettings = config.snmp_settings;
+    state.trap_kinds = config.trap_kinds;
+    state.ipamSettings = config.ipam_settings;
+    state.nodesSettings = config.nodes_settings;
+    state.alertsSettings = config.alerts_settings;
+    state.wirelessSettings = config.wireless_settings;
+    state.configrxSettings = config.configrx_settings;
+    state.dimensions = config.dimensions;
+    state.categories = config.categories;
+    state.severities = config.severities;
+    state.facilities = config.facilities;
+    state.permissions = config.permissions || {};
+    applyPermissions();
+    if (config.version) {
+      const el = document.getElementById('version');
+      if (el) el.textContent = `v${config.version}`;
+    }
+    return config;
+  }
+
   async function loadState() {
     const payload = await get('/api/state');
-    state.settings = payload.settings;
-    state.flowSettings = payload.flow_settings;
-    state.syslogSettings = payload.syslog_settings;
-    state.snmpSettings = payload.snmp_settings;
-    state.trap_kinds = payload.trap_kinds;
-    state.ipamSettings = payload.ipam_settings;
-    state.nodesSettings = payload.nodes_settings;
-    state.alertsSettings = payload.alerts_settings;
-    state.wirelessSettings = payload.wireless_settings;
-    state.configrxSettings = payload.configrx_settings;
-    state.dimensions = payload.dimensions;
-    state.categories = payload.categories;
-    state.severities = payload.severities;
-    state.facilities = payload.facilities;
-    state.permissions = payload.permissions || {};
-    state.serverState = payload;
-    applyPermissions();
+    // A save anywhere — this browser's or another operator's — moves the
+    // version, and the next poll notices and fetches the config once.
+    if (payload.config_version !== state.configVersion || !state.config) {
+      await loadConfig();
+    }
+    // Every module reads its live block off serverState, and Settings reads
+    // version, update and storage off it too: the two halves are merged here
+    // so a consumer written against the old single payload sees the same
+    // shape.
+    state.serverState = { ...state.config, ...payload };
     const openCount = (payload.alerts || {}).open_count || 0;
     const alertsBadge = document.getElementById('alerts-tab-badge');
     if (alertsBadge) {
@@ -2527,10 +2630,6 @@ const App = (() => {
           pages.settings.forcePasswordChange();
         }
       }
-    }
-    if (payload.version) {
-      const el = document.getElementById('version');
-      if (el) el.textContent = `v${payload.version}`;
     }
     return payload;
   }
@@ -2822,8 +2921,16 @@ const App = (() => {
   //
   // Started from here rather than an inline script in the page: the server
   // sends a strict Content-Security-Policy, and 'self' does not permit inline
-  // script. The five files are ordinary parser-blocking scripts, so every page
-  // module has registered itself by the time this fires.
+  // script.
+  //
+  // Every module script carries `defer`, so all thirteen have run — and every
+  // App.pages.<x> is registered — before DOMContentLoaded fires and start()
+  // runs. Before `defer`, this file ran while the parser was still at its
+  // own <script> tag: readyState was already 'interactive', start() was
+  // called synchronously, and the twelve modules below it had not even been
+  // fetched. It worked only because start()'s first `await loadState()`
+  // yielded long enough for the parser to reach them. The branch for
+  // 'interactive' stays for a page that loads this file without defer.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => { start(); });
   } else {
@@ -2831,7 +2938,7 @@ const App = (() => {
   }
 
   const api = {
-    state, pages, start, selectTab, loadState, refreshNow, rateFor,
+    state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
     parseRoute, buildRoute, setRoute, applyRoute,
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,

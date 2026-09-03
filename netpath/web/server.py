@@ -15,6 +15,8 @@ it a certificate.
 from __future__ import annotations
 
 import json
+import gzip
+import hashlib
 import mimetypes
 import os
 import re
@@ -34,6 +36,124 @@ from .. import permissions
 from .service import Service
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# Content types by extension, written down rather than asked of
+# `mimetypes.guess_type`. That function consults the Windows registry, where
+# .js has been known to resolve to text/plain — and every response here
+# carries `X-Content-Type-Options: nosniff`, under which a script served as
+# text/plain is refused outright and the application does not load. The
+# charset is stated for every text type so a browser never has to guess it.
+MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".png": "image/png",
+    ".woff2": "font/woff2",
+}
+
+# What gets gzip-compressed on the way out. Text of every kind and the two
+# structured formats; never an image (other than SVG, which is text) or
+# anything already compressed. Below GZIP_MIN_BYTES the gzip header costs
+# more than it saves.
+COMPRESSIBLE_PREFIXES = ("text/", "application/json", "application/javascript",
+                         "image/svg+xml")
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 6
+
+
+def content_type_for(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in MIME_TYPES:
+        return MIME_TYPES[ext]
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or "application/octet-stream"
+
+
+def is_compressible(content_type: str) -> bool:
+    return content_type.startswith(COMPRESSIBLE_PREFIXES)
+
+
+class StaticCache:
+    """The files under static/, read once and served from memory.
+
+    Each entry holds the bytes, a gzip of them, a content-hash ETag and the
+    file's mtime and size. Before this every request for a script re-read the
+    file from disk (283 KB for the terminal emulator) and, on a match, sent a
+    304 whose ETag was `mtime-size` — so identical files across two deploys
+    revalidated as different, and a same-second rewrite of the same length
+    aliased as the same. A hash is right in both directions.
+
+    Loaded by WebServer.start(), which is also what restart() goes through,
+    so a listener re-bound in-process for a port change gets a fresh map. A
+    self-update never serves from a stale map: it swaps the whole package
+    with the listener down and always ends in execv or _exit (selfupdate.py).
+
+    The one live case is a developer editing a file while the server runs.
+    `get()` stats the file (one stat, where the old path did a stat AND a
+    read) and reloads the entry if the mtime or size moved, so an edit shows
+    on the next request exactly as it did before. A file that is not in the
+    map yet — added after start — is loaded on first request.
+    """
+
+    def __init__(self, root: str):
+        self.root = root
+        self._entries: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def load(self) -> None:
+        entries = {}
+        for dirpath, _dirs, files in os.walk(self.root):
+            for name in files:
+                full = os.path.join(dirpath, name)
+                try:
+                    entries[full] = self._read(full)
+                except OSError:
+                    continue
+        with self._lock:
+            self._entries = entries
+
+    @staticmethod
+    def _read(full: str) -> dict:
+        stat = os.stat(full)
+        with open(full, "rb") as handle:
+            body = handle.read()
+        content_type = content_type_for(full)
+        gzipped = (gzip.compress(body, GZIP_LEVEL)
+                   if is_compressible(content_type) and len(body) >= GZIP_MIN_BYTES
+                   else None)
+        return {
+            "body": body,
+            "gzip": gzipped,
+            "etag": '"' + hashlib.sha256(body).hexdigest()[:32] + '"',
+            "content_type": content_type,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+    def get(self, full: str) -> dict | None:
+        try:
+            stat = os.stat(full)
+        except OSError:
+            return None
+        with self._lock:
+            entry = self._entries.get(full)
+        if entry and entry["mtime"] == stat.st_mtime and entry["size"] == stat.st_size:
+            return entry
+        try:
+            entry = self._read(full)
+        except OSError:
+            return None
+        with self._lock:
+            self._entries[full] = entry
+        return entry
+
+
+STATIC_CACHE = StaticCache(STATIC_DIR)
 
 R, W = permissions.READ, permissions.WRITE
 
@@ -92,6 +212,7 @@ ROUTES = [
     ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
     ("GET", r"^/api/state$", api.get_state, None),
+    ("GET", r"^/api/config$", api.get_config, None),
     ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
     ("POST", r"^/api/netpath/targets$", api.post_target, ("netpath", W)),
     ("PUT", r"^/api/netpath/targets/(\d+)$", api.put_target, ("netpath", W)),
@@ -325,7 +446,7 @@ PUBLIC_API = {"/api/login", "/api/session"}
 # exempt, so a fresh install was owned by whoever reached the port first.
 # Static files are untouched: the browser has to be able to load the app in
 # order to show the change-password dialog at all.
-MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state",
+MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state", "/api/config",
                    "/api/heartbeat", "/api/password"}
 
 SESSION_COOKIE = "sw_session"
@@ -426,6 +547,18 @@ class AccessLog:
 class Handler(BaseHTTPRequestHandler):
     server_version = "SappiWhere"
     sys_version = ""
+    # HTTP/1.1, for keep-alive. The default here is HTTP/1.0, under which
+    # every response closed the connection and a page load opened one TCP
+    # (or TLS) connection per script — around twenty. Three things in this
+    # file leaned on that and are unaffected: the WebSocket handshake writes
+    # its own 101 status line (wsock.py) and sets close_connection; _body
+    # refuses Transfer-Encoding outright, so a chunked request is still
+    # 411 and never misread; and every response leaves through _send with a
+    # Content-Length, or is a 304 with no body — the two things a persistent
+    # connection needs to know where one response ends. What changes is the
+    # resource profile: a browser holds a handful of idle connections per
+    # tab, each on a daemon thread, until `timeout` below closes them.
+    protocol_version = "HTTP/1.1"
     service: Service = None      # set on the server instance
     access: AccessLog = None
 
@@ -466,12 +599,60 @@ class Handler(BaseHTTPRequestHandler):
             if self.access:
                 self.access.closed()
 
+    def _accepts_gzip(self) -> bool:
+        """Whether the client asked for gzip, per Accept-Encoding.
+
+        Token-wise rather than a substring test, so `gzip;q=0` — a client
+        saying it must NOT receive gzip — is honoured, and `x-gzip` is not
+        mistaken for a request for it."""
+        header = self.headers.get("Accept-Encoding") or ""
+        for part in header.split(","):
+            token, _, params = part.strip().partition(";")
+            if token.strip().lower() != "gzip":
+                continue
+            q = 1.0
+            for param in params.split(";"):
+                name, _, value = param.strip().partition("=")
+                if name.strip().lower() == "q":
+                    try:
+                        q = float(value)
+                    except ValueError:
+                        q = 0.0
+            return q > 0
+        return False
+
     def _send(self, code: int, body: bytes, content_type: str,
-              extra_headers: dict | None = None) -> None:
+              extra_headers: dict | None = None,
+              gzipped: bytes | None = None) -> None:
+        """Every response leaves through here — that is what makes the
+        security headers below a guarantee rather than a convention, and it
+        is where compression is negotiated once for all of them.
+
+        `gzipped` is a caller that already holds the compressed form (the
+        static cache); anything else compressible above GZIP_MIN_BYTES is
+        compressed here per response, which for the 10 KB JSON polls is
+        cheaper than the bytes it saves many times over. A 304 carries no
+        body, no length and no type — but it does carry every security
+        header, which the hand-written 304 this replaces did not: revalidation
+        is the steady state for every script and stylesheet, so those were
+        the headers most responses were missing.
+        """
+        headers = dict(extra_headers or {})
+        self._drain_request_body()
         self._status = code
         self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        if code != 304:
+            compressible = is_compressible(content_type)
+            if compressible:
+                # The representation depends on the request header, and any
+                # cache between here and the browser has to know that.
+                headers.setdefault("Vary", "Accept-Encoding")
+            if (compressible and body and len(body) >= GZIP_MIN_BYTES
+                    and "Content-Encoding" not in headers and self._accepts_gzip()):
+                body = gzipped if gzipped is not None else gzip.compress(body, GZIP_LEVEL)
+                headers["Content-Encoding"] = "gzip"
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
         # No external resources are loaded, so this can be strict.
         # `connect-src 'self'` is what the terminal window's WebSocket needs
         # and all it needs: current browsers count a same-origin ws:// (or
@@ -496,10 +677,10 @@ class Handler(BaseHTTPRequestHandler):
         # remembered it.
         if getattr(self.server, "is_tls", False):
             self.send_header("Strict-Transport-Security", "max-age=31536000")
-        for key, value in (extra_headers or {}).items():
+        for key, value in headers.items():
             self.send_header(key, value)
         self.end_headers()
-        if self.command != "HEAD":
+        if self.command != "HEAD" and code != 304:
             self.wfile.write(body)
 
     def _json(self, payload, code: int = 200, extra_headers: dict | None = None) -> None:
@@ -533,6 +714,38 @@ class Handler(BaseHTTPRequestHandler):
         # base64 is four bytes per three, plus the JSON envelope around it.
         return max(self.MAX_BODY_BYTES, (budget * 4) // 3 + 65536)
 
+    def _drain_request_body(self) -> None:
+        """Consume a request body the handler never read, before answering.
+
+        A refusal that comes before the handler — not signed in, must change
+        password, wrong content type, wrong origin — used to respond with the
+        POST body still sitting unread in the socket. Under HTTP/1.0 the
+        close threw it away. Under a persistent connection it is the first
+        bytes of the next request, and that request fails to parse. Small
+        bodies are read and dropped so the connection stays usable; anything
+        larger, or chunked, closes the connection instead, which is also
+        what the 411 for chunked bodies needs."""
+        if getattr(self, "_body_consumed", False):
+            return
+        self._body_consumed = True
+        if (self.headers.get("Transfer-Encoding") or "").strip():
+            self.close_connection = True
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > self.MAX_BODY_BYTES:
+            self.close_connection = True
+            return
+        try:
+            self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+
     def _body(self, limit: int | None = None) -> dict:
         # Chunked bodies were read as Content-Length 0, i.e. as an empty
         # body, and the request then ran with default arguments — POST
@@ -546,13 +759,17 @@ class Handler(BaseHTTPRequestHandler):
                 "length rather than chunked")
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
+            self._body_consumed = True
             return {}
         cap = self.MAX_BODY_BYTES if limit is None else limit
         if length > cap:
+            # Left unread on purpose: _send will close the connection rather
+            # than read a body this size.
             raise ValueError(
                 f"Request body of {length:,} bytes exceeds the "
                 f"{cap:,} byte limit")
         raw = self.rfile.read(length)
+        self._body_consumed = True
         try:
             body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -606,6 +823,9 @@ class Handler(BaseHTTPRequestHandler):
         return {"Set-Cookie": "; ".join(attributes)}
 
     def _dispatch(self, method: str) -> None:
+        # One Handler instance serves every request on a persistent
+        # connection, so per-request state is reset here, not in __init__.
+        self._body_consumed = False
         started = time.perf_counter()
         try:
             self._route(method)
@@ -828,34 +1048,52 @@ class Handler(BaseHTTPRequestHandler):
             path = "/index.html"
         if path == "/login":
             path = "/login.html"
-        # Resolve inside the static directory and refuse anything that escapes.
+        # Resolve inside the static directory and refuse anything that
+        # escapes. commonpath rather than startswith: the directory name is
+        # a prefix of its own siblings' names ("static_notes"), and a prefix
+        # test would have let one of those through.
         candidate = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip("/")))
-        if not candidate.startswith(STATIC_DIR) or not os.path.isfile(candidate):
+        try:
+            inside = os.path.commonpath([STATIC_DIR, candidate]) == STATIC_DIR
+        except ValueError:
+            inside = False
+        entry = STATIC_CACHE.get(candidate) if inside and os.path.isfile(candidate) else None
+        if entry is None:
             self._send(404, b"Not found", "text/plain; charset=utf-8")
             return
-        content_type, _ = mimetypes.guess_type(candidate)
-        stat = os.stat(candidate)
-        etag = f'"{int(stat.st_mtime)}-{stat.st_size}"'
 
         # An update replaces the files underneath a browser that already has
         # the old ones. The shell is never cached so a reload always picks up
-        # new script tags, and the scripts carry a validator so the browser can
-        # tell stale from current instead of guessing.
+        # new script tags, and the scripts carry a validator so the browser
+        # can tell stale from current instead of guessing. `no-cache` (not
+        # `immutable`): the URLs are fixed names, so the browser must ask;
+        # what changed is that asking is now answered from memory with a
+        # content hash, and the answer carries the same headers as a 200.
         if candidate.endswith(".html"):
             cache = {"Cache-Control": "no-store"}
         else:
-            cache = {"Cache-Control": "no-cache", "ETag": etag}
-            if self.headers.get("If-None-Match") == etag:
-                self.send_response(304)
-                self.send_header("ETag", etag)
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self._status = 304
+            cache = {"Cache-Control": "no-cache", "ETag": entry["etag"]}
+            if self._etag_matches(entry["etag"]):
+                self._send(304, b"", entry["content_type"], cache)
                 return
+        self._send(200, entry["body"], entry["content_type"], cache,
+                   gzipped=entry["gzip"])
 
-        with open(candidate, "rb") as handle:
-            body = handle.read()
-        self._send(200, body, content_type or "application/octet-stream", cache)
+    def _etag_matches(self, etag: str) -> bool:
+        """If-None-Match, read as the header it is: a list, possibly weak-
+        prefixed, possibly `*` — not a single string compared whole."""
+        header = self.headers.get("If-None-Match")
+        if not header:
+            return False
+        for candidate in header.split(","):
+            candidate = candidate.strip()
+            if candidate == "*":
+                return True
+            if candidate.startswith("W/"):
+                candidate = candidate[2:]
+            if candidate == etag:
+                return True
+        return False
 
 
 class WebServer:
@@ -887,6 +1125,9 @@ class WebServer:
     def start(self, block: bool = True) -> bool:
         """Bring the listener up. Returns False and sets `error` if it cannot."""
         self.error = None
+        # Read once per listener, so restart() (a port or certificate change,
+        # in-process) serves whatever is on disk now.
+        STATIC_CACHE.load()
         handler = type("BoundHandler", (Handler,),
                        {"service": self.service, "access": self.access})
         try:

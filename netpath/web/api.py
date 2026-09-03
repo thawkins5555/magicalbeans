@@ -81,15 +81,36 @@ def _window(params) -> tuple[float, float]:
 # (the Dashboard it feeds is always reachable) — instead each per-module
 # section is dropped from the response below when the signed-in user
 # can't read that module, rather than the request being refused outright.
+#
+# The payload is two routes since 4.43.0. /api/config is what changes only
+# when an operator changes it — every settings block, the grants, the constant
+# vocabularies — and carries `config_version`; /api/state is what changes on
+# its own — running flags, counters, counts, clocks — and repeats the version
+# so the browser knows when to fetch the other half. Before the split every
+# poll of every tab carried both: measured 10.9 KB every two seconds, of
+# which 6-7 KB could not have changed since the last one.
+#
+# Both maps below are applied the same way: a module's keys are dropped for
+# an account that cannot read it.
+_CONFIG_MODULE_KEYS = {
+    "netflow": ("flow_settings", "dimensions"),
+    "syslog": ("syslog_settings",),
+    "snmp": ("snmp_settings", "trap_kinds"),
+    "ipam": ("ipam_settings",),
+    "nodes": ("nodes_settings",),
+    "alerts": ("alerts_settings",),
+    "wireless": ("wireless_settings",),
+    "configrx": ("configrx_settings",),
+}
 _STATE_MODULE_KEYS = {
-    "netflow": ("flow_settings", "dimensions", "collector"),
-    "syslog": ("syslog_settings", "syslog"),
-    "snmp": ("snmp_settings", "trap_kinds", "snmp"),
-    "ipam": ("ipam_settings", "ipam"),
-    "nodes": ("nodes_settings", "nodes"),
-    "alerts": ("alerts_settings", "alerts"),
-    "wireless": ("wireless_settings", "wireless"),
-    "configrx": ("configrx_settings", "configrx"),
+    "netflow": ("collector",),
+    "syslog": ("syslog",),
+    "snmp": ("snmp",),
+    "ipam": ("ipam",),
+    "nodes": ("nodes",),
+    "alerts": ("alerts",),
+    "wireless": ("wireless",),
+    "configrx": ("configrx",),
     "settings": ("storage",),
 }
 
@@ -114,24 +135,26 @@ def _visible_settings(settings: dict, granted: dict) -> dict:
     return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
 
 
-def get_state(service, params, body) -> dict:
+def _drop_unreadable(result: dict, granted: dict, module_keys: dict) -> None:
+    for module, keys in module_keys.items():
+        if not _permissions.allows(granted.get(module), _permissions.READ):
+            for key in keys:
+                result.pop(key, None)
+
+
+def get_config(service, params, body) -> dict:
+    """Everything the browser needs that only an operator can change.
+
+    Fetched once at start-up and again whenever /api/state reports a new
+    `config_version`. Never polled on its own: nothing in here moves by
+    itself. Not gated as a whole, like /api/state — a module's block is
+    dropped for an account that cannot read it."""
     from .. import __version__
     from ..selfupdate import (INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY,
                               INSTALLED_TAG_KEY, updates_enabled)
-
-    names = service.hostname_stats()
-    session = service.sessions.get(params.get("_token", ""))
-    idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
-                      if session else None)
-    # The absolute ceiling is the other way a session ends, and staying at the
-    # keyboard does not move it. It used to arrive with no warning at all: a
-    # wallboard left up overnight simply became the sign-in page. Sent the
-    # same way as the idle figure — server-authoritative, so a browser clock
-    # that disagrees cannot make the countdown lie.
-    max_remaining = (service.sessions.max_seconds - (time.time() - session["created"])
-                     if session else None)
     granted = service.app_db.permissions_for(params.get("_username", ""))
     result = {
+        "config_version": service.config_version,
         "version": __version__,
         "permissions": granted,
         "update": {
@@ -141,17 +164,6 @@ def get_state(service, params, body) -> dict:
             # So the Settings page can say why the button does nothing,
             # rather than showing one that always fails.
             "enabled": updates_enabled(service.app_db),
-        },
-        "session": {
-            "username": session["username"] if session else "",
-            "must_change": bool(
-                (service.app_db.user(session["username"]) or {})["must_change"])
-            if session and service.app_db.user(session["username"]) else False,
-            "idle_timeout_minutes": service.sessions.idle_seconds // 60,
-            "idle_seconds_remaining":
-                max(0, round(idle_remaining)) if idle_remaining is not None else None,
-            "max_seconds_remaining":
-                max(0, round(max_remaining)) if max_remaining is not None else None,
         },
         "settings": service.settings,
         "flow_settings": service.flow_settings,
@@ -167,6 +179,47 @@ def get_state(service, params, body) -> dict:
         "alerts_settings": service.alerts_settings,
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
+    }
+    _drop_unreadable(result, granted, _CONFIG_MODULE_KEYS)
+    # "settings" itself stays present even without Settings access — every
+    # module's own refresh cadence (nodes_refresh_s and so on) lives in it,
+    # and every tab needs to read those regardless of its own module's
+    # grant. Only the keys in SETTINGS_ONLY_KEYS are stripped.
+    result["settings"] = _visible_settings(result["settings"], granted)
+    return result
+
+
+def get_state(service, params, body) -> dict:
+    """What changes on its own: every worker's running flag, status line
+    and counters, the counts the tab badges show, the session clocks. Polled
+    every two seconds by every open tab, so what it costs matters: the
+    figures that cannot usefully change at that rate are served from a
+    short cache (Service.cached_poll), and every count is a COUNT(*)."""
+    session = service.sessions.get(params.get("_token", ""))
+    idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
+                      if session else None)
+    # The absolute ceiling is the other way a session ends, and staying at the
+    # keyboard does not move it. It used to arrive with no warning at all: a
+    # wallboard left up overnight simply became the sign-in page. Sent the
+    # same way as the idle figure — server-authoritative, so a browser clock
+    # that disagrees cannot make the countdown lie.
+    max_remaining = (service.sessions.max_seconds - (time.time() - session["created"])
+                     if session else None)
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    # One lookup, not two: this expression used to call user() twice.
+    account = service.app_db.user(session["username"]) if session else None
+    names = service.cached_poll("hostname_stats", 10, service.hostname_stats)
+    result = {
+        "config_version": service.config_version,
+        "session": {
+            "username": session["username"] if session else "",
+            "must_change": bool(account["must_change"]) if account else False,
+            "idle_timeout_minutes": service.sessions.idle_seconds // 60,
+            "idle_seconds_remaining":
+                max(0, round(idle_remaining)) if idle_remaining is not None else None,
+            "max_seconds_remaining":
+                max(0, round(max_remaining)) if max_remaining is not None else None,
+        },
         "uptime_s": time.time() - service.started_at,
         "collector": {
             "running": service.collector.running,
@@ -199,7 +252,7 @@ def get_state(service, params, body) -> dict:
         "ipam": {
             "running": service.ipam.running,
             **service.ipam.state(),
-            "open_conflicts": len(service.ipam_db.conflicts()),
+            "open_conflicts": service.ipam_db.conflict_count(),
         },
         "nodes": {
             "running": service.node_poller.running,
@@ -223,7 +276,7 @@ def get_state(service, params, body) -> dict:
             "status": service.wireless.status_text(),
             "counters": service.wireless.counters,
             "ap_counts": service.wireless_db.ap_counts(),
-            "controller_count": len(service.wireless_db.controllers()),
+            "controller_count": service.wireless_db.controller_count(),
         },
         "configrx": {
             "running": service.configrx.running,
@@ -234,38 +287,20 @@ def get_state(service, params, body) -> dict:
             # in the error text of one that already did.
             "ssh": configrx.ssh_algorithm_status(),
         },
-        "storage": {
-            "app_path": service.app_db.path,
-            "trace_path": service.db.path,
-            "flow_path": service.flow_db.path,
-            "syslog_path": service.syslog_db.path,
-            "snmp_path": service.snmp_db.path,
-            "ipam_path": service.ipam_db.path,
-            "nodes_path": service.nodes_db.path,
-            "alerts_path": service.alerts_db.path,
-            "wireless_path": service.wireless_db.path,
-            "configrx_path": service.configrx_db.path,
-            "app_bytes": service.app_db.size_bytes(),
-            "trace_bytes": service.db.size_bytes(),
-            "flow_bytes": service.flow_db.size_bytes(),
-            "syslog_bytes": service.syslog_db.size_bytes(),
-            "snmp_bytes": service.snmp_db.size_bytes(),
-            "ipam_bytes": service.ipam_db.size_bytes(),
-            "nodes_bytes": service.nodes_db.size_bytes(),
-            "alerts_bytes": service.alerts_db.size_bytes(),
-            "wireless_bytes": service.wireless_db.size_bytes(),
-            "configrx_bytes": service.configrx_db.size_bytes(),
-        },
+        "storage": service.cached_poll("storage", 10, lambda: _storage(service)),
     }
-    for module, keys in _STATE_MODULE_KEYS.items():
-        if not _permissions.allows(granted.get(module), _permissions.READ):
-            for key in keys:
-                result.pop(key, None)
-    # "settings" itself stays present even without Settings access — every
-    # module's own refresh cadence (nodes_refresh_s and so on) lives in it,
-    # and every tab needs to read those regardless of its own module's
-    # grant. Only the keys in SETTINGS_ONLY_KEYS are stripped.
-    result["settings"] = _visible_settings(result["settings"], granted)
+    _drop_unreadable(result, granted, _STATE_MODULE_KEYS)
+    return result
+
+
+def _storage(service) -> dict:
+    stores = (("app", service.app_db), ("trace", service.db), ("flow", service.flow_db),
+              ("syslog", service.syslog_db), ("snmp", service.snmp_db),
+              ("ipam", service.ipam_db), ("nodes", service.nodes_db),
+              ("alerts", service.alerts_db), ("wireless", service.wireless_db),
+              ("configrx", service.configrx_db))
+    result = {f"{name}_path": db.path for name, db in stores}
+    result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
     return result
 
 
@@ -4606,9 +4641,12 @@ def post_user(service, params, body) -> dict:
         raise ValueError(f"There is already an account called {username}")
 
     service.app_db.add_user(username, hash_password(password), must_change=True)
+
+    service.bump_config()
     grants = body.get("grants") or {}
     if grants:
         service.app_db.set_permissions(username, grants)
+        service.bump_config()
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {username} created by "
                     f"{params.get('_username', 'someone')}")
@@ -4657,6 +4695,7 @@ def post_user_permissions(service, params, body) -> dict:
     _last_admin_guard(service, username,
                       grants.get("admin") == _permissions.WRITE)
     service.app_db.set_permissions(username, grants)
+    service.bump_config()
     service.log.add(SYSTEM_CATEGORY,
                     f"Permissions for {username} changed by "
                     f"{params.get('_username', 'someone')}")
@@ -4684,6 +4723,8 @@ def delete_user(service, params, body, username: str = "") -> dict:
     _last_admin_guard(service, target, keeps_admin=False)
 
     service.app_db.remove_user(target)
+
+    service.bump_config()
     ended = service.sessions.destroy_user(target)
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {target} removed by {me}; {ended} session(s) ended")

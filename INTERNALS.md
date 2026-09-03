@@ -3225,16 +3225,39 @@ grant never reaches its handler, returning 403 with `{"error": "No
 everything client-side (hiding a tab, hiding a write-gated button) is
 strictly a courtesy on top of it, never a substitute.
 
-**`/api/state` is the one deliberate exception** to "a route either
-passes or is refused outright." It's an omnibus endpoint every open tab
-polls regardless of which module it's actually looking at — Dashboard,
-which is always visible, depends on it — so blocking it for anyone
-without a specific module's access would break Dashboard for everyone
-but a full admin. Instead `api.get_state()` always succeeds and its
-`_STATE_MODULE_KEYS` mapping strips the module-specific top-level keys
-(e.g. `nodes_settings`/`nodes` for Nodes, `wireless_settings`/`wireless`
-for Wireless) the requesting account can't read, after building the full
-response — a filter on the way out, not a gate on the way in.
+**`/api/state` and `/api/config` are the one deliberate exception** to
+"a route either passes or is refused outright." Every open tab polls
+`/api/state` regardless of which module it's actually looking at —
+Dashboard, which is always visible, depends on it — so blocking it for
+anyone without a specific module's access would break Dashboard for
+everyone but a full admin. Instead both routes always succeed and a
+per-module map (`_STATE_MODULE_KEYS` for the live blocks, `_CONFIG_MODULE_KEYS`
+for the settings blocks) strips the top-level keys the requesting account
+can't read, after building the full response — a filter on the way out,
+not a gate on the way in.
+
+The two routes are the same payload split by *what changes it* (4.43.0).
+`/api/config` — `api.get_config()` — is everything only an operator
+changes: every `*_settings` block, `permissions`, `update`, `version`, the
+constant vocabularies (`severities`, `facilities`, `trap_kinds`,
+`dimensions`, `categories`). It carries `config_version`, an integer
+`Service.bump_config()` moves from every `apply_*_settings`,
+`save_listener_settings`, and the account and grant writers in `api.py`.
+`/api/state` — `api.get_state()` — is what changes on its own: each
+worker's `running`/`status`/`counters`, the counts behind the tab badges,
+the session clocks, `storage`, `dns`; it repeats `config_version`. The
+browser (`App.loadState`) fetches config once at start and again only when
+the version it sees differs from the one it holds, then merges the two
+into `App.state.serverState` so every consumer written against the single
+payload still sees one object. Before the split the poll was 10.9 KB
+every two seconds, of which 6–7 KB could not have changed since the last;
+it is 4.5 KB identity, 1.3 KB on the wire. The poll also lost its
+duplicated `app_db.user()` lookup, two `SELECT *`-then-`len()` counts
+(`conflict_count()`, `controller_count()` are `COUNT(*)`), and its ten
+`size_bytes()` and the hostname-cache figures go through
+`Service.cached_poll(key, ttl_s, compute)` — at most once per ten
+seconds across every open tab, since neither means anything at
+two-second resolution.
 
 **Always-reachable password change**: `/api/password` is one of the
 routes whose requirement is a callable rather than a static pair,
@@ -3646,9 +3669,46 @@ browser refuses, which is belt-and-braces alongside the session cookie's
 own `SameSite=Strict`. Static files are served with `Cache-Control:
 no-store` for HTML (an update swaps files out from under a browser that
 already loaded the old shell; the shell itself must always be re-fetched)
-and `no-cache` plus an `ETag` (`mtime-size`) for everything else, so a
-reload after an update picks up new scripts via a 304 fast path once the
-browser has re-validated.
+and `no-cache` plus an `ETag` for everything else, so a reload after an
+update picks up new scripts via a 304 once the browser has re-validated.
+
+**The static handler (4.43.0).** `StaticCache` (`server.py`) reads every
+file under `static/` once when the listener starts — `WebServer.start()`,
+which `restart()` also goes through — and holds the bytes, a gzip of them,
+a SHA-256-prefix ETag, and the content type from an explicit `MIME_TYPES`
+map (never `mimetypes.guess_type` alone: it consults the Windows registry,
+where `.js` has resolved to `text/plain`, and every response is `nosniff`).
+`get()` costs one `stat` and reloads the entry if mtime or size moved, so
+an edit while the server runs still shows on the next request. A
+self-update cannot leave the map stale: it swaps the package with the
+listener down and always ends in `execv`/`_exit`. The traversal guard is
+`os.path.commonpath`, not a `startswith` on a directory name that is a
+prefix of its siblings'. The 304 goes through `_send` like every other
+response — it used to be three headers written by hand, and since
+revalidation is the steady state for every script, most responses the
+browser received carried no CSP, no `nosniff`, no `Referrer-Policy`.
+
+**Compression** is negotiated once, in `_send`: text, JSON and SVG bodies
+of 1 KB or more are gzipped when `Accept-Encoding` lists `gzip` with a
+non-zero q (`_accepts_gzip` reads the header token-wise), with
+`Vary: Accept-Encoding` on every compressible type whether or not this
+response was compressed. Static bodies come pre-compressed from the cache;
+JSON is compressed per response. Measured cold load: 800 KB → 242 KB.
+
+**HTTP/1.1.** `Handler.protocol_version` is set, so connections are kept
+alive; the library default was HTTP/1.0 and a page load opened one TCP
+(TLS) connection per script. Two things follow. Every response must say
+where it ends: `_send` always sends `Content-Length`, and a 304 sends no
+body. And every request body must be consumed before the response — a
+refusal that comes before the handler (401, 403, 415) used to answer with
+the POST body still in the socket, which the close threw away and a
+persistent connection would have fed to the next request's parser.
+`_drain_request_body()` in `_send` reads and drops an unread body up to
+`MAX_BODY_BYTES`, and closes the connection for anything larger or
+chunked. Per-request state (`_body_consumed`) is reset in `_dispatch`,
+because one `Handler` instance now serves every request on a connection.
+`tests/test_static_headers.py` sends the exact refused-POST-then-GET
+sequence over one connection.
 
 ### `web/api.py`
 
@@ -4018,9 +4078,10 @@ landing on a dead tab.
 That `start()`-driven restore alone still flashes NetPath on every
 reload, because it runs late: `start()` is called from a `DOMContentLoaded`
 listener, which fires only after every `<script src>` tag in `index.html`
-has been fetched and executed (over a dozen of them, each its own
-blocking network round trip since `server.py` serves scripts `no-cache`
-with an `ETag`), and even then `start()` itself `await`s `loadState()`
+has been fetched and executed (over a dozen of them — since 4.43.0
+`defer`red, so fetched in parallel and gzipped, but still revalidated
+`no-cache` with an `ETag` on every reload), and even then `start()` itself
+`await`s `loadState()`
 — one more round trip, to `/api/state` — before it reaches
 `selectTab()`. The static
 markup's own default (`class="tab active"` on the NetPath button,
@@ -4167,8 +4228,10 @@ selectors, sharing the same two keys.
 ### The SSH terminal: WebSocket hijack, protocol, sessions (`web/wsock.py`, `sshterm.py`)
 
 **Hijack and framing.** The web server is a `ThreadingHTTPServer` with one
-daemon thread per connection, HTTP/1.0 (so no keep-alive to unwind),
-`wbufsize = 0` and no handler timeout. That shape makes a WebSocket almost
+daemon thread per connection, `wbufsize = 0` and a 30 s handler timeout.
+It speaks HTTP/1.1 since 4.43.0; the hijack sets `close_connection` so
+there is still no keep-alive pipeline to unwind behind a socket it takes
+over. That shape makes a WebSocket almost
 free: the connection can be taken over after the 101 and held for the life
 of the conversation without blocking anything else. A route whose handler
 carries `hijack = True` runs after exactly the same cookie → session →

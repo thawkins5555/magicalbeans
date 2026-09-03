@@ -157,10 +157,17 @@
 
   function drawChart() {
     const svg = App.el('nf-chart-svg');
-    svg.innerHTML = '';
     const box = App.el('nf-chart').getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 160);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // Redrawn only when the data or the drawing area changed: this ran on
+    // every refresh and on every frame of a divider drag, tearing the SVG
+    // down and rebuilding one hit rectangle with three listeners per
+    // bucket each time, whether or not anything was different.
+    const signature = `${width}x${height}:${JSON.stringify(view.data)}`;
+    if (svg.dataset.signature === signature) return;
+    svg.dataset.signature = signature;
+    svg.innerHTML = '';
 
     const data = view.data;
     const legendH = 22;
@@ -644,8 +651,12 @@
     status.textContent = text;
     status.title = text;
     status.classList.toggle('error', failed);
-    status.onmousemove = (event) => App.tooltip(text, event);
-    status.onmouseleave = App.hideTooltip;
+    // Wired once, reading the live title, rather than a fresh closure ten
+    // times a second from fastTick.
+    if (!status.onmousemove) {
+      status.onmousemove = (event) => App.tooltip(status.title, event);
+      status.onmouseleave = App.hideTooltip;
+    }
 
     App.el('nf-dot').style.background = collector.running
       ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
