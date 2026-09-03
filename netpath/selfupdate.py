@@ -426,8 +426,14 @@ def apply(app_db) -> dict:
 
     try:
         release = latest_tag()
-    except (urllib.error.URLError, ValueError, KeyError, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError) as exc:
         return {"ok": False, "error": f"Could not reach GitHub: {exc}"}
+    except (ValueError, KeyError) as exc:
+        # GitHub answered; what it said is the problem. Reporting "could not
+        # reach GitHub" for a repository that has simply published no tags
+        # sent the operator to look at firewalls and proxies for a condition
+        # no amount of connectivity would change.
+        return {"ok": False, "error": str(exc)}
 
     tag = release["tag"]
     if app_db.meta(INSTALLED_TAG_KEY) == tag:
