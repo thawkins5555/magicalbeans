@@ -14,6 +14,7 @@ import socket
 import sqlite3
 import struct
 import sys
+import threading
 import time
 
 from _paths import free_udp_port, tmpdir
@@ -982,11 +983,122 @@ def test_c8_device_correlation_through_aliases() -> None:
     trap_db.close()
 
 
+# ---------------------------------------------------------------- C4 (G-24)
+
+class LockSpy:
+    """Stands in for a database's RLock and records how long each acquisition
+    is held, so a test can assert on the stall a writer would suffer rather
+    than on wall-clock timing that varies with the machine."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.worst = 0.0
+        self._taken = []
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._taken.append(time.monotonic())
+        return self
+
+    def __exit__(self, *_):
+        self.worst = max(self.worst, time.monotonic() - self._taken.pop())
+        self._lock.release()
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._lock.release()
+
+
+def test_c4b_trim_never_holds_the_lock(self_check=None) -> None:
+    """G-24: trim_to_size deleted 15% of the table and then VACUUMed the whole
+    file with the write lock held, up to six times. Measured on a 232 MB trap
+    database with a writer alongside: one insert waited 4.1 s and only six
+    completed in 12.3 s — and the six-iteration cap then gave up above the
+    target and reported success, so the same expensive pass ran again for
+    ever."""
+    print("C4 (G-24): a trim never stalls the writer, and reaches the cap")
+
+    trap_db = SnmpTrapDatabase(db_path("g24-traps.db"))
+    trap_db.store_raw = True
+    raw = bytes(range(256)) * 8                      # 2 KB per trap
+    base = time.time()
+    started = time.monotonic()
+    for start in range(0, 15_000, 2_500):
+        trap_db.insert([
+            trapdecode.Trap(ts=base + index, source="10.0.0.5", version=1,
+                            community="public", severity=3,
+                            trap_oid="1.3.6.1.6.3.1.1.5.3",
+                            trap_name="linkDown", trap_kind="linkDown",
+                            varbind_text="ifIndex=3 ifDescr=Gi0/3 " * 20,
+                            raw=raw)
+            for index in range(start, start + 2_500)])
+    size = trap_db.size_bytes()
+    print(f"    seeded a {size / 1e6:.0f} MB trap database in "
+          f"{time.monotonic() - started:.1f} s")
+    check(size >= 50e6, f"the fixture is {size / 1e6:.0f} MB")
+
+    spy = LockSpy(trap_db._lock)
+    trap_db._lock = spy
+
+    stop = threading.Event()
+    latency = [0.0]
+    inserts = [0]
+
+    def writer():
+        while not stop.is_set():
+            began = time.monotonic()
+            trap_db.insert([trapdecode.Trap(
+                ts=time.time(), source="10.0.0.9", version=1, severity=3,
+                trap_oid="1.3.6.1.6.3.1.1.5.4", raw=b"x")])
+            latency[0] = max(latency[0], time.monotonic() - began)
+            inserts[0] += 1
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    time.sleep(0.5)
+    latency[0] = 0.0
+    inserts[0] = 0
+
+    target = int(trap_db.size_bytes() * 0.4)
+    began = time.monotonic()
+    removed = trap_db.trim_to_size(target)
+    elapsed = time.monotonic() - began
+    stop.set()
+    thread.join(timeout=5)
+
+    final = trap_db.size_bytes()
+    print(f"    trimmed {removed} rows in {elapsed:.1f} s; {inserts[0]} inserts "
+          f"completed alongside, worst {latency[0] * 1000:.0f} ms")
+    check(spy.worst < 0.5,
+          f"no single lock acquisition is held longer than 0.5 s "
+          f"(worst {spy.worst * 1000:.0f} ms)")
+    check(final <= target,
+          f"the trim reaches the cap: {final / 1e6:.1f} MB against a "
+          f"{target / 1e6:.1f} MB target")
+    check(inserts[0] >= 50,
+          f"the writer keeps running throughout ({inserts[0]} inserts, against "
+          f"6 in 12.3 s before this change)")
+    trap_db._lock = spy._lock
+    trap_db.close()
+
+    # An empty or tiny database is left alone rather than emptied.
+    small = SnmpTrapDatabase(db_path("g24-small.db"))
+    small.insert([trapdecode.Trap(ts=time.time(), source="10.0.0.5", version=1,
+                                  severity=3, trap_oid="1.3.6.1.6.3.1.1.5.3")])
+    check(small.trim_to_size(1) == 0 and small.max_id() == 1,
+          "a database below the row floor is not emptied to meet the cap")
+    small.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
     test_c3_kernel_drops_are_visible,
     test_c4_prune_does_not_rebuild_the_index,
+    test_c4b_trim_never_holds_the_lock,
     test_c5_drain_sources_can_be_caught_up,
     test_c6_forged_v3_traps_are_dropped,
     test_c7_syslog_robustness,

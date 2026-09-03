@@ -8,14 +8,30 @@ moved to appdb.py, which is what every module reads them from.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 
-from . import dbmaint, dbopen
 from statistics import mean
 
+from . import dbmaint, dbopen
 from .tracer import TraceResult
+
+log = logging.getLogger(__name__)
+
+# Trimming a database back under its size cap: rows are deleted in fixed
+# batches, each in its own short transaction, so the write lock is never held
+# for more than one batch. The old shape deleted 15% of the table and then
+# VACUUMed the whole file with the lock held, up to six times per maintenance
+# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
+# still finished above the cap and reported success.
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -556,39 +572,69 @@ class Database:
         return total
 
     def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest traces until the file fits under the cap.
-
-        Deletes in chunks and reclaims between them, because SQLite does not
-        return space to the filesystem on its own — without that the loop
-        would never see the size fall and would empty the table.
-        """
+        """Delete the oldest traces, and their hops, until the file fits
+        under the cap."""
         if max_bytes <= 0:
             return 0
         removed = 0
-        for _ in range(6):
-            if self.size_bytes() <= max_bytes:
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        for _ in range(TRIM_PASSES):
+            size = self.size_bytes()
+            if size <= max_bytes:
                 break
             with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM traces").fetchone()["n"]
-                if total <= 200:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traces").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - 200)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                cut = low + want
+                chunk = TRIM_CHUNK
+                while low < cut and time.monotonic() < deadline:
+                    upper = min(low + chunk, cut)
+                    started = time.monotonic()
+                    with self._lock:
+                        self._conn.execute(
+                            "DELETE FROM hops"
+                            " WHERE trace_id >= ? AND trace_id < ?",
+                            (low, upper))
+                        cursor = self._conn.execute(
+                            "DELETE FROM traces"
+                            " WHERE id >= ? AND id < ?", (low, upper))
+                        removed += cursor.rowcount or 0
+                        self._conn.commit()
+                    held = time.monotonic() - started
+                    low = upper
+                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
+                    # however large the rows turn out to be — a trap with its
+                    # raw frame stored costs an order of magnitude more than a
+                    # syslog line, and one fixed batch size cannot suit both.
+                    if held > TRIM_LOCK_TARGET_S:
+                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+                    elif held < TRIM_LOCK_TARGET_S / 4:
+                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+            # Hand the freed pages back, in short slices outside the lock
+            # block. reclaim takes the lock itself and reacquires it in a
+            # tight loop, and a Python lock is not fair, so it is asked for a
+            # little at a time rather than for one long run.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="netpath.db"):
                     break
-                chunk = max(int(total * 0.15), 200)
-                ids = [row["id"] for row in self._conn.execute(
-                    "SELECT id FROM traces ORDER BY started_ts LIMIT ?", (chunk,))]
-                marks = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"DELETE FROM hops WHERE trace_id IN ({marks})", ids)
-                cur = self._conn.execute(
-                    f"DELETE FROM traces WHERE id IN ({marks})", ids)
-                removed += cur.rowcount or 0
-                self._conn.commit()
-            # Outside the lock block: reclaim takes the lock itself, one
-            # short incremental_vacuum step at a time, so a writer is
-            # never blocked for a whole file rewrite.
-            dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self.size_bytes() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        "netpath.db", self.size_bytes(), removed, max_bytes)
         return removed
-
     def prune(self, older_than_days: float) -> int:
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
@@ -599,5 +645,10 @@ class Database:
             cur = self._conn.execute("DELETE FROM traces WHERE started_ts < ?", (cutoff,))
             self._conn.commit()
             removed = cur.rowcount
-        dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
+        if removed:
+            # Nothing deleted means nothing to give back. The old code rewrote
+            # the whole file with VACUUM on every call regardless, which on a
+            # netpath.db holding months of per-hop rows froze the trace
+            # scheduler and the UI for seconds at a time.
+            dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
         return removed

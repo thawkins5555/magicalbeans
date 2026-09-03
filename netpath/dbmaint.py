@@ -78,6 +78,11 @@ def reclaim(conn: sqlite3.Connection, lock: threading.Lock | threading.RLock,
         freed += max(0, before - after)
         if after <= 0 or after == before or time.monotonic() >= deadline:
             break
+        # Release the GIL before reacquiring the lock. A Python lock is not
+        # fair: without this the loop reacquires it before a waiting writer
+        # is ever scheduled, so "the lock is released between steps" bought
+        # the writer nothing.
+        time.sleep(0)
     with lock:
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

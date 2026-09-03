@@ -9,11 +9,27 @@ flow batch contend with the trace scheduler.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 
 from . import dbmaint, dbopen
+
+log = logging.getLogger(__name__)
+
+# Trimming a database back under its size cap: rows are deleted in fixed
+# batches, each in its own short transaction, so the write lock is never held
+# for more than one batch. The old shape deleted 15% of the table and then
+# VACUUMed the whole file with the lock held, up to six times per maintenance
+# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
+# still finished above the cap and reported success.
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flows (
@@ -244,26 +260,60 @@ class FlowDatabase:
         if max_bytes <= 0:
             return 0
         removed = 0
-        for _ in range(6):
-            if self.size_bytes() <= max_bytes:
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        for _ in range(TRIM_PASSES):
+            size = self.size_bytes()
+            if size <= max_bytes:
                 break
             with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM flows").fetchone()["n"]
-                if total <= 1000:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - 1000)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                cut = low + want
+                chunk = TRIM_CHUNK
+                while low < cut and time.monotonic() < deadline:
+                    upper = min(low + chunk, cut)
+                    started = time.monotonic()
+                    with self._lock:
+                        cursor = self._conn.execute(
+                            "DELETE FROM flows"
+                            " WHERE id >= ? AND id < ?", (low, upper))
+                        removed += cursor.rowcount or 0
+                        self._conn.commit()
+                    held = time.monotonic() - started
+                    low = upper
+                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
+                    # however large the rows turn out to be — a trap with its
+                    # raw frame stored costs an order of magnitude more than a
+                    # syslog line, and one fixed batch size cannot suit both.
+                    if held > TRIM_LOCK_TARGET_S:
+                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+                    elif held < TRIM_LOCK_TARGET_S / 4:
+                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+            # Hand the freed pages back, in short slices outside the lock
+            # block. reclaim takes the lock itself and reacquires it in a
+            # tight loop, and a Python lock is not fair, so it is asked for a
+            # little at a time rather than for one long run.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="netflow.db"):
                     break
-                chunk = max(int(total * 0.15), 1000)
-                cur = self._conn.execute(
-                    "DELETE FROM flows WHERE id IN (SELECT id FROM flows"
-                    " ORDER BY ts_end ASC LIMIT ?)", (chunk,))
-                removed += cur.rowcount or 0
-                self._conn.commit()
-            # Outside the lock block: reclaim takes the lock itself, one
-            # short incremental_vacuum step at a time, so a writer is
-            # never blocked for a whole file rewrite.
-            dbmaint.reclaim(self._conn, self._lock, label="netflow.db")
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self.size_bytes() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        "netflow.db", self.size_bytes(), removed, max_bytes)
         return removed
-
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
         """Busiest source and destination addresses seen recently.
 
