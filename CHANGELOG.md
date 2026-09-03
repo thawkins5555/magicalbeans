@@ -6,6 +6,52 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.37.1 — Review of 4.37.0
+
+- **A hand-resolved outage keeps covering its alerts until the device answers,
+  not for seven days.** 4.37.0 covered a device's implied alerts while its
+  outage was hand-resolved and the device stayed down, but the cover was read
+  from a seven-day window of hand resolves, so a decommissioned device that
+  was never deleted released every implied alert at once exactly seven days
+  later, with no outage alert beside them. The cover now persists for as long
+  as the device stays down, and one line in the Nodes log says when it takes
+  effect. Two more ways a hand resolve came back are closed: a breach run now
+  ends only on a real clear, so a value dipping into the hysteresis band and
+  back no longer re-opens a resolved alert (device thresholds, DHCP scopes,
+  NetPath); and SNMP authentication events are true transitions — one
+  "authentication failing" while the credentials stay wrong even when the
+  recorded error alternates with a timeout, one "authentication OK" when SNMP
+  works again, and nothing at all for a timeout that recovers.
+- **Clearing a filter bar clears what the page remembers.** The Clear buttons
+  on Syslog, Traps and NetFlow and the All / None category buttons on Debug
+  set their controls directly, which the view store did not see: NetFlow's
+  exporter could not be cleared at all (the request kept naming it and the
+  dropdown snapped back), and the others came back after a reload. Choosing
+  "any" in a late-filled dropdown no longer sends the previous choice on the
+  very next request; a stored Debug destination the log has not mentioned yet
+  is kept rather than forgotten; and a stored ConfigRX vendor with no devices
+  left is dropped instead of filtering the list to nothing forever.
+- **What the browser remembers is per account.** On a shared workstation one
+  operator's searches no longer pre-fill the next operator's filter bars: the
+  store is discarded when a different account signs in, and sign-out clears
+  it.
+- **Discovery's live results are cheaper and more careful.** A running sweep's
+  results are fetched only when its progress counters move, the table is
+  rebuilt only when a row changed, a job click while a fetch is in flight can
+  no longer paint the other job's rows and ticks, devices found after the job
+  was opened arrive pre-ticked like the ones found before it, and a sweep that
+  finishes while another sub-tab is open shows its final results on the way
+  back. A job with nothing to add no longer paints a select-all box, and the
+  enterprise-arc explanation is back on the whole Vendor cell.
+- **A failed single-row Resolve, Acknowledge or Mute says so in the detail
+  pane itself**, not only on the counters line above the table.
+- Under the hood: the entity-to-device rule the engine and the API both apply
+  lives in one function; the three copies of the operator-resolve gate are
+  one; the rollup parent lookup no longer costs a query per suppressed
+  occurrence; alert rows carry `device_id` only (the page never read the
+  name) and a page-sized list resolves its devices in chunked queries; a dead
+  database method and two misleading index comments are gone.
+
 ### 4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves
 
 - **Reloading a page keeps what you had on screen.** Column sorts, search
