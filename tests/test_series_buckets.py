@@ -361,4 +361,50 @@ print("PASS: a writer is never blocked for more than a step of the reclaim")
 trim_db.close()
 
 nodes_db.close()
+# --- starting the application must not wait for a whole-file rewrite
+# 4.38 moved every database to incremental auto-vacuum. Converting an
+# existing one is a VACUUM, and doing that for ten databases while the
+# operator waits for the window took 26 seconds on 840 MB of real data.
+# The conversion belongs to maintenance, not to startup.
+import tempfile as _tempfile, threading as _threading, time as _time
+from netpath import dbopen as _dbopen, dbmaint as _dbmaint
+
+_dir = _tempfile.mkdtemp()
+_path = os.path.join(_dir, "startup.db")
+_c = _dbopen.connect(_path)
+_c.execute("CREATE TABLE bulk(a blob)")
+_c.executemany("INSERT INTO bulk VALUES (?)", [(b"z" * 4000,)] * 6000)
+_c.commit()
+_pages = _c.execute("PRAGMA page_count").fetchone()[0]
+assert _pages > _dbmaint.CONVERT_AT_OPEN_PAGES, _pages
+_c.close()
+
+_c = _dbopen.connect(_path)
+_started = _time.monotonic()
+_converted = _dbmaint.enable_incremental_vacuum(_c, "startup")
+_elapsed = _time.monotonic() - _started
+assert _converted is False, "a large database must not be converted at open"
+assert _elapsed < 0.25, f"the open path took {_elapsed:.2f}s"
+assert _c.execute("PRAGMA auto_vacuum").fetchone()[0] != 2
+print(f"a large database is not converted while the app is starting "
+      f"({_elapsed*1000:.0f} ms) OK")
+
+# Maintenance does the conversion, and then reclaims.
+_c.execute("DELETE FROM bulk"); _c.commit()
+_before = os.path.getsize(_path)
+_dbmaint.reclaim(_c, _threading.RLock(), label="startup")
+assert _c.execute("PRAGMA auto_vacuum").fetchone()[0] == 2, \
+    "maintenance must convert what the open path deferred"
+assert os.path.getsize(_path) < _before / 2, (_before, os.path.getsize(_path))
+print("maintenance converts it and reclaims the space OK")
+
+# And a database already in incremental mode costs nothing to reopen.
+_c.close()
+_c = _dbopen.connect(_path)
+_started = _time.monotonic()
+assert _dbmaint.enable_incremental_vacuum(_c, "startup") is True
+assert _time.monotonic() - _started < 0.25
+print("an already-converted database reopens without a rewrite OK")
+_c.close()
+
 print("ALL SERIES-BUCKET ASSERTIONS PASSED")

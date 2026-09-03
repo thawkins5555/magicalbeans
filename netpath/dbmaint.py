@@ -21,13 +21,30 @@ log = logging.getLogger(__name__)
 INCREMENTAL = 2
 
 
-def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool:
+# An existing database is converted at open only when it is at most this
+# many pages — about 8 MB at SQLite's default page size, which converts in
+# well under a tenth of a second. Anything larger is left for reclaim() to
+# convert during maintenance. The conversion is a whole-file VACUUM, and
+# seven of them running while an operator waits for the window is how
+# starting the application came to take half a minute on a real fleet's data.
+CONVERT_AT_OPEN_PAGES = 2000
+
+
+def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "",
+                              max_pages: int | None = CONVERT_AT_OPEN_PAGES) -> bool:
     """Switch ``conn``'s database to incremental auto-vacuum.
 
-    A new (empty) database takes the pragma directly.  An existing database
-    created with ``auto_vacuum=NONE`` needs one ``VACUUM`` to rebuild the
-    page map — a one-time cost at startup that is logged.  Returns True when
-    the database is in incremental mode afterwards.
+    A new (empty) database takes the pragma for free.  An existing database
+    created with ``auto_vacuum=NONE`` needs one ``VACUUM`` to rebuild its
+    page map, which rewrites the whole file — so by default that is done
+    only for a database small enough for it to be imperceptible, and
+    ``reclaim`` (which runs from the prune and trim paths, on the
+    maintenance timer rather than at startup) converts the rest by passing
+    ``max_pages=None``.
+
+    Returns True when the database is in incremental mode afterwards. False
+    means "not converted yet", which costs nothing: ``reclaim`` still
+    checkpoints, and the next maintenance pass tries again.
     """
     try:
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
@@ -35,6 +52,13 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
         return False
     if mode == INCREMENTAL:
         return True
+    try:
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return False
+    if max_pages is not None and pages > max_pages:
+        # Not now: this is the startup path.
+        return False
     try:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
@@ -44,7 +68,6 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
             # brand-new file needs the VACUUM for the setting to stick. It is
             # instant when there is nothing in the file; only a database with
             # real content in it is worth mentioning in the log.
-            pages = conn.execute("PRAGMA page_count").fetchone()[0]
             started = time.monotonic()
             conn.execute("VACUUM")
             if pages > 1:
@@ -63,6 +86,12 @@ def reclaim(conn: sqlite3.Connection, lock: threading.Lock | threading.RLock,
     budget is spent.  Each step runs inside ``lock``; the lock is released
     between steps.  Returns the number of pages freed.
     """
+    # Whatever the open path was too large to convert. This runs from the
+    # prune and trim paths — the maintenance timer, not startup — so the
+    # one-time whole-file rewrite lands where a pause is expected. Under the
+    # lock, like every other statement on this shared connection.
+    with lock:
+        enable_incremental_vacuum(conn, label, max_pages=None)
     freed = 0
     deadline = time.monotonic() + max(0.0, budget_s)
     while True:

@@ -161,7 +161,7 @@ Nine changes are not, and an operator should read them before updating.
 #### Foundation
 
 - `netpath/dbopen.py`: one `connect()` helper that opens a database and narrows the file and its WAL/SHM companions to owner-only (0600) on POSIX hosts. Modules adopt it as they are touched.
-- `netpath/dbmaint.py`: `enable_incremental_vacuum()` converts a database to incremental auto-vacuum once, and `reclaim()` frees pages in short locked steps followed by a WAL truncate, replacing the whole-file `VACUUM` that stalled every writer during prunes and size trims.
+- `netpath/dbmaint.py`: `enable_incremental_vacuum()` converts a database to incremental auto-vacuum once, and `reclaim()` frees pages in short locked steps followed by a WAL truncate, replacing the whole-file `VACUUM` that stalled every writer during prunes and size trims. **The one-time conversion happens during maintenance, not while the application is starting**: it rewrites the whole file, and doing that for ten databases before the window opens made the first start after upgrading take about half a minute on a real fleet's data. A database small enough for it to be imperceptible is still converted at open.
 
 #### Alerts
 
