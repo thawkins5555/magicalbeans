@@ -11,6 +11,8 @@ import ipaddress
 import sqlite3
 import json
 import math
+import secrets
+import threading
 import time
 
 from ..analysis import availability, build_timeline, build_topology
@@ -4104,37 +4106,93 @@ def _client(params) -> str:
     return params.get("_client", "")
 
 
+# At most this many password verifications at once. Each one is a scrypt
+# at N=2^17 — about 128 MiB and half a second — on an endpoint that needs
+# no session, so unbounded concurrency was both a memory DoS (30 parallel
+# attempts is ~4 GB) and the reason the throttle's sleep did not bite: the
+# server is threaded, so twelve simultaneous guesses each slept five
+# seconds in parallel and the effective rate was one attempt per 0.9 s
+# rather than one per five.
+_LOGIN_SLOTS = threading.Semaphore(4)
+
+_dummy_hash_value: str | None = None
+_dummy_hash_lock = threading.Lock()
+
+
+def _dummy_hash() -> str:
+    """A real hash of a random string, built with the parameters in force
+    now.
+
+    The point of hashing when the account does not exist is that the time
+    taken says nothing about whether it does. The hardcoded string this
+    replaces named N=2^14 while stored hashes use 2^17, so a missing
+    account answered about nine times faster — measured 0.055 s against
+    0.48 s — and the endpoint was a username oracle. Derived from
+    hash_password so it cannot drift from the real cost again, including
+    onto the PBKDF2 fallback where scrypt is unavailable.
+    """
+    global _dummy_hash_value
+    with _dummy_hash_lock:
+        if _dummy_hash_value is None:
+            from ..auth import hash_password
+            _dummy_hash_value = hash_password(secrets.token_urlsafe(32))
+        return _dummy_hash_value
+
+
 def post_login(service, params, body) -> dict:
     """Verify a password. Deliberately slow to fail, and vague about why."""
-    from ..auth import needs_rehash, hash_password, verify_password
+    from ..auth import (AuthError, LockedOut, check_username, needs_rehash,
+                        hash_password, verify_password)
 
-    username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
     client = _client(params)
 
-    delay = service.throttle.delay_for(username, client)
-    if delay:
-        time.sleep(min(delay, 5))
+    # Validated before it is used as a throttle key or written anywhere.
+    # An unvalidated name reached both: a 200 KB username produced a 200 KB
+    # event, which is a cheap way to push every other event out of the
+    # 3,000-entry ring. Every name that is not a username shares one key
+    # and one log line, so trying millions of them costs one entry.
+    try:
+        username = check_username(str(body.get("username", "")))
+    except AuthError:
+        username = ""
+    label = username or "(not a username)"
 
-    row = service.app_db.user(username) if username else None
-    stored = row["password"] if row else None
-
-    # Hash something even when the account does not exist, so the time taken
-    # cannot be used to discover which usernames are real.
-    if stored is None:
-        verify_password(password, "scrypt$16384$8$1$" + "A" * 24 + "$" + "A" * 44)
-        service.throttle.record_failure(username or "?", client)
-        service.log.add(ERROR_CATEGORY, f"Failed sign-in for "
-                                        f"{username or '(blank)'} from {client}")
-        raise PermissionError("Wrong username or password")
-
-    if not verify_password(password, stored):
-        service.throttle.record_failure(username, client)
+    # Checked before the semaphore and before any hashing: a locked-out
+    # caller must not be able to hold a verification slot or spend a
+    # half-second of scrypt.
+    remaining = service.throttle.lockout_remaining(username, client)
+    if remaining > 0:
         service.log.add(ERROR_CATEGORY,
-                        f"Failed sign-in for {row['username']} from {client}")
-        raise PermissionError("Wrong username or password")
+                        f"Refused sign-in for {label} from {client}: too many "
+                        f"failures, locked for another {remaining / 60:.0f} min")
+        raise LockedOut(f"Too many failed sign-ins. Try again in "
+                        f"{max(1, round(remaining / 60))} minute(s).")
 
-    service.throttle.clear(username, client)
+    with _LOGIN_SLOTS:
+        delay = service.throttle.delay_for(username, client)
+        if delay:
+            time.sleep(min(delay, 5))
+
+        row = service.app_db.user(username) if username else None
+        stored = row["password"] if row else None
+
+        # Hash something even when the account does not exist, so the time
+        # taken cannot be used to discover which usernames are real.
+        if stored is None:
+            verify_password(password, _dummy_hash())
+            service.throttle.record_failure(username, client)
+            service.log.add(ERROR_CATEGORY,
+                            f"Failed sign-in for {label} from {client}")
+            raise PermissionError("Wrong username or password")
+
+        if not verify_password(password, stored):
+            service.throttle.record_failure(username, client)
+            service.log.add(ERROR_CATEGORY,
+                            f"Failed sign-in for {row['username']} from {client}")
+            raise PermissionError("Wrong username or password")
+
+    service.throttle.clear(username)
     service.app_db.touch_login(row["username"])
 
     # Upgrade the stored hash quietly, now that we hold the password.

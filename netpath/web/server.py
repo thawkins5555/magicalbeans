@@ -29,6 +29,7 @@ from collections import deque
 
 from . import api
 from . import wsock
+from .. import auth
 from .. import permissions
 from .service import Service
 
@@ -710,6 +711,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(result, extra_headers=headers)
             except LengthRequired as exc:
                 self._json({"error": str(exc)}, 411)
+            except auth.LockedOut as exc:
+                # Before the ValueError arm below: LockedOut is an AuthError,
+                # not a ValueError, but keeping it here says plainly that
+                # "stop" and "wrong password" are different answers.
+                self._json({"error": str(exc)}, 429)
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
             except ValueError as exc:

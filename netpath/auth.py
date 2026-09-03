@@ -30,6 +30,7 @@ import re
 import secrets
 import threading
 import time
+from collections import OrderedDict
 
 # OWASP Password Storage Cheat Sheet, 2024 figures.
 SCRYPT_N = 1 << 17
@@ -59,6 +60,13 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 
 class AuthError(Exception):
     """Anything the user is allowed to be told about."""
+
+
+class LockedOut(AuthError):
+    """Too many failures in the window: this username, or this address, is
+    refused outright for a while rather than merely slowed down. Its own
+    type so the web layer answers 429 (with the wait) instead of 401,
+    which is the difference between "wrong password" and "stop"."""
 
 
 # ------------------------------------------------------------------ hashing
@@ -260,8 +268,23 @@ class SessionStore:
 
 # ----------------------------------------------------------- login throttle
 
+# Failures in `window_s` before an account or an address is refused
+# outright rather than merely slowed. Counted independently, so one noisy
+# address does not lock an account for everyone else and one account
+# cannot be used to lock out an address.
+LOCKOUT_THRESHOLD = 20
+
+# How many distinct usernames and addresses are remembered at once. A
+# plain dict grew one entry per username tried, forever — a few million
+# guesses at distinct names was a memory leak with an attacker's hand on
+# the tap. Least-recently-touched keys are dropped past this; dropping a
+# key only forgets failures, and the ones that matter are by definition
+# the ones being touched.
+MAX_TRACKED_KEYS = 10_000
+
+
 class LoginThrottle:
-    """Slow down guessing without locking a real user out permanently.
+    """Slow down guessing, then stop it.
 
     Counted per username and per source address, so one noisy address cannot
     lock an account for everyone else, and one account cannot be used to lock
@@ -269,36 +292,73 @@ class LoginThrottle:
     """
 
     def __init__(self, threshold: int = 5, window_s: float = 900,
-                 max_delay_s: float = 30):
+                 max_delay_s: float = 30,
+                 lockout_threshold: int = LOCKOUT_THRESHOLD,
+                 max_keys: int = MAX_TRACKED_KEYS):
         self._lock = threading.Lock()
-        self._failures: dict[str, list[float]] = {}
+        # Ordered so the least recently touched key is the one evicted.
+        self._failures: "OrderedDict[str, list[float]]" = OrderedDict()
         self.threshold = threshold
         self.window_s = window_s
         self.max_delay_s = max_delay_s
+        self.lockout_threshold = lockout_threshold
+        self.max_keys = max_keys
+
+    @staticmethod
+    def _keys(username: str, client: str) -> tuple[str, str]:
+        return f"u:{(username or '?').lower()}", f"c:{client}"
 
     def _recent(self, key: str, now: float) -> list[float]:
+        """The failures still inside the window, with `key` marked as just
+        used. Called with the lock held."""
         stamps = [ts for ts in self._failures.get(key, []) if now - ts < self.window_s]
-        self._failures[key] = stamps
+        if stamps:
+            self._failures[key] = stamps
+            self._failures.move_to_end(key)
+        else:
+            self._failures.pop(key, None)
         return stamps
 
     def delay_for(self, username: str, client: str) -> float:
         now = time.time()
         with self._lock:
             worst = 0
-            for key in (f"u:{username.lower()}", f"c:{client}"):
+            for key in self._keys(username, client):
                 worst = max(worst, len(self._recent(key, now)))
         if worst < self.threshold:
             return 0.0
         # Doubling, capped: 5 failures is a second, 10 is half a minute.
         return min(self.max_delay_s, 2 ** (worst - self.threshold))
 
+    def lockout_remaining(self, username: str, client: str) -> float:
+        """Seconds this username or this address is refused for, 0 when
+        neither is. Either being over the threshold is enough — they are
+        counted independently on purpose."""
+        now = time.time()
+        with self._lock:
+            worst = 0.0
+            for key in self._keys(username, client):
+                stamps = self._recent(key, now)
+                if len(stamps) >= self.lockout_threshold:
+                    # The lock lifts when the oldest failure that still
+                    # counts towards the threshold ages out of the window.
+                    oldest_counted = sorted(stamps)[-self.lockout_threshold]
+                    worst = max(worst, oldest_counted + self.window_s - now)
+        return max(0.0, worst)
+
     def record_failure(self, username: str, client: str) -> None:
         now = time.time()
         with self._lock:
-            for key in (f"u:{username.lower()}", f"c:{client}"):
+            for key in self._keys(username, client):
                 self._failures.setdefault(key, []).append(now)
+                self._failures.move_to_end(key)
+            while len(self._failures) > self.max_keys:
+                self._failures.popitem(last=False)
 
-    def clear(self, username: str, client: str) -> None:
+    def clear(self, username: str) -> None:
+        """Forget this account's failures. The address's are NOT forgotten:
+        anyone holding one valid low-privilege account could otherwise reset
+        the per-address counter at will and go on guessing other accounts
+        from the same machine as fast as they liked."""
         with self._lock:
-            self._failures.pop(f"u:{username.lower()}", None)
-            self._failures.pop(f"c:{client}", None)
+            self._failures.pop(f"u:{(username or '?').lower()}", None)

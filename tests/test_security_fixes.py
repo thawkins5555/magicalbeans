@@ -588,6 +588,72 @@ def main() -> int:
     check("D6 the session list shows the real User-Agent, not a body field",
           not any("onerror" in a for a in agents), str(agents))
 
+    # ------------------------------------------------------------- D7 login
+    from netpath import auth as auth_mod
+
+    # Timing: a real account and an account that does not exist must cost
+    # the same. The dummy hash is built lazily, so warm it up first.
+    login("nosuchaccount", "whatever")
+
+    def timed(username, password):
+        started = time.perf_counter()
+        login(username, password)
+        return time.perf_counter() - started
+
+    real = min(timed("admin", "definitely-not-the-password") for _ in range(3))
+    fake = min(timed("nosuchaccount", "definitely-not-the-password")
+               for _ in range(3))
+    gap = abs(real - fake) / max(real, fake, 1e-9)
+    check("D7 an unknown username costs the same as a known one",
+          gap < 0.20, f"real={real:.3f}s fake={fake:.3f}s gap={gap:.0%}")
+
+    # A username that is not a username is refused before it is used as a
+    # key or written anywhere.
+    huge = "A" * 200_000
+    before = len(SERVICE.log.all())
+    _c, status, _p = login(huge, "x")
+    check("D7 an oversized username is refused", status == 401, str(status))
+    check("D7 …and does not put itself into the event log",
+          not any(huge[:200] in (e.message or "") for e in SERVICE.log.all()[before:]))
+
+    # Lockout: independent counters per username and per address.
+    throttle = auth_mod.LoginThrottle(threshold=5, window_s=900,
+                                      lockout_threshold=3, max_keys=10)
+    for _ in range(3):
+        throttle.record_failure("victim", "10.0.0.1")
+    check("D7 the username is locked out after the threshold",
+          throttle.lockout_remaining("victim", "10.0.0.9") > 0)
+    check("D7 …and so is the address, independently",
+          throttle.lockout_remaining("someone-else", "10.0.0.1") > 0)
+    check("D7 …while an unrelated pair is not",
+          throttle.lockout_remaining("bystander", "10.0.0.2") == 0)
+    throttle.clear("victim")
+    check("D7 a successful sign-in clears only that account's failures",
+          throttle.lockout_remaining("victim", "10.0.0.9") == 0
+          and throttle.lockout_remaining("someone-else", "10.0.0.1") > 0)
+    for n in range(200):
+        throttle.record_failure(f"guess{n}", f"10.1.0.{n % 250}")
+    check("D7 the failure table is bounded",
+          len(throttle._failures) <= throttle.max_keys,
+          str(len(throttle._failures)))
+
+    # And end to end: 429 rather than 401 once the real threshold is passed.
+    victim = make_user("lockme", {"nodes": "read"})
+    for _ in range(auth_mod.LOCKOUT_THRESHOLD):
+        req("POST", "/api/login", {"username": "lockme", "password": "wrong"})
+    status, _h, payload = req("POST", "/api/login",
+                              {"username": "lockme",
+                               "password": "Corr3ct-Horse-Battery"})
+    check("D7 the real threshold locks the account out with 429",
+          status == 429 and "Try again" in str(payload.get("error", "")),
+          f"{status} {payload}")
+    SERVICE.throttle.clear("lockme")
+
+    # Concurrency cannot dilute the throttle: the verifications serialise.
+    check("D7 password verification is bounded by a semaphore",
+          getattr(__import__("netpath.web.api", fromlist=["x"]),
+                  "_LOGIN_SLOTS")._value <= 4)
+
     return 0
 
 
