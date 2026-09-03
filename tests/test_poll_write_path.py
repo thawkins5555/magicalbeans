@@ -14,6 +14,7 @@ wrappers around them.
 """
 import json
 import os
+import socket
 import sys
 import time
 
@@ -642,11 +643,23 @@ def request_matching():
         check(len(ids) == 200, "a session's request ids do not repeat")
         session.close()
 
-        # A datagram from any other address is not an answer.
+        # A datagram from any other address is not an answer. Targeting a
+        # closed port relied on platform-specific ICMP behaviour: on Linux
+        # an unconnected UDP send to a closed local port typically leaves
+        # the socket to time out with nothing delivered back, but on
+        # Windows the ICMP port-unreachable commonly does surface, as
+        # ConnectionResetError on the next recvfrom, which is not
+        # SnmpTimeout and made this test flaky there. A real socket bound
+        # and never read from is a genuine black hole on either platform —
+        # nothing rejects the datagram, so it is simply never answered.
         from netpath.snmppoll import SnmpTimeout
+        black_hole = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        black_hole.bind(("127.0.0.1", 0))
+        black_hole_port = black_hole.getsockname()[1]
         session = poller._session_for(device, {"snmp_timeout_s": 0.4,
                                                "snmp_retries": 0})
-        session.ip = "127.0.0.2"          # nothing is listening there
+        session.ip = "127.0.0.1"
+        session.port = black_hole_port
         raised = False
         try:
             session.request(b"\x30\x00", 1)
@@ -656,6 +669,7 @@ def request_matching():
             pass
         check(raised, "a request to an address that answers nothing times out")
         session.close()
+        black_hole.close()
 
         poller.shutdown()
         db.close()
