@@ -1619,6 +1619,13 @@ class AlertEngine:
         # Alerts page and nowhere else.
         if rule_row["kind"] == "system":
             return
+        # A rule can be worth recording and not worth mailing about. The
+        # alert still opens, is still listed, is still counted — only the
+        # inbox is spared. Guarded on the column's presence so an engine
+        # against a database that predates it keeps notifying, which is the
+        # behaviour every rule had before.
+        if "notify" in rule_row.keys() and not rule_row["notify"]:
+            return
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]

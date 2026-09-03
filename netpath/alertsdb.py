@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS rules (
     enabled         INTEGER NOT NULL DEFAULT 1,
     is_builtin      INTEGER NOT NULL DEFAULT 0,
     device_filter   TEXT NOT NULL DEFAULT '',
+    -- Whether this rule's alerts send email at all. A rule can be worth
+    -- recording and not worth mailing about: mib_missing opens on every
+    -- device with a recognised enterprise arc and no uploaded MIB, which on
+    -- a fresh 250-device install is 234 emails in the first minute about a
+    -- housekeeping task.
+    notify          INTEGER NOT NULL DEFAULT 1,
     threshold       REAL,
     clear_threshold REAL,
     for_polls       INTEGER NOT NULL DEFAULT 1,
@@ -233,27 +239,34 @@ MAX_MUTE_HOURS = 24.0
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
-                  "flap_window_s", "flap_min_transitions", "auto_resolve_after_s")
+                  "flap_window_s", "flap_min_transitions", "auto_resolve_after_s",
+                  "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 33 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
+# 35 built-in rules: 8 device_event + 3 interface_event + 11 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold + 1 system. Each `template` name is a
+# 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
-# one, since only 5 ship; an admin can point any rule at any template.
+# one, since only 6 ship; an admin can point any rule at any template.
 _BUILTIN_RULES = [
     # key, name, kind, source_kind, severity, template, threshold, clear_threshold, for_polls
     ("device_down", "Device not responding", "device_event", "down", 1, "device_down", None, None, 1),
     ("device_up", "Device recovered", "device_event", "up", 5, "device_up", None, None, 1),
     ("device_rebooted", "Device rebooted", "device_event", "rebooted", 4, "device_rebooted", None, None, 1),
-    ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "device_down", None, None, 1),
-    ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "device_down", None, None, 1),
-    ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "device_down", None, None, 1),
-    ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "device_down", None, None, 1),
-    ("interface_down", "Interface down", "interface_event", "link_down", 3, "device_down", None, None, 1),
+    ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "event_notice", None, None, 1),
+    ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "event_notice", None, None, 1),
+    ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "event_notice", None, None, 1),
+    ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "event_notice", None, None, 1),
+    # A device that answers ping while SNMP fails is invisible to
+    # device_down (which is about reachability) and to every threshold rule
+    # (whose metrics simply stop arriving), so the most common half-failure
+    # in a fleet had no rule at all. The poller records an snmp_error device
+    # event for it.
+    ("snmp_failing_ping_ok", "SNMP failing while the device answers ping", "device_event", "snmp_error", 3, "event_notice", None, None, 1),
+    ("interface_down", "Interface down", "interface_event", "link_down", 3, "event_notice", None, None, 1),
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
-    ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "device_down", None, None, 1),
+    ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("mem_high", "Memory utilization high", "threshold", "mem_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("if_in_util_high", "Interface inbound utilization high", "threshold", "if_in_util_pct", 4, "threshold_breach", 90.0, 80.0, 2),
@@ -273,12 +286,12 @@ _BUILTIN_RULES = [
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
-    ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "device_down", None, None, 1),
+    ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "event_notice", None, None, 1),
     # Distinct from ap_removed, and deliberately not rolled up under it: "the
     # controller lost this AP" and "the controller has it but it is not
     # working" are different facts with different remedies. An AP marked out
     # of service raises neither.
-    ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "device_down", None, None, 1),
+    ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "event_notice", None, None, 1),
     # DHCP scope utilization, as a percentage of the scope's address range
     # that is leased or reserved. Its own kind rather than a "threshold"
     # rule because the threshold evaluator reads Nodes' metrics table for a
@@ -328,7 +341,12 @@ _BUILTIN_RULES = [
     # AlertEngine._notify): this one exists precisely because email is not
     # working, and the others would be reporting a fault in the machinery
     # they would have to use.
-    ("smtp_failing", "Alert email is not being delivered", "system", "smtp_failing", 2, "trap_forwarded", None, None, 1),
+    ("smtp_failing", "Alert email is not being delivered", "system", "smtp_failing", 2, "event_notice", None, None, 1),
+    # Raised by the poller when every worker is busy and the queue is not
+    # draining: polls are being skipped, so every other rule in this table is
+    # quietly evaluating stale data. Its own rule rather than a log line,
+    # because "why did nothing alert" deserves an answer on the Alerts page.
+    ("poll_pool_saturated", "Polling pool saturated — polls are being skipped", "system", "poll_pool_saturated", 3, "event_notice", None, None, 1),
 ]
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
@@ -376,10 +394,43 @@ _BUILTIN_AUTO_RESOLVE_S = {
     "trap_link_down_unmanaged": 86400,
     "syslog_critical": 86400,
     "ipam_new_conflict": 604800,
+    # Both of these report a CONDITION through repeated events rather than
+    # through a state with a clear, so last_ts is what says whether it is
+    # still happening: while the condition holds the events keep arriving and
+    # the alert stays current, and when it stops the alert closes on its own.
+    # An hour is comfortably longer than any poll interval; fifteen minutes
+    # matches how quickly a poll pool recovers once the backlog clears.
+    "snmp_failing_ping_ok": 3600,
+    "poll_pool_saturated": 900,
 }
 
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
-                         "threshold_breach", "trap_forwarded")
+                         "threshold_breach", "trap_forwarded", "event_notice")
+
+# key -> the template a rule was bound to BEFORE 4.37, for the rules whose
+# shipped binding changed to event_notice. The migration only re-points a
+# rule still on exactly this template, so an admin who has already pointed
+# one somewhere of their own keeps their choice.
+_EVENT_NOTICE_REBIND = {
+    "device_auth_fail": "device_down",
+    "device_unsupported": "device_down",
+    "poll_overrun": "device_down",
+    "mib_missing": "device_down",
+    "interface_down": "device_down",
+    "interface_flapping": "device_down",
+    "wireless_ap_removed": "device_down",
+    "wireless_ap_offline": "device_down",
+    # New in this release and never in an operator's hands bound to
+    # trap_forwarded, whose body would render three empty trap fields.
+    "smtp_failing": "trap_forwarded",
+}
+
+# Rules that ship with email off. mib_missing is the onboarding storm: every
+# device with a recognised enterprise arc and no uploaded MIB opens one on
+# its first poll, which is 234 alerts and 234 emails within a minute of
+# seeding 250 devices. The alerts are useful — they are the to-do list for
+# MIB uploads — and mailing them is not.
+_BUILTIN_NOTIFY_OFF = ("mib_missing",)
 
 # Template text as shipped by the PREVIOUS release, verbatim, for every
 # built-in whose wording has since changed.
@@ -438,6 +489,11 @@ class AlertsDatabase:
             if column not in rules:
                 self._conn.execute(
                     f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
+        if "notify" not in rules:
+            self._conn.execute(
+                "ALTER TABLE rules ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
+            self._conn.execute(
+                "UPDATE rules SET notify = 0 WHERE key = 'mib_missing'")
         if "for_seconds" not in rules:
             # Seed the shipped default onto an existing database, so an
             # install that already has alerts.db gets sustained packet loss
@@ -476,6 +532,7 @@ class AlertsDatabase:
         return (
             ("rekey_trap_syslog_alerts_1", self._rekey_trap_syslog_alerts),
             ("seed_auto_resolve_1", self._seed_auto_resolve),
+            ("rebind_event_notice_1", self._rebind_event_notice),
         )
 
     def _run_named_migrations(self) -> None:
@@ -520,6 +577,30 @@ class AlertsDatabase:
                     "UPDATE rules SET auto_resolve_after_s = ? WHERE key = ?"
                     " AND is_builtin = 1 AND auto_resolve_after_s IS NULL",
                     (seconds, key))
+            self._conn.commit()
+
+    def _rebind_event_notice(self) -> None:
+        """Move the non-outage rules off the "is not responding" template.
+
+        Only a rule still bound to exactly the template it shipped with is
+        moved — the same "an operator's edit is not ours to touch" rule
+        _migrate_templates already follows for template text. A rule someone
+        has already pointed at a template of their own keeps that binding.
+        """
+        with self._lock:
+            templates = {row["key"]: row["id"] for row in self._conn.execute(
+                "SELECT key, id FROM templates").fetchall()}
+            target = templates.get("event_notice")
+            if target is None:
+                return
+            for key, previous_key in _EVENT_NOTICE_REBIND.items():
+                previous = templates.get(previous_key)
+                if previous is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE rules SET template_id = ? WHERE key = ?"
+                    " AND is_builtin = 1 AND template_id = ?",
+                    (target, key, previous))
             self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:
@@ -645,11 +726,12 @@ class AlertsDatabase:
                  threshold, clear_threshold, for_polls) in _BUILTIN_RULES:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO rules(key, name, kind, source_kind,"
-                    " severity, enabled, is_builtin, device_filter, threshold,"
-                    " clear_threshold, for_polls, for_seconds,"
+                    " severity, enabled, is_builtin, device_filter, notify,"
+                    " threshold, clear_threshold, for_polls, for_seconds,"
                     " auto_resolve_after_s, template_id,"
-                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?)",
-                    (key, name, kind, source_kind, severity, threshold,
+                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?,?)",
+                    (key, name, kind, source_kind, severity,
+                     0 if key in _BUILTIN_NOTIFY_OFF else 1, threshold,
                      clear_threshold, for_polls, _BUILTIN_FOR_SECONDS.get(key),
                      _BUILTIN_AUTO_RESOLVE_S.get(key),
                      template_ids.get(template_key), now))

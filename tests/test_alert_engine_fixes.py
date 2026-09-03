@@ -763,3 +763,118 @@ ok("a still-breaching threshold with no open alert re-opens on the next "
    "tick, with no new sample")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== A8
+print("\nA8 — non-outage rules stop saying \"is not responding\"")
+
+REBOUND = ("device_auth_fail", "device_unsupported", "poll_overrun",
+           "mib_missing", "interface_down", "interface_flapping",
+           "wireless_ap_removed", "wireless_ap_offline", "smtp_failing")
+
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+by_id = {t["id"]: t["key"] for t in alerts.templates()}
+for key in REBOUND:
+    rule = alerts.rule_by_key(key)
+    assert by_id[rule["template_id"]] == "event_notice", (key, dict(rule))
+assert by_id[alerts.rule_by_key("device_down")["template_id"]] == "device_down"
+assert by_id[alerts.rule_by_key("interface_up")["template_id"]] == "device_up"
+ok(f"a fresh install binds {len(REBOUND)} non-outage rules to event_notice "
+   f"and leaves the outage and recovery rules alone")
+
+event_tpl = alerts.template_by_key("event_notice")
+assert event_tpl["subject"] == "SappiWhere: {{rule_name}} — {{entity_label}}", \
+    event_tpl["subject"]
+ok("the generic template's subject names the rule, not the device's health")
+
+# mib_missing opens its alert and sends nothing.
+sent = FakeMail()
+alertmail.send = sent
+try:
+    engine._tick()
+    did = add_device(nodes, "10.11.0.1", "acc-sw-070")
+    nodes.record_device_event(did, "mib_missing", "no vendor MIB uploaded")
+    nodes.record_device_event(did, "poll_overrun", "poll took 190 s")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    missing = open_rows(alerts, "mib_missing", did)
+    assert len(missing) == 1, [dict(a) for a in missing]
+    assert alerts.notifications_for(missing[0]["id"]) == []
+    ok("mib_missing opens its alert and sends no email at all")
+
+    overrun = open_rows(alerts, "poll_overrun", did)
+    assert len(overrun) == 1
+    subjects = [n["subject"] for n in alerts.notifications_for(overrun[0]["id"])]
+    assert len(subjects) == 1, subjects
+    assert "is not responding" not in subjects[0], subjects
+    assert "Poll taking longer than its interval" in subjects[0], subjects
+    ok(f"a poll overrun mails {subjects[0]!r}")
+finally:
+    alertmail.send = real_send
+engine.stop()
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- the two rules other components emit occurrences for
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+saturated = alerts.rule_by_key("poll_pool_saturated")
+assert saturated["kind"] == "system" and saturated["severity"] == 3, dict(saturated)
+snmp_rule = alerts.rule_by_key("snmp_failing_ping_ok")
+assert snmp_rule["kind"] == "device_event" and snmp_rule["source_kind"] == "snmp_error"
+assert snmp_rule["severity"] == 3, dict(snmp_rule)
+ok("poll_pool_saturated and snmp_failing_ping_ok ship ready for their emitters")
+
+engine.system_occurrence("poll_pool_saturated", "poller", "Polling pool",
+                         severity=3, extra={"queued": "412"},
+                         message="16 of 16 workers busy, 412 polls queued")
+engine._tick()
+pool = open_rows(alerts, "poll_pool_saturated", "poller")
+assert len(pool) == 1, [dict(a) for a in pool]
+assert pool[0]["dedup_key"] == "poll_pool_saturated:system:poller", dict(pool[0])
+ok("system_occurrence() from another component opens the alert it names")
+
+did = add_device(nodes, "10.11.1.1", "plc-gw-3")
+nodes.record_device_event(did, "snmp_error", "SNMP timed out; ping still succeeds")
+engine._tick()
+assert len(open_rows(alerts, "snmp_failing_ping_ok", did)) == 1
+assert open_rows(alerts, "device_down", did) == []
+ok("a device event named snmp_error opens the half-failure alert and nothing else")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- upgrading an existing database
+folder = os.path.join(TMPDIR, "eventnotice")
+os.makedirs(folder, exist_ok=True)
+legacy_path = os.path.join(folder, "alerts.db")
+legacy = AlertsDatabase(legacy_path)
+legacy.close()
+conn = sqlite3.connect(legacy_path)
+conn.execute("DELETE FROM schema_migrations WHERE name = 'rebind_event_notice_1'")
+device_down_id = conn.execute(
+    "SELECT id FROM templates WHERE key = 'device_down'").fetchone()[0]
+threshold_id = conn.execute(
+    "SELECT id FROM templates WHERE key = 'threshold_breach'").fetchone()[0]
+conn.execute("UPDATE rules SET template_id = ? WHERE key IN"
+             " ('device_auth_fail','device_unsupported','poll_overrun',"
+             "  'mib_missing','interface_down','interface_flapping',"
+             "  'wireless_ap_removed','wireless_ap_offline')",
+             (device_down_id,))
+# One an operator repointed themselves; the migration must not touch it.
+conn.execute("UPDATE rules SET template_id = ? WHERE key = 'poll_overrun'",
+             (threshold_id,))
+conn.commit(); conn.close()
+
+upgraded = AlertsDatabase(legacy_path)
+by_id = {t["id"]: t["key"] for t in upgraded.templates()}
+for key in ("device_auth_fail", "mib_missing", "interface_flapping",
+            "wireless_ap_offline"):
+    assert by_id[upgraded.rule_by_key(key)["template_id"]] == "event_notice", key
+assert by_id[upgraded.rule_by_key("poll_overrun")["template_id"]] == "threshold_breach"
+ok("upgrading rebinds only the rules still on the template they shipped with")
+
+assert upgraded.rule_by_key("mib_missing")["notify"] == 0
+assert upgraded.rule_by_key("device_down")["notify"] == 1
+ok("upgrading turns email off for mib_missing and leaves every other rule on")
+upgraded.close()

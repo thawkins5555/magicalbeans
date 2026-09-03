@@ -75,6 +75,28 @@ BUILTIN_TEMPLATES = {
             "-- SappiWhere, {{severity_name}}"
         ),
     },
+    # The generic non-outage notice. Six rules used to borrow "device_down",
+    # whose subject is "{{device_name}} is not responding" — so seeding 250
+    # devices produced 234 emails titled "acc-sw-070 is not responding" that
+    # were actually "vendor MIB not uploaded". An operator reading the inbox
+    # saw a site outage that was not happening.
+    #
+    # Deliberately not trap_forwarded, whose subject line is identical but
+    # whose body names a Trap OID and varbinds: rendered for a poll overrun
+    # those three lines are blank labels, which reads as a truncated message
+    # rather than a short one.
+    "event_notice": {
+        "name": "Event notice",
+        "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
+        "body": (
+            "{{rule_name}} — {{entity_label}}\n\n"
+            "{{message}}\n\n"
+            "{{detail}}\n"
+            "First seen {{opened_time}}; most recently {{last_time}}.\n"
+            "This alert has occurred {{count}} time(s).\n\n"
+            "-- SappiWhere, {{severity_name}}"
+        ),
+    },
     "trap_forwarded": {
         "name": "Forwarded event",
         "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
