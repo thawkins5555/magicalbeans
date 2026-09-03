@@ -48,7 +48,7 @@
     if (!total) {
       svg.appendChild(App.svgNode('circle', {
         cx: size / 2, cy: size / 2, r: radius, fill: 'none',
-        stroke: 'var(--hairline)', 'stroke-width': 5,
+        stroke: 'var(--data-neutral)', 'stroke-width': 5,
       }));
       return svg;
     }
@@ -73,7 +73,7 @@
     return donut([
       { value: u.alive || 0, color: 'var(--ok)' },
       { value: u.seen_down || 0, color: 'var(--warn)' },
-      { value: u.never_seen || 0, color: 'var(--hairline)' },
+      { value: u.never_seen || 0, color: 'var(--data-neutral)' },
     ], size);
   }
 
@@ -82,7 +82,7 @@
     return donut([
       { value: u.leased || 0, color: 'var(--ok)' },
       { value: u.reserved || 0, color: 'var(--accent)' },
-      { value: u.available || 0, color: 'var(--hairline)' },
+      { value: u.available || 0, color: 'var(--data-neutral)' },
     ], size);
   }
 
@@ -131,7 +131,7 @@
       ` <b>${u.alive || 0}</b> <span class="hint">(${pct(u.alive || 0)})</span></div>` +
       `<div><span class="legend-dot" style="background:var(--warn)"></span>Seen before, now down` +
       ` <b>${u.seen_down || 0}</b> <span class="hint">(${pct(u.seen_down || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Never seen` +
+      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Never seen` +
       ` <b>${u.never_seen || 0}</b> <span class="hint">(${pct(u.never_seen || 0)})</span></div>` +
       `</div>` +
       `<div class="hint">${total} usable address(es) \u00b7 ${escape(scanLine)}</div>`;
@@ -209,6 +209,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function subnetForm(subnet) {
@@ -348,6 +349,7 @@
       view.hostSort.key, view.hostSort.descending, columns);
     App.drawRows(body, rows, columns);
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-hosts-count').textContent = `${rows.length} of ${view.hosts.length}`;
   }
 
@@ -392,6 +394,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-conflicts-count').textContent =
       `${view.conflicts.length} ${App.el('ipam-show-resolved').checked ? '' : 'open '}conflict(s)`;
   }
@@ -459,8 +462,16 @@
       : 'never polled';
     const authText = server.has_credential
       ? `stored credential · ${escape(server.username || '')}` : 'ambient identity';
-    statusEl.className = server.last_status === 'error' ? 'sev sev-1' : 'hint';
+    // `hint err`, not `sev sev-1`: .sev is the syslog table's severity chip,
+    // a fixed 62px inline-block, and borrowing it here purely for its red
+    // meant this whole line was laid out in a 62px column — one word per
+    // line down the bar. .err is the colour on its own, which is all this
+    // ever wanted.
+    statusEl.className = server.last_status === 'error' ? 'hint err' : 'hint';
     statusEl.textContent = `${server.address} · ${authText} · ${statusText}`;
+    // The line ellipsises when the bar is tight (see .bar > .hint), so the
+    // whole of it has to stay reachable on hover.
+    statusEl.title = statusEl.textContent;
   }
 
   function dhcpServerForm(server) {
@@ -686,6 +697,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* The larger chart for whichever scope is currently selected, above its
@@ -721,7 +733,7 @@
       ` <b>${u.leased || 0}</b> <span class="hint">(${pct(u.leased || 0)})</span></div>` +
       `<div><span class="legend-dot" style="background:var(--accent)"></span>Reserved` +
       ` <b>${u.reserved || 0}</b> <span class="hint">(${pct(u.reserved || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Available` +
+      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Available` +
       ` <b>${u.available || 0}</b> <span class="hint">(${pct(u.available || 0)})</span></div>` +
       `</div>` +
       `<div class="hint">${total} address(es) in range \u00b7 ${escape(scope.state || '')} \u00b7 ` +
@@ -896,6 +908,7 @@
       view.leaseSort.descending, columns);
     App.drawRows(body, rows, columns);
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;
   }
 

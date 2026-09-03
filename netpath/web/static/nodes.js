@@ -58,6 +58,12 @@
 
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--faint)' };
+  /* This module's vocabulary mapped onto the five tones App.statusMark
+     draws. Kept beside STATUS_COLOR, which the timeline lanes still use for
+     their fills — a band in a chart is a different problem from a word in a
+     row, and only the row can carry a shape. */
+  const STATUS_TONE = { up: 'ok', down: 'fail', unsupported: 'warn',
+    auth: 'warn', unknown: 'none' };
 
   /* The one place display-name precedence lives: 'auto' prefers the SNMP
      hostname (sysName) and falls back to the manually entered name, then
@@ -135,14 +141,14 @@
 
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
-      cell: (r) => `<input type="checkbox" class="nd-check"${
-        view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
+      // Named, because a column of identical unlabelled checkboxes is
+      // announced as "checkbox, checkbox, checkbox" and picking the right
+      // row means counting. The device is what the box is about.
+      cell: (r) => `<input type="checkbox" class="nd-check" aria-label="Select ${
+        escape(displayName(r))}"${view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'status', label: 'Status', width: 90, on: true,
       value: (r) => r.status || '',
-      cell: (r) => `<span class="dot" style="background:${
-        STATUS_COLOR[r.status] || 'var(--faint)'};display:inline-block;` +
-        `width:8px;height:8px;border-radius:50%;margin-right:6px"></span>` +
-        escape(r.status) },
+      cell: (r) => App.statusMark(STATUS_TONE[r.status] || 'none', r.status) },
     { key: 'name', label: 'Name / IP', width: 200, on: true,
       value: (r) => displayName(r) || r.ip || '',
       // The mute lives in Alerts but is shown here on purpose: an operator
@@ -308,6 +314,12 @@
       if (!seen.has(id)) rowCache.delete(id);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
+    // This table builds its own rows rather than going through
+    // App.drawRows, so it asks for the keyboard behaviour explicitly. Safe
+    // to call on every draw: the wiring is idempotent, and the position of
+    // the one tabbable row is recomputed from the current selection.
+    App.wireRowKeyboard(body);
     App.el('nd-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
   }
@@ -987,6 +999,7 @@
       tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* ---------------------------------------------- device drill-down */
@@ -1409,6 +1422,7 @@
         body.appendChild(tr);
       }
       table.appendChild(body);
+      App.wireRowKeyboard(body);
     }
 
     async function walk(base) {
@@ -1849,6 +1863,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* -------------------------------------------------------------- CRUD */
@@ -2083,17 +2098,35 @@
     const box = App.modal('Add device', deviceForm({}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Test', onClick: () => testDevice(box, null) },
-      { label: 'Add', primary: true, onClick: async (box) => {
+      { label: 'Add', primary: true, onClick: async (box, button) => {
+        // Both halves of this used to be silent: a blank address returned
+        // without a word, and a refusal from the server (a duplicate, or an
+        // address that is not one) rejected into nothing, so the dialog just
+        // sat there and the button looked broken. The form's own status line
+        // is where the Test button already reports, so it reports here too.
+        const status = box.querySelector('#nd-f-test-result');
+        const fail = (message) => {
+          status.textContent = message;
+          status.style.color = 'var(--fail)';
+          box.querySelector('#nd-f-ip').focus();
+        };
         const ip = box.querySelector('#nd-f-ip').value.trim();
-        if (!ip) return;
+        if (!ip) return fail('An IP address is required.');
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
         const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
-        const result = await App.post('/api/nodes/devices',
-          { ip, name, group_id, device_group_id, display_name_source, ...overrides });
+        let result;
+        button.disabled = true;          // a slow add must not run twice
+        try {
+          result = await App.post('/api/nodes/devices',
+            { ip, name, group_id, device_group_id, display_name_source, ...overrides });
+        } catch (error) {
+          button.disabled = false;
+          return fail(error.message);
+        }
         if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
           await App.post(`/api/nodes/devices/${result.id}/credential`,
             { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -2308,6 +2341,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* --------------------------------------------------- additional credentials
@@ -2758,6 +2792,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   async function loadDiscResults() {
@@ -2829,6 +2864,7 @@
           'added from this scan">\u2014</span>';
     }
     return `<input type="checkbox" class="${cls}" data-result="${r.id}"` +
+      ` aria-label="Select ${escape(r.ip || 'result')}"` +
       `${checkedSet.has(r.id) ? ' checked' : ''}>`;
   }
 
@@ -3234,6 +3270,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* --------------------------------------------------------- MIB catalog */

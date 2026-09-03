@@ -40,15 +40,22 @@
 
   const STATUS_COLOR = { changed: 'var(--ok)', unchanged: 'var(--accent)',
     error: 'var(--fail)' };
+  /* Backup outcomes mapped onto the tones App.statusMark draws. "changed"
+     is information rather than health — a device whose config differs from
+     the last copy is working exactly as intended — so it takes the info
+     tone and its own shape, instead of the green that means "up" on every
+     other page in the product. */
+  const STATUS_TONE = { changed: 'info', unchanged: 'ok', error: 'fail' };
 
   function statusDot(status) {
     // last_backup_status can carry a trailing host-key note, e.g.
     // "changed (host key not previously known)" — only the leading word
     // decides the color.
     const key = (status || '').split(' ')[0];
-    const color = STATUS_COLOR[key] || 'var(--faint)';
-    return `<span class="dot" style="background:${color};display:inline-block;` +
-      `width:8px;height:8px;border-radius:50%;margin-right:6px"></span>`;
+    // This column is 28px of icon with no header — the word itself is in
+    // the "Last backup" column beside it — so the mark carries a name of
+    // its own rather than being decorative.
+    return App.statusMark(STATUS_TONE[key] || 'none', '', status || 'not backed up yet');
   }
 
   /* ------------------------------------------------------------ status */
@@ -78,7 +85,9 @@
 
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
-      cell: (r) => `<input type="checkbox" class="cx-check"${
+      // See the Nodes device list.
+      cell: (r) => `<input type="checkbox" class="cx-check" aria-label="Select ${
+        escape(r.name || r.ip || 'device')}"${
         view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'backup_enabled', label: '', width: 28, on: true, sortable: false,
       cell: (r) => (r.backup_enabled ? statusDot(r.last_backup_status) : '') },
@@ -154,6 +163,7 @@
       tr.onclick = () => selectDevice(row.id);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     App.el('cx-device-count').textContent = `${view.devices.length} device(s)`;
     drawBulkBar();
   }
@@ -399,6 +409,7 @@
       tr.onclick = () => selectBackup(row.id);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     drawBackupBulkBar();
   }
 

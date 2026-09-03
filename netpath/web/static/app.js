@@ -41,7 +41,17 @@ const App = (() => {
       <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
         session using this account, including this one.</p>`,
       [
-        ...(forced ? [] : [{ label: 'Cancel', onClick: closeModal }]),
+        // Forced, this dialog is the only thing the account can do — the
+        // server refuses everything else until the password is replaced — so
+        // Cancel would be a lie. Sign out takes its place: leaving is a real
+        // option, carrying on as if nothing were owed is not.
+        ...(forced
+          ? [{ label: 'Sign out', onClick: async () => {
+              state.modalLocked = false;
+              try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
+              window.location.href = '/login';
+            } }]
+          : [{ label: 'Cancel', onClick: closeModal }]),
         { label: 'Change password', primary: true, onClick: async () => {
           const status = document.getElementById('am-status');
           const next = document.getElementById('am-new').value;
@@ -65,6 +75,10 @@ const App = (() => {
           }
         } },
       ]);
+    // Escape and a backdrop click must not dismiss this one. Without the
+    // lock the prompt was advisory: it closed on a stray keypress, came back
+    // only on the next reload, and the account stayed usable throughout.
+    if (forced) state.modalLocked = true;
     return box;
   }
 
@@ -88,10 +102,13 @@ const App = (() => {
     for (const el of document.querySelectorAll('[data-requires-write]')) {
       if (!canWrite(el.dataset.requiresWrite)) el.hidden = true;
     }
-    const activeTab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
-    if (activeTab && activeTab.hidden) {
-      const firstVisible = document.querySelector('.tab:not([hidden])');
-      if (firstVisible) selectTab(firstVisible.dataset.tab);
+    // The open tab can stop being showable underneath the operator — access
+    // revoked, or its module hidden after a failed init — so move off it
+    // rather than leaving an empty page behind a still-highlighted tab.
+    if (state.tab && !usableTab(state.tab)) {
+      const next = [...document.querySelectorAll('.tab:not([hidden])')]
+        .map((tab) => tab.dataset.tab).find(usableTab);
+      if (next) selectTab(next);
     }
   }
 
@@ -135,6 +152,20 @@ const App = (() => {
     } catch (error) {
       // Left at the permissive default above on purpose.
     }
+  }
+
+  /* Modules whose init() threw during start(). Their tabs are hidden and
+     never selected, so a module that cannot start takes only itself out
+     rather than the whole application. Populated once, at startup; a reload
+     is what clears it, since init() only ever runs there. */
+  const brokenPages = new Set();
+
+  /* A tab worth painting: it exists, this account may read it, and its
+     module actually started. Used both at startup and by applyPermissions
+     when the open tab stops being readable. */
+  function usableTab(name) {
+    if (!name || brokenPages.has(name)) return false;
+    return Boolean(document.querySelector(`.tab[data-tab="${name}"]:not([hidden])`));
   }
 
   /* ------------------------------------------------------------ server */
@@ -326,18 +357,16 @@ const App = (() => {
      the idle countdown and a bulk action's result were all silent DOM
      mutations, so a screen-reader user never learned the server had gone
      away. `role="status"` on the visible elements covers most of it; this is
-     for the results that have no element of their own. */
+     for the results that have no element of their own.
+
+     `#live` is the sr-only region index.html carries for this. Re-setting
+     identical text is not a change and is not announced, so a poll that
+     reports the same failure every two seconds says it once — the clear
+     first is what lets the SAME text be announced again for an unrelated
+     repeat (two bulk actions that happen to report the same count). */
   function announce(message) {
-    let live = document.getElementById('sr-announce');
-    if (!live) {
-      live = document.createElement('div');
-      live.id = 'sr-announce';
-      live.className = 'sr-only';
-      live.setAttribute('role', 'status');
-      live.setAttribute('aria-live', 'polite');
-      document.body.appendChild(live);
-    }
-    // Re-setting identical text is not a change, and is not announced.
+    const live = document.getElementById('live');
+    if (!live) return;
     if (live.textContent === message) live.textContent = '';
     live.textContent = message;
   }
@@ -360,6 +389,7 @@ const App = (() => {
   let lastActivity = Date.now();
   let lastHeartbeat = 0;
   let idleRemainingMs = null;   // null until the first /api/state reply
+  let maxRemainingMs = null;    // the absolute ceiling, which activity cannot move
   let idleBanner = null;
 
   for (const name of ACTIVITY_EVENTS) {
@@ -372,17 +402,29 @@ const App = (() => {
   function applySessionIdle(session) {
     if (!session || session.idle_seconds_remaining == null) {
       idleRemainingMs = null;
+      maxRemainingMs = null;
       hideIdleWarning();
       return;
     }
     // The server's figure is authoritative and immune to clock skew between
     // browser and server; it resyncs the local countdown on every poll.
     idleRemainingMs = session.idle_seconds_remaining * 1000;
+    maxRemainingMs = session.max_seconds_remaining == null
+      ? null : session.max_seconds_remaining * 1000;
   }
 
   async function idleTick(now) {
     if (idleRemainingMs == null) return;
     idleRemainingMs = Math.max(0, idleRemainingMs - MASTER_MS);
+    if (maxRemainingMs != null) maxRemainingMs = Math.max(0, maxRemainingMs - MASTER_MS);
+
+    // The ceiling comes first, because it is the one a heartbeat cannot
+    // move: warning "you have gone idle" to someone actively typing, sixty
+    // seconds before they are signed out anyway, would be a lie.
+    if (maxRemainingMs != null && maxRemainingMs <= WARNING_MS) {
+      showSessionEndWarning(Math.max(0, Math.ceil(maxRemainingMs / 1000)));
+      return;
+    }
 
     const active = now - lastActivity < HEARTBEAT_GAP_MS;
     if (active && now - lastHeartbeat >= HEARTBEAT_GAP_MS) {
@@ -403,7 +445,11 @@ const App = (() => {
     }
   }
 
-  function showIdleWarning(secondsLeft) {
+  /* The absolute ceiling, reached whether or not anyone is at the keyboard.
+     Deliberately has no "Stay signed in": nothing this session can do will
+     extend it, and offering a button that cannot work would be worse than
+     the silence this replaces. It says what to expect instead. */
+  function ensureIdleBanner() {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
@@ -420,8 +466,25 @@ const App = (() => {
       };
     }
     idleBanner.hidden = false;
-    document.getElementById('idle-banner-text').textContent =
-      `Signing out in ${secondsLeft}s from inactivity`;
+    return document.getElementById('idle-banner-text');
+  }
+
+  function showIdleWarning(secondsLeft) {
+    const text = ensureIdleBanner();
+    document.getElementById('idle-banner-stay').hidden = false;
+    text.textContent = `Signing out in ${secondsLeft}s from inactivity`;
+  }
+
+  /* The absolute ceiling, reached whether or not anyone is at the keyboard.
+     Deliberately has no "Stay signed in": nothing this session can do will
+     extend it, and offering a button that cannot work would be worse than
+     the silence this replaces. It says what to expect instead. */
+  function showSessionEndWarning(secondsLeft) {
+    const text = ensureIdleBanner();
+    document.getElementById('idle-banner-stay').hidden = true;
+    text.textContent =
+      `Signing out in ${secondsLeft}s — this session has reached its maximum ` +
+      'length. Sign in again to carry on.';
   }
 
   function hideIdleWarning() {
@@ -712,11 +775,21 @@ const App = (() => {
       .filter((node) => !node.hidden && node.offsetParent !== null);
   }
 
-  /* Tab must not walk out of an open dialog into the page behind it: that
-     page is inert to the eye (the backdrop covers it) but not to the
-     keyboard, so without this a few Tabs put focus on controls the operator
-     cannot see. Wrapping both ways is the ARIA authoring-practices
-     behaviour. */
+  /* The page behind an open dialog is not merely covered, it is switched
+     off: `inert` takes it out of the tab order, out of the accessibility
+     tree and out of reach of a click, which is what the scrim only ever
+     implied visually — Tab could still reach controls the operator cannot
+     see. */
+  function setBackgroundInert(on) {
+    for (const el of document.querySelectorAll('#tabs, section.page')) {
+      el.inert = on;
+    }
+  }
+
+  /* Tab must not walk out of an open dialog into the page behind it, even
+     with the background switched inert above: the trap is what makes it a
+     cycle rather than a barrier, so Tab off the last control returns to the
+     first. Wrapping both ways is the ARIA authoring-practices behaviour. */
   function trapTab(event) {
     if (event.key !== 'Tab') return;
     const wrap = document.getElementById('modal');
@@ -775,7 +848,11 @@ const App = (() => {
     box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-labelledby', 'modal-title');
     wrap.hidden = false;
-    const first = box.querySelector('input, select, textarea');
+    setBackgroundInert(true);
+    // A dialog with no field to fill still has to take the keyboard, or the
+    // trap has nothing to hold and Escape is the only way to answer it.
+    const first = box.querySelector('input, select, textarea')
+      || box.querySelector('.row button');
     if (first) first.focus();
     else {
       const anything = focusableIn(box)[0];
@@ -789,6 +866,7 @@ const App = (() => {
     const wrap = document.getElementById('modal');
     const wasOpen = wrap && !wrap.hidden;
     if (wrap) wrap.hidden = true;
+    setBackgroundInert(false);
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
@@ -904,6 +982,36 @@ const App = (() => {
         done(true);
       } },
     ]);
+  }
+
+  /* One status renderer for the whole application.
+
+     `tone` is the meaning — ok, warn, fail, info or none — not the colour,
+     so a module maps its own vocabulary ("up", "out_of_service", "changed")
+     onto it once and the drawing is decided here. Every tone has a distinct
+     SHAPE as well as a colour, which is what makes the state readable in
+     greyscale and to a colour-blind operator; see .status in app.css.
+
+     Returns markup rather than a node because every caller is building a
+     table cell as a string. `label` is escaped here — it is a device name
+     or a vendor's status word often enough to matter. */
+  const STATUS_MARKS = { ok: '\u25CF', warn: '\u25B2', fail: '\u25A0',
+                         info: '\u25C6', none: '\u25CB' };
+
+  function statusMark(tone, label, title) {
+    const kind = STATUS_MARKS[tone] ? tone : 'none';
+    const text = label === undefined || label === null || label === ''
+      ? '' : `<span class="status-text">${escapeHtml(label)}</span>`;
+    // A narrow icon-only column has no room for the word, so it passes one
+    // as `title` instead — and the mark stops being aria-hidden there,
+    // because then it is the only thing carrying the state.
+    const named = !text && title;
+    const mark = named
+      ? `<i class="status-mark" role="img" aria-label="${escapeHtml(title)}">`
+      : '<i class="status-mark" aria-hidden="true">';
+    const hover = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<span class="status status-${kind}"${hover}>` +
+      `${mark}${STATUS_MARKS[kind]}</i>${text}</span>`;
   }
 
   function el(id) { return document.getElementById(id); }
@@ -1124,6 +1232,12 @@ const App = (() => {
   }
 
   /* ------------------------------------------------------- table columns */
+
+  /* Set by grid() when it is about to wipe a table that holds the focused
+     row, read by the wireRowKeyboard call that fills the same table. A
+     single slot rather than a map: the two always run in sequence for one
+     table, and a stale value is discarded by the guards at the point of use. */
+  let pendingRowFocus = -1;
 
   const COLUMN_KEY = 'sappiwhere.columns';
 
@@ -1561,6 +1675,16 @@ const App = (() => {
     });
     head.appendChild(row);
 
+    // Rebuilding the head wipes the body with it, and with the body goes
+    // whichever row had the keyboard. The position is handed to the next
+    // wireRowKeyboard call, which is drawRows filling this same table a
+    // moment later, so a keyboard user keeps their place across a refresh
+    // instead of being returned to the top of the page every poll.
+    const focused = document.activeElement;
+    pendingRowFocus = (focused && focused.tagName === 'TR' && table.contains(focused))
+      ? [...focused.parentElement.rows].indexOf(focused)
+      : -1;
+
     table.innerHTML = '';
     table.appendChild(caption);
     table.appendChild(colgroup);
@@ -1665,7 +1789,85 @@ const App = (() => {
       if (onRow) onRow(tr, row);
       tbody.appendChild(tr);
     }
+    wireRowKeyboard(tbody);
     return tbody;
+  }
+
+  /* A row a mouse can open has to be a row a keyboard can open.
+
+     Every module attaches its row behaviour as `tr.onclick` inside the
+     onRow callback above, so the keyboard half is added once here rather
+     than ten times across nine files: Enter and Space run the handler the
+     row already has, and the arrows move between rows. Selecting a row to
+     fill a detail pane is the core gesture of most of this application and
+     it was reachable only with a pointer.
+
+     Only one row per table sits in the tab order at a time, moved by the
+     arrows. Making all of them tabbable would put three hundred stops
+     between the Syslog table and anything after it — reachable, but not
+     usable, which is the failure mode this is meant to fix.
+
+     No role is imposed on the row: a <tr> told it is a button stops being
+     a row, and the table's own semantics are worth more than the label.
+     Exported, so the tables that build their own bodies can call it too. */
+  function wireRowKeyboard(tbody) {
+    const rows = [...tbody.rows].filter((tr) => tr.onclick);
+    if (!rows.length) return;
+
+    /* Every table here is rebuilt from scratch on its poll tick, so a row
+       that had the keyboard simply stopped existing — focus fell back to
+       <body> and the next Tab started again from the top of the page. A
+       keyboard user could not hold a row for longer than one refresh
+       interval, which on Syslog is ten seconds.
+
+       grid() records the row's position just before it wipes the table;
+       this puts the keyboard back on the row now at that position, once
+       the new body is actually in the document. */
+    const restoreIndex = pendingRowFocus;
+    pendingRowFocus = -1;
+    if (restoreIndex >= 0 && restoreIndex < rows.length) {
+      requestAnimationFrame(() => {
+        // Only if nothing else has claimed the keyboard in the meantime —
+        // an operator who tabbed away during the redraw keeps where they went.
+        if (document.activeElement !== document.body || !tbody.isConnected) return;
+        for (const other of rows) other.tabIndex = -1;
+        rows[restoreIndex].tabIndex = 0;
+        rows[restoreIndex].focus();
+      });
+    }
+
+    // The open row is where the keyboard should land; failing that, the first.
+    const landing = rows.find((tr) => tr.classList.contains('selected')) || rows[0];
+    for (const tr of rows) {
+      tr.tabIndex = tr === landing ? 0 : -1;
+      // The Nodes table reuses its row elements across refreshes rather than
+      // rebuilding them, so this can be called repeatedly on the same <tr>.
+      // The position above is recomputed every time; the listeners are
+      // attached once, or they would stack up one deep per poll.
+      if (tr.dataset.keyboardWired) continue;
+      tr.dataset.keyboardWired = '1';
+      tr.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();     // Space would scroll the pane instead
+          tr.click();
+          return;
+        }
+        const step = event.key === 'ArrowDown' ? 1
+          : event.key === 'ArrowUp' ? -1 : 0;
+        if (!step) return;
+        const next = rows[rows.indexOf(tr) + step];
+        if (!next) return;
+        event.preventDefault();
+        tr.tabIndex = -1;
+        next.tabIndex = 0;
+        next.focus();
+      });
+      // A row picked with the mouse becomes the one the keyboard returns to,
+      // so Tab does not send focus back to the top of a long table.
+      tr.addEventListener('mousedown', () => {
+        for (const other of rows) other.tabIndex = other === tr ? 0 : -1;
+      });
+    }
   }
 
   /* The checkbox block for a settings dialog. `fixed` columns (a row's
@@ -1933,6 +2135,16 @@ const App = (() => {
     if (alertsBadge) {
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
+      // Syslog severities: 0-2 are emergency/alert/critical, 3-4 error and
+      // warning, the rest informational. The badge takes the tone of the
+      // worst one open rather than being permanently amber.
+      const worst = (payload.alerts || {}).open_worst;
+      alertsBadge.classList.toggle('sev-fail', worst !== null && worst !== undefined && worst <= 2);
+      alertsBadge.classList.toggle('sev-warn', worst === 3 || worst === 4);
+      alertsBadge.classList.toggle('sev-info', worst !== null && worst !== undefined && worst >= 5);
+      if (!alertsBadge.hidden) {
+        alertsBadge.title = `${openCount} open alert(s)`;
+      }
     }
     // Deliberately not awaited: the title is set synchronously inside, and
     // the (rare) alert fetch behind it must not hold up the poll.
@@ -2171,8 +2383,32 @@ const App = (() => {
     document.addEventListener('visibilitychange', onVisibilityChange);
     initSplitters();
 
-    for (const page of Object.values(pages)) {
-      if (page.init) page.init();
+    // Every module initialises inside its own try/catch, because this loop
+    // used to be the single point of failure for the entire application: one
+    // module throwing here meant selectTab() and restartTimer() below were
+    // never reached, so the page painted whatever boot.js had marked and then
+    // sat there, frozen, with no error anywhere a user could see.
+    //
+    // That was not hypothetical. /api/state deliberately omits a module's
+    // block for an account that cannot read it (_STATE_MODULE_KEYS in
+    // api.py), so an account without NetFlow access reached a `for` over an
+    // undefined `dimensions` list and lost the whole app — including the
+    // modules it *could* read. Each module now fails alone: its tab is
+    // hidden, the rest of the app starts normally.
+    for (const [name, page] of Object.entries(pages)) {
+      if (!page.init) continue;
+      try {
+        page.init();
+      } catch (error) {
+        // Hiding matches applyPermissions' one-way rule: a tab whose module
+        // never initialised cannot render, and clicking it would be a worse
+        // experience than not offering it. A reload is the way back, exactly
+        // as it is for a permission granted mid-session.
+        brokenPages.add(name);
+        const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+        if (tab) tab.hidden = true;
+        console.error(`${name}: module failed to start, tab hidden`, error);
+      }
     }
     // A link is more specific than a memory: if the address bar names a
     // tab (and a selection in it), that wins over the remembered tab, and
@@ -2182,16 +2418,21 @@ const App = (() => {
       applyRoute();
     });
     if (!applyRoute(true)) {
-      // A refresh should land back on whichever module was open, not reset
-      // to NetPath — but only if that tab still exists (a build could drop
-      // one).
+      // A refresh should land back on whichever module was open, rather than
+      // resetting to NetPath — but only if that tab is one this browser can
+      // actually show: a build could drop it, the account may not be allowed
+      // to read it, or its module may have just failed above.
       let initialTab = 'netpath';
       try {
         const stored = localStorage.getItem(TAB_KEY);
-        if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
-          initialTab = stored;
-        }
-      } catch (error) { /* private browsing: default to netpath */ }
+        if (stored) initialTab = stored;
+      } catch (error) { /* private browsing, or storage full: default to netpath */ }
+      if (!usableTab(initialTab)) {
+        // Dashboard is the last resort rather than an error page: it is
+        // never permission-gated and has no module state of its own to break.
+        initialTab = [...document.querySelectorAll('.tab:not([hidden])')]
+          .map((tab) => tab.dataset.tab).find(usableTab) || 'dashboard';
+      }
       selectTab(initialTab);
     }
     restartTimer();
@@ -2227,8 +2468,8 @@ const App = (() => {
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub,
-    grid, a11yTable, sortRows, canRead, canWrite, accountModal,
-    statusPatternDefs, statusPatternUrl,
+    grid, a11yTable, sortRows, canRead, canWrite, accountModal, wireRowKeyboard,
+    statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };

@@ -212,6 +212,7 @@
       };
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   function showDetail(row) {

@@ -1,8 +1,16 @@
 /* The Debug page: live worker state and the filterable event log. */
 (() => {
+  /* Every category eventlog.py can emit, in its order. Five of these were
+     missing, so events from Nodes, Alerts, SNMP, Wireless and ConfigRX
+     reached the filter row and the Category column as their raw lowercase
+     keys — the page offered "configrx" as a tick box beside "Traceroute".
+     A key with no entry here still renders, as itself; this map only
+     decides how it reads. */
   const CATEGORY_LABEL = {
-    trace: 'Traceroute', dns: 'Reverse DNS', netflow: 'NetFlow', ipam: 'IPAM',
-    system: 'System', error: 'Errors',
+    trace: 'Traceroute', dns: 'Reverse DNS', netflow: 'NetFlow',
+    snmp: 'SNMP traps', nodes: 'Nodes', alerts: 'Alerts', ipam: 'IPAM',
+    wireless: 'Wireless', configrx: 'ConfigRX', system: 'System',
+    error: 'Errors',
   };
   const STATUS_COLOR = {
     ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--fail)',
@@ -134,6 +142,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) view.cells.push(row.children[3]);
   }
 
@@ -156,6 +165,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.dnsCells.push(row.children[1]);
     }
@@ -181,6 +191,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.ipamCells.push(row.children[1]);
     }
@@ -206,6 +217,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 1) view.nodeCells.push(row.children[1]);
     }
@@ -233,6 +245,7 @@
       body.appendChild(tr);
     }
     table.appendChild(body);
+    App.wireRowKeyboard(body);
     for (const row of body.children) {
       if (row.children.length > 3) view.discCells.push(row.children[3]);
     }
@@ -342,6 +355,7 @@
       tbody.replaceChildren(frag);
     }
     view.drawnSeq = visible.length ? visible[visible.length - 1].seq : null;
+    App.wireRowKeyboard(tbody);
 
     if (App.el('dbg-follow').checked) {
       const wrap = table.parentElement;

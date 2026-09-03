@@ -142,7 +142,7 @@
                device dialog (double-click the device), alongside it. -->
           <div class="bar">
             <span class="section">STATUS</span>
-            <select id="nd-d-range"></select>
+            <select id="nd-d-range" aria-label="Status timeline range"></select>
           </div>
           <div id="nd-status-timeline" class="canvas chart strip">
             <svg id="nd-status-timeline-svg"></svg>
@@ -239,7 +239,7 @@
       <label>Rule <select id="alerts-filter-rule"></select></label>
       <label>Device <input id="alerts-filter-device" size="16"></label>
       <label>Find <input id="alerts-filter-text" size="20"></label>
-      <select id="alerts-range"></select>
+      <select id="alerts-range" aria-label="Time window"></select>
       <button id="alerts-apply">Apply</button>
       <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
@@ -326,8 +326,8 @@
       <span class="grow"></span>
       <button id="route-live" class="primary" hidden>Return to live</button>
       <button id="route-expand">Expand silent hops</button>
-      <button id="route-zoom-out" class="icon">&minus;</button>
-      <button id="route-zoom-in" class="icon">+</button>
+      <button id="route-zoom-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
+      <button id="route-zoom-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
       <span id="route-zoom" class="hint zoom">100%</span>
       <button id="route-fit">Fit</button>
       <button id="netpath-settings" class="module-settings" data-requires-write="netpath">Settings</button>
@@ -341,11 +341,11 @@
       <span class="section">TIMELINE</span>
       <span id="block-label" class="hint"></span>
       <span class="grow"></span>
-      <select id="range-select"></select>
-      <button id="tl-back" class="icon">&lsaquo;</button>
-      <button id="tl-out" class="icon">&minus;</button>
-      <button id="tl-in" class="icon">+</button>
-      <button id="tl-fwd" class="icon">&rsaquo;</button>
+      <select id="range-select" aria-label="Time window"></select>
+      <button id="tl-back" aria-label="Pan back" title="Pan back" class="icon">&lsaquo;</button>
+      <button id="tl-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
+      <button id="tl-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
+      <button id="tl-fwd" aria-label="Pan forward" title="Pan forward" class="icon">&rsaquo;</button>
       <label class="check"><input type="checkbox" id="tl-follow" checked> Follow now</label>
       <button id="tl-reset">Reset</button>
     </header>
@@ -378,8 +378,8 @@
     <label>Source <input id="nf-src" size="10" placeholder="10.20."></label>
     <label>Destination <input id="nf-dst" size="10" placeholder="any"></label>
     <label>Port <input id="nf-port" size="5"></label>
-    <select id="nf-protocol"></select>
-    <select id="nf-exporter"></select>
+    <select id="nf-protocol" aria-label="Protocol"></select>
+    <select id="nf-exporter" aria-label="Exporter"></select>
     <label class="check"><input type="checkbox" id="nf-resolve"> Resolve names</label>
     <button id="nf-apply">Apply</button>
     <button id="nf-clear">Clear</button>
@@ -390,10 +390,10 @@
     <span id="nf-totals" class="hint"></span>
     <span class="grow"></span>
     <span id="nf-window" class="stat"></span>
-    <button id="nf-back" class="icon">&lsaquo;</button>
-    <button id="nf-out" class="icon">&minus;</button>
-    <button id="nf-in" class="icon">+</button>
-    <button id="nf-fwd" class="icon">&rsaquo;</button>
+    <button id="nf-back" aria-label="Pan back" title="Pan back" class="icon">&lsaquo;</button>
+    <button id="nf-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
+    <button id="nf-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
+    <button id="nf-fwd" aria-label="Pan forward" title="Pan forward" class="icon">&rsaquo;</button>
     <label class="check"><input type="checkbox" id="nf-follow" checked> Follow now</label>
     <button id="nf-reset">Reset</button>
   </header>
@@ -468,7 +468,7 @@
       <span id="sn-count" class="hint"></span>
       <label class="check"><input type="checkbox" id="sn-show-hostname" checked> Hostname</label>
       <span class="grow"></span>
-      <select id="sn-limit">
+      <select id="sn-limit" aria-label="Rows to show">
         <option value="300">300 rows</option>
         <option value="1000">1000 rows</option>
         <option value="2000">2000 rows</option>
@@ -528,7 +528,7 @@
       <span id="sl-count" class="hint"></span>
       <label class="check"><input type="checkbox" id="sl-show-hostname" checked> Hostname</label>
       <span class="grow"></span>
-      <select id="sl-limit">
+      <select id="sl-limit" aria-label="Rows to show">
         <option value="300">300 rows</option>
         <option value="1000">1000 rows</option>
         <option value="2000">2000 rows</option>
@@ -622,7 +622,7 @@
     <div id="ipam-dhcp-body">
     <div class="bar">
       <span class="section">DHCP SERVER</span>
-      <select id="ipam-dhcp-server-select"></select>
+      <select id="ipam-dhcp-server-select" aria-label="DHCP server"></select>
       <span id="ipam-dhcp-server-status" class="hint"></span>
       <span class="grow"></span>
       <button id="ipam-poll-now">Poll now</button>
@@ -637,7 +637,7 @@
       <div class="bar">
         <span class="section">SCOPES</span>
         <span class="grow"></span>
-        <select id="ipam-scope-sort">
+        <select id="ipam-scope-sort" aria-label="Sort scopes by">
           <option value="least" selected>Sort: Least available</option>
           <option value="most">Sort: Most available</option>
           <option value="name">Sort: Name</option>
@@ -959,7 +959,10 @@
 
     <fieldset>
       <legend>MAINTENANCE</legend>
-      <div class="row">
+      <!-- .wrap because this row carries nine buttons with sentence-length
+           labels: .row alone cannot wrap, so every label folded onto two
+           lines at 1366px rather than the row folding onto two rows. -->
+      <div class="row wrap">
         <button data-maint="redns" data-requires-write="settings">Re-run reverse DNS</button>
         <button data-maint="prune_traces" data-requires-write="settings">Delete old traces</button>
         <button data-maint="prune_flows" data-requires-write="settings">Delete stored flows</button>
@@ -980,6 +983,12 @@
     <button id="set-apply" class="primary" data-requires-write="settings">Apply changes</button>
   </div>
 </section>
+
+<!-- Where anything that only mutated a button label or a status line
+     also gets said out loud. One region for the whole application:
+     several would compete, and a screen reader would read whichever
+     changed last rather than what just happened. -->
+<div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
