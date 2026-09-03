@@ -225,6 +225,17 @@ def until_connected(client, timeout: float = 30.0) -> list:
     raise AssertionError(f"never reached 'connected': {seen}")
 
 
+def wait_idle(timeout: float = 10.0) -> None:
+    """Wait for the registry to be empty again. A client's close() returns
+    as soon as its own frame is on the wire; the server thread lets its
+    session go a moment later, and a cap counted before that is a cap
+    already spent."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and service.ssh_sessions.count:
+        time.sleep(0.05)
+    assert service.ssh_sessions.count == 0, service.ssh_sessions.count
+
+
 # -------------------------------------------------------------- the service
 
 service = Service(
@@ -399,6 +410,7 @@ try:
     status, payload = call("GET", f"/api/ssh/devices/{device}", token=token)
     assert payload["host_key"], payload
     assert payload["host_key"]["fingerprint"] == first_fingerprint, payload
+    seen_before = service.configrx_db.host_key("127.0.0.1", stub.port)["last_seen_ts"]
     ws = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
     ws.send_json({"type": "open", "cols": 80, "rows": 24})
     seen = until_connected(ws)
@@ -406,6 +418,14 @@ try:
     print("PASS: a second connection to a known host key reports no hostkey "
           "event, and the page's GET shows the stored fingerprint")
     ws.close()
+
+    # And the sighting is recorded: last_seen_ts is the only thing that says
+    # a remembered key is still in use rather than left over from a device
+    # that has gone. A terminal is a sighting exactly as a backup is.
+    seen_after = service.configrx_db.host_key("127.0.0.1", stub.port)["last_seen_ts"]
+    assert seen_after > seen_before, (seen_before, seen_after)
+    print("PASS: connecting again advances the host key's last-seen time, so a "
+          "device that is only ever SSHed to does not look unconfirmed")
 
     # -------------------------------------------------- a changed host key
 
@@ -517,6 +537,52 @@ try:
         print("PASS: a session with no keystrokes is closed with 4408 once the "
               "idle timeout passes")
         idle.close()
+        wait_idle()
+
+        # Frames are not presence; keystrokes are. A page on a second
+        # monitor that a window manager nudges sends `resize` and nothing
+        # else, and that must not keep a root shell on a core switch alive.
+        nudged = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        nudged.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(nudged)
+        stop_nudging = threading.Event()
+
+        def nudge():
+            while not stop_nudging.wait(0.4):
+                try:
+                    nudged.send_json({"type": "resize", "cols": 100, "rows": 30})
+                except OSError:
+                    return
+
+        threading.Thread(target=nudge, daemon=True).start()
+        assert nudged.wait_closed(20) == 4408, nudged.close_code
+        stop_nudging.set()
+        nudged.close()
+        wait_idle()
+        print("PASS: a stream of resize frames does not hold the session open "
+              "— only keystrokes refresh the idle timer")
+
+        # And the other way round: somebody typing is never idle.
+        typed = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        typed.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(typed)
+        stop_typing = threading.Event()
+
+        def keep_typing():
+            while not stop_typing.wait(0.4):
+                try:
+                    typed.send_binary(b" ")     # a keystroke the stub buffers
+                except OSError:
+                    return
+
+        threading.Thread(target=keep_typing, daemon=True).start()
+        time.sleep(sshterm.IDLE_TIMEOUT_S * 2)
+        assert service.ssh_sessions.count == 1, service.ssh_sessions.count
+        stop_typing.set()
+        assert typed.wait_closed(20) == 4408, typed.close_code
+        typed.close()
+        print("PASS: keystrokes hold it open past twice the idle timeout, and "
+              "it closes once they stop")
     finally:
         sshterm.IDLE_TIMEOUT_S = original_idle
 
@@ -533,12 +599,6 @@ try:
             if found or time.time() > deadline:
                 return found
             time.sleep(0.05)
-
-    def wait_idle(timeout: float = 10.0) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline and service.ssh_sessions.count:
-            time.sleep(0.05)
-        assert service.ssh_sessions.count == 0, service.ssh_sessions.count
 
     wait_idle()
     import stubs.stub_ssh_device as stub_module

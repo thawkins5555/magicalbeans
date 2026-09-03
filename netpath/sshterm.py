@@ -131,6 +131,12 @@ _MAX_ROWS = 300
 _OP_TEXT = 0x1
 _OP_BINARY = 0x2
 
+# The control messages a person has to produce, and so the only ones that
+# count as presence. `resize` is not one of them: a window manager nudging
+# a page nobody is watching sends it, and IDLE_TIMEOUT_S is about
+# keystrokes — see its comment.
+_INPUT_TYPES = ("open", "auth", "trust")
+
 
 def _int_in(value, low: int, high: int, default: int) -> int:
     try:
@@ -369,7 +375,11 @@ class SshSession:
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(decoded, dict):
-                self._last_input = time.time()
+                # Only a message somebody had to type refreshes the idle
+                # timer; a `resize` arriving on its own is traffic, not
+                # presence.
+                if decoded.get("type") in _INPUT_TYPES:
+                    self._last_input = time.time()
                 return decoded
         return None
 
@@ -578,6 +588,18 @@ class SshSession:
 
         self._password = None
         self.client = client
+        # "This same key was presented again just now" — the store's own
+        # usage contract, which ConfigRX's backup path already follows. The
+        # policy touches the row only on the path where `prepare` could not
+        # rebuild the stored key; on the ordinary one paramiko checks the
+        # key itself and the policy is never reached, so without this a
+        # device that is SSHed to daily but never backed up shows a
+        # last_seen_ts frozen at its first connection — which the ConfigRX
+        # dialog reads as a key nobody has confirmed since it was pinned.
+        try:
+            store.record_seen(self.host, self.port)
+        except Exception:
+            pass                     # a sighting lost is not a failed connect
         # The policy is the only thing that knows whether this was a first
         # sighting: it is what stored the key, and it kept the fingerprint.
         if policy.stored_new:
@@ -649,8 +671,13 @@ class SshSession:
             if message is None:
                 break
             opcode, payload = message
-            self._last_input = time.time()
             if opcode == _OP_BINARY:                 # keystrokes
+                # The idle timer is refreshed here and nowhere else in this
+                # loop: a shell is ended by nobody *typing* at it, and a
+                # `resize` from a window a monitor nudged is not somebody
+                # typing. Otherwise a root shell on a core switch stays open
+                # for as long as any client keeps sending anything at all.
+                self._last_input = time.time()
                 self._touch_web_session()
                 try:
                     self.channel.sendall(payload)
