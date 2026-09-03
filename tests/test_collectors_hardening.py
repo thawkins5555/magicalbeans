@@ -11,6 +11,7 @@ Plain script, no pytest: run it, read the PASS lines, non-zero exit on failure.
 import os
 import shutil
 import socket
+import sqlite3
 import struct
 import sys
 import time
@@ -25,7 +26,10 @@ from netpath.flowdb import FlowDatabase
 from netpath.snmptrapd import TrapCollector
 from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.syslogd import SyslogCollector
+from netpath.db import Database as NetPathDatabase
+from netpath.ipamdb import IpamDatabase
 from netpath.syslogdb import SyslogDatabase
+from netpath.syslogparse import LogEntry
 
 FAILURES: list[str] = []
 
@@ -388,10 +392,114 @@ def test_c3_kernel_drops_are_visible() -> None:
     flow_db.close()
 
 
+# ----------------------------------------------------------------------- C4
+
+def fill_logs(db: SyslogDatabase, count: int, base_ts: float) -> None:
+    for start in range(0, count, 5000):
+        db.insert([
+            LogEntry(ts=base_ts + index, source="10.0.0.1", host="core-sw-a",
+                     app="LINK", severity=3, procid="", msgid="",
+                     message=f"%LINK-3-UPDOWN: Interface Gi0/{index} changed "
+                             f"state to down",
+                     raw="raw line")
+            for index in range(start, min(start + 5000, count))])
+
+
+def test_c4_prune_does_not_rebuild_the_index() -> None:
+    """Every syslog prune re-indexed the whole logs table under the write
+    lock — 18.6 s to delete one row from a million, every fifteen minutes once
+    retention bit, stalling the writer for the whole of it. And every trim
+    VACUUMed on the shared connection."""
+    print("C4: targeted FTS deletes and incremental reclamation")
+
+    path = db_path("c4-syslog.db")
+    syslog_db = SyslogDatabase(path)
+    if not syslog_db.fts:
+        check(True, "no FTS5 in this SQLite build; the delete path is skipped")
+        syslog_db.close()
+        return
+
+    mode = syslog_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    check(mode == 2, f"a fresh syslog.db opens in incremental auto-vacuum "
+                     f"(auto_vacuum={mode})")
+
+    rows = 60_000
+    started = time.monotonic()
+    fill_logs(syslog_db, rows, time.time() - rows)
+    print(f"    seeded {rows} rows in {time.monotonic() - started:.1f} s")
+
+    total = syslog_db._conn.execute("SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
+    oldest = syslog_db._conn.execute(
+        "SELECT message FROM logs ORDER BY ts ASC LIMIT 1").fetchone()["message"]
+    started = time.monotonic()
+    removed = syslog_db.prune(retention_days=10_000, max_rows=total - 1)
+    targeted_s = time.monotonic() - started
+    check(removed == 1 and targeted_s < 0.5,
+          f"pruning 1 row from {total} takes {targeted_s * 1000:.1f} ms")
+
+    started = time.monotonic()
+    with syslog_db._lock:
+        syslog_db._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+        syslog_db._conn.commit()
+    rebuild_s = time.monotonic() - started
+    check(targeted_s < rebuild_s / 10,
+          f"that is not a function of table size: the rebuild it replaced "
+          f"costs {rebuild_s * 1000:.0f} ms")
+
+    # The index must still agree with the table after a targeted delete.
+    found = syslog_db.search(0, time.time() + 60, {"q": "UPDOWN"}, limit=5)
+    hits = found["rows"] if isinstance(found, dict) else found
+    check(len(hits) == 5, "search still returns rows through the FTS index")
+    needle = oldest.split(": ", 1)[1].split(" changed")[0]     # "Interface Gi0/0"
+    found = syslog_db.search(0, time.time() + 60, {"q": needle}, limit=5)
+    hits = found["rows"] if isinstance(found, dict) else found
+    check(all(row["message"] != oldest for row in hits),
+          "the pruned row is gone from the index as well as from the table")
+
+    before = syslog_db.size_bytes()
+    removed = syslog_db.trim_to_size(int(before * 0.6))
+    after = syslog_db.size_bytes()
+    check(removed > 0 and after < before,
+          f"trim_to_size reclaims space without VACUUM "
+          f"({before // 1024} KiB -> {after // 1024} KiB)")
+    syslog_db.close()
+
+    # --- an existing 4.35-era file is converted in place ------------------
+    legacy = db_path("c4-legacy.db")
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, ts REAL NOT NULL,"
+                 " source TEXT NOT NULL, host TEXT, facility INTEGER,"
+                 " severity INTEGER, app TEXT, procid TEXT, msgid TEXT,"
+                 " message TEXT NOT NULL, raw TEXT)")
+    conn.executemany("INSERT INTO logs(ts, source, message) VALUES (?,?,?)",
+                     [(float(i), "10.0.0.9", "old row %d" % i) for i in range(2000)])
+    conn.commit()
+    check(conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 0,
+          "the fixture starts with auto_vacuum off, as a 4.35 file does")
+    conn.close()
+    reopened = SyslogDatabase(legacy)
+    check(reopened._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2,
+          "opening it converts it to incremental auto-vacuum, keeping its rows")
+    check(reopened._conn.execute("SELECT COUNT(*) AS n FROM logs").fetchone()["n"] == 2000,
+          "and the existing rows survive the conversion")
+    reopened.close()
+
+    # --- the other four files open the same way ---------------------------
+    for name, factory in (("snmptraps.db", SnmpTrapDatabase),
+                          ("netflow.db", FlowDatabase),
+                          ("ipam.db", IpamDatabase),
+                          ("netpath.db", NetPathDatabase)):
+        handle = factory(db_path("c4-" + name))
+        mode = handle._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        check(mode == 2, f"{name} opens in incremental auto-vacuum")
+        handle.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
     test_c3_kernel_drops_are_visible,
+    test_c4_prune_does_not_rebuild_the_index,
 ]
 
 

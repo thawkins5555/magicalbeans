@@ -11,6 +11,8 @@ import json
 import sqlite3
 import threading
 import time
+
+from . import dbmaint, dbopen
 from statistics import mean
 
 from .tracer import TraceResult
@@ -103,11 +105,12 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            dbmaint.enable_incremental_vacuum(self._conn, "netpath.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -555,9 +558,9 @@ class Database:
     def trim_to_size(self, max_bytes: int) -> int:
         """Delete the oldest traces until the file fits under the cap.
 
-        Deletes in chunks and vacuums between them, because SQLite does not
-        return space to the filesystem until it is vacuumed — without that the
-        loop would never see the size fall and would empty the table.
+        Deletes in chunks and reclaims between them, because SQLite does not
+        return space to the filesystem on its own — without that the loop
+        would never see the size fall and would empty the table.
         """
         if max_bytes <= 0:
             return 0
@@ -580,11 +583,10 @@ class Database:
                     f"DELETE FROM traces WHERE id IN ({marks})", ids)
                 removed += cur.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                # VACUUM alone does not shrink the files in WAL mode: the freed
-                # pages sit in the write-ahead log until it is checkpointed and
-                # truncated, so the loop would never see the size fall.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Outside the lock block: reclaim takes the lock itself, one
+            # short incremental_vacuum step at a time, so a writer is
+            # never blocked for a whole file rewrite.
+            dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
         return removed
 
     def prune(self, older_than_days: float) -> int:
@@ -597,6 +599,5 @@ class Database:
             cur = self._conn.execute("DELETE FROM traces WHERE started_ts < ?", (cutoff,))
             self._conn.commit()
             removed = cur.rowcount
-        with self._lock:
-            self._conn.execute("VACUUM")
+        dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
         return removed

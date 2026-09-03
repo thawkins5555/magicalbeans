@@ -23,6 +23,8 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint, dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traps (
     id           INTEGER PRIMARY KEY,
@@ -118,12 +120,13 @@ class SnmpTrapDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         self.store_raw = False
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            dbmaint.enable_incremental_vacuum(self._conn, "snmptraps.db")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
@@ -390,6 +393,8 @@ class SnmpTrapDatabase:
                     " ORDER BY ts ASC LIMIT ?)", (chunk,))
                 removed += cursor.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Outside the lock block: reclaim takes the lock itself, one
+            # short incremental_vacuum step at a time, so a writer is
+            # never blocked for a whole file rewrite.
+            dbmaint.reclaim(self._conn, self._lock, label="snmptraps.db")
         return removed

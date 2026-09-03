@@ -29,6 +29,8 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint, dbopen
+
 
 def scope_size(start_ip: str, end_ip: str) -> int | None:
     """Addresses in a DHCP scope's dynamic range, inclusive — shared by the
@@ -213,11 +215,12 @@ class IpamDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            dbmaint.enable_incremental_vacuum(self._conn, "ipam.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -717,10 +720,10 @@ class IpamDatabase:
 
         Scan history is the one table here that grows without bound —
         subnets, hosts and open conflicts are all bounded by what currently
-        exists on the network, not by time. Deletes in chunks and vacuums
+        exists on the network, not by time. Deletes in chunks and reclaims
         between them, because SQLite does not return space to the filesystem
-        until it is vacuumed — without that the loop would never see the
-        size fall and would empty the table.
+        on its own — without that the loop would never see the size fall and
+        would empty the table.
         """
         if max_bytes <= 0:
             return 0
@@ -739,9 +742,8 @@ class IpamDatabase:
                     "(SELECT id FROM scans ORDER BY started_ts LIMIT ?)", (chunk,))
                 removed += cur.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                # VACUUM alone does not shrink the files in WAL mode: the freed
-                # pages sit in the write-ahead log until it is checkpointed and
-                # truncated, so the loop would never see the size fall.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Outside the lock block: reclaim takes the lock itself, one
+            # short incremental_vacuum step at a time, so a writer is
+            # never blocked for a whole file rewrite.
+            dbmaint.reclaim(self._conn, self._lock, label="ipam.db")
         return removed

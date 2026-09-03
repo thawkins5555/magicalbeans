@@ -25,6 +25,16 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint, dbopen
+
+# RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
+# possible: an external-content FTS5 table cannot work out what a deleted row
+# contained, so without the old column values the only way to keep the index
+# honest was to rebuild the whole thing.
+HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
+# How often the pre-3.35 fallback is allowed to rebuild the index.
+REBUILD_INTERVAL_S = 3600.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS logs (
     id       INTEGER PRIMARY KEY,
@@ -92,9 +102,10 @@ class SyslogDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         self.fts = False
+        self._last_rebuild: float | None = None
         # Set when an index from an older build had to be dropped; the refill
         # runs on a thread so opening the database stays instant.
         self._backfill_wanted = False
@@ -103,6 +114,7 @@ class SyslogDatabase:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            dbmaint.enable_incremental_vacuum(self._conn, "syslog.db")
             self._conn.executescript(SCHEMA)
             self._enable_fts()
             self._conn.commit()
@@ -465,22 +477,60 @@ class SyslogDatabase:
                 pass
         return total
 
+    def _delete_logs(self, where: str, params) -> int:
+        """Delete matching log rows and their index entries, without a rebuild.
+
+        `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` costs a full
+        re-index of the whole table however few rows were removed — measured
+        at 18.6 s to delete a single row from a million, with the write lock
+        held the whole time, every fifteen minutes once retention bites.
+        RETURNING hands back exactly the column values FTS5 needs to retire
+        each row's entries, so the cost becomes proportional to what was
+        actually deleted. Must be called with the lock held.
+        """
+        if self.fts and HAS_RETURNING:
+            rows = self._conn.execute(
+                f"DELETE FROM logs WHERE {where}"
+                " RETURNING id, message, app, host, source", params).fetchall()
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO logs_fts(logs_fts, rowid, message, app, host,"
+                    " source) VALUES ('delete', ?, ?, ?, ?, ?)",
+                    [(row["id"], row["message"], row["app"], row["host"],
+                      row["source"]) for row in rows])
+            return len(rows)
+
+        cursor = self._conn.execute(f"DELETE FROM logs WHERE {where}", params)
+        removed = cursor.rowcount or 0
+        if removed and self.fts:
+            self._rebuild_index()
+        return removed
+
+    def _rebuild_index(self) -> None:
+        """Pre-3.35 fallback: a full rebuild, at most once an hour.
+
+        Orphaned index rows are harmless — search joins `logs` on the rowid
+        and drops what no longer exists — so the rebuild is housekeeping, not
+        correctness, and running it on every prune was the whole problem.
+        """
+        now = time.monotonic()
+        if self._last_rebuild is not None and now - self._last_rebuild < REBUILD_INTERVAL_S:
+            return
+        self._last_rebuild = now
+        self._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+
     def prune(self, retention_days: float, max_rows: int) -> int:
         removed = 0
         cutoff = time.time() - retention_days * 86400
         with self._lock:
-            cursor = self._conn.execute("DELETE FROM logs WHERE ts < ?", (cutoff,))
-            removed += cursor.rowcount or 0
+            removed += self._delete_logs("ts < ?", (cutoff,))
             self._conn.execute("DELETE FROM log_counts WHERE hour < ?", (cutoff,))
             total = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
             if max_rows and total > max_rows:
-                cursor = self._conn.execute(
-                    "DELETE FROM logs WHERE id IN (SELECT id FROM logs"
-                    " ORDER BY ts ASC LIMIT ?)", (total - max_rows,))
-                removed += cursor.rowcount or 0
-            if removed and self.fts:
-                self._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+                removed += self._delete_logs(
+                    "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
+                    (total - max_rows,))
             self._conn.commit()
         return removed
 
@@ -497,14 +547,12 @@ class SyslogDatabase:
                 if total <= 5000:
                     break
                 chunk = max(int(total * 0.15), 5000)
-                cursor = self._conn.execute(
-                    "DELETE FROM logs WHERE id IN (SELECT id FROM logs"
-                    " ORDER BY ts ASC LIMIT ?)", (chunk,))
-                removed += cursor.rowcount or 0
-                if self.fts:
-                    self._conn.execute(
-                        "INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+                removed += self._delete_logs(
+                    "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
+                    (chunk,))
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Outside the lock block: reclaim takes the lock itself, one
+            # short incremental_vacuum step at a time, so a writer is
+            # never blocked for a whole file rewrite.
+            dbmaint.reclaim(self._conn, self._lock, label="syslog.db")
         return removed

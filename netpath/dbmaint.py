@@ -38,11 +38,17 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
     try:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         pages = conn.execute("PRAGMA page_count").fetchone()[0]
-        if pages > 1:
+        if pages > 0:
+            # The pragma alone only takes on a database with no pages at all,
+            # and opening one in WAL mode already writes page 1 — so even a
+            # brand-new file needs the VACUUM for the setting to stick. It is
+            # instant when there is nothing in the file; only a database with
+            # real content in it is worth mentioning in the log.
             started = time.monotonic()
             conn.execute("VACUUM")
-            log.info("%s: converted to incremental auto-vacuum in %.1f s",
-                     label or "database", time.monotonic() - started)
+            if pages > 1:
+                log.info("%s: converted to incremental auto-vacuum in %.1f s",
+                         label or "database", time.monotonic() - started)
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         log.warning("%s: could not enable incremental vacuum: %s", label or "database", exc)

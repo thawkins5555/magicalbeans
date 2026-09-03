@@ -13,6 +13,8 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint, dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flows (
     id        INTEGER PRIMARY KEY,
@@ -113,11 +115,12 @@ class FlowDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            dbmaint.enable_incremental_vacuum(self._conn, "netflow.db")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
@@ -255,11 +258,10 @@ class FlowDatabase:
                     " ORDER BY ts_end ASC LIMIT ?)", (chunk,))
                 removed += cur.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                # VACUUM alone does not shrink the files in WAL mode: the freed
-                # pages sit in the write-ahead log until it is checkpointed and
-                # truncated, so the loop would never see the size fall.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Outside the lock block: reclaim takes the lock itself, one
+            # short incremental_vacuum step at a time, so a writer is
+            # never blocked for a whole file rewrite.
+            dbmaint.reclaim(self._conn, self._lock, label="netflow.db")
         return removed
 
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
