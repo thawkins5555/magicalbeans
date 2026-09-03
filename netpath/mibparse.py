@@ -103,6 +103,10 @@ class ParseResult:
     notes: list[str] = field(default_factory=list)
 
 
+# The only two spans that get blanked: a quoted string and an ASN.1 comment.
+_MASK_OPEN_RE = re.compile(r'"|--')
+
+
 def _strip_comments_and_strings(text: str) -> str:
     """Masks `-- comment` (to the next `--` or end of line, per ASN.1
     comment syntax) and `"quoted strings"` with spaces of the same
@@ -113,31 +117,39 @@ def _strip_comments_and_strings(text: str) -> str:
 
     This is what lets the structural regexes below treat `--` or `::=`
     appearing inside a comment or a quoted description as inert text
-    instead of real syntax."""
-    out = list(text)
+    instead of real syntax.
+
+    Written as "copy the span up to the next `"` or `--`, then blank that
+    one span" rather than as a per-character walk: `list(text)` cost nine
+    bytes of memory per input byte and 3.6 s on an 8 MB file before any
+    regex had run, for a pass that only ever blanks two kinds of span."""
+    parts: list[str] = []
     i, n = 0, len(text)
     while i < n:
-        ch = text[i]
-        if ch == '"':
-            j = text.find('"', i + 1)
-            end = (j + 1) if j != -1 else n
-            for k in range(i, end):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = end
-            continue
-        if text[i:i + 2] == "--":
-            j = i + 2
-            while j < n and text[j] != "\n" and text[j:j + 2] != "--":
-                j += 1
-            end = (j + 2) if text[j:j + 2] == "--" else j
-            for k in range(i, min(end, n)):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = end
-            continue
-        i += 1
-    return "".join(out)
+        opener = _MASK_OPEN_RE.search(text, i)
+        if opener is None:
+            parts.append(text[i:])
+            break
+        start = opener.start()
+        if start > i:
+            parts.append(text[i:start])
+        if opener.group(0) == '"':
+            closer = text.find('"', start + 1)
+            end = (closer + 1) if closer != -1 else n
+        else:
+            # ASN.1: a comment runs to the next `--` or to end of line,
+            # whichever comes first. The newline itself is not part of it.
+            newline = text.find("\n", start + 2)
+            dashes = text.find("--", start + 2)
+            if dashes != -1 and (newline == -1 or dashes < newline):
+                end = dashes + 2
+            else:
+                end = newline if newline != -1 else n
+        span = text[start:end]
+        parts.append(" " * len(span) if "\n" not in span
+                     else "".join("\n" if ch == "\n" else " " for ch in span))
+        i = end
+    return "".join(parts)
 
 
 _MODULE_RE = re.compile(r"([A-Za-z][\w-]*)\s+DEFINITIONS\b")
@@ -178,7 +190,14 @@ _OID_ASSIGN_RE = re.compile(r"::=\s*\{([^{}]*)\}")
 
 _SYNTAX_RE = re.compile(r"\bSYNTAX\s+([A-Za-z][\w-]*)")
 _SYNTAX_ENUM_RE = re.compile(r"\bSYNTAX\s+INTEGER\s*\{([^{}]*)\}")
-_ENUM_PAIR_RE = re.compile(r"([A-Za-z][\w-]*)\s*\((-?\d+)\)")
+# `\d{1,100}` rather than `\d+`: since 3.11 `int()` refuses a decimal string
+# longer than sys.get_int_max_str_digits() (4,300 by default, and settable as
+# low as 640), and an unbounded capture made that ValueError escape parse() —
+# so an operator uploading a MIB with a silly enum value got a message about
+# Python's integer limits, and resolve_all() then skipped the file silently
+# on every later re-resolve. No SMI enum is anywhere near 100 digits; one that
+# is simply is not recorded.
+_ENUM_PAIR_RE = re.compile(r"([A-Za-z][\w-]*)\s*\((-?\d{1,100})\)")
 _DESCRIPTION_RE = re.compile(r'\bDESCRIPTION\s+"([^"]*)"', re.DOTALL)
 
 
@@ -295,12 +314,17 @@ def _extract_enums(body_original: str) -> dict[int, str] | None:
     match = _SYNTAX_ENUM_RE.search(body_original)
     if not match:
         return None
-    enums = {int(v): n for n, v in _ENUM_PAIR_RE.findall(match.group(1))}
+    enums: dict[int, str] = {}
+    for name, value in _ENUM_PAIR_RE.findall(match.group(1)):
+        try:
+            enums[int(value)] = name
+        except ValueError:      # belt and braces behind the digit bound
+            continue
     return enums or None
 
 
 def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
-          budget_s: float = PARSE_BUDGET_S) -> ParseResult:
+          budget_s: float | None = None) -> ParseResult:
     """Best-effort. Never raises for malformed input — a file with zero
     recognizable definitions comes back as a ParseResult with an empty
     object list and a note explaining why, not an exception.
@@ -316,6 +340,10 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
     if len(text.encode("utf-8", "replace")) > max_bytes:
         raise MibTooLarge(f"File exceeds the {max_bytes:,} byte limit")
 
+    # Read from the module constant, not from a default argument bound at
+    # import time, so an operator's build or a test can change the ceiling.
+    if budget_s is None:
+        budget_s = PARSE_BUDGET_S
     deadline = (time.monotonic() + budget_s) if budget_s and budget_s > 0 else None
 
     def check_budget() -> None:
@@ -515,11 +543,20 @@ def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
     """
     rows = [row for row in nodes_db.mib_files() if row["content"]]
     parsed: dict[int, ParseResult] = {}
+    failed = 0
     for row in rows:
         try:
             parsed[row["id"]] = parse(row["content"], max_bytes=max_bytes)
-        except ValueError:
+        except MibTooLarge:
             continue          # oversized now that the cap is lower: leave as-is
+        except ValueError as exc:
+            # Anything else — the parse budget, or a guard added later — is a
+            # file that will be skipped on every re-resolve from here on. Say
+            # so on the file itself: silently skipping it forever is how a MIB
+            # ends up shown as "0 objects" with nothing to explain it.
+            failed += 1
+            nodes_db.update_mib_file(row["id"],
+                                     parse_notes=f"Could not be parsed: {exc}")
 
     known = dict(WELL_KNOWN_ROOTS)
     known.update(nodes_db.all_known_oids())
@@ -559,6 +596,7 @@ def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
             for obj in result.objects])
         changed += 1
     return {"files": len(parsed), "files_changed": changed, "passes": passes,
+            "files_failed": failed,
             "object_count": object_total, "resolved_count": resolved_total}
 
 

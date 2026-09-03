@@ -279,6 +279,91 @@ check("...to the right OIDs across every file",
                "lvl1": "1.3.6.1.4.1.42.4.3.2.1"}, str(oids))
 
 
+# ---------------------------- H3: no per-character copy, and no escaping int()
+
+print("H3  masking is linear in spans, and no enum value can escape parse()")
+
+# 8 MB of ordinary MIB text — the shipped cap. `list(text)` cost 3.6 s and
+# 72 MB of resident memory here before any regex had run.
+benign = ("-- a comment line that is quite long indeed, padding padding\n"
+          'x OBJECT-TYPE SYNTAX Integer32 DESCRIPTION "hello" ::= { mib-2 1 }\n')
+benign = benign * (8 * MB // len(benign))
+masked, elapsed = timed(mibparse._strip_comments_and_strings, benign)
+check("masking 8 MB of ordinary MIB text takes under 1 s", elapsed < 1.0,
+      f"{elapsed:.3f}s (1.8-3.6 s before)")
+check("...and every byte keeps its offset", len(masked) == len(benign))
+check("...with comments and quoted strings blanked but newlines kept",
+      "comment line" not in masked and "hello" not in masked
+      and masked.count("\n") == benign.count("\n") and "OBJECT-TYPE" in masked)
+
+# The masking is what makes `--` and `::=` inside a comment or a description
+# inert; that has to survive the rewrite.
+tricky = mibparse.parse(
+    "F DEFINITIONS ::= BEGIN\n"
+    "-- a comment with a fake ::= { mib-2 999 } in it\n"
+    "a OBJECT-TYPE\n  SYNTAX Integer32\n"
+    '  DESCRIPTION "text with -- two dashes and a literal ::= { x 1 } in it"\n'
+    "  ::= { mib-2 7 }\nEND", max_bytes=MB)
+found = {o.name: o for o in tricky.objects}
+check("a fake '::= { }' inside a comment or a string is still inert",
+      list(found) == ["a"] and found["a"].last_arc == "7", str(list(found)))
+check("...while the DESCRIPTION text itself comes back unmasked",
+      "-- two dashes" in found["a"].description
+      and "::= { x 1 }" in found["a"].description, found["a"].description)
+
+# G-14: an enum value longer than sys.get_int_max_str_digits() raised
+# Python's own "Exceeds the limit (4300 digits)" ValueError out of parse(), so
+# the operator was told about Python's integer limits instead of about their
+# MIB, and resolve_all() then skipped that file for good.
+huge_enum = ("E DEFINITIONS ::= BEGIN\n"
+             "x OBJECT-TYPE SYNTAX INTEGER { up(" + "1" * 5000 + "), down(2) }\n"
+             "  ::= { mib-2 1 }\nEND")
+try:
+    got = {o.name: o for o in mibparse.parse(huge_enum, max_bytes=MB).objects}
+    check("a 5,000-digit enum value does not raise out of parse()", True)
+    check("...the object is still recorded, with the usable enums it has",
+          got["x"].last_arc == "1" and got["x"].enums == {2: "down"},
+          str(got["x"].enums))
+except ValueError as exc:
+    check("a 5,000-digit enum value does not raise out of parse()", False, str(exc))
+
+ordinary = mibparse.parse("E DEFINITIONS ::= BEGIN\nx OBJECT-TYPE\n"
+                          " SYNTAX INTEGER { up(1), down(2), testing(-3) }\n"
+                          " ::= { mib-2 1 }\nEND", max_bytes=MB)
+check("an ordinary enum table is unaffected",
+      ordinary.objects[0].enums == {1: "up", 2: "down", -3: "testing"},
+      str(ordinary.objects[0].enums))
+
+# A file resolve_all() cannot parse is reported on the file, not skipped in
+# silence on this and every future re-resolve.
+good = "G DEFINITIONS ::= BEGIN\ng OBJECT IDENTIFIER ::= { enterprises 7 }\nEND"
+store = FakeMibStore({
+    "good.mib": good,
+    "toobig.mib": "B DEFINITIONS ::= BEGIN\n" + "b OBJECT-TYPE\n SYNTAX X\n" * 400 + "END",
+})
+big_id = [r["id"] for r in store.rows if r["filename"] == "toobig.mib"][0]
+summary = mibparse.resolve_all(store, max_bytes=200)
+check("a file over the byte cap is left exactly as it was",
+      summary["files_failed"] == 0 and big_id not in store.updates, str(summary))
+check("...and the files that do parse still resolve",
+      summary["files"] == 1 and summary["resolved_count"] == 1, str(summary))
+
+store = FakeMibStore({
+    "slow.mib": "S DEFINITIONS ::= BEGIN\n" + "s OBJECT-TYPE\n SYNTAX X\n" * 5000 + "END",
+})
+slow_id = [r["id"] for r in store.rows if r["filename"] == "slow.mib"][0]
+budget_was = mibparse.PARSE_BUDGET_S
+try:
+    mibparse.PARSE_BUDGET_S = 0.0000001
+    summary = mibparse.resolve_all(store, max_bytes=MB)
+finally:
+    mibparse.PARSE_BUDGET_S = budget_was
+note = store.updates.get(slow_id, {}).get("parse_notes", "")
+check("a file that cannot be parsed gets a note saying so",
+      summary["files_failed"] == 1 and note.startswith("Could not be parsed"),
+      f"{summary['files_failed']} failed, note={note[:70]!r}")
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
