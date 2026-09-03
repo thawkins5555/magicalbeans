@@ -4644,10 +4644,29 @@ def post_logout(service, params, body) -> dict:
 
 
 def post_heartbeat(service, params, body) -> dict:
-    """Confirms a person is present. server.py has already touched the
-    session for any POST by the time this runs; the only job left is to hand
-    back a fresh countdown so the client's warning banner resets."""
-    return {"ok": True, "idle_timeout_minutes": service.sessions.idle_seconds // 60}
+    """Confirms a person is present, or — in kiosk mode — that a wall
+    display is allowed to stay signed in without one.
+
+    server.py touches the session for every other POST before dispatch; this
+    route is the one exception, so that the kiosk case can be REFUSED without
+    extending anything. The rule: a heartbeat carrying ``{"kiosk": true}``
+    is honoured only for an account with no write grant on any module. A
+    read-only wall account stays signed in until the absolute ceiling
+    (session_max_hours); an administrator who adds ?kiosk=1 keeps the idle
+    sign-out, and the reply says so in words the kiosk bar shows. Enforced
+    here rather than in the browser because the idle policy is a security
+    control, and a client-side exception to a security control is not one.
+    """
+    kiosk = bool(isinstance(body, dict) and body.get("kiosk"))
+    minutes = service.sessions.idle_seconds // 60
+    if kiosk:
+        granted = service.app_db.permissions_for(params.get("_username", ""))
+        if any(level == "write" for level in granted.values()):
+            return {"ok": False, "kiosk": False, "idle_timeout_minutes": minutes,
+                    "reason": "Kiosk mode keeps only a read-only account signed in; "
+                              "this account can write, so the idle sign-out applies."}
+    service.sessions.touch(params.get("_token", ""))
+    return {"ok": True, "kiosk": kiosk, "idle_timeout_minutes": minutes}
 
 
 def _first_run(service) -> bool:

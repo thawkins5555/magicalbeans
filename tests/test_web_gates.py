@@ -205,6 +205,37 @@ try:
     status, payload, _ = call("POST", "/api/ipam/worker", {"action": "dance"}, token=token)
     check("an unknown action is refused", status == 400, status)
 
+    # ------------------------------------------- 4.46.0: the kiosk heartbeat
+    # A wall display sends {"kiosk": true} with nobody at the keyboard. The
+    # server honours it only for an account with no write grant anywhere,
+    # and a refusal must not extend the session — which is why server.py
+    # no longer touches the session for this one route before dispatch.
+    print("kiosk heartbeat")
+    status, payload, _ = call("POST", "/api/heartbeat", {"kiosk": True}, token=token)
+    check("an account that can write is refused a kiosk hold",
+          status == 200 and payload.get("ok") is False and payload.get("kiosk") is False
+          and "read-only" in payload.get("reason", ""), f"{status} {payload}")
+    status, s1, _ = call("GET", "/api/state", token=token)
+    time.sleep(1.1)
+    status, payload, _ = call("POST", "/api/heartbeat", {"kiosk": True}, token=token)
+    status, s2, _ = call("GET", "/api/state", token=token)
+    check("and the refusal did not extend its idle countdown",
+          s2["session"]["idle_seconds_remaining"] < s1["session"]["idle_seconds_remaining"],
+          (s1["session"]["idle_seconds_remaining"], s2["session"]["idle_seconds_remaining"]))
+    status, payload, _ = call("POST", "/api/heartbeat", {}, token=token)
+    check("a plain heartbeat from the same account still counts",
+          status == 200 and payload.get("ok") is True and payload.get("kiosk") is False,
+          f"{status} {payload}")
+    status, r1, _ = call("GET", "/api/state", token=reader_token)
+    time.sleep(1.1)
+    status, payload, _ = call("POST", "/api/heartbeat", {"kiosk": True}, token=reader_token)
+    check("a read-only account is held", status == 200 and payload.get("ok") is True
+          and payload.get("kiosk") is True, f"{status} {payload}")
+    status, r2, _ = call("GET", "/api/state", token=reader_token)
+    check("and its idle countdown was reset by the kiosk heartbeat",
+          r2["session"]["idle_seconds_remaining"] >= r1["session"]["idle_seconds_remaining"] - 0.5,
+          (r1["session"]["idle_seconds_remaining"], r2["session"]["idle_seconds_remaining"]))
+
     print("FAILED: " + ", ".join(failures) if failures else "ALL WEB GATE ASSERTIONS PASSED")
 finally:
     server.stop()

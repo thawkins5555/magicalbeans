@@ -46,12 +46,45 @@ def contrast(a, b):
 
 
 tokens_css = read(STATIC, "tokens.css")
-TOKENS = dict(re.findall(r"^\s*(--[a-z0-9-]+):\s*([^;]+);", tokens_css, re.M))
+# One dict per block: the bare :root is the dark default, and each
+# :root[data-theme="…"] block is a set of overrides on top of it. The pairs
+# below are then measured for every theme, each with its own overrides
+# applied over the base — so a dark tone a theme forgot to redefine is
+# measured against that theme's light ground and fails, instead of being
+# invisible in a browser.
+BLOCKS = re.findall(r':root(?:\[data-theme="([a-z]+)"\])?\s*\{(.*?)\n\}', tokens_css, re.S)
+check(len(BLOCKS) == 3, "tokens.css has a base block and two theme blocks (found %d)" % len(BLOCKS))
+BASE = {}
+OVERRIDES = {}
+for theme_name, body_text in BLOCKS:
+    values = dict(re.findall(r"^\s*(--[a-z0-9-]+):\s*([^;]+);", body_text, re.M))
+    if theme_name:
+        OVERRIDES[theme_name] = values
+    else:
+        BASE = values
+TOKENS = BASE
 check(len(TOKENS) > 40, "tokens.css parsed (%d tokens)" % len(TOKENS))
+THEMES = {"dark": dict(BASE)}
+for theme_name, values in OVERRIDES.items():
+    THEMES[theme_name] = dict(BASE, **values)
+check(sorted(THEMES) == ["contrast", "dark", "light"], "the themes are dark, light and contrast")
+# Every role a light ground makes unreadable if left dark. A theme block
+# must say each one explicitly.
+THEMED_ROLES = ["--bg", "--panel", "--raised", "--hairline", "--grid", "--text", "--muted",
+                "--dim", "--line", "--data-neutral", "--accent", "--accent-hover", "--focus",
+                "--ok", "--warn", "--fail", "--blocked", "--overrun", "--error", "--nodata",
+                "--selected", "--checked", "--checked-strong"]
+for theme_name, values in OVERRIDES.items():
+    missing = [role for role in THEMED_ROLES if role not in values]
+    check(not missing, "theme %s redefines every themed role (missing %s)" % (theme_name, missing or "none"))
+check("color-scheme: dark" in BLOCKS[0][1], "the base block declares color-scheme: dark")
+check("color-scheme: light" in OVERRIDES.get("light", {}).get("color-scheme", "")
+      or "color-scheme: light" in tokens_css.split('[data-theme="light"]')[1],
+      "the light theme declares color-scheme: light")
 
 
-def tok(name):
-    return TOKENS[name].strip()
+def tok(name, theme="dark"):
+    return THEMES[theme][name].strip()
 
 
 # --------------------------------------------------------------------------
@@ -80,14 +113,25 @@ GRAPHIC_ON = [
     ("--data-neutral", "--panel", 3.0),
     ("--accent", "--raised", 3.0),       # the selected-row bar, the focus ring
 ]
-for fg, bg, floor in TEXT_ON + GRAPHIC_ON:
-    ratio = contrast(tok(fg), tok(bg))
-    check(ratio >= floor, "%s on %s = %.2f:1 (floor %.1f)" % (fg, bg, ratio, floor))
-
-# The hierarchy has to stay a hierarchy: each tone dimmer than the last.
-check(luminance(tok("--text")) > luminance(tok("--muted")) > luminance(tok("--dim"))
-      > luminance(tok("--line")),
-      "text > muted > dim > line in luminance")
+# High contrast is held to AAA: 7:1 for text, 4.5:1 for a line or a ring.
+FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5)}
+for theme_name in sorted(THEMES):
+    text_lift, graphic_lift = FLOOR_LIFT[theme_name]
+    for fg, bg, floor in TEXT_ON:
+        lift = 0.0 if fg.startswith("--canvas") or bg.startswith("--canvas") else text_lift
+        ratio = contrast(tok(fg, theme_name), tok(bg, theme_name))
+        check(ratio >= floor + lift, "[%s] %s on %s = %.2f:1 (floor %.1f)"
+              % (theme_name, fg, bg, ratio, floor + lift))
+    for fg, bg, floor in GRAPHIC_ON:
+        ratio = contrast(tok(fg, theme_name), tok(bg, theme_name))
+        check(ratio >= floor + graphic_lift, "[%s] %s on %s = %.2f:1 (floor %.1f)"
+              % (theme_name, fg, bg, ratio, floor + graphic_lift))
+    # The hierarchy has to stay a hierarchy: each tone quieter than the
+    # last against the page, whichever way round light and dark are.
+    against_bg = [contrast(tok(role, theme_name), tok("--bg", theme_name))
+                  for role in ("--text", "--muted", "--dim", "--line")]
+    check(against_bg[0] > against_bg[1] > against_bg[2] > against_bg[3],
+          "[%s] text > muted > dim > line against the page" % theme_name)
 
 # --------------------------------------------------------------------------
 # 2. The desktop console carries the same values.
@@ -175,6 +219,18 @@ for page in ("index.html", "login.html", "ssh.html"):
 server = read(REPO_ROOT, "netpath", "web", "server.py")
 check('"/tokens.css"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
       "server.py serves /tokens.css before sign-in")
+check('"/boot.js"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
+      "server.py serves /boot.js before sign-in (the theme must not flash on the sign-in page)")
+boot = read(STATIC, "boot.js")
+check("sappiwhere.theme" in boot and "dataset.theme" in boot,
+      "boot.js applies the stored theme before first paint")
+for page in ("index.html", "login.html", "ssh.html"):
+    body = read(STATIC, page)
+    check('<script src="/boot.js"></script>' in body, "%s loads boot.js blocking, in <head>" % page)
+    check('class="brand"' in body and 'class="mark"' in body, "%s carries the wordmark" % page)
+    marks = re.findall(r"<svg class=\"mark\".*?</svg>", body, re.S)
+    check(marks and not any(re.search(r"#[0-9A-Fa-f]{3,6}\b", m) for m in marks),
+          "%s: the inline mark is coloured by the theme, not by hex" % page)
 
 # --------------------------------------------------------------------------
 # 5. The landmark and the skip link.

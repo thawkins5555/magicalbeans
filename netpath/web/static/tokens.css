@@ -16,6 +16,14 @@
    theme later redefines the values under :root[data-theme] and nothing else
    has to move. */
 :root {
+  /* Dark is the default and needs no attribute. boot.js sets
+     data-theme="light" or "contrast" on <html> before first paint from the
+     browser's stored choice; the two blocks at the end of this file redefine
+     the tones under those attributes and nothing else in the product has to
+     know. color-scheme tells the browser which way to draw the parts it
+     owns: scrollbars, the date picker, a <select>'s dropdown. */
+  color-scheme: dark;
+
   /* ------------------------------------------------------------ surfaces
      Four steps of dark, each one a hairline apart. --bg is the page and the
      dialog; --panel is a card on it; --raised is a table's alternate stripe
@@ -199,4 +207,84 @@
   --z-stale: 40;      /* "the server has gone away" banner */
   --z-idle: 60;       /* the sign-out countdown */
   --z-skip: 100;      /* the skip link, when it has focus */
+}
+
+/* ================================================================ themes
+   Every value below is a role from the block above given a new value, and
+   tests/test_design_tokens.py recomputes every contrast pair for each
+   theme exactly as it does for the dark one — light at the same AA floors,
+   high contrast at AAA (7:1 text, 4.5:1 graphics). A theme block must
+   define the full set of surfaces, text tones, structure, emphasis, meaning
+   and selection tokens: a dark tone inherited by accident onto a light
+   ground is invisible, and the test refuses a block that leaves one out.
+
+   The --canvas-* set is untouched by both: the route canvas is already a
+   light palette measured on white, and it prints. The desktop console
+   (theme.py) stays on the dark palette; it is a service window, not the
+   operator's screen. */
+
+/* High contrast: the same hues, pushed apart. Near-black ground, near-white
+   text at 18.5:1, every tone at least 7:1 as text and 4.5:1 as a line. A
+   white focus ring, because on this ground the accent is a colour and a
+   ring must be a flash. */
+:root[data-theme="contrast"] {
+  --bg: #07090C;
+  --panel: #0B0E12;
+  --raised: #11151B;
+  --hairline: #2E3745;
+  --grid: #1F2731;
+  --text: #F2F6FA;
+  --muted: #C3CCD6;
+  --dim: #AEB8C4;
+  --line: #8A96A5;
+  --data-neutral: #7C889A;
+  --accent: #9EC1FF;
+  --accent-hover: #BDD5FF;
+  --focus: #FFFFFF;
+  --ok: #5FD97A;
+  --warn: #F0C25A;
+  --fail: #FF8580;
+  --blocked: #FFA07A;
+  --overrun: #7FD9CF;
+  --error: #C9A6FF;
+  --nodata: #161B22;
+  --selected: #1A2537;
+  --checked: #22314F;
+  --checked-strong: #2F4778;
+}
+
+/* Light: the route canvas's palette applied to the chrome. The canvas has
+   been a light theme measured against white since 4.42.0; the surfaces,
+   greys and semantic hues here are its values, with the selection tints
+   and shadows that a light ground needs. The badge fills (--fail, --warn,
+   --accent) carry --bg as their text, so each is dark enough to hold white
+   text AND to read as text on white — the canvas hues already do both. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #FFFFFF;
+  --panel: #F4F6F9;
+  --raised: #E9EDF2;
+  --hairline: #C9D2DD;
+  --grid: #DDE3EB;
+  --text: #161C24;
+  --muted: #4E5967;
+  --dim: #5E6975;
+  --line: #76818F;
+  --data-neutral: #7F8A98;
+  --accent: #2F5FC4;
+  --accent-hover: #244FA8;
+  --focus: #1D4FB8;
+  --ok: #1B7F3B;
+  --warn: #9A6510;
+  --fail: #B3261E;
+  --blocked: #A63D10;
+  --overrun: #0F766E;
+  --error: #6D3FC7;
+  --nodata: #E4E9F0;
+  --selected: #E6EEFA;
+  --checked: #D6E3F7;
+  --checked-strong: #BFD3F2;
+  --shadow-pop: 0 12px 40px rgba(20, 30, 45, 0.25);
+  --shadow-float: 0 6px 20px rgba(20, 30, 45, 0.2);
+  --scrim: rgba(20, 30, 45, 0.45);
 }

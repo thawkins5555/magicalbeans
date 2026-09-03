@@ -728,9 +728,13 @@
   }
 
   function beginPan(event) {
-    if (event.button !== 0 || !view.frame) return;
+    if (event.button !== 0 || !event.isPrimary || !view.frame) return;
     // Suppress the browser's own drag-select before it begins.
     event.preventDefault();
+    // Captured: the svg keeps receiving the gesture after the pointer has
+    // left it, which is what "a drag that leaves the canvas still ends"
+    // needs — and a finger or a pen gets the same treatment as a mouse.
+    event.currentTarget.setPointerCapture(event.pointerId);
     const selection = window.getSelection();
     if (selection) selection.removeAllRanges();
     view.panDrag = {
@@ -931,8 +935,10 @@
       }));
     }
 
-    svg.onmousedown = (event) => {
+    svg.onpointerdown = (event) => {
+      if (event.button !== 0 || !event.isPrimary) return;
       event.preventDefault();
+      svg.setPointerCapture(event.pointerId);
       const x = event.offsetX * (width / svg.clientWidth);
       view.drag = { from: timeAt(x), to: timeAt(x), moved: false };
     };
@@ -942,7 +948,7 @@
     });
     svg.appendChild(crosshair);
 
-    svg.onmousemove = (event) => {
+    svg.onpointermove = (event) => {
       const x = event.offsetX * (width / svg.clientWidth);
       if (view.drag) {
         view.drag.to = timeAt(x);
@@ -955,17 +961,19 @@
       crosshair.setAttribute('visibility', 'visible');
       App.tooltip(bucketTip(timeAt(x)), event);
     };
-    svg.onmouseleave = () => {
+    svg.onpointerleave = () => {
       crosshair.setAttribute('visibility', 'hidden');
       App.hideTooltip();
     };
-    svg.onmouseup = () => {
+    svg.onpointerup = () => {
       if (!view.drag) return;
       const { from, to, moved } = view.drag;
       view.drag = null;
       if (moved) { view.pinned = null; setWindow(Math.min(from, to), Math.max(from, to), false); }
       else { view.pinned = from; App.refreshNow('netpath'); }
     };
+    // A cancelled gesture selects nothing and pins nothing.
+    svg.onpointercancel = () => { view.drag = null; drawTimeline(); };
     svg.oncontextmenu = (event) => {
       event.preventDefault();
       view.pinned = null;
@@ -1177,10 +1185,13 @@
 
     const routeSvg = App.el('route-svg');
     routeSvg.addEventListener('wheel', wheelZoom, { passive: false });
-    routeSvg.addEventListener('mousedown', beginPan);
-    // Tracked on the window so a drag that leaves the canvas still ends.
-    window.addEventListener('mousemove', movePan);
-    window.addEventListener('mouseup', endPan);
+    routeSvg.addEventListener('pointerdown', beginPan);
+    // beginPan captures the pointer, so these fire on the svg for the whole
+    // gesture wherever it wanders; cancel (a touch turned into a scroll,
+    // a pen lifted out of range) ends it like a release.
+    routeSvg.addEventListener('pointermove', movePan);
+    routeSvg.addEventListener('pointerup', endPan);
+    routeSvg.addEventListener('pointercancel', endPan);
     App.el('route-live').onclick = () => {
       view.pinned = null;
       App.refreshNow('netpath');

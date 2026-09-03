@@ -13,6 +13,7 @@ body.ssh-page {
   background: var(--panel);
   border-bottom: 1px solid var(--hairline);
 }
+#ssh-bar .brand { margin-right: 6px; }
 .ssh-ip {
   font-family: var(--mono);
   font-size: var(--fs-xs);

@@ -11,6 +11,7 @@ const App = (() => {
     timer: null,
     modalLocked: false,
     permissions: {},   // {module: 'read'|'write'}, from /api/state
+    kiosk: false,      // opened as /?kiosk=1: a wall display, see initKiosk
   };
 
   /* write implies read; a module absent from state.permissions means no
@@ -521,8 +522,8 @@ const App = (() => {
      heartbeat call, sent at most every HEARTBEAT_GAP_MS so a moving mouse
      does not turn into a request per frame. */
 
-  const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'keydown', 'touchstart',
-                           'scroll', 'wheel'];
+  const ACTIVITY_EVENTS = ['mousemove', 'mousedown', 'pointerdown', 'keydown',
+                           'touchstart', 'scroll', 'wheel'];
   const HEARTBEAT_GAP_MS = 20_000;
   const WARNING_MS = 60_000;
 
@@ -531,6 +532,8 @@ const App = (() => {
   let idleRemainingMs = null;   // null until the first /api/state reply
   let maxRemainingMs = null;    // the absolute ceiling, which activity cannot move
   let idleBanner = null;
+  let kioskHeld = null;         // null: not yet asked; true: held; false: refused
+  let kioskNote = '';
 
   for (const name of ACTIVITY_EVENTS) {
     window.addEventListener(name, () => { lastActivity = Date.now(); },
@@ -567,10 +570,22 @@ const App = (() => {
     }
 
     const active = now - lastActivity < HEARTBEAT_GAP_MS;
-    if (active && now - lastHeartbeat >= HEARTBEAT_GAP_MS) {
+    // A wall display has nobody at the keyboard, so in kiosk mode the
+    // heartbeat goes anyway, flagged as such — and the SERVER decides
+    // whether to honour it: only an account with no write grant anywhere
+    // is kept signed in (api.post_heartbeat). One refusal is final for the
+    // session; the kiosk bar shows the reason and the idle rules apply.
+    const holding = state.kiosk && !active && kioskHeld !== false;
+    if ((active || holding) && now - lastHeartbeat >= HEARTBEAT_GAP_MS) {
       lastHeartbeat = now;
       try {
-        const result = await post('/api/heartbeat', {});
+        const result = await post('/api/heartbeat', holding ? { kiosk: true } : {});
+        if (holding && result.ok === false) {
+          kioskHeld = false;
+          kioskNote = result.reason || 'this account can write, so the idle sign-out applies';
+          return;
+        }
+        if (holding) kioskHeld = true;
         idleRemainingMs = (result.idle_timeout_minutes || 0) * 60_000;
         hideIdleWarning();
       } catch (error) { /* a session that has actually expired 401s, which
@@ -1632,6 +1647,37 @@ const App = (() => {
     }
   }
 
+  /* A tile and a figure: the Dashboard's building blocks, shared so the
+     wall-display strips (kiosk mode) and any future summary use the same
+     markup and the same CSS (.tile, .figures, .figure). A figure is one
+     number with its label under it and, when `route` is given, a link to
+     where the number can be acted on. */
+  function tile(title, bodyHtml, options = {}) {
+    const cls = ['card', 'tile'];
+    if (options.wide) cls.push('wide');
+    if (options.tone) cls.push(`tone-${options.tone}`);
+    return `<section class="${cls.join(' ')}">
+      <h3>${escapeHtml(title)}</h3>
+      ${bodyHtml}
+    </section>`;
+  }
+
+  function figure(value, label, route, options = {}) {
+    const text = typeof value === 'number' ? value.toLocaleString() : String(value);
+    const cls = ['figure'];
+    if (options.className) cls.push(options.className);
+    const inner = `<span class="figure-value">${escapeHtml(text)}</span>` +
+      `<span class="figure-label">${escapeHtml(label)}</span>`;
+    if (!route) return `<span class="${cls.join(' ')}">${inner}</span>`;
+    return `<a class="${cls.join(' ')}" href="${escapeHtml(route)}"` +
+      `${options.title ? ` title="${escapeHtml(options.title)}"` : ''}>${inner}</a>`;
+  }
+
+  // A row of figures: [{value, label, route?, className?, title?}, …].
+  function figures(items) {
+    return `<div class="figures">${items.map((f) => figure(f.value, f.label, f.route, f)).join('')}</div>`;
+  }
+
   /* One status renderer for the whole application.
 
      `tone` is the meaning — ok, warn, fail, info or none — not the colour,
@@ -1789,11 +1835,23 @@ const App = (() => {
     } catch (error) { /* private browsing, or storage full: not worth failing */ }
   }
 
+  /* Splitter dividers are separators in the ARIA sense: focusable, with an
+     orientation and a value, movable from the keyboard. Their orientation is
+     read when a gesture starts rather than once at load, because app.css
+     stacks the side-by-side (.cols) layouts below 900 px and a divider
+     wired as horizontal at load would then drag along the wrong axis.
+     applyDensity() re-reads it on resize through the callbacks below. */
+  const dividerAria = [];
+  const PANE_MINIMUM = 60;
+
+  function isVertical(container) {
+    return getComputedStyle(container).flexDirection.startsWith('column');
+  }
+
   function initSplitters() {
     const layout = loadLayout();
     for (const container of document.querySelectorAll('[data-splitter]')) {
       const name = container.dataset.splitter;
-      const vertical = container.classList.contains('rows');
       const panes = [...container.children].filter((el) => el.classList.contains('pane'));
       const saved = layout[name];
 
@@ -1805,74 +1863,135 @@ const App = (() => {
       });
 
       for (const divider of container.querySelectorAll(':scope > .divider')) {
-        wireDivider(container, divider, vertical, name, panes);
+        wireDivider(container, divider, name, panes);
       }
     }
   }
 
-  function wireDivider(container, divider, vertical, name, panes) {
-    divider.addEventListener('mousedown', (event) => {
-      event.preventDefault();
-      const before = divider.previousElementSibling;
-      const after = divider.nextElementSibling;
-      if (!before || !after) return;
+  function wireDivider(container, divider, name, panes) {
+    divider.setAttribute('role', 'separator');
+    divider.tabIndex = 0;
+    divider.setAttribute('aria-label', `Resize ${name.replace(/-/g, ' ')} panes`);
 
-      const startPos = vertical ? event.clientY : event.clientX;
+    const neighbours = () => ({
+      before: divider.previousElementSibling, after: divider.nextElementSibling,
+    });
+    // The pair's sizes and combined growth, measured now.
+    const measure = (vertical, before, after) => {
       const beforeBox = before.getBoundingClientRect();
       const afterBox = after.getBoundingClientRect();
       const beforeSize = vertical ? beforeBox.height : beforeBox.width;
       const afterSize = vertical ? afterBox.height : afterBox.width;
-      const total = beforeSize + afterSize;
-      const growTotal = Number(before.style.flexGrow) + Number(after.style.flexGrow);
-      const minimum = 60;
+      return {
+        beforeSize, total: Math.max(beforeSize + afterSize, 1),
+        growTotal: (Number(before.style.flexGrow) + Number(after.style.flexGrow)) || 1,
+      };
+    };
+    // One writer for the pair: the drag, the keys and the reset all land
+    // here, so the ARIA value and the chart re-measure can never be skipped.
+    const setShare = (before, after, growTotal, share) => {
+      before.style.flexGrow = String(growTotal * share);
+      after.style.flexGrow = String(growTotal * (1 - share));
+      divider.setAttribute('aria-valuenow', String(Math.round(share * 100)));
+      window.dispatchEvent(new Event('panes-resized'));
+    };
+    const persist = () => {
+      const layout = loadLayout();
+      layout[name] = panes.map((pane) => Number(pane.style.flexGrow));
+      saveLayout(layout);
+    };
+    const refreshAria = () => {
+      const { before, after } = neighbours();
+      if (!before || !after) return;
+      // aria-orientation describes the SEPARATOR: a bar between columns is
+      // vertical, one between rows is horizontal.
+      divider.setAttribute('aria-orientation', isVertical(container) ? 'horizontal' : 'vertical');
+      const growTotal = (Number(before.style.flexGrow) + Number(after.style.flexGrow)) || 1;
+      divider.setAttribute('aria-valuenow',
+                           String(Math.round(100 * Number(before.style.flexGrow) / growTotal)));
+    };
+    refreshAria();
+    dividerAria.push(refreshAria);
+
+    divider.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || !event.isPrimary) return;
+      const { before, after } = neighbours();
+      if (!before || !after) return;
+      event.preventDefault();
+      const vertical = isVertical(container);
+      const startPos = vertical ? event.clientY : event.clientX;
+      const m = measure(vertical, before, after);
 
       document.body.classList.add(vertical ? 'resizing-v' : 'resizing-h');
+      // Captured, so the gesture keeps reporting to the divider after the
+      // pointer has left it — the reason the old mouse version listened
+      // on document. Works for a finger and a pen exactly as for a mouse.
+      divider.setPointerCapture(event.pointerId);
 
       /* The pointer reports far more often than the screen paints, and
          every 'panes-resized' listener rebuilds a chart from scratch, so
          the work is done once per frame from the latest position rather
          than once per event. Without this a drag on the NetPath divider
-         tore down and redrew two SVGs per mousemove. */
+         tore down and redrew two SVGs per move. */
       let frame = 0;
       let latest = startPos;
       const apply = () => {
         frame = 0;
-        const delta = latest - startPos;
-        let first = beforeSize + delta;
-        first = Math.max(minimum, Math.min(first, total - minimum));
-        const share = first / total;
-        before.style.flexGrow = String(growTotal * share);
-        after.style.flexGrow = String(growTotal * (1 - share));
-        window.dispatchEvent(new Event('panes-resized'));
+        let first = m.beforeSize + (latest - startPos);
+        first = Math.max(PANE_MINIMUM, Math.min(first, m.total - PANE_MINIMUM));
+        setShare(before, after, m.growTotal, first / m.total);
       };
       const move = (moveEvent) => {
         latest = vertical ? moveEvent.clientY : moveEvent.clientX;
         if (!frame) frame = requestAnimationFrame(apply);
       };
-
       const up = () => {
-        document.removeEventListener('mousemove', move);
-        document.removeEventListener('mouseup', up);
+        divider.removeEventListener('pointermove', move);
+        divider.removeEventListener('pointerup', up);
+        divider.removeEventListener('pointercancel', up);
         if (frame) { cancelAnimationFrame(frame); apply(); }
         document.body.classList.remove('resizing-v', 'resizing-h');
-        const layout = loadLayout();
-        layout[name] = panes.map((pane) => Number(pane.style.flexGrow));
-        saveLayout(layout);
-        window.dispatchEvent(new Event('panes-resized'));
+        persist();
       };
-
-      document.addEventListener('mousemove', move);
-      document.addEventListener('mouseup', up);
+      divider.addEventListener('pointermove', move);
+      divider.addEventListener('pointerup', up);
+      divider.addEventListener('pointercancel', up);
     });
 
-    divider.addEventListener('dblclick', () => {
+    const reset = () => {
       const layout = loadLayout();
       delete layout[name];
       saveLayout(layout);
       panes.forEach((pane) => {
         pane.style.flexGrow = String(Number(pane.dataset.grow || 1));
       });
+      refreshAria();
       window.dispatchEvent(new Event('panes-resized'));
+    };
+    divider.addEventListener('dblclick', reset);
+
+    // Arrow keys along the divider's axis move it 5 % (Shift: 1 %); Home and
+    // End park it at the minimum pane; Enter resets, like a double-click.
+    divider.addEventListener('keydown', (event) => {
+      const { before, after } = neighbours();
+      if (!before || !after) return;
+      const vertical = isVertical(container);
+      const less = vertical ? 'ArrowUp' : 'ArrowLeft';
+      const more = vertical ? 'ArrowDown' : 'ArrowRight';
+      const m = measure(vertical, before, after);
+      const floor = PANE_MINIMUM / m.total;
+      const step = event.shiftKey ? 0.01 : 0.05;
+      const share = m.beforeSize / m.total;
+      let next;
+      if (event.key === less) next = share - step;
+      else if (event.key === more) next = share + step;
+      else if (event.key === 'Home') next = floor;
+      else if (event.key === 'End') next = 1 - floor;
+      else if (event.key === 'Enter') { event.preventDefault(); reset(); return; }
+      else return;
+      event.preventDefault();
+      setShare(before, after, m.growTotal, Math.max(floor, Math.min(next, 1 - floor)));
+      persist();
     });
   }
 
@@ -2268,6 +2387,10 @@ const App = (() => {
     const row = document.createElement('tr');
     columns.forEach((column, index) => {
       const th = document.createElement('th');
+      // Set where the grip is built (every column but the last); read by the
+      // header's keydown. Declared here, outside the sortable branch, so both
+      // see the same binding.
+      let resizeColumn = null;
       // `scope` is what lets assistive tech say which column a cell belongs
       // to; `columnheader` is the implicit role but stated so the sortable
       // headers below (which take a tabindex) keep it once focusable.
@@ -2348,6 +2471,15 @@ const App = (() => {
           doSort();
         });
         th.addEventListener('keydown', (event) => {
+          // Alt+Arrow resizes the column the header is focused on, the
+          // keyboard's answer to the grip (which is decoration, aria-hidden).
+          if (event.altKey && resizeColumn
+              && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+            event.preventDefault();
+            resizeColumn(th.getBoundingClientRect().width
+                         + (event.key === 'ArrowRight' ? 16 : -16));
+            return;
+          }
           if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') {
             return;
           }
@@ -2359,11 +2491,28 @@ const App = (() => {
       if (index < columns.length - 1) {
         const grip = document.createElement('span');
         grip.className = 'grip';
-        // A mouse-only resize handle: not focusable, and not announced.
+        // The grip is decoration for the pointer; the keyboard resizes
+        // through the header itself (Alt+Arrow, above), so the grip is
+        // neither focusable nor announced.
         grip.setAttribute('aria-hidden', 'true');
-        grip.addEventListener('mousedown', (event) => {
+        th.setAttribute('aria-keyshortcuts', 'Alt+ArrowLeft Alt+ArrowRight');
+        // One writer for the column's width — drag and keys both land here.
+        const setWidth = (next) => {
+          colgroup.children[index].style.width = `${Math.max(40, Math.round(next))}px`;
+        };
+        const persist = () => {
+          const all = loadColumns();
+          all[name] = all[name] || {};
+          all[name][column.key] =
+            Math.round(parseFloat(colgroup.children[index].style.width) || 0);
+          saveColumns(all);
+        };
+        resizeColumn = (next) => { setWidth(next); persist(); };
+        grip.addEventListener('pointerdown', (event) => {
+          if (event.button !== 0 || !event.isPrimary) return;
           event.preventDefault();
           event.stopPropagation();
+          grip.setPointerCapture(event.pointerId);
           const startX = event.clientX;
           const startWidth = th.getBoundingClientRect().width;
           // One colgroup write per frame, not per pointer event (see
@@ -2372,8 +2521,7 @@ const App = (() => {
           let latestX = startX;
           const apply = () => {
             frame = 0;
-            const next = Math.max(40, startWidth + latestX - startX);
-            colgroup.children[index].style.width = `${next}px`;
+            setWidth(startWidth + latestX - startX);
             th.dataset.dragged = '1';
           };
           const move = (moveEvent) => {
@@ -2381,17 +2529,15 @@ const App = (() => {
             if (!frame) frame = requestAnimationFrame(apply);
           };
           const up = () => {
-            document.removeEventListener('mousemove', move);
-            document.removeEventListener('mouseup', up);
+            grip.removeEventListener('pointermove', move);
+            grip.removeEventListener('pointerup', up);
+            grip.removeEventListener('pointercancel', up);
             if (frame) { cancelAnimationFrame(frame); apply(); }
-            const all = loadColumns();
-            all[name] = all[name] || {};
-            all[name][column.key] =
-              Math.round(parseFloat(colgroup.children[index].style.width) || 0);
-            saveColumns(all);
+            persist();
           };
-          document.addEventListener('mousemove', move);
-          document.addEventListener('mouseup', up);
+          grip.addEventListener('pointermove', move);
+          grip.addEventListener('pointerup', up);
+          grip.addEventListener('pointercancel', up);
         });
         th.appendChild(grip);
       }
@@ -2682,8 +2828,94 @@ const App = (() => {
      laptop cannot spare 260 pixels of chart the way a desktop monitor can. */
   function applyDensity() {
     const height = window.innerHeight;
-    document.body.classList.toggle('compact', height < 900);
-    document.body.classList.toggle('tiny', height < 700);
+    // A wall is not a laptop: kiosk mode never tightens, whatever the height.
+    document.body.classList.toggle('compact', !state.kiosk && height < 900);
+    document.body.classList.toggle('tiny', !state.kiosk && height < 700);
+    // Width, too (app.css stacks the side-by-side panes below 900 px); the
+    // class lets scripts ask the same question the stylesheet answers.
+    document.body.classList.toggle('narrow', window.innerWidth < 900);
+    // A stacked .cols splitter is now a horizontal separator: its ARIA says so.
+    for (const refresh of dividerAria) refresh();
+  }
+
+  /* ------------------------------------------------------------- theme
+
+     Three palettes in tokens.css — dark (the default, no attribute), light
+     and high contrast — selected per BROWSER, not per account: it is a
+     property of the screen and the eyes in front of it, and a shared NOC
+     workstation keeps its choice across sign-ins. boot.js reads the same
+     key before first paint so no frame is drawn in the wrong theme; this
+     is the half that changes it while the page is up. Charts follow for
+     free: every fill in the product is a var(--token). */
+  const THEME_KEY = 'sappiwhere.theme';
+  const THEMES = ['dark', 'light', 'contrast'];
+
+  function currentTheme() {
+    const theme = document.documentElement.dataset.theme;
+    return THEMES.includes(theme) ? theme : 'dark';
+  }
+
+  function setTheme(name, options = {}) {
+    const theme = THEMES.includes(name) ? name : 'dark';
+    // Dark is the absence of the attribute, so a browser that has never
+    // chosen has nothing stored and nothing to migrate.
+    if (theme === 'dark') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
+    if (!options.silent) {
+      try { localStorage.setItem(THEME_KEY, theme); } catch (error) { /* private browsing: applies until reload */ }
+    }
+    const select = document.getElementById('set-theme');
+    if (select && select.value !== theme) select.value = theme;
+    window.dispatchEvent(new Event('theme-changed'));
+  }
+
+  // Another tab on this browser changed it: follow, without writing it back.
+  window.addEventListener('storage', (event) => {
+    if (event.key === THEME_KEY) setTheme(event.newValue || 'dark', { silent: true });
+  });
+
+  /* ------------------------------------------------------------- kiosk
+
+     /?kiosk=1 is a wall display: no tab strip, a quarter larger through the
+     rem root, and one thin bar naming the view, the time and how long the
+     session has left. Read from the query string (the hash is the route
+     and stays free), preserved by writeRoute and handed back through
+     sign-in by login.js, so a bookmark works as one. */
+  function initKiosk() {
+    let wanted = false;
+    try {
+      wanted = new URLSearchParams(window.location.search).get('kiosk') === '1';
+    } catch (error) { wanted = false; }
+    state.kiosk = wanted;
+    if (!wanted) return;
+    document.documentElement.dataset.kiosk = '1';
+    document.body.classList.add('kiosk');
+    const bar = document.getElementById('kiosk-bar');
+    if (bar) bar.hidden = false;
+  }
+
+  let lastKioskDraw = 0;
+  function drawKioskBar(now) {
+    if (!state.kiosk || now - lastKioskDraw < 1000) return;
+    lastKioskDraw = now;
+    const tab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
+    const label = document.getElementById('kiosk-tab');
+    if (label && tab) label.textContent = tab.textContent.replace(/\d+$/, '').trim();
+    const clockEl = document.getElementById('kiosk-clock');
+    if (clockEl) clockEl.textContent = clock(now / 1000);
+    const sessionEl = document.getElementById('kiosk-session');
+    if (!sessionEl) return;
+    const user = (state.serverState && state.serverState.session
+                  && state.serverState.session.username) || '';
+    const parts = [];
+    if (user) parts.push(`signed in as ${user}`);
+    if (kioskNote) parts.push(kioskNote);
+    if (maxRemainingMs != null) {
+      parts.push(`session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}`);
+    }
+    sessionEl.textContent = parts.join(' · ');
+    sessionEl.classList.toggle('warn', !!kioskNote
+      || (maxRemainingMs != null && maxRemainingMs < 15 * 60_000));
   }
 
 
@@ -2966,6 +3198,7 @@ const App = (() => {
     }
 
     idleTick(now);
+    drawKioskBar(now);
 
     const page = pages[state.tab];
     if (!page) return;
@@ -3150,10 +3383,11 @@ const App = (() => {
     // Before any module's init() builds a form that depends on it.
     await loadPlatform();
 
+    initKiosk();
+    initSplitters();
     applyDensity();
     window.addEventListener('resize', applyDensity);
     document.addEventListener('visibilitychange', onVisibilityChange);
-    initSplitters();
 
     // Every module initialises inside its own try/catch, because this loop
     // used to be the single point of failure for the entire application: one
@@ -3248,7 +3482,7 @@ const App = (() => {
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,
-    resetLayout,
+    resetLayout, setTheme, currentTheme, tile, figure, figures,
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub,

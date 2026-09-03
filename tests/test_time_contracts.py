@@ -101,6 +101,8 @@ check("<legend>LISTENER</legend>" not in read("snmp.js") and "<legend>RECEIVER</
       "SNMP settings call it a receiver, like its strip")
 check("<legend>LISTENER</legend>" not in read("syslog.js"), "Syslog settings call it a collector, like its strip")
 check("tile('Workers'" in read("dashboard.js"), "the Dashboard tile is 'Workers'")
+check("App.tile" in read("dashboard.js") and "function tile(" not in read("dashboard.js"),
+      "the Dashboard draws its tiles with the shared App.tile")
 
 # --------------------------------------------------------------------------
 # 5. Labels that follow state.

@@ -10,6 +10,7 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 ## Contents
 
 - [How it runs](#how-it-runs)
+- [Appearance, screens and the wall](#appearance-screens-and-the-wall)
 - [Dashboard — the screen a shift starts on](#dashboard--the-screen-a-shift-starts-on)
 - [Nodes — SNMP poller and device inventory](#nodes--snmp-poller-and-device-inventory)
 - [Alerts — rule-based alerting and email notification](#alerts--rule-based-alerting-and-email-notification)
@@ -121,6 +122,50 @@ The Debug page is deliberately outside this: its tables are live worker state
 rather than records to work through.
 
 ---
+
+## Appearance, screens and the wall
+
+### Themes
+
+Three, chosen on the Settings tab under **Appearance · this browser**: Dark
+(the default), Light, and High contrast. The choice is stored in the browser,
+not on the server — it belongs to the screen and the eyes in front of it, so
+a shared NOC workstation keeps it across sign-ins and every account on that
+machine sees it. It applies at once, needs no Apply, and the sign-in page
+follows it. Light is the route canvas's palette applied to the whole
+interface; High contrast keeps the same hues and pushes them apart to at
+least 7:1. Charts follow the theme because every colour in the product is a
+token.
+
+### Any width
+
+Below about 1200 px the sidebar narrows and dialogs size to the window;
+below 900 px side-by-side panes stack and the NetPath destination list moves
+above the route. The layout is measured down to 768 px (a tablet); below
+that nothing is clipped, but nothing is designed for a phone either.
+
+### Touch, pen and keyboard
+
+Every drag — pane splitters, column grips, panning the route, brushing a
+time range on a chart — works from a finger or a pen as it does from a
+mouse. A pane splitter can be moved from the keyboard: Tab to it, arrow keys
+move it 5 % (1 % with Shift), Home and End park it, Enter resets it, exactly
+as a double-click does. A column header resizes with Alt+Left/Right.
+
+### On a wall — `/?kiosk=1`
+
+Open the application as `/?kiosk=1#/dashboard` (any tab route works) for a
+wall display: the tab strip goes, everything is a quarter larger, and one
+thin bar names the view, shows the clock, the account, and **how long the
+session has left**. Sign-in keeps the flag, so a bookmark works.
+
+The session is held open — the heartbeat goes without anyone at the
+keyboard — **only for an account with no write permission on any module**.
+Create a read-only account for the wall. An administrator who opens kiosk
+mode is told in the bar that the idle sign-out still applies to them. The
+absolute session length (`session_max_hours`, 12 by default) is not
+extended by anything; the bar counts it down, and a site that wants a wall
+to run longer raises that setting.
 
 ## Dashboard — the screen a shift starts on
 

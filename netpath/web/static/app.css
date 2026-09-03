@@ -88,12 +88,16 @@ body {
 /* A tile is a .card (dashboard.js says so in the markup) and takes its
    surface, border, radius, padding and eyebrow from there. This used to be
    a sixth panel implementation with its own h3 rule that differed from
-   .card h3 by 0.2px of letter-spacing and 2px of margin. */
-.dash-tile.wide { grid-column: span 2; }
-@media (max-width: 900px) { .dash-tile.wide { grid-column: span 1; } }
-.dash-tile.tone-bad { border-color: var(--fail); }
-.dash-figures { display: flex; flex-wrap: wrap; gap: 16px; }
-.dash-figure {
+   .card h3 by 0.2px of letter-spacing and 2px of margin. The wide/tone
+   variants below are the tile's own. */
+.tile.wide { grid-column: span 2; }
+.tile.tone-bad { border-color: var(--fail); }
+/* A figure is one number with its label under it — the Dashboard's tiles
+   are made of them, and in kiosk mode the Nodes and Alerts strips render
+   their counters as a row of them (App.figures). One component, so a wall
+   display and the Dashboard are not two designs of the same thing. */
+.figures { display: flex; flex-wrap: wrap; gap: 16px; }
+.figure {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -101,16 +105,16 @@ body {
   color: var(--text);
   border-bottom: 2px solid transparent;
 }
-a.dash-figure:hover, a.dash-figure:focus-visible {
+a.figure:hover, a.figure:focus-visible {
   border-bottom-color: var(--accent);
   outline: none;
 }
-a.dash-figure:focus-visible .dash-value { text-decoration: underline; }
-.dash-value { font: 600 var(--fs-2xl)/1 var(--mono); }
-.dash-figure.ok .dash-value { color: var(--ok); }
-.dash-figure.warn .dash-value { color: var(--warn); }
-.dash-figure.fail .dash-value { color: var(--fail); }
-.dash-label { color: var(--muted); font-size: var(--fs-xs); }
+a.figure:focus-visible .figure-value { text-decoration: underline; }
+.figure-value { font: 600 var(--fs-2xl)/1 var(--mono); }
+.figure.ok .figure-value { color: var(--ok); }
+.figure.warn .figure-value { color: var(--warn); }
+.figure.fail .figure-value { color: var(--fail); }
+.figure-label { color: var(--muted); font-size: var(--fs-xs); }
 .dash-sev-list { margin-top: 10px; display: flex; flex-direction: column; gap: 2px; }
 .dash-sev-row,
 .dash-row {
@@ -150,6 +154,32 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .dash-bar-fill { display: block; height: 100%; background: var(--ok); }
 .dash-bar-fill.warn { background: var(--warn); }
 .dash-bar-fill.bad { background: var(--fail); }
+
+/* ----------------------------------------------------------------- brand
+   The wordmark: favicon.svg's route, drawn inline with classes so the theme
+   colours it, and the name in the tab face. An <h1> in the strip on the
+   application page, centred above the form on sign-in, the mark alone in
+   the SSH window's bar. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 10px 0 0;
+  padding: 0 12px 0 0;
+  border-right: 1px solid var(--hairline);
+  font: 600 var(--fs-sm)/1 var(--ui);
+  letter-spacing: var(--track-tab);
+  color: var(--text);
+  text-transform: none;
+  white-space: nowrap;
+}
+.brand a { display: inline-flex; align-items: center; gap: 8px; color: inherit; text-decoration: none; }
+.brand .mark { width: 18px; height: 18px; flex: none; }
+.brand .mark-route { fill: none; stroke: var(--accent); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.brand .mark-start { fill: var(--accent); }
+.brand .mark-hop { fill: var(--text); }
+.brand .mark-end { fill: var(--ok); }
+body.tiny .brand span { display: none; }
 
 /* ------------------------------------------------------------------ tabs */
 #tabs {
@@ -250,8 +280,11 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   color: var(--muted);
   margin: 2px 0 6px;
 }
-.nd-summary .nd-f { margin-right: 14px; white-space: nowrap; }
-.nd-summary .nd-v { color: var(--text); }
+/* Each field is an inline-block: fields wrap between each other as units,
+   and a long value wraps inside its own field instead of running off the
+   pane (a 200-character sysDescr used to). */
+.nd-summary .nd-f { display: inline-block; max-width: 100%; margin-right: 14px; vertical-align: top; }
+.nd-summary .nd-v { color: var(--text); overflow-wrap: anywhere; }
 .nd-summary .nd-err { color: var(--fail); }
 .nd-summary .warn-text { color: var(--warn); }
 /* The interfaces/events subtabs take whatever height is left under the
@@ -795,11 +828,16 @@ th.sort-asc .sort-caret, th.sort-desc .sort-caret { opacity: 1; }
 th .grip {
   position: absolute;
   top: 0;
-  right: -3px;
-  width: 7px;
+  /* Wholly inside its own header. It used to overhang the next cell by 3 px,
+     and since a sticky <th> is its own stacking context the later header
+     painted over that overhang — a pointer on the grip's centre landed on
+     the neighbour and the drag never started. */
+  right: 0;
+  width: 8px;
   height: 100%;
   cursor: col-resize;
   z-index: var(--z-sticky);
+  touch-action: none;
 }
 /* A visible resting tick between column headers — same reasoning as the
    pane dividers: a resize handle nobody can see might as well not exist. */
@@ -808,7 +846,7 @@ th .grip::after {
   position: absolute;
   top: 20%;
   bottom: 20%;
-  right: 3px;
+  right: 0;
   width: 1px;
   background: var(--line);
 }
@@ -827,7 +865,7 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
 .took { font-family: var(--mono); font-size: var(--fs-xs); color: var(--dim); }
 
 /* ---------------------------------------------------------------- debug */
-.cats { display: inline-flex; gap: 10px; }
+.cats { display: inline-flex; flex-wrap: wrap; gap: 10px; }
 .detail {
   flex: 1;
   margin: 0;
@@ -953,7 +991,16 @@ fieldset .hint { margin: 8px 0 0; }
   background: transparent;
   position: relative;
   z-index: var(--z-divider);
+  /* The drag is pointer-captured (app.js wireDivider); without this a
+     finger on the divider scrolls the page instead of moving the pane. */
+  touch-action: none;
 }
+/* A divider is a focusable separator: arrow keys move it (5 %, Shift 1 %),
+   Home/End park it, Enter resets it. The ring would sit around an 8 px
+   strip, so the focus indicator is the line itself turning accent, the
+   same signal hover gives. */
+.divider:focus-visible { outline: none; }
+.divider:focus-visible::after { background: var(--accent); }
 .rows > .divider { height: 8px; cursor: row-resize; }
 .cols > .divider { width: 8px; cursor: col-resize; }
 /* The grab area is wider than the visible line, so it is easy to hit.
@@ -972,6 +1019,11 @@ fieldset .hint { margin: 8px 0 0; }
 .divider:hover::after { background: var(--accent); }
 body.resizing-v, body.resizing-v * { cursor: row-resize !important; user-select: none; }
 body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select: none; }
+
+/* Dragged canvases: the route graph pans, the two brush charts select a
+   time range. Pointer capture handles the drag; this stops the browser
+   treating the same finger as a scroll. */
+#route-svg, .brush svg { touch-action: none; }
 
 /* --------------------------------------------------------- idle banner */
 .idle-banner {
@@ -1070,11 +1122,14 @@ body.login-page {
   width: 340px;
   padding: 26px 28px 22px;
 }
-.login-box h1 {
+.login-box .brand {
+  justify-content: center;
   margin: 0 0 18px;
+  padding: 0;
+  border: none;
   font-size: var(--fs-xl);
-  letter-spacing: var(--track-tab);
 }
+.login-box .brand .mark { width: 26px; height: 26px; }
 .login-box form { display: flex; flex-direction: column; gap: 4px; }
 .login-box label { margin-top: 10px; }
 .login-box input { padding: 8px 10px; font-size: var(--fs-md); }
@@ -1228,3 +1283,60 @@ body.login-page {
 .toast.info { border-left-color: var(--accent); }
 .err { color: var(--fail); }
 .warn-text { color: var(--warn); }
+
+/* ---------------------------------------------------------------- kiosk
+   /?kiosk=1 — a wall display. The root font grows a quarter, which through
+   the rem scale grows every size, row and figure with it; the tab strip
+   goes (there is nobody to click it) and the one-line bar below it takes
+   over: the mark, the view's name, the clock and the session's remaining
+   life. Height density never applies: a wall is not a laptop. */
+html[data-kiosk] { font-size: 125%; }
+body.kiosk #tabs { display: none; }
+.kiosk-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+  flex: none;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.kiosk-bar .brand { margin: 0; padding: 0; border: none; }
+.kiosk-tab { color: var(--text); font-weight: 600; letter-spacing: var(--track-tab); text-transform: uppercase; }
+.kiosk-clock { font-family: var(--mono); color: var(--text); }
+.kiosk-session.warn { color: var(--warn); }
+body.kiosk td { padding: 6px 10px; }
+body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
+.card.strip .figures { display: inline-flex; gap: 14px; }
+.card.strip .figure-value { font-size: var(--fs-lg); }
+
+/* ----------------------------------------------------------- breakpoints
+   Width, at last. Density above keys on height only, so a narrow, tall
+   window — a tablet, a half-screen split — got the full sidebar and a
+   420 px dialog. Two steps: below 1200 px the fixed widths become fluid;
+   below 900 px the side-by-side layouts stack. The .cols splitters keep
+   working when stacked because wireDivider reads the flex direction when
+   a drag starts, not once at load. 768 px is the floor the layout is
+   measured at; below it nothing is clipped, but nothing is designed. */
+@media (max-width: 1200px) {
+  .sidebar { width: 240px; }
+  .modal-box { min-width: 0; width: min(760px, calc(100vw - 32px)); }
+  .modal-box.wide { width: min(960px, calc(100vw - 32px)); }
+  .modal.help .modal-box { min-width: 0; width: min(600px, calc(100vw - 32px)); }
+  .login-box { width: min(340px, calc(100vw - 32px)); }
+  fieldset label input { max-width: 100%; }
+}
+@media (max-width: 900px) {
+  /* Both selectors the row rule uses, so the stack wins whichever one
+     painted the page (boot.js's first frame or app.js's .active). */
+  #page-netpath.active, html[data-tab="netpath"] #page-netpath.page { flex-direction: column; }
+  #page-netpath .sidebar { width: auto; max-height: 40vh; }
+  [data-splitter].cols { flex-direction: column; }
+  .cols > .divider { width: auto; height: 8px; cursor: row-resize; }
+  .cols > .divider::after { left: 12px; right: 12px; top: 3px; bottom: auto; width: auto; height: 2px; }
+  .tile.wide { grid-column: span 1; }
+  .card.strip { flex-wrap: wrap; row-gap: 6px; }
+  .card.strip > .stat, .card.strip > .hint { white-space: normal; }
+}

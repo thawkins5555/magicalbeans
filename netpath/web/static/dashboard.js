@@ -46,28 +46,11 @@
 
   /* ------------------------------------------------------------- tiles */
 
-  function tile(title, bodyHtml, options = {}) {
-    const cls = ['card', 'dash-tile'];
-    if (options.wide) cls.push('wide');
-    if (options.tone) cls.push(`tone-${options.tone}`);
-    return `<section class="${cls.join(' ')}">
-      <h3>${escape(title)}</h3>
-      ${bodyHtml}
-    </section>`;
-  }
-
-  /* One number with a label under it, as a link to where it can be acted on.
-     `route` is a hash route (E11); `hint` is the word under the figure. */
-  function figure(value, label, route, options = {}) {
-    const text = typeof value === 'number' ? value.toLocaleString() : String(value);
-    const cls = ['dash-figure'];
-    if (options.className) cls.push(options.className);
-    const inner = `<span class="dash-value">${escape(text)}</span>` +
-      `<span class="dash-label">${escape(label)}</span>`;
-    if (!route) return `<span class="${cls.join(' ')}">${inner}</span>`;
-    return `<a class="${cls.join(' ')}" href="${escape(route)}"` +
-      `${options.title ? ` title="${escape(options.title)}"` : ''}>${inner}</a>`;
-  }
+  /* tile() and figure() live in app.js (App.tile / App.figure) since
+     4.46.0: the kiosk strips render the same figures, so the component is
+     shared rather than the Dashboard's own. */
+  const tile = App.tile;
+  const figure = App.figure;
 
   function fleetTile(fleet) {
     const c = fleet.counts || {};
@@ -94,7 +77,7 @@
       : '<p class="warn-text">The poller is stopped — none of these figures '
         + 'is being updated.</p>';
     return tile(`Fleet · ${total.toLocaleString()} device(s)`,
-                `<div class="dash-figures">${figures}</div>${stopped}${poolLine}`,
+                `<div class="figures">${figures}</div>${stopped}${poolLine}`,
                 { wide: true });
   }
 
@@ -121,7 +104,7 @@
         + 'behind.</p>'
       : '';
     return tile('Open alerts',
-      `<div class="dash-figures">
+      `<div class="figures">
          ${figure(alerts.open || 0, 'open', '#/alerts?state=open',
                   { className: worst != null && worst <= 2 ? 'fail' : '' })}
          ${figure(alerts.acked || 0, 'acknowledged', '#/alerts?state=acked')}

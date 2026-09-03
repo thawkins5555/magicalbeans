@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.46.0 — Any screen, any hand, any wall](#4460--any-screen-any-hand-any-wall)
 - [4.45.0 — Twelve modules, one set of parts](#4450--twelve-modules-one-set-of-parts)
 - [4.44.0 — Since when, in which zone](#4440--since-when-in-which-zone)
 - [4.43.0 — Less over the wire](#4430--less-over-the-wire)
@@ -108,6 +109,93 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.46.0 — Any screen, any hand, any wall
+
+The stylesheet had one width breakpoint, for one dashboard tile. Density
+keyed on viewport height alone, so a narrow, tall window — a tablet, a
+half-screen split — got the full 290 px sidebar and a dialog that could not
+shrink below 420 px, inside a page that clips rather than scrolls. Every
+drag in the product started on `mousedown`: panel splitters, column grips,
+the route canvas, the two brush charts — nothing worked from a finger or a
+pen, and a splitter could not be moved from the keyboard at all. There was
+one theme. The product's name appeared on the sign-in page and nowhere else.
+And a wall display signed itself out: the idle timeout needs real input,
+and the absolute session ceiling arrived overnight as an unexplained
+sign-in page.
+
+**Width, at last.** Two breakpoints. Below 1200 px the fixed widths become
+fluid: the sidebar narrows, dialogs and the sign-in card size to the
+viewport, field widths cap at their container. Below 900 px the side-by-side
+layouts stack — every `.cols` splitter becomes rows, the NetPath sidebar
+moves above the canvas — and `body.narrow` lets scripts ask the same
+question. The layout is measured at 768 px: nothing is clipped on any of
+the twelve tabs. Found on the way: a device's long `sysDescr` ran off the
+detail pane at every width (fields now wrap inside themselves), and the
+Debug category checkboxes did not wrap.
+
+**Pointer events, captured, plus the keyboard.** The splitter, the column
+grip, the route pan and both brush charts start on `pointerdown` and
+capture the pointer, so the gesture keeps reporting to its element after
+leaving it — what the old document-level mouse listeners were for — and a
+touch or a pen gets the same treatment as a mouse (`touch-action: none` on
+each). A splitter reads its orientation when a drag starts, not once at
+load, so a stacked one drags the right way. Splitters are now real
+separators: focusable, with `aria-orientation` and `aria-valuenow`, moved
+5 % by the arrow keys (1 % with Shift), parked by Home/End, reset by Enter.
+Column headers resize with Alt+Arrow and say so in `aria-keyshortcuts`. One
+bug the migration exposed: the grip overhung the next header by 3 px, and
+since a sticky header is its own stacking context the neighbour painted
+over it — a pointer on the grip's centre landed on the wrong cell and the
+drag never began. It sits inside its own cell now.
+
+**Three themes, chosen per browser.** Dark stays the default and is the
+absence of an attribute. **Light** is the route canvas's palette — a light
+theme measured on white since 4.42.0 — applied to the chrome. **High
+contrast** is the same hues pushed apart: near-black ground, text at
+18.5:1, every tone at least 7:1 as text and 4.5:1 as a line. Both are
+`:root[data-theme]` blocks in `tokens.css`; charts follow for free because
+every fill in the product is a token. `boot.js` applies the stored choice
+before first paint on all three pages (it is now loaded by the sign-in and
+SSH pages too), and a new **Appearance · this browser** fieldset on Settings
+holds the selector — the one fieldset on that page that never touches the
+server, so a read-only operator may choose how their own screen looks.
+`tests/test_design_tokens.py` parses the token file per theme and
+recomputes every contrast pair for each; high contrast is held to AAA. The
+desktop console stays dark.
+
+**A wordmark.** The favicon's three-hop route, drawn inline with classes so
+the theme colours it, and the name in the tab face: the `<h1>` at the left
+of the tab strip, centred above the sign-in form, the mark alone in the SSH
+bar. The word drops out under tiny density and the whole strip in kiosk.
+
+**Tiles and figures are one component.** `App.tile` and `App.figure` moved
+out of the Dashboard into `app.js`; the Nodes and Alerts strips render
+their counters as figures on a wall.
+
+**`/?kiosk=1`.** A wall display: no tab strip, the root font a quarter
+larger (so every size, row and figure scales through the rem scale), and
+one thin bar with the mark, the view's name, the clock, the account and
+**how long the session has left** — the absolute ceiling is a countdown
+now, not a surprise. The session hold is enforced where the idle policy
+lives: the browser sends its heartbeat flagged `kiosk` with nobody at the
+keyboard, and `/api/heartbeat` honours it **only for an account with no
+write grant on any module**. An administrator's kiosk is refused, the bar
+says why, and the idle sign-out applies to them as before; the refusal does
+not extend the session, which is why `server.py` no longer touches the
+session for that one route before dispatch. The query string survives the
+sign-in bounce, so a bookmark works as a kiosk.
+
+Measured on the seeded instance: all twelve tabs clean of overflow at 1600,
+1200, 1024, 800 and 768 px; a divider dragged by pointer from 2.000/3.000
+to 1.593/3.407 and persisted, moved 32 → 41 % by two arrow presses and reset
+by Enter; a column widened 90 → 122 px by Alt+Arrow and to 225 px by a drag;
+the timeline brush selecting a window by pointer; light and high-contrast
+themes applied, surviving a reload and painting the sign-in page without a
+dark frame; kiosk as a read-only account sending a flagged heartbeat every
+20 s and holding, as an administrator refused once with the reason in the
+bar; zero console errors in all three themes for the admin, read-only and
+two-module accounts. New suite `tests/test_layout_contracts.py`.
 
 ### 4.45.0 — Twelve modules, one set of parts
 

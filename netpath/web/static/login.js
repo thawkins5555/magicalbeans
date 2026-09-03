@@ -42,7 +42,10 @@
       // than dropping them on the Dashboard with the link lost. The hash is
       // preserved by the redirect, so it is still here to hand back.
       const wanted = String(window.location.hash || '');
-      window.location.href = wanted.startsWith('#/') ? `/${wanted}` : '/';
+      // The query string rides along too: a wall display opened as
+      // /?kiosk=1 and bounced through sign-in should come back as one.
+      const search = String(window.location.search || '');
+      window.location.href = `/${search}${wanted.startsWith('#/') ? wanted : ''}`;
     } catch (err) {
       show('The server did not answer. It may have stopped.');
     } finally {

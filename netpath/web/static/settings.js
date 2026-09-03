@@ -475,6 +475,13 @@
         showUsage((App.state.serverState || {}).storage || {});
     }
     App.el('set-apply').onclick = apply;
+    // Client state: applied on change, stored per browser, never sent.
+    const theme = App.el('set-theme');
+    theme.value = App.currentTheme();
+    theme.onchange = () => {
+      App.setTheme(theme.value);
+      App.announce(`Theme: ${theme.options[theme.selectedIndex].text}`);
+    };
     App.el('set-revert').onclick = load;
     App.el('update-now').onclick = checkForUpdate;
     App.el('set-updates-enabled').onchange = setUpdatesEnabled;

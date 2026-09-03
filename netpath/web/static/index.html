@@ -20,9 +20,10 @@
 </head>
 <body>
 
-<!-- The document has to start with a name and a way past the twelve-item tab
-     bar; neither is worth pixels on a NOC screen, so both are sr-only. -->
-<h1 class="sr-only">SappiWhere network monitor</h1>
+<!-- The document starts with a way past the twelve-item tab bar. The name
+     itself is the wordmark at the left of the strip (the <h1> below): the
+     mark is favicon.svg's route drawn with classes so the theme colours it,
+     and the word drops out under tiny density and in kiosk mode. -->
 <!-- #view is the <main> around the page sections below. This used to say
      #tabs — the twelve-item nav the link exists to skip. app.js moves focus
      to the active page on activation, because <main> is display: contents
@@ -30,6 +31,7 @@
 <a class="skip-link" href="#view">Skip to the current view</a>
 
 <nav id="tabs" role="tablist" aria-label="Views">
+  <h1 class="brand"><a href="#/dashboard" title="Dashboard"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></a></h1>
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab" data-tab="nodes">NODES</button>
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
@@ -50,6 +52,19 @@
   <!-- The one honest signal during an outage: announced, not just recoloured. -->
   <span id="conn" class="conn" role="status" aria-live="polite">connecting…</span>
 </nav>
+
+<!-- Wall display. Shown only when the page was opened as /?kiosk=1 (app.js
+     initKiosk): the tab strip is hidden, the root font grows a quarter, and
+     this one thin line says what is on screen, whose session it is and how
+     long that session has left — the absolute ceiling used to arrive as an
+     unexplained sign-in page overnight. -->
+<div id="kiosk-bar" class="kiosk-bar" hidden>
+  <span class="brand" aria-hidden="true"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg></span>
+  <span id="kiosk-tab" class="kiosk-tab"></span>
+  <span class="grow"></span>
+  <span id="kiosk-clock" class="kiosk-clock"></span>
+  <span id="kiosk-session" class="kiosk-session"></span>
+</div>
 
 <!-- The one main landmark, around all twelve views; exactly one is shown at
      a time. Before this the only <main> in the document was inside the
@@ -363,7 +378,7 @@
       <label class="check"><input type="checkbox" id="tl-follow" checked> Live</label>
       <button id="tl-reset">Reset</button>
     </header>
-    <div id="timeline" class="timeline"><svg id="timeline-svg"></svg></div>
+    <div id="timeline" class="timeline brush"><svg id="timeline-svg"></svg></div>
     <p class="hint pad">
       Click a block for the route as it was at that moment · drag to focus a range ·
       buttons above to zoom and pan · right-click to clear
@@ -413,7 +428,7 @@
   </header>
   <div class="rows" data-splitter="netflow-body">
    <div class="pane pad-x" data-grow="3">
-    <div id="nf-chart" class="canvas chart"><svg id="nf-chart-svg"></svg></div>
+    <div id="nf-chart" class="canvas chart brush"><svg id="nf-chart-svg"></svg></div>
     <p class="hint">Drag across the chart to zoom into a range · scroll to zoom</p>
    </div>
    <div class="divider"></div>
@@ -852,6 +867,20 @@
       collector's listener, sampling and storage are under Settings on the
       NetFlow tab.
     </p>
+    <!-- Client state, not server state: the only fieldset on this page that
+         does not round-trip to /api/settings. Applied on change, not on Apply
+         changes, and never gated — a read-only operator may choose how their
+         own screen looks. -->
+    <fieldset id="appearance">
+      <legend>APPEARANCE · THIS BROWSER</legend>
+      <label>Theme <select id="set-theme">
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+        <option value="contrast">High contrast</option>
+      </select></label>
+      <p class="hint">Stored in this browser, not on the server: it applies at once,
+        to every account that signs in on this machine, and needs no Apply.</p>
+    </fieldset>
     <fieldset>
       <legend>REVERSE DNS</legend>
       <label class="check"><input type="checkbox" id="set-dns-enabled"> Resolve addresses to names</label>

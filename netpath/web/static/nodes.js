@@ -83,6 +83,15 @@
     if (counts.unsupported) parts.push(`${counts.unsupported} unsupported`);
     if (counts.auth) parts.push(`${counts.auth} auth failed`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
+    // On a wall the counts are the point: figures, not a line of prose.
+    if (App.state.kiosk) {
+      App.el('nd-counters').innerHTML = App.figures([
+        { value: counts.total || 0, label: 'devices' },
+        { value: counts.up || 0, label: 'up', className: 'ok' },
+        { value: counts.down || 0, label: 'down', className: counts.down ? 'fail' : '' },
+      ]);
+      return;
+    }
     App.el('nd-counters').textContent = parts.join(' · ');
   }
 

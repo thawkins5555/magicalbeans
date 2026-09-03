@@ -266,6 +266,21 @@ One consequence worth knowing: a refused trace often shows 0% loss, because the 
 
 Route changes are recorded as a path signature per trace and drawn as ticks, but they do not change the colour on their own — a route change with no latency or loss impact isn't a fault.
 
+## Display: themes, small screens, the wall
+
+Three themes — Dark, Light, High contrast — under **Appearance · this
+browser** on Settings, stored per browser so a shared workstation keeps its
+choice across sign-ins. The layout works down to a 768 px tablet; every drag
+works from a finger or a pen, and pane splitters and column widths can be
+changed from the keyboard (arrow keys on a splitter, Alt+Arrow on a column
+header).
+
+For a wall display open `/?kiosk=1#/dashboard`: no tab strip, a quarter
+larger, and a thin bar with the view, the clock and the session's remaining
+time. The session is held open only for an account with **no write
+permission anywhere** — make a read-only account for the wall; the absolute
+session length (`session_max_hours`) still applies and is counted down.
+
 ## Dashboard
 
 The tab every sign-in lands on, and until 4.39.0 an empty placeholder. It is now

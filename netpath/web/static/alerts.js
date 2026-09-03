@@ -87,7 +87,14 @@
     App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--line)';
     App.el('alerts-toggle').textContent = alerts.running ? 'Stop alert engine' : 'Start alert engine';
     const c = alerts.counters || {};
-    App.el('alerts-counters').textContent =
+    if (App.state.kiosk) {
+      App.el('alerts-counters').innerHTML = App.figures([
+        { value: alerts.open_count || 0, label: 'open',
+          className: alerts.open_count ? 'warn' : '' },
+        { value: c.opened || 0, label: 'opened' },
+        { value: c.resolved || 0, label: 'resolved' },
+      ]);
+    } else App.el('alerts-counters').textContent =
       `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +

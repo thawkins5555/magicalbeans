@@ -16,6 +16,25 @@
    The key and the 'netpath' fallback must stay in step with app.js's own
    TAB_KEY / default tab. */
 (function () {
+  /* The theme comes first and runs on every page — index, sign-in and the
+     SSH window all load this file — because it is the one thing that
+     would flash on all three: a light-theme browser painting one dark
+     frame before app.js gets to it. Dark is the default and is expressed
+     by the ABSENCE of the attribute, so a browser that has never chosen
+     stores nothing and tokens.css's :root block simply applies. The key
+     must stay in step with app.js's THEME_KEY. */
+  var THEMES = ['dark', 'light', 'contrast'];
+  var theme = 'dark';
+  try {
+    theme = localStorage.getItem('sappiwhere.theme') || 'dark';
+  } catch (error) { theme = 'dark'; }
+  if (THEMES.indexOf(theme) === -1) theme = 'dark';
+  if (theme !== 'dark') document.documentElement.dataset.theme = theme;
+
+  // Everything below paints the first tab of the application page; the
+  // sign-in and SSH pages have no tabs and stop here.
+  if (!/^\/(index\.html)?$/.test(window.location.pathname)) return;
+
   var DEFAULT_TAB = 'netpath';
   var TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
               'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];

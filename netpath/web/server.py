@@ -436,7 +436,7 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
 # Reachable without a session: the sign-in page and what it needs to render.
 # tokens.css is the stylesheet app.css reads its colours from; the sign-in
 # page links both, before there is a session to be gated on.
-PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/tokens.css", "/app.css",
+PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/tokens.css", "/app.css", "/boot.js",
                 "/favicon.ico", "/favicon.svg"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
@@ -908,14 +908,22 @@ class Handler(BaseHTTPRequestHandler):
             # every open tab makes on its own every couple of seconds. Only
             # the former counts as presence for the idle timeout; otherwise a
             # tab left open in the background would never time out.
-            if method in ("POST", "PUT", "DELETE"):
+            # /api/heartbeat decides for itself: a kiosk heartbeat from an
+            # account that can write is refused WITHOUT extending the
+            # session (api.post_heartbeat), which this blanket touch would
+            # have made impossible.
+            if method in ("POST", "PUT", "DELETE") and path != "/api/heartbeat":
                 self.service.sessions.touch(token)
 
         if not session and path not in PUBLIC_PATHS and path not in PUBLIC_API:
             if path.startswith("/api/"):
                 self._json({"error": "Not signed in", "authenticated": False}, 401)
             else:
-                self._send(302, b"", "text/plain", {"Location": "/login"})
+                # The query string survives the bounce so /?kiosk=1 comes
+                # back as a kiosk after sign-in (login.js hands it back).
+                query = urlparse(self.path).query
+                self._send(302, b"", "text/plain",
+                           {"Location": "/login" + ("?" + query if query else "")})
             return
 
         # The flag on the account, not on the session: a reset takes effect

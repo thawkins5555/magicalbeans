@@ -274,12 +274,15 @@
     });
     svg.appendChild(crosshair);
 
-    svg.onmousedown = (event) => {
+    svg.onpointerdown = (event) => {
+      if (event.button !== 0 || !event.isPrimary) return;
       event.preventDefault();
+      // Captured so the brush follows a finger or a mouse out of the chart.
+      svg.setPointerCapture(event.pointerId);
       const x = event.offsetX * (width / svg.clientWidth);
       view.drag = { from: timeAt(x), to: timeAt(x), moved: false };
     };
-    svg.onmousemove = (event) => {
+    svg.onpointermove = (event) => {
       const x = event.offsetX * (width / svg.clientWidth);
       if (view.drag) {
         view.drag.to = timeAt(x);
@@ -297,11 +300,11 @@
       const slot = Math.min(Math.round((x - plot.x) / stepX), count - 1);
       App.tooltip(slotTip(data, slot), event);
     };
-    svg.onmouseleave = () => {
+    svg.onpointerleave = () => {
       crosshair.setAttribute('visibility', 'hidden');
       App.hideTooltip();
     };
-    svg.onmouseup = () => {
+    svg.onpointerup = () => {
       if (!view.drag) return;
       const { from, to, moved } = view.drag;
       view.drag = null;
@@ -309,6 +312,7 @@
         setWindow(Math.min(from, to), Math.max(from, to), false);
       } else drawChart();
     };
+    svg.onpointercancel = () => { view.drag = null; drawChart(); };
     svg.onwheel = (event) => {
       event.preventDefault();
       const x = event.offsetX * (width / svg.clientWidth);

@@ -4044,6 +4044,65 @@ could have asked `App` for. The pieces and where they came from:
   and two column reads, never a password check. `login.js` unhides
   `#login-note` and pre-fills the username when it is true.
 
+### Themes, breakpoints, pointer capture and kiosk (`tokens.css`, `boot.js`, `app.js`) — 4.46.0
+
+- **Themes.** `tokens.css` is a base `:root` block (dark, `color-scheme:
+  dark`) plus `:root[data-theme="contrast"]` and `:root[data-theme="light"]`
+  blocks that redefine every surface, text, structure, emphasis, meaning
+  and selection token. Dark is the *absence* of the attribute, so a browser
+  that never chose stores nothing. The choice lives in
+  `localStorage['sappiwhere.theme']`, per browser: `boot.js` reads it and
+  sets `documentElement.dataset.theme` before `<body>` parses on all three
+  pages (it is loaded by `login.html` and `ssh.html` now and is in
+  `PUBLIC_PATHS`; its tab half returns early off the application page);
+  `App.setTheme()` changes it live, a `storage` listener follows other
+  tabs, and Settings' Appearance fieldset is the UI. The `--canvas-*` set is
+  untouched by both themes. `tests/test_design_tokens.py` parses the file
+  per block and recomputes every pair per theme — light at AA, contrast at
+  AAA — and requires each theme block to define the full themed set, so a
+  dark tone inherited onto a light ground fails instead of vanishing.
+  `theme.py` (the console window) stays on the dark values.
+- **Breakpoints.** `@media (max-width: 1200px)` makes the fixed widths
+  fluid; `(max-width: 900px)` stacks `[data-splitter].cols` and the NetPath
+  page (both selectors the row rule uses, since boot.js's first-frame rule
+  is heavier). `applyDensity()` toggles `body.narrow` at the same 900 px and
+  never applies `compact`/`tiny` in kiosk.
+- **Pointer capture.** `wireDivider`, the column grip, `netpath.js`
+  `beginPan` and the two brush charts (`netpath.js` timeline, `netflow.js`)
+  start on `pointerdown` (`button === 0 && isPrimary`), call
+  `setPointerCapture`, and listen for `pointermove`/`pointerup`/
+  `pointercancel` on the element itself; no `document`/`window` mouse
+  listeners remain, and `touch-action: none` is set on `.divider`,
+  `th .grip`, `#route-svg` and `.brush svg`. `wireDivider` reads
+  `getComputedStyle(container).flexDirection` when a gesture starts, sets
+  `role="separator"`, `tabindex`, `aria-orientation`, `aria-valuenow`, and
+  handles Arrow (5 %, Shift 1 %), Home/End and Enter through the same
+  `setShare` writer the drag uses; `dividerAria` callbacks refresh the
+  orientation on resize. The header's keydown handles Alt+Arrow through
+  `resizeColumn`, declared per column outside the sortable branch so both
+  the grip block and the keydown see one binding. The grip sits inside its
+  own cell (`right: 0`): a sticky `<th>` is a stacking context, so an
+  overhang was painted over by the next header. `tests/test_layout_contracts.py`
+  pins all of it.
+- **Kiosk.** `initKiosk()` reads `?kiosk=1` from `location.search` (the
+  hash stays the route; `writeRoute` preserves the search, `login.js` hands
+  it back after sign-in and the 302 to `/login` carries it). It sets
+  `html[data-kiosk]` (root `font-size: 125%`) and `body.kiosk` (tab strip
+  hidden, `#kiosk-bar` shown, larger rows). `drawKioskBar()` runs once a
+  second from `master()`: tab name, `App.clock`, the account, any refusal
+  note, and `session ends in …` from `maxRemainingMs`. `idleTick` sends
+  `{kiosk: true}` every `HEARTBEAT_GAP_MS` when there has been no input;
+  `api.post_heartbeat` touches the session only for a plain heartbeat or a
+  kiosk one from an account with no `'write'` in `permissions_for()`, and
+  otherwise returns `ok: false` with a reason — which is why `server.py`
+  skips its pre-dispatch touch for `/api/heartbeat` alone. One refusal is
+  final for the page (`kioskHeld = false`). `nodes.js`/`alerts.js`
+  `drawStatus` render `App.figures` into the strip in kiosk.
+- **Tiles and figures.** `App.tile(title, html, {wide, tone})`,
+  `App.figure(value, label, route, {className, title})` and
+  `App.figures([...])` emit `.card.tile`, `.figure > .figure-value +
+  .figure-label`; `dashboard.js` aliases them.
+
 ### The view store (`app.js` `sappiwhere.view`)
 
 What the operator has a page *set to* — the column each table is sorted by,
