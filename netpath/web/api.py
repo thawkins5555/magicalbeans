@@ -35,8 +35,24 @@ from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
+from .. import appdb as _appdb
 
 MIN_BLOCK_PX = 3
+
+
+def _audit(service, params, action: str, target: str = "",
+           detail: str = "") -> None:
+    """One line in the on-disk audit trail (appdb.audit).
+
+    Written alongside the event-log line most of these actions already
+    produce, not instead of it: the ring is for watching the application
+    work and is gone on the next restart, this is the record that answers
+    "who changed that" a month later. Only authentication, authorization,
+    credential and destructive-administration actions come here — this is
+    not a second copy of the event log.
+    """
+    service.app_db.audit(params.get("_username", ""), params.get("_client", ""),
+                         action, target, detail)
 
 
 def _num(params, key, default=None, cast=float):
@@ -750,6 +766,29 @@ ws_ssh_device.hijack = True
 # -------------------------------------------------------------------- debug
 
 
+# Which module's grant an event category belongs to. eventlog.CATEGORIES is
+# a display taxonomy, not an authorization one, so the mapping is written
+# out here rather than assumed. The three that name no module of their own
+# go to `settings`: `system` carries sign-in history and account changes,
+# `error` carries every module's failure detail (including ConfigRX's), and
+# `dns` names the addresses the resolver is working through. Holding
+# `debug` alone still shows the worker tables, counters and schedules,
+# which is what the Debug page is for.
+_EVENT_CATEGORY_MODULE = {
+    "trace": "netpath",
+    "dns": "settings",
+    "netflow": "netflow",
+    "snmp": "snmp",
+    "nodes": "nodes",
+    "alerts": "alerts",
+    "ipam": "ipam",
+    "wireless": "wireless",
+    "configrx": "configrx",
+    "system": "settings",
+    "error": "settings",
+}
+
+
 def get_debug(service, params, body) -> dict:
     since = int(_num(params, "since", 0, int) or 0)
     state = service.monitor.worker_state()
@@ -789,10 +828,19 @@ def get_debug(service, params, body) -> dict:
                 entry["elapsed"] = now - (work.get("queued") or now)
         workers.append(entry)
 
+    # The event log is one stream carrying every module's events, and
+    # `debug: read` was enough to read all of them — device names and
+    # addresses, DHCP server labels, ConfigRX failure detail, sign-in
+    # history — with no grant on any of those modules. Each category is
+    # filtered by the module it belongs to, so the Debug page shows a
+    # caller their own modules' events and nothing else.
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
+               if _permissions.allows(granted.get(module), _permissions.READ)}
     events = [
         {"seq": e.seq, "ts": e.ts, "clock": e.clock, "category": e.category,
          "target": e.target, "message": e.message, "detail": e.detail}
-        for e in service.log.since(since)
+        for e in service.log.since(since) if e.category in visible
     ]
 
     # One row per address currently out for a reverse lookup.
@@ -950,6 +998,11 @@ def post_settings(service, params, body) -> dict:
     if touched and not _may_change_admin_settings(service, params):
         raise PermissionError(
             f"Changing {', '.join(touched)} needs administrator access")
+    # The keys, never the values: a settings value can be a credential-
+    # adjacent path or a hostname, and an audit trail is a record of what
+    # was touched, not a second copy of the configuration.
+    _audit(service, params, "settings.change", target=scope,
+           detail=", ".join(sorted(str(k) for k in values)) or "nothing")
     entry = SETTINGS_SCOPES.get(scope)
     if entry is None:
         applied = service.apply_global_settings(values)
@@ -969,49 +1022,105 @@ def post_update(service, params, body) -> dict:
     # than a failed update, and nothing reaches the network at all.
     if not selfupdate.updates_enabled(service.app_db):
         raise PermissionError(selfupdate.UPDATES_DISABLED_MESSAGE)
+    _audit(service, params, "update.requested")
     result = selfupdate.apply(service.app_db)
     if result.get("ok") and not result.get("up_to_date"):
         service.log.add(SYSTEM_CATEGORY,
                         f"Updated to {result.get('tag') or result['commit']}; "
                         f"restarting")
+        # Written before the restart, and to disk, which is the whole point:
+        # the process is about to be replaced.
+        _audit(service, params, "update.installed",
+               target=str(result.get("tag") or result.get("commit") or ""))
+    elif not result.get("ok"):
+        _audit(service, params, "update.refused",
+               detail=str(result.get("error", "")))
     return result
+
+
+# Maintenance actions that delete everything rather than applying a
+# retention policy: `prune(0, 0)` means "every row". On a regulated network
+# prune_syslog erases the evidence trail and prune_configrx erases every
+# stored config. Each needs `confirm: true` in the body, and each is
+# audited with the number of rows it destroyed.
+_DESTRUCTIVE_MAINTENANCE = {
+    "prune_traces", "prune_flows", "prune_syslog", "prune_snmp", "prune_ipam",
+    "prune_nodes", "prune_alerts", "prune_configrx",
+}
 
 
 def post_maintenance(service, params, body) -> dict:
     action = str(body.get("action", ""))
+    if action in _DESTRUCTIVE_MAINTENANCE and body.get("confirm") is not True:
+        raise ValueError(
+            f"{action} deletes stored history outright — it is not the "
+            f"retention policy. Send \"confirm\": true to go ahead.")
+
+    def done(message: str, counted: int) -> dict:
+        _audit(service, params, f"maintenance.{action}",
+               target=action, detail=f"{counted} row(s): {message}")
+        service.log.add(SYSTEM_CATEGORY, f"Maintenance {action}: {message}")
+        return {"message": message, "removed": counted}
+
     if action == "redns":
         removed = service.app_db.clear_hostnames()
-        return {"message": f"Cleared {removed} cached names; "
-                           f"lookups restart within 15s"}
+        return done(f"Cleared {removed} cached names; "
+                    f"lookups restart within 15s", removed)
     if action == "prune_traces":
         days = float(service.settings.get("trace_retention_days", 90))
         removed = service.db.prune(days)
-        return {"message": f"Deleted {removed} traces older than {days:.0f} days"}
+        return done(f"Deleted {removed} traces older than {days:.0f} days",
+                    removed)
     if action == "prune_flows":
         removed = service.flow_db.prune(0, 0)
-        return {"message": f"Deleted {removed} flow records"}
+        return done(f"Deleted {removed} flow records", removed)
     if action == "prune_syslog":
         removed = service.syslog_db.prune(0, 0)
-        return {"message": f"Deleted {removed} syslog messages"}
+        return done(f"Deleted {removed} syslog messages", removed)
     if action == "prune_snmp":
         removed = service.snmp_db.prune(0, 0)
-        return {"message": f"Deleted {removed} stored traps"}
+        return done(f"Deleted {removed} stored traps", removed)
     if action == "prune_ipam":
         hosts = service.ipam_db.prune_hosts(0)
         conflicts = service.ipam_db.prune_conflicts(0)
         scans = service.ipam_db.prune_scans(0)
-        return {"message": f"Deleted {hosts} host record(s), {conflicts} "
-                           f"resolved conflict(s), {scans} scan record(s)"}
+        return done(f"Deleted {hosts} host record(s), {conflicts} "
+                    f"resolved conflict(s), {scans} scan record(s)",
+                    hosts + conflicts + scans)
     if action == "prune_nodes":
         removed = service.nodes_db.prune(sample_days=0, event_days=0, discovery_days=0)
-        return {"message": f"Deleted {removed} stored sample(s)/event(s)"}
+        return done(f"Deleted {removed} stored sample(s)/event(s)", removed)
     if action == "prune_alerts":
         removed = service.alerts_db.prune(0)
-        return {"message": f"Deleted {removed} resolved alert(s)"}
+        return done(f"Deleted {removed} resolved alert(s)", removed)
     if action == "prune_configrx":
         removed = service.configrx_db.prune(0, 0)
-        return {"message": f"Deleted {removed} stored config backup(s)"}
-    return {"message": "Unknown action"}
+        return done(f"Deleted {removed} stored config backup(s)", removed)
+    # A 200 saying "Unknown action" made a typo in an automation script look
+    # like a successful prune.
+    raise ValueError(f"Unknown maintenance action {action!r}")
+
+
+def get_audit(service, params, body) -> dict:
+    """The on-disk audit trail. Administrator-only, and read-only: there is
+    no endpoint anywhere that deletes from this table.
+
+    `since` is the last id already seen (the same cursor shape the Debug
+    page's event feed uses), `limit` how many rows to return at most,
+    capped server-side.
+    """
+    since = int(_num(params, "since", 0, int) or 0)
+    limit = int(_num(params, "limit", 500, int) or 500)
+    rows = service.app_db.audit_events(since, limit)
+    return {
+        "events": [{"id": row["id"], "ts": row["ts"],
+                    "username": row["username"], "client": row["client"],
+                    "action": row["action"], "target": row["target"],
+                    "detail": row["detail"]} for row in rows],
+        "last_id": rows[-1]["id"] if rows else since,
+        "max_id": service.app_db.audit_last_id(),
+        "limit": min(max(1, limit), _appdb.AUDIT_MAX_LIMIT),
+    }
 
 
 # ------------------------------------------------------------------- syslog
@@ -1543,6 +1652,8 @@ def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
     service.ipam_db.set_dhcp_credential(server_id, username, encrypted)
     service.log.add(IPAM_CATEGORY,
                     f"Stored a credential for DHCP server {server['label']}")
+    _audit(service, params, "credential.store",
+           target=f"dhcp:{server['address']}", detail=f"username {username}")
     return {"ok": True}
 
 
@@ -1553,6 +1664,8 @@ def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict
     service.ipam_db.clear_dhcp_credential(server_id)
     service.log.add(IPAM_CATEGORY, f"Cleared the stored credential for DHCP "
                                    f"server {server['label']}")
+    _audit(service, params, "credential.clear",
+           target=f"dhcp:{server['address']}")
     return {"ok": True}
 
 
@@ -2477,6 +2590,8 @@ def post_nodes_device_credential(service, params, body, device_id) -> dict:
         password = None
     service.nodes_db.set_device_credential(device_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY, f"Stored an SNMPv3 credential for {row['ip']}")
+    _audit(service, params, "credential.store", target=f"device:{row['ip']}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2485,6 +2600,7 @@ def delete_nodes_device_credential(service, params, body, device_id) -> dict:
     if not row:
         raise ValueError("No such device")
     service.nodes_db.clear_device_credential(device_id)
+    _audit(service, params, "credential.clear", target=f"device:{row['ip']}")
     service.log.add(NODES_CATEGORY,
                     f"Cleared the stored SNMPv3 credential for {row['ip']}")
     return {"ok": True}
@@ -2595,6 +2711,8 @@ def post_nodes_group_credential(service, params, body, group_id) -> dict:
     service.nodes_db.set_group_credential(group_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY,
                     f"Stored an SNMPv3 credential for profile {row['name']}")
+    _audit(service, params, "credential.store", target=f"profile:{row['name']}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2673,6 +2791,9 @@ def post_nodes_group_credential_secret(service, params, body, group_id, credenti
     service.nodes_db.set_group_credential_password(credential_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY, "Stored an SNMPv3 credential for an additional "
                                     f"credential on profile {cred['label'] or credential_id}")
+    _audit(service, params, "credential.store",
+           target=f"profile-credential:{cred['label'] or credential_id}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2681,6 +2802,8 @@ def delete_nodes_group_credential_secret(service, params, body, group_id, creden
     if not cred or cred["group_id"] != int(group_id):
         raise ValueError("No such credential")
     service.nodes_db.clear_group_credential_password(credential_id)
+    _audit(service, params, "credential.clear",
+           target=f"profile-credential:{cred['label'] or credential_id}")
     return {"ok": True}
 
 
@@ -3132,6 +3255,7 @@ def post_alert_ack(service, params, body, alert_id) -> dict:
         raise ValueError("No such alert")
     service.alerts_db.acknowledge(alert_id, params.get("_username", ""),
                                   str(body.get("note", "")))
+    _audit(service, params, "alert.ack", target=str(alert_id))
     return {"ok": True}
 
 
@@ -3139,6 +3263,7 @@ def post_alert_resolve(service, params, body, alert_id) -> dict:
     if not service.alerts_db.alert(alert_id):
         raise ValueError("No such alert")
     service.alerts_db.resolve(alert_id, params.get("_username", ""))
+    _audit(service, params, "alert.resolve", target=str(alert_id))
     return {"ok": True}
 
 
@@ -3184,16 +3309,21 @@ def post_alerts_mute(service, params, body) -> dict:
     row = service.alerts_db.mute(kind, entity_id, hours,
                                  by=params.get("_username", ""),
                                  reason=str(body.get("reason", "")))
+    _audit(service, params, "alert.mute", target=f"{kind}:{entity_id}",
+           detail=f"{hours:g}h: {str(body.get('reason', ''))}")
     return {"mute": _mute_json(row)}
 
 
 def delete_alerts_mute(service, params, body) -> dict:
     kind, entity_id = _mute_entity(body)
-    return {"lifted": service.alerts_db.unmute(kind, entity_id)}
+    lifted = service.alerts_db.unmute(kind, entity_id)
+    _audit(service, params, "alert.unmute", target=f"{kind}:{entity_id}")
+    return {"lifted": lifted}
 
 
 def post_alerts_ack_all(service, params, body) -> dict:
     n = service.alerts_db.acknowledge_all(params.get("_username", ""))
+    _audit(service, params, "alert.ack_all", detail=f"{n} alert(s)")
     return {"acknowledged": n}
 
 
@@ -3207,12 +3337,14 @@ def _bulk_alert_ids(body) -> list[int]:
 def post_alerts_bulk_ack(service, params, body) -> dict:
     alert_ids = _bulk_alert_ids(body)
     n = service.alerts_db.acknowledge_many(alert_ids, params.get("_username", ""))
+    _audit(service, params, "alert.ack_bulk", detail=f"{n} of {len(alert_ids)}")
     return {"acknowledged": n}
 
 
 def post_alerts_bulk_resolve(service, params, body) -> dict:
     alert_ids = _bulk_alert_ids(body)
     n = service.alerts_db.resolve_many(alert_ids, params.get("_username", ""))
+    _audit(service, params, "alert.resolve_bulk", detail=f"{n} of {len(alert_ids)}")
     return {"resolved": n}
 
 
@@ -3374,12 +3506,14 @@ def post_alerts_smtp_credential(service, params, body) -> dict:
         password = None
     service.alerts_db.set_smtp_credential(encrypted)
     service.log.add(ALERTS_CATEGORY, "Stored the SMTP credential")
+    _audit(service, params, "credential.store", target="smtp")
     return {"ok": True}
 
 
 def delete_alerts_smtp_credential(service, params, body) -> dict:
     service.alerts_db.clear_smtp_credential()
     service.log.add(ALERTS_CATEGORY, "Cleared the stored SMTP credential")
+    _audit(service, params, "credential.clear", target="smtp")
     return {"ok": True}
 
 
@@ -3673,6 +3807,8 @@ def post_wireless_controller_credential(service, params, body, controller_id) ->
     service.wireless_db.update_controller(controller_id, v3_user=user, v3_auth_proto=auth_proto)
     service.wireless_db.set_credential(controller_id, encrypted)
     service.log.add(WIRELESS_CATEGORY, f"Stored an SNMPv3 credential for {row['name']}")
+    _audit(service, params, "credential.store",
+           target=f"controller:{row['ip']}", detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -3682,6 +3818,7 @@ def delete_wireless_controller_credential(service, params, body, controller_id) 
         raise ValueError("No such controller")
     service.wireless_db.set_credential(controller_id, None)
     service.log.add(WIRELESS_CATEGORY, f"Cleared the stored SNMPv3 credential for {row['name']}")
+    _audit(service, params, "credential.clear", target=f"controller:{row['ip']}")
     return {"ok": True}
 
 
@@ -3971,6 +4108,8 @@ def post_configrx_devices_bulk_credential(service, params, body) -> dict:
             service.configrx_db.set_credential(device_id, username, encrypted)
             updated += 1
     service.log.add(CONFIGRX_CATEGORY, f"Bulk-stored an SSH credential for {updated} device(s)")
+    _audit(service, params, "credential.store", target="configrx:bulk",
+           detail=f"{updated} device(s), username {username}")
     return {"ok": True, "updated": updated}
 
 
@@ -3997,6 +4136,8 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
         password = None
     service.configrx_db.set_credential(device_id, username, encrypted)
     service.log.add(CONFIGRX_CATEGORY, f"Stored an SSH credential for {row['ip']}")
+    _audit(service, params, "credential.store", target=f"configrx:{row['ip']}",
+           detail=f"username {username}")
     return {"ok": True}
 
 
@@ -4006,6 +4147,7 @@ def delete_configrx_device_credential(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     service.configrx_db.clear_credential(device_id)
     service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored SSH credential for {row['ip']}")
+    _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}")
     return {"ok": True}
 
 
@@ -4170,6 +4312,8 @@ def post_login(service, params, body) -> dict:
         service.log.add(ERROR_CATEGORY,
                         f"Refused sign-in for {label} from {client}: too many "
                         f"failures, locked for another {remaining / 60:.0f} min")
+        _audit(service, dict(params, _username=label), "signin.locked_out",
+               target=label, detail=f"locked for another {remaining:.0f}s")
         raise LockedOut(f"Too many failed sign-ins. Try again in "
                         f"{max(1, round(remaining / 60))} minute(s).")
 
@@ -4188,12 +4332,17 @@ def post_login(service, params, body) -> dict:
             service.throttle.record_failure(username, client)
             service.log.add(ERROR_CATEGORY,
                             f"Failed sign-in for {label} from {client}")
+            _audit(service, dict(params, _username=label), "signin.failed",
+                   target=label, detail="no such account")
             raise PermissionError("Wrong username or password")
 
         if not verify_password(password, stored):
             service.throttle.record_failure(username, client)
             service.log.add(ERROR_CATEGORY,
                             f"Failed sign-in for {row['username']} from {client}")
+            _audit(service, dict(params, _username=row["username"]),
+                   "signin.failed", target=row["username"],
+                   detail="wrong password")
             raise PermissionError("Wrong username or password")
 
     service.throttle.clear(username)
@@ -4210,6 +4359,8 @@ def post_login(service, params, body) -> dict:
     token = service.sessions.create(row["username"], client,
                                     str(params.get("_agent", "")))
     service.log.add(SYSTEM_CATEGORY, f"{row['username']} signed in from {client}")
+    _audit(service, dict(params, _username=row["username"]), "signin.ok",
+           target=row["username"], detail=str(params.get("_agent", ""))[:120])
     return {"token": token, "username": row["username"],
             "must_change": bool(row["must_change"])}
 
@@ -4219,6 +4370,8 @@ def post_logout(service, params, body) -> dict:
     session = service.sessions.get(token)
     if session:
         service.log.add(SYSTEM_CATEGORY, f"{session['username']} signed out")
+        _audit(service, dict(params, _username=session["username"]),
+               "signout", target=session["username"])
     service.sessions.destroy(token)
     return {"ok": True}
 
@@ -4279,6 +4432,9 @@ def post_user(service, params, body) -> dict:
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {username} created by "
                     f"{params.get('_username', 'someone')}")
+    _audit(service, params, "user.create", target=username,
+           detail=", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
+                  or "no grants")
     return {"username": username}
 
 
@@ -4324,6 +4480,9 @@ def post_user_permissions(service, params, body) -> dict:
     service.log.add(SYSTEM_CATEGORY,
                     f"Permissions for {username} changed by "
                     f"{params.get('_username', 'someone')}")
+    _audit(service, params, "user.permissions", target=username,
+           detail=", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
+                  or "no grants")
     return {"username": username, "permissions": service.app_db.permissions_for(username)}
 
 
@@ -4348,6 +4507,8 @@ def delete_user(service, params, body, username: str = "") -> dict:
     ended = service.sessions.destroy_user(target)
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {target} removed by {me}; {ended} session(s) ended")
+    _audit(service, params, "user.delete", target=target,
+           detail=f"{ended} session(s) ended")
     return {"removed": target}
 
 
@@ -4384,4 +4545,6 @@ def post_password(service, params, body) -> dict:
     service.log.add(SYSTEM_CATEGORY,
                     f"Password for {target} changed by {me}; "
                     f"{ended} session(s) ended")
+    _audit(service, params, "password.reset" if resetting else "password.change",
+           target=target, detail=f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}

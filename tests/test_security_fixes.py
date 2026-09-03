@@ -28,6 +28,7 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.error as urllib_error
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
@@ -596,16 +597,22 @@ def main() -> int:
     login("nosuchaccount", "whatever")
 
     def timed(username, password):
+        # The throttle's own delay would otherwise dominate after five
+        # failures; what is being measured here is the hashing.
+        SERVICE.throttle._failures.clear()
         started = time.perf_counter()
         login(username, password)
         return time.perf_counter() - started
 
-    real = min(timed("admin", "definitely-not-the-password") for _ in range(3))
+    # Minimum of several, so a scheduling hiccup lengthens a sample rather
+    # than shortening one. The defect this replaces was a factor of nine
+    # (0.055 s against 0.48 s); anything under a third is not an oracle.
+    real = min(timed("admin", "definitely-not-the-password") for _ in range(5))
     fake = min(timed("nosuchaccount", "definitely-not-the-password")
-               for _ in range(3))
+               for _ in range(5))
     gap = abs(real - fake) / max(real, fake, 1e-9)
     check("D7 an unknown username costs the same as a known one",
-          gap < 0.20, f"real={real:.3f}s fake={fake:.3f}s gap={gap:.0%}")
+          gap < 0.30, f"real={real:.3f}s fake={fake:.3f}s gap={gap:.0%}")
 
     # A username that is not a username is refused before it is used as a
     # key or written anywhere.
@@ -754,6 +761,93 @@ def main() -> int:
     check("D8 the migration is idempotent — revoking it sticks",
           legacy.permissions_for("olduser").get("admin") is None)
     legacy.close()
+
+    # --------------------------------------------------------- D9 audit log
+    # Exercise the remaining audited paths through the API, so what the
+    # trail is checked for below is what a real caller produces.
+    throwaway = make_user("auditwalker", {"alerts": "write"})
+    req("POST", "/api/alerts/smtp/credential", {"password": "audit-me"},
+        cookie=throwaway)
+    req("DELETE", "/api/alerts/smtp/credential", {}, cookie=throwaway)
+    req("POST", "/api/logout", {}, cookie=throwaway)
+
+    # An update attempt that cannot reach GitHub: enabled, so the route
+    # runs, with the network boundary replaced so nothing leaves the host.
+    SERVICE.app_db.save_settings({"updates_enabled": True})
+    broken = selfupdate._fetch_json
+    selfupdate._fetch_json = lambda url, timeout=10.0: (_ for _ in ()).throw(
+        urllib_error.URLError("no network in this test"))
+    try:
+        req("POST", "/api/update", {}, cookie=admin_cookie)
+    finally:
+        selfupdate._fetch_json = broken
+        SERVICE.app_db.save_settings({"updates_enabled": False})
+
+    status, _h, payload = req("GET", "/api/audit", cookie=debug_cookie)
+    check("D9 the audit log is administrator-only", status == 403, str(status))
+
+    status, _h, payload = req("GET", "/api/audit?limit=99999", cookie=admin_cookie)
+    check("D9 the limit is capped server-side",
+          status == 200 and payload.get("limit") == 5000, f"{status} {payload!r}"[:200])
+    actions = [e["action"] for e in payload.get("events", [])]
+    for wanted in ("signin.ok", "signin.failed", "signout", "user.create",
+                   "user.permissions", "settings.change", "credential.store",
+                   "credential.clear", "password.change", "update.refused"):
+        check(f"D9 {wanted} is audited", wanted in actions,
+              str(sorted(set(actions))))
+
+    # No row carries an unbounded field, and nothing deletes from the table.
+    longest = max((len(e["detail"]) for e in payload["events"]), default=0)
+    check("D9 audit fields are capped", longest <= 512, str(longest))
+    check("D9 there is no route that deletes audit rows",
+          not any("audit" in pattern and method in ("DELETE", "POST")
+                  for method, pattern, _h2, _r in
+                  __import__("netpath.web.server", fromlist=["x"]).ROUTES))
+
+    before = payload["max_id"]
+    status, _h, _p = req("POST", "/api/maintenance", {"action": "prune_syslog"},
+                         cookie=admin_cookie)
+    check("D9 a destructive maintenance action needs confirm", status == 400,
+          str(status))
+    status, _h, payload = req("POST", "/api/maintenance",
+                              {"action": "prune_syslog", "confirm": True},
+                              cookie=admin_cookie)
+    check("D9 …and with it, reports the row count", status == 200
+          and "removed" in payload, f"{status} {payload}")
+    status, _h, payload = req("POST", "/api/maintenance", {"action": "nonsense"},
+                              cookie=admin_cookie)
+    check("D9 an unknown maintenance action is an error, not a 200",
+          status == 400, f"{status} {payload}")
+
+    status, _h, payload = req(f"GET", f"/api/audit?since={before}",
+                              cookie=admin_cookie)
+    pruned = [e for e in payload["events"] if e["action"] == "maintenance.prune_syslog"]
+    check("D9 the prune is audited with its count",
+          len(pruned) == 1 and "row(s)" in pruned[0]["detail"],
+          str(pruned))
+
+    # Rows survive the process: reopen the same file and read them back.
+    from netpath.appdb import AppDatabase as _AppDb
+    reopened = _AppDb(os.path.join(DATA_DIR, "app.db"))
+    try:
+        check("D9 audit rows survive a restart",
+              reopened.audit_last_id() >= payload["max_id"] > 0,
+              str(reopened.audit_last_id()))
+    finally:
+        reopened.close()
+
+    # The Debug event feed is filtered by the caller's module grants.
+    SERVICE.log.add("configrx", "a ConfigRX event only a ConfigRX reader sees")
+    SERVICE.log.add("nodes", "a Nodes event only a Nodes reader sees")
+    status, _h, payload = req("GET", "/api/debug", cookie=debug_cookie)
+    categories = {e["category"] for e in payload.get("events", [])}
+    check("D9 debug:read alone no longer reads every module's events",
+          status == 200 and not (categories & {"configrx", "nodes", "system"}),
+          str(sorted(categories)))
+    status, _h, payload = req("GET", "/api/debug", cookie=admin_cookie)
+    categories = {e["category"] for e in payload.get("events", [])}
+    check("D9 …while an account holding those modules still does",
+          {"configrx", "nodes"} <= categories, str(sorted(categories)))
 
     return 0
 

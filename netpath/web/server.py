@@ -266,6 +266,9 @@ ROUTES = [
     # the socket is the one hijacking route in the table (see _route).
     ("GET", r"^/api/ssh/devices/(\d+)$", api.get_ssh_device, ("ssh", W)),
     ("GET", r"^/api/ssh/devices/(\d+)/socket$", api.ws_ssh_device, ("ssh", W)),
+    # The on-disk audit trail. Administrator-only, and there is deliberately
+    # no route that writes to or deletes from it.
+    ("GET", r"^/api/audit$", api.get_audit, ("admin", R)),
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),

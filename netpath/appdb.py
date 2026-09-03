@@ -80,6 +80,31 @@ CREATE TABLE IF NOT EXISTS asn_cache (
 );
 CREATE INDEX IF NOT EXISTS ix_asn_cache_resolved ON asn_cache(resolved_ts);
 
+-- Who did what, on disk and append-only.
+--
+-- Sign-ins and failed sign-ins, account creation, permission changes,
+-- password resets, credential storage and settings changes used to land
+-- only in eventlog.py's 3,000-entry in-memory ring — lost on every
+-- restart (including the one a self-update performs), a few minutes deep
+-- on a busy install, and erasable outright by anyone with `debug: write`.
+--
+-- This table is the opposite of that ring in every way that matters: it
+-- survives a restart, nothing trims it (retention here is a filesystem
+-- decision, not a setting an attacker can turn down), and there is no API
+-- that deletes from it. The two are complementary — the ring is for
+-- watching the application work, this is for answering "who changed
+-- that" a month later.
+CREATE TABLE IF NOT EXISTS audit (
+    id       INTEGER PRIMARY KEY,
+    ts       REAL NOT NULL,
+    username TEXT NOT NULL,
+    client   TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    target   TEXT NOT NULL DEFAULT '',
+    detail   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit(ts);
+
 -- Housekeeping this file needs about itself. Not user-visible, and separate
 -- from `settings` so a marker can never be mistaken for a setting.
 CREATE TABLE IF NOT EXISTS meta (
@@ -87,6 +112,15 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 """
+
+# Per-field caps on an audit row. Every one of these fields can carry text
+# the caller chose — a username, a settings key, a device label — and an
+# audit trail that can be filled with one enormous row is not one.
+AUDIT_LIMITS = {"username": 64, "client": 64, "action": 64,
+                "target": 256, "detail": 512}
+
+# Never returned in one page, whatever the caller asks for.
+AUDIT_MAX_LIMIT = 5000
 
 MIGRATION_MARKER = "migrated_from_netpath_db"
 # Set once the one-time `ssh` grant below has been considered, so that an
@@ -463,6 +497,48 @@ class AppDatabase:
                     "INSERT INTO user_permissions(username, module, level)"
                     " VALUES (?,?,?)", (username, module, level))
             self._conn.commit()
+
+    # ----------------------------------------------------------------- audit
+
+    @staticmethod
+    def _clip(value, key: str) -> str:
+        text = "" if value is None else str(value)
+        limit = AUDIT_LIMITS[key]
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+
+    def audit(self, username: str, client: str, action: str,
+              target: str = "", detail: str = "") -> None:
+        """Record one thing somebody did. Never raises: an audit write that
+        fails must not turn a successful action into a 500, and the caller
+        has already done the thing by the time this runs."""
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO audit(ts, username, client, action, target,"
+                    " detail) VALUES (?,?,?,?,?,?)",
+                    (time.time(), self._clip(username, "username"),
+                     self._clip(client, "client"), self._clip(action, "action"),
+                     self._clip(target, "target"), self._clip(detail, "detail")))
+                self._conn.commit()
+        except sqlite3.DatabaseError:
+            log_module.exception("could not write an audit row for %r", action)
+
+    def audit_events(self, since_id: int = 0,
+                     limit: int = 500) -> list[sqlite3.Row]:
+        """Rows newer than `since_id`, oldest first — the same "since a
+        cursor" shape the Debug page's event feed uses, so a caller polls
+        by passing back the last id it saw."""
+        limit = max(1, min(int(limit or 500), AUDIT_MAX_LIMIT))
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM audit WHERE id > ? ORDER BY id LIMIT ?",
+                (int(since_id or 0), limit)).fetchall()
+
+    def audit_last_id(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(id) AS n FROM audit").fetchone()
+        return int(row["n"] or 0)
 
     # ------------------------------------------------------------- hostnames
 
