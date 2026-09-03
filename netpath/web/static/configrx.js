@@ -9,10 +9,10 @@
     devices: [],
     selectedDeviceId: null,
     devicesChecked: new Set(),
-    deviceSort: { key: 'name', descending: false },
+    deviceSort: App.recallSort('configrx-devices', { key: 'name', descending: false }),
     backups: [],
     backupsChecked: new Set(),
-    backupSort: { key: 'ts', descending: true },
+    backupSort: App.recallSort('configrx-backups', { key: 'ts', descending: true }),
     selectedBackupId: null,
     backupContent: '',
   };
@@ -667,9 +667,14 @@
     if (App.state.tab !== 'configrx') return;
     drawStatus();
     const vendorSelect = App.el('cx-filter-vendor');
+    // The vendor list is built from this very response, so on the load after
+    // a reload the restored choice is not on the element yet; the fetch has
+    // to read it from the store or the list would contradict the filter.
+    const vendor = vendorSelect.value ||
+      App.savedControl('configrx', 'cx-filter-vendor') || '';
     const params = { q: App.el('cx-q').value.trim() };
     if (App.el('cx-enabled-only').checked) params.enabled_only = 1;
-    if (vendorSelect.value) params.vendor = vendorSelect.value;
+    if (vendor) params.vendor = vendor;
     const result = await App.get('/api/configrx/devices', params);
     view.devices = result.devices;
     drawVendorFilter(result.devices, vendorSelect);
@@ -683,7 +688,8 @@
      the current choice is kept in the list — otherwise picking one would
      immediately empty the control that made the choice. */
   function drawVendorFilter(devices, select) {
-    const current = select.value;
+    const current = select.value ||
+      App.savedControl('configrx', 'cx-filter-vendor') || '';
     const seen = new Set(devices.map((d) => d.effective_vendor || '(none)'));
     if (current) seen.add(current);
     const options = [...seen].sort();
@@ -779,6 +785,13 @@
       await App.loadState();
       App.refreshNow('configrx');
     };
+
+    // Last thing in init(): refresh() reads the search and the tickbox
+    // straight off the DOM, so the first search already carries them. The
+    // vendor list is late-filled — see drawVendorFilter.
+    const CONTROLS = ['cx-q', 'cx-filter-vendor', 'cx-enabled-only'];
+    App.restoreControls('configrx', CONTROLS);
+    App.rememberControls('configrx', CONTROLS);
   }
 
   App.pages.configrx = { init, refresh, fastTick: drawStatus };

@@ -17,10 +17,11 @@
     // that bar hides the instant the selection clears, and the refresh the
     // action triggers runs synchronously, so nothing put there would paint.
     bulkNotice: null,
-    // Per session only, like every other table's sort: a saved sort order is
-    // a different feature from saved columns, and mixing the two storage
-    // models is how Reset layout ends up eating a settings choice.
-    alertSort: { key: 'last_ts', descending: true },
+    // Newest first until the operator clicks a heading. That click is
+    // remembered per browser (App.recallSort) — separately from the column
+    // *choice*, which is an account setting: mixing the two storage models
+    // is how Reset layout ends up eating a settings choice.
+    alertSort: App.recallSort('alerts', { key: 'last_ts', descending: true }),
     rules: [],
     rulesSelected: null,
     templates: [],
@@ -58,7 +59,11 @@
     return {
       state: App.el('alerts-filter-state').value,
       severity: App.el('alerts-filter-sev').value,
-      rule_id: App.el('alerts-filter-rule').value,
+      // The rule list is filled by the refresh below, so on the load after
+      // a reload the restored choice is not on the element yet; the first
+      // fetch has to honour it or the list contradicts the filter for a tick.
+      rule_id: App.el('alerts-filter-rule').value ||
+        App.savedControl('alerts', 'alerts-filter-rule') || '',
       device: App.el('alerts-filter-device').value.trim(),
       q: App.el('alerts-filter-text').value.trim(),
     };
@@ -862,17 +867,30 @@
     drawTemplatesTable();
   }
 
+  /* Filled from the refresh, after init() — so a restored choice arrives
+     from the store here rather than from restoreControls. A rule that has
+     since been deleted matches no option, which selects nothing at all:
+     snap back to "any rule" rather than show a blank filter. */
   function fillRuleFilter() {
     const select = App.el('alerts-filter-rule');
-    const current = select.value;
+    const current = select.value || App.savedControl('alerts', 'alerts-filter-rule') || '';
     select.innerHTML = '<option value="">any rule</option>' +
       view.rules.map((r) => `<option value="${r.id}">${escape(r.name)}</option>`).join('');
     select.value = current;
+    // Dropped from the store as well as from the control: while it is stored,
+    // filters() above would go on sending a rule id that matches nothing.
+    if (select.selectedIndex < 0) {
+      select.value = '';
+      App.rememberControl('alerts', 'alerts-filter-rule', '');
+    }
   }
 
   function init() {
     for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
-      btn.onclick = () => selectSub(btn.dataset.subtab);
+      btn.onclick = () => {
+        App.rememberSub('alerts', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
     }
     App.fillRanges(App.el('alerts-range'), 'Last 24 hours');
     const sev = App.el('alerts-filter-sev');
@@ -943,6 +961,16 @@
         if (App.state.tab === 'alerts') drawHistogram();
       });
     }
+
+    // Last thing in init(): the range and severity lists above are filled
+    // and nothing has been fetched, so the first refresh reads these back
+    // out of the DOM the way it reads the markup defaults.
+    const CONTROLS = ['alerts-filter-sev', 'alerts-filter-state',
+      'alerts-filter-rule', 'alerts-filter-device', 'alerts-filter-text',
+      'alerts-range'];
+    App.restoreControls('alerts', CONTROLS);
+    App.rememberControls('alerts', CONTROLS);
+    selectSub(App.recallSub('alerts', 'current'));
   }
 
   function selectSub(name) {

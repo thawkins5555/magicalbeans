@@ -355,17 +355,31 @@
           select.appendChild(option);
         }
       }
+      // Late-filled: destinations are discovered from the event stream, so a
+      // restored choice can only be applied once its option turns up. One
+      // that never does leaves the filter on "All destinations".
+      if (!select.value) {
+        select.value = App.savedControl('debug', 'dbg-target') || '';
+        if (select.selectedIndex < 0) {
+          select.value = '';
+          App.rememberControl('debug', 'dbg-target', '');
+        }
+      }
       drawEvents();
     }
   }
 
   function init() {
     const cats = App.el('dbg-categories');
+    // Each box gets an id so the shared control store can carry it: the set
+    // of categories comes from the server, so the stored keys stay bounded
+    // by what this build knows about.
     for (const category of App.state.categories) {
       const label = document.createElement('label');
       label.className = 'check';
       label.innerHTML =
-        `<input type="checkbox" value="${category}" checked> ${CATEGORY_LABEL[category] || category}`;
+        `<input type="checkbox" id="dbg-cat-${category}" value="${category}" checked>` +
+        ` ${CATEGORY_LABEL[category] || category}`;
       label.querySelector('input').onchange = drawEvents;
       cats.appendChild(label);
     }
@@ -401,6 +415,14 @@
         });
     };
     App.el('dbg-export').onclick = exportLog;
+
+    // Last thing in init(): the category boxes above exist, and nothing has
+    // been drawn — the first drawEvents reads all of these live. Follow is
+    // deliberately not restored.
+    const CONTROLS = ['dbg-target', 'dbg-search'].concat(
+      App.state.categories.map((category) => `dbg-cat-${category}`));
+    App.restoreControls('debug', CONTROLS);
+    App.rememberControls('debug', CONTROLS);
   }
 
   App.pages.debug = { init, refresh, fastTick };

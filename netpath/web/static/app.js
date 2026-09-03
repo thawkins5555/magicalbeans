@@ -682,6 +682,167 @@ const App = (() => {
     } catch (error) { /* private browsing, or storage full: not worth failing */ }
   }
 
+  /* ---------------------------------------------------------- view state
+
+     What the operator has the page *set to* — which column each table is
+     sorted by, what is typed in the filter bars, which sub-view is open —
+     as opposed to what the page looks like (splitter sizes, column widths)
+     or what the account has chosen (which columns exist). A reload used to
+     drop all of it: you came back to an unsorted table and an empty search
+     box, on a page you had spent a minute setting up.
+
+     Per browser and per browser only. The values are the operator's own
+     filter text — device names, addresses, a rule id — written to the same
+     localStorage as the tab and the column widths, and never sent anywhere.
+     `Reset panel sizes` deliberately leaves this key alone: it means "put
+     the furniture back", not "throw away what I was looking at".
+
+     Deliberately NOT stored: the Live/Follow checkboxes on Syslog, Traps,
+     NetFlow and Debug. Persisting "Live off" would hand somebody a page
+     that has silently stopped moving, with nothing on screen to say why —
+     the one setting where remembering the last state is the wrong answer.
+
+     Shape: {sort: {gridName: {key, descending}},
+             pages: {page: {controls: {elementId: value}, sub: name}}}. */
+
+  const VIEW_KEY = 'sappiwhere.view';
+
+  function loadView() {
+    try {
+      return JSON.parse(localStorage.getItem(VIEW_KEY) || '{}') || {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function saveView(store) {
+    try {
+      localStorage.setItem(VIEW_KEY, JSON.stringify(store));
+    } catch (error) { /* private browsing, or storage full: not worth failing */ }
+  }
+
+  /* The OID browser's table is a modal built fresh each time it opens, over
+     a different device's objects; restoring last week's sort into it would
+     be noise, so its clicks are not recorded at all rather than recorded
+     and ignored. Keeping the store to the tables that actually read it back
+     is also what keeps it small. */
+  const UNSAVED_SORTS = new Set(['nodes-oids']);
+
+  /* A saved sort whose column no longer exists is harmless: sortRows leaves
+     the rows in server order, which is what an unsorted table shows anyway. */
+  function recallSort(name, fallback) {
+    const saved = (loadView().sort || {})[name];
+    if (!saved || typeof saved.key !== 'string') return fallback;
+    return { key: saved.key, descending: !!saved.descending };
+  }
+
+  function rememberSort(name, sort) {
+    if (!name || UNSAVED_SORTS.has(name)) return;
+    const store = loadView();
+    store.sort = store.sort || {};
+    store.sort[name] = { key: sort.key, descending: !!sort.descending };
+    saveView(store);
+  }
+
+  function pageControls(page) {
+    return ((loadView().pages || {})[page] || {}).controls || {};
+  }
+
+  function controlValue(element) {
+    return element.type === 'checkbox' ? !!element.checked : element.value;
+  }
+
+  /* What a fill function that runs after init() should select: whatever is
+     already chosen, else what was stored before the options existed. Only
+     the late-filled selects need this — every control whose options are in
+     the markup, or built during init(), is restored outright below. */
+  function savedControl(page, id) {
+    const controls = pageControls(page);
+    return Object.prototype.hasOwnProperty.call(controls, id) ? controls[id] : null;
+  }
+
+  /* Set the named controls from the store, and report what was applied.
+     Called at the END of a module's init(): the ranges and severity lists
+     are filled by then and nothing has been drawn or fetched yet, so the
+     first fetch reads the restored values out of the DOM exactly the way it
+     reads the markup defaults.
+
+     A stored choice that no longer matches any option — a rule that was
+     deleted, a vendor with no devices left — is skipped rather than forced,
+     because assigning an absent value to a <select> selects nothing at all
+     and would leave the operator looking at a blank filter. */
+  function restoreControls(page, ids) {
+    const controls = pageControls(page);
+    const applied = {};
+    for (const id of ids) {
+      const element = document.getElementById(id);
+      if (!element) continue;
+      if (!Object.prototype.hasOwnProperty.call(controls, id)) continue;
+      const value = controls[id];
+      if (element.type === 'checkbox') {
+        element.checked = !!value;
+      } else if (element.tagName === 'SELECT') {
+        const text = String(value ?? '');
+        if (![...element.options].some((option) => option.value === text)) continue;
+        element.value = text;
+      } else {
+        element.value = String(value ?? '');
+      }
+      applied[id] = controlValue(element);
+    }
+    return applied;
+  }
+
+  /* One control's stored value, written directly. The listeners below are
+     the usual writer; the late-filled selects also use it to *forget* a
+     choice they cannot offer any more — a rule that was deleted, an
+     exporter that has stopped sending. Without that, the fetch fallback
+     that makes a restored choice count on the very first request would go
+     on applying a value the operator can no longer see or clear. */
+  function rememberControl(page, id, value) {
+    const store = loadView();
+    store.pages = store.pages || {};
+    store.pages[page] = store.pages[page] || {};
+    store.pages[page].controls = store.pages[page].controls || {};
+    store.pages[page].controls[id] = value;
+    saveView(store);
+  }
+
+  function rememberControls(page, ids) {
+    for (const id of ids) {
+      const element = document.getElementById(id);
+      if (!element) continue;
+      // Typing is the change, for a text box: `change` only fires on blur,
+      // and a reload with the cursor still in the field is exactly the case
+      // this exists for. Selects and checkboxes have no such gap.
+      const eventName = (element.tagName === 'INPUT' && element.type !== 'checkbox')
+        ? 'input' : 'change';
+      element.addEventListener(eventName,
+        () => rememberControl(page, id, controlValue(element)));
+    }
+  }
+
+  /* Sub-views (Nodes' DEVICES/DISCOVERY, IPAM's DHCP/CONFLICTS/SUBNETS …).
+     A reload that keeps the search but drops the sub-tab it was typed into
+     has not kept anything, so these travel with the controls. A stored name
+     is only honoured while a button for it is still on its page — a build
+     that drops a sub-view must not leave every sub-view hidden. */
+  function recallSub(page, fallback) {
+    const sub = ((loadView().pages || {})[page] || {}).sub;
+    if (!sub || typeof sub !== 'string' || !/^[a-z0-9_-]+$/i.test(sub)) return fallback;
+    const section = document.getElementById(`page-${String(page).split('.')[0]}`);
+    if (!section || !section.querySelector(`.subtab[data-subtab="${sub}"]`)) return fallback;
+    return sub;
+  }
+
+  function rememberSub(page, value) {
+    const store = loadView();
+    store.pages = store.pages || {};
+    store.pages[page] = store.pages[page] || {};
+    store.pages[page].sub = String(value || '');
+    saveView(store);
+  }
+
   /* Build a table head that can be dragged wider and clicked to sort.
      
      Widths live in a <colgroup> rather than on each <th>, so a redraw of the
@@ -756,7 +917,13 @@ const App = (() => {
           if (th.dataset.dragged) { delete th.dataset.dragged; return; }
           if (event.target.classList.contains('grip')) return;
           const same = sort && sort.key === column.key;
-          onSort(column.key, same ? !sort.descending : !!column.descendingFirst);
+          const descending = same ? !sort.descending : !!column.descendingFirst;
+          // Remembered here rather than in twelve onSort callbacks: every
+          // table reports its header clicks through this one handler, so
+          // surviving a reload costs each module one seed line and nothing
+          // on the write path.
+          rememberSort(name, { key: column.key, descending });
+          onSort(column.key, descending);
         });
       }
       if (index < columns.length - 1) {
@@ -1169,6 +1336,9 @@ const App = (() => {
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
+    recallSort, rememberSort, restoreControls, rememberControls,
+    rememberControl, savedControl,
+    recallSub, rememberSub,
     grid, sortRows, canRead, canWrite, accountModal,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,

@@ -7,8 +7,9 @@
   const view = {
     devices: [],
     devicesChecked: new Set(),
-    // Server order (name) until the operator clicks a heading.
-    deviceSort: { key: 'name', descending: false },
+    // Server order (name) until the operator clicks a heading, and that
+    // click survives a reload — see App.recallSort.
+    deviceSort: App.recallSort('nodes-devices', { key: 'name', descending: false }),
     groups: [],
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
@@ -24,7 +25,7 @@
     // device); its window and data are local to that dialog's own closure,
     // not pane-wide state — see deviceDialog.
     ifaces: [],
-    ifaceSort: { key: 'if_index', descending: false },
+    ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
     discJobs: [],
     discSelected: null,
@@ -3218,8 +3219,13 @@
     if (App.state.tab !== 'nodes') return;
     drawStatus();
     const q = App.el('nd-q').value.trim();
-    const group_id = App.el('nd-filter-group').value;
-    const device_group_id = App.el('nd-filter-devgroup').value;
+    // Same fallback as fillGroupFilter: on the load right after a reload
+    // the options do not exist yet, and the first fetch has to honour the
+    // restored choice or the list would contradict the filter for a tick.
+    const group_id = App.el('nd-filter-group').value ||
+      App.savedControl('nodes', 'nd-filter-group') || '';
+    const device_group_id = App.el('nd-filter-devgroup').value ||
+      App.savedControl('nodes', 'nd-filter-devgroup') || '';
     const status = App.el('nd-filter-status').value;
     // Omitted entirely when unchecked, not sent as "false": App.get only
     // drops params equal to '', so the API reads presence, not value.
@@ -3368,28 +3374,51 @@
     maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
   }
 
+  /* Snap a filter back to "any" and drop the stored value with it: while it
+     is still in the store, refresh() would go on sending an id that matches
+     nothing, and the list would stay empty with no filter on screen to
+     explain it. */
+  function forget(select, id) {
+    select.value = '';
+    App.rememberControl('nodes', id, '');
+  }
+
+  /* These two are filled from the refresh that init() has not run yet when
+     the page loads, so a restored choice cannot be set on the element in
+     init() — it is read back from the store here instead, the first time
+     the options exist. A saved profile that has since been deleted matches
+     no option, which selects nothing at all: snap back to "any" rather than
+     leave the filter showing a blank. */
   function fillGroupFilter() {
     const select = App.el('nd-filter-group');
-    const current = select.value;
+    const current = select.value || App.savedControl('nodes', 'nd-filter-group') || '';
     select.innerHTML = '<option value="">any profile</option>' +
       view.groups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
     select.value = current;
+    if (select.selectedIndex < 0) forget(select, 'nd-filter-group');
   }
 
   function fillDevGroupFilter() {
     const select = App.el('nd-filter-devgroup');
-    const current = select.value;
+    const current = select.value || App.savedControl('nodes', 'nd-filter-devgroup') || '';
     select.innerHTML = '<option value="">any group</option>' +
       view.deviceGroups.map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
     select.value = current;
+    if (select.selectedIndex < 0) forget(select, 'nd-filter-devgroup');
   }
 
   function init() {
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
-      btn.onclick = () => selectSub(btn.dataset.subtab);
+      btn.onclick = () => {
+        App.rememberSub('nodes', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
     }
     for (const btn of document.querySelectorAll('#nd-detail .subtabs > .subtab')) {
-      btn.onclick = () => selectDetailSub(btn.dataset.subtab);
+      btn.onclick = () => {
+        App.rememberSub('nodes.detail', btn.dataset.subtab);
+        selectDetailSub(btn.dataset.subtab);
+      };
     }
     App.el('nd-add-device').onclick = addDevice;
     App.el('nd-edit-device').onclick = editDevice;
@@ -3523,6 +3552,18 @@
         drawStatusTimeline();
       });
     }
+
+    // Last thing in init(): every list this page builds above is filled and
+    // nothing has been fetched, so refresh() reads the restored values out
+    // of the DOM exactly as it reads the markup defaults. A restored Find
+    // box does not search for a MAC on its own — that stays a keypress,
+    // because the lookup can open a dialog.
+    const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
+      'nd-filter-status', 'nd-filter-offline', 'disc-target', 'disc-pingonly'];
+    App.restoreControls('nodes', CONTROLS);
+    App.rememberControls('nodes', CONTROLS);
+    selectSub(App.recallSub('nodes', 'devices'));
+    selectDetailSub(App.recallSub('nodes.detail', 'interfaces'));
   }
 
   function selectSub(name) {

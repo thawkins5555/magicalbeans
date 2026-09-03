@@ -6,7 +6,7 @@
   const view = {
     sub: 'dhcp',
     subnets: [], subnetId: null,
-    hosts: [], hostSort: { key: 'ip', descending: false },
+    hosts: [], hostSort: App.recallSort('ipam-hosts', { key: 'ip', descending: false }),
     conflicts: [],
     dhcpServers: [], dhcpServerId: null,
     // The selected scope's own scope_id (e.g. "10.20.3.0"), kept beside the
@@ -14,7 +14,7 @@
     // loadDhcpScopes().
     dhcpScopeKey: null,
     dhcpScopes: [], dhcpScopeId: null, dhcpLeases: [],
-    leaseSort: { key: 'ip', descending: false },
+    leaseSort: App.recallSort('ipam-leases', { key: 'ip', descending: false }),
     scopeSort: 'least',
     scopeTrendWindow: '24h', scopeTrend: [],
   };
@@ -1044,7 +1044,10 @@
 
   function init() {
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
-      btn.onclick = () => selectSub(btn.dataset.subtab);
+      btn.onclick = () => {
+        App.rememberSub('ipam', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
     }
     App.el('ipam-settings').onclick = settingsDialog;
     App.el('ipam-add-subnet').onclick = addSubnet;
@@ -1069,6 +1072,15 @@
     App.el('ipam-show-resolved').onchange = loadConflicts;
     App.el('ipam-search-btn').onclick = searchHosts;
     App.el('ipam-search-q').onkeydown = (e) => { if (e.key === 'Enter') searchHosts(); };
+
+    // Last thing in init(): nothing has been drawn yet, so the first draw
+    // of each sub-view already has these. The scope order lives on `view`
+    // as well as on the control, so the two have to start out agreeing.
+    const CONTROLS = ['ipam-alive-only', 'ipam-show-resolved', 'ipam-scope-sort'];
+    App.restoreControls('ipam', CONTROLS);
+    App.rememberControls('ipam', CONTROLS);
+    view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
+    selectSub(App.recallSub('ipam', view.sub));
   }
 
   App.pages.ipam = { init, refresh, fastTick: drawStatus };

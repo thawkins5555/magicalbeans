@@ -19,7 +19,7 @@
     selected: null,
     controllerFilter: '',
     lastReportedTs: null,
-    apSort: { key: 'name', descending: false },
+    apSort: App.recallSort('wireless-aps', { key: 'name', descending: false }),
   };
 
   const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
@@ -389,11 +389,20 @@
     const overview = await App.get('/api/wireless/overview', {});
     view.controllers = overview.controllers;
 
+    // Late-filled: the controller list arrives with this response, so a
+    // restored choice comes from the store the first time round rather than
+    // from restoreControls. A controller that has since been removed matches
+    // no option, which selects nothing at all — snap back to "All".
     const filterSelect = App.el('wl-controller');
-    const current = filterSelect.value;
+    const current = filterSelect.value ||
+      App.savedControl('wireless', 'wl-controller') || '';
     filterSelect.innerHTML = '<option value="">All controllers</option>' +
       view.controllers.map((c) => `<option value="${c.id}">${escape(c.name)}</option>`).join('');
     filterSelect.value = current;
+    if (filterSelect.selectedIndex < 0) {
+      filterSelect.value = '';
+      App.rememberControl('wireless', 'wl-controller', '');
+    }
 
     const search = await App.get('/api/wireless/aps', {
       q: App.el('wl-q').value.trim(),
@@ -458,6 +467,12 @@
       await App.loadState();
       App.refreshNow('wireless');
     };
+
+    // Last thing in init(): refresh() reads all three straight off the DOM,
+    // so the first search already carries them.
+    const CONTROLS = ['wl-q', 'wl-controller', 'wl-state'];
+    App.restoreControls('wireless', CONTROLS);
+    App.rememberControls('wireless', CONTROLS);
   }
 
   App.pages.wireless = { init, refresh, fastTick: drawStatus };
