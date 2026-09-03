@@ -17,6 +17,9 @@
     // that bar hides the instant the selection clears, and the refresh the
     // action triggers runs synchronously, so nothing put there would paint.
     bulkNotice: null,
+    // How many alerts match the current filters, against the capped page the
+    // list is actually showing. {total, capped, cap} from /api/alerts/total.
+    alertTotal: null,
     // Per session only, like every other table's sort: a saved sort order is
     // a different feature from saved columns, and mixing the two storage
     // models is how Reset layout ends up eating a settings choice.
@@ -180,6 +183,11 @@
         key: 'check',
         checked: view.alerts.length > 0 && view.alerts.every((a) => checked.has(a.id)),
         some: view.alerts.some((a) => checked.has(a.id)),
+        // It only ever reaches the rows that were sent. Saying "select all"
+        // above a truncated list is how select-all-then-acknowledge came to
+        // acknowledge 300 of 1,842.
+        label: truncated() ? `Select the ${view.alerts.length} shown`
+                           : 'Select all rows',
         onToggle: (on) => {
           checked.clear();
           if (on) for (const a of view.alerts) checked.add(a.id);
@@ -210,8 +218,25 @@
       };
     });
     table.appendChild(body);
-    App.el('alerts-count').textContent = `${view.alerts.length} shown`;
+    App.el('alerts-count').textContent = countLabel();
     drawBulkBar();
+  }
+
+  /* True when the server sent fewer alerts than match the filters — the
+     case the old "300 shown" label hid. */
+  function truncated() {
+    const t = view.alertTotal;
+    if (!t || typeof t.total !== 'number') return false;
+    return t.capped || t.total > view.alerts.length;
+  }
+
+  function countLabel() {
+    const shown = view.alerts.length;
+    const t = view.alertTotal;
+    if (!t || typeof t.total !== 'number') return `${shown} shown`;
+    if (t.capped) return `${shown} of more than ${t.total.toLocaleString()} shown`;
+    if (t.total <= shown) return `${shown} shown`;
+    return `${shown} of ${t.total.toLocaleString()} shown`;
   }
 
   /* ------------------------------------------------------- bulk actions */
@@ -853,15 +878,19 @@
     const span = t1 - t0;
     const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
     const f = filters();
-    const [overview, list, rules, templates, mutes] = await Promise.all([
+    const [overview, list, total, rules, templates, mutes] = await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', f),
+      // Same filters, in the same round trip, so the label under the table
+      // can say what fraction of the matches is on screen.
+      App.get('/api/alerts/total', f),
       App.get('/api/alerts/rules'),
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
     ]);
     view.hist = overview.buckets;
     view.alerts = list.alerts;
+    view.alertTotal = total;
     view.rules = rules.rules;
     view.templates = templates.templates;
     // entity_id -> until_ts, for the devices with an active mute. The server
@@ -920,9 +949,13 @@
     // state for everything on screen in one click and there is no undo, so
     // they get the same guard as a delete.
     App.el('alerts-ack-all').onclick = () => {
-      const open = view.alerts.filter((a) => a.state === 'open').length;
+      // The route acknowledges every open alert on the SERVER, so the number
+      // in the question has to be the server's, not the truncated page's —
+      // it used to say "(N shown)", which read as the size of the action.
+      const open = ((App.state.serverState || {}).alerts || {}).open_count;
       App.confirmDestructive('Acknowledge all',
-        `<p>Acknowledge every open alert${open ? ` (${open} shown)` : ''}?</p>` +
+        `<p>Acknowledge ${open != null ? `all ${open.toLocaleString()}` : 'every'} ` +
+        'open alert(s)?</p>' +
         '<p class="hint">Every open alert on the server — not your ticked ' +
         'selection, and not just the ones matching the current filter. Use ' +
         '"Acknowledge selected" for the rows you have ticked. They cannot be ' +

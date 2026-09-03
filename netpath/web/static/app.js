@@ -1137,12 +1137,14 @@ const App = (() => {
         // Some-but-not-all is a real third state and a plain tick would lie
         // about it. It cannot be set from markup, only from script.
         box.indeterminate = !selectAll.checked && !!selectAll.some;
-        box.title = selectAll.checked ? 'Clear selection' : 'Select all';
         // The header cell is a checkbox with no visible text, so it needs
-        // its own name; `title` alone is not reliably announced.
+        // its own name; `title` alone is not reliably announced. A caller
+        // whose list is truncated passes a label that says so, and the
+        // tooltip says the same thing as the announcement.
+        const selectLabel = selectAll.label || 'Select all rows';
         box.setAttribute('aria-label',
-                         selectAll.label || (selectAll.checked ? 'Clear selection'
-                                                              : 'Select all rows'));
+                         selectAll.checked ? 'Clear selection' : selectLabel);
+        box.title = selectAll.checked ? 'Clear selection' : selectLabel;
         box.onclick = (event) => {
           event.stopPropagation();
           selectAll.onToggle(box.checked);
@@ -1308,7 +1310,11 @@ const App = (() => {
     if (!box) return;
     box.checked = total > 0 && selected === total;
     box.indeterminate = selected > 0 && selected < total;
-    box.title = box.checked ? 'Clear selection' : 'Select all';
+    // grid() gave the box its accessible name, which may say "Select the 300
+    // shown" above a truncated list; reuse it rather than overwriting it with
+    // the generic wording.
+    const name = box.getAttribute('aria-label') || 'Select all';
+    box.title = box.checked ? 'Clear selection' : name;
   }
 
   /* Builds a table body from column descriptors: `cell(row)` renders when

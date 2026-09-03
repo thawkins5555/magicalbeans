@@ -4192,3 +4192,45 @@ def post_password(service, params, body) -> dict:
                     f"Password for {target} changed by {me}; "
                     f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}
+
+
+# ---------------------------------------------------------------------------
+# Everything below this line is the browser front end's own additions
+# (workstream E). They are appended rather than filed beside their relatives
+# so the front-end work and the module work never touch the same hunk.
+# ---------------------------------------------------------------------------
+
+
+# `GET /api/alerts` caps its answer (300 by default, 2,000 hard) and the list
+# said "300 shown" with no total, so an operator ticking select-all
+# acknowledged 300 of however many there really were. This gives the same
+# filters an honest denominator.
+#
+# alerts.db has no filtered COUNT of its own, and alertsdb.py belongs to
+# another workstream, so the count is taken by asking for ids up to a cap and
+# saying so when the cap is what answered: "300 of 5,000+ shown" is honest,
+# "300 shown" was not. If a `count_alerts` ever lands on the database object
+# this uses it instead, and the cap stops applying.
+ALERT_TOTAL_CAP = 5000
+
+
+def get_alerts_total(service, params, body) -> dict:
+    """How many alerts match the filters the list is showing."""
+    filters = {
+        "state": params.get("state") or None,
+        "severity": int(params["severity"]) if params.get("severity") else None,
+        "rule_id": int(params["rule_id"]) if params.get("rule_id") else None,
+        "device_text": params.get("device") or None,
+        "text": params.get("q") or None,
+        "t0": _num(params, "t0", None),
+        "t1": _num(params, "t1", None),
+    }
+    counter = getattr(service.alerts_db, "count_alerts", None)
+    if callable(counter):
+        return {"total": int(counter(**filters)), "capped": False,
+                "cap": None}
+    rows = service.alerts_db.alerts(limit=ALERT_TOTAL_CAP + 1, **filters)
+    total = len(rows)
+    capped = total > ALERT_TOTAL_CAP
+    return {"total": ALERT_TOTAL_CAP if capped else total,
+            "capped": capped, "cap": ALERT_TOTAL_CAP}

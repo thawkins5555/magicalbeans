@@ -251,6 +251,10 @@ ROUTES = [
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
     ("POST", r"^/api/maintenance$", api.post_maintenance, ("settings", W)),
     ("POST", r"^/api/update$", api.post_update, ("settings", W)),
+    # Front-end additions (workstream E), appended so they never share
+    # a hunk with the module routes above. `/api/alerts/total` cannot
+    # collide with `/api/alerts/(\d+)`, which only matches digits.
+    ("GET", r"^/api/alerts/total$", api.get_alerts_total, ("alerts", R)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)
