@@ -213,7 +213,12 @@ class Scenario:
         os.makedirs(self.out, exist_ok=True)
         self.count = args.count
         self.scale = 0.25 if args.fast else 1.0
-        self.data_dir = os.path.join(self.out, "data-%d" % self.count)
+        # A defaults run keeps its own databases: it is a different
+        # configuration of the same fleet, and mixing the two would make
+        # the retention and alert figures unreadable.
+        self.data_dir = os.path.join(
+            self.out, "data-%d%s" % (self.count,
+                                     "-defaults" if getattr(args, "defaults", False) else ""))
         self.mail_log = os.path.join(self.out, "mail-%d.log" % self.count)
         self.app_log = os.path.join(self.out, "app-%d.log" % self.count)
         self.fleet_log = os.path.join(self.out, "fleet-%d.log" % self.count)
@@ -344,6 +349,11 @@ class Scenario:
         argv = [sys.executable, "-u", seed, "--base", self.base,
                 "--count", str(self.count), "--out", self.out,
                 "--workers", str(self.args.workers)]
+        if getattr(self.args, "defaults", False):
+            # A run at shipped settings: seed.py then makes none of the
+            # campaign's overrides, so the numbers can be read beside a
+            # customer's own install rather than only against each other.
+            argv.append("--defaults")
         self.log("[seed] %s" % " ".join(argv))
         seed_log = os.path.join(self.out, "seed-stdout-%d.log" % self.count)
         with open(seed_log, "w", encoding="utf-8") as handle:
@@ -733,7 +743,7 @@ class Scenario:
         payload = {"count": self.count, "fast": self.args.fast,
                    "base": self.base, "generated": time.time(),
                    "notes": self.notes, "steps": self.steps, **extra}
-        json_path = os.path.join(self.out, "results-%d.json" % self.count)
+        json_path = os.path.join(self.out, "results-%d%s.json" % (self.count, "-defaults" if getattr(self.args, "defaults", False) else ""))
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=1, default=str)
 
@@ -822,7 +832,7 @@ class Scenario:
             lines.extend("- %s" % note for note in self.notes)
             lines.append("")
 
-        md_path = os.path.join(self.out, "results-%d.md" % self.count)
+        md_path = os.path.join(self.out, "results-%d%s.md" % (self.count, "-defaults" if getattr(self.args, "defaults", False) else ""))
         with open(md_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines))
         self.log("[ok] wrote %s and %s"
@@ -886,6 +896,9 @@ def main(argv=None) -> int:
                         help="do not run demo/ui_walk.mjs at the end")
     parser.add_argument("--fast", action="store_true",
                         help="scale every wait down 4x for a dry run")
+    parser.add_argument("--defaults", action="store_true",
+                        help="seed with the shipped settings: no threshold, "
+                             "grace, interval, worker or mail-cap overrides")
     args = parser.parse_args(argv)
 
     scenario = Scenario(args)
