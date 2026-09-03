@@ -501,6 +501,61 @@ rollup running, cached settings in the scheduler, one keyed alert query, and
 GETBULK for the interface columns) plus concurrent pings with back-off for
 failing devices (§4.5 X-F15) are what move that ceiling; none of them is large.
 
+### 3.5 After the fixes — the same campaign re-run on 4.37.0
+
+Everything in §3.1–§3.4 was measured against 4.35.0. The campaign was re-run
+after all eight workstreams merged, on the same machine, with the same fleet
+and the same nine incidents. Two tiers used the campaign settings, so the
+numbers sit beside the ones above; a third ran at the **shipped defaults**
+(16 workers, a 120 s interval, the shipped thresholds, 300 s grace, 60
+emails/hour) — the like-for-like column §3 previously lacked.
+
+| Measure | 1,000 before | 1,000 after | 2,000 before | 2,000 after | 2,000 at shipped defaults |
+|---|---|---|---|---|---|
+| Baseline poll-overrun events | present | **0** | present | 2,000 | **0** |
+| Poll-overrun events, outage step | 6,420 | **219** | 5,423 | 3,255 | 1,627 |
+| Site outage: dark devices → alerts raised for them | 500 → 16 | 500 → **920** (420 `device_down` + 500 packet-loss) | 500 → 0 | 500 → 298 | 500 → poll-overrun and pool-saturation alerts (see below) |
+| Baseline app CPU | 67% | 60% | 70% | 70% | **44.5%** |
+| Nodes table fill after refresh | 1,854 ms | **274 ms** | 1,488 ms | — | **618 ms** (2,000 rows) |
+| `/api/nodes/devices` payload | 1.32 MB in 653 ms | 1.37 MB in **54 ms** | 2.64 MB in 201 ms | 2.74 MB in 426 ms | 2.74 MB in **98 ms** |
+| Browser long tasks (longest) | 122 (429 ms) | 30 (781 ms) | 251 (1,460 ms) | 44 (835 ms) | 37 (1,125 ms) |
+| `samples` / `samples_hourly` rows | 441,991 / **0** | — | 585,259 / **0** | 5,661,712 / **465,197** | 4,127,376 / 0 (see below) |
+| Emails sent by `mib_missing` | one per alert | — | one per alert | **0** (1,898 alerts, no mail) | **0** (1,898 alerts, no mail) |
+
+What the re-run establishes:
+
+- **The retention machinery is alive.** `samples_hourly` was empty at every
+  tier before, because `compact_rollup()` was never called (§4.1 P-B2); it now
+  holds 465,197 rows. The defaults run shows 0 for an honest reason rather
+  than a regression: it spans 06:18–06:40 UTC and contains no *completed*
+  hour, and the rollup deliberately aggregates only hours that have ended.
+  The campaign run spans 05:54–06:18, crosses 06:00, and aggregated that hour.
+- **Rules that could never fire now fire.** Interface utilisation, error and
+  discard rates are recorded, so six shipped rules that had no data behind
+  them open alerts; `SNMP failing while the device answers ping` — a switch
+  answering ping with a dead agent, previously invisible — opened 17 alerts at
+  2,000 devices and 3 at defaults.
+- **A rule that should not mail no longer mails.** `mib_missing` raised 1,898
+  alerts and sent **no** email, against one per alert before.
+- **The product now says when it is over capacity.** At shipped defaults with
+  a third of a 2,000-device fleet dark, the poller cannot keep up — and says
+  so: 1,627 `poll_overrun` events and a `Polling pool saturated — polls are
+  being skipped` alert. Before, the same condition produced silence and a
+  green screen. This is the honest reading of the tier: **2,000 devices behind
+  one poller at the shipped interval is still beyond capacity when a large
+  fraction goes dark.** The fixes moved the ceiling a long way — 1,000 devices
+  now detects an outage it previously missed, and the baseline at 2,000 runs
+  with no overruns at all — but they did not remove it, and the deferred
+  remote-poller work in §6 is what would.
+- **The mail cap behaves.** The outage at shipped settings opened 1,999 alerts
+  and sent 59 emails, against the 60/hour cap, with the rest recorded against
+  their alerts rather than dropped silently.
+- **Upgrades are safe.** The ten databases the 250-device 4.35.0 campaign left
+  behind were opened by this build: 250 devices, 210,272 samples and 1,219
+  alerts preserved, the three named alert migrations applied exactly once, all
+  new columns and tables added in place, `admin` granted to the account that
+  held `settings: write`, and every file re-created 0600 (they were 0644).
+
 ---
 
 ## 4. Findings by area
