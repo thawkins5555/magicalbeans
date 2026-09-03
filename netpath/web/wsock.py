@@ -19,7 +19,9 @@ What this implements, and what it deliberately does not:
   of the page asking — is settled in server.py before this is reached.
 * Text, binary and continuation frames, with masked payloads (a client
   frame that is not masked is a protocol error, per the RFC), ping answered
-  with pong, and the close handshake echoed.
+  with pong, and the close handshake echoed. Every other opcode is
+  reserved, and a reserved one fails the connection (§5.2) rather than
+  being reassembled as though it were data.
 * One lock around *all* socket I/O, not merely around sending. A session
   has two threads on one socket — the one reading it and the one pumping
   the SSH channel into it — and under TLS that would be a concurrent
@@ -48,12 +50,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import select
+import selectors
 import socket
 import ssl
 import struct
 import threading
+import time
+
+log = logging.getLogger(__name__)
 
 # The RFC's magic constant, appended to the client's key before the digest.
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -66,6 +73,14 @@ OP_PING = 0x9
 OP_PONG = 0xA
 
 _CONTROL_OPS = (OP_CLOSE, OP_PING, OP_PONG)
+# Every opcode the RFC defines. The rest — 0x3-0x7 (reserved non-control)
+# and 0xB-0xF (reserved control) — "MUST fail the WebSocket connection"
+# (§5.2). Without that they missed the control branch and the continuation
+# branch alike and were reassembled as if they were text or binary, and a
+# reserved *control* opcode also escaped the "fragmented control frame" and
+# "oversized control frame" guards, since those ask whether the opcode is
+# one of the three above.
+_DEFINED_OPS = (OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG)
 
 # One frame, and one reassembled message, may not exceed this. Generous for
 # a terminal by three orders of magnitude, small enough that a bad length
@@ -89,6 +104,16 @@ SEND_TIMEOUT_S = 15
 # One `recv` from the socket. Independent of the message cap: this is the
 # stream, not a frame.
 _RECV_BYTES = 65536
+
+# `poll()` where the platform has it (Linux, the BSDs), `selectors` — which
+# is epoll/kqueue there and `select` on Windows — everywhere else. NOT
+# `select.select`: it cannot express a descriptor at or above FD_SETSIZE
+# (1024) and raises ValueError for one, and this application reaches that
+# number on an ordinary busy appliance (ten databases with their WAL and
+# SHM companions, three UDP listeners, the poller's worker sockets, one
+# descriptor per open HTTP connection). Windows' select has no such ceiling
+# on the descriptor's *value*, which is why the fallback is safe there.
+_HAS_POLL = hasattr(select, "poll")
 
 # Close codes this module sends on its own behalf. The application's own
 # codes (4401/4408/4429) are passed to close() by the caller.
@@ -207,6 +232,9 @@ class WebSocket:
         # Filled in when the peer closes: the code and reason it gave.
         self.close_code: int | None = None
         self.close_reason: str = ""
+        # Whether the readability wait has already been reported as broken;
+        # one line per socket, not one per slice.
+        self._wait_broken = False
         self._set_timeout(READ_SLICE_S)
 
     def _set_timeout(self, seconds: float) -> None:
@@ -279,6 +307,8 @@ class WebSocket:
         if first & 0x70:
             raise WebSocketError("Reserved bits set")
         opcode = first & 0x0F
+        if opcode not in _DEFINED_OPS:
+            raise WebSocketError("Reserved opcode")
         masked = bool(second & 0x80)
         length = second & 0x7F
         if not masked:
@@ -349,15 +379,50 @@ class WebSocket:
         the slice to expire, which is what makes `closed` noticed promptly.
         Its answer is not trusted: the read that follows happens either way,
         because under TLS a whole record can already be decoded and waiting
-        inside the SSL object with nothing left for `select` to see — which
+        inside the SSL object with nothing left for the wait to see — which
         is also why a TLS socket that reports pending bytes is not made to
-        wait out the slice first."""
+        wait out the slice first.
+
+        What must never happen is *no* wait: the read behind this one is
+        non-blocking, so a wait that returns immediately turns the reader
+        into a loop that takes and releases the I/O lock millions of times
+        a second, pinning a core and starving the pump thread on the same
+        socket. That is why the wait uses `poll`/`epoll` rather than
+        `select` (see `_HAS_POLL`), and why a wait that cannot be performed
+        at all is slept out rather than skipped.
+        """
         try:
             if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending():
                 return
-            select.select([self.sock], [], [], READ_SLICE_S)
         except (OSError, ValueError):
             pass                          # closed underneath us; the read says so
+        try:
+            self._poll_readable(READ_SLICE_S)
+        except (OSError, ValueError) as exc:
+            # Not evidence that the socket is gone — the read that follows
+            # decides that — but the slice still has to pass, or this is a
+            # spin. Said once per socket, because it is the kind of fault
+            # that otherwise only shows up as an unexplained busy CPU.
+            if not self._wait_broken:
+                self._wait_broken = True
+                log.warning("WebSocket reader cannot wait on its socket "
+                            "(%s: %s); falling back to a timed sleep",
+                            type(exc).__name__, exc)
+            time.sleep(READ_SLICE_S)
+
+    def _poll_readable(self, timeout: float) -> None:
+        """One readability wait on this socket, with no ceiling on the
+        descriptor's value. Both objects are per-call: `select.poll()` costs
+        no descriptor at all, and a selector is only built on the platforms
+        that have no `poll`."""
+        if _HAS_POLL:
+            poller = select.poll()
+            poller.register(self.sock.fileno(), select.POLLIN | select.POLLPRI)
+            poller.poll(timeout * 1000.0)
+            return
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.sock, selectors.EVENT_READ)
+            selector.select(timeout)
 
     # ------------------------------------------------------------- writing
 
@@ -386,6 +451,20 @@ class WebSocket:
         # No waiting for the peer's answering close: the handler thread is
         # about to let the connection go, and a half-closed socket is what
         # unblocks a recv() parked in another thread.
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
+    def unblock(self) -> None:
+        """Stop the socket without sending anything and without taking the
+        I/O lock. `close()` cannot do this: it takes the lock to send its
+        close frame, and the lock can be held for `SEND_TIMEOUT_S` by a
+        write into a peer that stopped reading — which is exactly the case
+        a caller in a hurry (`SshSessionRegistry.shutdown()`) needs to get
+        past. The shutdown fails that write immediately and ends any
+        `recv()` parked on the socket."""
+        self.closed = True
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except (OSError, AttributeError):
