@@ -1564,7 +1564,7 @@
         onBack();
       } });
     }
-    const box = App.modal(ifaceTitle(iface, ifIndex, deviceId), `
+    const box = App.modal({ html: ifaceTitle(iface, ifIndex, deviceId) }, `
       <p class="section">BANDWIDTH — LAST HOUR
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
         <span style="color:var(--accent)">▬</span> out)</span>
@@ -2701,7 +2701,7 @@
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
     // Per-scan timing only — the values apply to this one sweep and are
     // never written back to any profile or setting.
-    App.modal(`Start discovery of ${escape(target)}`, `
+    App.modal(`Start discovery of ${target}`, `
       <p class="hint">Timing for this scan only. Retries are extra
         attempts on an address that hasn't answered; more retries or a
         longer timeout makes a large sweep noticeably slower.</p>

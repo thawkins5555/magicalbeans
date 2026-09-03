@@ -133,6 +133,26 @@ const App = (() => {
     el.classList.toggle('bad', !ok);
   }
 
+  /* Say something once, to assistive technology only. The connection state,
+     the idle countdown and a bulk action's result were all silent DOM
+     mutations, so a screen-reader user never learned the server had gone
+     away. `role="status"` on the visible elements covers most of it; this is
+     for the results that have no element of their own. */
+  function announce(message) {
+    let live = document.getElementById('sr-announce');
+    if (!live) {
+      live = document.createElement('div');
+      live.id = 'sr-announce';
+      live.className = 'sr-only';
+      live.setAttribute('role', 'status');
+      live.setAttribute('aria-live', 'polite');
+      document.body.appendChild(live);
+    }
+    // Re-setting identical text is not a change, and is not announced.
+    if (live.textContent === message) live.textContent = '';
+    live.textContent = message;
+  }
+
   /* --------------------------------------------------------- idle sign-out
 
      The idle timeout is meant to catch a session left open and unattended,
@@ -198,6 +218,9 @@ const App = (() => {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
+      // Assertive: being signed out in a minute is worth interrupting
+      // whatever is being read.
+      idleBanner.setAttribute('role', 'alert');
       idleBanner.innerHTML =
         '<span id="idle-banner-text"></span>' +
         '<button id="idle-banner-stay">Stay signed in</button>';
@@ -382,14 +405,68 @@ const App = (() => {
 
   /* ------------------------------------------------------------ modals */
 
+  /* What the operator was on when the dialog opened, so closing it hands
+     focus back there instead of dropping it on <body> and making them Tab
+     from the tab bar to their row again. The help panel (below) has always
+     done this; the main modal — which is every real dialog in the app — did
+     not. */
+  let modalTrigger = null;
+
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),' +
+    ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function focusableIn(box) {
+    return [...box.querySelectorAll(FOCUSABLE)]
+      .filter((node) => !node.hidden && node.offsetParent !== null);
+  }
+
+  /* Tab must not walk out of an open dialog into the page behind it: that
+     page is inert to the eye (the backdrop covers it) but not to the
+     keyboard, so without this a few Tabs put focus on controls the operator
+     cannot see. Wrapping both ways is the ARIA authoring-practices
+     behaviour. */
+  function trapTab(event) {
+    if (event.key !== 'Tab') return;
+    const wrap = document.getElementById('modal');
+    if (!wrap || wrap.hidden) return;
+    // The help panel is its own layer above this one.
+    if (helpOpen()) return;
+    const box = document.getElementById('modal-box');
+    const items = focusableIn(box);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !box.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !box.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function modal(title, bodyHtml, buttons, options = {}) {
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
+    // Remembered before the dialog takes focus. `options.trigger` lets a
+    // caller name the control explicitly when the dialog is opened from
+    // code rather than from a click.
+    modalTrigger = options.trigger
+      || (document.activeElement && document.activeElement !== document.body
+          ? document.activeElement : null);
+    // Titles carry device names, group names and interface aliases, and
+    // seven call sites interpolated them raw. A plain string is now escaped
+    // here, once, rather than by each caller remembering to; the one dialog
+    // whose heading is genuinely two lines of markup (the interface dialog)
+    // says so by passing {html}.
+    const heading = title && typeof title === 'object' && title.html !== undefined
+      ? String(title.html) : escapeHtml(title);
     // Long forms put their buttons at the top, so Save is reachable without
     // scrolling past every field first.
     box.innerHTML = options.buttonsTop
-      ? `<h2>${title}</h2><div class="row top"></div>${bodyHtml}`
-      : `<h2>${title}</h2>${bodyHtml}<div class="row"></div>`;
+      ? `<h2 id="modal-title">${heading}</h2><div class="row top"></div>${bodyHtml}`
+      : `<h2 id="modal-title">${heading}</h2>${bodyHtml}<div class="row"></div>`;
     const row = box.querySelector('.row');
     for (const spec of buttons) {
       const button = document.createElement('button');
@@ -398,20 +475,35 @@ const App = (() => {
       button.onclick = () => spec.onClick(box, button);
       row.appendChild(button);
     }
+    // The semantics the help panel already had ten lines away: a dialog,
+    // modal, named by its own heading.
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'modal-title');
     wrap.hidden = false;
     const first = box.querySelector('input, select, textarea');
     if (first) first.focus();
+    else {
+      const anything = focusableIn(box)[0];
+      if (anything) anything.focus();
+    }
     return box;
   }
 
   const closeModal = () => {
     if (state.modalLocked) return;
-    document.getElementById('modal').hidden = true;
+    const wrap = document.getElementById('modal');
+    const wasOpen = wrap && !wrap.hidden;
+    if (wrap) wrap.hidden = true;
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
     // close the modal without that button ever being pressed.
     window.dispatchEvent(new Event('modal-closed'));
+    if (wasOpen && modalTrigger && document.contains(modalTrigger)) {
+      modalTrigger.focus();
+    }
+    modalTrigger = null;
   };
 
   /* ------------------------------------------------------------ help
@@ -1037,7 +1129,9 @@ const App = (() => {
     // old data-tab page and the newly .active one visible at once.
     document.documentElement.dataset.tab = name;
     for (const tab of document.querySelectorAll('.tab')) {
-      tab.classList.toggle('active', tab.dataset.tab === name);
+      const current = tab.dataset.tab === name;
+      tab.classList.toggle('active', current);
+      tab.setAttribute('aria-selected', current ? 'true' : 'false');
     }
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
@@ -1157,8 +1251,21 @@ const App = (() => {
   }
 
   async function start() {
+    const tabBar = document.getElementById('tabs');
+    if (tabBar) tabBar.setAttribute('role', 'tablist');
     for (const tab of document.querySelectorAll('.tab')) {
       tab.onclick = () => selectTab(tab.dataset.tab);
+      // Twelve identical unlabelled buttons announced nothing about which
+      // one was current; selectTab keeps aria-selected in step below.
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-controls', `page-${tab.dataset.tab}`);
+      tab.setAttribute('aria-selected', 'false');
+      tab.id = tab.id || `tab-${tab.dataset.tab}`;
+      const panel = document.getElementById(`page-${tab.dataset.tab}`);
+      if (panel) {
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+      }
     }
     const signout = document.getElementById('signout');
     if (signout) {
@@ -1172,6 +1279,7 @@ const App = (() => {
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') closeModal();
     };
+    document.addEventListener('keydown', trapTab);
     document.addEventListener('keydown', (event) => {
       // Escape peels one layer: the help panel if it is open, else the
       // dialog under it. Closing both at once would throw away the form
@@ -1230,6 +1338,7 @@ const App = (() => {
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    announce,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, a11yTable, sortRows, canRead, canWrite, accountModal,

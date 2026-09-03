@@ -1021,7 +1021,7 @@
         [{ label: 'OK', primary: true, onClick: App.closeModal }]);
       return;
     }
-    App.modal(`Find: “${escape(query)}”`, resultsTable(payload.results),
+    App.modal(`Find: “${query}”`, resultsTable(payload.results),
       [{ label: 'Close', primary: true, onClick: App.closeModal }]);
   }
 

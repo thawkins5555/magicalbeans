@@ -76,6 +76,21 @@ body {
   overflow: hidden;
 }
 
+/* Off-screen until it takes focus, then a real target above everything. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  padding: 8px 14px;
+  font: 600 12px/1 var(--ui);
+  text-decoration: none;
+}
+.skip-link:focus { left: 8px; top: 8px; }
+
 /* ------------------------------------------------------------------ tabs */
 #tabs {
   display: flex;

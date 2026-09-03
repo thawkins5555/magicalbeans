@@ -16,7 +16,12 @@
 </head>
 <body>
 
-<nav id="tabs">
+<!-- The document has to start with a name and a way past the twelve-item tab
+     bar; neither is worth pixels on a NOC screen, so both are sr-only. -->
+<h1 class="sr-only">SappiWhere network monitor</h1>
+<a class="skip-link" href="#tabs">Skip to the current view</a>
+
+<nav id="tabs" role="tablist" aria-label="Views">
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab" data-tab="nodes">NODES</button>
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
@@ -34,7 +39,8 @@
   <span id="whoami" class="conn user"></span>
   <button id="account-btn" class="linkish">Account</button>
   <button id="signout" class="linkish">Sign out</button>
-  <span id="conn" class="conn">connecting…</span>
+  <!-- The one honest signal during an outage: announced, not just recoloured. -->
+  <span id="conn" class="conn" role="status" aria-live="polite">connecting…</span>
 </nav>
 
 <!-- =========================== DASHBOARD ============================ -->

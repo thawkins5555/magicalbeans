@@ -274,6 +274,10 @@
     const ids = [...view.checked];
     if (!ids.length) return;
     const result = await App.post(path, { alert_ids: ids });
+    // The notice is painted on the counters line, which reruns every poll
+    // and would be a noisy live region; the one-shot result is announced
+    // through the shared sr-only status instead.
+    App.announce(`${verb} ${result[key]} of ${ids.length}`);
     view.bulkNotice = { text: `${verb} ${result[key]} of ${ids.length}`,
                         until: Date.now() + 6000 };
     clearSelection();
