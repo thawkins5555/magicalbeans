@@ -127,6 +127,13 @@ class Service:
             self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
             syslog_db=self.syslog_db, ipam_db=self.ipam_db, app_db=self.app_db,
             wireless_db=self.wireless_db, netpath_db=self.db, log=self.log)
+        # The poller raises one alert about itself — that its worker pool is
+        # saturated and devices are being polled late — through the engine's
+        # system-occurrence path. Wired here rather than passed to the
+        # constructor because the engine is built last, after everything it
+        # reads from; the poller guards every use, so it runs standalone
+        # (tests, scripts) with this left unset.
+        self.node_poller.alert_engine = self.alert_engine
 
         self.sessions = SessionStore(
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),

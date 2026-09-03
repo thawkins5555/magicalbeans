@@ -673,6 +673,23 @@ class NodePoller:
         # device_id -> when its ipAddrTable was last read. See
         # _refresh_addresses: once an hour, not once a poll.
         self._addresses_read: dict[int, float] = {}
+        # device_id -> the GETBULK repetition count that last worked for it.
+        # A device that answers "tooBig" is retried at half as many rows, and
+        # remembering that means the next walk starts where the last one
+        # ended up rather than re-learning the same limit every time.
+        self._bulk_repetitions: dict[int, int] = {}
+        # Forwarding-table walks run here, not on the poll pool: one walk is
+        # hundreds to thousands of rows, and parking poll workers on them is
+        # what made the pool saturate.
+        self._mac_executor: ThreadPoolExecutor | None = None
+        # When the pool first looked saturated, and whether that has been
+        # reported. See _note_saturation.
+        self._saturated_since: float | None = None
+        self._saturation_reported = False
+        # Set by the application once the alert engine exists, so the poller
+        # can raise a system alert about itself. Left None (and every use
+        # guarded) so the poller runs standalone in tests and scripts.
+        self.alert_engine = None
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
         # mixed-vendor subnet, say) costs one extra request only on a
@@ -703,6 +720,8 @@ class NodePoller:
         self._stop.clear()
         workers = max(1, int((settings or self.db.settings()).get("poll_workers", 16)))
         self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._mac_executor = ThreadPoolExecutor(
+            max_workers=self._MAC_WALK_WORKERS, thread_name_prefix="mac-walk")
         self._thread = threading.Thread(target=self._loop, name="node-poller", daemon=True)
         self._thread.start()
 
@@ -724,12 +743,17 @@ class NodePoller:
         elif self.running:
             self.stop()
 
+    _MAC_WALK_WORKERS = 4
+
     def stop(self) -> None:
         self._stop.set()
         for job in list(self._discovery_jobs.values()):
             job.cancel()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._mac_executor:
+            self._mac_executor.shutdown(wait=False, cancel_futures=True)
+            self._mac_executor = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
@@ -737,13 +761,30 @@ class NodePoller:
     def shutdown(self) -> None:
         self.stop()
 
+    def pool_state(self) -> dict:
+        """How much of the poll pool is in use right now.
+
+        The review found the gauge on this counted queued and running
+        together against the pool size, so it read "48 of 32 busy" — which
+        is not wrong so much as unsayable. The two are separate here.
+        """
+        with self._lock:
+            busy = len(self._started)
+            queued = len(self._queued)
+        workers = getattr(self._executor, "_max_workers", 0) if self._executor else 0
+        return {"busy": busy, "queued": queued, "workers": workers,
+                "saturated": bool(workers and busy >= workers and queued)}
+
     def status_text(self) -> str:
         if self.error:
             return self.error
         if not self.running:
             return "Poller stopped"
         n = self.db.device_count()
-        return f"Polling {n} device(s) · last poll {_ago(self._last_completed)}"
+        pool = self.pool_state()
+        return (f"Polling {n} device(s) · {pool['busy']} busy and "
+                f"{pool['queued']} queued of {pool['workers']} worker(s) · "
+                f"last poll {_ago(self._last_completed)}")
 
     def worker_state(self) -> dict:
         with self._lock:
@@ -913,6 +954,8 @@ class NodePoller:
             self._configs = self.db.effective_configs()
             self._configs_generation = generation
             self._configs_loaded = now
+            self._forget_devices(set(self._configs))
+        self._note_saturation(now)
         focus = self._focus
         for device in self.db.schedule_rows():
             device_id = device["id"]
@@ -945,6 +988,70 @@ class NodePoller:
                     self._submit(device_id)
             self._maybe_walk_mac_table(device, config, now)
 
+    # How long the pool has to look saturated before it is worth telling
+    # somebody. A burst at the top of a poll cycle is normal; five minutes
+    # of it means the pool is genuinely too small for the fleet.
+    _SATURATION_S = 300.0
+
+    def _note_saturation(self, now: float) -> None:
+        """Raise (and clear) a system alert when every poll worker is busy
+        and devices are still waiting.
+
+        §4.1 S5 and the review's Tier 2 list: nothing said the pool was the
+        bottleneck, so a fleet that had outgrown poll_workers looked like a
+        fleet of slow devices. The alert names the number to raise.
+        """
+        pool = self.pool_state()
+        engine = self.alert_engine
+        if not pool["saturated"]:
+            if self._saturation_reported:
+                clear = getattr(engine, "clear_system_occurrence", None)
+                if clear is not None:
+                    clear("poll_pool_saturated", "poller")
+            self._saturated_since = None
+            self._saturation_reported = False
+            return
+        if self._saturated_since is None:
+            self._saturated_since = now
+            return
+        if self._saturation_reported or now - self._saturated_since < self._SATURATION_S:
+            return
+        self._saturation_reported = True
+        raise_it = getattr(engine, "system_occurrence", None)
+        if raise_it is None:
+            return
+        minutes = (now - self._saturated_since) / 60.0
+        raise_it(
+            "poll_pool_saturated", "poller", "Polling pool", severity=3,
+            extra={"busy": pool["busy"], "queued": pool["queued"],
+                   "workers": pool["workers"],
+                   "saturated_minutes": round(minutes, 1)},
+            message=(f"Every one of the {pool['workers']} poll workers has "
+                     f"been busy with {pool['queued']} device(s) waiting for "
+                     f"{minutes:.0f} minutes. Devices are being polled later "
+                     f"than their interval. Raise Nodes → Settings → Poll "
+                     f"workers, or lengthen the polling interval."))
+
+    def _forget_devices(self, keep: set) -> None:
+        """Drop the per-device state of devices that no longer exist.
+
+        Every one of these is keyed by device id and kept for the process
+        lifetime, so without this a long-running install accumulates an
+        entry per device ever deleted — small individually, unbounded
+        together, and the review asked for the cleanup by name.
+        """
+        for cache in (self._next_run, self._last_ping, self._next_mac_walk,
+                      self._credentials, self._credential_probe_failed,
+                      self._addresses_read, self._bulk_repetitions):
+            for device_id in [k for k in cache if k not in keep]:
+                cache.pop(device_id, None)
+        with self._lock:
+            for jobs in (self._oid_walks, self._vendor_ids):
+                for device_id in [k for k in jobs if k not in keep]:
+                    if not jobs[device_id].running:
+                        jobs.pop(device_id, None)
+        self._engines.forget(keep)
+
     def _maybe_walk_mac_table(self, device, config: dict, now: float) -> None:
         """Queue a forwarding-table walk when this device's own interval has
         come round. Off (0) unless a profile or a device asks for it, so an
@@ -974,7 +1081,7 @@ class NodePoller:
             self._mac_running.add(device_id)
         self._next_mac_walk[device_id] = now + interval
         try:
-            self._executor.submit(self._run_mac_table, device_id)
+            self._mac_executor.submit(self._run_mac_table, device_id)
         except (RuntimeError, AttributeError):
             with self._lock:
                 self._mac_running.discard(device_id)
@@ -1535,10 +1642,21 @@ class NodePoller:
         raises the same exception _poll_snmp_scalars alone would if no
         candidate works, so the caller's existing except chain still
         classifies the failure exactly as before this feature existed."""
+        device_id = device["id"]
         candidates = self.db.credential_candidates(device)
-        cached_index = self._credentials.get(device["id"])
+        cached_index = self._credentials.get(device_id)
         order = [cached_index] if cached_index is not None and cached_index < len(candidates) else []
         order += [i for i in range(len(candidates)) if i not in order]
+        # A device that is simply down does not need its whole credential
+        # list re-tried on every poll: four candidates at 3 s and two
+        # retries is 36 s of a worker per poll, per down device. After a
+        # sweep has failed, only the last-known-good candidate (or the
+        # first, if there is none) is tried until the retry window passes —
+        # the same negative caching the on-demand path in working_config
+        # has always had.
+        failed_at = self._credential_probe_failed.get(device_id, 0.0)
+        if len(order) > 1 and time.time() - failed_at < self._PROBE_RETRY_S:
+            order = order[:1]
         last_error: Exception | None = None
         for index in order:
             trial_config = {**config, **candidates[index]}
@@ -1547,8 +1665,11 @@ class NodePoller:
             except SnmpError as exc:
                 last_error = exc
                 continue
-            self._credentials[device["id"]] = index
+            self._credentials[device_id] = index
+            self._credential_probe_failed.pop(device_id, None)
             return trial_config, identity, uptime_ticks, metrics
+        if len(candidates) > 1:
+            self._credential_probe_failed[device_id] = time.time()
         raise last_error or SnmpTimeout(f"no reply from {device['ip']}")
 
     def _identity_extras(self, device, config: dict, oids: list[str]) -> dict:
@@ -2373,17 +2494,15 @@ class NodePoller:
         as the real failure it is instead of masquerading as "this
         device just doesn't have any more rows."""
         settings = self.db.settings()
-        max_repetitions = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
         max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
         # GETBULK does not exist in v1, so whether to use it is decided on
         # the configured version with 0 (v1) the only value that says no —
         # an absent version means v2c, the same default `_walk_request`,
         # `_snmp_get` and `_snmp_get_next` apply for framing. Framing
         # (build_request vs build_v3_request) is unaffected either way: v1
-        # and v2c share the same community-based wire format.
-        raw_version = config.get("snmp_version")
-        is_v1 = raw_version is not None and int(raw_version) == 0
-        use_bulk = not is_v1 and max_repetitions > 0
+        # and v2c share the same community-based wire format. The
+        # repetition count is the one this device last coped with.
+        use_bulk, max_repetitions = self._bulk_settings(device, config)
 
         values: dict[str, object] = {}
         current = base_oid
@@ -2421,6 +2540,7 @@ class NodePoller:
                         use_bulk = False
                     else:
                         max_repetitions = max(1, max_repetitions // 2)
+                    self._remember_repetitions(device, max_repetitions)
                     continue
                 if not response.varbinds:
                     complete = False
@@ -2645,7 +2765,8 @@ class NodePoller:
             entries.append(entry)
         return entries
 
-    def _bridge_ports_for(self, device, config: dict, if_index: int):
+    def _bridge_ports_for(self, device, config: dict, if_index: int,
+                          deadline: float | None = None):
         """(bridge ports mapping to this ifIndex, whether the device answered).
 
         A switch that does not answer dot1dBasePortIfIndex at all is a
@@ -2653,7 +2774,7 @@ class NodePoller:
         for this interface, and the caller reports them differently.
         """
         base_port_if_index = self._walk_column(
-            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
         if not base_port_if_index:
             return set(), False
         ports = set()
@@ -2699,6 +2820,11 @@ class NodePoller:
                 vlans.append(vlan)
         entries = []
         answered = False
+        # The budget is passed INTO each walk, not only checked between
+        # VLANs: checking between them let the last VLAN start two
+        # unbounded walks (bridge ports, then the forwarding table) after
+        # the budget was already spent, which is how a dialog a human is
+        # waiting on ran for minutes.
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
             if time.time() > deadline:
@@ -2711,11 +2837,12 @@ class NodePoller:
                 # read the caller tried first comes back empty on exactly
                 # the devices this path exists for.
                 ports, port_answered = self._bridge_ports_for(
-                    device, scoped, if_index)
+                    device, scoped, if_index, deadline=deadline)
                 answered = answered or port_answered
                 if not ports:
                     continue
-            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT,
+                                         deadline=deadline)
             entries.extend(self._fdb_entries(fdb_port, ports, vlan, False))
         return entries, answered
 
@@ -2839,10 +2966,11 @@ class NodePoller:
             unique.append(entry)
         return unique
 
-    def _bridge_port_map(self, device, config: dict) -> dict:
+    def _bridge_port_map(self, device, config: dict,
+                         deadline: float | None = None) -> dict:
         """bridge port -> ifIndex, for every port the device reports."""
         base_port_if_index = self._walk_column(
-            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
         mapping = {}
         for suffix, value in base_port_if_index.items():
             try:
@@ -2874,6 +3002,7 @@ class NodePoller:
                 vlans.append(vlan)
         entries = []
         answered = False
+        # See _cisco_vlan_fdb: the budget goes into the walks themselves.
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
             if time.time() > deadline:
@@ -2881,11 +3010,12 @@ class NodePoller:
             scoped = {**config, "community": f"{community}@{vlan}"}
             mapping = port_map
             if not mapping:
-                mapping = self._bridge_port_map(device, scoped)
+                mapping = self._bridge_port_map(device, scoped, deadline=deadline)
                 answered = answered or bool(mapping)
                 if not mapping:
                     continue
-            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT,
+                                         deadline=deadline)
             entries.extend(self._fdb_entries(
                 fdb_port, set(mapping), vlan, False, mapping))
         return entries, answered
@@ -2960,69 +3090,122 @@ class NodePoller:
         return {"base": base, "rows": rows, "stopped": stopped,
                 "complete": stopped == "end of subtree"}
 
+    def _bulk_settings(self, device, config: dict) -> tuple:
+        """(use GETBULK, repetitions) for a walk of this device.
+
+        The repetition count is remembered per device: an agent that
+        answered "tooBig" once will answer it again, and re-learning the
+        same limit at the start of every walk costs a wasted round trip
+        each time.
+        """
+        settings = self.db.settings()
+        configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+        raw_version = config.get("snmp_version")
+        is_v1 = raw_version is not None and int(raw_version) == 0
+        if is_v1 or configured <= 0:
+            return False, 0
+        learned = self._bulk_repetitions.get(device["id"])
+        return True, min(configured, learned) if learned else configured
+
+    def _remember_repetitions(self, device, repetitions: int) -> None:
+        self._bulk_repetitions[device["id"]] = max(1, int(repetitions))
+
     def _walk_from(self, device, config, base: str, max_rows: int,
                    budget_s: float, cancelled=None,
                    on_row=None) -> tuple[list[dict], str]:
-        """The GETNEXT walk itself: rows collected, and why it stopped.
+        """The subtree walk itself: rows collected, and why it stopped.
 
         Shared by walk_subtree (one subtree, in front of a waiting human)
         and the background whole-device walk, which differ only in their
         bounds and in having a cancel — not in what a walk is. `cancelled`
         is polled between requests; `on_row` sees each row as it arrives so
         a job can report progress without exposing its list.
+
+        GETBULK on v2c and v3, over one shared socket, the same way
+        _walk_column already walks a table column. This was one GETNEXT and
+        one fresh UDP socket per row: the review put a fleet-wide first
+        identification at about 2.8 hours, almost all of it round trips
+        that a single GETBULK could have answered forty at a time.
         """
         deadline = time.time() + budget_s
         rows: list[dict] = []
         stopped = "end of subtree"
         current = base
-        while True:
-            if cancelled is not None and cancelled():
-                stopped = f"cancelled after {len(rows)} row(s)"
-                break
-            if len(rows) >= max_rows:
-                stopped = f"stopped at the {max_rows}-row limit"
-                break
-            if time.time() > deadline:
-                stopped = f"stopped after {budget_s:.0f}s"
-                break
-            try:
-                response = self._snmp_get_next(device, config, current)
-            except SnmpTimeout:
-                # Name what was actually tried. "The device stopped
-                # answering" alone sent an operator hunting the device when
-                # the answer was on this end — which credential we used, and
-                # against which address and port.
-                stopped = (
-                    f"no reply from {device['ip']}:{DEFAULT_SNMP_PORT} "
-                    f"using {_credential_label(config)}"
-                    + (f" — stopped after {len(rows)} row(s)" if rows else ""))
-                break
-            except SnmpError as exc:
-                stopped = f"SNMP error: {exc}"
-                break
-            if not response.varbinds:
-                stopped = "the device returned nothing"
-                break
-            vb = response.varbinds[0]
-            oid = vb["oid"]
-            if not oid or not (oid == base or oid.startswith(base + ".")):
-                break                      # walked out of the subtree: done
-            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
-                break
-            # A GETNEXT answer must lexicographically follow the request; a
-            # broken agent that echoes the request OID (or goes backwards)
-            # would otherwise fill the dialog with the same row until the cap
-            # or the clock stopped it, presented as the device's answer.
-            if _oid_key(oid) <= _oid_key(current):
-                stopped = ("the device answered with a non-increasing OID "
-                           f"({oid}) — its SNMP agent is misbehaving")
-                break
-            row = {"oid": oid, "type": vb["type"],
-                   "value": vb["value"], "text": vb.get("text")}
-            rows.append(row)
-            if on_row is not None:
-                on_row(row)
-            current = oid
+        use_bulk, repetitions = self._bulk_settings(device, config)
+        session = self._session_for(device, config)
+        try:
+            while True:
+                if cancelled is not None and cancelled():
+                    stopped = f"cancelled after {len(rows)} row(s)"
+                    break
+                if len(rows) >= max_rows:
+                    stopped = f"stopped at the {max_rows}-row limit"
+                    break
+                if time.time() > deadline:
+                    stopped = f"stopped after {budget_s:.0f}s"
+                    break
+                try:
+                    response = self._walk_request(
+                        session, device, config, current,
+                        PDU_GETBULK if use_bulk else PDU_GETNEXT, repetitions)
+                except SnmpTimeout:
+                    # Name what was actually tried. "The device stopped
+                    # answering" alone sent an operator hunting the device
+                    # when the answer was on this end — which credential we
+                    # used, and against which address and port.
+                    stopped = (
+                        f"no reply from {device['ip']}:{DEFAULT_SNMP_PORT} "
+                        f"using {_credential_label(config)}"
+                        + (f" — stopped after {len(rows)} row(s)" if rows else ""))
+                    break
+                except SnmpError as exc:
+                    stopped = f"SNMP error: {exc}"
+                    break
+                if use_bulk and response.error_status == 1:      # tooBig
+                    if repetitions <= 1:
+                        use_bulk = False
+                    else:
+                        repetitions = max(1, repetitions // 2)
+                    self._remember_repetitions(device, repetitions)
+                    continue
+                if not response.varbinds:
+                    stopped = "the device returned nothing"
+                    break
+                done = False
+                for vb in response.varbinds:
+                    oid = vb["oid"]
+                    if not oid or not (oid == base or oid.startswith(base + ".")):
+                        done = True          # walked out of the subtree
+                        break
+                    if vb["type"] in ("noSuchObject", "noSuchInstance",
+                                      "endOfMibView"):
+                        done = True
+                        break
+                    # An answer must lexicographically follow the request; a
+                    # broken agent that echoes the request OID (or goes
+                    # backwards) would otherwise fill the dialog with the
+                    # same row until the cap or the clock stopped it,
+                    # presented as the device's answer.
+                    if _oid_key(oid) <= _oid_key(current):
+                        stopped = ("the device answered with a non-increasing "
+                                   f"OID ({oid}) — its SNMP agent is "
+                                   f"misbehaving")
+                        done = True
+                        break
+                    row = {"oid": oid, "type": vb["type"],
+                           "value": vb["value"], "text": vb.get("text")}
+                    rows.append(row)
+                    if on_row is not None:
+                        on_row(row)
+                    current = oid
+                    if len(rows) >= max_rows:
+                        stopped = f"stopped at the {max_rows}-row limit"
+                        done = True
+                        break
+                if done:
+                    break
+        finally:
+            session.close()
         return rows, stopped
 
     # The whole-device walk starts here rather than at .1: 1.3.6.1 is

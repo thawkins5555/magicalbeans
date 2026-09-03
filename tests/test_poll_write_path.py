@@ -158,6 +158,170 @@ def v3_engine_time():
         proc.kill()
 
 
+def pool_and_walks():
+    """The poll pool's own health, the per-device caches, and the walk that
+    used to open a socket per row."""
+    print("\n-- pool, caches and walks")
+    proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "6")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "pool.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "pool-test", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+
+        # --------------------------------------------- GETBULK in _walk_from
+        device = db.device(device_id)
+        config = db.effective_config(device)
+        sent = {"n": 0}
+        real_walk_request = poller._walk_request
+
+        def counting(session, dev, cfg, oid, pdu_tag, max_repetitions=0):
+            sent["n"] += 1
+            return real_walk_request(session, dev, cfg, oid, pdu_tag,
+                                     max_repetitions)
+
+        poller._walk_request = counting
+        rows, stopped = poller._walk_from(
+            device, config, "1.3.6.1.2.1.2.2.1.1", max_rows=100, budget_s=10)
+        poller._walk_request = real_walk_request
+        check(len(rows) == 6,
+              f"the subtree walk found every row ({len(rows)}, stopped: {stopped})")
+        check(sent["n"] < len(rows),
+              f"…in fewer requests than rows, so it used GETBULK "
+              f"({sent['n']} request(s) for {len(rows)} row(s))")
+
+        # A device that answered tooBig keeps the smaller repetition count.
+        poller._remember_repetitions(device, 5)
+        use_bulk, reps = poller._bulk_settings(device, config)
+        check(use_bulk and reps == 5,
+              f"the repetition count a device coped with is remembered "
+              f"({use_bulk}, {reps})")
+        v1_config = dict(config, snmp_version=0)
+        check(poller._bulk_settings(device, v1_config) == (False, 0),
+              "…and v1 still walks with GETNEXT, which is all it has")
+
+        # ------------------------------------------------ pool saturation
+        check(poller.pool_state()["saturated"] is False,
+              "an idle pool is not saturated")
+        occurrences = []
+
+        class FakeEngine:
+            def system_occurrence(self, rule_key, entity_id, label,
+                                  severity=3, extra=None, message=""):
+                occurrences.append(("raise", rule_key, entity_id, extra))
+
+            def clear_system_occurrence(self, rule_key, entity_id):
+                occurrences.append(("clear", rule_key, entity_id, None))
+
+        poller.alert_engine = FakeEngine()
+
+        class Pool:
+            _max_workers = 2
+
+        poller._executor = Pool()
+        with poller._lock:
+            poller._started.update({1: 0.0, 2: 0.0})
+            poller._queued.update({3: 0.0, 4: 0.0})
+        check(poller.pool_state()["saturated"] is True,
+              "every worker busy with devices waiting is saturation")
+        check("2 busy and 2 queued of 2 worker(s)" in
+              (poller.status_text() if poller.running else
+               f"{poller.pool_state()['busy']} busy and "
+               f"{poller.pool_state()['queued']} queued of "
+               f"{poller.pool_state()['workers']} worker(s)"),
+              "…and busy and queued are counted separately, not summed")
+
+        now = time.time()
+        poller._note_saturation(now)
+        check(not occurrences,
+              "a moment of saturation raises nothing (a poll cycle starts busy)")
+        poller._note_saturation(now + poller._SATURATION_S - 1)
+        check(not occurrences, "…nor does four and a half minutes of it")
+        poller._note_saturation(now + poller._SATURATION_S + 1)
+        check([o[:3] for o in occurrences] ==
+              [("raise", "poll_pool_saturated", "poller")],
+              f"…but five minutes does, once ({occurrences})")
+        poller._note_saturation(now + poller._SATURATION_S + 120)
+        check(len(occurrences) == 1, "…and it is not raised again while it lasts")
+
+        with poller._lock:
+            poller._queued.clear()
+        poller._note_saturation(time.time())
+        check([o[:3] for o in occurrences][-1] ==
+              ("clear", "poll_pool_saturated", "poller"),
+              f"…and it is cleared when the pool catches up ({occurrences})")
+        poller._executor = None
+
+        # -------------------------------------- per-device cache cleanup
+        poller._next_run[999] = 1.0
+        poller._credentials[999] = 0
+        poller._addresses_read[999] = 1.0
+        poller._bulk_repetitions[999] = 5
+        poller._engines.set(999, b"engine", 1, 1)
+        poller._forget_devices({device_id})
+        check(999 not in poller._next_run and 999 not in poller._credentials
+              and 999 not in poller._addresses_read
+              and 999 not in poller._bulk_repetitions
+              and poller._engines.get(999) is None,
+              "a deleted device's per-device caches are dropped")
+        check(device_id in poller._bulk_repetitions,
+              "…and a device that still exists keeps its own")
+
+        # ---------------------------------- a down device stops re-sweeping
+        # Two credentials on the profile, and a device that answers
+        # neither: the first failing poll tries both, the next one tries
+        # only the last-known-good until the retry window passes.
+        db.add_group_credential(group_id, label="alternate", snmp_version=1,
+                                community="other")
+        down_id = db.add_device(
+            "127.0.0.9", "down-device", group_id=group_id, ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=0.2, snmp_retries=0)
+        tried = []
+        real_scalars = poller._poll_snmp_scalars
+
+        def counting_scalars(dev, cfg):
+            tried.append(cfg.get("community"))
+            raise __import__("netpath.snmppoll", fromlist=["x"]).SnmpTimeout(
+                "no reply")
+
+        poller._poll_snmp_scalars = counting_scalars
+        down = db.device(down_id)
+        for _ in range(2):
+            try:
+                poller._poll_snmp_scalars_with_credential(
+                    down, db.effective_config(down))
+            except Exception:
+                pass
+        poller._poll_snmp_scalars = real_scalars
+        check(tried[:2] == ["public", "other"],
+              f"the first failing poll tries every credential ({tried})")
+        check(len(tried) == 3,
+              f"…and the next one tries only the cached candidate ({tried})")
+
+        # ------------------------------------- MAC walks off the poll pool
+        poller.start({"poll_workers": 2})
+        try:
+            check(poller._mac_executor is not None
+                  and poller._mac_executor is not poller._executor,
+                  "forwarding-table walks have their own pool")
+            check(poller._mac_executor._max_workers == poller._MAC_WALK_WORKERS,
+                  f"…of {poller._MAC_WALK_WORKERS} threads "
+                  f"({poller._mac_executor._max_workers})")
+        finally:
+            poller.stop()
+        check(poller._mac_executor is None,
+              "…and it is shut down with the poller")
+
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def ipv6_polling():
     """§4.1 N3: AF_INET was hardcoded in _Session and in the discovery
     probe, and tracer.resolve used the IPv4-only gethostbyname, so an
@@ -654,6 +818,7 @@ def main():
     interface_reads()
     vendor_health()
     ipv6_polling()
+    pool_and_walks()
     request_matching()
     v3_engine_time()
 
