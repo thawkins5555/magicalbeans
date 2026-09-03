@@ -685,6 +685,25 @@ const App = (() => {
      not. */
   let modalTrigger = null;
 
+  /* There is one #modal-box and every dialog rebuilds it, so a slow fetch
+     that lands after another dialog opened used to paint into that dialog —
+     `#oid-status` was gone and the walk threw an uncaught TypeError. Each
+     call to modal() stamps a generation on the box; a dialog captures
+     modalToken() when it opens and asks modalIsCurrent() before it paints.
+     `!#modal.hidden` could never see this: opening a second dialog does not
+     hide the first, it replaces its contents. */
+  let modalGeneration = 0;
+
+  function modalToken() {
+    const box = document.getElementById('modal-box');
+    return box ? box.dataset.modalGen : null;
+  }
+
+  function modalIsCurrent(token) {
+    const wrap = document.getElementById('modal');
+    return Boolean(wrap) && !wrap.hidden && modalToken() === token;
+  }
+
   const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),' +
     ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -728,6 +747,8 @@ const App = (() => {
     modalTrigger = options.trigger
       || (document.activeElement && document.activeElement !== document.body
           ? document.activeElement : null);
+    modalGeneration += 1;
+    box.dataset.modalGen = String(modalGeneration);
     // Titles carry device names, group names and interface aliases, and
     // seven call sites interpolated them raw. A plain string is now escaped
     // here, once, rather than by each caller remembering to; the one dialog
@@ -1680,6 +1701,39 @@ const App = (() => {
       if (event.target.id === 'modal') closeModal();
     };
     document.addEventListener('keydown', trapTab);
+
+    /* 1-9 select the first nine visible tabs and '/' focuses the current
+       page's search box. Both are bare keys, so both stand down whenever a
+       field, a dialog or the help panel has the keyboard — which is why the
+       chart shortcuts in netflow.js are Ctrl-modified instead: those have to
+       work while a filter box has focus. */
+    const SEARCH_BOXES = {
+      nodes: '#nd-q', alerts: '#alerts-filter-text', syslog: '#sl-q',
+      snmp: '#sn-q', ipam: '#ipam-search-q', netflow: '#nf-src',
+      configrx: '#cx-q', debug: '#dbg-search', wireless: '#wl-q',
+    };
+    document.addEventListener('keydown', (event) => {
+      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      if (!document.getElementById('modal').hidden || helpOpen()) return;
+      const active = document.activeElement;
+      if (active && (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)
+                     || active.isContentEditable)) return;
+      if (event.key === '/') {
+        const selector = SEARCH_BOXES[state.tab];
+        const box = selector && document.querySelector(selector);
+        if (!box || box.offsetParent === null) return;
+        event.preventDefault();      // or the '/' lands in the box it focuses
+        box.focus();
+        if (box.select) box.select();
+        return;
+      }
+      if (event.key < '1' || event.key > '9') return;
+      const tabs = [...document.querySelectorAll('.tab')].filter((t) => !t.hidden);
+      const tab = tabs[Number(event.key) - 1];
+      if (!tab) return;
+      event.preventDefault();
+      selectTab(tab.dataset.tab);
+    });
     document.addEventListener('keydown', (event) => {
       // Escape peels one layer: the help panel if it is open, else the
       // dialog under it. Closing both at once would throw away the form
@@ -1726,6 +1780,12 @@ const App = (() => {
     restartTimer();
   }
 
+  // `const App` at the top of this file is a global LEXICAL binding: it is
+  // reachable as a bare identifier from the other page scripts, but it is NOT
+  // a property of window, so anything evaluating `window.App` — a
+  // bookmarklet, an extension, an automated check — saw undefined. Exposed
+  // deliberately, and only here, at the end of the module.
+  //
   // Started from here rather than an inline script in the page: the server
   // sends a strict Content-Security-Policy, and 'self' does not permit inline
   // script. The five files are ordinary parser-blocking scripts, so every page
@@ -1736,11 +1796,12 @@ const App = (() => {
     start();
   }
 
-  return {
+  const api = {
     state, pages, start, selectTab, loadState, refreshNow, rateFor,
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
-    modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    modal, modalToken, modalIsCurrent,
+    closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,
@@ -1750,4 +1811,6 @@ const App = (() => {
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };
+  window.App = api;
+  return api;
 })();

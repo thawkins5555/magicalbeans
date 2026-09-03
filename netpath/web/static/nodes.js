@@ -941,9 +941,10 @@
     // The same ticket idiom the interface and OID dialogs use: App.modal
     // reuses one #modal-box, so a slow fetch must not paint into whatever
     // dialog is open by the time it lands.
-    const token = (view.deviceDialogSeq = (view.deviceDialogSeq || 0) + 1);
-    const current = () => token === view.deviceDialogSeq
-      && !App.el('modal').hidden;
+    // Set after App.modal below stamps the box; `current()` is only ever
+    // called from a fetch callback, which cannot run before then.
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
     const listed = (view.devices || []).find((d) => d.id === deviceId);
 
     // The packet-loss chart's window and request ticket, local to this one
@@ -968,6 +969,8 @@
       <div class="table-wrap" style="max-height:26vh"><table id="ndd-ev-table"></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     // Only up to three days, same reasoning as the pane's own loss chart
@@ -1279,8 +1282,8 @@
     // Same ticket idiom the interface dialog uses: App.modal reuses one
     // #modal-box, so a slow walk must not paint into whatever dialog is
     // open by the time it lands.
-    const token = (view.oidDialogSeq = (view.oidDialogSeq || 0) + 1);
-    const current = () => token === view.oidDialogSeq && !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     const box = App.modal(`Browse OIDs — ${displayName(device || {})}`, `
       <div class="bar wrap">
@@ -1299,6 +1302,8 @@
       <div class="table-wrap" style="max-height:52vh"><table id="oid-table"></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     const COLS = [
@@ -1567,9 +1572,8 @@
     // dialog's chart from the next port's — only a ticket can. Without it a
     // superseded dialog's timer kept painting one port's traffic into
     // another port's chart.
-    const token = (view.ifaceDialogSeq = (view.ifaceDialogSeq || 0) + 1);
-    const current = () => token === view.ifaceDialogSeq &&
-      !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     let smooth = true;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
@@ -1596,14 +1600,30 @@
       <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
       <p class="section">EVENTS</p>
       <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
-      <p class="section">SHOW RUN</p>
-      <p class="hint">Available once SSH integration is added.</p>
+      <p class="section">RUNNING CONFIGURATION</p>
+      <p class="hint">Stored configurations live in
+        <button type="button" class="linkish" id="ifd-configrx">ConfigRX</button>,
+        which backs up this device over SSH and keeps every version it has
+        seen. There is no per-port view of a configuration — a config is a
+        whole-device thing.</p>
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`,
       buttons, { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
+    const configrxLink = box.querySelector('#ifd-configrx');
+    if (configrxLink) {
+      configrxLink.onclick = () => {
+        App.closeModal();
+        App.selectTab('configrx');
+      };
+      // ConfigRX is a module like any other: an operator without read on it
+      // should not be pointed at a tab they cannot open.
+      if (!App.canRead('configrx')) configrxLink.hidden = true;
+    }
 
     // Escape and a backdrop click close the modal without the Close button
     // ever being pressed, so the timer hangs off the close event rather than
@@ -2902,8 +2922,13 @@
     const body = document.createElement('tbody');
     for (const f of view.mibFiles) {
       const tr = document.createElement('tr');
+      const notes = (f.parse_notes || '').trim();
       tr.innerHTML = `<td>${escape(f.filename)}</td><td>${escape(f.module || '—')}</td>` +
-        `<td>${f.object_count}</td>` +
+        // A zero object count is usually a correct import of a file that
+        // defines only textual conventions or imports; the note says which,
+        // and sits under the count rather than in a tooltip nobody hovers.
+        `<td>${f.object_count}${notes
+          ? `<div class="hint">${escape(notes)}</div>` : ''}</td>` +
         `<td>${f.unresolved.length ? escape(f.unresolved.join(', ')) : '—'}</td>` +
         `<td><button class="mib-resolve">Resolve</button> <button class="mib-remove">Remove</button></td>`;
       tr.querySelector('.mib-resolve').onclick = async () => {
@@ -2935,8 +2960,8 @@
      its progress and stops the moment it is closed. */
   async function mibCatalog() {
     const payload = await App.get('/api/nodes/mib-catalog');
-    const token = (view.catalogSeq = (view.catalogSeq || 0) + 1);
-    const current = () => token === view.catalogSeq && !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     const rows = payload.bundles.map((b) => `
       <tr data-key="${escape(b.key)}">
@@ -2963,6 +2988,8 @@
         <tbody>${rows}</tbody></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     const status = box.querySelector('#nd-cat-status');
@@ -3534,9 +3561,16 @@
     App.el('nd-mib-catalog').onclick = () => { mibCatalog().catch(() => {}); };
     App.el('nd-resolve-all').onclick = async () => {
       const result = await App.post('/api/nodes/mibs/resolve-all', {});
+      // A file that could not be parsed at all was skipped silently: the
+      // summary counted what worked and said nothing about what did not.
+      const failed = Number(result.files_failed || 0);
       App.modal('Resolve all', `<p>${result.resolved_count}/${result.object_count} ` +
         `object(s) resolved across ${result.files} stored MIB(s) after ` +
         `${result.passes} pass(es); ${result.files_changed} file(s) changed.</p>` +
+        (failed
+          ? `<p class="warn-text">${failed} stored MIB(s) could not be parsed ` +
+            'and were skipped. Their row in the table above says why.</p>'
+          : '') +
         '<p class="hint">Every stored MIB is re-parsed and resolved against every ' +
         'other, so a file uploaded before the one defining its parent branch ' +
         'finishes resolving here.</p>', [

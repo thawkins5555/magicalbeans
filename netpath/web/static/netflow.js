@@ -685,6 +685,32 @@
 
     App.el('nf-range').onchange = resetWindow;
     App.el('nf-reset').onclick = resetWindow;
+
+    /* The documented chart shortcuts. Ctrl-modified on purpose (README
+       :362): bare `+` and the arrow keys belong to whichever filter box or
+       dropdown has focus. Home is the one exception the table already
+       allows, so it is ignored while a text field has focus. */
+    document.addEventListener('keydown', (event) => {
+      if (App.state.tab !== 'netflow') return;
+      if (!App.el('modal').hidden) return;      // a dialog owns the keyboard
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(
+        (document.activeElement || {}).tagName || '');
+      if (event.key === 'Home' && !typing) {
+        event.preventDefault();
+        resetWindow();
+        return;
+      }
+      if (!event.ctrlKey || event.altKey || event.metaKey) return;
+      // '=' and '+' are the same key; '_' is shift-'-'. Accept the pairs so
+      // the shortcut works whether or not Shift is held.
+      const zoomIn = event.key === '=' || event.key === '+';
+      const zoomOut = event.key === '-' || event.key === '_';
+      if (zoomIn) { event.preventDefault(); zoom(0.5); }
+      else if (zoomOut) { event.preventDefault(); zoom(2); }
+      else if (event.key === 'ArrowLeft') { event.preventDefault(); pan(-0.25); }
+      else if (event.key === 'ArrowRight') { event.preventDefault(); pan(0.25); }
+      else if (event.key === '0') { event.preventDefault(); resetWindow(); }
+    });
     App.el('nf-in').onclick = () => zoom(0.5);
     App.el('nf-out').onclick = () => zoom(2);
     App.el('nf-back').onclick = () => pan(-0.25);

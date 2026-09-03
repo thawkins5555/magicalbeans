@@ -328,7 +328,26 @@
     ]);
   }
 
+  /* The accounts grid is behind settings:write on the server, so a
+     read-only account asking for it got a 403 every time Settings was
+     opened — and an empty table with no explanation. Ask only when the
+     grant is there, and say why when it is not. */
+  function usersVisible() {
+    return App.canWrite('settings');
+  }
+
   async function loadUsers() {
+    if (!usersVisible()) {
+      const table = App.el('users-table');
+      if (table) {
+        table.innerHTML = '<caption class="sr-only">User accounts</caption>' +
+          '<tbody><tr><td class="hint">Managing accounts needs Settings ' +
+          'write access. Ask an administrator if you need it.</td></tr></tbody>';
+      }
+      const grid = App.el('new-user-grid');
+      if (grid) grid.innerHTML = '';
+      return;
+    }
     const payload = await App.get('/api/users');
     modules = payload.modules || [];
     App.el('new-user-grid').innerHTML = permissionGridHtml('nu', {});
