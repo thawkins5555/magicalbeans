@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 
+from . import kerneldrops
 from .eventlog import ERROR, NullLog, SNMP
 from .snmptrapdb import SnmpTrapDatabase
 from .trapdecode import Decoder, VERSION_NAMES, build_inform_response
@@ -60,6 +61,8 @@ class TrapCollector:
         # status strip does not read like a deliberate stop.
         self._last_error_log = 0.0
         self._crash: str | None = None
+        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops_logged = False
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
@@ -128,6 +131,13 @@ class TrapCollector:
             self.stop()
             return False
 
+        self._drops = kerneldrops.KernelDrops(port) if kerneldrops.supported() else None
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
         self.bound = (address, port)
         self._spawn(self._receive, "snmp-udp")
         self._spawn(self._write, "snmp-write")
@@ -149,6 +159,17 @@ class TrapCollector:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buffer_bytes)
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            if granted < buffer_bytes:
+                # Linux reports back twice what it granted, so a readback
+                # below the request means net.core.rmem_max clamped it — the
+                # commonest reason for kernel drops under load.
+                self.log.add(ERROR,
+                             f"The receive buffer was clamped to {granted} bytes "
+                             f"(asked for {buffer_bytes})",
+                             detail="Raise net.core.rmem_max on this host, or "
+                                    "lower the buffer size in Settings so the "
+                                    "two agree.")
         except OSError:
             pass
         sock.bind((address, port))
@@ -173,6 +194,34 @@ class TrapCollector:
         else:
             if not self._stop.is_set():
                 self._crash = f"{name} ended unexpectedly"
+
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible. The key is
+        absent on platforms that do not publish the figure.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on trap port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
 
     def _note_error(self, exc: Exception) -> None:
         """Count a datagram the receive path could not process; log at most
@@ -311,6 +360,7 @@ class TrapCollector:
                 pending.append(self._queue.get(timeout=0.3))
             except queue.Empty:
                 pass
+            self._poll_kernel_drops()
             due = time.time() - last_flush >= FLUSH_S
             if pending and (due or len(pending) >= BATCH):
                 try:
@@ -340,5 +390,7 @@ class TrapCollector:
         address, port = self.bound or ("?", 0)
         base = f"Listening on {address} (UDP {port})"
         last = self.counters["last_trap"]
-        return (f"{base} · last trap {_ago(last)}" if last
+        text = (f"{base} · last trap {_ago(last)}" if last
                 else f"{base} · waiting for traps")
+        lost = self.counters.get("kernel_dropped", 0)
+        return f"{text} · {lost} dropped by the kernel" if lost else text

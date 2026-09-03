@@ -19,7 +19,7 @@ from _paths import free_udp_port, tmpdir
 
 TMPDIR = tmpdir("collectors_hardening_")
 
-from netpath import nfdecode, trapdecode
+from netpath import kerneldrops, nfdecode, trapdecode
 from netpath.collector import Collector
 from netpath.flowdb import FlowDatabase
 from netpath.snmptrapd import TrapCollector
@@ -297,9 +297,101 @@ def test_c2_template_guards_and_bounded_caches() -> None:
     flow_db.close()
 
 
+# ----------------------------------------------------------------------- C3
+
+def test_c3_kernel_drops_are_visible() -> None:
+    """counters["dropped"] only counts loss the application caused. Datagrams
+    the socket receive buffer threw away before anyone read them were
+    invisible: the review offered 300,000 syslog messages, stored 93,412, and
+    the strip reported no loss at all. On Linux the figure is the last column
+    of /proc/net/udp{,6} for the bound port."""
+    print("C3: kernel socket-buffer drops are counted and shown")
+
+    if not kerneldrops.supported():
+        # Not Linux (or no /proc): the key must simply be absent rather than
+        # reporting a guessed zero.
+        syslog_db = SyslogDatabase(db_path("c3-syslog.db"))
+        syslog = SyslogCollector(syslog_db)
+        assert syslog.start({"port": free_udp_port(), "bind_address": "127.0.0.1"})
+        check("kernel_dropped" not in syslog.counters,
+              "off Linux the kernel_dropped key is absent, not a guessed zero")
+        syslog.stop()
+        syslog_db.close()
+        return
+
+    # --- the reader itself, against a socket nobody drains ----------------
+    victim = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    victim.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    victim.bind(("127.0.0.1", 0))
+    victim_port = victim.getsockname()[1]
+    reader = kerneldrops.KernelDrops(victim_port, interval_s=0.0)
+    check(reader.poll(force=True) == 0, "a freshly bound port starts at zero drops")
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for _ in range(5000):
+        sender.sendto(b"x" * 512, ("127.0.0.1", victim_port))
+    sender.close()
+    drops = reader.poll(force=True)
+    check(drops is not None and drops > 0,
+          f"an undrained socket reports {drops} kernel drops")
+    check(kerneldrops.KernelDrops(free_udp_port(), interval_s=0.0).poll(force=True) is None,
+          "an unbound port reports None (unknown), not zero")
+    victim.close()
+
+    # --- a live collector surfaces it in counters and in the status strip --
+    syslog_db = SyslogDatabase(db_path("c3-syslog.db"))
+    syslog = SyslogCollector(syslog_db)
+    port = free_udp_port()
+    assert syslog.start({"port": port, "bind_address": "127.0.0.1",
+                         "socket_buffer_kb": 1})
+    try:
+        check(syslog.counters.get("kernel_dropped") == 0,
+              "the collector exposes counters['kernel_dropped'] on Linux")
+        # A slow consumer is the condition the counter exists to report: the
+        # sender is faster than this host can drain the socket.
+        fast_enqueue = syslog._enqueue
+
+        def slow_enqueue(data, source):
+            time.sleep(0.002)
+            return fast_enqueue(data, source)
+
+        syslog._enqueue = slow_enqueue
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for index in range(6000):
+            sender.sendto(b"<134>flood message %d" % index, ("127.0.0.1", port))
+        sender.close()
+        syslog._enqueue = fast_enqueue
+        check(wait_for(lambda: syslog.counters.get("kernel_dropped", 0) > 0, 12.0),
+              f"the collector reports kernel_dropped="
+              f"{syslog.counters.get('kernel_dropped')} after a burst it "
+              "could not drain")
+        check("dropped by the kernel" in syslog.status_text(),
+              "the status strip says so too")
+    finally:
+        syslog.stop()
+        syslog_db.close()
+
+    # The trap receiver and the flow collector expose the same key.
+    trap_db = SnmpTrapDatabase(db_path("c3-traps.db"))
+    traps = TrapCollector(trap_db)
+    assert traps.start({"port": free_udp_port(), "bind_address": "127.0.0.1"})
+    check(traps.counters.get("kernel_dropped") == 0,
+          "the trap receiver exposes counters['kernel_dropped']")
+    traps.stop()
+    trap_db.close()
+
+    flow_db = FlowDatabase(db_path("c3-flows.db"))
+    collector = Collector(flow_db)
+    assert collector.start({"port": free_udp_port(), "bind_address": "127.0.0.1"})
+    check(collector.counters.get("kernel_dropped") == 0,
+          "the flow collector exposes counters['kernel_dropped']")
+    collector.stop()
+    flow_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
+    test_c3_kernel_drops_are_visible,
 ]
 
 

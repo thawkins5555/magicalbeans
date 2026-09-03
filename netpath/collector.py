@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 
+from . import kerneldrops
 from .eventlog import ERROR, NETFLOW, NullLog
 from .flowdb import FlowDatabase
 from .nfdecode import IPFIX, V5, V9, Decoder
@@ -65,6 +66,8 @@ class Collector:
         self._loop_errors = 0
         self._last_error_log = 0.0
         self._crash: str | None = None
+        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops_logged = False
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
@@ -136,6 +139,22 @@ class Collector:
             self.log.add(ERROR, self.error)
             return False
 
+        if self.rcvbuf and self.rcvbuf < wanted:
+            # Linux reports back twice what it granted, so a readback below
+            # the request means net.core.rmem_max clamped it — the single
+            # commonest reason for kernel drops under load.
+            self.log.add(ERROR,
+                         f"The receive buffer was clamped to {self.rcvbuf} bytes "
+                         f"(asked for {wanted})",
+                         detail="Raise net.core.rmem_max on this host, or lower "
+                                "the buffer size in Settings so the two agree.")
+        self._drops = kerneldrops.KernelDrops(port) if kerneldrops.supported() else None
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
         self._sock = sock
         self.bound = (address, port)
         self._rx_thread = threading.Thread(
@@ -204,6 +223,34 @@ class Collector:
         while len(self._seen_exporters) > MAX_SEEN_SOURCES:
             self._seen_exporters.popitem(last=False)
         return True
+
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible. The key is
+        absent on platforms that do not publish the figure.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on NetFlow port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
 
     def _note_error(self, exc: Exception) -> None:
         """Count a datagram the receive path could not process, and log at
@@ -289,6 +336,7 @@ class Collector:
             except queue.Empty:
                 pass
 
+            self._poll_kernel_drops()
             due = time.time() - last_flush >= 1.0
             if pending and (due or len(pending) >= 500):
                 written = self.db.insert_flows(pending)
@@ -326,6 +374,9 @@ class Collector:
             # last one came is worth as much as the packet time.
             parts.append(f"last template {_ago(template)}" if template
                          else "no template yet")
+            lost = self.counters.get("kernel_dropped", 0)
+            if lost:
+                parts.append(f"{lost} dropped by the kernel")
             return " \u00b7 ".join(parts)
         waiting = time.time() - self.started_at if self.started_at else 0
         if waiting > 60:

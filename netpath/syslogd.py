@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 
+from . import kerneldrops
 from .eventlog import ERROR, NullLog, SYSTEM
 from .syslogdb import SyslogDatabase
 from .syslogparse import parse
@@ -60,6 +61,8 @@ class SyslogCollector:
         # status strip does not read like a deliberate stop.
         self._last_error_log = 0.0
         self._crash: str | None = None
+        self._drops: kerneldrops.KernelDrops | None = None
+        self._drops_logged = False
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
@@ -127,6 +130,14 @@ class SyslogCollector:
             self.error = "Neither UDP nor TCP is enabled"
             return False
 
+        self._drops = (kerneldrops.KernelDrops(port)
+                       if self._udp is not None and kerneldrops.supported() else None)
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
         self.bound = (address, port)
         if self._udp is not None:
             self._spawn(self._receive_udp, "syslog-udp")
@@ -150,6 +161,17 @@ class SyslogCollector:
         try:
             option = socket.SO_RCVBUF
             sock.setsockopt(socket.SOL_SOCKET, option, buffer_bytes)
+            granted = sock.getsockopt(socket.SOL_SOCKET, option)
+            if kind == socket.SOCK_DGRAM and granted < buffer_bytes:
+                # Linux reports back twice what it granted, so a readback
+                # below the request means net.core.rmem_max clamped it — the
+                # commonest reason for kernel drops under load.
+                self.log.add(ERROR,
+                             f"The receive buffer was clamped to {granted} bytes "
+                             f"(asked for {buffer_bytes})",
+                             detail="Raise net.core.rmem_max on this host, or "
+                                    "lower the buffer size in Settings so the "
+                                    "two agree.")
         except OSError:
             pass
         sock.bind((address, port))
@@ -174,6 +196,34 @@ class SyslogCollector:
         else:
             if not self._stop.is_set() and name != "syslog-tcp-client":
                 self._crash = f"{name} ended unexpectedly"
+
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible. The key is
+        absent on platforms that do not publish the figure.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on syslog port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
 
     def _note_error(self, exc: Exception) -> None:
         """Count a message the receive path could not process; log at most one
@@ -322,6 +372,7 @@ class SyslogCollector:
                 pending.append(self._queue.get(timeout=0.3))
             except queue.Empty:
                 pass
+            self._poll_kernel_drops()
             due = time.time() - last_flush >= FLUSH_S
             if pending and (due or len(pending) >= BATCH):
                 try:
@@ -352,5 +403,7 @@ class SyslogCollector:
         where = ", ".join(f"{name} {value}" for name, value in self.ports.items())
         base = f"Listening on {address} ({where})"
         last = self.counters["last_message"]
-        return f"{base} \u00b7 last message {_ago(last)}" if last else \
-            f"{base} \u00b7 waiting for messages"
+        text = (f"{base} \u00b7 last message {_ago(last)}" if last
+                else f"{base} \u00b7 waiting for messages")
+        lost = self.counters.get("kernel_dropped", 0)
+        return f"{text} \u00b7 {lost} dropped by the kernel" if lost else text
