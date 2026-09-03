@@ -30,7 +30,7 @@ Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
 and **Settings**, which stay rightmost so adding a module never moves
 them. Dashboard aggregates whatever other modules the signed-in account
 can read — see Permissions, under Settings — rather than holding data of
-its own; from 4.38.0 it is a real page rather than a placeholder, and it
+its own; from 4.39.0 it is a real page rather than a placeholder, and it
 is described under **Dashboard** below. A tab the signed-in account has no
 read access to is hidden from the tab bar entirely.
 
@@ -41,7 +41,7 @@ them all. The chrome also tightens automatically below 900 pixels of viewport
 height, and again below 700, so a laptop gets a usable layout before anything
 is dragged.
 
-**Every selection has a URL.** From 4.38.0 the address bar carries the
+**Every selection has a URL.** From 4.39.0 the address bar carries the
 open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 `#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
 `#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
@@ -123,7 +123,7 @@ rather than records to work through.
 
 ## Dashboard — the screen a shift starts on
 
-The landing page after every sign-in. Until 4.38.0 it said "nothing here
+The landing page after every sign-in. Until 4.39.0 it said "nothing here
 yet" — which it had said for several releases while being the first thing
 every operator saw. It now answers "what should I look at first" from data
 the application already had, refreshed on the interval in
@@ -167,7 +167,7 @@ own subtabs.
   CPU and memory came from **UCD-SNMP-MIB only** — `ssCpuRawIdle`,
   `memAvailReal`, `memTotalReal`, `laLoad` — which in practice means
   net-snmp on a Linux or BSD host and nothing else. HOST-RESOURCES-MIB was
-  named here and never actually read. From 4.38.0 both are true: a
+  named here and never actually read. From 4.39.0 both are true: a
   best-effort vendor-health GET rides the same poll and reads
   `hrProcessorLoad` and `hrStorageTable` where they answer, plus Cisco
   (`cpmCPUTotal5minRev`, `ciscoMemoryPool`), Fortinet (`fgSysCpuUsage`,
@@ -846,11 +846,11 @@ alerts and optionally emailing about them.
   conflict, an access point removed from its controller or gone offline, a
   DHCP scope running out of leases, and three NetPath path rules (below).
   Seven of the interface and disk thresholds among those could never fire
-  before 4.38.0, because nothing wrote the metric key they read: the poller
+  before 4.39.0, because nothing wrote the metric key they read: the poller
   now records `if_in_util_pct`, `if_out_util_pct`, `if_in_error_rate`,
   `if_out_error_rate`, `if_in_discard_rate`, `if_out_discard_rate` and
   `disk_pct`, both per port and as a device-level maximum, so they are live.
-- **Three of those 35 are new in 4.38.0**, and each one reports a failure
+- **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
   the case where a switch sat green with no counters behind it.
@@ -1016,7 +1016,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
   off is a deliberate, explicit opt-out, never a silent downgrade). A
   rate limit caps emails per hour; past it, sending is suspended for the
   rest of that hour and logged once, not per suppressed alert.
-- **Mail is sent off the engine's tick.** From 4.38.0 a notification is
+- **Mail is sent off the engine's tick.** From 4.39.0 a notification is
   handed to a queue drained by its own thread, so a relay that has stopped
   answering delays mail and nothing else: the rule engine keeps evaluating,
   opening and resolving at its normal cadence. Five consecutive failures
@@ -1369,7 +1369,7 @@ been wrong for several releases: **Nodes** polls with GET and GETBULK, and
 **Alerts** is a rule engine over device events, traps, syslog, IPAM conflicts
 and thresholds. Traps reaching this receiver are evaluated by it.)
 
-From 4.38.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
+From 4.39.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
 stored. The digest was always computed and counted; it was never enforced, so a
 forged v3 trap was stored and could open an alert. The `reject_failed_auth`
 setting controls this and defaults to on; traps that cannot be verified at all
@@ -2024,7 +2024,7 @@ password ends every session on that account, this one included.
 
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
-ConfigRX, SSH, Settings, Debug and — new in 4.38.0 — Admin, set from
+ConfigRX, SSH, Settings, Debug and — new in 4.39.0 — Admin, set from
 **Settings → Users** (itself gated on Admin write access). Write implies
 read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
@@ -2036,7 +2036,7 @@ tab is the one exception: it's always visible and simply omits whatever
 sections the signed-in account can't read, rather than being gated as a
 whole.
 
-**Administering the application is its own grant, from 4.38.0.** Settings
+**Administering the application is its own grant, from 4.39.0.** Settings
 write used to be root by accident: it could grant itself every other
 module, reset anybody's password and make the host replace its own code.
 **Admin** now covers exactly that work — adding, editing and removing
@@ -2138,7 +2138,7 @@ moves its settings, accounts and name cache into it on the first start.
   therefore polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a
   server that does not require authentication, and does not run config
   backups. The forms concerned say this before you type into them rather
-  than after you submit. A portable secret store was considered for 4.38.0
+  than after you submit. A portable secret store was considered for 4.39.0
   and deliberately deferred — `CREDENTIAL-SECURITY.md` sets out what it
   would have to promise and why a weak version of it is worse than an
   honest refusal.

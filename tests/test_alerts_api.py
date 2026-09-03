@@ -68,7 +68,7 @@ def call(method, path, body=None, token=None):
 
 
 def login(username, password):
-    # 4.38 refuses every API route for an account whose password must still be
+    # 4.39 refuses every API route for an account whose password must still be
     # changed (the forced first-run change is enforced by the server, not just
     # by the bundled UI), so clear the flag rather than re-password every
     # account this suite creates.

@@ -156,7 +156,7 @@ _VERSION_PART = re.compile(r"\d+")
 
 def _version_key(tag: str) -> tuple:
     """Sortable form of a tag name: the run of numbers in it, in order.
-    "v4.38.0" sorts above "v4.36.1" and above "v4.9.0", which plain string
+    "v4.39.0" sorts above "v4.36.1" and above "v4.9.0", which plain string
     order gets wrong. A tag with no numbers sorts below every tag that has
     some rather than raising."""
     return tuple(int(part) for part in _VERSION_PART.findall(tag)) or (-1,)

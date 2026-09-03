@@ -17,7 +17,7 @@ ways:
 | An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
-| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.38.0 a redaction pass runs over every captured configuration before it is stored, and the content endpoint requires `configrx: write` rather than `configrx: read`. See §6a. |
+| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored, and the content endpoint requires `configrx: write` rather than `configrx: read`. See §6a. |
 
 Everything below explains why each row is true.
 
@@ -473,7 +473,7 @@ rather than to SappiWhere. A representative Cisco config holds
 `snmp-server community`, `enable secret`, `username … secret`,
 `tacacs-server key`, `radius-server key`, `crypto isakmp key` and
 `pre-shared-key` lines; a FortiOS one holds `set password` and
-`set psksecret`. Until 4.38.0 all of that was stored as captured, compressed
+`set psksecret`. Until 4.39.0 all of that was stored as captured, compressed
 with zlib and no more, and served in full to any account with `configrx:
 read`. Compression is not encryption — `zlib.decompress` on the blob returns
 the plaintext — so the backup table was the least protected place in the
@@ -635,7 +635,7 @@ the device.
   identifier, no fleet data and no credential — a plain GET with a
   `User-Agent` — and the reply is a version string. But it *is* an outbound
   connection to a third party, and the previous wording denied that any
-  existed. From 4.38.0 the whole update path is off unless an administrator
+  existed. From 4.39.0 the whole update path is off unless an administrator
   turns on the `updates_enabled` setting, so on a default installation the
   button refuses before it reaches the network, and when it is on it pins to
   a published release tag and verifies the download's SHA-256 against a
@@ -646,7 +646,7 @@ the device.
 
 ## 8a. The audit log
 
-Until 4.38.0 the only record of who did what was `eventlog.py`: a 3,000-entry
+Until 4.39.0 the only record of who did what was `eventlog.py`: a 3,000-entry
 ring buffer in memory. It was fine as a debugging aid and useless as an audit
 trail — it was lost on every restart, any account with `debug: write` could
 clear it, and a single 200 KB field could evict everything else in it.
@@ -718,7 +718,7 @@ things remain outside its reach entirely:
   particular is granting the ability to change any other account's
   permissions, including its own, so treat it the same way root or
   domain-admin access would be treated. Note that "Settings write" is no
-  longer the top of the tree: from 4.38.0 user administration, permission
+  longer the top of the tree: from 4.39.0 user administration, permission
   changes, the update path and the destructive maintenance actions require an
   explicit **`admin`** capability, which accounts holding Settings write were
   granted on upgrade, which nobody can grant to themselves, and which the last
@@ -766,7 +766,7 @@ secret_store: false}` so the browser can make that decision without guessing.
 
 ### Why there is no portable secret store, yet
 
-A portable secret store was designed for 4.38.0 and **deliberately deferred**.
+A portable secret store was designed for 4.39.0 and **deliberately deferred**.
 The reasoning is worth writing down, because "just encrypt it with a key in a
 file" is the obvious answer and it is the wrong one.
 
@@ -805,7 +805,7 @@ refusal is at least accurate, visible in the interface, and documented here.
 the credentialed features — that is the supported answer. If it must be Linux,
 use SNMPv1/v2c or v3 noAuthNoPriv with communities scoped read-only on the
 device, and an SMTP relay on the local network that accepts unauthenticated
-mail from the monitoring host by address. From 4.38.0 the data directory is
+mail from the monitoring host by address. From 4.39.0 the data directory is
 created mode `0700` and every database file `0600`, so at least a shared Linux
 host does not expose one service's communities to every account on the
 machine — but note that a community string is not encrypted anywhere, on any

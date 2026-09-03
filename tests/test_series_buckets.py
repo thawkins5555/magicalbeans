@@ -362,7 +362,7 @@ trim_db.close()
 
 nodes_db.close()
 # --- starting the application must not wait for a whole-file rewrite
-# 4.38 moved every database to incremental auto-vacuum. Converting an
+# 4.39 moved every database to incremental auto-vacuum. Converting an
 # existing one is a VACUUM, and doing that for ten databases while the
 # operator waits for the window took 26 seconds on 840 MB of real data.
 # The conversion belongs to maintenance, not to startup.

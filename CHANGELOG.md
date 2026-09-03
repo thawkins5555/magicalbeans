@@ -4,7 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
-- [4.38.0 — unreleased](#4380-unreleased)
+- [4.39.0 — unreleased](#4390-unreleased)
 - [4.37.1 — Review of 4.37.0](#4371--review-of-4370)
 - [4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves](#4370--views-that-survive-a-reload-mute-where-it-belongs-bulk-resolve-that-resolves)
 - [4.36.1 — Review of the SSH terminal](#4361-review-of-the-ssh-terminal)
@@ -102,7 +102,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 4.38.0 — unreleased
+### 4.39.0 — unreleased
 
 Two reviews, implemented. The first is the network-engineer review in
 `REVIEW-NETWORK-ENGINEER.md` — a fortnight of a very large mixed fleet held

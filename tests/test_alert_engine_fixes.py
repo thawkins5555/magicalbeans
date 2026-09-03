@@ -1,4 +1,4 @@
-"""The alert-engine correctness fixes of 4.38.0, each section proving one
+"""The alert-engine correctness fixes of 4.39.0, each section proving one
 finding from the alerting review is closed.
 
 Structured as numbered sections that share one harness (`build()` returns

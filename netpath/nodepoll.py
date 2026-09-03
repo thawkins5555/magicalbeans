@@ -58,7 +58,7 @@ USM_STATS = {
 
 # The per-interface metric keys one poll emits, in the order they are
 # recorded. `in_bps`/`out_bps` and the two `*_err` keys keep the names the
-# charts and any stored history already use; the rest are new in 4.38.0.
+# charts and any stored history already use; the rest are new in 4.39.0.
 def _INTERFACE_METRICS(in_bps, out_bps, in_err_rate, out_err_rate,
                        in_disc_rate, out_disc_rate, in_util, out_util):
     return (

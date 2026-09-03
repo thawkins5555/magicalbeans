@@ -13,7 +13,7 @@ leaves it off never contacts GitHub at all, and is updated by replacing the
 ## What the updater does
 
 1. `GET /repos/<owner>/<repo>/tags` — the newest tag by version order (the run
-   of numbers in the name, so `v4.38.0` beats `v4.36.1` and `v4.9.0`). Branch
+   of numbers in the name, so `v4.39.0` beats `v4.36.1` and `v4.9.0`). Branch
    tips are never consulted: a branch moves, a tag is something a person
    published.
 2. If that tag is already recorded in `update_installed_tag` (app.db), it stops.
@@ -31,20 +31,20 @@ leaves it off never contacts GitHub at all, and is updated by replacing the
 
 ```sh
 # 1. Tag the commit you intend to ship, and push the tag.
-git tag -a v4.38.0 -m "SappiWhere 4.38.0"
-git push origin v4.38.0
+git tag -a v4.39.0 -m "SappiWhere 4.39.0"
+git push origin v4.39.0
 
 # 2. Take the tarball GitHub serves for that tag — the same URL the updater
 #    uses — and hash it. Do not build your own tarball: the digest has to be
 #    of the bytes the updater will actually receive.
-TAG=v4.38.0
+TAG=v4.39.0
 curl -fsSL -o "magicalbeans-$TAG.tar.gz" \
   "https://codeload.github.com/thawkins5555/magicalbeans/tar.gz/refs/tags/$TAG"
 sha256sum "magicalbeans-$TAG.tar.gz" > SHA256SUMS
-cat SHA256SUMS      # <64 hex chars>  magicalbeans-v4.38.0.tar.gz
+cat SHA256SUMS      # <64 hex chars>  magicalbeans-v4.39.0.tar.gz
 
 # 3. Create the release for that tag and attach SHA256SUMS as an asset.
-gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.38.0" --notes-file -
+gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.39.0" --notes-file -
 ```
 
 `SHA256SUMS` is `sha256sum`'s own format — `<digest>  <filename>` — so it can be

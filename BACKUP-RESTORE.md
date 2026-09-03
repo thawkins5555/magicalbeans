@@ -107,7 +107,7 @@ sqlite3 "$DST/nodes.db" "PRAGMA integrity_check;"    # sanity, not a formality
 
 Notes, all of which have bitten someone:
 
-- **Run it as the account that owns the files.** From 4.38.0 the directory is
+- **Run it as the account that owns the files.** From 4.39.0 the directory is
   `0700` and the databases `0600`, so a backup job running as a different user
   reads nothing and — depending on your `set -e` — may exit successfully having
   copied nothing.

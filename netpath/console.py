@@ -551,7 +551,7 @@ class ConsoleWindow(QMainWindow):
 
         # What is actually true and worth knowing at a glance: whether the
         # traffic is encrypted, and how far the listener reaches. Until
-        # 4.38.0 this card told the operator, once a second, that the product
+        # 4.39.0 this card told the operator, once a second, that the product
         # had no sign-in -- text left over from before auth.py, the login
         # page, the per-module read/write permissions, the forced first-run
         # password change and the sign-in throttling existed. Someone who

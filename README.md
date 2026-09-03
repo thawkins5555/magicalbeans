@@ -268,7 +268,7 @@ Route changes are recorded as a path signature per trace and drawn as ticks, but
 
 ## Dashboard
 
-The tab every sign-in lands on, and until 4.38.0 an empty placeholder. It is now
+The tab every sign-in lands on, and until 4.39.0 an empty placeholder. It is now
 a grid of tiles built entirely from data the application already had, refreshed
 on its own timer (`dashboard_refresh_s`, five seconds by default, on the
 Settings tab):
@@ -288,7 +288,7 @@ Every tile is a link. Clicking a count sets the destination tab's filter, so
 `kernel_dropped` deserves a note, because it is new and it is the number that
 tells you the truth. A UDP collector that is behind does not lose messages in
 the application — it loses them in the kernel's socket buffer, before any of
-this code sees them, and until 4.38.0 nothing counted that. The listeners now
+this code sees them, and until 4.39.0 nothing counted that. The listeners now
 read the drop counter for their own bound port every few seconds. A non-zero
 value means messages arrived and were discarded; the application logs the first
 increase as an error and shows the count in the collector's status strip.
@@ -510,7 +510,7 @@ Destination defaults are worth a note: they seed the Add dialog only. Changing t
 ### Retention and rollups
 
 Three settings on the Nodes settings dialog decide how much metric history
-survives, and from 4.38.0 they mean what they say.
+survives, and from 4.39.0 they mean what they say.
 
 | Setting | Default | What it bounds |
 | --- | --- | --- |
@@ -578,7 +578,7 @@ taken while the service is stopped is a complete, restorable backup.
 On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
 `systemctl start sappiwhere`. There is also an in-application update path — the
 **Update** button on the Settings tab — which is **disabled by default from
-4.38.0**: it does nothing until an administrator turns on the `updates_enabled`
+4.39.0**: it does nothing until an administrator turns on the `updates_enabled`
 setting, and it now pins to a published release tag and verifies the download's
 SHA-256 rather than pulling whatever is at the tip of a branch.
 
@@ -658,7 +658,7 @@ WantedBy=multi-user.target
 ```
 
 Add `User=sappiwhere` and `Group=sappiwhere` and give that account the data
-folder; from 4.38.0 the application creates `~/.local/share/netpath-monitor/`
+folder; from 4.39.0 the application creates `~/.local/share/netpath-monitor/`
 mode `0700` and its database files mode `0600`, so a shared server does not
 expose one operator's SNMP communities to another. `systemctl enable --now
 sappiwhere` after `daemon-reload`.

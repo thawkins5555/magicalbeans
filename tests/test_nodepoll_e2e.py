@@ -315,7 +315,7 @@ def main():
     # --- a device that answers ping but whose SNMP agent has died.
     #     unreachable_ping_only (the default) rightly keeps it out of
     #     device_down — it is reachable and broken, not down — and before
-    #     4.38.0 nothing else said anything at all, so a dead agent on a
+    #     4.39.0 nothing else said anything at all, so a dead agent on a
     #     live switch was invisible. It records an `snmp_error` event per
     #     failing poll, which the snmp_failing_ping_ok rule watches.
     if shutil.which("ping") is None:

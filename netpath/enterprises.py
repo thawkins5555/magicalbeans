@@ -15,7 +15,7 @@ tables is corroboration, not origin:
   worse than a vendor left as a number.
 
 Neither table was transcribed from vendor MIB modules, which is what this
-docstring claimed until 4.38.0: the tree holds vendor MIB text for exactly
+docstring claimed until 4.39.0: the tree holds vendor MIB text for exactly
 one of the 53 VERIFIED arcs (Moxa's 8691), and the file that ships those
 arcs — mibs/enterprise-roots.mib — says as much in terms.
 
@@ -247,7 +247,7 @@ def is_verified(arc) -> bool:
 
 # Vendors identified by sysDescr alone, which therefore have no arc to be
 # keyed by here, and still deserve to read as their own name rather than as
-# a camelCase token. Empty since 4.38.0: Rockwell Automation was the only
+# a camelCase token. Empty since 4.39.0: Rockwell Automation was the only
 # entry and now has arc 95 above, so it is reachable from a sysObjectID as
 # well as from a sysDescr substring.
 ARCLESS_DISPLAY: dict[str, str] = {}

@@ -2,7 +2,7 @@
 
 Deliberately not a test_*.py: throughput depends on the disk under it, so
 this prints numbers rather than asserting them (run_all.py only picks up
-test_*.py). It exists so the claim in the 4.38.0 notes — that batching a
+test_*.py). It exists so the claim in the 4.39.0 notes — that batching a
 poll's samples into one transaction is worth roughly two orders of
 magnitude — can be re-checked on any machine rather than taken on trust.
 
@@ -40,7 +40,7 @@ def build(path: str, preload: int):
 
 
 def record_one_at_a_time(db, device_id, key, label, unit, kind, ts, value):
-    """What record_metric_sample was before 4.38.0: a SELECT, an INSERT or
+    """What record_metric_sample was before 4.39.0: a SELECT, an INSERT or
     an UPDATE, the sample, and a commit — per sample. Reproduced here
     rather than kept in the module, so the shipped code has one write path.
     """

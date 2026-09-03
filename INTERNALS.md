@@ -481,7 +481,7 @@ already key off `reachable` rather than the status label.
 tuple per device needing v3, kept for the process lifetime, and
 `current()` returns `engine_time + (now - learned_at)` rather than the
 value learned at discovery. That last part matters and was missing until
-4.38.0: an agent accepts a message only inside a ±150 second window around
+4.39.0: an agent accepts a message only inside a ±150 second window around
 its own clock, so replaying the *discovered* `engine_time` on every
 subsequent request meant a device drifted out of its own window after
 about two and a half minutes and rejected roughly every third poll with a
@@ -4323,7 +4323,7 @@ write guards. `configrxdb.forget_device` therefore takes only the device
 id.
 
 **What the terminal does with it.** The same `prepare` / `policy` /
-`connect` sequence, and — from 4.38.0 — the `record_seen(host, port)` that
+`connect` sequence, and — from 4.39.0 — the `record_seen(host, port)` that
 closes it. A terminal connection that paramiko accepted against the stored
 key now touches that row's `last_seen_ts`, so the fingerprint line in
 ConfigRX's device dialog reports when the device last presented the key
