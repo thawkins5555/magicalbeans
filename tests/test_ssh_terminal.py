@@ -753,6 +753,87 @@ try:
             one.close()
     wait_idle()
 
+    # ------------------------------------------- the watchdog survives a fault
+
+    # Every limit on a live shell — the idle timeout, the sign-out check,
+    # the permission check — is that one loop in that one daemon thread. An
+    # exception used to end the thread, silently, and the shell then ran on
+    # with none of them. Here the session store raises for three ticks and
+    # the watchdog has to still be enforcing afterwards.
+    status, payload = call("POST", "/api/users",
+                           {"username": "flakyuser", "password": "Corr3ct-Horse-B6t",
+                            "grants": {"ssh": "write"}}, token=token)
+    assert status == 200, (status, payload)
+    flaky_token = login("flakyuser", "Corr3ct-Horse-B6t")
+    flaky = WsClient(web_port, f"/api/ssh/devices/{device}/socket", flaky_token)
+    flaky.send_json({"type": "open", "cols": 80, "rows": 24})
+    until_connected(flaky)
+
+    real_get = service.sessions.get
+    raised = []
+
+    def flaky_get(looked_up):
+        """Raise for this one session's token, and only three times: every
+        other caller — including the request that signs it out — sees the
+        real store."""
+        if looked_up == flaky_token and len(raised) < 3:
+            raised.append(looked_up)
+            raise RuntimeError("the session store is busy")
+        return real_get(looked_up)
+
+    service.sessions.get = flaky_get
+    try:
+        deadline = time.time() + 15
+        while len(raised) < 3 and time.time() < deadline:
+            time.sleep(0.1)
+        assert len(raised) == 3, raised
+    finally:
+        service.sessions.get = real_get
+    status, payload = call("POST", "/api/logout", {}, token=flaky_token)
+    assert status == 200, (status, payload)
+    assert flaky.wait_closed(15) == 4401, flaky.close_code
+    flaky.close()
+    print("PASS: a watchdog tick that raises is reported once — the traceback "
+          "above is that report, for three raised ticks — and the next tick "
+          "is still taken, so the shell's limits go on being enforced")
+    wait_idle()
+
+    # ------------------------------------ shutting down stops sessions at once
+
+    # `stop()` takes the socket's I/O lock, which a write into a browser
+    # that stopped reading holds for SEND_TIMEOUT_S. Serially that is
+    # sixteen of those, one after another, ahead of a three-second budget.
+    class StallingSession:
+        """A session whose stop() is parked exactly where a real one is:
+        waiting for a write that only a socket shutdown will release."""
+
+        def __init__(self, registry):
+            self.registry = registry
+            self.device_id = 0
+            self.released = threading.Event()
+            self.stopped = threading.Event()
+
+        def unblock(self):
+            self.released.set()
+
+        def stop(self, message=""):
+            self.released.wait(30)          # wsock.SEND_TIMEOUT_S, or longer
+            self.stopped.set()
+            with self.registry._lock:
+                self.registry._sessions.discard(self)
+
+    registry = sshterm.SshSessionRegistry(service)
+    stalled = [StallingSession(registry) for _ in range(sshterm.MAX_SESSIONS)]
+    registry._sessions.update(stalled)
+    started = time.time()
+    registry.shutdown()
+    elapsed = time.time() - started
+    assert elapsed < sshterm.SHUTDOWN_BUDGET_S + 2, elapsed
+    assert registry.count == 0, registry.count
+    assert all(one.stopped.is_set() for one in stalled)
+    print(f"PASS: {len(stalled)} stalled sessions are stopped together in "
+          f"{elapsed:.1f}s, inside one budget, instead of one timeout each")
+
     # ------------------------------------ a socket that never sends `open`
 
     # The slot is taken at the 101, not at `connected`: a laptop that slept

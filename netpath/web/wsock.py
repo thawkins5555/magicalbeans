@@ -444,6 +444,20 @@ class WebSocket:
         except (OSError, AttributeError):
             pass
 
+    def unblock(self) -> None:
+        """Stop the socket without sending anything and without taking the
+        I/O lock. `close()` cannot do this: it takes the lock to send its
+        close frame, and the lock can be held for `SEND_TIMEOUT_S` by a
+        write into a peer that stopped reading — which is exactly the case
+        a caller in a hurry (`SshSessionRegistry.shutdown()`) needs to get
+        past. The shutdown fails that write immediately and ends any
+        `recv()` parked on the socket."""
+        self.closed = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
     def _send_frame(self, opcode: int, payload: bytes) -> bool:
         frame = _frame(opcode, payload)
         with self._io_lock:

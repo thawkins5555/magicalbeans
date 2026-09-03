@@ -40,11 +40,14 @@ in both directions.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
 from . import configrx, hostkeys, permissions
 from .eventlog import NODES
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- the limits
 #
@@ -97,6 +100,17 @@ TOUCH_INTERVAL_S = 30
 # web session every tick, which is one dictionary lookup; the permission is a
 # database read). Five seconds from revoked to closed.
 PERMISSION_EVERY_TICKS = 5
+# How long `SshSessionRegistry.shutdown()` may take in total — for every
+# session, not for each one. Sessions are stopped concurrently inside it:
+# stopping one takes its socket's I/O lock, which its own output pump can
+# be holding for up to wsock.SEND_TIMEOUT_S against a browser that stopped
+# reading, and sixteen of those in a row is four minutes of an operator's
+# Ctrl+C apparently doing nothing while the poller and the databases wait.
+SHUTDOWN_BUDGET_S = 3.0
+# The grace after the budget in which sockets that were shut down by force
+# — which takes no lock, and is what fails a parked write at once — are
+# given to finish and let go of their slots.
+SHUTDOWN_GRACE_S = 0.5
 # The largest terminal output frame. Channel reads are capped at this, so a
 # device dumping a 4 MB `show tech-support` arrives as a stream of frames a
 # browser can render as it goes rather than one it must buffer whole.
@@ -250,13 +264,36 @@ class SshSessionRegistry:
 
     def shutdown(self) -> None:
         """End every session. Called before the databases close, because a
-        session that is still running will write a closing device event."""
+        session that is still running will write a closing device event.
+
+        Concurrently, under one budget for all of them: `stop()` sends a
+        closing status and a close frame, both of which take the socket's
+        I/O lock, and a pump thread writing into a browser that stopped
+        reading can hold that lock for `wsock.SEND_TIMEOUT_S`. Serially
+        that is sixteen timeouts one after another — minutes — before the
+        drain loop was even reached. Anything still live when the budget
+        runs out has its socket shut down by force, which takes no lock and
+        is what makes a parked write fail at once.
+        """
         with self._lock:
             self._stopping = True
             live = list(self._sessions)
+        if not live:
+            return
+        deadline = time.time() + SHUTDOWN_BUDGET_S
+        stoppers = []
         for session in live:
-            session.stop("The server is shutting down")
-        deadline = time.time() + 3.0
+            thread = threading.Thread(
+                target=session.stop, args=("The server is shutting down",),
+                name=f"ssh-stop-{session.device_id}", daemon=True)
+            thread.start()
+            stoppers.append(thread)
+        for thread in stoppers:
+            thread.join(timeout=max(0.0, deadline - time.time()))
+        if self.count:
+            for session in live:
+                session.unblock()
+            deadline += SHUTDOWN_GRACE_S
         while time.time() < deadline and self.count:
             time.sleep(0.05)
 
@@ -290,6 +327,9 @@ class SshSession:
         # back.
         self._started_at = time.time()
         self._open_seen = False
+        # Whether the watchdog has already reported a failed tick; one line
+        # per session, not one a second.
+        self._watch_failed = False
         self._last_input = time.time()
         self._last_touch = 0.0
         self._auth_failures = 0
@@ -679,34 +719,54 @@ class SshSession:
         ticks = 0
         while not self._stopped.wait(1.0):
             ticks += 1
-            if self.token and self.service.sessions.get(self.token) is None:
-                self._end_unauthorized(
-                    "You were signed out",
-                    f"SSH session closed: {self.app_user} is no longer signed in")
-                return
-            if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_ssh_write():
-                self._end_unauthorized(
-                    "SSH access was revoked",
-                    f"SSH session closed: {self.app_user} no longer holds "
-                    f"SSH write access")
-                return
-            # Read the module globals each time: the tests shorten them, and
-            # operator-facing constants are worth being able to change.
-            if not self._open_seen:
-                if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
-                    continue
-                self._status("closed", f"No terminal was opened within "
-                                       f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
-                self.ws.close(CLOSE_IDLE, "Handshake timeout")
-                self.stop()
-                return
-            if time.time() - self._last_input < IDLE_TIMEOUT_S:
-                continue
-            minutes = int(IDLE_TIMEOUT_S // 60) or 1
-            self._status("closed", f"Closed after {minutes} minute(s) idle")
-            self.ws.close(CLOSE_IDLE, "Idle timeout")
+            try:
+                if self._watch_tick(ticks):
+                    return
+            except Exception:
+                # This loop is the only thing enforcing the idle timeout,
+                # the sign-out check and the permission check, and it is one
+                # daemon thread: an exception from the session store, the
+                # socket or the audit path used to end it silently and leave
+                # the shell running with none of them. A tick that fails is
+                # a tick lost, not a control switched off — so it is
+                # reported once and the next one is taken.
+                if not self._watch_failed:
+                    self._watch_failed = True
+                    log.exception("The SSH session watchdog for device %s "
+                                  "failed a tick; it keeps running",
+                                  self.device_id)
+
+    def _watch_tick(self, ticks: int) -> bool:
+        """One beat of the watchdog. True when the session is over and the
+        loop should end."""
+        if self.token and self.service.sessions.get(self.token) is None:
+            self._end_unauthorized(
+                "You were signed out",
+                f"SSH session closed: {self.app_user} is no longer signed in")
+            return True
+        if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_ssh_write():
+            self._end_unauthorized(
+                "SSH access was revoked",
+                f"SSH session closed: {self.app_user} no longer holds "
+                f"SSH write access")
+            return True
+        # Read the module globals each time: the tests shorten them, and
+        # operator-facing constants are worth being able to change.
+        if not self._open_seen:
+            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
+                return False
+            self._status("closed", f"No terminal was opened within "
+                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
+            self.ws.close(CLOSE_IDLE, "Handshake timeout")
             self.stop()
-            return
+            return True
+        if time.time() - self._last_input < IDLE_TIMEOUT_S:
+            return False
+        minutes = int(IDLE_TIMEOUT_S // 60) or 1
+        self._status("closed", f"Closed after {minutes} minute(s) idle")
+        self.ws.close(CLOSE_IDLE, "Idle timeout")
+        self.stop()
+        return True
 
     def _has_ssh_write(self) -> bool:
         try:
@@ -725,6 +785,16 @@ class SshSession:
         self.stop()
 
     # --------------------------------------------------------------- close
+
+    def unblock(self) -> None:
+        """Shut the socket down without taking its I/O lock, so a thread
+        parked in a send or a read fails at once. The last resort of
+        `SshSessionRegistry.shutdown()`: it costs the operator the closing
+        notice on the page, which is why it is not the first."""
+        try:
+            self.ws.unblock()
+        except Exception:
+            pass
 
     def stop(self, message: str = "") -> None:
         with self._stop_lock:
