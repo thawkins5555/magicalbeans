@@ -495,11 +495,66 @@ def test_c4_prune_does_not_rebuild_the_index() -> None:
         handle.close()
 
 
+# ----------------------------------------------------------------------- C5
+
+def test_c5_drain_sources_can_be_caught_up() -> None:
+    """The alert engine drained 500 rows per five-second tick per source —
+    100 rows/s against a measured syslog ingest of ~11,800/s — with no inner
+    loop, no catch-up and no lag indicator anywhere. The engine's own loop is
+    workstream A's; the sources have to be able to say how far behind a
+    reader is and to hand over more than one tick's worth at a time."""
+    print("C5: sources can be sized and drained in catch-up batches")
+
+    syslog_db = SyslogDatabase(db_path("c5-syslog.db"))
+    fill_logs(syslog_db, 10_000, time.time() - 10_000)
+    check(syslog_db.max_id() == 10_000,
+          f"SyslogDatabase.max_id() sizes the backlog ({syslog_db.max_id()})")
+
+    # Drained the way the engine will: a budget per tick until the cursor
+    # reaches max_id. Ten thousand rows must not need twenty ticks.
+    cursor, ticks = 0, 0
+    high_water = syslog_db.max_id()
+    while cursor < high_water and ticks < 10:
+        rows = syslog_db.rows_since(cursor, limit=5000)
+        if not rows:
+            break
+        cursor = rows[-1]["id"]
+        ticks += 1
+    check(cursor == high_water and ticks <= 3,
+          f"10,000 rows drain in {ticks} tick(s) at a 5,000-row budget")
+    check(len(syslog_db.rows_since(0)) == 500,
+          "an unbudgeted caller still gets the old 500-row page")
+    check(len(syslog_db.rows_since(0, limit=None)) == 10_000,
+          "limit=None hands over the whole backlog for a caller that sized it")
+    check(syslog_db.rows_since(high_water, limit=5000) == [],
+          "a caught-up cursor reads nothing")
+    syslog_db.close()
+
+    trap_db = SnmpTrapDatabase(db_path("c5-traps.db"))
+    now = time.time()
+    for start in range(0, 2000, 500):
+        trap_db.insert([
+            trapdecode.Trap(ts=now + index, source="10.0.0.7", version=1,
+                            community="public", trap_oid="1.3.6.1.6.3.1.1.5.3",
+                            trap_name="linkDown", severity=3)
+            for index in range(start, start + 500)])
+    check(trap_db.max_id() == 2000,
+          f"SnmpTrapDatabase.max_id() sizes the backlog ({trap_db.max_id()})")
+    check(len(trap_db.traps_since(0, limit=1500)) == 1500,
+          "traps_since honours an explicit per-tick budget")
+    check(len(trap_db.traps_since(0)) == 500,
+          "and still defaults to 500 for a caller that passes nothing")
+    check(len(trap_db.traps_since(0, limit=None)) == 2000,
+          "limit=None hands over the whole trap backlog")
+    trap_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
     test_c3_kernel_drops_are_visible,
     test_c4_prune_does_not_rebuild_the_index,
+    test_c5_drain_sources_can_be_caught_up,
 ]
 
 

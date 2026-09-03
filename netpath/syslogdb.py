@@ -430,15 +430,26 @@ class SyslogDatabase:
                 by[key] = by.get(key, 0) + row["n"]
         return buckets
 
-    def rows_since(self, last_id: int, limit: int = 500) -> list[sqlite3.Row]:
+    def rows_since(self, last_id: int, limit: int | None = 500) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first — same cursor-read contract
-        as SnmpTrapDatabase.traps_since, used by the alert engine."""
+        as SnmpTrapDatabase.traps_since, used by the alert engine.
+
+        `limit` is the caller's per-tick budget; None means "everything
+        newer", which only a caller that has already sized the backlog with
+        max_id() should ask for.
+        """
         with self._lock:
+            if limit is None:
+                return self._conn.execute(
+                    "SELECT * FROM logs WHERE id > ? ORDER BY id ASC",
+                    (int(last_id),)).fetchall()
             return self._conn.execute(
                 "SELECT * FROM logs WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(last_id), int(limit))).fetchall()
 
     def max_id(self) -> int:
+        """Highest stored log id, so a reader can size its own backlog
+        (max_id() - cursor) and say how far behind it is."""
         with self._lock:
             row = self._conn.execute("SELECT MAX(id) AS m FROM logs").fetchone()
         return int(row["m"] or 0)

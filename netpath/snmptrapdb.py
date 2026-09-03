@@ -304,18 +304,31 @@ class SnmpTrapDatabase:
                 by[key] = by.get(key, 0) + row["n"]
         return buckets
 
-    def traps_since(self, last_id: int, limit: int = 500) -> list[sqlite3.Row]:
+    def traps_since(self, last_id: int, limit: int | None = 500) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first. The alert engine reads
         forward by id and keeps its own cursor, so it never re-reads a trap
         and never depends on wall-clock ordering — a device with a bad
         clock can file a trap timestamped in the past; its rowid is still
-        monotonic."""
+        monotonic.
+
+        `limit` is the caller's per-tick budget; None means "everything newer",
+        which only a caller that has already sized the backlog with max_id()
+        should ask for. The engine used to take the 500 default once per
+        five-second tick, i.e. 100 rows/s against a measured ingest of nearly
+        12,000/s, so a busy site fell behind for ever with no way to see it.
+        """
         with self._lock:
+            if limit is None:
+                return self._conn.execute(
+                    "SELECT * FROM traps WHERE id > ? ORDER BY id ASC",
+                    (int(last_id),)).fetchall()
             return self._conn.execute(
                 "SELECT * FROM traps WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(last_id), int(limit))).fetchall()
 
     def max_id(self) -> int:
+        """Highest stored trap id, so a reader can size its own backlog
+        (max_id() - cursor) and say how far behind it is."""
         with self._lock:
             row = self._conn.execute("SELECT MAX(id) AS m FROM traps").fetchone()
         return int(row["m"] or 0)
