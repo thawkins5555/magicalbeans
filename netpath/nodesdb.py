@@ -209,6 +209,28 @@ CREATE TABLE IF NOT EXISTS samples_hourly (
     vmin            REAL, vavg REAL, vmax REAL,
     PRIMARY KEY (metric_id, hour)
 );
+-- The primary key leads on metric_id, so "every rollup row older than N
+-- days" — what prune() asks once per maintenance pass — would scan the
+-- whole table without this.
+CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour ON samples_hourly(hour);
+
+-- Every address a device is known to answer on, beside its primary `ip`.
+-- A switch sends its traps from a loopback and its syslog from a
+-- management VRF, and both are addresses the devices table has never
+-- heard of, so the alert engine could not tell whose they were. Filled
+-- best-effort from each poll's ipAddrTable read (source 'ipAddrTable');
+-- `source` is kept so a later manual or protocol-learned entry can be
+-- told apart from a polled one. The device's own `ip` is deliberately NOT
+-- mirrored here — device_id_for_address falls back to devices.ip — so
+-- there is one place a primary address is stored.
+CREATE TABLE IF NOT EXISTS device_addresses (
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    ip              TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT '',
+    seen_ts         REAL NOT NULL,
+    PRIMARY KEY (device_id, ip)
+);
+CREATE INDEX IF NOT EXISTS ix_device_addresses_ip ON device_addresses(ip);
 
 CREATE TABLE IF NOT EXISTS device_events (
     id              INTEGER PRIMARY KEY,
@@ -608,6 +630,24 @@ class NodesDatabase:
             if column not in interfaces:
                 self._conn.execute(
                     f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
+        # ifInDiscards/ifOutDiscards (the counters that say a link is
+        # congested rather than broken) and their rates, alongside the error
+        # pair above.
+        for column in ("last_in_discards", "last_out_discards"):
+            if column not in interfaces:
+                self._conn.execute(
+                    f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
+        for column in ("in_discard_rate", "out_discard_rate"):
+            if column not in interfaces:
+                self._conn.execute(
+                    f"ALTER TABLE interfaces ADD COLUMN {column} REAL")
+        # ifCounterDiscontinuityTime (RFC 2863): the sysUpTime at which this
+        # interface's counters were last reset. Stored so a rate is not
+        # computed across a reset — an agent that restarts its counters
+        # otherwise reads as one enormous burst of traffic.
+        if "discontinuity_ts" not in interfaces:
+            self._conn.execute(
+                "ALTER TABLE interfaces ADD COLUMN discontinuity_ts REAL")
 
         jobs = {row["name"] for row in
                 self._conn.execute("PRAGMA table_info(discovery_jobs)").fetchall()}
@@ -1209,6 +1249,73 @@ class NodesDatabase:
             self._conn.commit()
             return previous
 
+    # ------------------------------------------------------- device addresses
+
+    def record_device_addresses(self, device_id: int, ips, source: str) -> int:
+        """Remember the addresses a device answers on besides its primary
+        `ip`, so a trap or syslog message from its loopback or its
+        management VRF correlates to the device that sent it.
+
+        An upsert per (device_id, ip) rather than delete-and-insert: an
+        address the device stopped advertising is still the address last
+        seen for it, and dropping it would silently un-correlate whatever
+        is still sending from there. Rows for the device's own primary
+        address are skipped — that one lives in `devices.ip` and
+        device_id_for_address already falls back to it. Loopback and
+        unspecified addresses are skipped too: every device reports
+        127.0.0.1 in its ipAddrTable, and storing that would make one
+        arbitrary device the owner of everything sent from localhost.
+        """
+        now = time.time()
+        rows = []
+        for ip in ips or ():
+            text = str(ip or "").strip()
+            if not text or text.startswith("127.") or text in ("0.0.0.0", "::1", "::"):
+                continue
+            rows.append((device_id, text, source or "", now))
+        if not rows:
+            return 0
+        with self._lock:
+            # The device's own address is not stored twice; a row that was
+            # previously learned for another device moves here, because the
+            # newest evidence is what an address currently belongs to.
+            primary = self._conn.execute(
+                "SELECT ip FROM devices WHERE id = ?", (device_id,)).fetchone()
+            primary_ip = primary["ip"] if primary else ""
+            rows = [row for row in rows if row[1] != primary_ip]
+            if not rows:
+                return 0
+            self._conn.executemany(
+                "INSERT INTO device_addresses(device_id, ip, source, seen_ts)"
+                " VALUES (?,?,?,?) ON CONFLICT(device_id, ip) DO UPDATE SET"
+                " source=excluded.source, seen_ts=excluded.seen_ts", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def device_id_for_address(self, ip: str) -> int | None:
+        """Which device answers on this address: its primary `ip` first,
+        then any alias learned for it. Primary first because that is the
+        address the operator configured, and an alias is only ever
+        supporting evidence."""
+        text = str(ip or "").strip()
+        if not text:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM devices WHERE ip = ?", (text,)).fetchone()
+            if row is not None:
+                return row["id"]
+            row = self._conn.execute(
+                "SELECT device_id FROM device_addresses WHERE ip = ?"
+                " ORDER BY seen_ts DESC LIMIT 1", (text,)).fetchone()
+        return row["device_id"] if row else None
+
+    def device_addresses(self, device_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_addresses WHERE device_id = ? ORDER BY ip",
+                (device_id,)).fetchall()
+
     # ------------------------------------------------------------- interfaces
 
     def interfaces(self, device_id: int) -> list[sqlite3.Row]:
@@ -1430,6 +1537,25 @@ class NodesDatabase:
             return self._conn.execute(
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
 
+    def top_metric(self, key: str, n: int = 10, *,
+                   ascending: bool = False) -> list[sqlite3.Row]:
+        """The n enabled devices with the highest (or lowest) current value
+        of one metric key — "worst packet loss", "slowest to answer" — in
+        one query rather than a metrics() call per device. NULL last_value
+        rows are excluded: a metric that has never produced a sample is not
+        a zero, and sorting it as one puts silent devices at the top of a
+        "best" list and hides real ones."""
+        order = "ASC" if ascending else "DESC"
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT m.device_id AS device_id, d.name AS name, d.ip AS ip,"
+                f" m.id AS metric_id, m.key AS key, m.label AS label,"
+                f" m.unit AS unit, m.last_value AS last_value, m.last_ts AS last_ts"
+                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
+                f" WHERE m.key = ? AND m.last_value IS NOT NULL AND d.enabled = 1"
+                f" ORDER BY m.last_value {order} LIMIT ?",
+                (key, int(n))).fetchall()
+
     def series(self, device_id: int, metric_id: int, t0: float, t1: float,
                bucket_s: float = 0) -> list[dict]:
         """Raw-vs-hourly selection: a wide window reads the rollup table
@@ -1589,21 +1715,55 @@ class NodesDatabase:
             segments.append({"ts_start": cursor, "ts_end": t1, "status": end_status})
         return segments
 
-    def device_events_since(self, last_id: int, limit: int = 2000) -> list[sqlite3.Row]:
+    def device_events_since(self, last_id: int,
+                            limit: int | None = 2000) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first — the same cursor-read
         contract SnmpTrapDatabase.traps_since/SyslogDatabase.rows_since
         use, so the alert engine's drain functions are uniform across
-        every source."""
+        every source.
+
+        `limit=None` means "no cap": a drain that loops until it reaches
+        max_event_id() sets its own per-tick budget and does not want a
+        second, invisible one here."""
+        sql = "SELECT * FROM device_events WHERE id > ? ORDER BY id ASC"
+        args: list = [int(last_id)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
         with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM device_events WHERE id > ? ORDER BY id ASC LIMIT ?",
-                (int(last_id), int(limit))).fetchall()
+            return self._conn.execute(sql, args).fetchall()
 
     def max_device_event_id(self) -> int:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(id) AS m FROM device_events").fetchone()
         return int(row["m"] or 0)
+
+    # The name every other source the alert engine drains uses for this
+    # (SnmpTrapDatabase.max_id, SyslogDatabase.max_id), so a drain loop can
+    # ask each source the same question instead of special-casing this one.
+    def max_event_id(self) -> int:
+        return self.max_device_event_id()
+
+    def count_events_by_device(self, since: float,
+                               kinds: list[str] | None = None) -> list[sqlite3.Row]:
+        """(device_id, name, ip, n) for the devices with the most events
+        since a wall-clock timestamp, busiest first — the "top offenders"
+        question a dashboard asks once, rather than one query per device."""
+        clauses = ["e.ts >= ?"]
+        params: list = [float(since)]
+        if kinds:
+            marks = ",".join("?" * len(kinds))
+            clauses.append(f"e.kind IN ({marks})")
+            params.extend(kinds)
+        where = " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT e.device_id AS device_id, d.name AS name, d.ip AS ip,"
+                f" COUNT(*) AS n FROM device_events e"
+                f" JOIN devices d ON d.id = e.device_id"
+                f" WHERE {where} GROUP BY e.device_id"
+                f" ORDER BY n DESC, d.name COLLATE NOCASE", params).fetchall()
 
     def record_interface_event(self, interface_id: int, kind: str, detail: str = "") -> None:
         with self._lock:
