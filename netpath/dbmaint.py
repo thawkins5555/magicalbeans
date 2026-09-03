@@ -37,13 +37,17 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
         return True
     try:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        pages = conn.execute("PRAGMA page_count").fetchone()[0]
-        if pages > 1:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode != INCREMENTAL:
+            # The pragma only takes effect on a database with no pages at
+            # all. A WAL-mode file already has its first page by the time
+            # the caller gets here, so a VACUUM (cheap on a new file, a
+            # one-time cost on an old one) is what actually converts it.
             started = time.monotonic()
             conn.execute("VACUUM")
             log.info("%s: converted to incremental auto-vacuum in %.1f s",
                      label or "database", time.monotonic() - started)
-        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+            mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         log.warning("%s: could not enable incremental vacuum: %s", label or "database", exc)
         return False
