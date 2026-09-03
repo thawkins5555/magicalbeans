@@ -49,6 +49,15 @@ OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
 DRAIN_ROW_BUDGET = 5000
 DRAIN_TIME_BUDGET_S = 2.0
 
+# _rollup_parent's third answer, beside "this open alert already says it" and
+# "nothing does". It means "an outage implies this, but there is no open row
+# to hang a note on" — the parent was resolved by hand while the device is
+# still down, or the outage is an upstream device's whose own alert an
+# operator has already worked. Suppressing without a note is right there: an
+# operator who resolved the outage has said they know about it, and handing
+# them the six alerts it implies is the opposite of what they asked for.
+SUPPRESSED = object()
+
 
 def _ago(ts: float) -> str:
     if not ts:
@@ -663,12 +672,50 @@ class AlertEngine:
                 device_name=device["name"] or "", device_ip=device["ip"],
                 extra=extra)
             occurrences.append(occurrence)
+            if row["kind"] == "up":
+                occurrences.extend(self._replay_downstream_outages(device))
             if resolved:
                 self.counters["resolved"] += 1
                 self._notify_clear(resolved, cleared_rule, settings, extra=extra)
         if max_id > cursor:
             self._advance_cursor("device_events", max_id)
         return occurrences
+
+    def _replay_downstream_outages(self, device) -> list[Occurrence]:
+        """`down` occurrences for devices behind an upstream that just
+        recovered and are still down themselves.
+
+        The other end of the topology rollup, and the reason it is safe. A
+        device whose outage was suppressed (or absorbed) under its upstream
+        has no open alert and will never produce a second `down` event, so
+        without this it would go quiet the moment the upstream recovered —
+        the network's remaining fault would be the one thing nobody was told
+        about. Asked of the device's CURRENT status rather than of what was
+        suppressed earlier, so a site that came back cleanly replays nothing.
+
+        Marked replayed so the new-device hold does not park them again.
+        """
+        ids_of = getattr(self.nodes_db, "downstream_ids", None)
+        if ids_of is None:
+            return []
+        child_ids = ids_of(device["id"])
+        if not child_ids:
+            return []
+        out = []
+        for child in self.nodes_db.devices_by_ids(child_ids):
+            if not child["enabled"] or child["status"] != "down":
+                continue
+            label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, child["ip"], device=child) or child["ip"]
+            occurrence = Occurrence(
+                kind="device_event", source_kind="down", entity_kind="device",
+                entity_id=str(child["id"]), entity_label=label, ts=time.time(),
+                message=f"{label}: still not responding now that the upstream "
+                        f"outage has cleared",
+                device_name=child["name"] or "", device_ip=child["ip"])
+            occurrence.replayed = True
+            out.append(occurrence)
+        return out
 
     def _drain_interface_events(self, settings) -> list[Occurrence]:
         if not self.db.has_cursor("interface_events"):
@@ -1420,15 +1467,70 @@ class AlertEngine:
     # ------------------------------------------------------------- rollup
 
     def _rollup_parent(self, rule, occurrence: Occurrence):
-        """The open alert that already says what `rule` is about to say, or
-        None. See alertrules.ROLLED_UP_BY for which rules have a parent."""
+        """The open alert that already says what `rule` is about to say,
+        SUPPRESSED, or None.
+
+        Three answers, in order:
+
+        1. The same device's own parent alert is open — the original rollup,
+           see alertrules.ROLLED_UP_BY for which rules have one.
+        2. The parent is `device_down`, it is NOT open, and the device is
+           still down. That is the case an operator creates by triaging: the
+           natural action on an outage is to resolve it, and the moment they
+           did, every child re-derived on the next tick. The review measured
+           three fresh alerts and three fresh emails within five seconds for
+           a device that was still down — and device_down could not come back
+           to re-suppress them, because it is event-driven and no second
+           `down` event is ever recorded. Triaging an outage was punished
+           with more noise than it removed.
+        3. `device_down` itself, for a device whose upstream is down. This is
+           the topology half: without it a core switch failure arrives as one
+           alert per access switch behind it, each true and none of them the
+           one worth reading.
+        """
+        if occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
+            return None
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
-        if not parent_key or occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
+        if parent_key:
+            parent_rule = self.db.rule_by_key(parent_key)
+            if parent_rule is None or not parent_rule["enabled"]:
+                return None
+            parent = self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
+            if parent is not None:
+                return parent
+            if parent_key == "device_down":
+                device = self._occurrence_device(occurrence)
+                if device is not None and device["status"] == "down":
+                    return SUPPRESSED
             return None
-        parent_rule = self.db.rule_by_key(parent_key)
-        if parent_rule is None or not parent_rule["enabled"]:
+        if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
+            return self._upstream_outage(rule, occurrence)
+        return None
+
+    def _upstream_outage(self, rule, occurrence: Occurrence):
+        """The open `device_down` of the nearest ancestor that is also down.
+
+        Walks upwards rather than checking only the immediate upstream: in a
+        site outage the whole chain goes at once, and whichever device the
+        engine happened to see first is the one holding the open alert. The
+        walk is cycle-safe and depth-capped in nodesdb.upstream_chain.
+
+        getattr rather than a direct call so an engine running against a
+        database module without the topology columns behaves exactly as it
+        did before them.
+        """
+        chain_of = getattr(self.nodes_db, "upstream_chain", None)
+        if chain_of is None:
             return None
-        return self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
+        try:
+            device_id = int(occurrence.entity_id)
+        except (TypeError, ValueError):
+            return None
+        for ancestor_id in chain_of(device_id):
+            parent = self.db.open_by_dedup(f"{rule['key']}:device:{ancestor_id}")
+            if parent is not None:
+                return parent
+        return None
 
     def _absorb_subordinates(self, parent_rule, occurrence: Occurrence,
                              parent_row) -> None:
@@ -1472,6 +1574,41 @@ class AlertEngine:
                 self.db.add_rollup_note(
                     parent_row["id"],
                     f"Resolved “{child_rule['name']}” — implied by this outage")
+        if (parent_rule["key"] or "") == "device_down" \
+                and occurrence.entity_kind == "device":
+            self._absorb_downstream(parent_rule, occurrence, parent_row)
+
+    def _absorb_downstream(self, rule, occurrence: Occurrence, parent_row) -> None:
+        """Resolve the outages of everything behind a device that just went
+        down, when their alerts opened before this one did.
+
+        _rollup_parent covers the other order — a downstream outage noticed
+        after the upstream one is suppressed before it opens. Both orders
+        happen: a power event takes the whole site at once and which device
+        the poller reaches first is arbitrary.
+
+        Silent, like every other absorption: no clear email for an alert that
+        was never a separate problem. If the upstream comes back and a
+        downstream device is still down, _replay_downstream_outages re-raises
+        it — a device the engine has stopped alerting about must not stay
+        silent once the excuse for the silence is gone.
+        """
+        ids_of = getattr(self.nodes_db, "downstream_ids", None)
+        if ids_of is None:
+            return
+        try:
+            device_id = int(occurrence.entity_id)
+        except (TypeError, ValueError):
+            return
+        for child_id in ids_of(device_id):
+            resolved = self.db.resolve_by_dedup(
+                f"{rule['key']}:device:{child_id}", by="")
+            if resolved:
+                self.counters["resolved"] += 1
+                self.db.add_rollup_note(
+                    parent_row["id"],
+                    f"Resolved “{resolved['entity_label']}” — implied by the "
+                    f"upstream outage of {occurrence.entity_label}")
 
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
@@ -1522,6 +1659,12 @@ class AlertEngine:
             key = dedup_key(rule, occurrence)
             if rollup:
                 parent = self._rollup_parent(rule, occurrence)
+                if parent is SUPPRESSED:
+                    # Implied by an outage with no open row to annotate: the
+                    # parent was hand-resolved while the device is still
+                    # down, or the upstream's own alert has been worked.
+                    self.counters["rolled_up"] += 1
+                    continue
                 if parent is not None:
                     # Not opened at all, so no email and no row to work. The
                     # parent says where it went, so the latency alert an
@@ -1633,6 +1776,18 @@ class AlertEngine:
         current_hour = int(now // 3600)
         if max_per_hour and len(self._sent_this_hour) >= max_per_hour:
             self.counters["suppressed"] += 1
+            # A row per suppressed send, not just a global counter. In the
+            # review's 500-device outage, 60 alerts were emailed and 440 were
+            # dropped with no record on the alert at all: the only trace was
+            # this counter and one ERROR line an hour in a 3,000-entry
+            # in-memory ring that the poller overwrites in about ninety
+            # seconds. An operator asking "were we told about site 14" could
+            # not be answered. Now the alert's own detail pane says nobody
+            # was told, and why.
+            self.db.record_notification(
+                alert_row["id"], notify_kind or ("renotify" if renotify else "alert"),
+                "", "", False,
+                f"not sent: over the {max_per_hour}/hour email limit")
             if self._suppression_logged_hour != current_hour:
                 self._suppression_logged_hour = current_hour
                 self.log.add(ERROR, f"Alert email volume over {max_per_hour}/hour — "

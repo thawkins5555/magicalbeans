@@ -1275,6 +1275,14 @@ class AlertsDatabase:
                 "SELECT * FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
                 (dedup_key,)).fetchone()
 
+    # How many lines an alert's rollup note may hold. Distinct lines, not
+    # repeats — those are skipped below — so this only bites where a single
+    # outage genuinely absorbed dozens of different alerts, which since the
+    # topology rollup means a site's worth of downstream devices. The note is
+    # read by a person; past a screenful it stops informing and starts
+    # costing a row rewrite per absorbed alert.
+    MAX_ROLLUP_NOTE_LINES = 50
+
     def add_rollup_note(self, alert_id: int, line: str) -> None:
         """Appends one line to an alert's rollup note, skipping duplicates so
         a flapping device does not grow the same line hundreds of times."""
@@ -1284,7 +1292,10 @@ class AlertsDatabase:
             if row is None:
                 return
             existing = row["rollup_note"] or ""
-            if line in existing.split("\n"):
+            lines = existing.split("\n") if existing else []
+            if line in lines:
+                return
+            if len(lines) >= self.MAX_ROLLUP_NOTE_LINES:
                 return
             merged = (existing + "\n" + line).strip() if existing else line
             self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",

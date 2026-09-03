@@ -221,6 +221,16 @@ ROLLUP_ENTITY_KINDS = frozenset({"device", "netpath_target"})
 # it went away, and a port that went down for its own reason stays worth
 # knowing about — it is a fact about the network, not an artefact of the
 # device being unreachable.
+#
+# The reviewer's counter-argument is real: when a chassis loses power the
+# transitions that matter come from its NEIGHBOURS' ports, and those genuinely
+# ARE implied by the downstream outage. Suppressing them needs to know which
+# port faces which device, and nothing in this application knows that —
+# devices.upstream_id (4.37) records the device relationship but not the
+# interface, and there is no LLDP/CDP neighbour walk. Guessing from MAC
+# forwarding tables would suppress a real port fault whenever the guess was
+# wrong, which is the one failure mode an alert system must not have. Left
+# undone on purpose until there is a neighbour table to consult.
 ROLLED_UP_BY = {
     # ping, measured by this app's own probes
     "response_time_high": "device_down",

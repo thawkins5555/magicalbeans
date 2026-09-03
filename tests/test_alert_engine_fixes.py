@@ -878,3 +878,236 @@ assert upgraded.rule_by_key("mib_missing")["notify"] == 0
 assert upgraded.rule_by_key("device_down")["notify"] == 1
 ok("upgrading turns email off for mib_missing and leaves every other rule on")
 upgraded.close()
+
+
+# =================================================================== A11
+print("\nA11 — a site outage is one alert, not one per device")
+
+
+def set_status(nodes, device_ids, status):
+    """The status column a poll would have written. Written directly rather
+    than through record_poll, which wants a whole poll result; what these
+    sections need is only the label the rollup reads."""
+    conn = sqlite3.connect(nodes.path)
+    conn.executemany("UPDATE devices SET status = ? WHERE id = ?",
+                     [(status, i) for i in device_ids])
+    conn.commit()
+    conn.close()
+
+
+def go_down(nodes, device_ids, detail="stopped responding"):
+    if isinstance(device_ids, int):
+        device_ids = [device_ids]
+    set_status(nodes, device_ids, "down")
+    for device_id in device_ids:
+        nodes.record_device_event(device_id, "down", detail)
+
+
+def come_up(nodes, device_id, detail="responding again"):
+    set_status(nodes, [device_id], "up")
+    nodes.record_device_event(device_id, "up", detail)
+
+
+# ---- a chain: C behind B behind A
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+engine._tick()
+a = add_device(nodes, "10.12.0.1", "core-sw-a")
+b = add_device(nodes, "10.12.0.2", "dist-sw-b")
+c = add_device(nodes, "10.12.0.3", "acc-sw-c")
+nodes.update_device(b, upstream_id=a)
+nodes.update_device(c, upstream_id=b)
+
+go_down(nodes, [a, b, c])
+engine._tick()
+outages = open_rows(alerts, "device_down")
+assert len(outages) == 1, [dict(o) for o in outages]
+assert outages[0]["entity_id"] == str(a), dict(outages[0])
+ok("three devices in a chain going down at once opens one alert, on the core")
+
+notes = (outages[0]["rollup_note"] or "").split("\n")
+assert len(notes) >= 1, notes
+ok(f"the surviving alert records what it absorbed ({len(notes)} note line(s))")
+
+come_up(nodes, a)
+engine._tick()
+reopened = {r["entity_id"] for r in open_rows(alerts, "device_down")}
+assert reopened == {str(b)}, reopened
+ok("the core recovering re-opens the outage of the device below it, which is "
+   "still down")
+
+# C is not lost — it is now rolled up under B, which has become the top of
+# what is left of the outage. It comes back the moment B does.
+come_up(nodes, b)
+engine._tick()
+reopened = {r["entity_id"] for r in open_rows(alerts, "device_down")}
+assert reopened == {str(c)}, reopened
+ok("and when that device recovers too, the one still behind it re-opens")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- the other order: the downstream alerts were already open
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+engine._tick()
+a = add_device(nodes, "10.12.1.1", "core-sw-a")
+kids = [add_device(nodes, f"10.12.1.{i + 2}", f"acc-sw-{i}") for i in range(4)]
+for device_id in kids:
+    nodes.update_device(device_id, upstream_id=a)
+go_down(nodes, kids)
+engine._tick()
+assert len(open_rows(alerts, "device_down")) == 4
+go_down(nodes, a)
+engine._tick()
+survivors = open_rows(alerts, "device_down")
+assert len(survivors) == 1 and survivors[0]["entity_id"] == str(a), \
+    [dict(x) for x in survivors]
+assert "upstream outage" in (survivors[0]["rollup_note"] or "")
+ok("an upstream failing after its downstream devices absorbs their alerts")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- a cycle must terminate rather than spin the tick thread
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+engine._tick()
+x = add_device(nodes, "10.12.2.1", "sw-x")
+y = add_device(nodes, "10.12.2.2", "sw-y")
+nodes.update_device(x, upstream_id=y)
+nodes.update_device(y, upstream_id=x)
+go_down(nodes, [x, y])
+started = time.monotonic()
+engine._tick()
+elapsed = time.monotonic() - started
+assert elapsed < 5.0, elapsed
+assert len(open_rows(alerts, "device_down")) >= 1
+ok(f"a mis-typed A<->B cycle terminates ({elapsed:.2f}s) instead of spinning")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- F11: hand-resolving the outage must not un-suppress its children
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+engine._tick()
+did = add_device(nodes, "10.12.3.1", "core-sw-a")
+base = time.time()
+for offset in (0, 65):
+    for key, label in (("cpu_pct", "CPU"), ("ping_rtt_ms", "RTT"),
+                       ("ping_loss_pct", "Loss")):
+        nodes.record_metric_sample(did, key, label, "%", "gauge",
+                                   base + offset, 999.0)
+    engine._tick()
+children = [k for k in ("cpu_high", "response_time_high", "packet_loss_high")
+            if open_rows(alerts, k, did)]
+assert len(children) == 3, children
+go_down(nodes, did)
+engine._tick()
+assert len(open_rows(alerts, "device_down", did)) == 1
+assert [k for k in children if open_rows(alerts, k, did)] == []
+ok("an outage absorbs the three alerts that only restate it")
+
+outage = open_rows(alerts, "device_down", did)[0]
+assert alerts.resolve_many([outage["id"]], "operator") == 1
+for _ in range(3):
+    engine._tick()
+assert [k for k in children if open_rows(alerts, k, did)] == [], \
+    "resolving an outage by hand must not re-open its children"
+ok("hand-resolving the outage keeps them suppressed while the device is down")
+
+come_up(nodes, did)
+for offset in (130, 195):
+    for key, label in (("cpu_pct", "CPU"), ("ping_rtt_ms", "RTT"),
+                       ("ping_loss_pct", "Loss")):
+        nodes.record_metric_sample(did, key, label, "%", "gauge",
+                                   base + offset, 999.0)
+    engine._tick()
+assert len([k for k in children if open_rows(alerts, k, did)]) == 3
+ok("once the device answers again its own breaches open normally")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- fan-out, with and without a topology
+def fan_out(count, with_upstream):
+    nodes, alerts, snmp, syslog, ipam, engine = build(
+        rollup_enabled=True, max_emails_per_hour=60, **MAIL_SETTINGS)
+    sent = FakeMail()
+    alertmail.send = sent
+    try:
+        engine._tick()
+        core = add_device(nodes, "10.13.0.1", "core-sw")
+        kids = []
+        for i in range(count):
+            device_id = add_device(nodes, f"10.13.{1 + i // 250}.{i % 250 + 1}",
+                                   f"acc-{i:03d}")
+            if with_upstream:
+                nodes.update_device(device_id, upstream_id=core)
+            kids.append(device_id)
+        if with_upstream:
+            # The core noticed first, which is the order a poller reaches a
+            # site outage in when the upstream is the thing that failed. The
+            # opposite order is covered above: the alerts open and are then
+            # absorbed, so the list still collapses to one row — but the mail
+            # for the ones already open has gone out by then.
+            go_down(nodes, core)
+        go_down(nodes, kids)
+        engine._tick()
+        assert engine._mail.wait_idle(20.0)
+        opened = len(open_rows(alerts, "device_down"))
+        notification_rows = sum(
+            len(alerts.notifications_for(a["id"]))
+            for a in alerts.alerts(state="unresolved", limit=2000))
+        return opened, len(sent.attempts), notification_rows, engine.counters
+    finally:
+        alertmail.send = real_send
+        engine.stop()
+        nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+opened, mailed, rows, counters = fan_out(120, with_upstream=False)
+assert opened == 120, opened
+assert mailed == 60, mailed
+assert rows == 120, rows
+ok(f"without a topology, {opened} outages give {mailed} emails and {rows} "
+   f"notification rows — every suppressed send is recorded")
+
+opened, mailed, rows, counters = fan_out(120, with_upstream=True)
+assert opened == 1, opened
+assert mailed == 1, mailed
+assert counters["rolled_up"] == 120, counters
+ok(f"with upstream_id set, the same 121 outages give {opened} alert and "
+   f"{mailed} email ({counters['rolled_up']} suppressed)")
+
+
+# ---- the device form field the topology needs, validated at the boundary
+class _FakeService:
+    def __init__(self, nodes_db):
+        self.nodes_db = nodes_db
+
+
+from netpath.web.api import put_nodes_device   # noqa: E402
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+service = _FakeService(nodes)
+a = add_device(nodes, "10.14.0.1", "core-sw-a")
+b = add_device(nodes, "10.14.0.2", "acc-sw-b")
+
+put_nodes_device(service, {}, {"upstream_id": a}, b)
+assert nodes.device(b)["upstream_id"] == a, dict(nodes.device(b))
+put_nodes_device(service, {}, {"upstream_id": None}, b)
+assert nodes.device(b)["upstream_id"] is None
+ok("PUT sets and clears a device's upstream")
+
+for bad, why in ((b, "itself"), (999999, "an id that is not there")):
+    try:
+        put_nodes_device(service, {}, {"upstream_id": bad}, b)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"PUT accepted {why} as an upstream")
+assert nodes.device(b)["upstream_id"] is None
+ok("PUT refuses a device as its own upstream, and an unknown device id")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+print(f"\nALL {len(PASSED)} ALERT-ENGINE ASSERTIONS PASSED")

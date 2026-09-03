@@ -1713,7 +1713,7 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
-                         "vendor_override")
+                         "vendor_override", "upstream_id")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
@@ -1907,11 +1907,38 @@ def _check_display_name_source(body) -> None:
         raise ValueError("display_name_source must be 'auto' or 'manual'")
 
 
+def _clean_upstream_id(service, device_id, value):
+    """The upstream device an alert rollup will look through, validated.
+
+    Empty, null and 0 all mean "no upstream" — the form's blank option sends
+    one of the three depending on the browser, and all three are the same
+    answer. A device pointed at itself would make its own outage suppress
+    itself, and a device pointed at an id that is not there would make the
+    walk quietly do nothing; both are rejected here rather than tolerated,
+    because a topology field that silently does nothing is exactly the
+    failure the dead threshold rules already demonstrated.
+    """
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        upstream = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("upstream_id must be a device id")
+    if upstream == int(device_id):
+        raise ValueError("A device cannot be its own upstream device")
+    if not service.nodes_db.device(upstream):
+        raise ValueError("No such upstream device")
+    return upstream
+
+
 def put_nodes_device(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
     _check_display_name_source(body)
     fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
+    if "upstream_id" in fields:
+        fields["upstream_id"] = _clean_upstream_id(
+            service, device_id, fields["upstream_id"])
     result = {"ok": True}
     if "vendor_override" in fields:
         # Not a plain column write: setting a vendor by hand also teaches
