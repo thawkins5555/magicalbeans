@@ -58,7 +58,8 @@ class Collector:
         self.rcvbuf = 0
         self.started_at = 0.0
         self.counters = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
-                         "errors": 0, "last_packet": 0.0, "last_template": 0.0}
+                         "errors": 0, "resampled": 0, "last_packet": 0.0,
+                         "last_template": 0.0}
         # A receive thread must never be able to die on packet content, so its
         # per-datagram work is guarded and the failures counted here; _crash
         # records a thread that ended anyway, so the status strip can say
@@ -306,6 +307,7 @@ class Collector:
 
     def _write(self) -> None:
         pending: list = []
+        # exporter -> [packets, flows, sampling, version]
         per_exporter: dict[str, list[int]] = {}
         last_flush = time.time()
 
@@ -313,10 +315,16 @@ class Collector:
             try:
                 exporter, flows = self._queue.get(timeout=0.4)
                 pending.extend(flows)
-                entry = per_exporter.setdefault(exporter, [0, 0, 1])
+                entry = per_exporter.setdefault(exporter, [0, 0, 1, 0])
                 entry[0] += 1
                 entry[1] += len(flows)
                 entry[2] = flows[0].sampling
+                # Each exporter's own version, not whichever flow happened to
+                # be first in the whole batch: with v5 and v9 exporters in one
+                # flush window the Exporters table told the operator the wrong
+                # protocol for every one of them, which is the first thing
+                # anyone checks when an exporter's records stop decoding.
+                entry[3] = flows[0].version
             except queue.Empty:
                 pass
 
@@ -325,17 +333,33 @@ class Collector:
             if pending and (due or len(pending) >= 500):
                 written = self.db.insert_flows(pending)
                 self.counters["flows"] += written
-                for exporter, (packets, flows_n, sampling) in per_exporter.items():
-                    version = pending[0].version if pending else 0
-                    self.db.touch_exporter(exporter, version, packets, flows_n, sampling)
+                self.db.touch_exporters(
+                    [(exporter, entry[3], entry[0], entry[1], entry[2])
+                     for exporter, entry in per_exporter.items()])
                 pending.clear()
                 per_exporter.clear()
                 last_flush = time.time()
+                self._apply_learned_rates()
                 if self.on_batch:
                     self.on_batch()
 
         if pending:
             self.db.insert_flows(pending)
+        self._apply_learned_rates()
+
+    def _apply_learned_rates(self) -> None:
+        """Store any sampling rate announced since the last flush, and correct
+        the flows that arrived before the announcement."""
+        rates, self.decoder.learned_rates = self.decoder.learned_rates, []
+        if not rates:
+            return
+        try:
+            corrected = self.db.record_sampling_rates(rates, self.started_at)
+        except Exception as exc:
+            self._note_error(exc)
+            return
+        if corrected:
+            self.counters["resampled"] += corrected
 
     # ----------------------------------------------------------------- status
 

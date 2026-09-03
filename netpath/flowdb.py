@@ -52,7 +52,11 @@ CREATE TABLE IF NOT EXISTS flows (
     next_hop  TEXT,
     packets   INTEGER,
     bytes     INTEGER,
-    sampling  INTEGER DEFAULT 1
+    sampling  INTEGER DEFAULT 1,
+    -- Which sampler produced the flow, so a rate announced after it arrived
+    -- can still be applied to it.
+    domain    INTEGER DEFAULT 0,
+    sampler_id INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_flows_ts ON flows(ts_end);
 CREATE INDEX IF NOT EXISTS ix_flows_exporter ON flows(exporter, ts_end);
@@ -78,6 +82,19 @@ CREATE TABLE IF NOT EXISTS interfaces (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Sampling rates as the exporter announced them, one row per sampler rather
+-- than one per exporter: a router with per-interface rates sends several
+-- options records and keeping only the last one applied the wrong factor to
+-- everything else.
+CREATE TABLE IF NOT EXISTS samplers (
+    exporter   TEXT    NOT NULL,
+    domain     INTEGER NOT NULL DEFAULT 0,
+    sampler_id INTEGER NOT NULL DEFAULT 0,
+    rate       INTEGER NOT NULL DEFAULT 1,
+    updated_ts REAL,
+    PRIMARY KEY (exporter, domain, sampler_id)
 );
 """
 
@@ -138,7 +155,23 @@ class FlowDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             dbmaint.enable_incremental_vacuum(self._conn, "netflow.db")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an
+        install from before per-sampler rates needs them added explicitly or
+        the next insert fails. Existing rows keep the factor that was baked
+        into them at decode time.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(flows)").fetchall()}
+        for column in ("domain", "sampler_id"):
+            if column not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE flows ADD COLUMN {column} INTEGER DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -177,7 +210,7 @@ class FlowDatabase:
             (f.exporter, f.version, f.ts_start, f.ts_end, f.src_ip, f.dst_ip,
              f.src_port, f.dst_port, f.protocol, f.tos, f.tcp_flags,
              f.in_if, f.out_if, f.src_as, f.dst_as, f.next_hop,
-             f.packets, f.bytes, f.sampling)
+             f.packets, f.bytes, f.sampling, f.domain, f.sampler_id)
             for f in flows
         ]
         if not rows:
@@ -186,8 +219,9 @@ class FlowDatabase:
             self._conn.executemany(
                 "INSERT INTO flows(exporter, version, ts_start, ts_end, src_ip,"
                 " dst_ip, src_port, dst_port, protocol, tos, tcp_flags, in_if,"
-                " out_if, src_as, dst_as, next_hop, packets, bytes, sampling)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " out_if, src_as, dst_as, next_hop, packets, bytes, sampling,"
+                " domain, sampler_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
             self._conn.commit()
@@ -195,18 +229,72 @@ class FlowDatabase:
 
     def touch_exporter(self, address: str, version: int, packets: int,
                        flows: int, sampling: int) -> None:
+        """One exporter's counters. A one-row wrapper around touch_exporters."""
+        self.touch_exporters([(address, version, packets, flows, sampling)])
+
+    def touch_exporters(self, entries) -> int:
+        """Fold a flush's worth of exporter counters in with one commit.
+
+        A fleet of 500 exporters used to produce 500 commits per flush
+        interval, each one taking the write lock the flow writer needs.
+        """
+        rows = list(entries)
+        if not rows:
+            return 0
         now = time.time()
         with self._lock:
-            self._conn.execute(
+            self._conn.executemany(
                 "INSERT INTO exporters(address, version, first_seen, last_seen,"
                 " packets, flows, sampling) VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(address) DO UPDATE SET last_seen=excluded.last_seen,"
                 " version=excluded.version, sampling=excluded.sampling,"
                 " packets=exporters.packets+excluded.packets,"
                 " flows=exporters.flows+excluded.flows",
-                (address, version, now, now, packets, flows, sampling),
-            )
+                [(address, version, now, now, packets, flows, sampling)
+                 for address, version, packets, flows, sampling in rows])
             self._conn.commit()
+        return len(rows)
+
+    def record_sampling_rates(self, rates, since_ts: float = 0.0) -> int:
+        """Store announced sampling rates, and correct the flows that arrived
+        before the announcement.
+
+        Options templates are sent on a slower cycle than data, so the flows
+        decoded before the first one were stored with sampling=1 for ever and
+        every byte figure for that window was understated by the sampling
+        factor, with no way to put it right — the multiplication is applied at
+        query time against the value baked into the row. The correction is
+        bounded to flows this collector run stored, which is exactly the
+        window that can be wrong.
+        """
+        rows = list(rates)
+        if not rows:
+            return 0
+        now = time.time()
+        corrected = 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO samplers(exporter, domain, sampler_id, rate,"
+                " updated_ts) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(exporter, domain, sampler_id) DO UPDATE SET"
+                " rate=excluded.rate, updated_ts=excluded.updated_ts",
+                [(exporter, domain, sampler_id, rate, now)
+                 for exporter, domain, sampler_id, rate in rows])
+            for exporter, domain, sampler_id, rate in rows:
+                cursor = self._conn.execute(
+                    "UPDATE flows SET sampling = ? WHERE exporter = ?"
+                    " AND domain = ? AND sampler_id = ? AND sampling <> ?"
+                    " AND ts_end >= ?",
+                    (rate, exporter, domain, sampler_id, rate, since_ts))
+                corrected += cursor.rowcount or 0
+            self._conn.commit()
+        return corrected
+
+    def samplers(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM samplers ORDER BY exporter, domain, sampler_id"
+            ).fetchall()
 
     def exporters(self) -> list[sqlite3.Row]:
         with self._lock:

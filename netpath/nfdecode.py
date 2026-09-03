@@ -50,6 +50,8 @@ SRC_IPV6 = 27
 DST_IPV6 = 28
 SAMPLING_INTERVAL = 34
 SAMPLING_ALGORITHM = 35
+FLOW_SAMPLER_ID = 48                 # v9 flowSamplerID
+FLOW_SAMPLER_RANDOM_INTERVAL = 50    # v9 flowSamplerRandomInterval
 NEXT_HOP_V6 = 62
 FLOW_START_SECONDS = 150
 FLOW_END_SECONDS = 151
@@ -58,6 +60,16 @@ FLOW_END_MS = 153
 OCTETS_TOTAL = 85
 PACKETS_TOTAL = 86
 SAMPLER_RANDOM_INTERVAL = 305
+SELECTOR_ID = 302                    # IPFIX selectorId
+SAMPLING_FLOW_INTERVAL = 309         # IPFIX samplingFlowInterval
+
+# Information elements that carry a sampling rate, and the ones that identify
+# which sampler it belongs to. A router with per-interface or per-sampler
+# rates sends several options records; keying only on the exporter address
+# kept whichever arrived last and applied it to everything.
+RATE_FIELDS = (SAMPLING_INTERVAL, SAMPLER_RANDOM_INTERVAL,
+               FLOW_SAMPLER_RANDOM_INTERVAL, SAMPLING_FLOW_INTERVAL)
+SAMPLER_ID_FIELDS = (FLOW_SAMPLER_ID, SELECTOR_ID)
 
 IPV4_FIELDS = {SRC_IPV4, DST_IPV4, NEXT_HOP_V4}
 IPV6_FIELDS = {SRC_IPV6, DST_IPV6, NEXT_HOP_V6}
@@ -84,6 +96,10 @@ class Flow:
     packets: int = 0
     bytes: int = 0
     sampling: int = 1
+    # Which sampler produced this flow, so a rate that arrives after it does
+    # can be applied to it rather than being lost.
+    domain: int = 0
+    sampler_id: int = 0
 
 
 class _Lru(collections.OrderedDict):
@@ -154,6 +170,14 @@ def _int(raw: bytes) -> int:
     return int.from_bytes(raw, "big") if raw else 0
 
 
+def _sampler_id(values: dict[int, bytes]) -> int:
+    """Which sampler a record belongs to, 0 when it does not say."""
+    for key in SAMPLER_ID_FIELDS:
+        if key in values:
+            return _int(values[key])
+    return 0
+
+
 def _pick(*candidates: bytes | None) -> bytes:
     """First address field with real content.
 
@@ -173,16 +197,46 @@ class Decoder:
 
     def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True):
         self.templates: _Lru = _Lru(MAX_TEMPLATES)
+        # (exporter, observation domain, sampler id) -> rate
         self.sampling: _Lru = _Lru(MAX_SAMPLING)
+        # Rates learned since the caller last drained this, so it can correct
+        # flows stored before the options record that announced them.
+        self.learned_rates: list[tuple[str, int, int, int]] = []
         self.default_sampling = max(1, int(default_sampling))
         self.trust_exporter_sampling = trust_exporter_sampling
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
                       "no_template": 0, "bad_template": 0}
 
-    def sampling_for(self, exporter: str) -> int:
-        if self.trust_exporter_sampling:
-            return max(1, self.sampling.get(exporter, self.default_sampling))
-        return self.default_sampling
+    def sampling_for(self, exporter: str, domain: int = 0,
+                     sampler_id: int = 0) -> int:
+        """The rate for one sampler, falling back to the exporter's own.
+
+        Most exporters announce a single rate and send no sampler id at all,
+        so the exact key, the domain-wide key and the exporter-wide key are
+        tried in that order before the configured default.
+        """
+        if not self.trust_exporter_sampling:
+            return self.default_sampling
+        for key in ((exporter, domain, sampler_id), (exporter, domain, 0),
+                    (exporter, 0, 0)):
+            rate = self.sampling.get(key)
+            if rate:
+                return max(1, rate)
+        return max(1, self.default_sampling)
+
+    def _set_sampling(self, exporter: str, domain: int, sampler_id: int,
+                      rate: int) -> None:
+        """Record a rate, and note it when it is new or changed so the caller
+        can correct the flows already stored under that key: an options
+        template arrives on a slower cycle than data, so the flows decoded
+        before the first one were stored with sampling=1 permanently and every
+        byte figure for that window was understated by the sampling factor."""
+        key = (exporter, domain, sampler_id)
+        if self.sampling.get(key) == rate:
+            self.sampling[key] = rate           # refresh its LRU position
+            return
+        self.sampling[key] = rate
+        self.learned_rates.append((exporter, domain, sampler_id, rate))
 
     def decode(self, data: bytes, exporter: str) -> list[Flow]:
         self.stats["packets"] += 1
@@ -221,7 +275,7 @@ class Decoder:
         # Top two bits are the sampling mode, the rest is the interval.
         interval = sampling_raw & 0x3FFF
         if interval > 1:
-            self.sampling[exporter] = interval
+            self._set_sampling(exporter, 0, 0, interval)
         sampling = self.sampling_for(exporter)
 
         boot = unix_secs - sys_uptime / 1000.0
@@ -411,10 +465,11 @@ class Decoder:
                     break
 
             if template.is_options:
-                self._apply_options(values, exporter)
+                self._apply_options(values, exporter, domain)
                 continue
 
-            flow = self._build_flow(values, exporter, version, boot, export_time)
+            flow = self._build_flow(values, exporter, version, boot, export_time,
+                                    domain)
             if flow is not None:
                 flows.append(flow)
 
@@ -453,15 +508,17 @@ class Decoder:
                 values[field_id] = chunk
         return values, offset, True
 
-    def _apply_options(self, values: dict[int, bytes], exporter: str) -> None:
-        for key in (SAMPLING_INTERVAL, SAMPLER_RANDOM_INTERVAL):
+    def _apply_options(self, values: dict[int, bytes], exporter: str,
+                       domain: int) -> None:
+        sampler_id = _sampler_id(values)
+        for key in RATE_FIELDS:
             if key in values:
                 rate = _int(values[key])
                 if rate > 1:
-                    self.sampling[exporter] = rate
+                    self._set_sampling(exporter, domain, sampler_id, rate)
 
     def _build_flow(self, values: dict[int, bytes], exporter: str, version: int,
-                    boot: float, export_time: float) -> Flow | None:
+                    boot: float, export_time: float, domain: int = 0) -> Flow | None:
         octets = _int(values.get(OCTETS) or values.get(OCTETS_TOTAL) or b"")
         packets = _int(values.get(PACKETS) or values.get(PACKETS_TOTAL) or b"")
         if not octets and not packets:
@@ -493,6 +550,7 @@ class Decoder:
             end = now
             start = min(start, end) if start else end
 
+        sampler_id = _sampler_id(values)
         src = _pick(values.get(SRC_IPV4), values.get(SRC_IPV6))
         dst = _pick(values.get(DST_IPV4), values.get(DST_IPV6))
         hop = _pick(values.get(NEXT_HOP_V4), values.get(NEXT_HOP_V6))
@@ -511,5 +569,6 @@ class Decoder:
             src_as=_int(values.get(SRC_AS, b"")),
             dst_as=_int(values.get(DST_AS, b"")),
             packets=packets, bytes=octets,
-            sampling=self.sampling_for(exporter),
+            domain=domain, sampler_id=sampler_id,
+            sampling=self.sampling_for(exporter, domain, sampler_id),
         )

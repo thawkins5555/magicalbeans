@@ -216,6 +216,17 @@ def v9_packet(sets: bytes, domain: int = 0) -> bytes:
     return header + sets
 
 
+def v9_flow_packet() -> bytes:
+    """A v9 template plus one data record that decodes to a flow."""
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+    template = struct.pack("!HH", 700, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    record = struct.pack("!I", 2000) + struct.pack("!I", 20)
+    return v9_packet(ipfix_set(0, template) + ipfix_set(700, record))
+
+
+
 def test_c2_template_guards_and_bounded_caches() -> None:
     """A template with no fields (or with zero-length fields) has a record
     length of zero, and _read_data looped on it forever at 100% CPU with the
@@ -1313,6 +1324,161 @@ def test_c9_netpath_probing_tracing_and_v6_listeners() -> None:
     trap_db.close()
 
 
+# ---------------------------------------------------------------------- C10
+
+def v9_options_template(template_id: int, fields) -> bytes:
+    """A v9 options template: scope length, option length, then the fields."""
+    scope = struct.pack("!HH", 1, 4)                     # one 4-byte scope field
+    options = b"".join(struct.pack("!HH", fid, size) for fid, size in fields)
+    return (struct.pack("!HHH", template_id, 4, len(options))
+            + scope + options)
+
+
+def test_c10_exporter_versions_and_per_sampler_rates() -> None:
+    """touch_exporter stamped every exporter in a flush window with whichever
+    flow happened to be first in the whole batch, and committed once per
+    exporter per second. Sampling was one rate per exporter address, applied
+    only to flows that arrived after the options template announced it."""
+    print("C10: per-exporter versions, one commit, and per-sampler rates")
+
+    flow_db = FlowDatabase(db_path("c10-flows.db"))
+    commits = [0]
+
+    class CountingConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def commit(self):
+            commits[0] += 1
+            return self._conn.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_conn = flow_db._conn
+    flow_db._conn = CountingConn(real_conn)
+    flow_db.touch_exporters([(f"10.0.{index // 256}.{index % 256}",
+                              5 if index % 2 else 9, 1, 10, 1)
+                             for index in range(500)])
+    flow_db._conn = real_conn
+    check(commits[0] == 1,
+          f"500 exporters are one commit per flush, not 500 ({commits[0]})")
+    rows = {row["address"]: row["version"] for row in flow_db.exporters()}
+    check(rows["10.0.0.0"] == 9 and rows["10.0.0.1"] == 5,
+          "and each exporter keeps its own version")
+    flow_db.close()
+
+    # --- a mixed v5/v9 flush window through the real collector -------------
+    flow_db = FlowDatabase(db_path("c10-mixed.db"))
+    collector = Collector(flow_db)
+    port = free_udp_port()
+    assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+    try:
+        # Two senders, two versions, inside one flush window. Only the source
+        # address distinguishes them, so both arrive on the same socket from
+        # 127.0.0.1 — send them as one exporter each by driving _handle
+        # directly, which is the code path the receive thread takes.
+        collector._handle(v5_packet(), ("10.1.1.5", 40000))
+        collector._handle(v9_flow_packet(), ("10.1.1.9", 40000))
+        check(wait_for(lambda: len(flow_db.exporters()) == 2, 8.0),
+              "both exporters are recorded")
+        versions = {row["address"]: row["version"] for row in flow_db.exporters()}
+        check(versions.get("10.1.1.5") == 5 and versions.get("10.1.1.9") == 9,
+              f"mixed v5/v9 exporters keep their own version ({versions})")
+    finally:
+        collector.stop()
+        flow_db.close()
+
+    # --- per-sampler rates, and a late options template ---------------------
+    decoder = nfdecode.Decoder()
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4),
+              (nfdecode.FLOW_SAMPLER_ID, 4)]
+    template = struct.pack("!HH", 500, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    decoder.decode(v9_packet(ipfix_set(0, template), domain=7), "10.2.0.1")
+
+    # Data first: no options record has arrived, so nothing is known yet.
+    record = struct.pack("!I", 1000) + struct.pack("!I", 10) + struct.pack("!I", 3)
+    flows = decoder.decode(v9_packet(ipfix_set(500, record), domain=7), "10.2.0.1")
+    check(len(flows) == 1 and flows[0].sampling == 1
+          and flows[0].sampler_id == 3 and flows[0].domain == 7,
+          f"a flow before the options template is stored unscaled, but knows "
+          f"which sampler produced it (sampler={flows[0].sampler_id if flows else None})")
+
+    # Now two options records, one per sampler, in the same domain.
+    for sampler, rate in ((3, 1000), (4, 100)):
+        options = v9_options_template(600 + sampler,
+                                      [(nfdecode.FLOW_SAMPLER_ID, 4),
+                                       (nfdecode.SAMPLING_INTERVAL, 4)])
+        decoder.decode(v9_packet(ipfix_set(1, options), domain=7), "10.2.0.1")
+        body = (struct.pack("!I", 0) + struct.pack("!I", sampler)
+                + struct.pack("!I", rate))
+        decoder.decode(v9_packet(ipfix_set(600 + sampler, body), domain=7),
+                       "10.2.0.1")
+    check(decoder.sampling_for("10.2.0.1", 7, 3) == 1000
+          and decoder.sampling_for("10.2.0.1", 7, 4) == 100,
+          "each sampler keeps its own rate rather than the last one announced")
+    check(decoder.sampling_for("10.2.0.1", 7, 99) == 1,
+          "and a sampler nobody announced falls back rather than borrowing one")
+
+    flows = decoder.decode(v9_packet(ipfix_set(500, record), domain=7), "10.2.0.1")
+    check(flows and flows[0].sampling == 1000,
+          f"a flow after the announcement carries its sampler's rate "
+          f"({flows[0].sampling if flows else None})")
+
+    learned = [entry for entry in decoder.learned_rates]
+    check(("10.2.0.1", 7, 3, 1000) in learned and ("10.2.0.1", 7, 4, 100) in learned,
+          "both rates are offered to the caller for the back-fill")
+
+    # --- the back-fill corrects the flows stored before the announcement ---
+    flow_db = FlowDatabase(db_path("c10-sampling.db"))
+    early = nfdecode.Flow(exporter="10.2.0.1", version=9, ts_start=time.time(),
+                          ts_end=time.time(), src_ip="10.0.0.1", dst_ip="10.0.0.2",
+                          packets=10, bytes=1000, sampling=1, domain=7,
+                          sampler_id=3)
+    other = nfdecode.Flow(exporter="10.2.0.1", version=9, ts_start=time.time(),
+                          ts_end=time.time(), src_ip="10.0.0.3", dst_ip="10.0.0.4",
+                          packets=10, bytes=1000, sampling=1, domain=7,
+                          sampler_id=4)
+    flow_db.insert_flows([early, other])
+    corrected = flow_db.record_sampling_rates(
+        [("10.2.0.1", 7, 3, 1000)], since_ts=time.time() - 60)
+    check(corrected == 1,
+          f"the rate is applied to the flows already stored under that sampler "
+          f"({corrected} corrected)")
+    stored = {row["sampler_id"]: row["sampling"] for row in
+              flow_db._conn.execute("SELECT sampler_id, sampling FROM flows")}
+    check(stored[3] == 1000 and stored[4] == 1,
+          f"and only to that sampler's flows ({stored})")
+    rates = {(row["exporter"], row["domain"], row["sampler_id"]): row["rate"]
+             for row in flow_db.samplers()}
+    check(rates.get(("10.2.0.1", 7, 3)) == 1000,
+          "the announced rate is kept so the Exporters view can show it")
+    flow_db.close()
+
+    # --- a 4.35 database gains the columns without losing its rows ---------
+    legacy = db_path("c10-legacy.db")
+    conn = sqlite3.connect(legacy)
+    conn.execute("CREATE TABLE flows (id INTEGER PRIMARY KEY, exporter TEXT NOT"
+                 " NULL, version INTEGER NOT NULL, ts_start REAL NOT NULL,"
+                 " ts_end REAL NOT NULL, src_ip TEXT, dst_ip TEXT,"
+                 " src_port INTEGER, dst_port INTEGER, protocol INTEGER,"
+                 " tos INTEGER, tcp_flags INTEGER, in_if INTEGER,"
+                 " out_if INTEGER, src_as INTEGER, dst_as INTEGER,"
+                 " next_hop TEXT, packets INTEGER, bytes INTEGER,"
+                 " sampling INTEGER DEFAULT 1)")
+    conn.execute("INSERT INTO flows(exporter, version, ts_start, ts_end, bytes,"
+                 " packets, sampling) VALUES ('10.9.9.9', 5, 1, 2, 500, 5, 64)")
+    conn.commit()
+    conn.close()
+    upgraded = FlowDatabase(legacy)
+    row = upgraded._conn.execute("SELECT * FROM flows").fetchone()
+    check(row["sampling"] == 64 and row["domain"] == 0 and row["sampler_id"] == 0,
+          "an existing row keeps the factor baked into it and gains the columns")
+    upgraded.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -1324,6 +1490,7 @@ TESTS = [
     test_c7_syslog_robustness,
     test_c8_device_correlation_through_aliases,
     test_c9_netpath_probing_tracing_and_v6_listeners,
+    test_c10_exporter_versions_and_per_sampler_rates,
 ]
 
 
