@@ -411,8 +411,15 @@ own subtabs.
   decodes gets "This looks like a Ubiquiti — Install the Ubiquiti MIBs"
   with the install one click away.
 - **Arcs with no MIB still get a name** from a bundled enterprise-number
-  list; entries verified from MIB text decide at high confidence, curated
-  ones at medium, always with the arc number in the evidence.
+  list, at one of two confidence levels, always with the arc number shown as
+  the evidence. Be clear about what that confidence is: both tiers are
+  hand-authored from IANA's public Private Enterprise Number registry, and the
+  application has no way to reach that registry to check itself. **High**
+  means the arc was cross-checked against the sysObjectID a real device of that
+  make reports, or against a MIB bundled here; **medium** means it was not. A
+  wrong arc would produce a confidently wrong vendor name, so the arc number is
+  always displayed beside the name — if it disagrees with what you know the
+  device to be, the number is the thing to trust.
 - **Discovery sweeps list each device's arcs** (a few extra requests per
   device that answers SNMP, switchable off under Settings → Nodes), mark
   confidence in the results table, hint at the bundle to install, and carry

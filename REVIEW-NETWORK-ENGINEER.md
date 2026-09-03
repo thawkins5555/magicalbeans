@@ -763,6 +763,9 @@ and D25 is new (see Appendix C).
 | D23 | "CPU/memory where UCD-SNMP-MIB **or HOST-RESOURCES-MIB** is present" | `FEATURES.md:94-96` | `HOST_RESOURCES` is defined at `nodeoids.py:64-67` and referenced nowhere (§4.1 P-S9) |
 | D24 | engine parameters "only need refreshing if the target reboots" | `nodepoll.py:44-46`, `INTERNALS.md:445` | engineTime is never advanced (§4.1 P-S3) |
 | D25 | "Never phones home. There is no telemetry, **no update check**…" | `CREDENTIAL-SECURITY.md:573` (§8) | the Update button calls `selfupdate.latest_commit()`, which requests `https://api.github.com/repos/…/commits/<branch>` on every press (`selfupdate.py:86-92`). Nothing is *sent* — no telemetry, no credential — but an outbound request to GitHub is made, and the sentence as written says it is not. Added by the re-review (Appendix C) |
+| D26 | "There is no authentication yet, so bind to an interface you trust…" — a **third** copy of D3/D4, and the one an operator sees most | `console.py:523-527`, the permanent hint under the listener card, repainted every second | as D3/D4. Three shipped places say it, two of them on screen or in the log on every single run. Found by the fresh-eyes pass (G-23) |
+| D27 | `VERIFIED`: "every arc was read out of the vendor's own MIB text (the `::= { enterprises N }` line)" | `enterprises.py:1-19`, reaching the operator as `confidence: high` in the device pane and in `vendor_evidence` | true of 1 of the 53 arcs. The repository contains vendor MIB text for Moxa's 8691 and for nothing else in the table, so the other 52 cannot have been read from anything in this build. The arcs themselves spot-check clean against real sysObjectIDs; it is the provenance claim that is false, and it is the claim `high` confidence rests on. Found by the fresh-eyes pass (G-15) |
+| D28 | — | `netpath/mibs/` | eighteen of the twenty-one bundled `.mib` files are third-party (IETF standards-track under BCP 78, IEEE Std 802.1AB, IANA, Net-SNMP) and carried no attribution or licence notice at all, while the vendored xterm.js beside them correctly ships `LICENSE-xterm.txt`. Three of the files carry no copyright block internally either. Found by the fresh-eyes pass (G-32) |
 
 ---
 
@@ -1037,9 +1040,16 @@ belongs to the documentation-truth table. It is now U-F36.
   U-F16, U-F17, U-F18 and U-F19 each stand on their own.
 - **Ids for the eleven documentation-truth rows that had none or shared one**:
   D11, D14, D23, D24, and D16–D22 split into seven.
-- **D25**, a documentation claim the first draft missed: `CREDENTIAL-SECURITY.md`
-  says the application performs "no update check" while the Update button calls
-  `api.github.com` on every press.
+- **D25 to D28**, four documentation claims the first draft missed. D25:
+  `CREDENTIAL-SECURITY.md` says the application performs "no update check"
+  while the Update button calls `api.github.com` on every press. D26: there is a
+  *third* "there is no authentication yet" string, in `console.py`, under the
+  listener card, repainted every second — the two the report found are the two
+  an operator sees least. D27: `enterprises.VERIFIED` asserts that every arc was
+  read from the vendor's own MIB text, which is true of one arc in fifty-three,
+  and `high` confidence in the device pane rests on that assertion. D28: the
+  twenty-one bundled MIB modules had no attribution or licence notice, eighteen
+  of them being other people's work.
 - **The §3 caveat paragraph** ("What the numbers do not mean"), the table of the
   six settings the campaign overrode, and the note that the per-step columns do
   not sum to the run totals.

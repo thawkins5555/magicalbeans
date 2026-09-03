@@ -255,14 +255,35 @@ arc or a sysObjectID outside enterprises: `8072.3.2.10` is every Linux box.
 Clearing deletes the learned row only when this device made it, then
 re-decides the row at once.
 
-**`enterprises.py`** keeps VERIFIED (read from MIB text: every WELL_KNOWN
-root plus the catalog arcs checked for 4.32 — 6027, 14179, 47196, 4413, 3375,
-17713, 705, 534) apart from CURATED (from memory; the IANA registry is not
-reachable from the build environment). `vendor_for` falls back to it after
-WELL_KNOWN misses, so `identify_vendor`, `suggest_group` and `browse_bases`
-inherit the names; `_arc_confidence` checks the tables directly because
-`vendor_for` can no longer tell the two apart. `mibcatalog.Bundle.arcs` and
-`vendor_key` join the catalog to the same vocabulary.
+**`enterprises.py`** keeps two tables apart, `VERIFIED` and `CURATED`, and
+`_arc_confidence` reads them directly — `vendor_for` merges them and can no
+longer tell which a name came from — to stamp `high` on the first and `medium`
+on the second. `vendor_for` is the fallback after `WELL_KNOWN` misses, so
+`identify_vendor`, `suggest_group` and `browse_bases` all inherit the names,
+and `mibcatalog.Bundle.arcs` and `vendor_key` join the catalog to the same
+vocabulary.
+
+**What the two tiers actually rest on**, because the names overstate it and a
+`high` confidence reaches the operator in the device pane and in
+`vendor_evidence`. Both tables are hand-authored from the IANA Private
+Enterprise Number registry (<https://www.iana.org/assignments/enterprise-numbers>),
+which is not reachable from this build environment and so was not machine-checked
+against anything. `VERIFIED`'s docstring says every arc was "read out of the
+vendor's own MIB text (the `::= { enterprises N }` line)"; that is true of
+exactly one of its 53 arcs — Moxa's 8691, which `enterprise-roots-2.mib` cites
+explicitly — because there is no Aruba, Ubiquiti, Hirschmann, Fortinet, Palo
+Alto, MikroTik or Arista MIB anywhere in this tree to have read it from. The
+arcs themselves look right: the ones used by the device classes in scope were
+spot-checked against the sysObjectIDs those products report (9 Cisco, 11
+HP/HPE, 248 Hirschmann, 318 APC, 2636 Juniper, 3833 Schneider, 4196 Siemens,
+4346 Phoenix Contact, 8691 Moxa, 12356 Fortinet, 14823 Aruba, 14988 MikroTik,
+25461 Palo Alto, 30065 Arista, 41112 Ubiquiti, 47196 Aruba CX) and none was
+wrong. So read the tiers as *"more sure"* and *"less sure"* rather than as a
+statement about primary sources: `VERIFIED` means an arc that was cross-checked
+against real device output or a bundled MIB, `CURATED` one that was not. The
+honest fix is a test that asserts each `VERIFIED` arc against a checked-in
+extract of the IANA registry, which would turn the claim into something CI
+keeps true; until that exists the docstring is the claim, and it is wrong.
 
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
@@ -4028,7 +4049,14 @@ nested paths and types them from the extension. Today that is xterm.js
 and `README.txt` recording the versions and where they came from. There is
 no build step and no local patching: a fix applied to a vendored file is
 invisible to the next update and would be silently lost, so anything that
-needs changing is worked around in first-party code. Updating one means
+needs changing is worked around in first-party code. The same obligation
+applies to the twenty-one MIB modules in `netpath/mibs/`, eighteen of which are
+other people's work — IETF standards-track modules under the Simplified BSD
+terms of BCP 78, IEEE Std 802.1AB, IANA's `IANAifType-MIB` and Net-SNMP's
+`UCD-SNMP-MIB` — and their attribution is `netpath/mibs/NOTICE.md`, which is to
+the MIB bundle what `LICENSE-xterm.txt` is to xterm.js. Three of those files
+carry no copyright block inside the file itself, which is why a notice beside
+them was needed rather than optional. Updating one means
 dropping in the new release's bundle and editing the version in the README.
 xterm injects its own `<style>` at runtime, which the CSP's `style-src
 'self' 'unsafe-inline'` already allowed.
