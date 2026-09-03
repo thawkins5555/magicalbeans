@@ -1154,7 +1154,7 @@ class AlertEngine:
                         # a fresh sample.
                         if open_keys is None:
                             open_keys = self.db.open_dedup_keys()
-                        if key in open_keys:
+                        if dedup_key(rule, occurrence) in open_keys:
                             continue
                     occurrences.append(occurrence)
                 elif result == "clear":
@@ -1590,12 +1590,13 @@ class AlertEngine:
             parent = self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
             if parent is not None:
                 return parent
-            if parent_key == "device_down" and self._parent_still_failing(
-                    occurrence):
-                # No open parent alert, but the outage behind it is still
-                # real — the same cover _parent_operator_resolved applies to
-                # a hand-resolved parent, asked through the one predicate.
-                return SUPPRESSED
+            # No open parent alert. Whether the outage behind it is still
+            # real is _parent_operator_resolved's question, immediately below
+            # this in _apply: it asks the same predicate but also remembers
+            # the cover (so it outlives the resolve window) and says so once
+            # in the Nodes log. Answering it here as well suppressed the
+            # occurrence before that ran, so the cover was silent and
+            # forgotten on the next restart.
             return None
         if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
             return self._upstream_outage(rule, occurrence)
@@ -1660,12 +1661,31 @@ class AlertEngine:
             return None
         covered = None
         for ancestor_id in chain_of(device_id):
-            parent = self.db.open_by_dedup(f"{rule['key']}:device:{ancestor_id}")
+            ancestor_dedup = f"{rule['key']}:device:{ancestor_id}"
+            parent = self.db.open_by_dedup(ancestor_dedup)
             if parent is not None:
                 return parent
-            if covered is None and self._parent_still_failing(
-                    occurrence, entity_id=ancestor_id):
+            if covered is not None:
+                continue
+            # No open alert for this ancestor. It covers what is behind it
+            # only if somebody RESOLVED its outage by hand and the outage is
+            # still real — the same condition _parent_operator_resolved
+            # applies within one device. "Still down" alone is not enough:
+            # in a site failure every device is down and none of them has an
+            # alert yet, so suppressing on that would leave the whole site
+            # silent with nothing to attach the silence to. The upstream's
+            # own alert opens first, and everything behind it rolls into it.
+            resolved_ts = self._operator_resolves.get(ancestor_dedup)
+            covered_since = self._parent_covers.get(ancestor_dedup)
+            if resolved_ts is None and covered_since is None:
+                continue
+            if self._parent_still_failing(occurrence, entity_id=ancestor_id):
+                if covered_since is None:
+                    self._parent_covers[ancestor_dedup] = (
+                        resolved_ts or time.time())
                 covered = SUPPRESSED
+            else:
+                self._parent_covers.pop(ancestor_dedup, None)
         return covered
 
     def _parent_operator_resolved(self, rule, occurrence: Occurrence) -> bool:
