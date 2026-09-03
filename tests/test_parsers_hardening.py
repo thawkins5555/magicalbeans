@@ -1,0 +1,188 @@
+"""The parsers and the small in-memory tables around them, under the inputs
+a fuzz run and a fresh-eyes review found: a MIB whose IMPORTS block never
+closes, a truncated MIB that is all macro headers and no clauses, a reversed
+dependency chain, an enum value longer than Python's own integer guard, and
+the vendor/port/name-lookup tables that back them.
+
+No network, no database, no subprocess: everything here is a pure function
+or an in-memory object, so the suite is deterministic and finishes in a few
+seconds. The timing assertions carry a wide margin on purpose — each one is
+two to three orders of magnitude below what the unfixed code measured, so a
+loaded build machine cannot make them flap, and a return of the quadratic
+behaviour cannot make them pass.
+"""
+import hashlib
+import json
+import os
+import time
+
+from _paths import REPO_ROOT, STUBS_DIR
+
+from netpath import mibparse
+
+MIB_DIR = os.path.join(REPO_ROOT, "netpath", "mibs")
+EXPECTED_PATH = os.path.join(STUBS_DIR, "mib_parse_expected.json")
+
+failures: list[str] = []
+
+
+def check(label: str, ok: bool, detail: str = "") -> None:
+    print(f"  {'PASS' if ok else 'FAIL'}  {label}{(': ' + detail) if detail else ''}")
+    if not ok:
+        failures.append(label)
+
+
+def timed(fn, *args, **kwargs):
+    started = time.perf_counter()
+    value = fn(*args, **kwargs)
+    return value, time.perf_counter() - started
+
+
+# ------------------------------------------------------- H1: parse() is linear
+#
+# Every shape below made parse() quadratic before 4.37.0. The numbers in the
+# comments are what the unfixed parser measured on this hardware; `re` holds
+# the GIL while it matches, so each of those seconds was a second in which
+# the whole appliance answered nothing.
+
+print("H1  mibparse.parse() is linear in the file")
+
+# 64 KB of IMPORTS symbols with no FROM in them: 66.8 s before.
+imports_65k = ("FOO-MIB DEFINITIONS ::= BEGIN\nIMPORTS\n"
+               + "aSymbolName, " * (64 * 1024 // 13)
+               + "\n;\nfoo OBJECT IDENTIFIER ::= { enterprises 1 }\nEND\n")
+result, elapsed = timed(mibparse.parse, imports_65k, max_bytes=8 * 1024 * 1024)
+check("65 KB IMPORTS block with no FROM parses in under 1 s",
+      elapsed < 1.0, f"{elapsed:.3f}s, {len(imports_65k):,} chars")
+check("...and the definition after the block is still found",
+      [o.name for o in result.objects] == ["foo"],
+      str([o.name for o in result.objects]))
+
+# The same block with its terminating ';' lost — a hand-edited or truncated
+# file. Before: the lazy group re-expanded from every start position.
+imports_no_semi = ("FOO-MIB DEFINITIONS ::= BEGIN\nIMPORTS\n"
+                   + "aSymbolName, " * (64 * 1024 // 13)
+                   + "\nfoo OBJECT IDENTIFIER ::= { enterprises 1 }\nEND\n")
+_, elapsed = timed(mibparse.parse, imports_no_semi, max_bytes=8 * 1024 * 1024)
+check("65 KB IMPORTS block with no ';' parses in under 1 s", elapsed < 1.0,
+      f"{elapsed:.3f}s")
+
+# 1 MB of bare macro headers — a MIB whose download was cut short keeps all
+# its headers and none of its `::= { ... }` clauses. Before: 200-232 s each.
+MB = 1024 * 1024
+shapes = {
+    "1 MB of bare OBJECT-TYPE headers": "o OBJECT-TYPE\n SYNTAX Integer32\n",
+    "1 MB of '::= { a { }' (an inner brace defeats [^{}]*)":
+        "o OBJECT-TYPE\n SYNTAX X\n ::= { a { }\n",
+    "1 MB of bare NOTIFICATION-TYPE headers": "n NOTIFICATION-TYPE\n OBJECTS { x }\n",
+    "1 MB of bare MODULE-IDENTITY headers": "m MODULE-IDENTITY\n LAST-UPDATED z\n",
+}
+for label, unit in shapes.items():
+    text = unit * (MB // len(unit))
+    _, elapsed = timed(mibparse.parse, text, max_bytes=8 * 1024 * 1024)
+    check(f"{label} parses in under 1 s", elapsed < 1.0,
+          f"{elapsed:.3f}s, {len(text):,} chars")
+
+# A real MIB with one clause chopped out of the middle: the header before the
+# hole must not swallow the definition after it.
+truncated = """
+FOO-MIB DEFINITIONS ::= BEGIN
+foo OBJECT IDENTIFIER ::= { enterprises 99 }
+fooBroken OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+fooGood OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+    ::= { foo 1 }
+END
+"""
+result = mibparse.parse(truncated, max_bytes=MB)
+names = sorted(o.name for o in result.objects)
+check("a clause with no '::=' is skipped, not merged with the next one",
+      names == ["foo", "fooGood"], str(names))
+
+# The wall-clock budget: a file that somehow still takes too long is refused
+# with a message about the file, and the refusal is a ValueError so the
+# upload endpoint keeps turning it into a 400.
+try:
+    mibparse.parse("x OBJECT-TYPE\n SYNTAX Y\n ::= { a 1 }\n" * 20000,
+                   max_bytes=8 * 1024 * 1024, budget_s=0.0000001)
+    check("the parse budget stops a file that runs long", False, "no exception")
+except mibparse.MibParseTimeout as exc:
+    check("the parse budget stops a file that runs long",
+          isinstance(exc, ValueError), str(exc)[:60])
+
+check("the byte cap raises MibTooLarge, a ValueError subclass",
+      issubclass(mibparse.MibTooLarge, ValueError))
+try:
+    mibparse.parse("x" * 100, max_bytes=10)
+    check("oversized input is refused", False, "no exception")
+except mibparse.MibTooLarge:
+    check("oversized input is refused", True)
+
+# ------------------------------- H1: the shipped MIBs parse to the same objects
+#
+# tests/stubs/mib_parse_expected.json was taken from the parser as it shipped
+# in 4.36.1 (with one correction, noted below), so it is an oracle for the
+# rewrite rather than a snapshot of it.
+
+print("H1  the 21 shipped MIBs parse to the objects they always did")
+
+with open(EXPECTED_PATH) as handle:
+    expected = json.load(handle)
+
+shipped = sorted(name for name in os.listdir(MIB_DIR) if name.endswith(".mib"))
+check("every shipped MIB has an expectation on file",
+      set(shipped) == set(expected), str(set(shipped) ^ set(expected)))
+
+slowest = ("", 0.0)
+for name in shipped:
+    want = expected[name]
+    with open(os.path.join(MIB_DIR, name), encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    parsed, elapsed = timed(mibparse.parse, text, max_bytes=8 * 1024 * 1024)
+    resolved, unresolved = mibparse.resolve(parsed.objects,
+                                            dict(mibparse.WELL_KNOWN_ROOTS))
+    if elapsed > slowest[1]:
+        slowest = (name, elapsed)
+    lines = sorted(f"{o.name}\t{o.oid}\t{o.syntax}\t{int(o.is_notification)}"
+                   f"\t{sorted((o.enums or {}).items())}" for o in parsed.objects)
+    got = {
+        "module": parsed.module,
+        "object_count": len(parsed.objects),
+        "resolved_count": resolved,
+        "unresolved": unresolved,
+        "import_count": len(parsed.imports),
+        "digest": hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+    }
+    if got != want:
+        differing = {k: (want[k], got[k]) for k in want if want[k] != got[k]}
+        check(f"{name} parses as expected", False, str(differing))
+    elif name == shipped[-1]:
+        check("all 21 shipped MIBs parse to the same module, object set, OIDs, "
+              "syntax, enums, imports and resolution as before", True,
+              f"{sum(e['object_count'] for e in expected.values())} objects")
+
+check("no shipped MIB takes more than 1 s to parse", slowest[1] < 1.0,
+      f"slowest {slowest[0]} {slowest[1]:.3f}s")
+
+# The one deliberate difference from 4.36.1: SNMPv2-SMI carries the ASN.1
+# macro definitions themselves ("NOTIFICATION-TYPE MACRO ::= BEGIN ... END"),
+# and the old regexes read the `END` of one macro definition as an object name
+# and gave it the OID of the next real clause in the file — while losing the
+# clause that OID actually belongs to.
+with open(os.path.join(MIB_DIR, "SNMPv2-SMI.mib"), encoding="utf-8") as fh:
+    smi = mibparse.parse(fh.read(), max_bytes=MB)
+by_name = {o.name: o for o in smi.objects}
+check("SNMPv2-SMI's zeroDotZero is found under its own name",
+      by_name.get("zeroDotZero") is not None and by_name["zeroDotZero"].oid == "0.0",
+      str(by_name.get("zeroDotZero")))
+check("...and 'END' is no longer recorded as an object",
+      "END" not in by_name)
+
+
+if failures:
+    print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
+    raise SystemExit(1)
+print("\nall parser hardening checks passed")

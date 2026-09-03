@@ -24,11 +24,24 @@ framing:
     match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE regex when they
     themselves define an object; a bare `Foo ::= TEXTUAL-CONVENTION ...`
     type alias (no trailing `{ parent number }`) is not modeled at all.
+
+Why every scan below is written as "find the next landmark, then look
+forward a bounded distance" rather than as one regex per clause: a lazy
+`(.*?)` between a macro keyword and its `::=` re-reads the rest of the
+file from every candidate start, so a truncated MIB — all the headers,
+none of the closing clauses, which is exactly how a half-downloaded file
+looks — costs O(n^2). CPython's `re` does not release the GIL while it
+matches, so that is not a slow request but a frozen appliance: no web UI,
+no poller timers, no trap or syslog drain, for as long as it runs. Every
+pass here is linear in the file, and `parse()` carries a wall-clock
+budget on top so no single upload can hold the interpreter for long even
+if some input shape defeats the analysis.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 # Seeds IMPORTS resolution — every real-world MIB transitively imports one
@@ -41,6 +54,33 @@ WELL_KNOWN_ROOTS = {
     "enterprises": "1.3.6.1.4.1", "security": "1.3.6.1.5",
     "snmpV2": "1.3.6.1.6", "snmpModules": "1.3.6.1.6.3",
 }
+
+# How long one file may spend inside parse(). Every shipped MIB parses in
+# under 0.05 s and the largest module anyone has ever published is a few
+# hundred KB, so this is three orders of magnitude of headroom for real
+# input and still a hard ceiling on how long a hostile upload can hold the
+# GIL. Checked between phases and every few hundred clauses within one.
+PARSE_BUDGET_S = 5.0
+
+# A macro clause ("NAME OBJECT-TYPE ... ::= { parent 3 }") is a few hundred
+# bytes in every real MIB; the largest in the shipped bundle is under 2 KB.
+# Bounding how far past a macro keyword the `::=` may sit is what stops a
+# file of bare headers from making each failed clause cost the whole file.
+MACRO_CLAUSE_LIMIT = 20_000
+
+
+class MibTooLarge(ValueError):
+    """The input is larger than the caller's byte cap.
+
+    A distinct type so `resolve_all()` can tell "this file is bigger than
+    the cap that is in force today" — which is a stored file to leave
+    exactly as it is — from "this file could not be parsed", which is
+    something the operator has to be told about.
+    """
+
+
+class MibParseTimeout(ValueError):
+    """Parsing spent longer than `budget_s` and was abandoned."""
 
 
 @dataclass
@@ -101,15 +141,28 @@ def _strip_comments_and_strings(text: str) -> str:
 
 
 _MODULE_RE = re.compile(r"([A-Za-z][\w-]*)\s+DEFINITIONS\b")
-_IMPORTS_BLOCK_RE = re.compile(r"\bIMPORTS\b(.*?);", re.DOTALL)
-_IMPORT_GROUP_RE = re.compile(r"([\w,\s-]+?)\s+FROM\s+([A-Za-z][\w-]*)")
+_IMPORTS_KW_RE = re.compile(r"\bIMPORTS\b")
+# The symbol list of one IMPORTS group is everything between the previous
+# `FROM <module>` and the next `FROM`; the lookbehind keeps `FROM` a word of
+# its own rather than the tail of a symbol name.
+_IMPORT_FROM_RE = re.compile(r"(?<=\s)FROM\s+([A-Za-z][\w-]*)")
+_IMPORT_SYMBOL_RE = re.compile(r"[\w-]+")
 
-_OBJECT_TYPE_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+OBJECT-TYPE\b(.*?)::=\s*\{([^{}]*)\}", re.DOTALL)
+# Each macro is found by its header alone; the `::= { ... }` that closes the
+# clause is then looked for in a bounded window that stops at the next
+# header of the same macro (see _iter_macro_clauses).
+# `(?!\s+MACRO\b)` skips the ASN.1 macro *definitions* themselves, which
+# SNMPv2-SMI carries in full ("NOTIFICATION-TYPE MACRO ::= BEGIN ... END").
+# Without it the word before the macro keyword — `END`, from the previous
+# macro definition — was read as an object name and given the OID of the
+# next real clause in the file.
+_MACRO_DEFN_TAIL = r"(?!\s+MACRO\b)"
+_OBJECT_TYPE_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+OBJECT-TYPE\b" + _MACRO_DEFN_TAIL)
 _OBJECT_ID_RE = re.compile(
     r"\b([a-zA-Z][\w-]*)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{([^{}]*)\}")
-_NOTIFICATION_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+NOTIFICATION-TYPE\b(.*?)::=\s*\{([^{}]*)\}", re.DOTALL)
+_NOTIFICATION_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+NOTIFICATION-TYPE\b" + _MACRO_DEFN_TAIL)
 # The two other macros that define a real branch node rather than describing
 # one. Nearly every RFC MIB names its own root with MODULE-IDENTITY
 # (`dot1dBridge MODULE-IDENTITY ... ::= { mib-2 17 }`) and hangs the whole
@@ -118,9 +171,10 @@ _NOTIFICATION_RE = re.compile(
 # macros (OBJECT-GROUP, NOTIFICATION-GROUP, MODULE-COMPLIANCE) are
 # deliberately still ignored: they are agent-capability paperwork, never
 # polled, and nothing hangs off them.
-_MODULE_IDENTITY_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b(.*?)"
-    r"::=\s*\{([^{}]*)\}", re.DOTALL)
+_MODULE_IDENTITY_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b"
+    + _MACRO_DEFN_TAIL)
+_OID_ASSIGN_RE = re.compile(r"::=\s*\{([^{}]*)\}")
 
 _SYNTAX_RE = re.compile(r"\bSYNTAX\s+([A-Za-z][\w-]*)")
 _SYNTAX_ENUM_RE = re.compile(r"\bSYNTAX\s+INTEGER\s*\{([^{}]*)\}")
@@ -164,18 +218,77 @@ def _parse_oid_tail(braces_text: str):
     return parent_name, ".".join(arcs), None
 
 
-def _parse_imports(masked_text: str) -> dict[str, str]:
+def _imports_span(masked_text: str) -> tuple[int, int, int] | None:
+    """(block_start, body_start, block_end) of the `IMPORTS ... ;` block,
+    or None. Two `str` searches rather than `\\bIMPORTS\\b(.*?);`, which
+    re-reads the file once per `IMPORTS` keyword when the `;` is missing."""
+    keyword = _IMPORTS_KW_RE.search(masked_text)
+    if keyword is None:
+        return None
+    semicolon = masked_text.find(";", keyword.end())
+    if semicolon == -1:
+        return None
+    return keyword.start(), keyword.end(), semicolon + 1
+
+
+def _parse_imports(masked_text: str, body_start: int, body_end: int) -> dict[str, str]:
+    """symbol -> module, read by walking the block once.
+
+    The block reads `sym, sym, sym FROM Module sym FROM Module ...`, so
+    every `FROM` closes the run of symbols since the previous one. Written
+    as a scan because the regex this replaces (`([\\w,\\s-]+?)\\s+FROM\\s+...`)
+    re-expanded its lazy symbol run from every start position whenever a
+    stretch of the block held no `FROM` at all — a truncated import list
+    cost 66 s at 64 KB.
+    """
     imports: dict[str, str] = {}
-    block = _IMPORTS_BLOCK_RE.search(masked_text)
-    if not block:
-        return imports
-    for group in _IMPORT_GROUP_RE.finditer(block.group(1)):
-        module_name = group.group(2)
-        for symbol in group.group(1).split(","):
+    position = body_start
+    for group in _IMPORT_FROM_RE.finditer(masked_text, body_start, body_end):
+        module_name = group.group(1)
+        for symbol in masked_text[position:group.start()].split(","):
             symbol = symbol.strip()
-            if symbol:
+            if symbol and _IMPORT_SYMBOL_RE.fullmatch(symbol):
                 imports[symbol] = module_name
+        position = group.end()
     return imports
+
+
+def _blank_span(text: str, start: int, end: int) -> str:
+    """`text` with [start:end) replaced by spaces, newlines kept, so every
+    later match's offset still indexes into the original text."""
+    span = text[start:end]
+    blanked = "".join("\n" if ch == "\n" else " " for ch in span)
+    return text[:start] + blanked + text[end:]
+
+
+def _iter_macro_clauses(masked_text: str, head_re: re.Pattern,
+                        limit: int = MACRO_CLAUSE_LIMIT):
+    """Yield (name, body_start, body_end, brace_text) for every
+    `NAME <macro> ...body... ::= { ... }` clause, in one left-to-right pass.
+
+    The window in which the closing `::= { ... }` is looked for stops at
+    whichever comes first: `limit` bytes, or the next header of the same
+    macro. Both bounds matter. The second is what makes the pass linear —
+    the sum of all windows is at most the length of the file — and it is
+    also the more faithful reading: one macro's clause has never legally
+    contained another's header, so a header with no clause of its own
+    should be skipped rather than allowed to swallow the definition that
+    follows it.
+    """
+    text_len = len(masked_text)
+    heads = head_re.finditer(masked_text)
+    head = next(heads, None)
+    while head is not None:
+        following = next(heads, None)
+        body_start = head.end()
+        stop = min(text_len, body_start + limit)
+        if following is not None:
+            stop = min(stop, following.start())
+        assignment = _OID_ASSIGN_RE.search(masked_text, body_start, stop)
+        if assignment is not None:
+            yield (head.group(1), body_start, assignment.start(),
+                   assignment.group(1))
+        head = following
 
 
 def _extract_enums(body_original: str) -> dict[int, str] | None:
@@ -186,17 +299,35 @@ def _extract_enums(body_original: str) -> dict[int, str] | None:
     return enums or None
 
 
-def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
+def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
+          budget_s: float = PARSE_BUDGET_S) -> ParseResult:
     """Best-effort. Never raises for malformed input — a file with zero
     recognizable definitions comes back as a ParseResult with an empty
-    object list and a note explaining why, not an exception; the only
-    exception this raises is the size guard, checked before any regex
-    work so a pasted multi-megabyte file is refused cheaply."""
+    object list and a note explaining why, not an exception.
+
+    Two guards do raise, both subclasses of ValueError so the upload
+    endpoint keeps turning them into a 400 with their own message:
+    `MibTooLarge` for the byte cap, checked before any scanning so a
+    pasted multi-megabyte file is refused cheaply, and `MibParseTimeout`
+    for the wall-clock budget, checked between phases and periodically
+    within one. Nothing else escapes: an enum value too long for
+    `int()`, a truncated clause, an unterminated string are all just
+    definitions that do not get recorded."""
     if len(text.encode("utf-8", "replace")) > max_bytes:
-        raise ValueError(f"File exceeds the {max_bytes:,} byte limit")
+        raise MibTooLarge(f"File exceeds the {max_bytes:,} byte limit")
+
+    deadline = (time.monotonic() + budget_s) if budget_s and budget_s > 0 else None
+
+    def check_budget() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise MibParseTimeout(
+                f"This file took longer than {budget_s:g}s to parse and was "
+                "abandoned; it is far larger or far more unusual than any "
+                "real MIB module.")
 
     notes: list[str] = []
     masked = _strip_comments_and_strings(text)
+    check_budget()
 
     module_match = _MODULE_RE.search(masked)
     module = module_match.group(1) if module_match else ""
@@ -204,19 +335,25 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
         notes.append("No 'NAME DEFINITIONS ::= BEGIN' header was found; "
                      "the module name is left blank.")
 
-    imports = _parse_imports(masked)
     # An IMPORTS list names macros as bare symbols ("IMPORTS MODULE-IDENTITY,
     # OBJECT-TYPE ... FROM SNMPv2-SMI"), which reads to a regex exactly like a
     # definition whose name is IMPORTS. Blank the block out — keeping its
     # length and newlines so offsets into the original text still line up —
     # once its symbols have been recorded.
-    masked = _IMPORTS_BLOCK_RE.sub(
-        lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)),
-        masked, count=1)
+    span = _imports_span(masked)
+    if span is None:
+        imports: dict[str, str] = {}
+    else:
+        block_start, body_start, block_end = span
+        imports = _parse_imports(masked, body_start, block_end - 1)
+        masked = _blank_span(masked, block_start, block_end)
+    check_budget()
 
     objects: dict[str, ParsedObject] = {}
 
-    for match in _OBJECT_ID_RE.finditer(masked):
+    for index, match in enumerate(_OBJECT_ID_RE.finditer(masked)):
+        if not index % 256:
+            check_budget()
         name, braces = match.group(1), match.group(2)
         if name in objects:
             continue
@@ -224,12 +361,14 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
         objects[name] = ParsedObject(name=name, parent=parent, last_arc=last_arc,
                                      oid=literal)
 
-    for match in _OBJECT_TYPE_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _OBJECT_TYPE_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         syntax_match = _SYNTAX_RE.search(body_original)
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
@@ -238,23 +377,27 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
             syntax=(syntax_match.group(1) if syntax_match else ""),
             enums=_extract_enums(body_original))
 
-    for match in _MODULE_IDENTITY_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _MODULE_IDENTITY_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
             name=name, parent=parent, last_arc=last_arc, oid=literal,
             description=(desc_match.group(1).strip() if desc_match else ""))
 
-    for match in _NOTIFICATION_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _NOTIFICATION_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
             name=name, parent=parent, last_arc=last_arc, oid=literal,
