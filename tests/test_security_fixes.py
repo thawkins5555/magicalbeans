@@ -1197,6 +1197,28 @@ end
     check("D14 the snapshot still reads",
           isinstance(small.snapshot()["clients"], dict))
 
+    # ------------------------------------------- D15 the stale "no auth" lines
+    # Both of this workstream's copies went with D5, when the headless
+    # banner was rewritten. This is the guard that keeps them gone: the
+    # claim was false from 4.22 onward, and __main__'s copy printed on
+    # every headless start, so an operator's last word before walking away
+    # was that the application they had just secured was unauthenticated.
+    # console.py's third copy belongs to another workstream.
+    import netpath.web.server as server_mod
+    import netpath.__main__ as main_mod
+
+    stale = []
+    for module in (server_mod, main_mod):
+        with open(module.__file__, encoding="utf-8") as handle:
+            text = handle.read().lower()
+        for phrase in ("no authentication yet", "is no authentication"):
+            if phrase in text:
+                stale.append(f"{os.path.basename(module.__file__)}: {phrase}")
+    check("D15 nothing in the server or the entry point claims there is no "
+          "authentication", not stale, ", ".join(stale))
+    check("D15 …and the headless banner says what is actually true",
+          "must change its" in open(main_mod.__file__, encoding="utf-8").read())
+
     return 0
 
 
