@@ -648,3 +648,82 @@ assert upgraded.rule_by_key("poll_overrun")["auto_resolve_after_s"] == 3600
 assert upgraded.rule_by_key("device_up")["auto_resolve_after_s"] == 120
 ok("upgrading seeds the shipped intervals and leaves an operator's own alone")
 upgraded.close()
+
+
+# ==================================================================== A7
+print("\nA7 — one keyed metrics query, and stale samples read as absent")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+did = add_device(nodes, "10.9.0.1", "ap-bridge")
+old_ts = time.time() - 45 * 86400
+for _ in range(3):
+    nodes.record_metric_sample(did, "cpu_pct", "CPU", "%", "gauge", old_ts, 97.0)
+    engine._tick()
+assert open_rows(alerts, "cpu_high", did) == [], \
+    "a 45-day-old sample must not open an alert"
+ok("a 45-day-old sample opens nothing, however long the engine runs")
+
+# An alert already open must NOT be resolved by the device going quiet: that
+# is device_down's job, and a silent recovery would be a lie.
+base = time.time()
+for offset in (0, 65):
+    nodes.record_metric_sample(did, "cpu_pct", "CPU", "%", "gauge",
+                               base + offset, 97.0)
+    engine._tick()
+live = open_rows(alerts, "cpu_high", did)
+assert len(live) == 1, [dict(a) for a in live]
+conn = sqlite3.connect(nodes.path)
+conn.execute("UPDATE metrics SET last_ts = last_ts - 86400 WHERE device_id = ?",
+             (did,))
+conn.commit(); conn.close()
+for _ in range(3):
+    engine._tick()
+still = open_rows(alerts, "cpu_high", did)
+assert len(still) == 1 and still[0]["id"] == live[0]["id"], [dict(a) for a in still]
+ok("an alert already open survives its metric going stale")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- one statement against `metrics` per tick, at 50 devices
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+base = time.time()
+for i in range(50):
+    device_id = add_device(nodes, f"10.9.1.{i + 1}", f"acc-sw-{i:02d}")
+    for key, label in (("cpu_pct", "CPU"), ("mem_pct", "Memory"),
+                       ("ping_rtt_ms", "RTT"), ("ping_loss_pct", "Loss")):
+        nodes.record_metric_sample(device_id, key, label, "%", "gauge", base, 5.0)
+
+statements = []
+nodes._conn.set_trace_callback(statements.append)   # the engine's own connection
+try:
+    engine._tick()
+finally:
+    nodes._conn.set_trace_callback(None)
+from_metrics = [q for q in statements if "FROM metrics" in q]
+assert len(from_metrics) == 1, from_metrics
+ok(f"one FROM metrics statement per tick at 50 devices "
+   f"(was 50; {len(statements)} statements in total)")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- streak state does not outlive the devices it is about
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+base = time.time()
+victims = [add_device(nodes, f"10.9.2.{i + 1}", f"tmp-sw-{i}") for i in range(5)]
+for device_id in victims:
+    nodes.record_metric_sample(device_id, "cpu_pct", "CPU", "%", "gauge",
+                               base, 20.0)
+engine._tick()
+assert engine._breach_streaks, "the streaks were never built"
+for device_id in victims:
+    nodes.remove_device(device_id)
+engine._tick()
+assert engine._breach_streaks == {}, engine._breach_streaks
+ok("streak state for a deleted device is dropped rather than leaked")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()

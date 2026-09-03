@@ -968,15 +968,44 @@ class AlertEngine:
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
             return occurrences
-        for device in self.nodes_db.devices():
-            if not device["enabled"]:
+        # One query for the keys the enabled rules actually name, instead of
+        # a full `SELECT *` per device: at 2,000 devices with ~90 metrics
+        # each that was 400,000 rows every five seconds to evaluate four live
+        # rules, ~88% of it rows no rule reads, all of it through the
+        # connection and lock the poller writes with.
+        wanted = sorted({r["source_kind"] for r in rules if r["source_kind"]})
+        metric_rows = self.nodes_db.metrics_for_keys(wanted)
+        metrics_by_device_key = {(m["device_id"], m["key"]): m for m in metric_rows}
+        device_ids = sorted({m["device_id"] for m in metric_rows})
+        devices = {d["id"]: d for d in self.nodes_db.devices_by_ids(device_ids)}
+        # A sample this old is treated as absent. evaluate_threshold has no
+        # notion of sample age, so once a streak was satisfied every later
+        # tick re-raised the occurrence from last_value even if the device
+        # had stopped answering weeks ago — an alert opened from a 45-day-old
+        # sample, refreshed to last_ts = now on every tick, sorting itself to
+        # the top of a list ordered by last_ts. Absent means the streak
+        # resets; it does NOT resolve the alert, because a device that went
+        # quiet is a fault for device_down or the rollup to report, not
+        # something to quietly declare recovered.
+        stale_after = float(settings.get("threshold_stale_s", 900) or 0)
+        now = time.time()
+        # Streak state is per (rule, device) and lived forever, so a fleet
+        # with add/remove churn leaked an entry per deleted device. Only the
+        # devices this tick actually saw are carried forward.
+        live_streaks: dict[tuple, tuple] = {}
+        for device_id in device_ids:
+            device = devices.get(device_id)
+            if device is None:
                 continue
-            metrics_by_key = {m["key"]: m for m in self.nodes_db.metrics(device["id"])}
+            label = None
             for rule in rules:
-                metric = metrics_by_key.get(rule["source_kind"])
+                metric = metrics_by_device_key.get((device_id, rule["source_kind"]))
                 value = metric["last_value"] if metric else None
                 sample_ts = metric["last_ts"] if metric else None
-                streak_key = (rule["id"], device["id"])
+                if (stale_after > 0 and sample_ts is not None
+                        and now - sample_ts > stale_after):
+                    value, sample_ts = None, None
+                streak_key = (rule["id"], device_id)
                 previous_ts, streak, first_breach_ts = self._breach_streaks.get(
                     streak_key, (None, 0, None))
                 threshold = rule["threshold"]
@@ -988,14 +1017,20 @@ class AlertEngine:
                     streak += 1
                     if first_breach_ts is None:
                         first_breach_ts = sample_ts
-                self._breach_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
+                live_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
                 # Sample time, not wall-clock: a device that stopped being
                 # polled must not accumulate breach seconds while silent.
                 breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
                                   else max(0.0, sample_ts - first_breach_ts))
                 result = evaluate_threshold(rule, value, streak, breach_seconds)
-                label = hostresolve.resolve_name(
-                    self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
+                if result == "":
+                    continue
+                if label is None:
+                    # Resolved at most once per device per tick, and only for
+                    # a device that has something to report.
+                    label = hostresolve.resolve_name(
+                        self.nodes_db, self.app_db, device["ip"],
+                        device=device) or device["ip"]
                 if result == "breach":
                     occurrence = Occurrence(
                         kind="threshold", source_kind=rule["source_kind"],
@@ -1023,6 +1058,7 @@ class AlertEngine:
                     if resolved:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, rule, settings)
+        self._breach_streaks = live_streaks
         return occurrences
 
     def _evaluate_dhcp_thresholds(self, settings) -> list[Occurrence]:

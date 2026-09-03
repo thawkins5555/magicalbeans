@@ -173,6 +173,14 @@ DEFAULTS = {
     # metric — leaving one "Device not responding". See alertrules.ROLLED_UP_BY
     # for exactly which, and why interface alerts are not among them.
     "rollup_enabled": True,
+    # A metric sample older than this is treated as absent by the threshold
+    # evaluator: the streak resets and no occurrence is raised from it. Not a
+    # multiple of the poll interval, because the interval is per profile and
+    # per device while this is one number an operator can reason about; 900 s
+    # is comfortably longer than the shipped 120 s interval with room for a
+    # slow poll and a missed one. 0 disables the check, restoring the
+    # pre-4.37 behaviour of alerting from a value of any age.
+    "threshold_stale_s": 900,
     # Comma-joined column keys the alert table shows; "" means the
     # frontend's defaults. Lives here rather than in the browser's
     # localStorage so it sits beside the rest of the module's settings

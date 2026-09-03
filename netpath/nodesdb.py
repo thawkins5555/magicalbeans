@@ -652,6 +652,13 @@ class NodesDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
             " ON mac_entries(mac, present, seen_ts)")
+        # The alert engine asks for one metric key across the whole fleet
+        # twelve times a minute (metrics_for_keys). Without this the plan is
+        # a full scan of `metrics`, which at 2,000 devices × ~90 keys is
+        # 180,000 rows per lookup; the UNIQUE(device_id, key) index leads
+        # with device_id and cannot serve a key-first query.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key)")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -961,6 +968,30 @@ class NodesDatabase:
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM devices WHERE id IN ({marks})", device_ids).fetchall()
+
+    def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
+        """The newest value of each named metric key, fleet-wide, in one query.
+
+        The alert engine used to read `SELECT * FROM metrics WHERE device_id
+        = ?` once per device per tick — at 2,000 devices and ~90 metrics
+        each, 400,000 full rows every five seconds through the same
+        connection and lock the poller writes with, to evaluate a handful of
+        threshold rules. It reads four columns for the keys that have a rule
+        instead.
+
+        Disabled devices are excluded here rather than by the caller: a
+        device somebody turned off is not being polled, so its last value is
+        by definition stale and must not hold an alert open.
+        """
+        keys = [str(k) for k in keys if k]
+        if not keys:
+            return []
+        marks = ",".join("?" * len(keys))
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
+                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
+                f" WHERE d.enabled = 1 AND m.key IN ({marks})", keys).fetchall()
 
     def device_count(self) -> int:
         with self._lock:
