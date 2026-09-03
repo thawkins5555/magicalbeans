@@ -312,6 +312,7 @@
     view.selectedDeviceId = deviceId;
     view.selectedBackupId = null;
     view.backupContent = '';
+    App.setRoute(deviceId != null ? ['device', deviceId] : []);
     drawDevices();
     drawViewer();
     const result = await App.get(`/api/configrx/devices/${deviceId}/backups`, {});
@@ -445,6 +446,11 @@
 
   async function selectBackup(backupId) {
     view.selectedBackupId = backupId;
+    // #/configrx/device/4/backup/91 — a specific stored configuration, which
+    // is what a change-control conversation is actually about.
+    if (view.selectedDeviceId != null) {
+      App.setRoute(['device', view.selectedDeviceId, 'backup', backupId]);
+    }
     drawBackups();
     const result = await App.get(`/api/configrx/backups/${backupId}`, {});
     view.backupContent = result.content || '';
@@ -785,5 +791,21 @@
     };
   }
 
-  App.pages.configrx = { init, refresh, fastTick: drawStatus };
+  /* #/configrx/device/<id> and .../backup/<bid>. Runs after refresh(), so
+     the device list is populated; selectDevice fetches that device's backups
+     before the backup half is applied. */
+  async function activate(opts) {
+    if (!opts || !opts.parts || opts.parts[0] !== 'device') return;
+    const deviceId = Number(opts.parts[1]);
+    if (!Number.isFinite(deviceId)) return;
+    if (view.selectedDeviceId !== deviceId) {
+      await selectDevice(deviceId).catch(() => { /* a link to a gone device */ });
+    }
+    if (opts.parts[2] !== 'backup' || opts.parts[3] === undefined) return;
+    const backupId = Number(opts.parts[3]);
+    if (!Number.isFinite(backupId)) return;
+    await selectBackup(backupId).catch(() => { /* pruned backup */ });
+  }
+
+  App.pages.configrx = { init, refresh, activate, fastTick: drawStatus };
 })();

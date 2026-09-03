@@ -483,8 +483,54 @@
 
   function selectDevice(id) {
     view.selected = id;
+    // A device is a thing worth linking to: #/nodes/device/1234 in the
+    // address bar, replacing rather than pushing so clicking down a list
+    // does not fill the Back button with forty entries.
+    App.setRoute(id != null ? ['device', id] : []);
     drawTable();
     loadDetail();
+  }
+
+  /* A route into this tab: #/nodes, #/nodes?status=down,
+     #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>. Called after
+     refresh() has run, so view.devices is populated and the "select the
+     first device if none is selected" rule below has already happened —
+     which is exactly why the selection is applied here and not before. */
+  async function activate(opts) {
+    if (!opts) return;
+    const parts = opts.parts || [];
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['nd-filter-status', 'status'],
+                             ['nd-q', 'q']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (query.offline !== undefined) {
+      App.el('nd-filter-offline').checked = query.offline === '1'
+        || query.offline === 'true';
+      filtered = true;
+    }
+    if (filtered) {
+      view.selected = null;
+      await App.refreshNow('nodes');
+    }
+    if (parts[0] !== 'device' || parts[1] === undefined) return;
+    const deviceId = Number(parts[1]);
+    if (!Number.isFinite(deviceId)) return;
+    if (view.selected !== deviceId) {
+      view.selected = deviceId;
+      drawTable();
+      await loadDetail().catch(() => { /* a link to a deleted device */ });
+    }
+    if (parts[2] === 'port' && parts[3] !== undefined) {
+      const ifIndex = Number(parts[3]);
+      const row = (view.ifaces || []).find((r) => r.if_index === ifIndex);
+      if (row) interfaceDialog(row, deviceId);
+    }
   }
 
   async function loadDetail() {
@@ -3616,5 +3662,5 @@
     }
   }
 
-  App.pages.nodes = { init, refresh, fastTick: drawStatus };
+  App.pages.nodes = { init, refresh, activate, fastTick: drawStatus };
 })();

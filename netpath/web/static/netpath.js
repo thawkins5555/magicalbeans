@@ -177,6 +177,7 @@
       li.className = target.id === view.targetId ? 'selected' : '';
       li.onclick = () => {
         view.targetId = target.id;
+        App.setRoute([target.id]);
         view.pinned = null;
         view.expanded.clear();
         view.expandAll = false;
@@ -1129,6 +1130,13 @@
      click it in the target list. Safe to call with no args — App.selectTab
      already calls this with none on every ordinary tab switch. */
   function activate(opts) {
+    // A hash route (#/netpath/<targetId>) names the destination in its path;
+    // NetFlow's "view route" jump passes it as targetId directly. Both end
+    // up in the same place.
+    if (opts && opts.parts && opts.parts[0] !== undefined && !opts.targetId) {
+      const fromRoute = Number(opts.parts[0]);
+      if (Number.isFinite(fromRoute)) opts = { ...opts, targetId: fromRoute };
+    }
     if (!opts || !opts.targetId) return;
     view.targetId = opts.targetId;
     view.pinned = null;

@@ -154,7 +154,12 @@
     const rows = App.sortRows(view.aps, view.apSort.key, view.apSort.descending, columns);
     App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
+      tr.onclick = () => {
+        view.selected = row.id;
+        App.setRoute([row.id]);
+        showDetail(row);
+        drawTable();
+      };
     });
     table.appendChild(body);
     App.el('wl-count').textContent = `${rows.length} AP(s)`;
@@ -463,5 +468,21 @@
     };
   }
 
-  App.pages.wireless = { init, refresh, fastTick: drawStatus };
+  /* #/wireless/<id>: select the row a link names, once refresh() has
+     filled the list it lives in. A row that is not in the current
+     window is simply not selected — these three tables are live
+     tails, and silently widening the window to find one row would
+     change what the operator asked to see. */
+  function activate(opts) {
+    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
+    const id = Number(opts.parts[0]);
+    if (!Number.isFinite(id)) return;
+    const row = (view.aps || []).find((r) => r.id === id);
+    if (!row) return;
+    view.selected = id;
+    showDetail(row);
+    drawTable();
+  }
+
+  App.pages.wireless = { init, refresh, activate, fastTick: drawStatus };
 })();

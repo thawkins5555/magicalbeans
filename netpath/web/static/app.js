@@ -1487,11 +1487,126 @@ const App = (() => {
     document.body.classList.toggle('tiny', height < 700);
   }
 
+
+  /* ------------------------------------------------------------- routing
+
+     Nothing in this application could be linked to: no URL changed as the
+     operator moved, Back did nothing, and an escalation was prose — "open
+     Nodes, search for core-sw-01, click the third row". Every selection
+     worth naming now has a hash route.
+
+         #/nodes                            a tab
+         #/nodes?status=down                a tab with its filter set
+         #/nodes/device/1234                a device
+         #/nodes/device/1234/port/7         a port on it
+         #/alerts/998                       an alert
+         #/netpath/12                       a destination
+         #/configrx/device/4/backup/91      a stored configuration
+         #/snmp/5512  #/syslog/8801  #/wireless/3
+
+     The tab change is a pushState, so Back walks the tabs. Selecting a row
+     inside a tab is a replaceState: an operator clicking down a list of
+     devices should not have to press Back forty times to leave.
+
+     Modules take a route through their existing `activate(opts)` — the entry
+     point netpath.js already had for NetFlow's "view route" jump — and report
+     a selection back with App.setRoute(). A module that implements neither
+     still works: it simply has no deeper routes than its own tab. */
+
+  const ROUTE_TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow',
+                      'snmp', 'syslog', 'ipam', 'wireless', 'configrx',
+                      'debug', 'settings'];
+
+  // Set while writeRoute is changing location.hash, so the hashchange it
+  // fires (pushState does not, assigning location.hash does) is not read
+  // back as a navigation and applied a second time.
+  let writingRoute = false;
+
+  function parseRoute(hash) {
+    const raw = String(hash === undefined ? window.location.hash : hash);
+    const text = raw.replace(/^#\/?/, '');
+    const cut = text.indexOf('?');
+    const pathText = cut === -1 ? text : text.slice(0, cut);
+    const queryText = cut === -1 ? '' : text.slice(cut + 1);
+    const parts = pathText.split('/').filter(Boolean).map((p) => {
+      try { return decodeURIComponent(p); } catch (error) { return p; }
+    });
+    const query = {};
+    if (queryText) {
+      for (const [key, value] of new URLSearchParams(queryText)) query[key] = value;
+    }
+    const tab = ROUTE_TABS.includes(parts[0]) ? parts.shift() : null;
+    return { tab, parts, query };
+  }
+
+  function buildRoute(tab, parts = [], query = {}) {
+    const path = [tab, ...parts.filter((p) => p !== null && p !== undefined)]
+      .map((p) => encodeURIComponent(String(p))).join('/');
+    const pairs = Object.entries(query)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '');
+    const search = pairs.length ? `?${new URLSearchParams(pairs)}` : '';
+    return `#/${path}${search}`;
+  }
+
+  /* Called by a module when its own selection changes. Always a replace:
+     only a tab change is worth a history entry. */
+  function setRoute(parts, query, options = {}) {
+    writeRoute(buildRoute(state.tab, parts, query), options);
+  }
+
+  function writeRoute(hash, options = {}) {
+    if (window.location.hash === hash) return;
+    writingRoute = true;
+    try {
+      const url = window.location.pathname + window.location.search + hash;
+      if (options.push) window.history.pushState(null, '', url);
+      else window.history.replaceState(null, '', url);
+    } catch (error) {
+      // Some embedded browsers refuse history writes; the app still works,
+      // it just cannot be linked to.
+    } finally {
+      writingRoute = false;
+    }
+  }
+
+  /* Apply whatever the address bar says. `initial` is true for the load-time
+     call, where there is no current tab to compare against. */
+  function applyRoute(initial = false) {
+    const route = parseRoute();
+    if (!route.tab) return false;
+    const tabButton = document.querySelector(`.tab[data-tab="${route.tab}"]`);
+    if (!tabButton || tabButton.hidden) {
+      // A link into a module this account cannot read: land on the tab the
+      // app would have chosen, rather than on a blank page.
+      return false;
+    }
+    const changed = initial || state.tab !== route.tab;
+    if (changed) selectTab(route.tab, { fromRoute: true, route });
+    else deliverRoute(route);
+    return true;
+  }
+
+  /* Hands the route to the module. The selection half runs after the
+     module's first refresh, or nodes.js's own "select the first device if
+     none is selected" would overwrite the device the link named. */
+  function deliverRoute(route) {
+    const page = pages[route.tab];
+    if (!page || !page.activate) return;
+    const opts = { route, parts: route.parts, query: route.query };
+    if (!page.refresh) {
+      page.activate(opts);
+      return;
+    }
+    Promise.resolve(refreshNow(route.tab)).then(() => {
+      try { page.activate(opts); } catch (error) { /* a bad link is not fatal */ }
+    });
+  }
+
   /* ------------------------------------------------------------- tabs */
 
   const TAB_KEY = 'sappiwhere.tab';
 
-  function selectTab(name) {
+  function selectTab(name, options = {}) {
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
     // Kept in sync with .active below, not just set once at load: index.html's
@@ -1509,7 +1624,16 @@ const App = (() => {
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
     }
+    // The tab itself is a history entry: Back walks the tabs the operator
+    // visited. A selection inside a tab replaces instead (setRoute).
+    if (!options.fromRoute) writeRoute(buildRoute(name), { push: true });
     const page = pages[name];
+    if (options.route) {
+      // A route names both the tab and what to select in it; the selection
+      // has to wait for the module's first refresh.
+      deliverRoute(options.route);
+      return;
+    }
     if (page && page.activate) page.activate();
     refreshNow(name);
   }
@@ -1775,16 +1899,26 @@ const App = (() => {
     for (const page of Object.values(pages)) {
       if (page.init) page.init();
     }
-    // A refresh should land back on whichever module was open, not reset to
-    // NetPath — but only if that tab still exists (a build could drop one).
-    let initialTab = 'netpath';
-    try {
-      const stored = localStorage.getItem(TAB_KEY);
-      if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
-        initialTab = stored;
-      }
-    } catch (error) { /* private browsing, or storage full: default to netpath */ }
-    selectTab(initialTab);
+    // A link is more specific than a memory: if the address bar names a
+    // tab (and a selection in it), that wins over the remembered tab, and
+    // over login.js's "land on Dashboard after signing in".
+    window.addEventListener('hashchange', () => {
+      if (writingRoute) return;
+      applyRoute();
+    });
+    if (!applyRoute(true)) {
+      // A refresh should land back on whichever module was open, not reset
+      // to NetPath — but only if that tab still exists (a build could drop
+      // one).
+      let initialTab = 'netpath';
+      try {
+        const stored = localStorage.getItem(TAB_KEY);
+        if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
+          initialTab = stored;
+        }
+      } catch (error) { /* private browsing: default to netpath */ }
+      selectTab(initialTab);
+    }
     restartTimer();
   }
 
@@ -1806,6 +1940,7 @@ const App = (() => {
 
   const api = {
     state, pages, start, selectTab, loadState, refreshNow, rateFor,
+    parseRoute, buildRoute, setRoute, applyRoute,
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,

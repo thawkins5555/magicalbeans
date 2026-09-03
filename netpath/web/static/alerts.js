@@ -213,6 +213,8 @@
       }
       tr.onclick = () => {
         view.selected = row.id;
+        // #/alerts/998 — the link that goes in the ticket.
+        App.setRoute([row.id]);
         drawTable();
         showDetail(row);
       };
@@ -871,6 +873,44 @@
     };
   }
 
+  /* A route into this tab: #/alerts, #/alerts?state=open&severity=2, or
+     #/alerts/<id>. Runs after refresh(), so view.alerts is populated and an
+     alert named by a link can be found in it. An alert that is not in the
+     current page of the list is fetched on its own rather than reported as
+     missing — a link from a ticket is usually to something older than the
+     300 rows on screen. */
+  async function activate(opts) {
+    if (!opts) return;
+    const parts = opts.parts || [];
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['alerts-filter-state', 'state'],
+                             ['alerts-filter-sev', 'severity'],
+                             ['alerts-filter-device', 'device'],
+                             ['alerts-filter-text', 'q']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (filtered) await App.refreshNow('alerts');
+    if (parts[0] === undefined) return;
+    const alertId = Number(parts[0]);
+    if (!Number.isFinite(alertId)) return;
+    view.selected = alertId;
+    drawTable();
+    let row = (view.alerts || []).find((a) => a.id === alertId);
+    if (!row) {
+      try {
+        row = (await App.get(`/api/alerts/${alertId}`)).alert;
+      } catch (error) {
+        return;                    // a link to an alert that has been pruned
+      }
+    }
+    showDetail(row);
+  }
+
   /* ----------------------------------------------------------- refresh */
 
   async function refresh() {
@@ -1015,5 +1055,5 @@
     }
   }
 
-  App.pages.alerts = { init, refresh, fastTick: drawStatus };
+  App.pages.alerts = { init, refresh, activate, fastTick: drawStatus };
 })();
