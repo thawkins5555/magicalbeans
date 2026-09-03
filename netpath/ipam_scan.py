@@ -186,7 +186,11 @@ def read_arp_table() -> dict[str, str]:
     try:
         completed = subprocess.run(command, capture_output=True, text=True,
                                    timeout=10, **hidden())
-    except OSError:
+    except (subprocess.TimeoutExpired, OSError):
+        # TimeoutExpired is a SubprocessError, not an OSError, so the one
+        # failure this call arranges for itself was the one it did not
+        # catch: a slow `ip neigh` turned a good sweep into "scan finished
+        # with an error".
         return {}
     return parser(completed.stdout or "")
 

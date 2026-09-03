@@ -3059,7 +3059,8 @@ def post_nodes_mib(service, params, body) -> dict:
         raw = base64.b64decode(content_b64, validate=False)
     except Exception:
         raise ValueError("content is not valid base64")
-    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes",
+                                                nodesdb.DEFAULTS["max_mib_bytes"]))
 
     if mibcatalog.looks_like_zip(raw):
         members = mibcatalog.unpack_zip(
@@ -3108,7 +3109,8 @@ def post_nodes_mibs_resolve_all(service, params, body) -> dict:
     without an admin having to guess which one to press Resolve on."""
     from .. import mibparse
 
-    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes",
+                                                nodesdb.DEFAULTS["max_mib_bytes"]))
     summary = mibparse.resolve_all(service.nodes_db, max_bytes)
     service._snmp_settings_with_mibs()
     service.log.add(NODES_CATEGORY,
@@ -3182,7 +3184,8 @@ def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
         raise ValueError("This file's original text was not retained "
                          "(uploaded before this feature could re-resolve) "
                          "— re-upload it to enable Resolve.")
-    max_bytes = int(service.nodes_settings.get("max_mib_bytes", 8 * 1024 * 1024))
+    max_bytes = int(service.nodes_settings.get("max_mib_bytes",
+                                                nodesdb.DEFAULTS["max_mib_bytes"]))
     result = mibparse.parse(row["content"], max_bytes=max_bytes)
     resolved_count, unresolved = mibparse.resolve(
         result.objects, _known_oids_for_resolve(service))
