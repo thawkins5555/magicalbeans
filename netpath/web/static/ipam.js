@@ -155,7 +155,7 @@
   function drawStatus() {
     const ipam = (App.state.serverState || {}).ipam || {};
     const dot = App.el('ipam-dot');
-    dot.style.background = ipam.running ? 'var(--ok)' : 'var(--faint)';
+    dot.style.background = ipam.running ? 'var(--ok)' : 'var(--line)';
     App.el('ipam-status').textContent = ipam.running
       ? 'Worker running' : 'Worker stopped';
     const parts = [];

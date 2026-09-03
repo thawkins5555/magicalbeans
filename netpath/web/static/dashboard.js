@@ -47,7 +47,7 @@
   /* ------------------------------------------------------------- tiles */
 
   function tile(title, bodyHtml, options = {}) {
-    const cls = ['dash-tile'];
+    const cls = ['card', 'dash-tile'];
     if (options.wide) cls.push('wide');
     if (options.tone) cls.push(`tone-${options.tone}`);
     return `<section class="${cls.join(' ')}">
@@ -159,10 +159,12 @@
         .join(' · ');
       const received = counters.received != null ? counters.received
         : counters.packets != null ? counters.packets : null;
+      // App.statusMark, not a hand-rolled dot: shape + colour + word, the
+      // same as every other status in the product.
       return `<a class="dash-row" href="#/${escape(c.module)}">
-        <span class="dot" style="background:${c.running ? 'var(--ok)' : 'var(--faint)'}"></span>
         <span class="dash-row-name">${escape(c.name)}</span>
-        <span class="dash-row-value">${c.running ? 'running' : 'stopped'}${
+        <span class="dash-row-value">${App.statusMark(c.running ? 'ok' : 'none',
+          c.running ? 'running' : 'stopped')}${
           received != null ? ` · ${Number(received).toLocaleString()} in` : ''}</span>
         ${notes ? `<span class="dash-row-note">${notes}</span>` : ''}
       </a>`;

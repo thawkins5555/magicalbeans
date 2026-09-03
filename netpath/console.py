@@ -311,7 +311,7 @@ class ConsoleWindow(QMainWindow):
         row.setContentsMargins(14, 10, 14, 10)
 
         self.dot = QLabel("\u25cf")
-        self.dot.setStyleSheet(f"color: {theme.TEXT_FAINT.name()}; font-size: 16px;")
+        self.dot.setStyleSheet(f"color: {theme.LINE.name()}; font-size: 16px;")
         row.addWidget(self.dot)
 
         column = QVBoxLayout()
@@ -532,7 +532,7 @@ class ConsoleWindow(QMainWindow):
     def _refresh(self) -> None:
         running = self.server.running
         colour = theme.OK if running else (theme.FAIL if self.server.error
-                                           else theme.TEXT_FAINT)
+                                           else theme.LINE)
         self.dot.setStyleSheet(f"color: {QColor(colour).name()}; font-size: 16px;")
         self.toggle_button.setText("Stop server" if running else "Start server")
         self.open_button.setEnabled(running)

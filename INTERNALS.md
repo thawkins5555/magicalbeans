@@ -608,10 +608,38 @@ each module so there is one implementation and one tri-state rule.
 `refreshSelectAll(table, total, selected)` corrects it in place after a
 single-row toggle, because `toggleChecked` deliberately does not redraw.
 
+**Design tokens** (`netpath/web/static/tokens.css`). Every colour, text
+size, tracking, radius, shadow and z-index the interface uses is a custom
+property in this one file, linked before `app.css` on all three pages
+(`index.html`, `login.html`, `ssh.html`) and listed in `PUBLIC_PATHS`
+because the sign-in page needs it before there is a session. `app.css`,
+`ssh.css` and the module scripts read tokens by name and write no hex colour
+or pixel font size of their own; `tests/test_design_tokens.py` fails if one
+appears, if `theme.py`'s copy of the palette disagrees with the file, or if
+any of the contrast ratios written beside the tones stops being true — it
+recomputes every one from the hex values.
+
+The tones are named for their role. Three text tiers — `--text`, `--muted`,
+`--dim` — and the dimmest is 4.6:1 on `--raised`, the darkest surface text
+is allowed on. There is no `--faint`: it was 2.5:1 and was being used for
+prose. Structure that is not text but must be seen (dividers, grips, the
+ring of an empty status mark) is `--line`, 3.1:1 on `--raised`; the fill for
+"none of this yet" in a chart is `--data-neutral`, 3.05:1 on `--panel`.
+Sizes are seven `rem` steps (`--fs-2xs` … `--fs-2xl`) plus `--fs-glyph` for
+the ●▲■◆○ status marks only, so the browser's text-size setting is honoured
+and a wall-display density can scale everything from the root. SVG chart
+labels take the same tokens through their `font-size` and `fill`
+presentation attributes, which are parsed as CSS and resolve `var()`.
+A light or high-contrast theme is a `:root[data-theme]` block redefining
+values; nothing outside the file has to move.
+
 A row can still be simultaneously selected (detail pane) and checked (bulk set);
 `tr.bulk-checked` and `tr.selected` (`app.css`) are separate rules for
 exactly that reason, and `tr.bulk-checked.selected` gives the combination
-its own shade rather than letting one tint win. The checked marker used to
+its own shade rather than letting one tint win. The selected row is
+`--selected` (a blue-grey a step off `--raised`; `--hairline` had put
+`--muted` at 3.5:1 on the one row being read) plus an accent bar on its
+*first cell only* — see the next sentence for why not every cell. The checked marker used to
 be `box-shadow: inset 3px 0 0 var(--accent)`, which draws that bar on the
 left edge of *every cell* — under `table-layout: fixed` that reads as a blue
 stripe at each column divider rather than as a selected row, which is

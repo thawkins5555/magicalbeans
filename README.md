@@ -731,10 +731,11 @@ netpath/
     server.py      HTTP(S) server: routing, sessions/cookies, access log,
                    serving static/
     static/        the browser interface
-      index.html   the six-tab shell (NetPath, NetFlow, Syslog, IPAM,
-                   Debug, Settings)
+      index.html   the twelve-tab shell
       login.html   the sign-in page
-      app.css      shared styling for the whole interface
+      tokens.css   the design tokens: every colour, text size and
+                   spacing value, with its measured contrast
+      app.css      shared styling for the whole interface, on the tokens
       app.js       shared plumbing: server calls, tab switching, the
                    refresh loop, modals
       netpath.js   NetPath tab: route graph, timeline, destinations

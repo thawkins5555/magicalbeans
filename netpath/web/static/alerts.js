@@ -2,7 +2,7 @@
    email templates. Table/modal patterns follow snmp.js and ipam.js. */
 (() => {
   const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
-                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--faint)'];
+                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--data-neutral)'];
   const PAD = { left: 40, right: 10, top: 8, bottom: 18 };
 
   const view = {
@@ -93,7 +93,7 @@
     const server = App.state.serverState || {};
     const alerts = server.alerts || { counters: {} };
     App.el('alerts-status').textContent = alerts.status || 'Engine stopped';
-    App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--line)';
     App.el('alerts-toggle').textContent = alerts.running ? 'Stop engine' : 'Start engine';
     const c = alerts.counters || {};
     App.el('alerts-counters').textContent =
@@ -128,7 +128,7 @@
     if (!data || !data.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 12 }, 'No alerts in this window'));
+        fill: 'var(--muted)', 'font-size': 'var(--fs-xs)' }, 'No alerts in this window'));
       return;
     }
     const plot = { x: PAD.left, y: PAD.top,

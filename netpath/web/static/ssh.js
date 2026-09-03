@@ -119,7 +119,7 @@
       magenta: cssVar('--error', '#A371F7'),
       cyan: cssVar('--overrun', '#4DB6AC'),
       white: fg,
-      brightBlack: cssVar('--faint', '#4C5561'),
+      brightBlack: cssVar('--line', '#646E7C'),
       brightWhite: '#FFFFFF',
     };
   }

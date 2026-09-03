@@ -3,6 +3,10 @@
 Addresses, latencies and timestamps are set in monospace because that is the
 vernacular of network tooling and because columns of figures should line up.
 Chrome stays quiet so the two data views carry the colour.
+
+Every colour here is a copy of one in netpath/web/static/tokens.css, which is
+the authority; tests/test_design_tokens.py fails if the two disagree. The
+names map one to one: TEXT_MUTED is --muted, LINE is --line, and so on.
 """
 
 from __future__ import annotations
@@ -16,10 +20,17 @@ HAIRLINE = QColor("#2A323D")
 GRID = QColor("#222933")
 
 TEXT = QColor("#DCE3EA")
-TEXT_MUTED = QColor("#7C8794")
-TEXT_FAINT = QColor("#4C5561")
+TEXT_MUTED = QColor("#8F9AA7")
+# The dimmest tone text may be set in: 4.6:1 on PANEL_RAISED. There is no
+# TEXT_FAINT any more — it was 2.5:1 and was being used for prose.
+TEXT_DIM = QColor("#808B98")
+# Not text: dividers, grips, the dot of a stopped collector. 3.1:1 on RAISED.
+LINE = QColor("#646E7C")
+# The fill for "none of this yet" in a chart. 3.05:1 on PANEL.
+DATA_NEUTRAL = QColor("#606A78")
 
 ACCENT = QColor("#7AA2F7")
+ACCENT_HOVER = QColor("#97B6FF")   # a primary button under the pointer
 
 # The route canvas is light while the rest of the app stays dark, so it needs
 # its own palette: the dark one's greys and accents have far too little
@@ -34,6 +45,7 @@ CANVAS_TEXT_FAINT = QColor("#8A94A2")
 CANVAS_ACCENT = QColor("#2F5FC4")
 CANVAS_OK = QColor("#1B7F3B")
 CANVAS_WARN = QColor("#9A6510")
+CANVAS_FAIL = QColor("#B3261E")
 
 OK = QColor("#3FB950")
 WARN = QColor("#E3B341")
@@ -63,15 +75,16 @@ STATUS_LABELS = {
     "none": "No data",
 }
 
-# Categorical palette for stacked flow charts. Chosen to stay separable on the
-# dark panel and to avoid colliding with the status green/amber/red, which
-# carry a fixed meaning everywhere else in the app.
+# Categorical palette for stacked flow charts: the same eight hues the web
+# NetFlow chart uses (--cat-1 .. --cat-8), chosen for separation under
+# protanopia simulation as well as in normal vision, and clear of the status
+# green/amber/red, which carry a fixed meaning everywhere else in the app.
+# The desktop console had kept its own ten-colour set after the web moved.
 SERIES = [
-    QColor("#7AA2F7"), QColor("#7DCFB6"), QColor("#E5A3C4"), QColor("#F2B880"),
-    QColor("#A9A0F0"), QColor("#69B3D6"), QColor("#C3D06A"), QColor("#E0868A"),
-    QColor("#8FB8A0"), QColor("#C9A227"),
+    QColor("#5B8DEB"), QColor("#CF7638"), QColor("#2FA886"), QColor("#B0881A"),
+    QColor("#D1609A"), QColor("#4F9A3A"), QColor("#8F76E8"), QColor("#DC5A5A"),
 ]
-SERIES_OTHER = QColor("#4C5561")
+SERIES_OTHER = DATA_NEUTRAL
 
 
 def series_color(index: int) -> QColor:
@@ -127,7 +140,7 @@ QLabel#sectionTitle {{
     padding: 2px 0px;
 }}
 QLabel#stat {{ color: {TEXT.name()}; font-family: "DejaVu Sans Mono", monospace; }}
-QLabel#hint {{ color: {TEXT_FAINT.name()}; font-size: 11px; }}
+QLabel#hint {{ color: {TEXT_MUTED.name()}; font-size: 11px; }}
 
 QFrame#card {{
     background: {PANEL.name()};
@@ -144,9 +157,9 @@ QPushButton {{
 }}
 QPushButton:hover {{ border-color: {ACCENT.name()}; }}
 QPushButton:pressed {{ background: {HAIRLINE.name()}; }}
-QPushButton:disabled {{ color: {TEXT_FAINT.name()}; border-color: {GRID.name()}; }}
-QPushButton#primary {{ background: {ACCENT.name()}; color: #0E1116; border: none; font-weight: 600; }}
-QPushButton#primary:hover {{ background: #97B6FF; }}
+QPushButton:disabled {{ color: {TEXT_MUTED.name()}; border-color: {GRID.name()}; }}
+QPushButton#primary {{ background: {ACCENT.name()}; color: {BG.name()}; border: none; font-weight: 600; }}
+QPushButton#primary:hover {{ background: {ACCENT_HOVER.name()}; }}
 
 QListWidget {{
     background: {PANEL.name()};
@@ -173,7 +186,7 @@ QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit, QDateTimeEdit {{
     border-radius: 4px;
     padding: 4px 8px;
     selection-background-color: {ACCENT.name()};
-    selection-color: #0E1116;
+    selection-color: {BG.name()};
 }}
 QComboBox:focus, QSpinBox:focus, QLineEdit:focus, QDateTimeEdit:focus {{
     border-color: {ACCENT.name()};
@@ -228,19 +241,19 @@ QPushButton#moduleSettings {{
 }}
 QPushButton#moduleSettings:hover {{
     background: {ACCENT.name()};
-    color: #0E1116;
+    color: {BG.name()};
 }}
 QComboBox QAbstractItemView {{
     background: {PANEL_RAISED.name()};
     border: 1px solid {HAIRLINE.name()};
     selection-background-color: {ACCENT.name()};
-    selection-color: #0E1116;
+    selection-color: {BG.name()};
 }}
 QCheckBox {{ spacing: 6px; }}
 
 QScrollBar:vertical, QScrollBar:horizontal {{ background: transparent; width: 10px; height: 10px; }}
 QScrollBar::handle {{ background: {HAIRLINE.name()}; border-radius: 5px; min-height: 24px; }}
-QScrollBar::handle:hover {{ background: {TEXT_FAINT.name()}; }}
+QScrollBar::handle:hover {{ background: {LINE.name()}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0px; width: 0px; }}
 
 QToolTip {{
@@ -254,7 +267,7 @@ QMenuBar::item {{ padding: 5px 10px; background: transparent; }}
 QMenuBar::item:selected {{ background: {PANEL_RAISED.name()}; }}
 QMenu {{ background: {PANEL_RAISED.name()}; border: 1px solid {HAIRLINE.name()}; padding: 4px; }}
 QMenu::item {{ padding: 5px 20px; border-radius: 3px; }}
-QMenu::item:selected {{ background: {ACCENT.name()}; color: #0E1116; }}
+QMenu::item:selected {{ background: {ACCENT.name()}; color: {BG.name()}; }}
 
 QStatusBar {{ background: {PANEL.name()}; color: {TEXT_MUTED.name()}; }}
 QSplitter::handle {{ background: {BG.name()}; }}

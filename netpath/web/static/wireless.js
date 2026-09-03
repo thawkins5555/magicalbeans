@@ -8,10 +8,10 @@
 (() => {
   const STATUS_COLOR = { online: 'var(--ok)', offline: 'var(--fail)',
     standby: 'var(--warn)', downloading_image: 'var(--warn)',
-    connected_image: 'var(--warn)', other: 'var(--faint)',
+    connected_image: 'var(--warn)', other: 'var(--line)',
     // Not a reported status — an admin marking, deliberately muted so an
     // AP someone already knows about doesn't read as a live failure.
-    out_of_service: 'var(--faint)' };
+    out_of_service: 'var(--line)' };
 
   const view = {
     controllers: [],
@@ -55,7 +55,7 @@
     const wireless = server.wireless || { counters: {} };
     const text = wireless.status || 'Poller stopped';
     App.el('wl-status').textContent = text;
-    App.el('wl-dot').style.background = wireless.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('wl-dot').style.background = wireless.running ? 'var(--ok)' : 'var(--line)';
     App.el('wl-toggle').textContent = wireless.running ? 'Stop poller' : 'Start poller';
     const counts = wireless.ap_counts || {};
     const c = wireless.counters || {};

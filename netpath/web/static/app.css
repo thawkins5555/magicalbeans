@@ -1,57 +1,7 @@
-/* The desktop palette, unchanged: dark instrument chrome with a light route
-   canvas. The canvas keeps its own variables because greys that work on black
-   have no contrast on white. */
-:root {
-  --bg: #0E1116;
-  --panel: #151A21;
-  --raised: #1B222B;
-  --hairline: #2A323D;
-  --grid: #222933;
-  --text: #DCE3EA;
-  --muted: #7C8794;
-  --faint: #4C5561;
-  --accent: #7AA2F7;
-  /* Light enough to read as a ring against every surface in this palette
-     (9.6:1 on --bg) and distinct from --accent, so a focused primary button
-     does not draw a ring in its own fill colour. */
-  --focus: #9EC1FF;
-  --ok: #3FB950;
-  --warn: #E3B341;
-  --fail: #F85149;
-  --blocked: #FF8A65;
-  --overrun: #4DB6AC;
-  --error: #A371F7;
-  --nodata: #1E242D;
-  /* The fill for "none of this yet" in a chart — never seen, available,
-     no samples. --hairline was being used for it, which is a border colour:
-     at 1.35:1 against the panel the remaining slice of an IPAM donut was
-     invisible, so a subnet with three addresses left looked identical to
-     one that was full. 3:1 against the panel, which is the floor for a
-     graphical object that carries meaning. */
-  --data-neutral: #3A4552;
-  /* Ticked-for-a-bulk-action rows. Solid rather than a translucent accent so
-     the tint is identical on the odd and even table stripes — the point is a
-     single unbroken bar across the row. --checked-strong is the same colour a
-     step further along, for a row that is both ticked and open in the detail
-     pane. */
-  --checked: #22304A;
-  --checked-strong: #2E4470;
-
-  --canvas: #FFFFFF;
-  --canvas-panel: #F4F6F9;
-  --canvas-hairline: #C9D2DD;
-  --canvas-grid: #E4E9F0;
-  --canvas-text: #161C24;
-  --canvas-muted: #55606E;
-  --canvas-faint: #8A94A2;
-  --canvas-accent: #2F5FC4;
-  --canvas-ok: #1B7F3B;
-  --canvas-warn: #9A6510;
-  --canvas-fail: #B3261E;
-
-  --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
-  --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
-}
+/* The interface. Every colour, text size and tracking below is a token
+   from tokens.css, which is linked before this file on every page and is
+   the only place a value is written down; tests/test_design_tokens.py
+   fails on a hex colour or a pixel font size appearing here. */
 
 * { box-sizing: border-box; }
 
@@ -81,23 +31,34 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--ui);
-  font-size: 13px;
+  /* --fs-sm is the interface size; rem, so the browser's text-size setting
+     and a wall-display density both scale everything from the root. */
+  font-size: var(--fs-sm);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
+
+/* One <main> around the twelve page sections, so the document has the
+   landmark the skip link jumps to. display: contents so it takes no part in
+   the body's column layout — the sections stay its direct flex children. */
+.views { display: contents; }
+/* The page a skip-link or a route lands on takes focus programmatically
+   (tabindex=-1, set by app.js); it should not draw a ring around the whole
+   view for doing so. */
+.page:focus { outline: none; }
 
 /* Off-screen until it takes focus, then a real target above everything. */
 .skip-link {
   position: absolute;
   left: -9999px;
   top: 0;
-  z-index: 100;
+  z-index: var(--z-skip);
   background: var(--raised);
   color: var(--text);
   border: 1px solid var(--accent);
   padding: 8px 14px;
-  font: 600 12px/1 var(--ui);
+  font: 600 var(--fs-xs)/1 var(--ui);
   text-decoration: none;
 }
 .skip-link:focus { left: 8px; top: 8px; }
@@ -124,22 +85,13 @@ body {
   margin-top: 10px;
   align-items: start;
 }
-.dash-tile {
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: 4px;
-  padding: 10px 12px;
-}
+/* A tile is a .card (dashboard.js says so in the markup) and takes its
+   surface, border, radius, padding and eyebrow from there. This used to be
+   a sixth panel implementation with its own h3 rule that differed from
+   .card h3 by 0.2px of letter-spacing and 2px of margin. */
 .dash-tile.wide { grid-column: span 2; }
 @media (max-width: 900px) { .dash-tile.wide { grid-column: span 1; } }
 .dash-tile.tone-bad { border-color: var(--fail); }
-.dash-tile h3 {
-  margin: 0 0 8px;
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 1.2px;
-  text-transform: uppercase;
-  color: var(--muted);
-}
 .dash-figures { display: flex; flex-wrap: wrap; gap: 16px; }
 .dash-figure {
   display: flex;
@@ -154,17 +106,22 @@ a.dash-figure:hover, a.dash-figure:focus-visible {
   outline: none;
 }
 a.dash-figure:focus-visible .dash-value { text-decoration: underline; }
-.dash-value { font: 600 22px/1 var(--mono); }
+.dash-value { font: 600 var(--fs-2xl)/1 var(--mono); }
 .dash-figure.ok .dash-value { color: var(--ok); }
 .dash-figure.warn .dash-value { color: var(--warn); }
 .dash-figure.fail .dash-value { color: var(--fail); }
-.dash-label { color: var(--muted); font-size: 11px; }
+.dash-label { color: var(--muted); font-size: var(--fs-xs); }
 .dash-sev-list { margin-top: 10px; display: flex; flex-direction: column; gap: 2px; }
 .dash-sev-row,
 .dash-row {
   display: flex;
+  /* The bar and the note below are flex-basis: 100% — they are meant to take
+     a second line under the name and value. Without wrap they took the FIRST
+     line instead, and the name (flex: 1, min-width 0) shrank to nothing:
+     every Storage headroom row with a bar showed a size and no name. */
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px;
+  gap: 2px 8px;
   padding: 3px 4px;
   border-radius: 3px;
   text-decoration: none;
@@ -177,12 +134,16 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 }
 .dash-sev-count { margin-left: auto; font-family: var(--mono); }
 .dash-row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dash-row-value { font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.dash-row-note { flex-basis: 100%; font-size: 11px; }
+.dash-row-value { flex: none; white-space: nowrap; font-family: var(--mono); font-size: var(--fs-xs); color: var(--muted); }
+.dash-row-note { flex-basis: 100%; font-size: var(--fs-xs); }
 .dash-bar {
   flex-basis: 100%;
   height: 4px;
-  background: var(--grid);
+  /* --data-neutral, not --grid: the track is the "not yet used" part of
+     the figure and has to be seen to be read. --grid on --panel is 1.19:1 —
+     the same invisible track the Settings meter had, rebuilt here while
+     that one was being fixed. */
+  background: var(--data-neutral);
   border-radius: 2px;
   overflow: hidden;
 }
@@ -218,8 +179,8 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   border-bottom: 2px solid transparent;
   color: var(--muted);
   padding: 10px 22px;
-  font: 600 12px/1 var(--ui);
-  letter-spacing: 0.8px;
+  font: 600 var(--fs-xs)/1 var(--ui);
+  letter-spacing: var(--track-tab);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -245,8 +206,8 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   border-bottom: 2px solid transparent;
   color: var(--muted);
   padding: 8px 16px;
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 0.6px;
+  font: 600 var(--fs-2xs)/1 var(--ui);
+  letter-spacing: var(--track-tab);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -274,7 +235,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
    device the hardest thing on the page to read. The name is a title, and
    the identity line is content, so both say so. */
 #nd-d-name {
-  font: 600 14px/1.3 var(--ui);
+  font: 600 var(--fs-md)/1.3 var(--ui);
   color: var(--text);
   letter-spacing: 0;
 }
@@ -282,7 +243,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
    line for a device that is not the selected one, and must look identical
    to the pane's. */
 #nd-d-summary, .nd-summary {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.6;
   color: var(--muted);
   margin: 2px 0 6px;
@@ -302,7 +263,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   color: var(--bg);
   border-radius: 9px;
   padding: 1px 7px;
-  font: 700 10px/1.4 var(--ui);
+  font: 700 var(--fs-2xs)/1.4 var(--ui);
 }
 /* A count on its own only ever said "there are some". These say how bad the
    worst one is, in the same three tones the rest of the application uses
@@ -314,13 +275,13 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .badge.sev-fail { background: var(--fail); color: var(--bg); }
 .badge.sev-warn { background: var(--warn); color: var(--bg); }
 .badge.sev-info { background: var(--accent); color: var(--bg); }
-.conn { color: var(--faint); font: 11px var(--mono); padding-right: 4px; }
+.conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: 4px; }
 .conn.user { color: var(--muted); }
 button.linkish {
   background: none;
   border: none;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 2px 8px;
   cursor: pointer;
 }
@@ -337,15 +298,15 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
   left: 50%;
   transform: translateX(-50%);
   top: 8px;
-  z-index: 40;
+  z-index: var(--z-stale);
   max-width: 80vw;
   background: var(--raised);
   border: 1px solid var(--fail);
   border-left: 4px solid var(--fail);
   color: var(--text);
   padding: 9px 16px;
-  font: 600 12px/1.4 var(--ui);
-  border-radius: 4px;
+  font: 600 var(--fs-xs)/1.4 var(--ui);
+  border-radius: var(--radius-sm);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 }
 
@@ -379,10 +340,10 @@ html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }
 button {
   background: var(--raised);
   border: 1px solid var(--hairline);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   padding: 5px 12px;
-  font: 13px var(--ui);
+  font: var(--fs-sm) var(--ui);
   cursor: pointer;
 }
 button:hover { border-color: var(--accent); }
@@ -392,8 +353,8 @@ button:hover { border-color: var(--accent); }
    disabled state has to carry. */
 button:disabled { color: var(--muted); border-color: var(--grid); cursor: default; }
 button:disabled:hover { border-color: var(--grid); }
-button.primary { background: var(--accent); color: #0E1116; border: none; font-weight: 600; }
-button.primary:hover { background: #97B6FF; }
+button.primary { background: var(--accent); color: var(--bg); border: none; font-weight: 600; }
+button.primary:hover { background: var(--accent-hover); }
 /* Declared after .primary on purpose. The two rules have equal specificity,
    so the earlier button:disabled lost on source order and a disabled
    primary kept its full accent fill — the most emphatic control on the bar
@@ -421,7 +382,7 @@ button.module-settings {
   font-weight: 600;
   padding: 5px 14px;
 }
-button.module-settings:hover { background: var(--accent); color: #0E1116; }
+button.module-settings:hover { background: var(--accent); color: var(--bg); }
 /* Same source-order trap as button.primary above: this rule set follows
    button:disabled at equal specificity, so a gear the account may not use
    kept its full accent outline and read as the most prominent control on
@@ -440,10 +401,10 @@ button.module-settings:disabled:hover {
 input, select, textarea {
   background: var(--raised);
   border: 1px solid var(--hairline);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   color: var(--text);
   padding: 4px 8px;
-  font: 13px var(--ui);
+  font: var(--fs-sm) var(--ui);
 }
 /* Focus you can see. This rule used to say `outline: none` and replace the
    ring with a one-pixel border-colour change; buttons, tabs and table rows
@@ -462,17 +423,6 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
    and on a full-bleed pane it would fall outside the scroll box entirely. */
 tr:focus-visible, td:focus-visible, .table-wrap:focus-visible { outline-offset: -2px; }
 
-/* Announcements for screen readers: present in the accessibility tree,
-   absent from the page. Not `display: none`, which would take it out of
-   both. */
-.sr-only {
-  position: absolute;
-  width: 1px; height: 1px;
-  margin: -1px; padding: 0; border: 0;
-  clip-path: inset(50%);
-  overflow: hidden;
-  white-space: nowrap;
-}
 input[readonly] { color: var(--muted); }
 label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 label.check { cursor: pointer; }
@@ -480,23 +430,23 @@ input[type=checkbox] { accent-color: var(--accent); }
 
 .section {
   color: var(--muted);
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 1.4px;
+  font: 600 var(--fs-2xs)/1 var(--ui);
+  letter-spacing: var(--track-wide);
 }
 /* --faint is 2.50:1 on --bg at 11px, roughly half of what AA asks for, and
    .hint is not decorative: it carries every device's IP address, the mute
    tag, alert counts and every empty state. --muted is 5.18:1. */
-.hint { color: var(--muted); font-size: 11px; }
+.hint { color: var(--muted); font-size: var(--fs-xs); }
 /* The IP under a device name is the network engineer's primary key and the
    first thing to disappear on a NOC wall screen: its own class, a size up
    from a hint, so it is not carried along by whatever .hint becomes next. */
-.ip-line { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.ip-line { color: var(--muted); font-size: var(--fs-xs); font-family: var(--mono); }
 .ip-line .muted-tag { font-family: var(--ui); }
 .hint.pad { padding: 2px 12px 6px; margin: 0; }
 .terms { font-family: var(--mono); padding: 0 12px 6px; }
 .terms b { color: var(--muted); font-weight: 600; }
 body.tiny .terms { display: none; }
-.stat { font-family: var(--mono); font-size: 12px; white-space: pre; }
+.stat { font-family: var(--mono); font-size: var(--fs-xs); white-space: pre; }
 .grow { flex: 1; }
 .zoom { min-width: 40px; text-align: center; }
 
@@ -541,7 +491,7 @@ body.tiny .terms { display: none; }
 .card {
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   padding: 10px 12px;
 }
 .card.strip {
@@ -567,11 +517,11 @@ body.tiny .terms { display: none; }
 .card h3 {
   margin: 0 0 6px;
   color: var(--muted);
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 1.4px;
+  font: 600 var(--fs-2xs)/1 var(--ui);
+  letter-spacing: var(--track-wide);
   text-transform: uppercase;
 }
-.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--faint); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
 
 /* Status said three ways at once: a shape, a colour and a word.
 
@@ -584,13 +534,13 @@ body.tiny .terms { display: none; }
    this came from; this makes it the rule and gives the three modules that
    had each inlined their own 8px dot one implementation to share. */
 .status { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
-.status-mark { flex: none; font-size: 9px; line-height: 1; font-style: normal; }
+.status-mark { flex: none; font-size: var(--fs-glyph); line-height: 1; font-style: normal; }
 .status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .status-ok   .status-mark { color: var(--ok); }
 .status-warn .status-mark { color: var(--warn); }
 .status-fail .status-mark { color: var(--fail); }
 .status-info .status-mark { color: var(--accent); }
-.status-none .status-mark { color: var(--faint); }
+.status-none .status-mark { color: var(--line); }
 
 /* -------------------------------------------------------------- netpath */
 .sidebar {
@@ -605,8 +555,8 @@ body.tiny .terms { display: none; }
 .sidebar h2 {
   margin: 0;
   color: var(--muted);
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 1.4px;
+  font: 600 var(--fs-2xs)/1 var(--ui);
+  letter-spacing: var(--track-wide);
   text-transform: uppercase;
 }
 .target-list {
@@ -615,7 +565,7 @@ body.tiny .terms { display: none; }
   padding: 4px;
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   flex: 1;
   min-height: 160px;
   overflow: auto;
@@ -625,11 +575,11 @@ body.tiny .terms { display: none; }
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   border: 1px solid transparent;
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 .target-list li:hover { background: var(--grid); }
 /* The active destination stays legible and bold whatever else has focus. */
@@ -639,13 +589,15 @@ body.tiny .terms { display: none; }
   font-weight: 700;
 }
 .target-list .name { color: var(--text); }
-.target-list .host { color: var(--muted); font-size: 11px; }
-.legend { color: var(--faint); font-size: 11px; margin: 0; }
+.target-list .host { color: var(--muted); font-size: var(--fs-xs); }
+/* This is the paragraph that decodes the whole texture vocabulary. It was
+   set in --faint at 2.5:1 — the least legible prose on the page. */
+.legend { color: var(--muted); font-size: var(--fs-xs); margin: 0; }
 
 /* Sidebar table rows (IPAM's subnets and DHCP servers) want the same weight
    .target-list already gives its <li> rows, but aren't inside one. */
 .name { color: var(--text); font-weight: 600; }
-.host { color: var(--muted); font-size: 11px; }
+.host { color: var(--muted); font-size: var(--fs-xs); }
 
 /* A subnet row: a small utilization donut beside its label, rather than a
    second column, so it reads as part of the row instead of a separate table
@@ -663,11 +615,11 @@ body.tiny .terms { display: none; }
   margin-bottom: 10px;
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   flex: none;
 }
-.subnet-detail-title { font: 600 13px/1.3 var(--ui); color: var(--text); margin-bottom: 6px; }
-.subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: 12px; margin-bottom: 4px; }
+.subnet-detail-title { font: 600 var(--fs-sm)/1.3 var(--ui); color: var(--text); margin-bottom: 6px; }
+.subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-xs); margin-bottom: 4px; }
 .legend-dot {
   display: inline-block;
   width: 9px;
@@ -700,7 +652,7 @@ body.tiny .terms { display: none; }
   min-height: 150px;
   background: var(--canvas);
   border: 1px solid var(--canvas-hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   overflow: hidden;
 }
 .canvas svg {
@@ -724,7 +676,7 @@ body.tiny .terms { display: none; }
    NetPath's own status lane (STATUS_H = 26 in netpath.js) rather than
    reading as a chart panel. Used by the Nodes device up/down timeline. */
 .canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: 8px; }
-.timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: 6px; }
+.timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: var(--radius); }
 .timeline svg { width: 100%; height: 100%; display: block; }
 
 /* -------------------------------------------------------------- netflow */
@@ -735,12 +687,12 @@ body.tiny .terms { display: none; }
 .pad-b { padding-bottom: 10px; }
 .pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pane.grow-pane { flex: 2; }
-.bars { flex: 1; overflow: auto; background: var(--panel); border-radius: 6px; padding: 6px; }
+.bars { flex: 1; overflow: auto; background: var(--panel); border-radius: var(--radius); padding: 6px; }
 .bar-row { position: relative; height: 24px; margin-bottom: 2px; }
 .bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; opacity: 0.55; }
 .bar-label, .bar-value {
   position: absolute; top: 0; line-height: 24px;
-  font-family: var(--mono); font-size: 12px;
+  font-family: var(--mono); font-size: var(--fs-xs);
 }
 .bar-label { left: 8px; color: var(--text); }
 .bar-value { right: 8px; color: var(--muted); }
@@ -750,12 +702,12 @@ body.tiny .terms { display: none; }
   overflow: auto;
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   min-height: 0;
 }
 .table-wrap.workers { flex: 1; min-height: 80px; margin: 0 12px; }
 .table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 12px 10px; }
-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
 th {
   position: sticky; top: 0;
   background: var(--raised);
@@ -769,7 +721,15 @@ th {
 td { padding: 4px 8px; border-bottom: 1px solid var(--grid); color: var(--text); }
 tr:nth-child(even) td { background: var(--raised); }
 tr.clickable { cursor: pointer; }
-tr.selected td { background: var(--hairline); }
+/* --selected, not --hairline: on the one row the operator is actually
+   reading, --hairline put every hint at 3.5:1. And a bar at the left edge,
+   so the selection survives greyscale and a colour-blind viewer — the tint
+   alone is one lightness step from the zebra stripe. On the first cell
+   only: an inset shadow on every td draws a stripe at each column divider
+   under table-layout: fixed, which is the mistake bulk-checked already
+   learned from below. */
+tr.selected td { background: var(--selected); }
+tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 /* A ticked checkbox tints the whole row. This used to be
    `box-shadow: inset 3px 0 0 var(--accent)`, which draws that bar on the left
    edge of EVERY cell — under table-layout: fixed that reads as a blue stripe
@@ -807,7 +767,7 @@ th.sortable:hover { color: var(--text); }
    nothing shifts sideways as the sort moves between columns. */
 th .sort-caret {
   margin-left: 6px;
-  font-size: 8px;
+  font-size: var(--fs-2xs);
   opacity: 0;
 }
 th.sort-asc, th.sort-desc { color: var(--text); }
@@ -819,7 +779,7 @@ th .grip {
   width: 7px;
   height: 100%;
   cursor: col-resize;
-  z-index: 1;
+  z-index: var(--z-sticky);
 }
 /* A visible resting tick between column headers — same reasoning as the
    pane dividers: a resize handle nobody can see might as well not exist. */
@@ -830,9 +790,9 @@ th .grip::after {
   bottom: 20%;
   right: 3px;
   width: 1px;
-  background: var(--faint);
+  background: var(--line);
 }
-th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
+th .grip:hover { background: var(--accent); opacity: 0.35; }
 
 /* --------------------------------------------------------------- syslog */
 .sev { display: inline-block; width: 62px; font-weight: 600; }
@@ -845,7 +805,7 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 #syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #nodes-table td.msg, #alerts-table td.msg { white-space: pre-wrap; word-break: break-word; }
-.took { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.took { font-family: var(--mono); font-size: var(--fs-xs); color: var(--dim); }
 
 /* ---------------------------------------------------------------- debug */
 .cats { display: inline-flex; gap: 10px; }
@@ -855,10 +815,10 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
   padding: 10px;
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   overflow: auto;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text);
   white-space: pre-wrap;
   min-width: 0;
@@ -867,31 +827,31 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 .cat-dns { color: var(--muted); }
 .cat-netflow { color: var(--ok); }
 .cat-ipam { color: var(--accent); }
-.cat-system { color: var(--faint); }
+.cat-system { color: var(--dim); }
 .cat-error { color: var(--fail); }
 
 /* ------------------------------------------------------------- settings */
 #page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px 16px; min-height: 0; }
 fieldset {
   border: 1px solid var(--hairline);
-  border-radius: 6px;
+  border-radius: var(--radius);
   background: var(--panel);
   margin: 0 0 14px;
   padding: 10px 14px 14px;
 }
 legend {
   color: var(--muted);
-  font: 600 11px/1 var(--ui);
-  letter-spacing: 1.2px;
+  font: 600 var(--fs-2xs)/1 var(--ui);
+  letter-spacing: var(--track-wide);
   padding: 0 4px;
 }
 fieldset label { display: flex; margin: 8px 0; gap: 8px; align-items: center; }
 fieldset label input:not([type=checkbox]) { width: 220px; }
-fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: 12px; }
+fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: var(--fs-xs); }
 fieldset .hint { margin: 8px 0 0; }
 .usage {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--muted);
   margin-left: 10px;
   white-space: nowrap;
@@ -908,7 +868,7 @@ fieldset .hint { margin: 8px 0 0; }
   width: 90px;
   height: 6px;
   border-radius: 3px;
-  background: var(--grid);
+  background: var(--data-neutral);   /* the track has to be visible to read */
   margin: 0 6px;
   vertical-align: middle;
   overflow: hidden;
@@ -924,10 +884,10 @@ fieldset .hint { margin: 8px 0 0; }
   background: var(--panel); border-left: 1px solid var(--hairline);
 }
 #page-settings .scroll::-webkit-scrollbar-thumb {
-  background: var(--faint); border-radius: 5px; border: 2px solid var(--panel);
+  background: var(--line); border-radius: 5px; border: 2px solid var(--panel);
 }
 #page-settings .scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
-#page-settings .scroll { scrollbar-color: var(--faint) var(--panel); scrollbar-width: auto; }
+#page-settings .scroll { scrollbar-color: var(--line) var(--panel); scrollbar-width: auto; }
 
 /* ------------------------------------------------------------ splitters */
 [data-splitter] { display: flex; min-height: 0; min-width: 0; flex: 1; }
@@ -944,17 +904,18 @@ fieldset .hint { margin: 8px 0 0; }
   flex: none;
   background: transparent;
   position: relative;
-  z-index: 2;
+  z-index: var(--z-divider);
 }
 .rows > .divider { height: 8px; cursor: row-resize; }
 .cols > .divider { width: 8px; cursor: col-resize; }
 /* The grab area is wider than the visible line, so it is easy to hit.
-   --faint, not --hairline: a resize handle nobody can see might as well
-   not exist. */
+   --line, not --hairline: a resize handle nobody can see might as well
+   not exist, and --line is the tone that clears 3:1 on every surface a
+   divider sits between. */
 .divider::after {
   content: '';
   position: absolute;
-  background: var(--faint);
+  background: var(--line);
   border-radius: 2px;
   transition: background 120ms;
 }
@@ -967,7 +928,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
 /* --------------------------------------------------------- idle banner */
 .idle-banner {
   position: fixed;
-  z-index: 60;
+  z-index: var(--z-idle);
   bottom: 20px;
   left: 50%;
   transform: translateX(-50%);
@@ -976,19 +937,19 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   gap: 14px;
   background: var(--raised);
   border: 1px solid var(--warn);
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
   padding: 10px 14px;
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
 }
 .idle-banner button {
   background: var(--warn);
-  color: #1a1a1a;
+  color: var(--bg);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 5px 10px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   cursor: pointer;
 }
@@ -1009,15 +970,15 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
 
 .tooltip {
   position: fixed;
-  z-index: 50;
+  z-index: var(--z-tooltip);
   pointer-events: none;
   background: var(--raised);
   border: 1px solid var(--hairline);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   padding: 7px 9px;
   color: var(--text);
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.45;
   white-space: pre;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
@@ -1027,7 +988,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
 /* --------------------------------------------------------------- density */
 /* Everything below keeps a laptop usable: the panes are resizable, but the
    defaults should already fit rather than needing to be dragged first. */
-body.compact { font-size: 12px; }
+body.compact { font-size: var(--fs-xs); }
 body.compact .bar { padding: 5px 10px; }
 body.compact .tab { padding: 7px 16px; }
 body.compact .card { padding: 7px 10px; }
@@ -1061,40 +1022,39 @@ body.login-page {
   width: 340px;
   background: var(--panel);
   border: 1px solid var(--hairline);
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
   padding: 26px 28px 22px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
 }
 .login-box h1 {
   margin: 0;
-  font-size: 20px;
-  letter-spacing: 0.5px;
+  font-size: var(--fs-xl);
+  letter-spacing: var(--track-tab);
 }
 .login-box h1 { margin-bottom: 18px; }
 .login-box form { display: flex; flex-direction: column; gap: 4px; }
 .login-box label {
   color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.6px;
+  font-size: var(--fs-2xs);
+  letter-spacing: var(--track-wide);
   text-transform: uppercase;
   margin-top: 10px;
 }
-.login-box input { padding: 8px 10px; font-size: 14px; }
-.login-box button { margin-top: 18px; padding: 9px; font-size: 14px; }
-.login-box .err { margin: 12px 0 0; font-size: 12px; }
-#login-note { margin-top: 18px; }
+.login-box input { padding: 8px 10px; font-size: var(--fs-md); }
+.login-box button { margin-top: 18px; padding: 9px; font-size: var(--fs-md); }
+.login-box .err { margin: 12px 0 0; font-size: var(--fs-xs); }
 
 /* ---------------------------------------------------------------- modal */
 .modal {
   position: fixed; inset: 0;
   background: rgba(0, 0, 0, 0.55);
   display: flex; align-items: center; justify-content: center;
-  z-index: 20;
+  z-index: var(--z-modal);
 }
 .modal-box {
   background: var(--bg);
   border: 1px solid var(--hairline);
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
   padding: 18px 20px;
   min-width: 420px;
   max-width: 760px;
@@ -1119,11 +1079,11 @@ body.login-page {
   width: 16px; height: 16px; padding: 0; margin-left: 4px;
   border-radius: 50%; border: 1px solid var(--hairline);
   background: transparent; color: var(--muted);
-  font-size: 11px; font-weight: 700; line-height: 1;
+  font-size: var(--fs-2xs); font-weight: 700; line-height: 1;
   cursor: pointer; vertical-align: middle;
 }
 .help-link:hover, .help-link:focus { color: var(--accent); border-color: var(--accent); }
-.modal.help { z-index: 30; }
+.modal.help { z-index: var(--z-help); }
 .modal.help .modal-box { min-width: 360px; max-width: 600px; }
 .help-body p { margin: 0 0 10px; line-height: 1.45; }
 .help-body ul { margin: 0 0 10px 18px; padding: 0; }
@@ -1132,7 +1092,7 @@ body.login-page {
    Enter submits it (see App.modal), which put one element between
    .modal-box and the labels this rule reaches. */
 .modal-box.wide > .modal-form > label { display: flex; }
-.modal-box h2 { margin: 0 0 12px; font-size: 15px; }
+.modal-box h2 { margin: 0 0 12px; font-size: var(--fs-lg); }
 /* The interface dialog's parent device name: its own line above the port
    name and inside the same h2, so it is the same size rather than dropping
    to hint text. Dimmer only so the port stays the subject of the dialog. */
@@ -1145,12 +1105,12 @@ body.login-page {
   position: sticky;
   top: 0;
   background: var(--bg);
-  z-index: 1;
+  z-index: var(--z-sticky);
 }
 .modal-box .row button { flex: none; }
 .modal-box pre {
-  background: var(--panel); border: 1px solid var(--hairline); border-radius: 4px;
-  padding: 10px; font-family: var(--mono); font-size: 12px; overflow: auto;
+  background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+  padding: 10px; font-family: var(--mono); font-size: var(--fs-xs); overflow: auto;
   white-space: pre-wrap;
 }
 .modal-box fieldset { margin-bottom: 10px; }
@@ -1164,10 +1124,10 @@ body.login-page {
   padding: 8px 10px;
   border: 1px solid var(--fail);
   border-left-width: 3px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--panel);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 .modal-box .row.top + .modal-error { margin: 0 0 12px; }
 /* A field App.requireFields found empty. The border alone would be colour
@@ -1187,7 +1147,7 @@ body.login-page {
   padding-top: 12px;
   border-top: 1px solid var(--hairline);
 }
-.discard-prompt p { margin: 0 0 10px; font-size: 12px; }
+.discard-prompt p { margin: 0 0 10px; font-size: var(--fs-xs); }
 .discard-prompt .row { justify-content: flex-end; }
 .discard-prompt .row button { flex: none; }
 
@@ -1202,7 +1162,7 @@ body.login-page {
   position: fixed;
   right: 16px;
   bottom: 16px;
-  z-index: 25;
+  z-index: var(--z-toast);
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -1216,10 +1176,10 @@ body.login-page {
   padding: 10px 14px;
   border: 1px solid var(--hairline);
   border-left: 3px solid var(--muted);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--raised);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 1.45;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }

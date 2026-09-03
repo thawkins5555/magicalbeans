@@ -7,6 +7,7 @@
 <!-- Every load used to 404 on /favicon.ico. SVG so one file covers
      every size a browser or a pinned tab asks for. -->
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/tokens.css">
 <link rel="stylesheet" href="/app.css">
 <!-- Marks which tab should paint first, before <body> has a single byte of
      content to render — see app.css's html[data-tab] rules and boot.js.
@@ -22,7 +23,11 @@
 <!-- The document has to start with a name and a way past the twelve-item tab
      bar; neither is worth pixels on a NOC screen, so both are sr-only. -->
 <h1 class="sr-only">SappiWhere network monitor</h1>
-<a class="skip-link" href="#tabs">Skip to the current view</a>
+<!-- #view is the <main> around the page sections below. This used to say
+     #tabs — the twelve-item nav the link exists to skip. app.js moves focus
+     to the active page on activation, because <main> is display: contents
+     and has no box of its own to focus. -->
+<a class="skip-link" href="#view">Skip to the current view</a>
 
 <nav id="tabs" role="tablist" aria-label="Views">
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
@@ -46,6 +51,10 @@
   <span id="conn" class="conn" role="status" aria-live="polite">connecting…</span>
 </nav>
 
+<!-- The one main landmark, around all twelve views; exactly one is shown at
+     a time. Before this the only <main> in the document was inside the
+     NetPath page, so eleven of the twelve views had no landmark at all. -->
+<main id="view" class="views">
 <!-- =========================== DASHBOARD ============================ -->
 <section id="page-dashboard" class="page">
   <div class="dash-scroll pad-x pad-b" style="padding-top:14px">
@@ -320,7 +329,7 @@
   </aside>
   <div class="divider"></div>
 
-  <main class="content pane" data-grow="4">
+  <div class="content pane" data-grow="4">
    <div class="rows" data-splitter="netpath-body">
     <div class="pane" data-grow="3">
     <header class="bar">
@@ -359,7 +368,7 @@
     </p>
     </div>
    </div>
-  </main>
+  </div>
  </div>
 </section>
 
@@ -582,7 +591,7 @@
       <p class="hint pad-x" style="padding-top:8px">
         <span style="color:var(--ok)">&#9679;</span> alive &nbsp;
         <span style="color:var(--warn)">&#9679;</span> seen before, now down &nbsp;
-        <span style="color:var(--faint)">&#9679;</span> never seen
+        <span style="color:var(--line)">&#9679;</span> never seen
       </p>
     </aside>
     <div class="divider"></div>
@@ -999,6 +1008,7 @@
     <button id="set-apply" class="primary" data-requires-write="settings">Apply changes</button>
   </div>
 </section>
+</main>
 
 <!-- Where anything that only mutated a button label or a status line
      also gets said out loud. One region for the whole application:

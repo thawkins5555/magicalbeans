@@ -2682,6 +2682,19 @@ const App = (() => {
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') requestCloseModal();
     };
+    /* The skip link names <main id="view">, which is display: contents and
+       so has no box to take focus. What the operator means is "the page I
+       am looking at", so focus goes to the active section — made focusable
+       for the purpose — and the next Tab lands on its first control rather
+       than back on the twelve tabs the link exists to skip. */
+    const skip = document.querySelector('.skip-link');
+    if (skip) skip.addEventListener('click', (event) => {
+      const page = document.querySelector('.page.active');
+      if (!page) return;
+      event.preventDefault();
+      page.tabIndex = -1;
+      page.focus({ preventScroll: true });
+    });
     document.addEventListener('keydown', trapTab);
 
     /* 1-9 select the first nine visible tabs and '/' focuses the current

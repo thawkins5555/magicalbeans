@@ -23,8 +23,7 @@
      name for the rest. Eight rather than ten because eight is near the
      limit of what anyone matches against a legend, and the server already
      folds the ninth series onwards into "Other". */
-  const SERIES = ['#5B8DEB', '#CF7638', '#2FA886', '#B0881A',
-                  '#D1609A', '#4F9A3A', '#8F76E8', '#DC5A5A'];
+  const SERIES = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => `var(--cat-${n})`);
   // "Other", and anything past the eighth series: deliberately the neutral
   // that means "nothing of its own" in the donuts too, not a ninth hue.
   const OTHER = 'var(--data-neutral)';
@@ -174,7 +173,7 @@
     if (!data || !data.times.length || !data.series.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 13,
+        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
       }, 'No flows in this window'));
       return;
     }
@@ -197,8 +196,8 @@
         x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)',
       }));
       svg.appendChild(App.svgNode('text', {
-        x: plot.x - 8, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        x: plot.x - 8, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, rateLabel(axisMax * fraction)));
     }
 
@@ -228,8 +227,8 @@
     for (let slot = 0; slot < count; slot += tickEvery) {
       const x = plot.x + slot * stepX;
       svg.appendChild(App.svgNode('text', {
-        x, y: plot.y + plot.h + 15, 'text-anchor': 'middle', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        x, y: plot.y + plot.h + 15, 'text-anchor': 'middle', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, App.stamp(data.times[slot], span)));
     }
 
@@ -244,7 +243,7 @@
       }));
       svg.appendChild(App.svgNode('text', {
         x: legendX + 14, y: height - legendH + 14, fill: 'var(--muted)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, label));
       legendX += width_;
     });
@@ -483,7 +482,7 @@
         routeCell.appendChild(btn);
       } else if (routeCell) {
         routeCell.textContent = '\u2014';
-        routeCell.style.color = 'var(--faint)';
+        routeCell.style.color = 'var(--dim)';
         routeCell.title = 'No NetPath target has traced a route to this destination';
       }
       const tip = [
@@ -649,7 +648,7 @@
     status.onmouseleave = App.hideTooltip;
 
     App.el('nf-dot').style.background = collector.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--faint)');
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
     App.el('nf-toggle').textContent = collector.running
       ? 'Stop collector' : 'Start collector';
 

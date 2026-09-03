@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.42.0 — One place the colours live](#4420--one-place-the-colours-live)
 - [4.41.0 — A dialog that says no](#4410--a-dialog-that-says-no)
 - [4.40.0 — The update button works again](#4400--the-update-button-works-again)
 - [4.39.0](#4390)
@@ -104,6 +105,76 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.42.0 — One place the colours live
+
+The interface had a palette but not a system: eleven `--` colours in
+`app.css`, one of which (`--faint`, 2.5:1) was doing dividers, grips, the
+scrollbar thumb *and* prose — including the paragraph that explains the
+colour-blind-safe texture vocabulary — ten pixel font sizes with one `rem`
+in the whole file, five letter-spacings with no rule, and a second copy of
+every hex in `theme.py` that had already drifted (its chart palette was ten
+colours to the web's eight). Measured across all twelve tabs, 19 text/
+background pairs failed WCAG AA. After this release, one does, and that one
+is a glyph.
+
+- **`tokens.css`.** Every colour, text size, tracking, radius, shadow and
+  stacking level, in one file, each tone with the contrast it was measured
+  at written beside it. `app.css`, `ssh.css` and every module script read
+  tokens by name and write no hex or pixel size of their own — a test fails
+  if one appears. Linked before `app.css` from all three pages and served
+  before sign-in, since the login page needs it.
+- **Three text tones, and the dimmest passes.** `--muted` was 4.39:1 on a
+  table header or a zebra stripe — under AA for every column heading and
+  every hint on alternate rows; it is 5.6:1 now. `--faint` is gone. What was
+  structural about it is `--line` (3.1:1 on the darkest surface a grip sits
+  on); what was prose is `--dim` (4.6:1) or `--muted`. Thirty-nine uses
+  across the stylesheet and thirteen scripts were re-pointed one at a time,
+  by what each one is: an axis label, an empty-state sentence, a stopped
+  collector's dot, a status line on Settings.
+- **`--data-neutral` is actually 3:1 now.** 4.36.2 introduced it as the
+  visible "none of this yet" fill and documented it as 3:1 against the
+  panel. It measured 1.79:1. The value is corrected, the claim is now
+  computed by a test, and the same token replaces `--grid` as the track of
+  the Settings storage meters (UI-012's fix had left the track at 1.19:1)
+  and of the Dashboard bars, which had rebuilt that exact invisible track
+  while the original was being fixed.
+- **A type scale, in rem.** Seven sizes replace ten pixel values, so the
+  browser's own text-size setting is honoured and a wall-display density can
+  scale everything from the root. The one visible change: hints are 12px,
+  up from 11 — the floor for prose. The 8px sort caret is 11px. Two
+  trackings replace five. SVG chart labels take the same tokens through
+  their presentation attributes, which resolve `var()` exactly as `fill`
+  already did.
+- **The selected row is a selected row.** Its tint was `--hairline`, which
+  put `--muted` at 3.5:1 on the one row the operator is reading, and one
+  lightness step from the zebra stripe. It has its own token now (4.9:1)
+  and an accent bar at its left edge, so selection is not carried by tint
+  alone.
+- **`theme.py` matches, and stays matched.** The desktop console's palette
+  carries the same values under the same names (`TEXT_MUTED` is `--muted`,
+  `LINE` is `--line`), its chart series are the web's eight hues, and
+  `tests/test_design_tokens.py` fails if the two drift.
+- **What the Dashboard brought with it.** Its tile was a sixth panel
+  implementation with an eyebrow rule differing from `.card h3` by 0.2px of
+  letter-spacing; it is a `.card`. Its collector rows drew a hand-rolled dot
+  in the window `App.statusMark` had replaced three; they use the mark, with
+  the word. Its 22px figure and 11px labels are on the scale. And its
+  Storage headroom rows have names again: `.dash-row` never wrapped, so the
+  full-width bar took the first line and squeezed the name to nothing —
+  every row with a bar showed a size and no label.
+- **The skip link skips something.** It pointed at `#tabs` — the twelve-item
+  nav it exists to bypass — and the only `<main>` in the document was inside
+  the NetPath page, so eleven views had no landmark. One `<main>` now wraps
+  the views; the skip link lands focus on the active page, and the next Tab
+  reaches its first control.
+- Two small removals: `.sr-only` was defined twice with different property
+  sets, and `#login-note` styled an element `login.html` does not have.
+
+What is left, named: the `○` status mark for "no data" measures 3.38:1 and
+the walk flags it because it contains a text node. It is a graphical mark,
+held to the 3:1 non-text floor, and it clears that on every surface it is
+drawn on.
 
 ### 4.41.0 — A dialog that says no
 

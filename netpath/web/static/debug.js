@@ -14,7 +14,7 @@
   };
   const STATUS_COLOR = {
     ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--fail)',
-    blocked: 'var(--blocked)', error: 'var(--error)', none: 'var(--faint)',
+    blocked: 'var(--blocked)', error: 'var(--error)', none: 'var(--line)',
   };
 
   const view = {

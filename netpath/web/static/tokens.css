@@ -1,0 +1,189 @@
+/* The design tokens: every colour, text size and letter-spacing the
+   interface uses, in one file, with the contrast each pair was measured at.
+
+   This is the authority. app.css, ssh.css and the module scripts read these
+   by name and never write a hex colour or a pixel font size of their own;
+   theme.py carries the same values for the desktop console and
+   tests/test_design_tokens.py fails if the two drift, or if any pair below
+   falls under the ratio written beside it. Linked before app.css from every
+   page — index.html, login.html and ssh.html — and listed in PUBLIC_PATHS
+   (server.py) because the sign-in page needs it before there is a session.
+
+   Contrast figures are WCAG 2.x relative-luminance ratios. AA asks 4.5:1 of
+   text under 18.66px bold or 24px regular — which is every line of text in
+   this product — and 3:1 of a graphical object or control boundary that
+   carries meaning. A tone is named for its ROLE, not its value: a light
+   theme later redefines the values under :root[data-theme] and nothing else
+   has to move. */
+:root {
+  /* ------------------------------------------------------------ surfaces
+     Four steps of dark, each one a hairline apart. --bg is the page and the
+     dialog; --panel is a card on it; --raised is a table's alternate stripe
+     and its header, a button and a field; --hairline is the border between
+     any two of them. --grid is the faint rule inside a table body. */
+  --bg: #0E1116;
+  --panel: #151A21;
+  --raised: #1B222B;
+  --hairline: #2A323D;
+  --grid: #222933;
+
+  /* ---------------------------------------------------------- text tones
+     Three tiers, and the dimmest still passes AA on the darkest surface it
+     is allowed on.
+
+       --text   14.6:1 on --bg, 12.4:1 on --raised     the content
+       --muted   6.6:1 on --bg,  5.6:1 on --raised     labels, hints, headers
+       --dim     5.2:1 on --bg,  4.6:1 on --raised     metadata: timings,
+                                                       axis labels, the
+                                                       version in the corner
+
+     --muted was #7C8794, which measured 4.39:1 on --raised — under AA for
+     every table header and every hint on a zebra stripe. There used to be a
+     fourth tier, --faint (#4C5561, 2.5:1), and it was used as text: the
+     legend explaining the whole colour-blind-safe texture vocabulary was set
+     in it. It no longer exists. What was structural about it is --line,
+     below; what was prose is --dim or --muted. */
+  --text: #DCE3EA;
+  --muted: #8F9AA7;
+  --dim: #808B98;
+
+  /* ------------------------------------------------------------ structure
+     Not text, but must still be seen: pane dividers, column grips, the ring
+     of an empty status mark, the scrollbar thumb. 3.1:1 on --raised, which
+     is the darkest surface a grip sits on (a table header). */
+  --line: #646E7C;
+  /* The fill for "none of this yet" in a chart — the remaining capacity of
+     a subnet, the track of a storage meter, the eighth-and-onwards NetFlow
+     series. 3.05:1 on --panel. Its predecessor (#3A4552) was documented as
+     3:1 and measured 1.79:1; the number here is computed by the test. */
+  --data-neutral: #606A78;
+
+  /* ------------------------------------------------------------ emphasis */
+  --accent: #7AA2F7;
+  --accent-hover: #97B6FF;   /* a primary button under the pointer */
+  /* Light enough to read as a ring against every surface in this palette
+     (9.6:1 on --bg) and distinct from --accent, so a focused primary button
+     does not draw a ring in its own fill colour. */
+  --focus: #9EC1FF;
+
+  /* ------------------------------------------------------------- meaning
+     Each of these means ONE thing, and the shape drawn with it carries the
+     same meaning (App.statusMark, the status textures), so the colour is
+     never the only signal.
+       --ok       healthy, running, up
+       --warn     degraded, approaching a limit, needs a look
+       --fail     down, refused, error — and the badge fill for the worst
+       --blocked  a hop that answered "unreachable" (NetPath only)
+       --overrun  a trace skipped because the previous one was still running
+       --error    a probe that itself failed (NetPath only)
+       --nodata   a chart cell with no sample in it
+     All four text-carrying tones clear 4.5:1 on --bg. */
+  --ok: #3FB950;
+  --warn: #E3B341;
+  --fail: #F85149;
+  --blocked: #FF8A65;
+  --overrun: #4DB6AC;
+  --error: #A371F7;
+  --nodata: #1E242D;
+
+  /* ------------------------------------------------------------ selection
+     Two different facts about a row, two different tints, and they compose:
+       --selected         open in the detail pane (one row at a time)
+       --checked          ticked for a bulk action (any number)
+       --checked-strong   both at once
+     --selected is a blue-grey a step off --raised rather than the old
+     --hairline, which put --muted at 3.5:1 on the one row the operator is
+     reading; it is 4.9:1 here. The selected row also carries an accent bar
+     at its left edge (app.css), so selection is not carried by tint alone. */
+  --selected: #1E2837;
+  --checked: #22304A;
+  --checked-strong: #2E4470;
+
+  /* ------------------------------------------------- categorical (charts)
+     Eight hues for stacked NetFlow series, chosen for separation under
+     protanopia simulation as well as in normal vision (netflow.js documents
+     the ΔE budget). Adjacent bands are the pairs the eye compares; the
+     legend and tooltip carry a swatch for the rest. A ninth series onwards
+     is --data-neutral, not a ninth hue. */
+  --cat-1: #5B8DEB;
+  --cat-2: #CF7638;
+  --cat-3: #2FA886;
+  --cat-4: #B0881A;
+  --cat-5: #D1609A;
+  --cat-6: #4F9A3A;
+  --cat-7: #8F76E8;
+  --cat-8: #DC5A5A;
+
+  /* -------------------------------------------------------- route canvas
+     NetPath draws its route on white on purpose — it is the pane addresses
+     are read off, and it prints. Greys that work on black have no contrast
+     on white, so it has its own set. */
+  --canvas: #FFFFFF;
+  --canvas-panel: #F4F6F9;
+  --canvas-hairline: #C9D2DD;
+  --canvas-grid: #E4E9F0;
+  --canvas-text: #161C24;
+  --canvas-muted: #55606E;
+  --canvas-faint: #8A94A2;
+  --canvas-accent: #2F5FC4;
+  --canvas-ok: #1B7F3B;
+  --canvas-warn: #9A6510;
+  --canvas-fail: #B3261E;
+
+  /* ------------------------------------------------------------- type
+     Seven sizes, in rem so the browser's own text-size setting is honoured
+     and so a wall-display density can scale the whole interface from one
+     root value. The pixel figures are at the default 16px root.
+
+       --fs-2xs  11px  eyebrows only: uppercase, letter-spaced, 600 weight
+                       (section titles, sub-tabs, legends) and chart axis
+                       labels. Never a sentence.
+       --fs-xs   12px  the floor for prose: hints, table bodies, metadata
+       --fs-sm   13px  the interface itself: body, buttons, fields
+       --fs-md   14px  a pane's title
+       --fs-lg   15px  a dialog's heading
+       --fs-xl   20px  the wordmark on the sign-in page
+       --fs-2xl  22px  a dashboard figure
+
+     Before this there were ten pixel sizes and one rem in the stylesheet.
+     Hints were 11px; they are 12px now, which is the one visible change.
+     --fs-glyph is not a text size: it is the ●▲■◆○ status marks, sized to
+     sit in a 12px line, and nothing else may use it. */
+  --fs-2xs: 0.6875rem;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-md: 0.875rem;
+  --fs-lg: 0.9375rem;
+  --fs-xl: 1.25rem;
+  --fs-2xl: 1.375rem;
+  --fs-glyph: 0.5625rem;
+
+  /* Two trackings, in em so they scale with the size they are applied to.
+     There were five pixel values, spread from 0.5 to 1.4 with no rule. */
+  --track-wide: 0.12em;   /* uppercase eyebrows */
+  --track-tab: 0.06em;    /* tab and sub-tab labels, the wordmark */
+
+  --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
+
+  /* --------------------------------------------------------- shape, depth
+     Three radii: a control, a panel, a dialog. One shadow, for the things
+     that float — a dialog, a toast, the sign-in card. */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.5);
+
+  /* ------------------------------------------------------------ stacking
+     Every fixed layer, in order, so nothing is ever given a z-index by
+     guessing a number bigger than the last one. */
+  --z-sticky: 1;      /* table headers, a dialog's top button row */
+  --z-divider: 2;     /* pane splitters, over the panes they separate */
+  --z-modal: 20;
+  --z-toast: 25;      /* over a dialog: its action is what usually toasts */
+  --z-tooltip: 50;    /* over everything a pointer can rest on, dialogs included */
+  --z-help: 30;       /* the ? panel opens above the dialog it explains */
+  --z-stale: 40;      /* "the server has gone away" banner */
+  --z-idle: 60;       /* the sign-out countdown */
+  --z-skip: 100;      /* the skip link, when it has focus */
+}

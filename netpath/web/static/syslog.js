@@ -2,7 +2,7 @@
    and the full record for whichever one is selected. */
 (() => {
   const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
-                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--faint)'];
+                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--data-neutral)'];
   const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
@@ -70,7 +70,7 @@
     if (!data || !data.buckets.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 13,
+        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
       }, 'No messages in this window'));
       return;
     }
@@ -89,8 +89,8 @@
         x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)',
       }));
       svg.appendChild(App.svgNode('text', {
-        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, String(Math.round(peak * fraction))));
     }
 
@@ -143,8 +143,8 @@
       if (index % every) return;
       svg.appendChild(App.svgNode('text', {
         x: plot.x + index * slotWidth + slotWidth / 2, y: height - 6,
-        'text-anchor': 'middle', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        'text-anchor': 'middle', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, App.stamp(bucket.t0, view.t1 - view.t0)));
     });
   }
@@ -373,7 +373,7 @@
     status.onmouseleave = App.hideTooltip;
 
     App.el('sl-dot').style.background = syslog.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--faint)');
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
     App.el('sl-toggle').textContent = syslog.running
       ? 'Stop collector' : 'Start collector';
     const c = syslog.counters || {};

@@ -64,7 +64,7 @@
     const server = App.state.serverState || {};
     const worker = server.configrx || { counters: {} };
     App.el('cx-status').textContent = worker.status || 'Worker stopped';
-    App.el('cx-dot').style.background = worker.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('cx-dot').style.background = worker.running ? 'var(--ok)' : 'var(--line)';
     App.el('cx-toggle').textContent = worker.running ? 'Stop worker' : 'Start worker';
     const c = worker.counters || {};
     const parts = [`${c.backups || 0} backup(s) run`, `${c.changed || 0} changed`,

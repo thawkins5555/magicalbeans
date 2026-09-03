@@ -189,7 +189,7 @@
       dot.className = 'dot';
       dot.style.background = target.status === 'none'
         ? 'transparent' : STATUS_COLOR[target.status];
-      if (target.status === 'none') dot.style.border = '1px solid var(--faint)';
+      if (target.status === 'none') dot.style.border = '1px solid var(--line)';
       // The dot was the only signal of a destination's state, and three of
       // the six colours are the same khaki to a deuteranope. The word goes
       // in the title for a mouse and in an sr-only span for everything else.
@@ -201,7 +201,7 @@
       const text = document.createElement('span');
       text.innerHTML = `<div class="name">${escape(target.label)}` +
                        (target.hop_probe_enabled
-                         ? ' <span title="Continuous per-hop probing is on for this destination" style="color:var(--accent);font-size:9px;font-weight:700;">MTR</span>'
+                         ? ' <span title="Continuous per-hop probing is on for this destination" style="color:var(--accent);font-size:var(--fs-2xs);font-weight:700;">MTR</span>'
                          : '') +
                        `</div><div class="host">${escape(target.host)}</div>`;
       li.append(dot, spoken, text);
@@ -391,7 +391,7 @@
         && view.pinned ? 'No trace recorded near that time.' : 'No traces in this window.';
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--canvas-faint)', 'font-size': 13,
+        fill: 'var(--canvas-faint)', 'font-size': 'var(--fs-sm)',
       }, message));
       return;
     }
@@ -446,7 +446,7 @@
       // starts at -33 and a fixed -30 label landed inside the box.
       nodeLayer.appendChild(App.svgNode('text', {
         x, y: y - 8, fill: 'var(--canvas-faint)',
-        'font-family': 'var(--mono)', 'font-size': 10, 'font-weight': 700,
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)', 'font-weight': 700,
       }, `HOP ${slot.ttl}`));
       for (const key of keys) {
         const node = byKey[key];
@@ -468,7 +468,7 @@
       }));
       tab.appendChild(App.svgNode('text', {
         x: left + w / 2, y: -42, 'text-anchor': 'middle',
-        fill: 'var(--canvas-faint)', 'font-family': 'var(--mono)', 'font-size': 10,
+        fill: 'var(--canvas-faint)', 'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, `${end - start + 1} silent hops — click to collapse`));
       tab.onclick = () => {
         if (view.dragMoved) return;
@@ -574,7 +574,7 @@
       ? '—' : `${node.rtt.toFixed(1)} ms`, 11, 'var(--canvas-muted)');
     const pct = App.svgNode('text', {
       x: NODE_W - 10, y: 54, 'text-anchor': 'end', fill: 'var(--canvas-faint)',
-      'font-family': 'var(--mono)', 'font-size': 11,
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-xs)',
     }, `${Math.round(node.share * 100)}%`);
     g.appendChild(pct);
 
@@ -811,13 +811,13 @@
     const peak = data ? Math.max(...data.buckets.map((b) => b.avg_rtt || 0), 0) : 0;
     const label = (lane, title, scale) => {
       svg.appendChild(App.svgNode('text', {
-        x: lane.x, y: lane.y - 4, fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10, 'font-weight': 700,
+        x: lane.x, y: lane.y - 4, fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)', 'font-weight': 700,
       }, title));
       if (scale) {
         svg.appendChild(App.svgNode('text', {
           x: lane.x + lane.w, y: lane.y - 4, 'text-anchor': 'end',
-          fill: 'var(--faint)', 'font-family': 'var(--mono)', 'font-size': 10,
+          fill: 'var(--dim)', 'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
         }, scale));
       }
       svg.appendChild(App.svgNode('line', {
@@ -906,8 +906,8 @@
     for (let ts = Math.ceil(t0 / step) * step; ts <= t1; ts += step) {
       const x = xFor(ts);
       svg.appendChild(App.svgNode('text', {
-        x, y: height - 6, 'text-anchor': 'middle', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10,
+        x, y: height - 6, 'text-anchor': 'middle', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, App.stamp(ts, span)));
     }
 
@@ -1006,7 +1006,7 @@
     }));
     svg.appendChild(App.svgNode('text', {
       x: lane.x + 6, y: y - 3, fill: 'var(--warn)',
-      'font-family': 'var(--mono)', 'font-size': 9,
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
     }, text));
   }
 

@@ -312,7 +312,9 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
             for method, pattern, handler, requirement in ROUTES]
 
 # Reachable without a session: the sign-in page and what it needs to render.
-PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css",
+# tokens.css is the stylesheet app.css reads its colours from; the sign-in
+# page links both, before there is a session to be gated on.
+PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/tokens.css", "/app.css",
                 "/favicon.ico", "/favicon.svg"}
 PUBLIC_API = {"/api/login", "/api/session"}
 

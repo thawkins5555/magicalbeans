@@ -57,7 +57,7 @@
   }
 
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
-    unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--faint)' };
+    unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--line)' };
   /* This module's vocabulary mapped onto the five tones App.statusMark
      draws. Kept beside STATUS_COLOR, which the timeline lanes still use for
      their fills — a band in a chart is a different problem from a word in a
@@ -80,7 +80,7 @@
     const nodes = server.nodes || { counters: {} };
     const text = nodes.status || 'Poller stopped';
     App.el('nd-status').textContent = text;
-    App.el('nd-dot').style.background = nodes.running ? 'var(--ok)' : 'var(--faint)';
+    App.el('nd-dot').style.background = nodes.running ? 'var(--ok)' : 'var(--line)';
     App.el('nd-toggle').textContent = nodes.running ? 'Stop poller' : 'Start poller';
     const counts = nodes.device_counts || {};
     const c = nodes.counters || {};
@@ -805,7 +805,7 @@
     if (!allValues.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 13,
+        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
       }, opts.emptyText || 'No data in this window'));
       return geo;
     }
@@ -836,8 +836,8 @@
       svg.appendChild(App.svgNode('line', {
         x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)' }));
       svg.appendChild(App.svgNode('text', {
-        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 },
+        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' },
         formatMetricValue(data.unit || '', peak * frac)));
     }
 
@@ -867,8 +867,8 @@
         svg.appendChild(App.svgNode('rect', {
           x, y: plot.y + 4, width: 14, height: 3, fill: s.color }));
         const text = App.svgNode('text', {
-          x: x + 18, y: plot.y + 9, fill: 'var(--faint)',
-          'font-family': 'var(--mono)', 'font-size': 10 }, s.label);
+          x: x + 18, y: plot.y + 9, fill: 'var(--dim)',
+          'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, s.label);
         svg.appendChild(text);
         x += 18 + s.label.length * 6.5 + 14;
       }
@@ -879,8 +879,8 @@
       svg.appendChild(App.svgNode('text', {
         x: xFor(ts), y: height - 6,
         'text-anchor': frac === 0 ? 'start' : frac === 1 ? 'end' : 'middle',
-        fill: 'var(--faint)',
-        'font-family': 'var(--mono)', 'font-size': 10 }, App.stamp(ts, t1 - t0)));
+        fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, App.stamp(ts, t1 - t0)));
     }
     return geo;
   }
@@ -902,7 +902,7 @@
     if (!data || !data.segments || !data.segments.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2 + 4, 'text-anchor': 'middle',
-        fill: 'var(--faint)', 'font-size': 11 }, 'No history in this window'));
+        fill: 'var(--muted)', 'font-size': 'var(--fs-xs)' }, 'No history in this window'));
       return;
     }
     const { t0, t1, segments } = data;
@@ -954,7 +954,7 @@
       cell: (r) => escape(r.admin_status || '\u2014') },
     { key: 'oper_status', label: 'Oper', width: 80, on: true,
       cell: (r) => `<span style="color:${r.oper_status === 'up' ? 'var(--ok)'
-        : r.oper_status === 'down' ? 'var(--fail)' : 'var(--faint)'}">` +
+        : r.oper_status === 'down' ? 'var(--fail)' : 'var(--line)'}">` +
         `${escape(r.oper_status || '\u2014')}</span>` },
     // No custom value() for these three: the default row[key] lookup
     // preserves null/undefined so App.sortRows' blanks-sort-last rule

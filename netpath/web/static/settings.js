@@ -42,7 +42,7 @@
     App.el('set-alerts-path').value = storage.alerts_path || '';
     showUsage(storage);
     showUpdateInfo(server);
-    status('Showing saved settings', 'var(--faint)');
+    status('Showing saved settings', 'var(--muted)');
   }
 
   /* --------------------------------------------------------------- update */
@@ -83,7 +83,7 @@
   function updateStatus(message, colour) {
     const el = App.el('update-status');
     el.textContent = message;
-    el.style.color = colour || 'var(--faint)';
+    el.style.color = colour || 'var(--muted)';
   }
 
   async function checkForUpdate() {
@@ -207,7 +207,7 @@
   function status(message, colour) {
     const el = App.el('set-status');
     el.textContent = message;
-    el.style.color = colour || 'var(--faint)';
+    el.style.color = colour || 'var(--muted)';
   }
 
   async function apply() {
@@ -438,7 +438,7 @@
   function usersStatus(message, colour) {
     const el = App.el('users-status');
     el.textContent = message;
-    el.style.color = colour || 'var(--faint)';
+    el.style.color = colour || 'var(--muted)';
   }
 
   async function addUser() {
