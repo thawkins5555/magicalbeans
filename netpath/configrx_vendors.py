@@ -1,11 +1,17 @@
-"""The one hard safety boundary in ConfigRX: an exhaustive, per-vendor
-allow-list of exactly what may ever be sent over an SSH session. Nothing
-in ConfigRX sends anything beyond a vendor's `pager_off` lines (session-
-scoped, read-only pagination settings) and its single `show_config`
-command — there is no free-form command execution anywhere in this
-module, by construction: nothing here accepts arbitrary text and there is
-no code path that builds a command from anything other than these fixed
-strings.
+"""The hard safety boundary of ConfigRX's BACKUP path: an exhaustive,
+per-vendor allow-list of exactly what a backup may ever send over an SSH
+session. Nothing on that path sends anything beyond a vendor's
+`pager_off` lines (session-scoped, read-only pagination settings) and its
+single `show_config` command — there is no free-form command execution
+anywhere in ConfigRX, by construction: nothing here accepts arbitrary
+text and there is no code path that builds a command from anything other
+than these fixed strings.
+
+That guarantee is about backups. The interactive SSH terminal
+(sshterm.py) is a separate feature with a separate boundary — a real
+shell, driven by a human, behind its own `ssh` permission that nobody
+holds by default — and it neither uses this table nor reaches the backup
+path. ConfigRX write still means only "may back up configs".
 
 Vendor keys are lowercase, matching nodeoids.vendor_for()'s output (itself
 sourced from trapoids.WELL_KNOWN's vendor-root names) so a Nodes device's

@@ -46,9 +46,9 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Absence of a row for (username, module) means no access at all. A
 -- fresh install has no rows and no users beyond the seeded default admin
--- (see AppDatabase.__init__'s one-time backfill for the upgrade case,
--- where existing accounts get full access rather than being silently
--- locked out the moment this table starts being enforced).
+-- (see AppDatabase.backfill_permissions() for the upgrade case, where
+-- existing accounts get full access rather than being silently locked out
+-- the moment this table starts being enforced).
 CREATE TABLE IF NOT EXISTS user_permissions (
     username TEXT NOT NULL,
     module   TEXT NOT NULL,
@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 MIGRATION_MARKER = "migrated_from_netpath_db"
+# Set once the one-time `ssh` grant below has been considered, so that an
+# administrator who deliberately takes the permission away is not handed it
+# back on the next restart.
+SSH_BACKFILL_MARKER = "ssh_permission_backfilled"
 
 HOSTNAME_TTL_S = 7 * 86400
 ASN_TTL_S = 30 * 86400
@@ -151,8 +155,27 @@ class AppDatabase:
                 "SELECT 1 FROM sqlite_master WHERE type='table'"
                 " AND name='user_permissions'").fetchone() is not None
             self._conn.executescript(SCHEMA)
-            if not had_permissions_table:
+            self._conn.commit()
+        # Neither backfill runs here. On an install that predates app.db the
+        # accounts they grant against are still in netpath.db at this point:
+        # Service.__init__ copies them over with migrate_from() immediately
+        # after this constructor returns, and then calls
+        # backfill_permissions(). Running against the empty table would set
+        # the ssh marker having granted nobody, permanently.
+        self._needs_full_backfill = not had_permissions_table
+
+    def backfill_permissions(self) -> None:
+        """Grants the permissions an upgrade owes existing accounts. Call it
+        once the `users` table is final — that is, after migrate_from() has
+        had its chance to bring accounts in from a legacy netpath.db. Both
+        halves are idempotent (the full backfill only runs when this database
+        had no user_permissions table when it was opened, and each is an
+        INSERT OR IGNORE behind a marker), so a second call does nothing."""
+        with self._lock:
+            if self._needs_full_backfill:
                 self._backfill_full_permissions()
+                self._needs_full_backfill = False
+            self._backfill_ssh_permission()
             self._conn.commit()
 
     def _backfill_full_permissions(self) -> None:
@@ -163,7 +186,10 @@ class AppDatabase:
         account write (which implies read) on every module. A fresh
         install has no users yet at this point (the default admin account
         is seeded later, in Service.__init__, once it already sees this
-        table), so this is a no-op there — nothing to backfill."""
+        table), so this is a no-op there — nothing to backfill.
+
+        Called from backfill_permissions(), which holds the lock and
+        commits, and only once the accounts have been migrated in."""
         from . import permissions
         usernames = [row["username"] for row in
                     self._conn.execute("SELECT username FROM users").fetchall()]
@@ -172,6 +198,48 @@ class AppDatabase:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO user_permissions(username, module, level)"
                     " VALUES (?,?,?)", (username, module, permissions.WRITE))
+
+    def _backfill_ssh_permission(self) -> None:
+        """The `ssh` module (an interactive shell on a device) is newer than
+        the permission table, so every existing account has no row for it
+        and would be refused — which is the right default for a permission
+        this sharp, but wrong for the accounts that already hold write on
+        everything else. Those are administrators by any reading, and the
+        SSH button took the place of one they already had, so they get it
+        once, here. Everybody else starts with none, which is the entire
+        point of giving a shell its own module rather than folding it into
+        ConfigRX or Nodes.
+
+        Exactly once: the marker is written whether or not anything is
+        granted, so revoking the permission afterwards sticks. A fresh
+        install has no users at this point (the default admin is seeded
+        later, in Service.__init__, with every module), so this is a no-op
+        there.
+
+        Called from backfill_permissions(), which holds the lock and
+        commits, and only once the accounts have been migrated in — the
+        marker must not be spent on an empty table.
+        """
+        from . import permissions
+        if self._conn.execute("SELECT 1 FROM meta WHERE key = ?",
+                              (SSH_BACKFILL_MARKER,)).fetchone():
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+            (SSH_BACKFILL_MARKER, str(time.time())))
+        others = [module for module in permissions.MODULES if module != "ssh"]
+        for row in self._conn.execute("SELECT username FROM users").fetchall():
+            username = row["username"]
+            grants = {grant["module"]: grant["level"] for grant in
+                      self._conn.execute(
+                          "SELECT module, level FROM user_permissions"
+                          " WHERE username = ? COLLATE NOCASE",
+                          (username,)).fetchall()}
+            if all(grants.get(module) == permissions.WRITE for module in others):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO user_permissions(username, module,"
+                    " level) VALUES (?,?,?)",
+                    (username, "ssh", permissions.WRITE))
 
     def close(self) -> None:
         with self._lock:

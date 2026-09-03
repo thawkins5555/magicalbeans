@@ -29,6 +29,7 @@ from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
 from .. import nodeoids
 from .. import configrx
+from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
@@ -682,7 +683,52 @@ def post_test_packet(service, params, body) -> dict:
             "script": script}
 
 
+# ---------------------------------------------------------------------- SSH
+
+
+def get_ssh_device(service, params, body, device_id) -> dict:
+    """What the terminal window needs before it opens its socket: which
+    device this is, whether it can log in without asking, and what is known
+    about the device's host key. Gated on ("ssh", W) like the socket itself
+    — there is no read-only half of "open a shell"."""
+    device, host, port = _ssh_device_host(service, device_id)
+    config = service.configrx_db.device_config(device_id)
+    # nodes.js's displayName() precedence, the same one ConfigRX's device
+    # list uses: the SNMP hostname wins unless the device is pinned to its
+    # manual name, with the IP as the last resort. Resolved here, once — the
+    # page shows what it is given rather than recomputing it.
+    name = ((device["name"] if device["display_name_source"] == "manual" else None)
+            or device["sys_name"] or device["name"] or device["ip"])
+    available = configrx.paramiko_available()
+    return {
+        "device": {"id": device["id"], "ip": host, "name": name},
+        "has_credential": bool(config and config["ssh_username"]
+                               and config["ssh_password_enc"]),
+        "ssh_port": port,
+        "paramiko": {"available": available,
+                     "message": "" if available else configrx.PARAMIKO_MISSING},
+        "host_key": sshterm.stored_host_key(service, host, port),
+    }
+
+
+def ws_ssh_device(websocket, service, params, device_id) -> None:
+    """The terminal's WebSocket. Hijacking: the connection is held for the
+    whole session, so this takes the socket server.py already upgraded
+    rather than a body, and returns nothing to serialise. server.py's
+    _route has already established who is asking, that the page asking is
+    this one (Origin), and that they hold ("ssh", W); the session token
+    goes with them so the session can be ended the moment that sign-in is."""
+    service.ssh_sessions.open(websocket, device_id,
+                              params.get("_username", ""),
+                              params.get("_client", ""),
+                              params.get("_token", ""))
+
+
+ws_ssh_device.hijack = True
+
+
 # -------------------------------------------------------------------- debug
+
 
 def get_debug(service, params, body) -> dict:
     since = int(_num(params, "since", 0, int) or 0)
@@ -3876,6 +3922,55 @@ def post_configrx_worker(service, params, body) -> dict:
         service.configrx.stop()
     return {"running": service.configrx.running,
             "status": service.configrx.status_text()}
+
+
+# ------------------------------------------------------------- ssh host keys
+# The remembered host key for a device, and forgetting it. Both live under
+# /api/ssh/ rather than /api/configrx/ because the key is shared: the SSH
+# terminal stores and checks the same row. Reading one is a ConfigRX read (it
+# is shown in ConfigRX's device dialog); forgetting one is an `ssh` WRITE,
+# because it is the act that lets the next connection to that device accept
+# whatever key it is offered.
+#
+# There is no HTTP route for trusting a NEW key: that decision is only ever
+# taken with the offered key in hand, over the terminal's own socket, so
+# there is no endpoint here through which a key could be trusted blind.
+
+def _ssh_device_host(service, device_id):
+    """(device row, ip, port) for a device, or ValueError. The port is
+    ConfigRX's stored SSH port, since that is the port this app connects on
+    and the store is keyed by (host, port)."""
+    device = service.nodes_db.device(device_id)
+    if not device:
+        raise ValueError("No such device")
+    config = service.configrx_db.device_config(device_id)
+    port = int(config["ssh_port"]) if config and config["ssh_port"] else 22
+    return device, device["ip"], port
+
+
+def _host_key_json(row) -> dict:
+    return {
+        "host": row["host"], "port": row["port"], "key_type": row["key_type"],
+        "fingerprint": row["fingerprint"], "first_seen_ts": row["first_seen_ts"],
+        "last_seen_ts": row["last_seen_ts"], "trusted_by": row["trusted_by"] or "",
+    }
+
+
+def get_ssh_device_hostkey(service, params, body, device_id) -> dict:
+    _device, host, port = _ssh_device_host(service, device_id)
+    row = service.configrx_db.host_key(host, port)
+    return {"host_key": _host_key_json(row) if row else None}
+
+
+def delete_ssh_device_hostkey(service, params, body, device_id) -> dict:
+    _device, host, port = _ssh_device_host(service, device_id)
+    removed = service.configrx_db.forget_host_key(host, port)
+    if removed:
+        service.log.add(CONFIGRX_CATEGORY,
+                        f"Forgot the stored SSH host key for {host}",
+                        detail=f"The next connection to {host} port {port} will store"
+                               f" whatever key it is offered.")
+    return {"ok": True, "removed": 1 if removed else 0}
 
 
 # --------------------------------------------------------------------- auth

@@ -1980,6 +1980,9 @@
             loadDetail();
           }, (confirmed) => { if (!confirmed) editDevice(); });
       } },
+      // Built here rather than declared in index.html, so — like every
+      // dynamically built control — it checks the permission itself.
+      ...(App.canWrite('nodes') ? [{ label: 'Remove', onClick: () => removeDevice(d) }] : []),
       { label: 'Test', onClick: () => testDevice(box, d.id) },
       { label: 'Save', primary: true, onClick: async (box) => {
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
@@ -2088,18 +2091,53 @@
     }
   }
 
-  function removeDevice() {
-    if (!view.detail) return;
-    const d = view.detail;
-    App.modal('Remove device', `<p>Remove <b>${escape(displayName(d))}</b>? This deletes its interfaces, metric history and events.</p>`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Remove', primary: true, onClick: async () => {
+  /* Removing one device lives inside the Edit dialog, now that SSH has the
+     place it used to hold in the pane header. It belongs there: it is the
+     rarest thing done to a single device, and the editor is already where
+     that device's settings are changed. Bulk Delete over the table's
+     selection is untouched.
+
+     Like Clear credential beside it, the confirm replaces the editor (there
+     is only one modal box), so `afterClose` reopens the editor when the
+     operator backs out — and does not when the device is gone. */
+  function removeDevice(d) {
+    if (!d) return;
+    App.confirmDestructive('Remove device',
+      `<p>Remove <b>${escape(displayName(d))}</b>?</p>` +
+      '<p class="hint">This deletes the device with its interfaces, its ' +
+      'metric history and its events, and the ConfigRX settings, credential ' +
+      'and stored configuration backups for it. It cannot be undone.</p>',
+      'Remove', async () => {
         await App.del(`/api/nodes/devices/${d.id}`);
-        App.closeModal();
         view.selected = null;
+        view.detail = null;
+        loadDetail();
         App.refreshNow('nodes');
-      } },
-    ]);
+      }, (confirmed) => { if (!confirmed) editDevice(); });
+  }
+
+  /* The one window.open in the application. A separate window rather than a
+     modal because a shell is not a dialog: it is kept open beside the rest
+     of the product, resized, and lived in. The name keys it to the device,
+     so a second SSH click on the same device raises the window it already
+     has instead of opening a rival session. `noopener` cannot be in the
+     feature string for that: a window opened with it is treated as `_blank`,
+     the name is discarded, and every click would open another window and
+     another shell. Clearing `opener` on the handle does the same job — the
+     window is same-origin, so we still get the handle back — and focus()
+     raises the existing window on the second click. The display name rides
+     in the URL because displayName() is private here — the window replaces
+     it with whatever /api/ssh/devices/<id> reports. */
+  function sshDevice() {
+    if (!view.detail || !App.canWrite('ssh')) return;
+    const d = view.detail;
+    const w = window.open(
+      `/ssh.html?device=${d.id}&name=${encodeURIComponent(displayName(d))}`,
+      `ssh-${d.id}`, 'width=1000,height=640');
+    if (w) {
+      w.opener = null;
+      w.focus();
+    }
   }
 
   /* ------------------------------------------------------------ profiles */
@@ -2421,6 +2459,35 @@
           of the device.</li>
           <li><b>SNMP unticked, Ping ticked:</b> reachable by ping alone.</li>
         </ul>`,
+    },
+    'nodes.device.ssh': {
+      title: 'SSH',
+      html: `
+        <p><b>SSH</b> opens an interactive shell on the selected device in a
+        new window. It is a real terminal — whatever you type goes to the
+        device exactly as typed, and whatever it prints comes back. Nothing
+        is recorded but the fact that the session happened: the device's
+        event log gets one line when it opens and one when it closes, with
+        who opened it and from which address, and never a keystroke.</p>
+        <p><b>Which credential it uses.</b> The SSH username, port and
+        password ConfigRX already stores for the device, if there is one —
+        the same credential its configuration backups use. If none is
+        stored, or the device refuses it, the window asks for a username and
+        password. What you type there is used for that one connection and is
+        never stored, on the server or in the browser.</p>
+        <p><b>Host keys.</b> The first connection to a device records its
+        host key and says so. From then on the key is checked on every
+        connection, by ConfigRX's backups as well as this window. If a device
+        offers a different key, the connection is refused before anything is
+        sent and the window shows both fingerprints and when the old one was
+        first seen. That happens after a legitimate rebuild — and it is also
+        what an impersonated address looks like, so <b>Trust the new key</b>
+        is a deliberate choice, not a formality.</p>
+        <p><b>Who can use it.</b> Its own <b>SSH</b> permission module,
+        granted to nobody by default. ConfigRX write only ever means "may
+        back this device up", which is a much narrower thing than a shell,
+        so it is not enough on its own — an administrator grants SSH write
+        under Settings, per account.</p>`,
     },
   });
 
@@ -3326,7 +3393,9 @@
     }
     App.el('nd-add-device').onclick = addDevice;
     App.el('nd-edit-device').onclick = editDevice;
-    App.el('nd-remove-device').onclick = removeDevice;
+    App.el('nd-ssh-device').onclick = sshDevice;
+    // The "?" beside it, from the one helper that renders every help link.
+    App.el('nd-ssh-help').innerHTML = App.helpLink('nodes.device.ssh');
     App.el('nd-browse-oids').onclick = oidBrowser;
     /* A poll is handed to a worker thread, so the POST returning means
        "queued", not "done" — which is why this button used to look inert for

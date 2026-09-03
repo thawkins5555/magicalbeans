@@ -17,6 +17,12 @@ connection and discarded right after (see configrx.ConfigRxWorker).
 A backup's content is stored zlib-compressed and only when its hash
 differs from that device's most recently stored backup — an unchanged
 config does not grow the database on every scheduled pull.
+
+One table here is not ConfigRX's alone: `ssh_host_keys` is the remembered
+host key per (host, port), written and checked by both the backup worker
+and the interactive SSH terminal. It lives in this database because this
+is where SSH for these devices already lives; it is keyed by address, not
+by device id, and so survives nothing else about a device changing.
 """
 
 from __future__ import annotations
@@ -55,6 +61,31 @@ CREATE INDEX IF NOT EXISTS ix_backups_device ON backups(device_id, ts);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- One remembered SSH host key per host and port, shared by ConfigRX's
+-- backups and the interactive SSH terminal: whichever of the two reaches a
+-- device first stores what it was shown, and both refuse a later connection
+-- that presents a different key. Keyed by host+port rather than by device id
+-- because a host key belongs to the endpoint, not to the Nodes row pointing
+-- at it, and because two device rows for the same address must not each
+-- remember a different key.
+--
+-- key_b64 is the wire encoding of the key (paramiko's get_base64(), the same
+-- text a known_hosts line carries) so the stored key can be handed back to
+-- paramiko verbatim; fingerprint is the SHA-256 of those same bytes, kept
+-- alongside only so the UI and error messages need no paramiko to render it.
+-- No index beyond the primary key: every read is a (host, port) lookup.
+CREATE TABLE IF NOT EXISTS ssh_host_keys (
+    host          TEXT NOT NULL,
+    port          INTEGER NOT NULL,
+    key_type      TEXT NOT NULL,
+    key_b64       TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    first_seen_ts REAL NOT NULL,
+    last_seen_ts  REAL NOT NULL,
+    trusted_by    TEXT,
+    PRIMARY KEY (host, port)
 );
 """
 
@@ -180,7 +211,13 @@ class ConfigRxDatabase:
 
     def forget_device(self, device_id: int) -> None:
         """Called when a device is removed from Nodes, so ConfigRX does not
-        keep polling (or displaying) a device that no longer exists."""
+        keep polling (or displaying) a device that no longer exists.
+
+        The remembered host key stays. A key belongs to an address and port,
+        not to a device row: another device may already be recorded at the
+        same address, and re-adding this one must not silently start trusting
+        whatever answers there. Only ConfigRX's Forget (forget_host_key)
+        removes a key, deliberately and per address."""
         with self._lock:
             self._conn.execute("DELETE FROM device_config WHERE device_id = ?", (device_id,))
             self._conn.execute("DELETE FROM backups WHERE device_id = ?", (device_id,))
@@ -202,6 +239,54 @@ class ConfigRxDatabase:
                 " last_backup_error = ? WHERE device_id = ?",
                 (time.time(), status if ok else "error", error, device_id))
             self._conn.commit()
+
+    # --------------------------------------------------------- ssh host keys
+
+    def host_key(self, host: str, port: int):
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM ssh_host_keys WHERE host = ? AND port = ?",
+                (host, int(port))).fetchone()
+
+    def host_keys(self) -> list:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM ssh_host_keys ORDER BY host, port").fetchall()
+
+    def store_host_key(self, host: str, port: int, key_type: str, key_b64: str,
+                       fingerprint: str, trusted_by: str = "") -> None:
+        """Remembers this key for this host and port, replacing whatever was
+        there. first_seen_ts is reset: a replacement is a NEW key, and "first
+        seen" answering "since when has this device presented this key" is the
+        only reading of it that is any use when one changes."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO ssh_host_keys(host, port, key_type, key_b64, fingerprint,"
+                " first_seen_ts, last_seen_ts, trusted_by) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(host, port) DO UPDATE SET key_type=excluded.key_type,"
+                " key_b64=excluded.key_b64, fingerprint=excluded.fingerprint,"
+                " first_seen_ts=excluded.first_seen_ts, last_seen_ts=excluded.last_seen_ts,"
+                " trusted_by=excluded.trusted_by",
+                (host, int(port), key_type, key_b64, fingerprint, now, now, trusted_by or ""))
+            self._conn.commit()
+
+    def touch_host_key(self, host: str, port: int) -> None:
+        """last_seen_ts only — "this same key was presented again just now"."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE ssh_host_keys SET last_seen_ts = ? WHERE host = ? AND port = ?",
+                (time.time(), host, int(port)))
+            self._conn.commit()
+
+    def forget_host_key(self, host: str, port: int) -> bool:
+        """True when a key went, False when there was none — a second Forget
+        click is a no-op, not an error."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM ssh_host_keys WHERE host = ? AND port = ?", (host, int(port)))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     # ----------------------------------------------------------------- backups
 

@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, urlparse
 from collections import deque
 
 from . import api
+from . import wsock
 from .. import permissions
 from .service import Service
 
@@ -231,6 +232,20 @@ ROUTES = [
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
+    # The remembered SSH host key for a device: shown and forgotten in
+    # ConfigRX's device dialog, so both routes are ConfigRX's. Forgetting is
+    # what lets the next connection accept a new key, and configrx write
+    # already decides which port and which credential that connection uses —
+    # it is the permission that already says which box is trusted, so it is
+    # the right holder of "start over with this device's key". Trusting a new
+    # key from inside the terminal stays ("ssh", W).
+    ("GET", r"^/api/ssh/devices/(\d+)/hostkey$", api.get_ssh_device_hostkey, ("configrx", R)),
+    ("DELETE", r"^/api/ssh/devices/(\d+)/hostkey$", api.delete_ssh_device_hostkey, ("configrx", W)),
+    # The terminal window. Read is meaningless for a shell — you either get
+    # to type on the device or you do not — so both routes want write, and
+    # the socket is the one hijacking route in the table (see _route).
+    ("GET", r"^/api/ssh/devices/(\d+)$", api.get_ssh_device, ("ssh", W)),
+    ("GET", r"^/api/ssh/devices/(\d+)/socket$", api.ws_ssh_device, ("ssh", W)),
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
@@ -276,7 +291,8 @@ class AccessLog:
                      "path": path, "status": status, "ms": ms}
             if not path.startswith(("/app.", "/netpath.js", "/netflow.js",
                                     "/snmp.js", "/syslog.js", "/debug.js",
-                                    "/settings.js")):
+                                    "/settings.js", "/ssh.js", "/ssh.css",
+                                    "/vendor/")):
                 self.recent.appendleft(entry)
             info = self.clients.setdefault(client, {
                 "requests": 0, "first_seen": time.time(), "last_seen": 0.0,
@@ -343,8 +359,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         # No external resources are loaded, so this can be strict.
+        # `connect-src 'self'` is what the terminal window's WebSocket needs
+        # and all it needs: current browsers count a same-origin ws:// (or
+        # wss://) URL as 'self', while the bare scheme-sources `ws: wss:`
+        # this used to carry matched *any* host, which would let every page
+        # in the product open a socket anywhere. `frame-ancestors 'none'`
+        # keeps the terminal — Trust button and all — out of anyone's
+        # iframe. Inline styles stay allowed for the terminal emulator,
+        # which injects its own <style>.
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; style-src 'self' 'unsafe-inline'")
+                         "default-src 'self'; style-src 'self' 'unsafe-inline';"
+                         " connect-src 'self'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         for key, value in (extra_headers or {}).items():
@@ -492,6 +517,53 @@ class Handler(BaseHTTPRequestHandler):
                 # arrive as ints so no handler signature changes.
                 args = [int(group) if group.isdigit() else group
                         for group in match.groups()]
+
+                # A hijacking handler (the terminal's WebSocket) takes the
+                # connection over and holds it for the life of the session.
+                # The upgrade is answered here, not in the handler, so that
+                # everything a refusal depends on stays on this side of the
+                # 101: the handler is handed a socket that is already
+                # established. It runs after exactly the same
+                # cookie/session/permission tail as every other route, which
+                # is the whole reason it is a route rather than a special
+                # case earlier in the dispatch. There is no keep-alive to
+                # unwind afterwards (HTTP/1.0), so the connection simply
+                # closes.
+                if getattr(handler, "hijack", False):
+                    self.close_connection = True
+                    # Origin, checked here rather than in wsock: this is the
+                    # CSRF gate for a route that has none of the usual ones.
+                    # An upgrade is a GET, so the JSON content-type check
+                    # above never sees it, and the session cookie is
+                    # SameSite=*Strict* — which is site-scoped, not
+                    # origin-scoped, so another port on this host or a
+                    # sibling subdomain is "same site" and its page could
+                    # otherwise open this socket with the operator's cookie
+                    # and drive a shell. A browser always sends Origin on an
+                    # upgrade, so a missing one is refused too; it is a check
+                    # about who is asking, which is this layer's business,
+                    # not the framing's.
+                    origin = (self.headers.get("Origin") or "").strip()
+                    host = (self.headers.get("Host") or "").strip().lower()
+                    if not origin or urlparse(origin).netloc.lower() != host:
+                        self._json({"error": "Cross-origin WebSocket refused"}, 403)
+                        return
+                    try:
+                        websocket = wsock.accept(self)
+                    except wsock.WebSocketError as exc:
+                        # Refused before anything was written, so this is
+                        # still an ordinary HTTP response.
+                        self._send(400, str(exc).encode("utf-8"),
+                                   "text/plain; charset=utf-8")
+                        return
+                    # Only now: a refused upgrade is not a 101 in the log.
+                    self._status = 101
+                    try:
+                        handler(websocket, self.service, params, *args)
+                    except Exception:
+                        traceback.print_exc()
+                    return
+
                 result = handler(self.service, params, body, *args)
 
                 headers = None

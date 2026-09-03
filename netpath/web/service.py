@@ -33,6 +33,7 @@ from .. import permissions
 from ..nodesdb import NodesDatabase
 from ..snmptrapd import TrapCollector
 from ..snmptrapdb import SnmpTrapDatabase
+from ..sshterm import SshSessionRegistry
 from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
 from ..wirelessdb import WirelessDatabase
@@ -51,6 +52,12 @@ class Service:
         # that predates app.db this lifts the settings, accounts and name cache
         # out of netpath.db and then drops them from it.
         migrate_from(self.app_db, db_path, log=self.log)
+        # Only now are the accounts final: what an upgrade owes them (write on
+        # every module for an install that predates the permission table, and
+        # `ssh` for the accounts that already hold write on everything else)
+        # is granted here rather than in AppDatabase.__init__, which runs
+        # before the migration above.
+        self.app_db.backfill_permissions()
 
         self.db = Database(db_path)
         self.flow_db = FlowDatabase(flow_db_path)
@@ -125,6 +132,10 @@ class Service:
             idle_minutes=int(self.settings.get("session_idle_minutes", 10)),
             max_hours=int(self.settings.get("session_max_hours", 12)))
         self.throttle = LoginThrottle()
+        # After sessions (a terminal belongs to a signed-in user) and after
+        # configrx_db (it is where the device's SSH credential and host key
+        # live). Holds no thread of its own until a session opens.
+        self.ssh_sessions = SshSessionRegistry(self)
         self._ensure_default_user()
 
         self._stop = threading.Event()
@@ -200,6 +211,10 @@ class Service:
 
     def shutdown(self) -> None:
         self._stop.set()
+        # Interactive SSH sessions first: they are the only thing here a
+        # person is watching, and each one writes a closing device event, so
+        # they must end while the databases are still open.
+        self.ssh_sessions.shutdown()
         self.monitor.shutdown()   # waits briefly for running traces to land
         self.hop_prober.shutdown()
         self.resolver.shutdown()

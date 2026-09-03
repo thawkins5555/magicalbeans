@@ -4,12 +4,15 @@
 schema script, which runs first, so every existing nodes.db failed to open.
 Every other suite starts from empty files and never sees an upgrade.
 
-Two parts. The first always runs: a fresh nodes.db is rebuilt into its 4.33
-shape (the mac_entries table without first_seen_ts/present, and without the
-index on them) and reopened. The second needs git history: the previous
+Three parts. The first always runs: a fresh nodes.db is rebuilt into its
+4.33 shape (the mac_entries table without first_seen_ts/present, and without
+the index on them) and reopened. The second needs git history: the previous
 main commit is exported with `git archive`, every database is created by
 that tree's own Service, and the current Service is started on them — the
-exact path that failed. It is skipped, loudly, when git cannot export."""
+exact path that failed. It is skipped, loudly, when git cannot export. The
+third is the other upgrade that has no fresh-install equivalent: accounts
+that still live in a legacy netpath.db and the permissions the migration
+owes them."""
 import os
 import sqlite3
 import subprocess
@@ -137,6 +140,65 @@ print("locations", len(rows), "present", rows[0]["present"] if rows else None)
               started.returncode == 0, started.stderr[-600:])
         check("...and the previous release's MAC rows survive as present",
               "locations 1 present 1" in started.stdout, started.stdout[-200:])
+
+# ------------------------------- part 3: permissions after the migration
+# On an install that predates app.db the accounts are still in netpath.db
+# when AppDatabase opens: Service copies them across with migrate_from()
+# straight afterwards. A permission backfill inside the constructor would
+# therefore grant against an empty users table — and spend its one-time
+# marker doing it — so the accounts an upgrade owes access to would get
+# none, ever. backfill_permissions() is the call that runs after the
+# accounts are final, and this is the path it exists for.
+from netpath.appdb import AppDatabase, migrate_from      # noqa: E402
+from netpath import permissions as perms                 # noqa: E402
+
+mig = os.path.join(work, "migrate")
+os.makedirs(mig, exist_ok=True)
+legacy_path = os.path.join(mig, "netpath.db")
+legacy = sqlite3.connect(legacy_path)
+legacy.executescript("""
+    CREATE TABLE users (
+        username     TEXT PRIMARY KEY,
+        password     TEXT NOT NULL,
+        created_ts   REAL NOT NULL,
+        updated_ts   REAL NOT NULL,
+        last_login   REAL,
+        must_change  INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+""")
+legacy.execute("INSERT INTO users(username, password, created_ts, updated_ts,"
+               " must_change) VALUES ('olduser', 'not-a-real-hash', 1.0, 1.0, 0)")
+legacy.execute("INSERT INTO settings(key, value) VALUES ('web_port', '8443')")
+legacy.commit()
+legacy.close()
+
+app_db = AppDatabase(os.path.join(mig, "app.db"))
+check("a fresh app.db knows nothing about the legacy account yet",
+      app_db.permissions_for("olduser") == {}, app_db.permissions_for("olduser"))
+migrate_from(app_db, legacy_path)
+app_db.backfill_permissions()
+granted = app_db.permissions_for("olduser")
+check("an account migrated out of netpath.db holds write on every module",
+      all(granted.get(module) == "write" for module in perms.MODULES), granted)
+check("...ssh among them", granted.get("ssh") == "write", granted)
+
+# And exactly once, in both halves: taking a permission away again sticks,
+# whether the second call comes in the same process or after a restart.
+app_db.set_permissions("olduser", {module: "write" for module in perms.MODULES
+                                   if module != "ssh"})
+app_db.backfill_permissions()
+check("a second backfill grants nothing back",
+      "ssh" not in app_db.permissions_for("olduser"),
+      app_db.permissions_for("olduser"))
+app_db.close()
+
+restarted = AppDatabase(os.path.join(mig, "app.db"))
+restarted.backfill_permissions()
+check("...nor does the next start",
+      "ssh" not in restarted.permissions_for("olduser"),
+      restarted.permissions_for("olduser"))
+restarted.close()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")
