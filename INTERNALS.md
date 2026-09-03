@@ -8,6 +8,20 @@ inside: which file does the work, which function, and the actual mechanism
 depth than the summary here. This is the one to open when something needs
 fixing, not just using.
 
+## Contents
+
+- [Layout](#layout) — the file map
+- [Process model](#process-model) — threads, who owns which loop
+- [Data layer](#data-layer) — the ten databases, migrations, retention
+- [Nodes](#nodes) — the SNMP poller, the wire, the scheduler, the write path
+- [Alerts](#alerts) — occurrences, dedup keys, rollup, notification
+- [NetPath](#netpath) · [NetFlow](#netflow) · [SNMP Trap](#snmp-trap) · [Syslog](#syslog) · [IPAM](#ipam)
+- [Self-update (`selfupdate.py`)](#self-update-selfupdatepy)
+- [Auth (`auth.py`)](#auth-authpy) · [Permissions](#permissions-permissionspy-appdbs-user_permissions)
+- [Wireless](#wireless-fortinetoidspy-wirelessdbpy-fortipollpy) · [ConfigRX](#configrx-configrxdbpy-configrxpy-configrx_vendorspy)
+- [Web layer](#web-layer) — routing, the API, the browser application
+- [Tests (`tests/`)](#tests-tests)
+
 ## Layout
 
 ```
@@ -443,12 +457,28 @@ override, so a device or profile can restore the old behaviour;
 already key off `reachable` rather than the status label.
 
 `EngineCache` holds one `(engine_id, boots, engine_time, learned_at)`
-tuple per device needing v3, kept for the process lifetime — engine
-parameters only need refreshing if the target actually reboots or its
-clock skews enough to be rejected, which surfaces as a Report-PDU on the
-next poll (`_snmp_get` invalidates the cache entry and raises
-`_AuthFailure`, causing a fresh discovery next time) rather than a
-background expiry timer.
+tuple per device needing v3, kept for the process lifetime, and
+`current()` returns `engine_time + (now - learned_at)` rather than the
+value learned at discovery. That last part matters and was missing until
+4.37.0: an agent accepts a message only inside a ±150 second window around
+its own clock, so replaying the *discovered* `engine_time` on every
+subsequent request meant a device drifted out of its own window after
+about two and a half minutes and rejected roughly every third poll with a
+Report — recorded as an authentication failure, which it was not. An
+earlier edition of this file said engine parameters "only need refreshing
+if the target reboots"; that was true of `engine_id` and `boots` and false
+of `engine_time`, which advances with the agent's clock and must be
+advanced with it here.
+
+A Report-PDU is still what says a resynchronisation is needed. All three v3
+send paths — `_snmp_get`, `_snmp_get_next` and `_walk_request` — now go
+through one `_v3_exchange()` helper that invalidates the cache entry,
+rediscovers and retries once; a second Report raises `_AuthFailure` with
+the `usmStats*` counter decoded into a real message, and
+`usmStatsUnsupportedSecLevels` raises `SnmpUnsupported` so the device is
+marked `unsupported` by exception type rather than by matching a substring
+of its own error string. Two of those three paths previously had no Report
+handling at all and decoded one as an ordinary reply with no varbinds.
 
 **Multiple credentials per profile.** A polling profile's own `snmp_version`/
 `community`/`v3_*` columns are its "primary" credential, unconditionally
