@@ -97,7 +97,8 @@ def _visible_settings(settings: dict, granted: dict) -> dict:
 
 def get_state(service, params, body) -> dict:
     from .. import __version__
-    from ..selfupdate import INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY
+    from ..selfupdate import (INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY,
+                              INSTALLED_TAG_KEY, updates_enabled)
 
     names = service.hostname_stats()
     session = service.sessions.get(params.get("_token", ""))
@@ -109,7 +110,11 @@ def get_state(service, params, body) -> dict:
         "permissions": granted,
         "update": {
             "installed_commit": service.app_db.meta(INSTALLED_COMMIT_KEY),
+            "installed_tag": service.app_db.meta(INSTALLED_TAG_KEY),
             "installed_at": service.app_db.meta(INSTALLED_AT_KEY),
+            # So the Settings page can say why the button does nothing,
+            # rather than showing one that always fails.
+            "enabled": updates_enabled(service.app_db),
         },
         "session": {
             "username": session["username"] if session else "",
@@ -918,10 +923,27 @@ SETTINGS_SCOPES = {
 }
 
 
+# Global settings that are not an operator's to change even with Settings
+# write: turning this host's self-update on decides whether it will replace
+# its own code from the internet.
+ADMIN_ONLY_SETTINGS = ("updates_enabled",)
+
+
+def _may_change_admin_settings(service, params) -> bool:
+    """Whether this caller may change ADMIN_ONLY_SETTINGS. Its own function
+    so there is exactly one place the answer is decided; the capability it
+    consults arrives with the `admin` module."""
+    return True
+
+
 def post_settings(service, params, body) -> dict:
     scope = str(body.get("scope", "global"))
     values = body.get("values") or {}
     granted = service.app_db.permissions_for(params.get("_username", ""))
+    touched = [key for key in ADMIN_ONLY_SETTINGS if key in values]
+    if touched and not _may_change_admin_settings(service, params):
+        raise PermissionError(
+            f"Changing {', '.join(touched)} needs administrator access")
     entry = SETTINGS_SCOPES.get(scope)
     if entry is None:
         applied = service.apply_global_settings(values)
@@ -936,11 +958,16 @@ def post_settings(service, params, body) -> dict:
 def post_update(service, params, body) -> dict:
     from .. import selfupdate
 
+    # Refused here as well as inside apply(): this is the one that produces
+    # a 403 rather than a JSON error, so an operator sees a refusal rather
+    # than a failed update, and nothing reaches the network at all.
+    if not selfupdate.updates_enabled(service.app_db):
+        raise PermissionError(selfupdate.UPDATES_DISABLED_MESSAGE)
     result = selfupdate.apply(service.app_db)
     if result.get("ok") and not result.get("up_to_date"):
         service.log.add(SYSTEM_CATEGORY,
-                        f"Updated to commit {result['commit']}: "
-                        f"{result['message']}; restarting")
+                        f"Updated to {result.get('tag') or result['commit']}; "
+                        f"restarting")
     return result
 
 

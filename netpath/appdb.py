@@ -29,6 +29,8 @@ import sqlite3
 import threading
 import time
 
+from . import dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -135,6 +137,19 @@ GLOBAL_DEFAULTS = {
     "max_snmp_db_mb": 256,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,
+    # Whether this host may replace its own code with what GitHub offers
+    # (selfupdate.py). Off, because on a change-controlled network nobody
+    # would choose "install whatever the internet offers, when anyone
+    # presses a button" as a default — and before this existed there was no
+    # way to say no. Only an administrator may turn it on.
+    "updates_enabled": False,
+    # Whether an SMTP password may be sent over a connection with no
+    # transport security. Off: the test-email endpoint refuses `none` (and
+    # any other value that is not ssl/starttls) when a password will be
+    # sent, because that puts the credential on the wire in the clear.
+    # Global rather than an Alerts setting so it reads as what it is — a
+    # policy decision about credentials, not a mail preference.
+    "smtp_allow_plain_auth": False,
 }
 
 # Tables this file took over whole. `settings` is not among them: that table
@@ -527,6 +542,27 @@ class AppDatabase:
             except OSError:
                 pass
         return total
+
+
+def write_meta(path: str, key: str, value: str) -> None:
+    """Set one housekeeping marker through a connection of this call's own.
+
+    For the one caller that has no live AppDatabase to go through:
+    selfupdate stops the service — which closes app.db — before it replaces
+    the package directory, and still has to record what it installed.
+    """
+    if not path:
+        return
+    conn = dbopen.connect(path)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,"
+                     " value TEXT)")
+        conn.execute("INSERT INTO meta(key, value) VALUES (?,?)"
+                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ----------------------------------------------------------------- migration

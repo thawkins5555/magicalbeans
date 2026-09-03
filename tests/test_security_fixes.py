@@ -212,6 +212,135 @@ def main() -> int:
           "web_cert" in payload.get("settings", {})
           and "session_idle_minutes" in payload.get("settings", {}))
 
+    # ------------------------------------------------------- D3 self-update
+    from netpath import selfupdate
+
+    status, _h, payload = req("POST", "/api/update", {}, cookie=admin_cookie)
+    check("D3 updates_enabled defaults to off and refuses the route",
+          status in (401, 403) and "switched off" in str(payload.get("error", "")),
+          f"{status} {payload}")
+
+    # A repository of one tag whose release publishes a digest, served
+    # entirely from memory: the two functions in selfupdate that touch the
+    # network are the only boundary, and both are replaced here.
+    TAG = "v9.9.9"
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w:gz") as tar:
+        for name, text in (("magicalbeans-9.9.9/netpath/__init__.py", "x = 1\n"),
+                           ("magicalbeans-9.9.9/netpath/web/__init__.py", "y = 1\n")):
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o777          # the archive asking for more than it may have
+            tar.addfile(info, io.BytesIO(data))
+    TARBALL = tar_bytes.getvalue()
+    GOOD_DIGEST = hashlib.sha256(TARBALL).hexdigest()
+
+    state = {"digest": GOOD_DIGEST, "tarball": TARBALL, "calls": []}
+
+    def fake_json(url, timeout=10.0):
+        state["calls"].append(url)
+        if url.endswith("/tags"):
+            return [{"name": "v9.8.0", "commit": {"sha": "a" * 40}},
+                    {"name": TAG, "commit": {"sha": "b" * 40}},
+                    {"name": "v9.10.0-broken", "commit": {"sha": "c" * 40}}]
+        if "/releases/tags/" in url:
+            if url.endswith("v9.10.0-broken"):
+                return {"assets": []}
+            return {"assets": [{"name": "SHA256SUMS",
+                                "browser_download_url": "https://example/SHA256SUMS"}]}
+        raise AssertionError(url)
+
+    def fake_bytes(url, timeout=60.0, max_bytes=0):
+        state["calls"].append(url)
+        if url.endswith("SHA256SUMS"):
+            return (f"{state['digest']}  magicalbeans-{TAG}.tar.gz\n"
+                    "0000  something-else.tar.gz\n").encode()
+        if "codeload" in url:
+            return state["tarball"]
+        raise AssertionError(url)
+
+    real_json, real_bytes = selfupdate._fetch_json, selfupdate._fetch_bytes
+    real_swap, real_restart = selfupdate._swap_in, selfupdate.schedule_restart
+    real_hook = selfupdate._before_restart_hook
+    selfupdate._fetch_json, selfupdate._fetch_bytes = fake_json, fake_bytes
+    swapped = []
+    modes = []
+
+    def fake_swap(path):
+        # The temp tree is removed as soon as apply() returns, so the mode
+        # the extraction left behind is read here, while it still exists.
+        swapped.append(path)
+        modes.append(stat.S_IMODE(
+            os.stat(os.path.join(path, "__init__.py")).st_mode))
+
+    selfupdate._swap_in = fake_swap
+    selfupdate.schedule_restart = lambda delay=1.5: None
+    quiesced = []
+    selfupdate.set_before_restart_hook(lambda: quiesced.append(True))
+    try:
+        release = selfupdate.latest_tag()
+        check("D3 the newest tag is chosen by version order, not list order",
+              release["tag"] == "v9.10.0-broken", release["tag"])
+
+        # The newest tag has no SHA256SUMS: refused, nothing downloaded.
+        SERVICE.app_db.save_settings({"updates_enabled": True})
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 a release with no SHA256SUMS is refused",
+              not result.get("ok") and "SHA256SUMS" in result.get("error", ""),
+              str(result))
+        check("D3 …and nothing was swapped in", not swapped, str(swapped))
+
+        # Drop the broken tag so v9.9.9 is newest, and tamper with the archive.
+        def only_good(url, timeout=10.0):
+            payload = fake_json(url, timeout)
+            if url.endswith("/tags"):
+                return [t for t in payload if not t["name"].endswith("broken")]
+            return payload
+        selfupdate._fetch_json = only_good
+
+        state["tarball"] = TARBALL + b"tampered"
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 a tarball whose digest differs is refused",
+              not result.get("ok") and "SHA-256" in result.get("error", ""),
+              str(result))
+        check("D3 …and still nothing was swapped in", not swapped, str(swapped))
+
+        # Oversized: refused before it can be unpacked.
+        state["tarball"] = TARBALL
+        result_ok_before = SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 the matching tarball installs",
+              result.get("ok") and result.get("tag") == TAG, str(result))
+        check("D3 …the workers were quiesced before the swap",
+              bool(quiesced) and bool(swapped), f"{quiesced} {swapped}")
+        check("D3 …and the installed tag is recorded",
+              SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY) == TAG
+              and result_ok_before is None,
+              str(SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)))
+
+        # The unpacked tree must not carry the archive's own mode bits
+        # (the tarball above asks for 0777 on every file).
+        check("D3 the archive's mode bits are discarded",
+              modes == [0o644], str([oct(m) for m in modes]))
+
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 the same tag again is 'up to date'",
+              result.get("ok") and result.get("up_to_date"), str(result))
+
+        # And with the setting off again, nothing is even asked of GitHub.
+        SERVICE.app_db.save_settings({"updates_enabled": False})
+        state["calls"].clear()
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 switching the setting off stops it reaching the network",
+              not result.get("ok") and result.get("disabled") and not state["calls"],
+              f"{result} {state['calls']}")
+    finally:
+        selfupdate._fetch_json, selfupdate._fetch_bytes = real_json, real_bytes
+        selfupdate._swap_in, selfupdate.schedule_restart = real_swap, real_restart
+        selfupdate.set_before_restart_hook(real_hook)
+        SERVICE.app_db.save_settings({"updates_enabled": False})
+
     return 0
 
 
