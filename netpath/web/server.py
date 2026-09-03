@@ -284,6 +284,12 @@ MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state",
 SESSION_COOKIE = "sw_session"
 
 
+class LengthRequired(ValueError):
+    """A body this server will not read: chunked rather than measured. Its
+    own type so _route can answer 411 instead of the 400 every other bad
+    body gets."""
+
+
 class AccessLog:
     """Recent requests and per-client totals, for the service console.
 
@@ -356,10 +362,30 @@ class Handler(BaseHTTPRequestHandler):
     service: Service = None      # set on the server instance
     access: AccessLog = None
 
+    # socketserver only calls settimeout() when this is not None, so without
+    # it a half-open connection sat in readline() forever holding its
+    # thread — one slow-loris socket per thread, with no cap on either.
+    # Thirty seconds is far longer than any legitimate client needs to
+    # finish sending a request. The terminal's WebSocket replaces this with
+    # its own timeout the moment it takes the socket over (wsock.WebSocket),
+    # so a quiet shell is not affected.
+    timeout = 30
+
     # ------------------------------------------------------------ plumbing
 
     def log_message(self, fmt, *args):
         return  # the event log is the log; stderr noise helps nobody
+
+    def send_response(self, code, message=None):
+        """The base class's, without the `Server` header.
+
+        "SappiWhere" on every response tells an unauthenticated scanner
+        which product — and so which version-specific weaknesses — to try,
+        and buys nothing: no client here reads it.
+        """
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
 
     def setup(self):
         super().setup()
@@ -386,13 +412,23 @@ class Handler(BaseHTTPRequestHandler):
         # this used to carry matched *any* host, which would let every page
         # in the product open a socket anywhere. `frame-ancestors 'none'`
         # keeps the terminal — Trust button and all — out of anyone's
-        # iframe. Inline styles stay allowed for the terminal emulator,
+        # iframe. `form-action 'self'` is what stops injected markup from
+        # posting an operator's typing off-site, and `base-uri 'none'`
+        # stops an injected <base> from repointing every relative URL on
+        # the page. Inline styles stay allowed for the terminal emulator,
         # which injects its own <style>.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline';"
-                         " connect-src 'self'; frame-ancestors 'none'")
+                         " connect-src 'self'; frame-ancestors 'none';"
+                         " base-uri 'none'; form-action 'self'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # Only under TLS: sent over plain HTTP it is ignored by browsers,
+        # and sending it from a host that is later served without a
+        # certificate would lock the interface out of every browser that
+        # remembered it.
+        if getattr(self.server, "is_tls", False):
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -405,26 +441,63 @@ class Handler(BaseHTTPRequestHandler):
         headers.update(extra_headers or {})
         self._send(code, body, "application/json; charset=utf-8", headers)
 
-    # Every request body this app takes is JSON, and the largest legitimate
-    # one by far is a base64-encoded MIB zip (max_mib_bundle_bytes, 64 MB by
-    # default, ~85 MB once encoded). Anything past this is refused before a
-    # byte is read, rather than being pulled into memory first — otherwise a
-    # single mistyped Content-Length is an out-of-memory kill.
-    MAX_BODY_BYTES = 128 * 1024 * 1024
+    # Every request body this app takes is JSON, and every one of them is
+    # small — a device, a rule, a settings block. Anything past this is
+    # refused before a byte is read, rather than being pulled into memory
+    # first: a single mistyped Content-Length used to be a 128 MiB
+    # allocation, and that was the general limit for every route.
+    MAX_BODY_BYTES = 16 * 1024 * 1024
 
-    def _body(self) -> dict:
+    # The exception, and the only one: a MIB upload carries a base64-encoded
+    # archive, whose ceiling is the operator's own max_mib_bundle_bytes
+    # setting (64 MB by default, ~85 MB once encoded). Raising the limit for
+    # exactly these paths keeps the general cap tight without breaking a
+    # documented setting.
+    LARGE_BODY_PATHS = ("/api/nodes/mibs",)
+
+    def _body_limit(self, path: str) -> int:
+        if not path.startswith(self.LARGE_BODY_PATHS):
+            return self.MAX_BODY_BYTES
+        try:
+            budget = int(self.service.nodes_settings.get(
+                "max_mib_bundle_bytes", 0))
+        except (AttributeError, TypeError, ValueError):
+            budget = 0
+        # base64 is four bytes per three, plus the JSON envelope around it.
+        return max(self.MAX_BODY_BYTES, (budget * 4) // 3 + 65536)
+
+    def _body(self, limit: int | None = None) -> dict:
+        # Chunked bodies were read as Content-Length 0, i.e. as an empty
+        # body, and the request then ran with default arguments — POST
+        # /api/settings with no body resolves to apply_global_settings({}).
+        # Harmless as deployed (HTTP/1.0, no keep-alive) and a hole the
+        # moment a reverse proxy forwards a chunked request, so it is
+        # refused outright rather than silently reinterpreted.
+        if (self.headers.get("Transfer-Encoding") or "").strip():
+            raise LengthRequired(
+                "This server reads Content-Length only; send the body with a "
+                "length rather than chunked")
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
-        if length > self.MAX_BODY_BYTES:
+        cap = self.MAX_BODY_BYTES if limit is None else limit
+        if length > cap:
             raise ValueError(
                 f"Request body of {length:,} bytes exceeds the "
-                f"{self.MAX_BODY_BYTES:,} byte limit")
+                f"{cap:,} byte limit")
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return {}
+        if not isinstance(body, dict):
+            return {}
+        # Underscore-prefixed keys are this layer's, not the caller's — the
+        # same rule the query string has always had. Only the body was
+        # exempt, and post_login read `_agent` out of it, so the session
+        # list showed whatever the client claimed instead of its real
+        # User-Agent (arbitrary markup included).
+        return {k: v for k, v in body.items() if not str(k).startswith("_")}
 
     # -------------------------------------------------------------- routing
 
@@ -477,6 +550,35 @@ class Handler(BaseHTTPRequestHandler):
                     (time.perf_counter() - started) * 1000,
                     self.headers.get("User-Agent", "")[:120])
 
+    def _same_origin(self) -> bool:
+        """Whether a state-changing request came from this server's own
+        pages. The same rule the terminal's WebSocket upgrade already
+        applies, with one difference that matters here.
+
+        A browser always sends `Origin` on an upgrade, so the socket refuses
+        a missing one. It does NOT always send it on a same-origin fetch,
+        and nothing outside a browser sends it at all — the demo harness and
+        every script that drives this API through http.client included — so
+        an absent `Origin` is allowed. That is not a hole: the attack this
+        closes is a page on another origin using the operator's cookie, and
+        a browser doing that always labels it. `Sec-Fetch-Site` is checked
+        the same way: honoured when the browser sends it, absent otherwise.
+
+        `SameSite=Strict` on the cookie is not enough on its own, because
+        "site" is registrable-domain-scoped: another port on this host or a
+        sibling subdomain is the same site, and over plain HTTP a network
+        attacker can put a page on one.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            host = (self.headers.get("Host") or "").strip().lower()
+            if urlparse(origin).netloc.lower() != host:
+                return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site and site not in ("same-origin", "none"):
+            return False
+        return True
+
     def _route(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -525,6 +627,9 @@ class Handler(BaseHTTPRequestHandler):
             if content_type.strip() != "application/json":
                 self._json({"error": "Requests must be application/json"}, 415)
                 return
+            if not self._same_origin():
+                self._json({"error": "Cross-origin request refused"}, 403)
+                return
 
         for route_method, pattern, handler, requirement in COMPILED:
             if route_method != method:
@@ -533,7 +638,8 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 continue
             try:
-                body = self._body() if method in ("POST", "PUT", "DELETE") else {}
+                body = (self._body(self._body_limit(path))
+                        if method in ("POST", "PUT", "DELETE") else {})
                 need = requirement(params, body) if callable(requirement) else requirement
                 if need is not None:
                     module, level = need
@@ -602,6 +708,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/logout":
                     headers = self._set_session_cookie("", clear=True)
                 self._json(result, extra_headers=headers)
+            except LengthRequired as exc:
+                self._json({"error": str(exc)}, 411)
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
             except ValueError as exc:

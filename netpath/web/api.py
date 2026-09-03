@@ -4142,8 +4142,11 @@ def post_login(service, params, body) -> dict:
         service.app_db.set_password(row["username"], hash_password(password),
                                 must_change=bool(row["must_change"]))
 
+    # The real User-Agent header, not a body field. The session list claims
+    # to show what signed in; it used to show whatever the caller put in a
+    # body key called "_agent", markup and all.
     token = service.sessions.create(row["username"], client,
-                                    str(body.get("_agent", "")))
+                                    str(params.get("_agent", "")))
     service.log.add(SYSTEM_CATEGORY, f"{row['username']} signed in from {client}")
     return {"token": token, "username": row["username"],
             "must_change": bool(row["must_change"])}

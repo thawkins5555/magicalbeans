@@ -524,6 +524,70 @@ def main() -> int:
     check("D5 allow_legacy_ssh is off by default",
           CONFIGRX_DEFAULTS["allow_legacy_ssh"] is False)
 
+    # ------------------------------------------------ D6 headers and bodies
+    status, head, _p = req("GET", "/api/state", cookie=admin_cookie)
+    csp = head.get("content-security-policy", "")
+    for directive in ("frame-ancestors 'none'", "base-uri 'none'",
+                      "form-action 'self'", "connect-src 'self'"):
+        check(f"D6 CSP carries {directive}", directive in csp, csp)
+    check("D6 the Server header is gone", "server" not in head, str(head))
+    check("D6 HSTS is absent over plain HTTP",
+          "strict-transport-security" not in head, str(head))
+
+    status, _h, payload = req("POST", "/api/maintenance", {"action": "redns"},
+                              cookie=admin_cookie,
+                              headers={"Origin": "http://evil.example"})
+    check("D6 a cross-site Origin is refused", status == 403, f"{status} {payload}")
+
+    status, _h, payload = req("POST", "/api/maintenance", {"action": "redns"},
+                              cookie=admin_cookie,
+                              headers={"Sec-Fetch-Site": "cross-site"})
+    check("D6 Sec-Fetch-Site: cross-site is refused", status == 403, str(status))
+
+    status, _h, payload = req("POST", "/api/maintenance", {"action": "redns"},
+                              cookie=admin_cookie)
+    check("D6 an absent Origin still works (scripts, the demo harness)",
+          status == 200, f"{status} {payload}")
+
+    status, _h, payload = req(
+        "POST", "/api/maintenance", {"action": "redns"}, cookie=admin_cookie,
+        headers={"Origin": f"http://127.0.0.1:{PORT}",
+                 "Sec-Fetch-Site": "same-origin"})
+    check("D6 the app's own origin is accepted", status == 200, str(status))
+
+    # Chunked: refused with 411 rather than run with an empty body.
+    chunked = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
+    payload = json.dumps({"action": "prune_syslog"}).encode()
+    chunked.putrequest("POST", "/api/maintenance", skip_accept_encoding=True)
+    chunked.putheader("Content-Type", "application/json")
+    chunked.putheader("Transfer-Encoding", "chunked")
+    chunked.putheader("Cookie", admin_cookie)
+    chunked.endheaders()
+    chunked.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(payload), payload))
+    response = chunked.getresponse()
+    response.read()
+    chunked.close()
+    check("D6 a chunked body is 411, not an empty body", response.status == 411,
+          str(response.status))
+
+    check("D6 the general body cap is 16 MiB",
+          SERVER.httpd.RequestHandlerClass.MAX_BODY_BYTES == 16 * 1024 * 1024)
+    handler_class = SERVER.httpd.RequestHandlerClass
+    check("D6 the handler has a socket timeout", handler_class.timeout == 30,
+          str(handler_class.timeout))
+
+    status, _h, payload = req("POST", "/api/nodes/devices",
+                              {"ip": "10.20.30.40",
+                               "_agent": "<img src=x onerror=alert(1)>EVIL"},
+                              cookie=admin_cookie)
+    check("D6 an underscore key in a body is dropped, not stored",
+          status == 200, f"{status} {payload}")
+    _c, _s, _p = login("admin", ADMIN_PASSWORD)
+    status, _h, payload = req("GET", "/api/users", cookie=admin_cookie)
+    agents = [s.get("agent", "") for s in payload.get("sessions", [])]
+    check("D6 the session list shows the real User-Agent, not a body field",
+          not any("onerror" in a for a in agents), str(agents))
+
     return 0
 
 
