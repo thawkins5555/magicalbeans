@@ -548,8 +548,13 @@
       return;
     }
     // Renew the fast-poll focus for the selected device on every refresh
-    // tick; the short server-side TTL ends it when the tab is left.
-    App.post(`/api/nodes/devices/${view.selected}/focus`, {}).catch(() => {});
+    // tick; the short server-side TTL ends it when the tab is left. Asking
+    // the poller to work harder is a write, so a read-only account skips it
+    // rather than collecting a 403 in the console on every refresh — the
+    // pane simply updates at the ordinary poll interval.
+    if (App.canWrite('nodes')) {
+      App.post(`/api/nodes/devices/${view.selected}/focus`, {}).catch(() => {});
+    }
     const [detail, metrics, ifaces, events] = await Promise.all([
       App.get(`/api/nodes/devices/${view.selected}`),
       App.get(`/api/nodes/devices/${view.selected}/metrics`),
