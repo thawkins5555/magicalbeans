@@ -176,7 +176,10 @@ body {
    worst one is, in the same three tones the rest of the application uses
    for state — so the tab strip answers "does this need me now?" without
    opening the tab. */
-.badge.sev-fail { background: var(--fail); color: var(--text); }
+/* Dark text on every badge fill, including this one: --text on --fail is
+   2.6:1, which is worse than the amber it replaced. --bg on --fail is
+   5.7:1 and matches the other two. */
+.badge.sev-fail { background: var(--fail); color: var(--bg); }
 .badge.sev-warn { background: var(--warn); color: var(--bg); }
 .badge.sev-info { background: var(--accent); color: var(--bg); }
 .conn { color: var(--faint); font: 11px var(--mono); padding-right: 4px; }
