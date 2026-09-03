@@ -213,7 +213,12 @@ def vendor_for(sys_object_id: str) -> str:
     for cut in range(len(parts), 0, -1):
         name = WELL_KNOWN.get(".".join(parts[:cut]))
         if name:
-            return name
+            # Through canonical_key, so a device under one of a maker's
+            # narrower arcs (hpCompaq, dellNetworking, arubaCx) is stored
+            # under the same key as one under its main arc and the two land
+            # in one row of the vendor filter.
+            from . import enterprises
+            return enterprises.canonical_key(name)
     arc = enterprise_arc(oid)
     if arc is not None:
         from . import enterprises

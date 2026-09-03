@@ -386,7 +386,9 @@ DEFAULTS = {
     "sample_row_cap_per_metric": 5_000,
     "event_retention_days": 180,
     "discovery_retention_days": 30,
-    "max_mib_bytes": 8 * 1024 * 1024,
+    "max_mib_bytes": 1024 * 1024,  # a real MIB module is tens of KB; the
+    # cap exists so one upload cannot occupy a parser thread, and it also
+    # bounds the bundle path, which multiplies it by the member count.
     # Installing a MIB bundle from the catalog. The per-file cap is
     # max_mib_bytes above; these bound the rest of the operation so a bad
     # upstream cannot fill the disk or hang a worker thread indefinitely.
