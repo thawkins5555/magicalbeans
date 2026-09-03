@@ -60,6 +60,65 @@ class CommitCounter:
             self.commits += 1
 
 
+def reboot_suppression():
+    """A device that restarted between two polls restarts its interface
+    counters with itself. counter_rate cannot tell that apart from a
+    32-bit wrap, so it used to report the switch as having carried
+    hundreds of megabits in the eight seconds it had been up. The rates
+    for that one poll are dropped instead; the counters are still stored,
+    so the poll after it measures against the post-reboot baseline.
+    """
+    print("\n-- reboot suppression")
+    proc, port = spawn_stub("stub_agent_iftable.py", "reboot",
+                            "--interfaces", "2", "--reboot-after", "2")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "reboot.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "reboot-test", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+
+        def poll():
+            device = db.device(device_id)
+            poller._poll_device(device, db.effective_config(device))
+            time.sleep(0.05)
+            return {r["if_index"]: r for r in db.interfaces(device_id)}[1]
+
+        poll()                                  # 1: baseline, no rate yet
+        before = poll()                         # 2: still up, real rates
+        check(before["in_bps"] is not None and before["in_bps"] > 0,
+              f"a normal poll computes a rate (in_bps={before['in_bps']})")
+        check(before["in_error_rate"] is not None and before["in_error_rate"] > 0,
+              "…and an error rate")
+
+        during = poll()                         # 3: uptime dropped
+        check(db.device_events(device_id, kinds=["rebooted"]),
+              "the reboot itself is still recorded as an event")
+        check(during["in_bps"] is None and during["out_bps"] is None,
+              f"the reboot poll stores no octet rate "
+              f"(in_bps={during['in_bps']}, out_bps={during['out_bps']})")
+        check(during["in_error_rate"] is None,
+              f"…and no phantom error-rate spike "
+              f"(in_error_rate={during['in_error_rate']})")
+        check(during["last_in_octets"] is not None
+              and during["last_in_octets"] < 10_000,
+              f"…but the post-reboot counters are stored as the new baseline "
+              f"(last_in_octets={during['last_in_octets']})")
+
+        after = poll()                          # 4: measured off that baseline
+        check(after["in_bps"] is not None and after["in_bps"] > 0,
+              f"the poll after the reboot measures normally again "
+              f"(in_bps={after['in_bps']})")
+
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def main():
     proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "24")
     try:
@@ -151,6 +210,8 @@ def main():
         db.close()
     finally:
         proc.kill()
+
+    reboot_suppression()
 
     print()
     if FAILURES:

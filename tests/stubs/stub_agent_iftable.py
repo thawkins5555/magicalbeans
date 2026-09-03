@@ -21,6 +21,10 @@ Modes:
                    N x timeout x retries.
   nonnumeric       the ifIndex column carries one non-numeric index suffix
                    between two numeric ones.
+  reboot           sysUpTime counts up for the first --reboot-after reads
+                   and then drops to a few seconds, and every counter
+                   restarts with it — a device that rebooted between two
+                   polls.
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
 spawn_stub waits for.
@@ -45,7 +49,8 @@ UPTIME_TICKS = 987_654
 
 
 class Agent:
-    def __init__(self, port: int, mode: str = "ok", interfaces: int = 2):
+    def __init__(self, port: int, mode: str = "ok", interfaces: int = 2,
+                 reboot_after: int = 2):
         self.mode = mode
         self.n_interfaces = interfaces
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -53,8 +58,16 @@ class Agent:
         self.port = self.sock.getsockname()[1]
         self.walked = False          # dark_after_walk: has the ifIndex walk run?
         self.in_octets = 1_000_000
+        self.reboot_after = reboot_after
+        self.uptime_reads = 0
 
     # ---------------------------------------------------------------- values
+
+    def rebooted(self) -> bool:
+        """True once this agent has 'restarted': sysUpTime drops and every
+        counter restarts from a low value at the same moment, exactly as a
+        real agent's do."""
+        return self.mode == "reboot" and self.uptime_reads > self.reboot_after
 
     def indexes(self) -> list[str]:
         """The ifIndex column's own suffixes, as text. `nonnumeric` puts a
@@ -73,7 +86,10 @@ class Agent:
         if oid == S["sys_object_id"]:
             return enc_octets("1.3.6.1.4.1.99999.1")
         if oid == S["sys_uptime"]:
-            return enc_unsigned(T_TIMETICKS, UPTIME_TICKS)
+            self.uptime_reads += 1
+            if self.rebooted():
+                return enc_unsigned(T_TIMETICKS, 800)   # 8 seconds up
+            return enc_unsigned(T_TIMETICKS, UPTIME_TICKS + self.uptime_reads)
         if oid == S["sys_contact"]:
             return enc_octets("noc@example.com")
         if oid == S["sys_name"]:
@@ -88,6 +104,15 @@ class Agent:
         if oid == U["mem_total_kb"]:
             return enc_unsigned(T_GAUGE32, 8_000_000)
         return None
+
+    def counter_base(self) -> int:
+        """Where this agent's counters currently sit. They advance once per
+        poll (sysUpTime is read exactly once per poll) and restart from
+        nearly zero after a 'reboot' — which is what makes a naive rate
+        calculation report an enormous burst across the restart."""
+        if self.rebooted():
+            return 700 * (self.uptime_reads - self.reboot_after)
+        return self.in_octets + 125_000 * self.uptime_reads
 
     def _if_value(self, key: str, index: int):
         if not 1 <= index <= self.n_interfaces:
@@ -104,16 +129,17 @@ class Agent:
             return enc_octets(bytes([0x02, 0, 0, 0, 0, index & 0xFF]))
         if key == "if_speed":
             return enc_unsigned(T_GAUGE32, 1_000_000_000)
+        base = self.counter_base()
         if key == "if_in_octets":
-            return enc_unsigned(T_COUNTER32, (self.in_octets + index) % (2 ** 32))
+            return enc_unsigned(T_COUNTER32, (base + index) % (2 ** 32))
         if key == "if_out_octets":
-            return enc_unsigned(T_COUNTER32, 500 + index)
+            return enc_unsigned(T_COUNTER32, (base // 2 + index) % (2 ** 32))
         if key == "if_in_errors":
-            return enc_unsigned(T_COUNTER32, index)
+            return enc_unsigned(T_COUNTER32, base // 1000 + index)
         if key == "if_out_errors":
             return enc_unsigned(T_COUNTER32, 0)
         if key == "if_in_discards":
-            return enc_unsigned(T_COUNTER32, 2 * index)
+            return enc_unsigned(T_COUNTER32, base // 2000 + index)
         if key == "if_out_discards":
             return enc_unsigned(T_COUNTER32, 0)
         return None
@@ -125,10 +151,11 @@ class Agent:
             return enc_octets(f"link-{index}")
         if key == "if_high_speed":
             return enc_unsigned(T_GAUGE32, 1000)
+        base = self.counter_base()
         if key == "if_hc_in_octets":
-            return enc_unsigned(T_COUNTER64, self.in_octets + index)
+            return enc_unsigned(T_COUNTER64, base + index)
         if key == "if_hc_out_octets":
-            return enc_unsigned(T_COUNTER64, 500 + index)
+            return enc_unsigned(T_COUNTER64, base // 2 + index)
         return None
 
     @staticmethod
@@ -246,14 +273,17 @@ def main(argv):
     port = int(argv[0])
     mode = "ok"
     interfaces = 2
+    reboot_after = 2
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
         if item == "--interfaces":
             interfaces = int(rest.pop(0))
+        elif item == "--reboot-after":
+            reboot_after = int(rest.pop(0))
         else:
             mode = item
-    Agent(port, mode, interfaces).serve()
+    Agent(port, mode, interfaces, reboot_after).serve()
 
 
 if __name__ == "__main__":

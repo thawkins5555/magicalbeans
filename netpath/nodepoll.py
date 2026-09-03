@@ -986,6 +986,15 @@ class NodePoller:
             if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
                 self.db.record_device_event(device_id, "auth_ok", "")
 
+        # Hoisted out of the branch below: the interface block needs it too.
+        # A device that has just restarted has restarted its interface
+        # counters with it, and counter_rate cannot tell a reset apart from
+        # a 32-bit wrap — it computes (2**32 - previous + current) / dt and
+        # reports a switch that has been up for eight seconds as carrying
+        # 220 Mbps. One poll's rates are dropped instead; the counters
+        # themselves are still stored, so the poll after this one measures
+        # against the post-reboot baseline and is correct.
+        rebooted = False
         if uptime_ticks is not None:
             rebooted, note = detect_reboot(
                 uptime_ticks, now, previous["last_uptime_ticks"],
@@ -1024,7 +1033,7 @@ class NodePoller:
                 # this poll.
                 sample_ts = row.get("_sample_ts") or now
                 in_bps = out_bps = in_err_rate = out_err_rate = None
-                if prior is not None:
+                if prior is not None and not rebooted:
                     in_bps = counter_rate(
                         prior["last_in_octets"], prior["last_sample_ts"] or 0,
                         row.get("in_octets"), sample_ts, row.get("_octet_bits", 32),
