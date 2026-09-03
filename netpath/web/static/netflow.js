@@ -27,8 +27,10 @@
     request: 0,
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
 
@@ -424,7 +426,8 @@
     view.records = records;
     const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
-                           { name: 'nf-records', columns, sort, onSort });
+                           { name: 'nf-records', caption: 'NetFlow records',
+                             columns, sort, onSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(records, sort.key, sort.descending, columns);
     App.drawRows(body, rows, columns, (tr, record) => {
@@ -573,6 +576,35 @@
 
   /* The collector strip is read from the shared state poll, so it keeps
      ticking at the usual rate while the charts below refresh far less often. */
+
+  /* Counters the collector reports only when they are non-zero, in the order
+     an operator cares about them. `kernel_dropped` first and always: it is
+     messages the kernel discarded before this application saw them, which is
+     the number that tells the truth about an overloaded listener. */
+  const EXTRA_COUNTERS = [
+    ['kernel_dropped', 'dropped by the kernel'],
+    ['throttled', 'throttled per source'],
+    ['bad_auth', 'failed authentication'],
+    ['unverified', 'unverified'],
+    ['too_many_varbinds', 'over the varbind limit'],
+    ['tcp_refused', 'TCP connections refused'],
+    ['resampled', 'resampled'],
+  ];
+
+  function extraCounterParts(counters) {
+    const parts = [];
+    for (const [key, label] of EXTRA_COUNTERS) {
+      const n = Number(counters[key] || 0);
+      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
+    }
+    // Not a fault and not hidden when zero: an operator wants to know how
+    // many senders are connected, including none.
+    if (counters.tcp_clients != null) {
+      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
+    }
+    return parts;
+  }
+
   function drawStatus() {
     const server = App.state.serverState || {};
     const collector = server.collector || { counters: {}, decoder: {} };
@@ -600,6 +632,7 @@
     if (counters.dropped) parts.push(`${counters.dropped} dropped`);
     if (counters.errors) parts.push(`${counters.errors} decode errors`);
     if (counters.rejected) parts.push(`${counters.rejected} rejected`);
+    parts.push(...extraCounterParts(counters));
     // v9 and IPFIX stay undecodable until a template arrives, and exporters
     // resend them only every few minutes, so this is as useful as packet age.
     parts.push(counters.last_template
@@ -684,6 +717,32 @@
 
     App.el('nf-range').onchange = resetWindow;
     App.el('nf-reset').onclick = resetWindow;
+
+    /* The documented chart shortcuts. Ctrl-modified on purpose (README
+       :362): bare `+` and the arrow keys belong to whichever filter box or
+       dropdown has focus. Home is the one exception the table already
+       allows, so it is ignored while a text field has focus. */
+    document.addEventListener('keydown', (event) => {
+      if (App.state.tab !== 'netflow') return;
+      if (!App.el('modal').hidden) return;      // a dialog owns the keyboard
+      const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(
+        (document.activeElement || {}).tagName || '');
+      if (event.key === 'Home' && !typing) {
+        event.preventDefault();
+        resetWindow();
+        return;
+      }
+      if (!event.ctrlKey || event.altKey || event.metaKey) return;
+      // '=' and '+' are the same key; '_' is shift-'-'. Accept the pairs so
+      // the shortcut works whether or not Shift is held.
+      const zoomIn = event.key === '=' || event.key === '+';
+      const zoomOut = event.key === '-' || event.key === '_';
+      if (zoomIn) { event.preventDefault(); zoom(0.5); }
+      else if (zoomOut) { event.preventDefault(); zoom(2); }
+      else if (event.key === 'ArrowLeft') { event.preventDefault(); pan(-0.25); }
+      else if (event.key === 'ArrowRight') { event.preventDefault(); pan(0.25); }
+      else if (event.key === '0') { event.preventDefault(); resetWindow(); }
+    });
     App.el('nf-in').onclick = () => zoom(0.5);
     App.el('nf-out').onclick = () => zoom(2);
     App.el('nf-back').onclick = () => pan(-0.25);

@@ -18,8 +18,10 @@
     showHostname: true,
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   /* Long messages need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
@@ -183,14 +185,19 @@
   function drawTable() {
     const columns = messageColumns();
     const table = App.grid(App.el('syslog-table'),
-      { name: 'syslog-messages', columns,
+      { name: 'syslog-messages', caption: 'Syslog messages', columns,
         sort: view.messageSort, onSort: onMessageSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.messages, view.messageSort.key,
                               view.messageSort.descending, columns);
     App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
+      tr.onclick = () => {
+        view.selected = row.id;
+        App.setRoute([row.id]);
+        showDetail(row);
+        drawTable();
+      };
     });
     table.appendChild(body);
   }
@@ -319,6 +326,35 @@
 
   /* ----------------------------------------------------------- refresh */
 
+
+  /* Counters the collector reports only when they are non-zero, in the order
+     an operator cares about them. `kernel_dropped` first and always: it is
+     messages the kernel discarded before this application saw them, which is
+     the number that tells the truth about an overloaded listener. */
+  const EXTRA_COUNTERS = [
+    ['kernel_dropped', 'dropped by the kernel'],
+    ['throttled', 'throttled per source'],
+    ['bad_auth', 'failed authentication'],
+    ['unverified', 'unverified'],
+    ['too_many_varbinds', 'over the varbind limit'],
+    ['tcp_refused', 'TCP connections refused'],
+    ['resampled', 'resampled'],
+  ];
+
+  function extraCounterParts(counters) {
+    const parts = [];
+    for (const [key, label] of EXTRA_COUNTERS) {
+      const n = Number(counters[key] || 0);
+      if (n > 0) parts.push(`${n.toLocaleString()} ${label}`);
+    }
+    // Not a fault and not hidden when zero: an operator wants to know how
+    // many senders are connected, including none.
+    if (counters.tcp_clients != null) {
+      parts.push(`${Number(counters.tcp_clients).toLocaleString()} TCP client(s)`);
+    }
+    return parts;
+  }
+
   function drawStatus() {
     const server = App.state.serverState || {};
     const syslog = server.syslog || { counters: {} };
@@ -343,6 +379,7 @@
     if (c.filtered) parts.push(`${c.filtered} filtered by severity`);
     if (c.dropped) parts.push(`${c.dropped} dropped`);
     if (c.rejected) parts.push(`${c.rejected} rejected`);
+    parts.push(...extraCounterParts(c));
     if (!syslog.fts) {
       parts.push('scan search (no FTS5)');
     } else if (syslog.index_ready === false) {
@@ -443,5 +480,21 @@
     }
   }
 
-  App.pages.syslog = { init, refresh, fastTick: drawStatus };
+  /* #/syslog/<id>: select the row a link names, once refresh() has
+     filled the list it lives in. A row that is not in the current
+     window is simply not selected — these three tables are live
+     tails, and silently widening the window to find one row would
+     change what the operator asked to see. */
+  function activate(opts) {
+    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
+    const id = Number(opts.parts[0]);
+    if (!Number.isFinite(id)) return;
+    const row = (view.messages || []).find((r) => r.id === id);
+    if (!row) return;
+    view.selected = id;
+    showDetail(row);
+    drawTable();
+  }
+
+  App.pages.syslog = { init, refresh, activate, fastTick: drawStatus };
 })();

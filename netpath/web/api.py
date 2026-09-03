@@ -4634,3 +4634,324 @@ def post_password(service, params, body) -> dict:
     _audit(service, params, "password.reset" if resetting else "password.change",
            target=target, detail=f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}
+
+
+# ---------------------------------------------------------------------------
+# Everything below this line is the browser front end's own additions
+# (workstream E). They are appended rather than filed beside their relatives
+# so the front-end work and the module work never touch the same hunk.
+# ---------------------------------------------------------------------------
+
+
+# `GET /api/alerts` caps its answer (300 by default, 2,000 hard) and the list
+# said "300 shown" with no total, so an operator ticking select-all
+# acknowledged 300 of however many there really were. This gives the same
+# filters an honest denominator.
+#
+# alerts.db has no filtered COUNT of its own, and alertsdb.py belongs to
+# another workstream, so the count is taken by asking for ids up to a cap and
+# saying so when the cap is what answered: "300 of 5,000+ shown" is honest,
+# "300 shown" was not. If a `count_alerts` ever lands on the database object
+# this uses it instead, and the cap stops applying.
+ALERT_TOTAL_CAP = 5000
+
+
+def get_alerts_total(service, params, body) -> dict:
+    """How many alerts match the filters the list is showing."""
+    filters = {
+        "state": params.get("state") or None,
+        "severity": int(params["severity"]) if params.get("severity") else None,
+        "rule_id": int(params["rule_id"]) if params.get("rule_id") else None,
+        "device_text": params.get("device") or None,
+        "text": params.get("q") or None,
+        "t0": _num(params, "t0", None),
+        "t1": _num(params, "t1", None),
+    }
+    counter = getattr(service.alerts_db, "count_alerts", None)
+    if callable(counter):
+        return {"total": int(counter(**filters)), "capped": False,
+                "cap": None}
+    rows = service.alerts_db.alerts(limit=ALERT_TOTAL_CAP + 1, **filters)
+    total = len(rows)
+    capped = total > ALERT_TOTAL_CAP
+    return {"total": ALERT_TOTAL_CAP if capped else total,
+            "capped": capped, "cap": ALERT_TOTAL_CAP}
+
+
+# Six features across four tabs store a secret, and every one of them goes
+# through Windows DPAPI: on Linux the credential fields render in full, the
+# operator types a password, and the save comes back 400. IPAM's DHCP form is
+# the worst of it — it renders completely, with Windows-only help text, on a
+# host where `ipam_dhcp.IS_WINDOWS` is False and nothing can ever work.
+#
+# This says so once, up front, so the front end can gate a form instead of
+# letting somebody fill it in and be refused. It is deliberately a route of
+# its own rather than another key on /api/state: the answer cannot change
+# while the process is running, so it is fetched once at start-up and never
+# polled. Nothing here is a secret — it is which of this host's features can
+# work at all — so read on any module is enough.
+def get_platform(service, params, body) -> dict:
+    """What this host can and cannot do, for the forms that depend on it."""
+    from .. import dpapi
+    from .. import ipam_dhcp
+
+    powershell = False
+    if ipam_dhcp.IS_WINDOWS:
+        try:
+            ipam_dhcp._powershell_binary()
+            powershell = True
+        except Exception:                                     # noqa: BLE001
+            powershell = False
+
+    return {
+        "platform": {
+            "is_windows": bool(dpapi.IS_WINDOWS),
+            "powershell": powershell,
+            # A platform-neutral secret store was considered and deferred
+            # (see the release notes); this stays False until one exists, and
+            # the front end words its refusals from it rather than hard-coding
+            # "Windows only" in nine places.
+            "secret_store": False,
+            "credential_store": "Windows DPAPI" if dpapi.IS_WINDOWS else None,
+        },
+    }
+
+
+# --------------------------------------------------------------- dashboard
+#
+# The Dashboard was a 385-byte placeholder and `login.js` makes it the
+# landing page after every sign-in, so the screen every shift starts on said
+# "nothing here yet". These two endpoints answer the questions a tile grid
+# asks; everything else the grid needs is already on /api/state, which every
+# tab polls anyway.
+#
+# Permission-gated the way get_state is: never refused outright (the tab is
+# always reachable), but a section the signed-in account cannot read is
+# absent rather than empty, so the front end can leave the tile out instead
+# of drawing a zero that is not true.
+
+# The metric keys the "worst" lists are built from. Named here rather than in
+# the front end because they are the poller's vocabulary (nodepoll.py:1281,
+# :1284 and nodeoids.py's per-vendor tables), not the browser's.
+DASHBOARD_METRICS = (
+    ("rtt", "ping_rtt_ms", "Slowest to answer", "ms", False),
+    ("loss", "ping_loss_pct", "Worst packet loss", "%", False),
+    ("cpu", "cpu_pct", "Highest CPU", "%", False),
+)
+
+DASHBOARD_OFFENDER_N = 10
+
+
+def _dash_can(service, params, module: str) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get(module), _permissions.READ)
+
+
+def get_dashboard(service, params, body) -> dict:
+    """The cross-module numbers the tile grid shows, in one round trip."""
+    result: dict = {}
+
+    if _dash_can(service, params, "nodes"):
+        poller = service.node_poller
+        # pool_state() separates busy from queued; the old gauge added them
+        # together against the pool size and read "48 of 32 busy".
+        pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
+        result["fleet"] = {
+            "counts": service.nodes_db.device_counts(),
+            "running": poller.running,
+            "pool": pool,
+        }
+
+    if _dash_can(service, params, "alerts"):
+        summary = service.alerts_db.open_summary()
+        # One severity-1 outage must never be hidden behind forty severity-6
+        # notices, so the tile is coloured by the worst open severity and
+        # broken down by severity rather than shown as one total. There is no
+        # per-severity COUNT on alerts.db and alertsdb.py belongs to another
+        # workstream, so the breakdown is counted from the open rows up to a
+        # bound and says when the bound is what answered.
+        by_severity: dict[str, int] = {}
+        rows = service.alerts_db.alerts(state="unresolved",
+                                        limit=ALERT_TOTAL_CAP + 1)
+        for row in rows[:ALERT_TOTAL_CAP]:
+            key = str(row["severity"])
+            by_severity[key] = by_severity.get(key, 0) + 1
+        result["alerts"] = {
+            "open": summary.get("open", 0),
+            "acked": summary.get("acked", 0),
+            "worst": summary.get("worst"),
+            "by_severity": by_severity,
+            "counted_capped": len(rows) > ALERT_TOTAL_CAP,
+            "engine_running": service.alert_engine.running,
+            "counters": service.alert_engine.counters,
+        }
+
+    collectors = []
+    for module, name, obj in (
+            ("netflow", "NetFlow", getattr(service, "collector", None)),
+            ("snmp", "SNMP traps", getattr(service, "snmp", None)),
+            ("syslog", "Syslog", getattr(service, "syslog", None))):
+        if obj is None or not _dash_can(service, params, module):
+            continue
+        counters = dict(getattr(obj, "counters", {}) or {})
+        collectors.append({
+            "module": module, "name": name,
+            "running": bool(getattr(obj, "running", False)),
+            "counters": counters,
+        })
+    if collectors:
+        result["collectors"] = collectors
+
+    if _dash_can(service, params, "settings"):
+        # Headroom, not raw sizes: "which database is closest to its cap" is
+        # the question, and it is answered worst-first.
+        settings = service.settings or {}
+        stores = []
+        # Only the seven databases that actually have a cap on the Settings
+        # tab; app.db, wireless.db and configrx.db have none, so they are
+        # reported as size without a fraction rather than as 0% used.
+        for label, db, cap_key in (
+                ("NetPath", service.db, "max_trace_db_mb"),
+                ("NetFlow", service.flow_db, "max_flow_db_mb"),
+                ("Syslog", service.syslog_db, "max_syslog_db_mb"),
+                ("Traps", service.snmp_db, "max_snmp_db_mb"),
+                ("IPAM", service.ipam_db, "max_ipam_db_mb"),
+                ("Nodes", service.nodes_db, "max_nodes_db_mb"),
+                ("Alerts", service.alerts_db, "max_alerts_db_mb"),
+                ("Wireless", service.wireless_db, None),
+                ("ConfigRX", service.configrx_db, None),
+                ("Application", service.app_db, None)):
+            try:
+                used = int(db.size_bytes())
+            except Exception:                                 # noqa: BLE001
+                continue
+            cap_mb = settings.get(cap_key) if cap_key else None
+            cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
+            stores.append({
+                "label": label, "bytes": used, "cap_bytes": cap,
+                "used_fraction": (used / cap) if cap else None,
+            })
+        stores.sort(key=lambda s: (s["used_fraction"] is None,
+                                   -(s["used_fraction"] or 0)))
+        result["storage"] = stores
+
+    return {"dashboard": result}
+
+
+def get_dashboard_offenders(service, params, body) -> dict:
+    """Six short "worst ten" lists, each row linking to its device.
+
+    One query per list rather than one per device: `count_events_by_device`
+    and `top_metric` exist for exactly this.
+    """
+    if not _dash_can(service, params, "nodes"):
+        raise PermissionError("Reading devices is not permitted")
+
+    window_s = _num(params, "window_s", 86400.0) or 86400.0
+    since = time.time() - float(window_s)
+    n = int(_num(params, "n", DASHBOARD_OFFENDER_N, int) or DASHBOARD_OFFENDER_N)
+    n = max(1, min(n, 50))
+
+    def _rows(rows, value_key, unit):
+        out = []
+        for row in rows[:n]:
+            out.append({"device_id": row["device_id"],
+                        "name": row["name"] or row["ip"],
+                        "ip": row["ip"],
+                        "value": row[value_key],
+                        "unit": unit})
+        return out
+
+    lists = []
+    events = service.nodes_db.count_events_by_device(since)
+    lists.append({"key": "events", "title": "Most device events (24 h)",
+                  "unit": "", "rows": _rows(events, "n", "")})
+
+    # Interface flaps are device events too, and they are the ones an
+    # operator chases; kept as their own list rather than folded into the
+    # count above, which would hide a flapping port behind a noisy device.
+    flaps = service.nodes_db.count_events_by_device(
+        since, kinds=["interface_down", "interface_up", "interface_flapping"])
+    lists.append({"key": "interface_events", "title": "Most interface events (24 h)",
+                  "unit": "", "rows": _rows(flaps, "n", "")})
+
+    if _dash_can(service, params, "alerts"):
+        counts: dict[str, dict] = {}
+        for row in service.alerts_db.alerts(t0=since, limit=ALERT_TOTAL_CAP):
+            if row["entity_kind"] != "device":
+                continue
+            key = str(row["entity_id"])
+            entry = counts.setdefault(
+                key, {"device_id": _int_or_none(row["entity_id"]),
+                      "name": row["entity_label"] or key, "ip": "",
+                      "value": 0, "unit": ""})
+            entry["value"] += 1
+        ranked = sorted(counts.values(), key=lambda e: -e["value"])[:n]
+        lists.append({"key": "alerts", "title": "Most alerts (24 h)",
+                      "unit": "", "rows": ranked})
+
+    for key, metric, title, unit, ascending in DASHBOARD_METRICS:
+        rows = service.nodes_db.top_metric(metric, n, ascending=ascending)
+        lists.append({"key": key, "title": title, "unit": unit,
+                      "rows": _rows(rows, "last_value", unit)})
+
+    return {"window_s": window_s, "lists": lists}
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# Two fields the database and the write paths already carry but the existing
+# serializers do not return yet, so a form has no way to show what is
+# currently set. `_device_json` and `_rule_json` live in modules another
+# workstream owns; rather than reach into them, these two small routes hand
+# the front end the missing values, and both disappear the moment the
+# serializers carry them (the front end merges whatever it is given).
+
+
+def get_nodes_device_upstream(service, params, body, device_id) -> dict:
+    """The device this one hangs off, and the devices it could hang off.
+
+    `PUT /api/nodes/devices/<id>` has accepted `upstream_id` since the
+    topology rollup landed — an outage on a core switch raises one alert
+    instead of five hundred — but nothing in the UI could set it, and
+    `_device_json` does not return it, so a form had nothing to show.
+    """
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    keys = row.keys()
+    upstream = row["upstream_id"] if "upstream_id" in keys else None
+    # Everything except this device: the server refuses self and unknown ids
+    # anyway (_clean_upstream_id), and offering them would only produce an
+    # error the operator could have been spared.
+    candidates = [
+        {"id": d["id"], "name": d["name"] or d["ip"], "ip": d["ip"]}
+        for d in service.nodes_db.devices()
+        if d["id"] != device_id
+    ]
+    candidates.sort(key=lambda d: (d["name"] or "").lower())
+    return {"upstream_id": upstream, "candidates": candidates}
+
+
+def get_alerts_rule_extras(service, params, body) -> dict:
+    """`auto_resolve_after_s` and `notify` per rule, keyed by rule id.
+
+    Both are accepted by POST and PUT /api/alerts/rules and neither is in
+    `_rule_json`, so the rule editor could set them but never show what they
+    were. There are dozens of rules, not thousands, so one flat map is the
+    whole answer.
+    """
+    extras = {}
+    for row in service.alerts_db.rules():
+        keys = row.keys()
+        extras[str(row["id"])] = {
+            "auto_resolve_after_s": (row["auto_resolve_after_s"]
+                                     if "auto_resolve_after_s" in keys else None),
+            "notify": (bool(row["notify"]) if "notify" in keys else True),
+        }
+    return {"rules": extras}

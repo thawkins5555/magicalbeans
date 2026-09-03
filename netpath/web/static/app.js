@@ -97,14 +97,114 @@ const App = (() => {
 
   const pages = {};
 
+  /* ---------------------------------------------------- host capabilities
+
+     Six features across four tabs store a secret and every one goes through
+     Windows DPAPI, so on Linux the credential fields rendered in full, the
+     operator typed a password and the save came back 400; IPAM's DHCP form
+     rendered completely, with Windows-only help text, on a host where it
+     could never work. `/api/platform` answers once at start-up (the answer
+     cannot change while the process runs) and these two helpers are what
+     the forms ask.
+
+     Defaults assume the host CAN do it: if the fetch fails, the operator
+     gets today's behaviour — a form and a server-side refusal — rather than
+     a wrongly disabled feature. */
+  state.platform = { is_windows: true, powershell: true, secret_store: false,
+                     credential_store: null };
+
+  function canStoreSecrets() {
+    const p = state.platform || {};
+    return Boolean(p.is_windows || p.secret_store);
+  }
+
+  /* One sentence, in one place, for every credential field that cannot work
+     on this host. Rendered where the field would have been, so nobody types
+     a password into something that will refuse it. */
+  function credentialUnavailableHtml(what) {
+    return `<p class="hint warn-text">${escapeHtml(what || 'A password')} cannot be` +
+      ' stored on this host: credentials are encrypted with Windows DPAPI, and' +
+      ' there is no equivalent here yet. Configure this on a Windows host, or' +
+      ' use an option that needs no stored secret.</p>';
+  }
+
+  async function loadPlatform() {
+    try {
+      const payload = await get('/api/platform');
+      if (payload && payload.platform) state.platform = payload.platform;
+    } catch (error) {
+      // Left at the permissive default above on purpose.
+    }
+  }
+
   /* ------------------------------------------------------------ server */
 
+  /* A request that never answers used to leave the UI frozen and looking
+     healthy: `fetch` had no deadline, so a tab pointed at a server that had
+     stopped replying sat with an in-flight request, never reached
+     connected(false), and showed stale data under a green indicator until
+     the browser's own multi-minute network timeout fired. The one honest
+     signal an operator has during an outage was the one that failed. */
+  const REQUEST_TIMEOUT_MS = 30_000;
+
+  /* In-flight GETs by URL. A page whose endpoint is slower than its refresh
+     interval would otherwise queue one request per tick behind the first;
+     the superseded one is aborted, since nothing would have painted from it
+     anyway. Only GETs — a POST must never be cancelled because a later one
+     looks like it. */
+  const inFlight = new Map();
+
   async function call(path, options = {}) {
-    const response = await fetch(path, {
-      headers: { 'Content-Type': 'application/json' },
-      ...options,
-      body: options.body ? JSON.stringify(options.body) : undefined,
-    });
+    const method = (options.method || 'GET').toUpperCase();
+    let controller = null;
+    if (method === 'GET' && !options.signal) {
+      const previous = inFlight.get(path);
+      if (previous) previous.abort();
+      controller = new AbortController();
+      inFlight.set(path, controller);
+    }
+    // AbortSignal.any keeps the caller's own signal working alongside the
+    // deadline; where it is missing, the deadline alone still applies.
+    const deadline = AbortSignal.timeout(options.timeoutMs || REQUEST_TIMEOUT_MS);
+    let signal = deadline;
+    if (options.signal) {
+      signal = typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([options.signal, deadline]) : options.signal;
+    } else if (controller) {
+      signal = typeof AbortSignal.any === 'function'
+        ? AbortSignal.any([controller.signal, deadline]) : controller.signal;
+    }
+    let response;
+    try {
+      response = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...options,
+        signal,
+        body: options.body ? JSON.stringify(options.body) : undefined,
+      });
+    } catch (error) {
+      // "signal is aborted without reason" and "Failed to fetch" are
+      // Chromium's words, not an operator's; connected() turns whatever
+      // comes out of here into a sentence, and this names the cases it
+      // cannot tell apart from the outside.
+      if (error && (error.name === 'TimeoutError'
+                    || (error.name === 'AbortError' && deadline.aborted))) {
+        throw new Error(`No answer within ${Math.round(
+          (options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)} seconds`);
+      }
+      // We cancelled this one ourselves because a newer request for the
+      // same URL started. That is not an outage and must never be reported
+      // as one, so it is flagged and swallowed by the refresh plumbing.
+      if (error && error.name === 'AbortError' && controller
+          && controller.signal.aborted) {
+        const superseded = new Error('Superseded by a newer request');
+        superseded.superseded = true;
+        throw superseded;
+      }
+      throw error;
+    } finally {
+      if (controller && inFlight.get(path) === controller) inFlight.delete(path);
+    }
     // A session that has timed out should land on the sign-in page rather
     // than filling the screen with failures.
     if (response.status === 401 && path !== '/api/login') {
@@ -127,10 +227,119 @@ const App = (() => {
   const put = (path, body) => call(path, { method: 'PUT', body });
   const del = (path, body) => call(path, { method: 'DELETE', body });
 
+  /* The dangerous failure this replaces: a wall display that has lost its
+     server looked exactly like a healthy fleet, distinguished only by the
+     raw Chromium string "Failed to fetch" in low-contrast grey while two
+     thousand stale rows stayed on screen unmarked. Staleness is driven by
+     what requests actually did — a run of failed polls — not by a timer,
+     so a frozen server cannot show a green light over old data.
+
+     One missed cycle is a hiccup and says so quietly; MISSED_BEFORE_STALE
+     of them dim the page and raise a banner naming the last time the data
+     was known good. */
+  const MISSED_BEFORE_STALE = 2;
+  let missedCycles = 0;
+  let lastGoodTs = null;         // seconds, like everything else here
+  let reconnectedUntil = 0;
+  let staleBanner = null;
+
+  // "14:32", the wall-clock time an operator would compare against their own
+  // watch. Seconds are noise on a banner that is about minutes of staleness.
+  function lastGoodClock() {
+    if (!lastGoodTs) return null;
+    const d = new Date(lastGoodTs * 1000);
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function lastUpdateText() {
+    const at = lastGoodClock();
+    return at ? `last update ${at}` : 'no data yet';
+  }
+
+  function showStaleBanner(text) {
+    if (!staleBanner) {
+      staleBanner = document.createElement('div');
+      staleBanner.className = 'stale-banner';
+      staleBanner.setAttribute('role', 'alert');
+      document.body.appendChild(staleBanner);
+    }
+    staleBanner.textContent = text;
+    staleBanner.hidden = false;
+  }
+
+  function hideStaleBanner() {
+    if (staleBanner) staleBanner.hidden = true;
+  }
+
   function connected(ok, message) {
     const el = document.getElementById('conn');
-    el.textContent = ok ? '' : (message || 'server unreachable');
-    el.classList.toggle('bad', !ok);
+    if (ok) {
+      const wasStale = missedCycles >= MISSED_BEFORE_STALE;
+      missedCycles = 0;
+      lastGoodTs = Date.now() / 1000;
+      document.body.classList.remove('stale');
+      hideStaleBanner();
+      if (wasStale) {
+        // A silent recovery is its own problem: the operator who saw the
+        // banner needs to be told the screen is current again.
+        reconnectedUntil = Date.now() + 5000;
+        announce('Reconnected to the SappiWhere server — data is current');
+      }
+      if (Date.now() < reconnectedUntil) {
+        el.textContent = 'reconnected — data is current';
+        el.classList.remove('bad');
+        el.classList.add('good');
+      } else {
+        el.textContent = '';
+        el.classList.remove('bad', 'good');
+      }
+      return;
+    }
+
+    missedCycles += 1;
+    reconnectedUntil = 0;
+    el.classList.remove('good');
+    el.classList.add('bad');
+    // Operator language, not the browser's. `message` still reaches the
+    // title so the underlying failure is one hover away.
+    const detail = String(message || 'no reason given');
+    if (missedCycles < MISSED_BEFORE_STALE) {
+      el.textContent = `no answer from the server — retrying (${lastUpdateText()})`;
+    } else {
+      el.textContent = `Cannot reach the SappiWhere server — ${lastUpdateText()}`;
+      if (!document.body.classList.contains('stale')) {
+        const since = lastGoodClock();
+        announce('Cannot reach the SappiWhere server. Everything on screen is '
+                 + (since ? `from ${since}` : 'not current') + '.');
+      }
+      document.body.classList.add('stale');
+      const at = lastGoodClock();
+      showStaleBanner(
+        'Cannot reach the SappiWhere server — everything below is ' +
+        (at ? `from ${at}` : 'not real data yet') +
+        ' and is not being refreshed.');
+    }
+    el.title = detail;
+  }
+
+  /* Say something once, to assistive technology only. The connection state,
+     the idle countdown and a bulk action's result were all silent DOM
+     mutations, so a screen-reader user never learned the server had gone
+     away. `role="status"` on the visible elements covers most of it; this is
+     for the results that have no element of their own. */
+  function announce(message) {
+    let live = document.getElementById('sr-announce');
+    if (!live) {
+      live = document.createElement('div');
+      live.id = 'sr-announce';
+      live.className = 'sr-only';
+      live.setAttribute('role', 'status');
+      live.setAttribute('aria-live', 'polite');
+      document.body.appendChild(live);
+    }
+    // Re-setting identical text is not a change, and is not announced.
+    if (live.textContent === message) live.textContent = '';
+    live.textContent = message;
   }
 
   /* --------------------------------------------------------- idle sign-out
@@ -198,6 +407,9 @@ const App = (() => {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
+      // Assertive: being signed out in a minute is worth interrupting
+      // whatever is being read.
+      idleBanner.setAttribute('role', 'alert');
       idleBanner.innerHTML =
         '<span id="idle-banner-text"></span>' +
         '<button id="idle-banner-stay">Stay signed in</button>';
@@ -214,6 +426,90 @@ const App = (() => {
 
   function hideIdleWarning() {
     if (idleBanner) idleBanner.hidden = true;
+  }
+
+  /* ------------------------------------------- out-of-app notification
+
+     Two signals that reach an operator who is not looking at this tab: the
+     open-alert count in the browser tab's title, and — only if they ask for
+     it — a desktop notification for a new alert of severity 1 or 2.
+
+     The desktop toggle is per browser, not per account: notification
+     permission is granted by this browser to this origin, so a preference
+     stored on the server would promise something a different machine cannot
+     keep. localStorage is the honest place for it. */
+  const NOTIFY_KEY = 'sappiwhere.notify.desktop';
+  const NOTIFY_SEVERITY = 2;       // 1 and 2 only; 3+ is not worth a popup
+  const BASE_TITLE = 'SappiWhere';
+  // Alert ids already notified about, so a re-render or a second tab poll
+  // does not raise the same popup twice. Bounded: the last few hundred.
+  const notified = new Set();
+  let lastOpenCount = null;
+
+  function desktopNotifyEnabled() {
+    try { return localStorage.getItem(NOTIFY_KEY) === 'on'; }
+    catch (error) { return false; }
+  }
+
+  /* Returns what actually happened, so the settings dialog can say
+     "blocked in this browser" rather than silently doing nothing. */
+  async function setDesktopNotify(on) {
+    try {
+      localStorage.setItem(NOTIFY_KEY, on ? 'on' : 'off');
+    } catch (error) { /* private browsing: the toggle lasts this session */ }
+    if (!on) return 'off';
+    if (typeof Notification === 'undefined') return 'unsupported';
+    if (Notification.permission === 'granted') return 'on';
+    if (Notification.permission === 'denied') return 'blocked';
+    try {
+      const result = await Notification.requestPermission();
+      return result === 'granted' ? 'on' : 'blocked';
+    } catch (error) {
+      return 'blocked';
+    }
+  }
+
+  function titleForAlerts(openCount) {
+    return openCount > 0 ? `(${openCount}) ${BASE_TITLE}` : BASE_TITLE;
+  }
+
+  /* Called from loadState with the alerts block every poll already fetches.
+     The list of open alerts is only pulled when the count has actually gone
+     up and the operator asked for popups — never on the ordinary path. */
+  async function alertsChanged(openCount) {
+    document.title = titleForAlerts(openCount);
+    const previous = lastOpenCount;
+    lastOpenCount = openCount;
+    if (!desktopNotifyEnabled()) return;
+    if (typeof Notification === 'undefined'
+        || Notification.permission !== 'granted') return;
+    if (previous === null || openCount <= previous) return;
+    let payload;
+    try {
+      payload = await get('/api/alerts', { state: 'open', limit: 50 });
+    } catch (error) {
+      return;                       // connected() already reports the outage
+    }
+    for (const alert of payload.alerts || []) {
+      if (Number(alert.severity) > NOTIFY_SEVERITY) continue;
+      if (notified.has(alert.id)) continue;
+      notified.add(alert.id);
+      if (notified.size > 500) {
+        // Oldest first: a Set iterates in insertion order.
+        const oldest = notified.values().next().value;
+        notified.delete(oldest);
+      }
+      try {
+        const popup = new Notification(
+          `${alert.entity_label || alert.entity_id || 'Alert'}`,
+          { body: alert.message || alert.rule_name || 'New alert',
+            tag: `sappiwhere-alert-${alert.id}` });
+        popup.onclick = () => {
+          window.focus();
+          window.location.hash = `#/alerts/${alert.id}`;
+        };
+      } catch (error) { /* the browser refused it; nothing more to do */ }
+    }
   }
 
   /* ------------------------------------------------------- formatting */
@@ -382,14 +678,89 @@ const App = (() => {
 
   /* ------------------------------------------------------------ modals */
 
+  /* What the operator was on when the dialog opened, so closing it hands
+     focus back there instead of dropping it on <body> and making them Tab
+     from the tab bar to their row again. The help panel (below) has always
+     done this; the main modal — which is every real dialog in the app — did
+     not. */
+  let modalTrigger = null;
+
+  /* There is one #modal-box and every dialog rebuilds it, so a slow fetch
+     that lands after another dialog opened used to paint into that dialog —
+     `#oid-status` was gone and the walk threw an uncaught TypeError. Each
+     call to modal() stamps a generation on the box; a dialog captures
+     modalToken() when it opens and asks modalIsCurrent() before it paints.
+     `!#modal.hidden` could never see this: opening a second dialog does not
+     hide the first, it replaces its contents. */
+  let modalGeneration = 0;
+
+  function modalToken() {
+    const box = document.getElementById('modal-box');
+    return box ? box.dataset.modalGen : null;
+  }
+
+  function modalIsCurrent(token) {
+    const wrap = document.getElementById('modal');
+    return Boolean(wrap) && !wrap.hidden && modalToken() === token;
+  }
+
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]),' +
+    ' select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+  function focusableIn(box) {
+    return [...box.querySelectorAll(FOCUSABLE)]
+      .filter((node) => !node.hidden && node.offsetParent !== null);
+  }
+
+  /* Tab must not walk out of an open dialog into the page behind it: that
+     page is inert to the eye (the backdrop covers it) but not to the
+     keyboard, so without this a few Tabs put focus on controls the operator
+     cannot see. Wrapping both ways is the ARIA authoring-practices
+     behaviour. */
+  function trapTab(event) {
+    if (event.key !== 'Tab') return;
+    const wrap = document.getElementById('modal');
+    if (!wrap || wrap.hidden) return;
+    // The help panel is its own layer above this one.
+    if (helpOpen()) return;
+    const box = document.getElementById('modal-box');
+    const items = focusableIn(box);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || !box.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !box.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function modal(title, bodyHtml, buttons, options = {}) {
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
+    // Remembered before the dialog takes focus. `options.trigger` lets a
+    // caller name the control explicitly when the dialog is opened from
+    // code rather than from a click.
+    modalTrigger = options.trigger
+      || (document.activeElement && document.activeElement !== document.body
+          ? document.activeElement : null);
+    modalGeneration += 1;
+    box.dataset.modalGen = String(modalGeneration);
+    // Titles carry device names, group names and interface aliases, and
+    // seven call sites interpolated them raw. A plain string is now escaped
+    // here, once, rather than by each caller remembering to; the one dialog
+    // whose heading is genuinely two lines of markup (the interface dialog)
+    // says so by passing {html}.
+    const heading = title && typeof title === 'object' && title.html !== undefined
+      ? String(title.html) : escapeHtml(title);
     // Long forms put their buttons at the top, so Save is reachable without
     // scrolling past every field first.
     box.innerHTML = options.buttonsTop
-      ? `<h2>${title}</h2><div class="row top"></div>${bodyHtml}`
-      : `<h2>${title}</h2>${bodyHtml}<div class="row"></div>`;
+      ? `<h2 id="modal-title">${heading}</h2><div class="row top"></div>${bodyHtml}`
+      : `<h2 id="modal-title">${heading}</h2>${bodyHtml}<div class="row"></div>`;
     const row = box.querySelector('.row');
     for (const spec of buttons) {
       const button = document.createElement('button');
@@ -398,20 +769,35 @@ const App = (() => {
       button.onclick = () => spec.onClick(box, button);
       row.appendChild(button);
     }
+    // The semantics the help panel already had ten lines away: a dialog,
+    // modal, named by its own heading.
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'modal-title');
     wrap.hidden = false;
     const first = box.querySelector('input, select, textarea');
     if (first) first.focus();
+    else {
+      const anything = focusableIn(box)[0];
+      if (anything) anything.focus();
+    }
     return box;
   }
 
   const closeModal = () => {
     if (state.modalLocked) return;
-    document.getElementById('modal').hidden = true;
+    const wrap = document.getElementById('modal');
+    const wasOpen = wrap && !wrap.hidden;
+    if (wrap) wrap.hidden = true;
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
     // close the modal without that button ever being pressed.
     window.dispatchEvent(new Event('modal-closed'));
+    if (wasOpen && modalTrigger && document.contains(modalTrigger)) {
+      modalTrigger.focus();
+    }
+    modalTrigger = null;
   };
 
   /* ------------------------------------------------------------ help
@@ -521,6 +907,79 @@ const App = (() => {
   }
 
   function el(id) { return document.getElementById(id); }
+
+  /* ------------------------------------------------- status patterns
+
+     Under a deuteranopia transform --ok #3FB950, --fail #F85149 and
+     --blocked #FF8A65 become three khakis 1.34:1 apart, and --fail and
+     --error have identical relative luminance, so a status timeline drawn
+     in colour alone says nothing to about one operator in twelve. NetPath
+     already hatched "refused" and striped "skipped"; this extends that
+     vocabulary to every state and shares one set of definitions between
+     the NetPath canvas and the device status timeline, so the two read the
+     same way.
+
+     `none`/`up`/`ok` are deliberately plain: the baseline needs to be the
+     one without texture, or everything is texture and nothing reads. */
+  const STATUS_PATTERN = {
+    warn: 'sw-pat-dots',       // degraded — sparse dots
+    unsupported: 'sw-pat-dots',
+    auth: 'sw-pat-dots',
+    fail: 'sw-pat-fail',       // no reply — diagonal, leaning the other way
+    down: 'sw-pat-fail',
+    blocked: 'sw-pat-hatch',   // refused — the 45 degree hatch NetPath used
+    overrun: 'sw-pat-bars',    // skipped — vertical bars, as before
+    error: 'sw-pat-rows',      // probe failed — horizontal bars
+    unknown: 'sw-pat-rows',
+  };
+
+  function statusPatternUrl(status) {
+    const id = STATUS_PATTERN[status];
+    return id ? `url(#${id})` : null;
+  }
+
+  /* Appends the pattern definitions to `svg` once. Ink is white at low
+     alpha so one definition works over every status colour and in both
+     themes, exactly as NetPath's original hatch did. */
+  function statusPatternDefs(svg) {
+    if (!svg || svg.querySelector('#sw-pat-defs')) return;
+    const defs = svgNode('defs', { id: 'sw-pat-defs' });
+    const stroke = 'rgba(255,255,255,0.45)';
+
+    const hatch = svgNode('pattern', { id: 'sw-pat-hatch', width: 6, height: 6,
+      patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
+    hatch.appendChild(svgNode('line',
+      { x1: 0, y1: 0, x2: 0, y2: 6, stroke, 'stroke-width': 2 }));
+    defs.appendChild(hatch);
+
+    const fail = svgNode('pattern', { id: 'sw-pat-fail', width: 5, height: 5,
+      patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(-45)' });
+    fail.appendChild(svgNode('line',
+      { x1: 0, y1: 0, x2: 0, y2: 5, stroke, 'stroke-width': 2.2 }));
+    defs.appendChild(fail);
+
+    const bars = svgNode('pattern', { id: 'sw-pat-bars', width: 4, height: 4,
+      patternUnits: 'userSpaceOnUse' });
+    bars.appendChild(svgNode('line',
+      { x1: 1, y1: 0, x2: 1, y2: 4, stroke: 'rgba(255,255,255,0.5)',
+        'stroke-width': 1.4 }));
+    defs.appendChild(bars);
+
+    const rows = svgNode('pattern', { id: 'sw-pat-rows', width: 4, height: 4,
+      patternUnits: 'userSpaceOnUse' });
+    rows.appendChild(svgNode('line',
+      { x1: 0, y1: 1, x2: 4, y2: 1, stroke: 'rgba(255,255,255,0.5)',
+        'stroke-width': 1.4 }));
+    defs.appendChild(rows);
+
+    const dots = svgNode('pattern', { id: 'sw-pat-dots', width: 5, height: 5,
+      patternUnits: 'userSpaceOnUse' });
+    dots.appendChild(svgNode('circle',
+      { cx: 1.6, cy: 1.6, r: 1.1, fill: 'rgba(255,255,255,0.55)' }));
+    defs.appendChild(dots);
+
+    svg.insertBefore(defs, svg.firstChild);
+  }
 
   function svgNode(name, attrs = {}, text) {
     const node = document.createElementNS('http://www.w3.org/2000/svg', name);
@@ -697,6 +1156,15 @@ const App = (() => {
     table.dataset.grid = name;
     table.classList.add('grid');
 
+    /* A screen reader announces a table by its caption; without one, 29
+       identically-shaped grids are all "table". The caller passes the panel
+       heading it sits under; the humanised grid name is the fallback so a
+       caller that forgets still says something specific. */
+    const caption = document.createElement('caption');
+    caption.className = 'sr-only';
+    caption.textContent = options.caption
+      || String(name || 'table').replace(/[-_]/g, ' ');
+
     const colgroup = document.createElement('colgroup');
     for (const column of columns) {
       const col = document.createElement('col');
@@ -712,6 +1180,11 @@ const App = (() => {
     const row = document.createElement('tr');
     columns.forEach((column, index) => {
       const th = document.createElement('th');
+      // `scope` is what lets assistive tech say which column a cell belongs
+      // to; `columnheader` is the implicit role but stated so the sortable
+      // headers below (which take a tabindex) keep it once focusable.
+      th.scope = 'col';
+      th.setAttribute('role', 'columnheader');
       // A select-all checkbox belongs directly above the boxes it governs,
       // not in a filter bar several controls away — that is the only place
       // it reads as "these rows". Rendered here rather than per module so
@@ -725,7 +1198,14 @@ const App = (() => {
         // Some-but-not-all is a real third state and a plain tick would lie
         // about it. It cannot be set from markup, only from script.
         box.indeterminate = !selectAll.checked && !!selectAll.some;
-        box.title = selectAll.checked ? 'Clear selection' : 'Select all';
+        // The header cell is a checkbox with no visible text, so it needs
+        // its own name; `title` alone is not reliably announced. A caller
+        // whose list is truncated passes a label that says so, and the
+        // tooltip says the same thing as the announcement.
+        const selectLabel = selectAll.label || 'Select all rows';
+        box.setAttribute('aria-label',
+                         selectAll.checked ? 'Clear selection' : selectLabel);
+        box.title = selectAll.checked ? 'Clear selection' : selectLabel;
         box.onclick = (event) => {
           event.stopPropagation();
           selectAll.onToggle(box.checked);
@@ -747,21 +1227,44 @@ const App = (() => {
         // A caret is rendered for every sortable column so the header width
         // never changes as the sort moves; only the sorted one is visible.
         caret.textContent = sorted && sort.descending ? '\u25BC' : '\u25B2';
+        // Decoration: the direction is announced by aria-sort, and a caret
+        // read out as "black down-pointing triangle" is noise.
+        caret.setAttribute('aria-hidden', 'true');
         th.appendChild(caret);
         if (sorted) {
           th.classList.add(sort.descending ? 'sort-desc' : 'sort-asc');
         }
+        // Sorting was mouse-only: the headers carried a click handler and
+        // nothing else, so a keyboard operator could not bring the down
+        // devices to the top of any table in the product.
+        th.tabIndex = 0;
+        th.setAttribute('aria-sort',
+                        sorted ? (sort.descending ? 'descending' : 'ascending')
+                               : 'none');
+        const doSort = () => {
+          const same = sort && sort.key === column.key;
+          onSort(column.key, same ? !sort.descending : !!column.descendingFirst);
+        };
         th.addEventListener('click', (event) => {
           // A click that ends a drag is not a click on the header.
           if (th.dataset.dragged) { delete th.dataset.dragged; return; }
           if (event.target.classList.contains('grip')) return;
-          const same = sort && sort.key === column.key;
-          onSort(column.key, same ? !sort.descending : !!column.descendingFirst);
+          doSort();
+        });
+        th.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') {
+            return;
+          }
+          // Space would otherwise scroll the pane out from under the table.
+          event.preventDefault();
+          doSort();
         });
       }
       if (index < columns.length - 1) {
         const grip = document.createElement('span');
         grip.className = 'grip';
+        // A mouse-only resize handle: not focusable, and not announced.
+        grip.setAttribute('aria-hidden', 'true');
         grip.addEventListener('mousedown', (event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -791,15 +1294,37 @@ const App = (() => {
     head.appendChild(row);
 
     table.innerHTML = '';
+    table.appendChild(caption);
     table.appendChild(colgroup);
     table.appendChild(head);
     return table;
   }
 
+  /* The same three things for a table this module did not build: the ~20
+     grids that are still a `<thead>` written as markup by their own module.
+     Idempotent, so a render that runs on every poll can just call it. */
+  function a11yTable(table, caption) {
+    if (!table) return table;
+    for (const th of table.querySelectorAll('thead th, tr:first-child > th')) {
+      if (!th.getAttribute('scope')) th.scope = 'col';
+    }
+    if (caption) {
+      let node = table.querySelector(':scope > caption');
+      if (!node) {
+        node = document.createElement('caption');
+        node.className = 'sr-only';
+        table.insertBefore(node, table.firstChild);
+      }
+      if (node.textContent !== caption) node.textContent = caption;
+    }
+    return table;
+  }
+
   /* The same escape every module file defines for itself, needed here now
      that app.js builds markup of its own. */
-  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"'`]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+              "'": '&#39;', '`': '&#96;' }[c]));
 
   /* ------------------------------------------------- choosing columns
 
@@ -847,7 +1372,11 @@ const App = (() => {
     if (!box) return;
     box.checked = total > 0 && selected === total;
     box.indeterminate = selected > 0 && selected < total;
-    box.title = box.checked ? 'Clear selection' : 'Select all';
+    // grid() gave the box its accessible name, which may say "Select the 300
+    // shown" above a truncated list; reuse it rather than overwriting it with
+    // the generic wording.
+    const name = box.getAttribute('aria-label') || 'Select all';
+    box.title = box.checked ? 'Clear selection' : name;
   }
 
   /* Builds a table body from column descriptors: `cell(row)` renders when
@@ -959,11 +1488,126 @@ const App = (() => {
     document.body.classList.toggle('tiny', height < 700);
   }
 
+
+  /* ------------------------------------------------------------- routing
+
+     Nothing in this application could be linked to: no URL changed as the
+     operator moved, Back did nothing, and an escalation was prose — "open
+     Nodes, search for core-sw-01, click the third row". Every selection
+     worth naming now has a hash route.
+
+         #/nodes                            a tab
+         #/nodes?status=down                a tab with its filter set
+         #/nodes/device/1234                a device
+         #/nodes/device/1234/port/7         a port on it
+         #/alerts/998                       an alert
+         #/netpath/12                       a destination
+         #/configrx/device/4/backup/91      a stored configuration
+         #/snmp/5512  #/syslog/8801  #/wireless/3
+
+     The tab change is a pushState, so Back walks the tabs. Selecting a row
+     inside a tab is a replaceState: an operator clicking down a list of
+     devices should not have to press Back forty times to leave.
+
+     Modules take a route through their existing `activate(opts)` — the entry
+     point netpath.js already had for NetFlow's "view route" jump — and report
+     a selection back with App.setRoute(). A module that implements neither
+     still works: it simply has no deeper routes than its own tab. */
+
+  const ROUTE_TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow',
+                      'snmp', 'syslog', 'ipam', 'wireless', 'configrx',
+                      'debug', 'settings'];
+
+  // Set while writeRoute is changing location.hash, so the hashchange it
+  // fires (pushState does not, assigning location.hash does) is not read
+  // back as a navigation and applied a second time.
+  let writingRoute = false;
+
+  function parseRoute(hash) {
+    const raw = String(hash === undefined ? window.location.hash : hash);
+    const text = raw.replace(/^#\/?/, '');
+    const cut = text.indexOf('?');
+    const pathText = cut === -1 ? text : text.slice(0, cut);
+    const queryText = cut === -1 ? '' : text.slice(cut + 1);
+    const parts = pathText.split('/').filter(Boolean).map((p) => {
+      try { return decodeURIComponent(p); } catch (error) { return p; }
+    });
+    const query = {};
+    if (queryText) {
+      for (const [key, value] of new URLSearchParams(queryText)) query[key] = value;
+    }
+    const tab = ROUTE_TABS.includes(parts[0]) ? parts.shift() : null;
+    return { tab, parts, query };
+  }
+
+  function buildRoute(tab, parts = [], query = {}) {
+    const path = [tab, ...parts.filter((p) => p !== null && p !== undefined)]
+      .map((p) => encodeURIComponent(String(p))).join('/');
+    const pairs = Object.entries(query)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '');
+    const search = pairs.length ? `?${new URLSearchParams(pairs)}` : '';
+    return `#/${path}${search}`;
+  }
+
+  /* Called by a module when its own selection changes. Always a replace:
+     only a tab change is worth a history entry. */
+  function setRoute(parts, query, options = {}) {
+    writeRoute(buildRoute(state.tab, parts, query), options);
+  }
+
+  function writeRoute(hash, options = {}) {
+    if (window.location.hash === hash) return;
+    writingRoute = true;
+    try {
+      const url = window.location.pathname + window.location.search + hash;
+      if (options.push) window.history.pushState(null, '', url);
+      else window.history.replaceState(null, '', url);
+    } catch (error) {
+      // Some embedded browsers refuse history writes; the app still works,
+      // it just cannot be linked to.
+    } finally {
+      writingRoute = false;
+    }
+  }
+
+  /* Apply whatever the address bar says. `initial` is true for the load-time
+     call, where there is no current tab to compare against. */
+  function applyRoute(initial = false) {
+    const route = parseRoute();
+    if (!route.tab) return false;
+    const tabButton = document.querySelector(`.tab[data-tab="${route.tab}"]`);
+    if (!tabButton || tabButton.hidden) {
+      // A link into a module this account cannot read: land on the tab the
+      // app would have chosen, rather than on a blank page.
+      return false;
+    }
+    const changed = initial || state.tab !== route.tab;
+    if (changed) selectTab(route.tab, { fromRoute: true, route });
+    else deliverRoute(route);
+    return true;
+  }
+
+  /* Hands the route to the module. The selection half runs after the
+     module's first refresh, or nodes.js's own "select the first device if
+     none is selected" would overwrite the device the link named. */
+  function deliverRoute(route) {
+    const page = pages[route.tab];
+    if (!page || !page.activate) return;
+    const opts = { route, parts: route.parts, query: route.query };
+    if (!page.refresh) {
+      page.activate(opts);
+      return;
+    }
+    Promise.resolve(refreshNow(route.tab)).then(() => {
+      try { page.activate(opts); } catch (error) { /* a bad link is not fatal */ }
+    });
+  }
+
   /* ------------------------------------------------------------- tabs */
 
   const TAB_KEY = 'sappiwhere.tab';
 
-  function selectTab(name) {
+  function selectTab(name, options = {}) {
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
     // Kept in sync with .active below, not just set once at load: index.html's
@@ -974,12 +1618,23 @@ const App = (() => {
     // old data-tab page and the newly .active one visible at once.
     document.documentElement.dataset.tab = name;
     for (const tab of document.querySelectorAll('.tab')) {
-      tab.classList.toggle('active', tab.dataset.tab === name);
+      const current = tab.dataset.tab === name;
+      tab.classList.toggle('active', current);
+      tab.setAttribute('aria-selected', current ? 'true' : 'false');
     }
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
     }
+    // The tab itself is a history entry: Back walks the tabs the operator
+    // visited. A selection inside a tab replaces instead (setRoute).
+    if (!options.fromRoute) writeRoute(buildRoute(name), { push: true });
     const page = pages[name];
+    if (options.route) {
+      // A route names both the tab and what to select in it; the selection
+      // has to wait for the module's first refresh.
+      deliverRoute(options.route);
+      return;
+    }
     if (page && page.activate) page.activate();
     refreshNow(name);
   }
@@ -1005,12 +1660,15 @@ const App = (() => {
     state.permissions = payload.permissions || {};
     state.serverState = payload;
     applyPermissions();
+    const openCount = (payload.alerts || {}).open_count || 0;
     const alertsBadge = document.getElementById('alerts-tab-badge');
     if (alertsBadge) {
-      const openCount = (payload.alerts || {}).open_count || 0;
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
     }
+    // Deliberately not awaited: the title is set synchronously inside, and
+    // the (rare) alert fetch behind it must not hold up the poll.
+    alertsChanged(openCount);
     if (payload.session) {
       state.session = payload.session;
       applySessionIdle(payload.session);
@@ -1039,13 +1697,24 @@ const App = (() => {
   const STATE_MS = 2000;
 
   function rateFor(page) {
+    // dashboard_refresh_s does not exist on the server yet (adding a
+    // default belongs to the settings module, which another workstream
+    // owns), so an absent value falls back to 5 s here rather than to the
+    // generic 2 s: the tiles are a wall-display view, not an instrument.
+    if (page === 'dashboard') {
+      const wanted = Number(state.settings.dashboard_refresh_s);
+      return Math.max(wanted > 0 ? wanted : 5, 1) * 1000;
+    }
     const key = { netpath: 'netpath_refresh_s', netflow: 'netflow_refresh_s',
                   snmp: 'snmp_refresh_s', nodes: 'nodes_refresh_s',
                   alerts: 'alerts_refresh_s', syslog: 'syslog_refresh_s',
                   ipam: 'ipam_refresh_s', wireless: 'wireless_refresh_s',
                   configrx: 'configrx_refresh_s', debug: 'debug_refresh_s' }[page];
     const seconds = Number(state.settings[key]);
-    return Math.max(seconds > 0 ? seconds : 2, 0.1) * 1000;
+    // The floor was 0.1 s, so one mistyped refresh setting made every open
+    // tab hit a heavy endpoint ten times a second. A second is already
+    // faster than anything here needs.
+    return Math.max(seconds > 0 ? seconds : 2, 1) * 1000;
   }
 
   async function master() {
@@ -1057,6 +1726,7 @@ const App = (() => {
         connected(true);
       }
     } catch (error) {
+      if (error && error.superseded) return;
       connected(false, String(error.message || error));
       return;
     }
@@ -1076,13 +1746,43 @@ const App = (() => {
       await page.refresh();
       connected(true);
     } catch (error) {
+      if (error && error.superseded) return;
       connected(false, String(error.message || error));
     }
   }
 
   function restartTimer() {
     if (state.timer) clearInterval(state.timer);
+    // A hidden tab polls nothing: the twelve tabs an engineer left open last
+    // week, and the laptop with the lid closed on the Nodes page, were each
+    // still fetching /api/state every two seconds and their page endpoint at
+    // its own rate, forever.
+    if (document.hidden) {
+      state.timer = null;
+      return;
+    }
     state.timer = setInterval(master, MASTER_MS);
+  }
+
+  /* Coming back to a tab that has been hidden for an hour: the data on it is
+     an hour old, so say so until the first successful poll lands, and make
+     that poll happen now rather than at the next slot. */
+  function onVisibilityChange() {
+    if (document.hidden) {
+      if (state.timer) clearInterval(state.timer);
+      state.timer = null;
+      return;
+    }
+    // Nothing was fetched while hidden, so what is on screen is by
+    // definition not current until the next poll says otherwise.
+    if (lastGoodTs && Date.now() / 1000 - lastGoodTs > STATE_MS / 1000) {
+      document.body.classList.add('stale');
+      showStaleBanner('Paused while this tab was in the background — '
+                      + `${lastUpdateText()}. Refreshing…`);
+    }
+    restartTimer();
+    state.lastState = 0;                  // force /api/state on the next beat
+    refreshNow(state.tab);
   }
 
   /* Called when a page needs its data now rather than at its next slot. */
@@ -1090,12 +1790,36 @@ const App = (() => {
     const page = pages[name || state.tab];
     if (!page || !page.refresh) return Promise.resolve();
     page.lastFetch = Date.now();
-    return page.refresh();
+    // selectTab and the visibility handler call this without awaiting it, so
+    // a refresh that fails during an outage used to surface as an unhandled
+    // rejection in the console rather than as the offline banner. The
+    // promise still resolves for callers that do await it (the UI walk).
+    return Promise.resolve(page.refresh()).then(
+      (value) => { connected(true); return value; },
+      (error) => {
+        if (!(error && error.superseded)) {
+          connected(false, String((error && error.message) || error));
+        }
+        return undefined;
+      });
   }
 
   async function start() {
+    const tabBar = document.getElementById('tabs');
+    if (tabBar) tabBar.setAttribute('role', 'tablist');
     for (const tab of document.querySelectorAll('.tab')) {
       tab.onclick = () => selectTab(tab.dataset.tab);
+      // Twelve identical unlabelled buttons announced nothing about which
+      // one was current; selectTab keeps aria-selected in step below.
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-controls', `page-${tab.dataset.tab}`);
+      tab.setAttribute('aria-selected', 'false');
+      tab.id = tab.id || `tab-${tab.dataset.tab}`;
+      const panel = document.getElementById(`page-${tab.dataset.tab}`);
+      if (panel) {
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+      }
     }
     const signout = document.getElementById('signout');
     if (signout) {
@@ -1109,6 +1833,40 @@ const App = (() => {
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') closeModal();
     };
+    document.addEventListener('keydown', trapTab);
+
+    /* 1-9 select the first nine visible tabs and '/' focuses the current
+       page's search box. Both are bare keys, so both stand down whenever a
+       field, a dialog or the help panel has the keyboard — which is why the
+       chart shortcuts in netflow.js are Ctrl-modified instead: those have to
+       work while a filter box has focus. */
+    const SEARCH_BOXES = {
+      nodes: '#nd-q', alerts: '#alerts-filter-text', syslog: '#sl-q',
+      snmp: '#sn-q', ipam: '#ipam-search-q', netflow: '#nf-src',
+      configrx: '#cx-q', debug: '#dbg-search', wireless: '#wl-q',
+    };
+    document.addEventListener('keydown', (event) => {
+      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      if (!document.getElementById('modal').hidden || helpOpen()) return;
+      const active = document.activeElement;
+      if (active && (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)
+                     || active.isContentEditable)) return;
+      if (event.key === '/') {
+        const selector = SEARCH_BOXES[state.tab];
+        const box = selector && document.querySelector(selector);
+        if (!box || box.offsetParent === null) return;
+        event.preventDefault();      // or the '/' lands in the box it focuses
+        box.focus();
+        if (box.select) box.select();
+        return;
+      }
+      if (event.key < '1' || event.key > '9') return;
+      const tabs = [...document.querySelectorAll('.tab')].filter((t) => !t.hidden);
+      const tab = tabs[Number(event.key) - 1];
+      if (!tab) return;
+      event.preventDefault();
+      selectTab(tab.dataset.tab);
+    });
     document.addEventListener('keydown', (event) => {
       // Escape peels one layer: the help panel if it is open, else the
       // dialog under it. Closing both at once would throw away the form
@@ -1131,27 +1889,46 @@ const App = (() => {
     } catch (error) {
       connected(false, String(error.message || error));
     }
+    // Before any module's init() builds a form that depends on it.
+    await loadPlatform();
 
     applyDensity();
     window.addEventListener('resize', applyDensity);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     initSplitters();
 
     for (const page of Object.values(pages)) {
       if (page.init) page.init();
     }
-    // A refresh should land back on whichever module was open, not reset to
-    // NetPath — but only if that tab still exists (a build could drop one).
-    let initialTab = 'netpath';
-    try {
-      const stored = localStorage.getItem(TAB_KEY);
-      if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
-        initialTab = stored;
-      }
-    } catch (error) { /* private browsing, or storage full: default to netpath */ }
-    selectTab(initialTab);
+    // A link is more specific than a memory: if the address bar names a
+    // tab (and a selection in it), that wins over the remembered tab, and
+    // over login.js's "land on Dashboard after signing in".
+    window.addEventListener('hashchange', () => {
+      if (writingRoute) return;
+      applyRoute();
+    });
+    if (!applyRoute(true)) {
+      // A refresh should land back on whichever module was open, not reset
+      // to NetPath — but only if that tab still exists (a build could drop
+      // one).
+      let initialTab = 'netpath';
+      try {
+        const stored = localStorage.getItem(TAB_KEY);
+        if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
+          initialTab = stored;
+        }
+      } catch (error) { /* private browsing: default to netpath */ }
+      selectTab(initialTab);
+    }
     restartTimer();
   }
 
+  // `const App` at the top of this file is a global LEXICAL binding: it is
+  // reachable as a bare identifier from the other page scripts, but it is NOT
+  // a property of window, so anything evaluating `window.App` — a
+  // bookmarklet, an extension, an automated check — saw undefined. Exposed
+  // deliberately, and only here, at the end of the module.
+  //
   // Started from here rather than an inline script in the page: the server
   // sends a strict Content-Security-Policy, and 'self' does not permit inline
   // script. The five files are ordinary parser-blocking scripts, so every page
@@ -1162,15 +1939,22 @@ const App = (() => {
     start();
   }
 
-  return {
+  const api = {
     state, pages, start, selectTab, loadState, refreshNow, rateFor,
+    parseRoute, buildRoute, setRoute, applyRoute,
     get, post, put, del,
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
-    modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    modal, modalToken, modalIsCurrent,
+    closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
+    announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
+    canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
-    grid, sortRows, canRead, canWrite, accountModal,
+    grid, a11yTable, sortRows, canRead, canWrite, accountModal,
+    statusPatternDefs, statusPatternUrl,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };
+  window.App = api;
+  return api;
 })();

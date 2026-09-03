@@ -17,8 +17,10 @@
     backupContent: '',
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return 'never';
@@ -121,7 +123,7 @@
     const columns = deviceColumns();
     const checked = view.devicesChecked;
     const table = App.grid(App.el('cx-devices'), {
-      name: 'configrx-devices', columns,
+      name: 'configrx-devices', caption: 'ConfigRX devices', columns,
       sort: view.deviceSort, onSort: onDeviceSort,
       selectAll: {
         key: 'check',
@@ -222,8 +224,10 @@
           placeholder="leave blank to leave unchanged"></label>
         <label>Username <input id="cx-bulk-username"
           placeholder="leave blank to leave unchanged"></label>
-        <label>Password <input id="cx-bulk-password" type="password"
-          placeholder="leave blank to keep each device's own"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="cx-bulk-password" type="password"
+              placeholder="leave blank to keep each device's own"></label>`
+          : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">A password is stored only when a username is given with
           it — the pair is what gets encrypted, and half of one would lock the
           batch out. Stored encrypted and never shown again.</p>
@@ -231,7 +235,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
         const username = m.querySelector('#cx-bulk-username').value.trim();
-        const password = m.querySelector('#cx-bulk-password').value;
+        const password = (m.querySelector('#cx-bulk-password') || {}).value || '';
         const enabled = m.querySelector('#cx-bulk-enabled').value;
         const vendor = m.querySelector('#cx-bulk-vendor').value.trim();
         const port = m.querySelector('#cx-bulk-port').value.trim();
@@ -310,6 +314,7 @@
     view.selectedDeviceId = deviceId;
     view.selectedBackupId = null;
     view.backupContent = '';
+    App.setRoute(deviceId != null ? ['device', deviceId] : []);
     drawDevices();
     drawViewer();
     const result = await App.get(`/api/configrx/devices/${deviceId}/backups`, {});
@@ -359,7 +364,7 @@
     const columns = backupColumns();
     const checked = view.backupsChecked;
     const table = App.grid(App.el('cx-backups'), {
-      name: 'configrx-backups', columns,
+      name: 'configrx-backups', caption: 'Stored backups', columns,
       sort: view.backupSort, onSort: onBackupSort,
       selectAll: {
         key: 'check',
@@ -443,6 +448,11 @@
 
   async function selectBackup(backupId) {
     view.selectedBackupId = backupId;
+    // #/configrx/device/4/backup/91 — a specific stored configuration, which
+    // is what a change-control conversation is actually about.
+    if (view.selectedDeviceId != null) {
+      App.setRoute(['device', view.selectedDeviceId, 'backup', backupId]);
+    }
     drawBackups();
     const result = await App.get(`/api/configrx/backups/${backupId}`, {});
     view.backupContent = result.content || '';
@@ -536,8 +546,10 @@
         <label>Port <input id="cx-port" type="number" min="1" max="65535"
           value="${device.ssh_port}"></label>
         <label>Username <input id="cx-username" value="${escape(device.ssh_username)}"></label>
-        <label>Password <input id="cx-password" type="password"
-          placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="cx-password" type="password"
+              placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
           is no way to run any other command from here.</p>
@@ -553,7 +565,7 @@
           ssh_username: m.querySelector('#cx-username').value.trim(),
           vendor_override: m.querySelector('#cx-vendor').value.trim(),
         });
-        const password = m.querySelector('#cx-password').value;
+        const password = (m.querySelector('#cx-password') || {}).value || '';
         const username = m.querySelector('#cx-username').value.trim();
         if (password && username) {
           await App.post(`/api/configrx/devices/${device.id}/credential`, {
@@ -781,5 +793,21 @@
     };
   }
 
-  App.pages.configrx = { init, refresh, fastTick: drawStatus };
+  /* #/configrx/device/<id> and .../backup/<bid>. Runs after refresh(), so
+     the device list is populated; selectDevice fetches that device's backups
+     before the backup half is applied. */
+  async function activate(opts) {
+    if (!opts || !opts.parts || opts.parts[0] !== 'device') return;
+    const deviceId = Number(opts.parts[1]);
+    if (!Number.isFinite(deviceId)) return;
+    if (view.selectedDeviceId !== deviceId) {
+      await selectDevice(deviceId).catch(() => { /* a link to a gone device */ });
+    }
+    if (opts.parts[2] !== 'backup' || opts.parts[3] === undefined) return;
+    const backupId = Number(opts.parts[3]);
+    if (!Number.isFinite(backupId)) return;
+    await selectBackup(backupId).catch(() => { /* pruned backup */ });
+  }
+
+  App.pages.configrx = { init, refresh, activate, fastTick: drawStatus };
 })();

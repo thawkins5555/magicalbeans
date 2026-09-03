@@ -37,7 +37,12 @@
       // last time — app.js's own reload-preserves-tab logic (same
       // 'sappiwhere.tab' key) takes over for every reload after this one.
       try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full: not worth failing */ }
-      window.location.href = '/';
+      // ...unless they were sent here from a link. A 401 on #/alerts/998
+      // redirects to /login, and signing in should finish the journey rather
+      // than dropping them on the Dashboard with the link lost. The hash is
+      // preserved by the redirect, so it is still here to hand back.
+      const wanted = String(window.location.hash || '');
+      window.location.href = wanted.startsWith('#/') ? `/${wanted}` : '/';
     } catch (err) {
       show('The server did not answer. It may have stopped.');
     } finally {

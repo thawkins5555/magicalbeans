@@ -36,8 +36,10 @@
     mibSelected: null,
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return 'never';
@@ -121,8 +123,8 @@
   function mutedTag(row) {
     if (!row.muted_until) return '';
     const until = new Date(row.muted_until * 1000).toLocaleString();
-    return ` · <span class="warn-text" title="New alerts for this device are ` +
-      `suppressed until ${escape(until)}">alerts muted</span>`;
+    return ` · <span class="warn-text muted-tag" title="New alerts for this ` +
+      `device are suppressed until ${escape(until)}">alerts muted</span>`;
   }
 
   const COLUMNS = [
@@ -140,7 +142,7 @@
       // The mute lives in Alerts but is shown here on purpose: an operator
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
-      cell: (r) => `${escape(displayName(r))}<div class="hint">${escape(r.ip)}` +
+      cell: (r) => `${escape(displayName(r))}<div class="ip-line">${escape(r.ip)}` +
         `${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
@@ -201,7 +203,7 @@
     const columns = deviceColumns();
     const checked = view.devicesChecked;
     const table = App.grid(App.el('nodes-table'), {
-      name: 'nodes-devices', columns,
+      name: 'nodes-devices', caption: 'Devices', columns,
       sort: view.deviceSort, onSort: onDeviceSort,
       selectAll: {
         key: 'check',
@@ -483,8 +485,54 @@
 
   function selectDevice(id) {
     view.selected = id;
+    // A device is a thing worth linking to: #/nodes/device/1234 in the
+    // address bar, replacing rather than pushing so clicking down a list
+    // does not fill the Back button with forty entries.
+    App.setRoute(id != null ? ['device', id] : []);
     drawTable();
     loadDetail();
+  }
+
+  /* A route into this tab: #/nodes, #/nodes?status=down,
+     #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>. Called after
+     refresh() has run, so view.devices is populated and the "select the
+     first device if none is selected" rule below has already happened —
+     which is exactly why the selection is applied here and not before. */
+  async function activate(opts) {
+    if (!opts) return;
+    const parts = opts.parts || [];
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['nd-filter-status', 'status'],
+                             ['nd-q', 'q']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (query.offline !== undefined) {
+      App.el('nd-filter-offline').checked = query.offline === '1'
+        || query.offline === 'true';
+      filtered = true;
+    }
+    if (filtered) {
+      view.selected = null;
+      await App.refreshNow('nodes');
+    }
+    if (parts[0] !== 'device' || parts[1] === undefined) return;
+    const deviceId = Number(parts[1]);
+    if (!Number.isFinite(deviceId)) return;
+    if (view.selected !== deviceId) {
+      view.selected = deviceId;
+      drawTable();
+      await loadDetail().catch(() => { /* a link to a deleted device */ });
+    }
+    if (parts[2] === 'port' && parts[3] !== undefined) {
+      const ifIndex = Number(parts[3]);
+      const row = (view.ifaces || []).find((r) => r.if_index === ifIndex);
+      if (row) interfaceDialog(row, deviceId);
+    }
   }
 
   async function loadDetail() {
@@ -808,6 +856,7 @@
     if (!el) return;
     const svg = App.el('nd-status-timeline-svg');
     svg.innerHTML = '';
+    App.statusPatternDefs(svg);
     const data = view.timeline;
     const width = el.clientWidth || 400;
     const height = el.clientHeight || 24;
@@ -824,16 +873,36 @@
     for (const seg of segments) {
       const x0 = x(seg.ts_start);
       const w = Math.max(x(seg.ts_end) - x0, 1);
-      const rect = App.svgNode('rect', {
-        x: x0, y: 0, width: w, height, fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+      const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
+      // The segment is a <g> rather than a bare rect so the colour, the
+      // texture over it and the keyboard focus are one thing the operator
+      // can Tab to and read, instead of a colour with a mouse-only tooltip.
+      const group = App.svgNode('g', {
+        tabindex: 0, role: 'img', 'aria-label': label,
+        class: 'timeline-seg',
       });
-      rect.addEventListener('mousemove', (event) => {
-        const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
-        App.tooltip(label, event);
+      group.appendChild(App.svgNode('title', {}, label));
+      group.appendChild(App.svgNode('rect', {
+        x: x0, y: 0, width: w, height,
+        fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+      }));
+      // Colour is never the only signal: every non-`up` state carries its
+      // own texture (see App.statusPatternDefs).
+      const pattern = App.statusPatternUrl(seg.status);
+      if (pattern) {
+        group.appendChild(App.svgNode('rect', {
+          x: x0, y: 0, width: w, height, fill: pattern,
+        }));
+      }
+      group.addEventListener('mousemove', (event) => App.tooltip(label, event));
+      group.addEventListener('mouseleave', App.hideTooltip);
+      group.addEventListener('focus', () => {
+        const box = group.getBoundingClientRect();
+        App.tooltip(label, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
-      rect.addEventListener('mouseleave', App.hideTooltip);
-      svg.appendChild(rect);
+      group.addEventListener('blur', App.hideTooltip);
+      svg.appendChild(group);
     }
   }
 
@@ -896,6 +965,7 @@
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
     const table = App.grid(target, { name: 'nodes-ifaces', columns,
+      caption: 'Interfaces',
       sort: view.ifaceSort,
       onSort: el ? null : onIfaceSort });
     const body = document.createElement('tbody');
@@ -919,9 +989,10 @@
     // The same ticket idiom the interface and OID dialogs use: App.modal
     // reuses one #modal-box, so a slow fetch must not paint into whatever
     // dialog is open by the time it lands.
-    const token = (view.deviceDialogSeq = (view.deviceDialogSeq || 0) + 1);
-    const current = () => token === view.deviceDialogSeq
-      && !App.el('modal').hidden;
+    // Set after App.modal below stamps the box; `current()` is only ever
+    // called from a fetch callback, which cannot run before then.
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
     const listed = (view.devices || []).find((d) => d.id === deviceId);
 
     // The packet-loss chart's window and request ticket, local to this one
@@ -946,6 +1017,8 @@
       <div class="table-wrap" style="max-height:26vh"><table id="ndd-ev-table"></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     // Only up to three days, same reasoning as the pane's own loss chart
@@ -1071,7 +1144,7 @@
         `${confidence ? ` · ${escape(confidence)} confidence` : ''}</span>`
       : '<b>Not identified</b>';
     const why = decision.reason || ev.error || '';
-    const arcLines = arcs.length ? `<table class="nd-arcs">${arcs.map((a) => {
+    const arcLines = arcs.length ? `<table class="nd-arcs"><caption class="sr-only">Enterprise arcs seen in this device\u2019s sysObjectID</caption>${arcs.map((a) => {
       const name = a.display || a.name || `enterprise ${a.arc}`;
       const mib = a.mib_file_id
         ? `${escape(a.module)} names ${a.named} of ${a.objects} (${Math.round((a.score || 0) * 100)}%)`
@@ -1202,7 +1275,7 @@
     const row = (label, val) =>
       `<tr><td class="hint" style="padding-right:14px">${label}</td><td>${val}</td></tr>`;
     const num = (v) => v != null ? Number(v).toLocaleString() : '—';
-    return `<table>${[
+    return `<table><caption class="sr-only">Interface facts</caption>${[
       row('Admin / Oper', `${escape(r.admin_status || '—')} / ${escape(r.oper_status || '—')}`),
       row('Speed', r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'),
       row('MAC address', escape(r.phys_addr || '—')),
@@ -1219,7 +1292,7 @@
     const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
-    return `<div class="table-wrap" style="max-height:120px"><table>` +
+    return `<div class="table-wrap" style="max-height:120px"><table><caption class="sr-only">Recent events on this port</caption>` +
       events.map((e) => `<tr><td>${App.clock(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
       '</table></div>';
@@ -1257,8 +1330,8 @@
     // Same ticket idiom the interface dialog uses: App.modal reuses one
     // #modal-box, so a slow walk must not paint into whatever dialog is
     // open by the time it lands.
-    const token = (view.oidDialogSeq = (view.oidDialogSeq || 0) + 1);
-    const current = () => token === view.oidDialogSeq && !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     const box = App.modal(`Browse OIDs — ${displayName(device || {})}`, `
       <div class="bar wrap">
@@ -1277,6 +1350,8 @@
       <div class="table-wrap" style="max-height:52vh"><table id="oid-table"></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     const COLS = [
@@ -1296,7 +1371,8 @@
 
     function draw() {
       const table = App.grid(box.querySelector('#oid-table'),
-        { name: 'nodes-oids', columns: COLS, sort, onSort: (key, descending) => {
+        { name: 'nodes-oids', caption: 'OID walk results',
+          columns: COLS, sort, onSort: (key, descending) => {
           sort = { key, descending }; draw();
         } });
       const body = document.createElement('tbody');
@@ -1544,9 +1620,8 @@
     // dialog's chart from the next port's — only a ticket can. Without it a
     // superseded dialog's timer kept painting one port's traffic into
     // another port's chart.
-    const token = (view.ifaceDialogSeq = (view.ifaceDialogSeq || 0) + 1);
-    const current = () => token === view.ifaceDialogSeq &&
-      !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     let smooth = true;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
@@ -1562,7 +1637,7 @@
         onBack();
       } });
     }
-    const box = App.modal(ifaceTitle(iface, ifIndex, deviceId), `
+    const box = App.modal({ html: ifaceTitle(iface, ifIndex, deviceId) }, `
       <p class="section">BANDWIDTH — LAST HOUR
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
         <span style="color:var(--accent)">▬</span> out)</span>
@@ -1573,14 +1648,30 @@
       <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
       <p class="section">EVENTS</p>
       <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
-      <p class="section">SHOW RUN</p>
-      <p class="hint">Available once SSH integration is added.</p>
+      <p class="section">RUNNING CONFIGURATION</p>
+      <p class="hint">Stored configurations live in
+        <button type="button" class="linkish" id="ifd-configrx">ConfigRX</button>,
+        which backs up this device over SSH and keeps every version it has
+        seen. There is no per-port view of a configuration — a config is a
+        whole-device thing.</p>
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ifd-dom"><p class="hint">Reading sensors…</p></div>`,
       buttons, { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
+    const configrxLink = box.querySelector('#ifd-configrx');
+    if (configrxLink) {
+      configrxLink.onclick = () => {
+        App.closeModal();
+        App.selectTab('configrx');
+      };
+      // ConfigRX is a module like any other: an operator without read on it
+      // should not be pointed at a tab they cannot open.
+      if (!App.canRead('configrx')) configrxLink.hidden = true;
+    }
 
     // Escape and a backdrop click close the modal without the Close button
     // ever being pressed, so the timer hangs off the close event rather than
@@ -1690,7 +1781,7 @@
           dom.innerHTML = '<p class="hint">No DOM/sensor data available from this device for this port.</p>';
           return;
         }
-        dom.innerHTML = '<table><tr><th>Sensor</th><th>Value</th><th>Status</th></tr>' +
+        dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
           r.sensors.map((s) =>
             `<tr><td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</table>';
@@ -1716,8 +1807,8 @@
         // The VLAN column only earns its place when the source actually knew
         // one: dot1dTpFdbTable has no VLAN in it at all.
         const anyVlan = r.macs.some((m) => m.vlan);
-        mac.innerHTML = `<table><tr><th>MAC address</th>${
-          anyVlan ? '<th>VLAN</th>' : ''}</tr>` +
+        mac.innerHTML = `<table><caption class="sr-only">MAC addresses learned on this port</caption><tr><th scope="col">MAC address</th>${
+          anyVlan ? '<th scope="col">VLAN</th>' : ''}</tr>` +
           r.macs.map((m) => `<tr><td>${escape(m.mac)}</td>${
             anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
           '</table>';
@@ -1734,7 +1825,7 @@
   function drawEventTable(el, payload) {
     const table = el || App.el('nd-ev-table');
     const events = payload || view.events || {};
-    table.innerHTML = '<thead><tr><th>Time</th><th>Kind</th><th>Detail</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Device events</caption><thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col">Detail</th></tr></thead>';
     const body = document.createElement('tbody');
     const all = [...(events.device_events || []).map((e) => ({ ...e, scope: 'device' })),
                 ...(events.interface_events || []).map((e) => ({ ...e, scope: `if ${e.if_index}` }))]
@@ -1776,6 +1867,17 @@
       </select></label>
       <label>Polling profile <select id="nd-f-group">${groupOptionsHtml(d.group_id)}</select></label>
       <label>Group <select id="nd-f-devgroup">${deviceGroupOptionsHtml(d.device_group_id)}</select></label>
+      <!-- The topology rollup has read this since the alert engine learned
+           to fold a site's alerts under the switch that carries it; nothing
+           in the UI could set it. Options are filled in by fillUpstream()
+           once the dialog is on screen, since the list is the fleet. -->
+      <label>Upstream device <select id="nd-f-upstream">
+        <option value="">(none)</option>
+      </select></label>
+      <p class="hint">The device this one is reached through — its access
+        switch, its site router. When the upstream goes down, alerts for
+        everything behind it are folded into the upstream's own alert instead
+        of arriving as a storm. Blank means nothing is in front of it.</p>
       <fieldset><legend>OVERRIDES (blank = use the profile's value)</legend>
         <label>SNMP version <select id="nd-f-version">
           <option value="">(profile)</option>
@@ -1790,8 +1892,10 @@
           ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((p) =>
             `<option value="${p}" ${d.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select></label>
-        <label>v3 auth password <input id="nd-f-authpass" type="password"
-          placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>v3 auth password <input id="nd-f-authpass" type="password"
+              placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>`
+          : App.credentialUnavailableHtml('An SNMPv3 auth password')}
         <label>Poll interval <input id="nd-f-interval" type="number" min="10" value="${d.poll_interval_s || ''}"> s</label>
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${App.helpLink('nodes.profile.ping')}
@@ -1897,6 +2001,31 @@
      distinct from an explicit on/off — a plain checkbox cannot represent
      "inherit" at all, and would silently turn every edit into a locked
      override even when the admin only meant to change something else. */
+  /* The Upstream device list is the fleet minus this device, so it is
+     fetched when the dialog opens rather than rendered into the form: the
+     form is a template string and this is 250 options on a small install and
+     several thousand on a large one. Failure is quiet — the select stays at
+     "(none)" and the rest of the dialog still works. */
+  async function fillUpstream(box, deviceId) {
+    const select = box.querySelector('#nd-f-upstream');
+    if (!select || deviceId == null) return;
+    let payload;
+    try {
+      payload = await App.get(`/api/nodes/devices/${deviceId}/upstream`);
+    } catch (error) {
+      return;
+    }
+    if (!box.isConnected) return;        // the dialog was closed or replaced
+    const options = ['<option value="">(none)</option>'];
+    for (const c of payload.candidates || []) {
+      options.push(`<option value="${c.id}"${
+        c.id === payload.upstream_id ? ' selected' : ''}>${
+        escape(c.name)} (${escape(c.ip)})</option>`);
+    }
+    select.innerHTML = options.join('');
+    select.value = payload.upstream_id == null ? '' : String(payload.upstream_id);
+  }
+
   function triOptions(value) {
     return `<option value="" ${value == null ? 'selected' : ''}>(profile)</option>` +
       `<option value="1" ${value === true ? 'selected' : ''}>on</option>` +
@@ -1930,6 +2059,11 @@
     overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
     overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
+    // Always sent, like the tri-states: "" is how the operator clears an
+    // upstream, and the server accepts "", null and 0 as "none".
+    const upstream = box.querySelector('#nd-f-upstream');
+    if (upstream) overrides.upstream_id = upstream.value === '' ? null
+      : Number(upstream.value);
     Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
@@ -1944,7 +2078,7 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = box.querySelector('#nd-f-authpass').value;
+        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         const result = await App.post('/api/nodes/devices',
@@ -1963,6 +2097,10 @@
         App.refreshNow('nodes');
       } },
     ]);
+    // No id yet, so borrow any existing device's candidate list; the server
+    // only excludes the device asked about, and a new device is in neither.
+    const anyDevice = (view.devices || [])[0];
+    if (anyDevice) fillUpstream(box, anyDevice.id);
   }
 
   function editDevice() {
@@ -1988,7 +2126,7 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = box.querySelector('#nd-f-authpass').value;
+        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         await App.put(`/api/nodes/devices/${d.id}`,
@@ -2003,6 +2141,7 @@
         App.refreshNow('nodes');
       } },
     ]);
+    fillUpstream(box, d.id);
   }
 
   /* ---------------------------------------------------------- device groups
@@ -2018,7 +2157,7 @@
         <td><button type="button" class="devgroup-save">Save</button></td>
         <td><button type="button" class="devgroup-remove">Remove</button></td>
       </tr>`).join('');
-    return `<table><thead><tr><th>Name</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<table><caption class="sr-only">Device groups</caption><thead><tr><th scope="col">Name</th><th scope="col"></th><th scope="col"></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   function wireDeviceGroupRows(box) {
@@ -2077,7 +2216,7 @@
     const result = box.querySelector('#nd-f-test-result');
     result.textContent = 'Testing…';
     const overrides = deviceOverrides(box);
-    const authPass = box.querySelector('#nd-f-authpass').value;
+    const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
     const body = { ...overrides };
     if (authPass) body.v3_auth_pass = authPass;
     try {
@@ -2144,7 +2283,7 @@
 
   function drawProfilesTable() {
     const table = App.el('nd-profiles-table');
-    table.innerHTML = '<thead><tr><th>Name</th><th>Version</th><th>Credentials</th><th>Interval</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Polling profiles</caption><thead><tr><th scope="col">Name</th><th scope="col">Version</th><th scope="col">Credentials</th><th scope="col">Interval</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const g of view.groups) {
       const tr = document.createElement('tr');
@@ -2184,7 +2323,7 @@
         <td>${c.snmp_version === 3 ? (c.has_credential ? 'password stored' : 'no password yet') : ''}</td>
         <td><button type="button" class="cred-remove" data-cred-id="${c.id}">Remove</button></td>
       </tr>`).join('');
-    return `<table><thead><tr><th>Label</th><th>Credential</th><th></th><th></th></tr></thead>
+    return `<table><caption class="sr-only">Stored credentials</caption><thead><tr><th scope="col">Label</th><th scope="col">Credential</th><th scope="col"></th><th scope="col"></th></tr></thead>
       <tbody>${rows}</tbody></table>`;
   }
 
@@ -2202,7 +2341,9 @@
         ${['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'].map((x) =>
           `<option value="${x}">${x}</option>`).join('')}
       </select></label>
-      <label>v3 auth password <input id="nd-pc-authpass" type="password"></label>
+      ${App.canStoreSecrets()
+        ? '<label>v3 auth password <input id="nd-pc-authpass" type="password"></label>'
+        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
       <button type="button" id="nd-pc-add">Add credential</button>
       <p class="hint" id="nd-pc-status"></p>`;
   }
@@ -2257,7 +2398,7 @@
         v3_user: box.querySelector('#nd-pc-v3user').value.trim(),
         v3_auth_proto: box.querySelector('#nd-pc-authproto').value,
       };
-      const authPass = box.querySelector('#nd-pc-authpass').value;
+      const authPass = (box.querySelector('#nd-pc-authpass') || {}).value || '';
       status.innerHTML = '';
       addBtn.disabled = true;
       try {
@@ -2277,8 +2418,10 @@
           }
         }
         await refreshCredentialsList(box, groupId);
+        // 'nd-pc-authpass' is absent on a host that cannot store secrets.
         for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user', 'nd-pc-authpass']) {
-          box.querySelector(`#${id}`).value = '';
+          const field = box.querySelector(`#${id}`);
+          if (field) field.value = '';
         }
       } catch (error) {
         status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
@@ -2304,8 +2447,10 @@
         ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((x) =>
           `<option value="${x}" ${p.v3_auth_proto === x ? 'selected' : ''}>${x}</option>`).join('')}
       </select></label>
-      <label>v3 auth password <input id="nd-p-authpass" type="password"
-        placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+      ${App.canStoreSecrets()
+        ? `<label>v3 auth password <input id="nd-p-authpass" type="password"
+            placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
       <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
@@ -2374,7 +2519,7 @@
       { label: 'Add', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
         if (!fields.name) return;
-        const authPass = box.querySelector('#nd-p-authpass').value;
+        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
         const result = await App.post('/api/nodes/groups', fields);
         if (authPass && fields.v3_user && fields.v3_auth_proto) {
           await App.post(`/api/nodes/groups/${result.id}/credential`,
@@ -2498,7 +2643,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
-        const authPass = box.querySelector('#nd-p-authpass').value;
+        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
         await App.put(`/api/nodes/groups/${g.id}`, fields);
         if (authPass && fields.v3_user && fields.v3_auth_proto) {
           await App.post(`/api/nodes/groups/${g.id}/credential`,
@@ -2557,7 +2702,7 @@
 
   function drawDiscJobsTable() {
     const table = App.el('disc-jobs-table');
-    table.innerHTML = '<thead><tr><th>Target</th><th>State</th><th>Found</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Discovery jobs</caption><thead><tr><th scope="col">Target</th><th scope="col">State</th><th scope="col">Found</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const job of view.discJobs) {
       const tr = document.createElement('tr');
@@ -2675,7 +2820,7 @@
   function drawDiscResultsTable() {
     const table = App.el('disc-results-table');
     const job = view.discJobs.find((j) => j.id === view.discSelected);
-    table.innerHTML = '<thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>' +
+    table.innerHTML = '<caption class="sr-only">Discovery results</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>' +
       `<tbody>${discResultRowsHtml(view.discResults, job, 'disc-check')}</tbody>`;
     for (const box of table.querySelectorAll('.disc-check')) {
       box.onchange = () => {
@@ -2699,7 +2844,7 @@
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
     // Per-scan timing only — the values apply to this one sweep and are
     // never written back to any profile or setting.
-    App.modal(`Start discovery of ${escape(target)}`, `
+    App.modal(`Start discovery of ${target}`, `
       <p class="hint">Timing for this scan only. Retries are extra
         attempts on an address that hasn't answered; more retries or a
         longer timeout makes a large sweep noticeably slower.</p>
@@ -2823,7 +2968,7 @@
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
       <div class="table-wrap" style="max-height:50vh">
-        <table><thead><tr><th></th><th>IP</th><th>Ping</th><th>SNMP</th><th>Name</th><th>Vendor</th></tr></thead>
+        <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
         <tbody>${(() => {
           const saved = view.discChecked; view.discChecked = checked;
           const html = discResultRowsHtml(found, job, 'disc-approve');
@@ -2867,12 +3012,17 @@
 
   function drawMibsTable() {
     const table = App.el('nd-mibs-table');
-    table.innerHTML = '<thead><tr><th>File</th><th>Module</th><th>Objects</th><th>Unresolved</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Loaded MIB files</caption><thead><tr><th scope="col">File</th><th scope="col">Module</th><th scope="col">Objects</th><th scope="col">Unresolved</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const f of view.mibFiles) {
       const tr = document.createElement('tr');
+      const notes = (f.parse_notes || '').trim();
       tr.innerHTML = `<td>${escape(f.filename)}</td><td>${escape(f.module || '—')}</td>` +
-        `<td>${f.object_count}</td>` +
+        // A zero object count is usually a correct import of a file that
+        // defines only textual conventions or imports; the note says which,
+        // and sits under the count rather than in a tooltip nobody hovers.
+        `<td>${f.object_count}${notes
+          ? `<div class="hint">${escape(notes)}</div>` : ''}</td>` +
         `<td>${f.unresolved.length ? escape(f.unresolved.join(', ')) : '—'}</td>` +
         `<td><button class="mib-resolve">Resolve</button> <button class="mib-remove">Remove</button></td>`;
       tr.querySelector('.mib-resolve').onclick = async () => {
@@ -2904,8 +3054,8 @@
      its progress and stops the moment it is closed. */
   async function mibCatalog() {
     const payload = await App.get('/api/nodes/mib-catalog');
-    const token = (view.catalogSeq = (view.catalogSeq || 0) + 1);
-    const current = () => token === view.catalogSeq && !App.el('modal').hidden;
+    let token = null;
+    const current = () => App.modalIsCurrent(token);
 
     const rows = payload.bundles.map((b) => `
       <tr data-key="${escape(b.key)}">
@@ -2927,11 +3077,13 @@
         network, download the files yourself and use Upload MIB, which accepts a
         zip.</p>
       <p id="nd-cat-status" class="hint"></p>
-      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table">
-        <thead><tr><th>Bundle</th><th>State</th><th></th></tr></thead>
+      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
+        <thead><tr><th scope="col">Bundle</th><th scope="col">State</th><th scope="col"></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`, [
       { label: 'Close', primary: true, onClick: App.closeModal },
     ], { buttonsTop: true });
+    // Stamped by App.modal above; every paint below checks it first.
+    token = App.modalToken();
     box.classList.add('wide');
 
     const status = box.querySelector('#nd-cat-status');
@@ -3168,6 +3320,12 @@
                                  s.table_columns_ifaces)}
       <fieldset><legend>STORAGE</legend>
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
+        ${number('np-rollupdays', 'Keep hourly rollups for', s.rollup_retention_days, 'min=1')} days
+        <p class="hint">Raw samples are rolled up into hourly minimum, average
+          and maximum after three days and the raw rows are then dropped, so
+          this is what decides how far back a wide chart can go. The setting
+          was honoured from the first release that had it; it simply had no
+          input.</p>
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
         ${number('np-maxmib', 'Max MIB file size', Math.round((s.max_mib_bytes || 0) / 1024 / 1024), 'min=1')} MB
         <p class="hint">A chart narrower than three days is drawn from raw
@@ -3209,7 +3367,9 @@
             box.querySelector('#cols-devices'), COLUMNS),
           table_columns_ifaces: App.readColumnPicker(
             box.querySelector('#cols-ifaces'), IFACE_COLUMNS),
-          sample_retention_days: num('#np-sampledays'), event_retention_days: num('#np-eventdays'),
+          sample_retention_days: num('#np-sampledays'),
+          rollup_retention_days: num('#np-rollupdays'),
+          event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
         } });
         await App.loadState();
@@ -3503,9 +3663,16 @@
     App.el('nd-mib-catalog').onclick = () => { mibCatalog().catch(() => {}); };
     App.el('nd-resolve-all').onclick = async () => {
       const result = await App.post('/api/nodes/mibs/resolve-all', {});
+      // A file that could not be parsed at all was skipped silently: the
+      // summary counted what worked and said nothing about what did not.
+      const failed = Number(result.files_failed || 0);
       App.modal('Resolve all', `<p>${result.resolved_count}/${result.object_count} ` +
         `object(s) resolved across ${result.files} stored MIB(s) after ` +
         `${result.passes} pass(es); ${result.files_changed} file(s) changed.</p>` +
+        (failed
+          ? `<p class="warn-text">${failed} stored MIB(s) could not be parsed ` +
+            'and were skipped. Their row in the table above says why.</p>'
+          : '') +
         '<p class="hint">Every stored MIB is re-parsed and resolved against every ' +
         'other, so a file uploaded before the one defining its parent branch ' +
         'finishes resolving here.</p>', [
@@ -3551,5 +3718,5 @@
     }
   }
 
-  App.pages.nodes = { init, refresh, fastTick: drawStatus };
+  App.pages.nodes = { init, refresh, activate, fastTick: drawStatus };
 })();

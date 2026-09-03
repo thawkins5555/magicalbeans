@@ -19,8 +19,10 @@
     scopeTrendWindow: '24h', scopeTrend: [],
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return 'never';
@@ -171,7 +173,7 @@
 
   function renderSubnets() {
     const table = App.el('ipam-subnet-table');
-    table.innerHTML = '';
+    table.innerHTML = '<caption class="sr-only">Subnets</caption>';
     const body = document.createElement('tbody');
     for (const subnet of view.subnets) {
       const tr = document.createElement('tr');
@@ -337,7 +339,8 @@
   function drawHosts() {
     const columns = hostColumns();
     const table = App.grid(App.el('ipam-hosts-table'),
-      { name: 'ipam-hosts', columns, sort: view.hostSort, onSort: onHostSort });
+      { name: 'ipam-hosts', caption: 'IPAM addresses', columns,
+        sort: view.hostSort, onSort: onHostSort });
     const body = document.createElement('tbody');
     const aliveOnly = App.el('ipam-alive-only').checked;
     const rows = App.sortRows(
@@ -363,9 +366,10 @@
 
   function drawConflicts() {
     const table = App.el('ipam-conflicts-table');
-    table.innerHTML = '<thead><tr><th>IP address</th><th>First MAC</th>' +
-      '<th>Second MAC</th><th>Source</th><th>Detected</th><th>Last seen</th>' +
-      '<th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Address conflicts</caption><thead><tr>' +
+      '<th scope="col">IP address</th><th scope="col">First MAC</th>' +
+      '<th scope="col">Second MAC</th><th scope="col">Source</th><th scope="col">Detected</th><th scope="col">Last seen</th>' +
+      '<th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const c of view.conflicts) {
       const tr = document.createElement('tr');
@@ -400,6 +404,36 @@
   }
 
   /* ---------------------------------------------------------------- dhcp */
+
+  /* Reading a Windows DHCP server runs PowerShell with the DhcpServer module
+     on the machine running SappiWhere (ipam_dhcp.py), so on any other host
+     the whole subtab is a form that cannot be made to work — and it used to
+     render completely, with Windows-only help text and no hint of that.
+     `/api/platform` says which host this is; the form is replaced by a
+     notice that names what is missing rather than being silently broken. */
+  function applyDhcpAvailability() {
+    const platform = App.state.platform || {};
+    const usable = Boolean(platform.is_windows && platform.powershell);
+    const body = App.el('ipam-dhcp-body');
+    const notice = App.el('ipam-dhcp-unavailable');
+    if (!body || !notice) return usable;
+    body.hidden = !usable;
+    notice.hidden = usable;
+    if (!usable) {
+      App.el('ipam-dhcp-unavailable-why').textContent = platform.is_windows
+        ? 'This host is Windows but no PowerShell was found on it. Reading a '
+          + 'DHCP server needs PowerShell with the DhcpServer module (part of '
+          + 'RSAT: DHCP Server Tools), installed on the machine running '
+          + 'SappiWhere — not necessarily on the DHCP server itself.'
+        : 'Scopes and leases are read by running PowerShell with the '
+          + 'DhcpServer module on the machine running SappiWhere, so this '
+          + 'subtab only works when SappiWhere itself runs on Windows. '
+          + 'Everything else in IPAM — subnets, scans, hosts and conflicts — '
+          + 'works here. Subnet scanning finds the same addresses; it just '
+          + 'cannot read the server\u2019s own lease records.';
+    }
+    return usable;
+  }
 
   /* One DHCP server is picked at a time via a dropdown rather than a full
      sidebar table -- that sidebar space belongs to SCOPES now, mirroring
@@ -855,7 +889,8 @@
   function drawLeases() {
     const columns = leaseColumns();
     const table = App.grid(App.el('ipam-dhcp-lease-table'),
-      { name: 'ipam-leases', columns, sort: view.leaseSort, onSort: onLeaseSort });
+      { name: 'ipam-leases', caption: 'DHCP leases', columns,
+        sort: view.leaseSort, onSort: onLeaseSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.dhcpLeases, view.leaseSort.key,
       view.leaseSort.descending, columns);
@@ -985,7 +1020,11 @@
   /* --------------------------------------------------------------- lifecycle */
 
   async function refresh() {
-    await Promise.all([loadSubnets(), loadConflicts(), loadDhcpServers()]);
+    // Nothing to poll for on a host where the DHCP subtab cannot work, and
+    // a server list that always comes back empty is noise on the wire.
+    const dhcp = applyDhcpAvailability();
+    await Promise.all([loadSubnets(), loadConflicts(),
+                       ...(dhcp ? [loadDhcpServers()] : [])]);
     drawStatus();
   }
 
@@ -1018,7 +1057,7 @@
         [{ label: 'OK', primary: true, onClick: App.closeModal }]);
       return;
     }
-    App.modal(`Find: “${escape(query)}”`, resultsTable(payload.results),
+    App.modal(`Find: “${query}”`, resultsTable(payload.results),
       [{ label: 'Close', primary: true, onClick: App.closeModal }]);
   }
 
@@ -1037,12 +1076,14 @@
       `<td class="hint">${escape(r.sources.join(', '))}</td>` +
       `</tr>`).join('');
     return `<div class="table-wrap" style="max-height:50vh">
-      <table><thead><tr><th>Hostname</th><th>IP</th><th>MAC</th>
-      <th>Status</th><th>Subnet</th><th>Source</th></tr></thead>
+      <table><caption class="sr-only">Search results</caption><thead><tr><th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">MAC</th>
+      <th scope="col">Status</th><th scope="col">Subnet</th><th scope="col">Source</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
   }
 
   function init() {
+    // /api/platform has already answered by the time any module inits.
+    applyDhcpAvailability();
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => selectSub(btn.dataset.subtab);
     }

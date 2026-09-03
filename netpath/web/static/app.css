@@ -43,6 +43,23 @@
 }
 
 * { box-sizing: border-box; }
+
+/* Text that only assistive technology reads: table captions naming the panel
+   a grid belongs to, the skip link, the word behind a status dot. Clipped
+   rather than `display:none`, which screen readers skip entirely. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* A class selector beats the user agent's [hidden] rule, so any element given
    display by a class of its own stays visible when hidden. The modal did
    exactly that and covered the page with a click-blocking overlay. */
@@ -59,6 +76,109 @@ body {
   overflow: hidden;
 }
 
+/* Off-screen until it takes focus, then a real target above everything. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  padding: 8px 14px;
+  font: 600 12px/1 var(--ui);
+  text-decoration: none;
+}
+.skip-link:focus { left: 8px; top: 8px; }
+
+/* Status-timeline segments are keyboard reachable (each one announces its
+   state and window), so focus has to be visible on them. */
+.timeline-seg { outline: none; }
+.timeline-seg:focus-visible rect:first-of-type,
+.timeline-seg:focus rect:first-of-type {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
+/* --------------------------------------------------------------- dashboard
+
+   A tile grid over the numbers the other tabs already own. It is the one
+   page in the application that scrolls: the tiles are content, not a fixed
+   instrument layout, and there are more of them than fit a laptop. */
+.dash-scroll { overflow-y: auto; flex: 1; }
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+  align-items: start;
+}
+.dash-tile {
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+.dash-tile.wide { grid-column: span 2; }
+@media (max-width: 900px) { .dash-tile.wide { grid-column: span 1; } }
+.dash-tile.tone-bad { border-color: var(--fail); }
+.dash-tile h3 {
+  margin: 0 0 8px;
+  font: 600 11px/1 var(--ui);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.dash-figures { display: flex; flex-wrap: wrap; gap: 16px; }
+.dash-figure {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-decoration: none;
+  color: var(--text);
+  border-bottom: 2px solid transparent;
+}
+a.dash-figure:hover, a.dash-figure:focus-visible {
+  border-bottom-color: var(--accent);
+  outline: none;
+}
+a.dash-figure:focus-visible .dash-value { text-decoration: underline; }
+.dash-value { font: 600 22px/1 var(--mono); }
+.dash-figure.ok .dash-value { color: var(--ok); }
+.dash-figure.warn .dash-value { color: var(--warn); }
+.dash-figure.fail .dash-value { color: var(--fail); }
+.dash-label { color: var(--muted); font-size: 11px; }
+.dash-sev-list { margin-top: 10px; display: flex; flex-direction: column; gap: 2px; }
+.dash-sev-row,
+.dash-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: 3px;
+  text-decoration: none;
+  color: var(--text);
+}
+a.dash-sev-row:hover, a.dash-row:hover,
+a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
+  background: var(--raised);
+  outline: 1px solid var(--accent);
+}
+.dash-sev-count { margin-left: auto; font-family: var(--mono); }
+.dash-row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dash-row-value { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.dash-row-note { flex-basis: 100%; font-size: 11px; }
+.dash-bar {
+  flex-basis: 100%;
+  height: 4px;
+  background: var(--grid);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.dash-bar-fill { display: block; height: 100%; background: var(--ok); }
+.dash-bar-fill.warn { background: var(--warn); }
+.dash-bar-fill.bad { background: var(--fail); }
+
 /* ------------------------------------------------------------------ tabs */
 #tabs {
   display: flex;
@@ -68,7 +188,19 @@ body {
   border-bottom: 1px solid var(--hairline);
   padding: 0 12px;
   flex: none;
+  /* `body { overflow: hidden }` clips rather than scrolls, so below about
+     1,400 px the right-hand tabs — Debug, Settings — and the sign-out button
+     were simply unreachable: cut off with nothing to scroll. This is the
+     one-line half of the narrow-layout problem (a real narrow layout is a
+     separate piece of work): the bar scrolls sideways instead of losing its
+     tail, and nothing in it is allowed to shrink into unreadability. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
 }
+#tabs > * { flex: none; }
+#tabs > .grow { flex: 1 0 auto; }
 .tab {
   background: none;
   border: none;
@@ -173,6 +305,28 @@ button.linkish {
 }
 button.linkish:hover { color: var(--accent); }
 .conn.bad { color: var(--fail); }
+.conn.good { color: var(--ok); }
+
+/* Stale content is dimmed rather than hidden: the operator may still want to
+   read the last known state, but must never mistake it for the current one.
+   The banner sits above it at full strength. */
+body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
+.stale-banner {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  top: 8px;
+  z-index: 40;
+  max-width: 80vw;
+  background: var(--raised);
+  border: 1px solid var(--fail);
+  border-left: 4px solid var(--fail);
+  color: var(--text);
+  padding: 9px 16px;
+  font: 600 12px/1.4 var(--ui);
+  border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
 
 .page { display: none; flex: 1; min-height: 0; }
 /* Column by default, so a new module cannot be forgotten here and end up
@@ -261,7 +415,15 @@ input[type=checkbox] { accent-color: var(--accent); }
   font: 600 11px/1 var(--ui);
   letter-spacing: 1.4px;
 }
-.hint { color: var(--faint); font-size: 11px; }
+/* --faint is 2.50:1 on --bg at 11px, roughly half of what AA asks for, and
+   .hint is not decorative: it carries every device's IP address, the mute
+   tag, alert counts and every empty state. --muted is 5.18:1. */
+.hint { color: var(--muted); font-size: 11px; }
+/* The IP under a device name is the network engineer's primary key and the
+   first thing to disappear on a NOC wall screen: its own class, a size up
+   from a hint, so it is not carried along by whatever .hint becomes next. */
+.ip-line { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.ip-line .muted-tag { font-family: var(--ui); }
 .hint.pad { padding: 2px 12px 6px; margin: 0; }
 .terms { font-family: var(--mono); padding: 0 12px 6px; }
 .terms b { color: var(--muted); font-weight: 600; }
@@ -573,7 +735,7 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 .sev-4 { color: var(--warn); }
 .sev-5 { color: var(--text); }
 .sev-6 { color: var(--muted); }
-.sev-7 { color: var(--faint); }
+.sev-7 { color: var(--muted); }        /* --faint was 2.50:1 — below AA */
 #syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #nodes-table td.msg, #alerts-table td.msg { white-space: pre-wrap; word-break: break-word; }

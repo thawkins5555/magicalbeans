@@ -177,6 +177,7 @@
       li.className = target.id === view.targetId ? 'selected' : '';
       li.onclick = () => {
         view.targetId = target.id;
+        App.setRoute([target.id]);
         view.pinned = null;
         view.expanded.clear();
         view.expandAll = false;
@@ -189,19 +190,29 @@
       dot.style.background = target.status === 'none'
         ? 'transparent' : STATUS_COLOR[target.status];
       if (target.status === 'none') dot.style.border = '1px solid var(--faint)';
+      // The dot was the only signal of a destination's state, and three of
+      // the six colours are the same khaki to a deuteranope. The word goes
+      // in the title for a mouse and in an sr-only span for everything else.
+      const statusWord = STATUS_LABEL[target.status] || target.status || 'No data';
+      dot.title = statusWord;
+      const spoken = document.createElement('span');
+      spoken.className = 'sr-only';
+      spoken.textContent = `${statusWord}: `;
       const text = document.createElement('span');
       text.innerHTML = `<div class="name">${escape(target.label)}` +
                        (target.hop_probe_enabled
                          ? ' <span title="Continuous per-hop probing is on for this destination" style="color:var(--accent);font-size:9px;font-weight:700;">MTR</span>'
                          : '') +
                        `</div><div class="host">${escape(target.host)}</div>`;
-      li.append(dot, text);
+      li.append(dot, spoken, text);
       list.appendChild(li);
     }
   }
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function targetForm(target) {
     const d = App.state.settings;
@@ -868,17 +879,13 @@
           'fill-opacity': bucket.status === 'none' ? 1 : 0.85,
         });
         svg.appendChild(cell);
-        if (bucket.status === 'blocked') {
+        // Refused was hatched and skipped was striped from the start; the
+        // rest of the vocabulary now comes from the same shared definitions
+        // the device status timeline uses, so no state is colour alone.
+        const texture = App.statusPatternUrl(bucket.status);
+        if (texture) {
           svg.appendChild(App.svgNode('rect', {
-            x: x0, y: L.status.y, width: bw, height: L.status.h,
-            fill: 'url(#hatch)',
-          }));
-        }
-        if (bucket.status === 'overrun') {
-          // Vertical bars, not the diagonal hatch a refusal gets.
-          svg.appendChild(App.svgNode('rect', {
-            x: x0, y: L.status.y, width: bw, height: L.status.h,
-            fill: 'url(#bars)',
+            x: x0, y: L.status.y, width: bw, height: L.status.h, fill: texture,
           }));
         }
         if (bucket.path_changed) {
@@ -890,23 +897,10 @@
       }
     }
 
-    const defs = App.svgNode('defs');
-    const pattern = App.svgNode('pattern', {
-      id: 'hatch', width: 6, height: 6, patternUnits: 'userSpaceOnUse',
-      patternTransform: 'rotate(45)',
-    });
-    pattern.appendChild(App.svgNode('line', {
-      x1: 0, y1: 0, x2: 0, y2: 6, stroke: 'rgba(255,255,255,0.45)', 'stroke-width': 2,
-    }));
-    defs.appendChild(pattern);
-    const bars = App.svgNode('pattern', {
-      id: 'bars', width: 4, height: 4, patternUnits: 'userSpaceOnUse',
-    });
-    bars.appendChild(App.svgNode('line', {
-      x1: 1, y1: 0, x2: 1, y2: 4, stroke: 'rgba(255,255,255,0.5)', 'stroke-width': 1.4,
-    }));
-    defs.appendChild(bars);
-    svg.insertBefore(defs, svg.firstChild);
+    // The hatch and the bars this file defined by hand now live in app.js
+    // beside the three the other states need, so the two timelines cannot
+    // drift apart.
+    App.statusPatternDefs(svg);
 
     const span = t1 - t0;
     const step = niceStep(span);
@@ -1138,6 +1132,13 @@
      click it in the target list. Safe to call with no args — App.selectTab
      already calls this with none on every ordinary tab switch. */
   function activate(opts) {
+    // A hash route (#/netpath/<targetId>) names the destination in its path;
+    // NetFlow's "view route" jump passes it as targetId directly. Both end
+    // up in the same place.
+    if (opts && opts.parts && opts.parts[0] !== undefined && !opts.targetId) {
+      const fromRoute = Number(opts.parts[0]);
+      if (Number.isFinite(fromRoute)) opts = { ...opts, targetId: fromRoute };
+    }
     if (!opts || !opts.targetId) return;
     view.targetId = opts.targetId;
     view.pinned = null;

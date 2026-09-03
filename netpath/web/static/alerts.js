@@ -17,6 +17,11 @@
     // that bar hides the instant the selection clears, and the refresh the
     // action triggers runs synchronously, so nothing put there would paint.
     bulkNotice: null,
+    // How many alerts match the current filters, against the capped page the
+    // list is actually showing. {total, capped, cap} from /api/alerts/total.
+    alertTotal: null,
+    // {ruleId: {auto_resolve_after_s, notify}} from /api/alerts/rules/extras.
+    ruleExtras: {},
     // Per session only, like every other table's sort: a saved sort order is
     // a different feature from saved columns, and mixing the two storage
     // models is how Reset layout ends up eating a settings choice.
@@ -35,8 +40,10 @@
 
   const MUTE_HOURS = [1, 6, 12, 24];
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return '—';
@@ -78,6 +85,11 @@
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
       (c.send_errors ? ` · ${c.send_errors} send errors` : '') +
+      // How far behind the engine is, and how many events it could not
+      // apply: an engine that has stopped keeping up used to look exactly
+      // like one with nothing to do.
+      (c.backlog ? ` · ${Number(c.backlog).toLocaleString()} event(s) behind` : '') +
+      (c.apply_errors ? ` · ${Number(c.apply_errors).toLocaleString()} apply errors` : '') +
       (view.bulkNotice && Date.now() < view.bulkNotice.until
         ? ` · ${view.bulkNotice.text}` : '');
     if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
@@ -174,12 +186,17 @@
     const columns = alertColumns();
     const checked = view.checked;
     const table = App.grid(App.el('alerts-table'), {
-      name: 'alerts', columns,
+      name: 'alerts', caption: 'Alerts', columns,
       sort: view.alertSort, onSort: onAlertSort,
       selectAll: {
         key: 'check',
         checked: view.alerts.length > 0 && view.alerts.every((a) => checked.has(a.id)),
         some: view.alerts.some((a) => checked.has(a.id)),
+        // It only ever reaches the rows that were sent. Saying "select all"
+        // above a truncated list is how select-all-then-acknowledge came to
+        // acknowledge 300 of 1,842.
+        label: truncated() ? `Select the ${view.alerts.length} shown`
+                           : 'Select all rows',
         onToggle: (on) => {
           checked.clear();
           if (on) for (const a of view.alerts) checked.add(a.id);
@@ -205,13 +222,32 @@
       }
       tr.onclick = () => {
         view.selected = row.id;
+        // #/alerts/998 — the link that goes in the ticket.
+        App.setRoute([row.id]);
         drawTable();
         showDetail(row);
       };
     });
     table.appendChild(body);
-    App.el('alerts-count').textContent = `${view.alerts.length} shown`;
+    App.el('alerts-count').textContent = countLabel();
     drawBulkBar();
+  }
+
+  /* True when the server sent fewer alerts than match the filters — the
+     case the old "300 shown" label hid. */
+  function truncated() {
+    const t = view.alertTotal;
+    if (!t || typeof t.total !== 'number') return false;
+    return t.capped || t.total > view.alerts.length;
+  }
+
+  function countLabel() {
+    const shown = view.alerts.length;
+    const t = view.alertTotal;
+    if (!t || typeof t.total !== 'number') return `${shown} shown`;
+    if (t.capped) return `${shown} of more than ${t.total.toLocaleString()} shown`;
+    if (t.total <= shown) return `${shown} shown`;
+    return `${shown} of ${t.total.toLocaleString()} shown`;
   }
 
   /* ------------------------------------------------------- bulk actions */
@@ -274,6 +310,10 @@
     const ids = [...view.checked];
     if (!ids.length) return;
     const result = await App.post(path, { alert_ids: ids });
+    // The notice is painted on the counters line, which reruns every poll
+    // and would be a noisy live region; the one-shot result is announced
+    // through the shared sr-only status instead.
+    App.announce(`${verb} ${result[key]} of ${ids.length}`);
     view.bulkNotice = { text: `${verb} ${result[key]} of ${ids.length}`,
                         until: Date.now() + 6000 };
     clearSelection();
@@ -376,7 +416,8 @@
 
   function drawRulesTable() {
     const table = App.el('alerts-rules-table');
-    table.innerHTML = '<thead><tr><th>Name</th><th>Kind</th><th>Sev</th><th>On</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Alert rules</caption><thead><tr><th scope="col">Name</th>' +
+      '<th scope="col">Kind</th><th scope="col">Sev</th><th scope="col">On</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const r of view.rules) {
       const tr = document.createElement('tr');
@@ -411,6 +452,9 @@
     // comparing a value to a threshold, so it gets its own two fields
     // instead of the threshold ones.
     const isFlapping = r.source_kind === 'flapping';
+    // auto_resolve_after_s and notify are not in the rules payload's own
+    // serializer; refresh() fetches them alongside and stashes them here.
+    const extras = (view.ruleExtras || {})[String(r.id)] || {};
     App.modal(`Edit ${r.name}`, `
       <label>Name <input id="ar-name" value="${escape(r.name)}"></label>
       <label>Severity <select id="ar-sev">${[0,1,2,3,4,5,6,7].map((n) =>
@@ -418,6 +462,32 @@
       <label class="check"><input type="checkbox" id="ar-enabled" ${r.enabled ? 'checked' : ''}> Enabled</label>
       <label>Device filter (substring, blank = all) <input id="ar-devfilter" value="${escape(r.device_filter || '')}"></label>
       <label>Template <select id="ar-template">${templateOptionsHtml(r.template_id)}</select></label>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never" value="${extras.auto_resolve_after_s
+          ? Math.round(extras.auto_resolve_after_s / 60) : ''}"> minutes
+        (blank = never)</label>
+      <p class="hint">For a rule that fires on something momentary — a reboot,
+        a trap, a syslog line — where nothing will ever arrive to clear it.
+        The alert resolves itself this long after its last occurrence. Blank
+        leaves it open until somebody resolves it or the condition clears.</p>
+      <label class="check"><input type="checkbox" id="ar-notify"
+        ${extras.notify !== false ? 'checked' : ''}> Send email for this rule</label>
+      <p class="hint">Off makes the rule raise alerts that appear in the list
+        and the badge but never reach a mailbox — for the noisy ones nobody
+        wants paged about, which used to mean disabling the rule outright.</p>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never" value="${extras.auto_resolve_after_s
+          ? Math.round(extras.auto_resolve_after_s / 60) : ''}"> minutes
+        (blank = never)</label>
+      <p class="hint">For a rule that fires on something momentary — a reboot,
+        a trap, a syslog line — where nothing will ever arrive to clear it.
+        The alert resolves itself this long after its last occurrence. Blank
+        leaves it open until somebody resolves it or the condition clears.</p>
+      <label class="check"><input type="checkbox" id="ar-notify"
+        ${extras.notify !== false ? 'checked' : ''}> Send email for this rule</label>
+      <p class="hint">Off makes the rule raise alerts that appear in the list
+        and the badge but never reach a mailbox — for the noisy ones nobody
+        wants paged about, which used to be turned off entirely instead.</p>
       ${isThreshold ? `
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
@@ -473,6 +543,12 @@
           device_filter: box.querySelector('#ar-devfilter').value.trim(),
           template_id: box.querySelector('#ar-template').value ? Number(box.querySelector('#ar-template').value) : null,
         };
+        // Blank means NULL — "never auto-resolve" — not zero, which would
+        // resolve every alert the moment it opened.
+        const autoText = box.querySelector('#ar-autoresolve').value.trim();
+        values.auto_resolve_after_s = autoText === '' || Number(autoText) === 0
+          ? null : Number(autoText) * 60;
+        values.notify = box.querySelector('#ar-notify').checked;
         if (isThreshold) {
           values.threshold = Number(box.querySelector('#ar-threshold').value);
           values.clear_threshold = Number(box.querySelector('#ar-clear').value);
@@ -521,7 +597,13 @@
         `<option value="${n}" ${n === 4 ? 'selected' : ''}>${n} ${App.state.severities?.[n] || ''}</option>`).join('')}</select></label>
       <label>Template <select id="ar-template">${templateOptionsHtml(null)}</select></label>
       <label>Threshold (threshold rules only) <input id="ar-threshold" type="number" step="0.1"></label>
-      <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>`, [
+      <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never"> minutes (blank = never)</label>
+      <label class="check"><input type="checkbox" id="ar-notify" checked>
+        Send email for this rule</label>
+      <p class="hint">A trap or syslog rule usually wants an auto-resolve: the
+        event is momentary and nothing will ever arrive to clear it.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (box) => {
         const key = box.querySelector('#ar-key').value.trim();
@@ -537,6 +619,11 @@
         const c = box.querySelector('#ar-clear').value;
         if (t) values.threshold = Number(t);
         if (c) values.clear_threshold = Number(c);
+        const autoText = box.querySelector('#ar-autoresolve').value.trim();
+        if (autoText && Number(autoText) > 0) {
+          values.auto_resolve_after_s = Number(autoText) * 60;
+        }
+        values.notify = box.querySelector('#ar-notify').checked;
         await App.post('/api/alerts/rules', values);
         App.closeModal();
         App.refreshNow('alerts');
@@ -562,7 +649,7 @@
 
   function drawTemplatesTable() {
     const table = App.el('alerts-templates-table');
-    table.innerHTML = '<thead><tr><th>Name</th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Notification templates</caption><thead><tr><th scope="col">Name</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const t of view.templates) {
       const tr = document.createElement('tr');
@@ -674,7 +761,7 @@
         <td>${escape(addr)}</td>
         <td><button type="button" class="as-to-remove" data-index="${index}">Remove</button></td>
       </tr>`).join('');
-    return `<table><tbody>${rows}</tbody></table>`;
+    return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
   }
 
   function settingsDialog() {
@@ -701,8 +788,10 @@
         </select></label>
         ${check('as-verify', 'Verify server certificate', s.smtp_verify_cert !== false)}
         <label>Username <input id="as-user" value="${escape(s.smtp_username || '')}"></label>
-        <label>Password <input id="as-pass" type="password"
-          placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="as-pass" type="password"
+          placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SMTP password')}
         <p class="hint" id="as-cred-status"></p>
       </fieldset>
       <fieldset><legend>IDENTITY &amp; RECIPIENTS</legend>
@@ -737,6 +826,16 @@
           When the device comes back, any metric that is genuinely still
           breaching re-opens on the next poll by itself.</p>
       </fieldset>
+      <fieldset><legend>THIS BROWSER</legend>
+        ${check('as-desktop', 'Show a desktop notification for a new alert of ' +
+                'severity 1 or 2', App.desktopNotifyEnabled())}
+        <p class="hint" id="as-desktop-status">Off by default. This one setting
+          is remembered by this browser rather than by your account, because
+          the permission that makes it work is granted by this browser to this
+          address — an account setting would promise something a different
+          machine could not keep. The browser asks for permission the first
+          time you turn it on.</p>
+      </fieldset>
       ${App.columnPickerFieldset('ALERT LIST COLUMNS', 'alerts', COLUMNS,
                                  s.table_columns)}
       <fieldset><legend>TEST</legend>
@@ -760,7 +859,7 @@
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
-        const password = box.querySelector('#as-pass').value;
+        const password = (box.querySelector('#as-pass') || {}).value || '';
         if (password) {
           try {
             await App.post('/api/alerts/smtp/credential', { password });
@@ -768,6 +867,17 @@
             box.querySelector('#as-cred-status').textContent = error.message;
             return;
           }
+        }
+        // Per browser, so it is stored (and its permission asked for) here
+        // rather than travelling to the server with the rest.
+        const notifyState = await App.setDesktopNotify(on('#as-desktop'));
+        if (notifyState === 'blocked' || notifyState === 'unsupported') {
+          box.querySelector('#as-desktop-status').textContent =
+            notifyState === 'blocked'
+              ? 'Desktop notifications are blocked for this address in this ' +
+                'browser — everything else below was saved.'
+              : 'This browser does not support desktop notifications — ' +
+                'everything else below was saved.';
         }
         await App.post('/api/settings', { scope: 'alerts', values: {
           enabled: on('#as-enabled'), min_severity: Number(box.querySelector('#as-minsev').value),
@@ -818,6 +928,44 @@
     };
   }
 
+  /* A route into this tab: #/alerts, #/alerts?state=open&severity=2, or
+     #/alerts/<id>. Runs after refresh(), so view.alerts is populated and an
+     alert named by a link can be found in it. An alert that is not in the
+     current page of the list is fetched on its own rather than reported as
+     missing — a link from a ticket is usually to something older than the
+     300 rows on screen. */
+  async function activate(opts) {
+    if (!opts) return;
+    const parts = opts.parts || [];
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['alerts-filter-state', 'state'],
+                             ['alerts-filter-sev', 'severity'],
+                             ['alerts-filter-device', 'device'],
+                             ['alerts-filter-text', 'q']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (filtered) await App.refreshNow('alerts');
+    if (parts[0] === undefined) return;
+    const alertId = Number(parts[0]);
+    if (!Number.isFinite(alertId)) return;
+    view.selected = alertId;
+    drawTable();
+    let row = (view.alerts || []).find((a) => a.id === alertId);
+    if (!row) {
+      try {
+        row = (await App.get(`/api/alerts/${alertId}`)).alert;
+      } catch (error) {
+        return;                    // a link to an alert that has been pruned
+      }
+    }
+    showDetail(row);
+  }
+
   /* ----------------------------------------------------------- refresh */
 
   async function refresh() {
@@ -827,16 +975,23 @@
     const span = t1 - t0;
     const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
     const f = filters();
-    const [overview, list, rules, templates, mutes] = await Promise.all([
+    const [overview, list, total, rules, ruleExtras, templates, mutes] =
+      await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', f),
+      // Same filters, in the same round trip, so the label under the table
+      // can say what fraction of the matches is on screen.
+      App.get('/api/alerts/total', f),
       App.get('/api/alerts/rules'),
+      App.get('/api/alerts/rules/extras'),
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
     ]);
     view.hist = overview.buckets;
     view.alerts = list.alerts;
+    view.alertTotal = total;
     view.rules = rules.rules;
+    view.ruleExtras = ruleExtras.rules || {};
     view.templates = templates.templates;
     // entity_id -> until_ts, for the devices with an active mute. The server
     // only ever returns unexpired ones, so presence here means muted.
@@ -894,9 +1049,13 @@
     // state for everything on screen in one click and there is no undo, so
     // they get the same guard as a delete.
     App.el('alerts-ack-all').onclick = () => {
-      const open = view.alerts.filter((a) => a.state === 'open').length;
+      // The route acknowledges every open alert on the SERVER, so the number
+      // in the question has to be the server's, not the truncated page's —
+      // it used to say "(N shown)", which read as the size of the action.
+      const open = ((App.state.serverState || {}).alerts || {}).open_count;
       App.confirmDestructive('Acknowledge all',
-        `<p>Acknowledge every open alert${open ? ` (${open} shown)` : ''}?</p>` +
+        `<p>Acknowledge ${open != null ? `all ${open.toLocaleString()}` : 'every'} ` +
+        'open alert(s)?</p>' +
         '<p class="hint">Every open alert on the server — not your ticked ' +
         'selection, and not just the ones matching the current filter. Use ' +
         '"Acknowledge selected" for the rows you have ticked. They cannot be ' +
@@ -954,5 +1113,5 @@
     }
   }
 
-  App.pages.alerts = { init, refresh, fastTick: drawStatus };
+  App.pages.alerts = { init, refresh, activate, fastTick: drawStatus };
 })();

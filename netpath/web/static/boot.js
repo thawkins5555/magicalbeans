@@ -16,6 +16,20 @@
    The key and the 'netpath' fallback must stay in step with app.js's own
    TAB_KEY / default tab. */
 (function () {
+  var TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
+              'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
+  // A hash route names the tab explicitly and beats the remembered one, the
+  // same order app.js applies once it runs (its ROUTE_TABS must stay in
+  // step with the list above). Reading it here is what stops a link to
+  // #/alerts/998 painting the remembered tab for a frame first.
+  try {
+    var hash = String(window.location.hash || '').replace(/^#\/?/, '');
+    var first = hash.split('?')[0].split('/')[0];
+    if (TABS.indexOf(first) !== -1) {
+      document.documentElement.dataset.tab = first;
+      return;
+    }
+  } catch (error) { /* fall through to the remembered tab */ }
   try {
     var stored = localStorage.getItem('sappiwhere.tab');
     document.documentElement.dataset.tab = stored || 'netpath';

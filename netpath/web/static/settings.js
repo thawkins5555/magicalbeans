@@ -274,8 +274,10 @@
 
   /* ------------------------------------------------------------- users */
 
-  const escape = (t) => String(t ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function when(ts) {
     return ts ? new Date(ts * 1000).toLocaleString() : 'never';
@@ -296,7 +298,7 @@
         `<td>${radio('read', 'Read')}</td>` +
         `<td>${radio('write', 'Write')}</td></tr>`;
     }).join('');
-    return `<table><thead><tr><th>Module</th><th></th><th></th><th></th></tr></thead>
+    return `<table><caption class="sr-only">Module permissions</caption><thead><tr><th scope="col">Module</th><th scope="col"></th><th scope="col"></th><th scope="col"></th></tr></thead>
       <tbody>${rows}</tbody></table>`;
   }
 
@@ -328,14 +330,34 @@
     ]);
   }
 
+  /* The accounts grid is behind settings:write on the server, so a
+     read-only account asking for it got a 403 every time Settings was
+     opened — and an empty table with no explanation. Ask only when the
+     grant is there, and say why when it is not. */
+  function usersVisible() {
+    return App.canWrite('settings');
+  }
+
   async function loadUsers() {
+    if (!usersVisible()) {
+      const table = App.el('users-table');
+      if (table) {
+        table.innerHTML = '<caption class="sr-only">User accounts</caption>' +
+          '<tbody><tr><td class="hint">Managing accounts needs Settings ' +
+          'write access. Ask an administrator if you need it.</td></tr></tbody>';
+      }
+      const grid = App.el('new-user-grid');
+      if (grid) grid.innerHTML = '';
+      return;
+    }
     const payload = await App.get('/api/users');
     modules = payload.modules || [];
     App.el('new-user-grid').innerHTML = permissionGridHtml('nu', {});
     const table = App.el('users-table');
     const me = (App.state.session || {}).username;
-    table.innerHTML = '<thead><tr><th>User</th><th>Created</th>' +
-      '<th>Last sign-in</th><th>State</th><th></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">User accounts</caption><thead><tr>' +
+      '<th scope="col">User</th><th scope="col">Created</th>' +
+      '<th scope="col">Last sign-in</th><th scope="col">State</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
 
     for (const user of payload.users) {

@@ -286,6 +286,26 @@ ROUTES = [
     # this host's own code: both are administrator acts, not settings.
     ("POST", r"^/api/maintenance$", api.post_maintenance, ("admin", W)),
     ("POST", r"^/api/update$", api.post_update, ("admin", W)),
+    # Front-end additions (workstream E), appended so they never share
+    # a hunk with the module routes above. `/api/alerts/total` cannot
+    # collide with `/api/alerts/(\d+)`, which only matches digits.
+    ("GET", r"^/api/alerts/total$", api.get_alerts_total, ("alerts", R)),
+    # Which of this host's features can work at all. No gate beyond a
+    # session: it is a property of the machine, not of any module.
+    ("GET", r"^/api/platform$", api.get_platform, None),
+    # The Dashboard aggregates whatever the account can already read,
+    # so like /api/state it is not gated as a whole — each section is
+    # dropped inside the handler instead. The offenders list is device
+    # data and is gated on Nodes read.
+    ("GET", r"^/api/dashboard$", api.get_dashboard, None),
+    ("GET", r"^/api/dashboard/offenders$", api.get_dashboard_offenders,
+     ("nodes", R)),
+    # Two fields the write paths accept and the read serializers do not
+    # return yet, so the forms that set them can show what is set.
+    ("GET", r"^/api/nodes/devices/(\d+)/upstream$",
+     api.get_nodes_device_upstream, ("nodes", R)),
+    ("GET", r"^/api/alerts/rules/extras$", api.get_alerts_rule_extras,
+     ("alerts", R)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)

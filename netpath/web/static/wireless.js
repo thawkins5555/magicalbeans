@@ -22,8 +22,10 @@
     apSort: { key: 'name', descending: false },
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return 'never';
@@ -148,12 +150,18 @@
   function drawTable() {
     const columns = activeColumns();
     const table = App.grid(App.el('wireless-table'),
-      { name: 'wireless-aps', columns, sort: view.apSort, onSort: onApSort });
+      { name: 'wireless-aps', caption: 'Wireless access points', columns,
+        sort: view.apSort, onSort: onApSort });
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.aps, view.apSort.key, view.apSort.descending, columns);
     App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable' + (view.selected === row.id ? ' selected' : '');
-      tr.onclick = () => { view.selected = row.id; showDetail(row); drawTable(); };
+      tr.onclick = () => {
+        view.selected = row.id;
+        App.setRoute([row.id]);
+        showDetail(row);
+        drawTable();
+      };
     });
     table.appendChild(body);
     App.el('wl-count').textContent = `${rows.length} AP(s)`;
@@ -237,8 +245,10 @@
           <option value="MD5" ${c && c.v3_auth_proto === 'MD5' ? 'selected' : ''}>MD5</option>
           <option value="SHA" ${c && c.v3_auth_proto === 'SHA' ? 'selected' : ''}>SHA</option>
         </select></label>
-        <label>Auth password <input id="wc-v3pass" type="password"
-          placeholder="${c && c.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Auth password <input id="wc-v3pass" type="password"
+              placeholder="${c && c.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SNMPv3 auth password')}
         <p class="hint">authPriv is not supported — only noAuthNoPriv or authNoPriv will
           reach the controller.</p>
       </fieldset>`;
@@ -273,7 +283,7 @@
         }
         const v3user = m.querySelector('#wc-v3user').value.trim();
         const v3proto = m.querySelector('#wc-v3proto').value;
-        const v3pass = m.querySelector('#wc-v3pass').value;
+        const v3pass = (m.querySelector('#wc-v3pass') || {}).value || '';
         if (v3user && v3proto && v3pass) {
           await App.post(`/api/wireless/controllers/${id}/credential`, {
             v3_user: v3user, v3_auth_proto: v3proto, v3_auth_pass: v3pass,
@@ -311,8 +321,8 @@
           <button data-poll="${c.id}">Poll now</button></td>
       </tr>`).join('');
     const box = App.modal('Wireless controllers', `
-      <table class="table-wrap"><thead><tr>
-        <th>Name</th><th>IP</th><th>State</th><th>Last poll</th><th></th>
+      <table class="table-wrap"><caption class="sr-only">Wireless controllers</caption><thead><tr>
+        <th scope="col">Name</th><th scope="col">IP</th><th scope="col">State</th><th scope="col">Last poll</th><th scope="col"></th>
       </tr></thead><tbody>${rows || '<tr><td colspan="5">No controllers configured</td></tr>'}</tbody></table>`,
       [
         { label: 'Close', onClick: App.closeModal },
@@ -460,5 +470,21 @@
     };
   }
 
-  App.pages.wireless = { init, refresh, fastTick: drawStatus };
+  /* #/wireless/<id>: select the row a link names, once refresh() has
+     filled the list it lives in. A row that is not in the current
+     window is simply not selected — these three tables are live
+     tails, and silently widening the window to find one row would
+     change what the operator asked to see. */
+  function activate(opts) {
+    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
+    const id = Number(opts.parts[0]);
+    if (!Number.isFinite(id)) return;
+    const row = (view.aps || []).find((r) => r.id === id);
+    if (!row) return;
+    view.selected = id;
+    showDetail(row);
+    drawTable();
+  }
+
+  App.pages.wireless = { init, refresh, activate, fastTick: drawStatus };
 })();
