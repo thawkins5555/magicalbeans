@@ -25,8 +25,10 @@ import time
 import traceback
 
 from . import mibcatalog, nodeoids, vendorid
-from .eventlog import ERROR, NullLog
-from .ipam_scan import SubnetTooLarge, sweep, usable_addresses
+from .eventlog import ERROR, NODES, NullLog
+from .ipam_scan import (DEFAULT_PROBES_PER_SECOND, SubnetTooLarge,
+                        is_never_scanned, parse_never_scan, sweep,
+                        usable_addresses)
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
 from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request, decode_response
@@ -161,7 +163,29 @@ class DiscoveryJob:
         # ipam_scan.scan_subnet's own shape rather than interleaving. Extra
         # ping passes (per-scan retries) only revisit the addresses that
         # have not answered yet.
-        alive = sweep(addresses, timeout_ms=int(ping_timeout_s * 1000))
+        # Pacing and the deny list, both from settings so a site can be
+        # gentler than the default without a code change. `never_scan_cidrs`
+        # is the list of networks this application must never put a probe
+        # into at all — a plant segment full of PLCs whose stacks predate
+        # the idea of an unsolicited packet.
+        probes_per_second = float(self.settings.get(
+            "discovery_probes_per_second") or DEFAULT_PROBES_PER_SECOND)
+        never_scan = parse_never_scan(self.settings.get("never_scan_cidrs", ""))
+        blocked = [ip for ip in addresses if is_never_scanned(ip, never_scan)]
+        if blocked and len(blocked) == len(addresses):
+            self.db.update_discovery_job(
+                self.job_id, state="error", finished_ts=time.time(),
+                error=f"Every address in {self.target} is inside the "
+                      f"never-scan list, so nothing was probed.")
+            return
+        if blocked:
+            self.log.add(NODES, f"Discovery of {self.target} skipped "
+                                f"{len(blocked)} address(es) on the never-scan "
+                                f"list")
+
+        alive = sweep(addresses, timeout_ms=int(ping_timeout_s * 1000),
+                      probes_per_second=probes_per_second,
+                      never_scan=never_scan)
         for _ in range(ping_retries):
             if self._stop.is_set():
                 break
@@ -169,8 +193,19 @@ class DiscoveryJob:
             if not silent:
                 break
             alive.update({ip: ok for ip, ok in
-                          sweep(silent, timeout_ms=int(ping_timeout_s * 1000)).items()
+                          sweep(silent, timeout_ms=int(ping_timeout_s * 1000),
+                                probes_per_second=probes_per_second,
+                                never_scan=never_scan).items()
                           if ok})
+
+        # The SNMP half is paced too, and by the same figure. A sweep that
+        # walks away from ICMP at 200/s and then fires several community
+        # guesses per responding address as fast as it can is still the
+        # burst this exists to prevent — a PLC that survived the ping is
+        # exactly the device most likely to fall over on the probes.
+        snmp_interval = (1.0 / probes_per_second
+                         if probes_per_second > 0 else 0.0)
+        next_probe = time.monotonic()
 
         probed = responded = identified = 0
         for ip in addresses:
@@ -189,7 +224,18 @@ class DiscoveryJob:
             # answered, or a /24 sweep would spend most of its time
             # probing SNMP against hundreds of genuinely dead addresses.
             result = {"ip": ip, "ping_ok": 1 if ping_ok else 0, "snmp_ok": 0}
-            if ping_ok or self.kind == "device":
+            # An address on the never-scan list is still reported, so a
+            # bounded sweep accounts for every address it was asked about;
+            # it simply never had a packet sent to it. The one log line
+            # above says how many those were.
+            if is_never_scanned(ip, never_scan):
+                pass
+            elif ping_ok or self.kind == "device":
+                if snmp_interval:
+                    delay = next_probe - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                    next_probe = time.monotonic() + snmp_interval
                 identity = self._try_snmp(ip, communities, snmp_timeout_s,
                                           snmp_retries)
                 if identity is not None:

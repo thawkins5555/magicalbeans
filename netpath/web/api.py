@@ -2888,7 +2888,15 @@ def post_nodes_discovery(service, params, body) -> dict:
         raise ValueError(
             "This profile has no v1/v2c communities for discovery to try. "
             "Pick a profile with one, or allow ping-only devices.")
-    overrides = {"discovery_communities": communities}
+    # The never-scan list and the probe rate are global settings the
+    # discovery job cannot see on its own (its settings dict is Nodes'),
+    # so they are carried in with the per-job overrides. They are NOT
+    # settable from the request body — a scan does not get to choose how
+    # gentle it is with a plant segment.
+    overrides = {
+        "discovery_communities": communities,
+        "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
+    }
     # Per-scan timing overrides from the Start-discovery dialog — they
     # live only in this job's settings, never in stored settings.
     for body_key, override_key, cast in (

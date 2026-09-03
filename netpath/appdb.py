@@ -189,6 +189,14 @@ GLOBAL_DEFAULTS = {
     # Global rather than an Alerts setting so it reads as what it is — a
     # policy decision about credentials, not a mail preference.
     "smtp_allow_plain_auth": False,
+    # Networks nothing in this application may ever probe: no ping sweep,
+    # no SNMP guess, nothing. Comma- or space-separated CIDRs; empty means
+    # no exclusions. Global rather than an IPAM or Nodes setting because it
+    # is a fact about the plant, not about a module — the safety of a
+    # segment full of PLCs does not depend on which tab started the scan.
+    # A discovery job whose whole target is inside the list fails saying so
+    # rather than quietly finding nothing.
+    "never_scan_cidrs": "",
 }
 
 # Tables this file took over whole. `settings` is not among them: that table

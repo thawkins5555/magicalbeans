@@ -1032,6 +1032,103 @@ end
           status == 200 and "<redacted>" in payload.get("content", ""),
           str(status))
 
+    # ----------------------------------------------------- D12 probe pacing
+    from netpath import ipam_scan
+
+    # A /24 at 200 probes per second cannot finish faster than ~1.27 s.
+    # The ping itself is replaced so what is being measured is the pacing,
+    # not this machine's ICMP.
+    real_ping = ipam_scan.ping_once
+    ipam_scan.ping_once = lambda ip, timeout_ms=800: False
+    try:
+        slash24 = ipam_scan.usable_addresses("10.88.0.0/24", 4096)
+        started = time.perf_counter()
+        result = ipam_scan.sweep(slash24, probes_per_second=200)
+        elapsed = time.perf_counter() - started
+        check("D12 a /24 sweep at 200/s takes at least 1.2 s",
+              elapsed >= 1.2 and len(result) == len(slash24),
+              f"{elapsed:.2f}s for {len(result)} addresses")
+
+        started = time.perf_counter()
+        ipam_scan.sweep(slash24, probes_per_second=0)
+        unpaced = time.perf_counter() - started
+        check("D12 …and is genuinely the pacing, not the probe",
+              unpaced < 0.5, f"{unpaced:.2f}s unpaced")
+
+        # The never-scan list: those addresses are reported, never probed.
+        probed = []
+        ipam_scan.ping_once = lambda ip, timeout_ms=800: probed.append(ip) or False
+        out = ipam_scan.sweep(["10.88.0.1", "10.99.0.1"],
+                              probes_per_second=0,
+                              never_scan="10.88.0.0/24, 192.0.2.0/24")
+        check("D12 an address on the never-scan list is not probed",
+              probed == ["10.99.0.1"], str(probed))
+        check("D12 …but is still accounted for",
+              out == {"10.88.0.1": False, "10.99.0.1": False}, str(out))
+        check("D12 an unparseable entry is dropped, not raised on",
+              ipam_scan.parse_never_scan("not-a-cidr, 10.0.0.0/8") ,
+              str(ipam_scan.parse_never_scan("not-a-cidr, 10.0.0.0/8")))
+    finally:
+        ipam_scan.ping_once = real_ping
+
+    check("D12 never_scan_cidrs is a stored setting",
+          "never_scan_cidrs" in SERVICE.app_db.settings())
+
+    # /focus is a write.
+    status, _h, payload = req("POST", f"/api/nodes/devices/{device_id}/focus",
+                              {}, cookie=reader)
+    check("D12 a Nodes-read account cannot start fast polling",
+          status == 403, f"{status} {payload}")
+    status, _h, payload = req("POST", f"/api/nodes/devices/{device_id}/focus",
+                              {}, cookie=admin_cookie)
+    check("D12 …while a Nodes-write account still can", status == 200, str(status))
+
+    # mibcatalog.fetch_file: the vendored CA bundle, and a pinned digest.
+    from netpath import mibcatalog, selfupdate as selfupdate_mod
+
+    seen_context = {}
+
+    class _FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self, n=-1):
+            return self._payload[:n] if n >= 0 else self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    real_urlopen = mibcatalog.urllib.request.urlopen
+    MIB_BYTES = b"TEST-MIB DEFINITIONS ::= BEGIN\nEND\n"
+
+    def fake_urlopen(request, timeout=None, context=None):
+        seen_context["context"] = context
+        return _FakeResponse(MIB_BYTES)
+
+    mibcatalog.urllib.request.urlopen = fake_urlopen
+    try:
+        text = mibcatalog.fetch_file("https://example/TEST-MIB", 5, 1 << 20)
+        check("D12 fetch_file uses the vendored CA bundle context",
+              seen_context.get("context") is not None
+              and isinstance(seen_context["context"], ssl.SSLContext)
+              and "BEGIN" in text)
+        good = hashlib.sha256(MIB_BYTES).hexdigest()
+        check("D12 …accepts a file matching its pinned digest",
+              "BEGIN" in mibcatalog.fetch_file("https://example/TEST-MIB", 5,
+                                               1 << 20, sha256=good))
+        try:
+            mibcatalog.fetch_file("https://example/TEST-MIB", 5, 1 << 20,
+                                  sha256="0" * 64)
+            refused = False
+        except mibcatalog.DownloadError:
+            refused = True
+        check("D12 …and refuses one that does not", refused)
+    finally:
+        mibcatalog.urllib.request.urlopen = real_urlopen
+
     return 0
 
 
