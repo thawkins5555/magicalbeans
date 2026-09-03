@@ -23,6 +23,7 @@ import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
+from netpath.alertrules import Occurrence, dedup_key
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
 from netpath.web import Service, WebServer
 
@@ -83,11 +84,17 @@ def login(username, password):
 def raise_alert(rule_key, entity_kind, entity_id, label, message):
     """One alert straight into the store, the way the engine's _apply would
     write it. No engine here on purpose: what is under test is the shape of
-    the row the API returns, not what made it."""
+    the row the API returns, not what made it — but the dedup key is built by
+    the engine's own alertrules.dedup_key, so a row written here is a row the
+    engine would recognise (it is "<key>:<entity_kind>:<entity_id>", not
+    "<key>:<entity_id>")."""
     rule = service.alerts_db.rule_by_key(rule_key)
     assert rule is not None, rule_key
+    occurrence = Occurrence(kind=rule["kind"], source_kind=rule["source_kind"] or "",
+                            entity_kind=entity_kind, entity_id=str(entity_id),
+                            entity_label=label, ts=time.time(), message=message)
     row, _created = service.alerts_db.open_or_increment(
-        rule["id"], f"{rule_key}:{entity_id}", entity_kind, str(entity_id),
+        rule["id"], dedup_key(rule, occurrence), entity_kind, str(entity_id),
         label, rule["severity"], message, "", time.time())
     return row["id"]
 
@@ -137,13 +144,12 @@ try:
     check("an interface alert resolves to the device the port is on",
           rows[iface_alert]["device_id"] == switch,
           rows.get(iface_alert))
-    check("both carry the device's display name",
-          rows[device_alert]["device_name"] == "Access Switch"
-          and rows[iface_alert]["device_name"] == "Access Switch",
-          (rows[device_alert]["device_name"], rows[iface_alert]["device_name"]))
+    check("...and neither carries a device_name the page never reads",
+          "device_name" not in rows[device_alert]
+          and "device_name" not in rows[iface_alert],
+          sorted(rows[device_alert]))
     check("an alert about nothing in Nodes resolves to no device",
-          rows[syslog_alert]["device_id"] is None
-          and rows[syslog_alert]["device_name"] == "",
+          rows[syslog_alert]["device_id"] is None,
           rows.get(syslog_alert))
 
     status, payload = call("GET", f"/api/alerts/{iface_alert}", token=admin)
@@ -229,8 +235,9 @@ try:
 finally:
     server.stop()
     service.shutdown()
-
-shutil.rmtree(TMPDIR, ignore_errors=True)
+    # In the finally, not after it: a crash anywhere above used to leave a
+    # whole temp tree of databases behind on every run.
+    shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

@@ -43,6 +43,32 @@ def dedup_key(rule, occurrence: Occurrence) -> str:
     return f"{rule['key']}:{occurrence.entity_kind}:{occurrence.entity_id}"
 
 
+def device_id_for(entity_kind: str, entity_id) -> int | None:
+    """The Nodes device an alert/occurrence entity is about, or None when it
+    is about nothing in Nodes.
+
+    One rule, in the one module both the engine and the web API already
+    import: a `device` entity's id IS the device id, an `interface` entity's
+    is "<device_id>:<if_index>" and resolves to the switch the port is on --
+    which is why muting a switch silences its ports with it -- and everything
+    structurally outside Nodes (traps from unpolled hosts, syslog from an
+    unknown source, IPAM conflicts, DHCP scopes, wireless APs, NetPath
+    destinations) resolves to nothing and therefore cannot be muted.
+
+    It lived in three places before 4.37.1 (the engine's mute check, the
+    engine's hold/still-true lookup and the API's alert row), which is three
+    chances for a future entity kind to be taught to two of them.
+    """
+    try:
+        if entity_kind == "device":
+            return int(entity_id)
+        if entity_kind == "interface":
+            return int(str(entity_id).split(":")[0])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def match_device(rule, occurrence: Occurrence) -> bool:
     """Empty device_filter matches everything. Otherwise a case-insensitive
     substring match against device_name or device_ip."""

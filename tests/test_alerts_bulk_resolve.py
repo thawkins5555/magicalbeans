@@ -180,8 +180,9 @@ try:
 finally:
     server.stop()
     service.shutdown()
-
-shutil.rmtree(TMPDIR, ignore_errors=True)
+    # In the finally, not after it: a crash anywhere above used to leave a
+    # whole temp tree of databases behind on every run.
+    shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

@@ -1600,13 +1600,27 @@ housekeeping pass so the table does not grow a row per mute ever set.
 silence a device until next year.
 
 **The page is told which device an alert is about.** Since 4.37.0 every
-alert row the API returns carries `device_id` and `device_name`, resolved in
-`api._alert_device_id` by the same rule `_occurrence_device` applies: a
-device alert is its own device, an interface alert (`entity_id` of the form
+alert row the API returns carries `device_id` — and, since 4.37.1, only
+that: `device_name` went with it for a release and the page never once read
+it, since the row already carries the engine's own `entity_label`. The rule
+itself is `alertrules.device_id_for(entity_kind, entity_id)`, one function
+in the dependency-free module both the engine and the API already import,
+where it used to be three copies (`api._alert_device_id`,
+`alertengine._occurrence_device`, `alertengine._muted_alert`): a device
+alert is its own device, an interface alert (`entity_id` of the form
 `<device_id>:<if_index>`) is the switch the port is on, and every other kind
 is null — as is a device that has since been removed from Nodes, so the page
-never offers a mute the API would refuse. The names come from one
-`devices_by_ids` query per page. `alerts.js showDetail` draws the mute area
+never offers a mute the API would refuse.
+
+"Has since been removed" is one `devices_by_ids` query per page, returning
+a **set of ids that still exist**; `_alert_json(row, present_ids)` takes it
+as a required argument, because when it was optional a caller that forgot
+it got every alert on the page silently reported as being about no device —
+the Mute control greyed out everywhere for no visible reason. The set is
+unsorted (it feeds an `IN (...)` list, which has no order to respect), and
+`NodesDatabase.devices_by_ids` chunks it 500 ids to a statement: an alert
+list is up to 2000 rows, and SQLite builds before 3.32 cap a statement at
+999 bind parameters. `alerts.js showDetail` draws the mute area
 from that field alone: enabled (the 1/6/12/24 h picker, or "Muted until … /
 Lift mute" looked up in `view.mutes` by the same id) when it is set and the
 account holds alerts write, otherwise disabled with a `title` and a `.hint`
@@ -1695,20 +1709,45 @@ resolved_ts` over resolved rows whose `resolved_by` is neither `''` nor
 `'engine'`, within `OPERATOR_RESOLVE_WINDOW_S` (seven days), served by
 `ix_alerts_state_resolved (state, resolved_ts, dedup_key)`. A breach whose
 `first_breach_ts` is at or before that timestamp is the run the operator
-already closed and produces no occurrence. A clear observation resets
-`first_breach_ts`, so the next breach is a new run and opens normally.
+already closed and produces no occurrence. All three ask it through one
+helper, `_operator_resolved(rule, occurrence, first_breach_ts)`; it was
+three verbatim copies until 4.37.1, and the DHCP evaluator spent a release
+without the copy at all.
+
+**A run ends on an observed clear, not on the first sample under the
+threshold** (4.37.1). `evaluate_threshold` only reports `clear` below
+`clear_threshold`; the gap up to `threshold` is the hysteresis band, which
+exists precisely because a value wobbling around the limit has not
+recovered. Every evaluator nevertheless reset `first_breach_ts` on `not
+over`, so a CPU that dipped from 99 % to 85 % (`cpu_high` clears at 80) and
+went back up counted as a new run — and the alert an operator had resolved
+came back, the 4.34.0 complaint reached through the band instead of through
+a poll. `first_breach_ts` is now cleared only when the evaluator's own
+`result == "clear"`. The *streak* still resets on any sample under the
+threshold: `for_polls` means consecutive polls over it, which is a different
+question.
+
 Every resolve a person makes goes through the API with a session username,
 so "non-empty and not `engine`" is exactly "resolved by hand" — written
-`COALESCE(resolved_by, '') NOT IN ('', 'engine')`, since a NULL from an
-older build would otherwise make the predicate NULL and drop the row from
-a WHERE clause asked either way round.
+`COALESCE(resolved_by, '') NOT IN ('', 'engine')`. The COALESCE changes
+nothing for that WHERE clause (a NULL `resolved_by` makes the predicate
+NULL, which WHERE discards exactly as it discards false, which is the
+wanted answer); it is written out because the predicate reads as a
+statement about the data rather than as a filter that happens to work, and
+because asking it the other way round — `NOT (...)`, or inside a CASE —
+would otherwise yield NULL where it wanted true. Rows with a NULL
+`resolved_by` do exist: a much older build, or a hand edit in `sqlite3`.
 
 That index leads with `(state, resolved_ts)` because this is a range scan
 over recent resolves. Its predecessor `ix_alerts_dedup_state` led with
 `dedup_key`, the one column the query does not constrain, so SQLite walked
 every resolved alert in the table on every tick. `_migrate` drops the old
 index and creates the new one — an index, never in `SCHEMA`; see the
-storage-layer rule above.
+storage-layer rule above. Nothing else reads resolved rows by dedup key:
+`ux_alerts_active_dedup` is a *partial* index over `open`/`acked` and so
+can never serve them, and the single-key `operator_resolved_ts` that might
+have wanted a second index was deleted in 4.37.1 with no callers ever
+having existed.
 
 **A resolve of a rollup parent covers the children it was hiding**
 (`_parent_operator_resolved`, 4.37.0). A child is suppressed only while its
@@ -1733,11 +1772,33 @@ rejected: that would suppress children forever. This ends by itself, the
 moment the device answers again, and a child still breaching on its own
 account (a device that is up but lossy) opens normally.
 
+**The cover ends when the device answers, not when the resolve gets old**
+(`_parent_covers`, 4.37.1). `_operator_resolves` only reaches back
+`OPERATOR_RESOLVE_WINDOW_S`, so a device hand-resolved and left down was
+covered right up to the moment the resolve fell out of that window — and
+then every still-breaching child opened in a single tick, one row and one
+email per rule per device, seven days after anybody did anything.
+`_parent_covers` is `parent dedup key → when the cover started`: the engine
+records the key the first time it suppresses on the strength of a hand
+resolve, and from then on the key counts as resolved whether or not
+`_operator_resolves` can still see it. The entry is dropped on the tick
+`_still_true` says the device is answering, which is the moment the cover
+was always meant to end. In memory, so a restart forgets it — the same
+tradeoff the threshold gate documents, and a restart re-derives the outage
+alert anyway. The first time a device's cover takes effect the engine
+writes one `NODES` line saying so, so the silence that follows can be
+found from the Nodes page, where the device is visibly down; it is not
+repeated per tick.
+
 It costs no query. The parent's rule comes from `_rules_by_key`, rebuilt
-once per tick from the rule list `_tick` already reads; the hand resolve
-comes from the per-tick `_operator_resolves` cache; and the device read
-behind the condition is memoised per tick in `_parent_conditions`, so N
-children of one dead device ask once.
+once per tick from the rule list `_tick` already reads — `_rollup_parent`
+reads the same snapshot as of 4.37.1, where it used to run a
+`rule_by_key()` query per suppressed occurrence per tick and could see a
+different rule set from the check beside it. (`_rules_by_key` holds only
+*enabled* rules, which is exactly the `enabled` test `_rollup_parent` made
+by hand.) The hand resolve comes from the per-tick `_operator_resolves`
+cache, and the device read behind the condition is memoised per tick in
+`_parent_conditions`, so N children of one dead device ask once.
 
 Two engine paths used to write descriptive strings into `resolved_by` —
 the NetPath sweep for a destination no longer traced, and a child alert
@@ -1759,12 +1820,29 @@ change of state; `auth_fail` was recorded on *every* poll that failed with
 an authentication error, so "SNMP authentication failing" re-opened within
 a poll interval however often it was resolved — the credentials are wrong
 until somebody fixes them, and the poller was reporting that as news each
-minute. It is now recorded when this poll fails on auth and the previous
-one did not (a different auth error counts as a new fact; an identical
-repeat does not). Its clear, `auth_ok`, had never fired at all: it tested
-`previous["snmp_ok"] is False`, and SQLite hands back `1`, `0` or `NULL` —
-never a Python `False`. The test is `== 0`, which `None` correctly fails,
-so a device that has never been polled is not a recovery.
+minute.
+
+The transition is held by the poller, in `NodePoller._auth_failing`
+(a `set[int]` of device ids, mutated under the poller's own `_lock` since
+polls run on a `ThreadPoolExecutor`): **entering the set records
+`auth_fail`, leaving it — SNMP actually working — records `auth_ok`, and
+nothing else records anything.** 4.37.0 derived both from the previous
+poll's `snmp_ok`/`snmp_error` on the device row, which cannot answer
+either question:
+
+- `snmp_ok == 0` last poll and working now is not "the credentials were
+  rejected and are now accepted". A device on a lossy WAN link that times
+  out one poll in ten wrote an `auth_ok` on every recovery, and every one
+  became an engine occurrence against `device_auth_fail`'s CLEARS pair.
+- `_poll_snmp_scalars_with_credential` re-raises the *last* candidate's
+  error, so a profile with several credentials can alternate the recorded
+  error between an auth string and a timeout while nothing about the device
+  changed. "A different auth error is a new fact" then re-recorded
+  `auth_fail` every other poll — the de-duplication defeating itself.
+
+`_auth_failing` is in memory and process-lifetime only, like `_credentials`
+beside it: a restart re-records one `auth_fail` per still-failing device,
+which is one event, not one per poll.
 
 ### Newly added device hold (`alertengine.py`, `alertsdb.py`)
 

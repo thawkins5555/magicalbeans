@@ -499,6 +499,19 @@ class NodePoller:
         # so a device that is simply down does not re-sweep its profile's
         # candidates on every dialog a human opens. See working_config().
         self._credential_probe_failed: dict[int, float] = {}
+        # device_id set: the devices whose SNMP is currently failing on
+        # AUTHENTICATION, as this process has observed it. auth_fail is
+        # recorded on entering the set and auth_ok only on leaving it, which
+        # is what makes both of them transitions. Reading the previous poll's
+        # snmp_ok/snmp_error off the device row could not do that: any failure
+        # recovering looked like an auth recovery (a WAN device that times out
+        # one poll in ten wrote an auth_ok on every recovery), and a
+        # multi-credential profile whose recorded error alternates between an
+        # auth string and a timeout re-recorded auth_fail every other poll.
+        # In memory and process-lifetime only, like _credentials above: a
+        # restart re-records one auth_fail per still-failing device, which is
+        # one event, not one per poll.
+        self._auth_failing: set[int] = set()
         # (device_id, expires_ts, interval_s): the device currently selected
         # in a browser polls at interval_s until expires_ts. Renewed by the
         # frontend every refresh tick while selected, so it self-expires
@@ -983,27 +996,40 @@ class NodePoller:
         # said. Recorded on every failing poll, "SNMP authentication failing"
         # came back within a poll interval however often it was resolved.
         #
-        # The previous poll's state is read from the device row, where SQLite
-        # stores 1, 0 or NULL — never a Python False. `is False` therefore
-        # never matched anything, which is why the auth_ok clear had never
-        # once fired: `== 0` is the comparison this column needs (None == 0
-        # is False, so a device that has never been polled is not a clear).
+        # The transition is held HERE, in _auth_failing, rather than derived
+        # from the device row's previous snmp_ok/snmp_error. That row cannot
+        # answer the question:
+        #
+        # - "SNMP failed last poll and works now" is not "the credentials
+        #   were rejected and are now accepted". A device on a lossy WAN link
+        #   that times out one poll in ten recovered into an auth_ok every
+        #   time, and every one of those became an alert occurrence.
+        # - A profile with several candidate credentials re-raises the LAST
+        #   candidate's error, so the recorded error can alternate between an
+        #   auth string and a timeout while nothing about the device changed.
+        #   Comparing this poll's error text with the last one's then read as
+        #   "a different auth error, a new fact" every other poll — exactly
+        #   the repeat this is supposed to suppress.
+        #
+        # So: entering the set records auth_fail, leaving it (SNMP actually
+        # working) records auth_ok, and everything else — a timeout while
+        # already failing, a second identical auth failure, a different auth
+        # error for the same broken profile — records nothing at all. A
+        # timeout recovery for a device that was never failing on auth is not
+        # an auth recovery and records nothing.
         auth_failing = bool(snmp_ok is False and isinstance(snmp_error, str)
                             and "auth" in snmp_error.lower())
-        keys = previous.keys()
-        previous_snmp_ok = previous["snmp_ok"] if "snmp_ok" in keys else None
-        previous_error = (previous["snmp_error"] or "") if "snmp_error" in keys else ""
-        was_auth_failing = (previous_snmp_ok == 0 and "auth" in previous_error.lower())
-        if auth_failing and not (was_auth_failing and previous_error == snmp_error):
-            # A different auth error than last time is a new fact worth
-            # recording — a second credential failing where the first one
-            # was, say — so only an identical repeat is suppressed.
-            self.db.record_device_event(device_id, "auth_fail", snmp_error)
-        elif snmp_ok and previous_snmp_ok == 0:
-            # SNMP works again after a poll where it did not, whatever the
-            # reason it did not: the credentials are demonstrably good now,
-            # which is exactly what device_auth_fail's CLEARS pair means.
-            self.db.record_device_event(device_id, "auth_ok", "")
+        with self._lock:
+            if auth_failing and device_id not in self._auth_failing:
+                self._auth_failing.add(device_id)
+                auth_event = ("auth_fail", snmp_error)
+            elif snmp_ok and device_id in self._auth_failing:
+                self._auth_failing.discard(device_id)
+                auth_event = ("auth_ok", "")
+            else:
+                auth_event = None
+        if auth_event is not None:
+            self.db.record_device_event(device_id, auth_event[0], auth_event[1])
 
         if uptime_ticks is not None:
             rebooted, note = detect_reboot(

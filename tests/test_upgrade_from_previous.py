@@ -120,13 +120,19 @@ check("...and the migration creates the index the per-tick query needs",
       "ix_alerts_state_resolved" in new_idx, new_idx)
 check("...and drops the one it replaces",
       "ix_alerts_dedup_state" not in new_idx, new_idx)
+# The predicate comes from the database class itself rather than being
+# spelled out again here: a copy would go on passing after the real one
+# changed, which is the one thing this check exists to catch.
 plan = " ".join(str(r[-1]) for r in alerts_db._conn.execute(
     "EXPLAIN QUERY PLAN SELECT dedup_key, MAX(resolved_ts) FROM alerts"
-    " WHERE state = 'resolved' AND COALESCE(resolved_by, '') NOT IN ('', 'engine')"
+    f" WHERE state = 'resolved' AND {AlertsDatabase._OPERATOR_RESOLVE_SQL}"
     " AND resolved_ts >= 0 GROUP BY dedup_key").fetchall())
-check("...and the hand-resolve query is a range scan on it",
-      "ix_alerts_state_resolved" in plan and "SCAN" not in plan.split("USING")[0],
-      plan)
+# The index has to be USED; whether the planner calls that SEARCH or
+# "SCAN ... USING INDEX" (a covering-index scan is a perfectly good plan for
+# this GROUP BY) varies by SQLite build, and asserting one of those spellings
+# made the test a report on the local sqlite3 rather than on the schema.
+check("...and the hand-resolve query is served by it",
+      "ix_alerts_state_resolved" in plan, plan)
 alerts_db.close()
 
 # ------------------------------------------- part 2: the previous release

@@ -389,9 +389,18 @@ engine6._tick()
 for i in range(5):
     seed_trace(netpath6, target6, base6 + 2300 + i * 310, 100.0, reached=False)
     engine6._tick()
-assert len(open_rows(alerts6, unreach_rule["id"], target6)) == 1, \
-    "a fresh outage re-opens the parent itself"
-print("a reached trace plus a fresh outage re-opens the NetPath parent OK")
+reopened6 = open_rows(alerts6, unreach_rule["id"], target6)
+assert len(reopened6) == 1, "a fresh outage re-opens the parent itself"
+assert reopened6[0]["id"] != np_parent_id, \
+    "and it is a new row, not the hand-resolved one coming back"
+# The child is still not an open row, but for the ordinary reason now: there
+# is an open parent above it again, so _rollup_parent suppresses it the way
+# it always did. Worth asserting because "the child is absent" has two
+# possible causes here and only one of them is right.
+assert open_rows(alerts6, unstable_rule["id"], target6) == [], \
+    "the child is suppressed behind the re-opened parent, not left open"
+print("a reached trace plus a fresh outage re-opens the NetPath parent, with "
+      "its child suppressed behind it again OK")
 nodes6.close(); alerts6.close(); netpath6.close()
 
 
@@ -450,6 +459,170 @@ assert len(reopened7) == 1 and reopened7[0]["id"] != scope_alert_id, reopened7
 print(f"a poll under the clear threshold plus a fresh breach re-opens as a "
       f"new row (#{reopened7[0]['id']}) OK")
 nodes7.close(); alerts7.close(); netpath7.close()
+
+
+# ================== 8. the hysteresis band is not a clear, on any evaluator
+# The gap between clear_threshold and threshold exists because a value
+# wobbling around the limit has NOT recovered. Every evaluator nevertheless
+# ended the breach run on the first sample under the *threshold*, so a CPU
+# that dipped from 99 % to 85 % (cpu_high clears at 80) and went back up
+# started a "new run" the operator had never resolved — and the alert they
+# resolved came back, which is the 4.34.0 complaint reached through the band
+# instead of through a poll.
+nodes8, alerts8, netpath8, engine8 = build(suffix="_band")
+did8 = add_device(nodes8, "10.7.7.7", "band-sw")
+engine8._tick()
+cpu_rule8 = alerts8.rule_by_key("cpu_high")
+assert (cpu_rule8["threshold"], cpu_rule8["clear_threshold"]) == (90.0, 80.0), \
+    (cpu_rule8["threshold"], cpu_rule8["clear_threshold"])
+
+base8 = time.time()
+sample(nodes8, did8, "cpu_pct", 99.0, base8)
+engine8._tick()
+sample(nodes8, did8, "cpu_pct", 99.0, base8 + 65)
+engine8._tick()
+band_alert = open_rows(alerts8, cpu_rule8["id"], did8)
+assert len(band_alert) == 1, band_alert
+band_alert_id = band_alert[0]["id"]
+assert alerts8.resolve_many([band_alert_id], "operator") == 1
+print(f"cpu_high opened and was resolved by hand (alert #{band_alert_id}) OK")
+
+# 85 % is in the band: under the threshold, over the clear. Not a recovery.
+sample(nodes8, did8, "cpu_pct", 85.0, base8 + 130)
+engine8._tick()
+sample(nodes8, did8, "cpu_pct", 99.0, base8 + 195)
+engine8._tick()
+sample(nodes8, did8, "cpu_pct", 99.0, base8 + 260)
+engine8._tick()
+assert open_rows(alerts8, cpu_rule8["id"], did8) == [], \
+    "a dip into the hysteresis band is not a clear: the hand-resolved alert " \
+    "must stay resolved"
+assert len(alerts8.alerts(rule_id=cpu_rule8["id"])) == 1, \
+    "and no second row was written for it"
+print("a dip into the hysteresis band and back: still no new row OK")
+
+# An actual clear, though, ends the run — and the breach after it opens.
+sample(nodes8, did8, "cpu_pct", 40.0, base8 + 325)
+engine8._tick()
+sample(nodes8, did8, "cpu_pct", 99.0, base8 + 390)
+engine8._tick()
+sample(nodes8, did8, "cpu_pct", 99.0, base8 + 455)
+engine8._tick()
+band_reopened = open_rows(alerts8, cpu_rule8["id"], did8)
+assert len(band_reopened) == 1 and band_reopened[0]["id"] != band_alert_id, \
+    band_reopened
+print(f"a real clear plus a fresh breach still re-opens as a new row "
+      f"(#{band_reopened[0]['id']}) OK")
+nodes8.close(); alerts8.close(); netpath8.close()
+
+# The same question of the DHCP evaluator, whose band is 75-85 %.
+nodes9, alerts9, netpath9, engine9 = build(suffix="_band_dhcp")
+ipam9 = engine9.ipam_db
+server9 = ipam9.add_dhcp_server("10.20.0.6", "dhcp-b")
+
+
+def dhcp_poll9(used):
+    """One DHCP poll of a 20-address scope: 18 leases is 90 % (over the 85 %
+    threshold), 16 is 80 % (inside the band), 14 is 70 % (a real clear)."""
+    time.sleep(0.01)
+    ipam9.replace_dhcp_scopes(server9, [SCOPE])
+    ipam9.replace_dhcp_leases(server9, [
+        {"scope_id": SCOPE["scope_id"], "ip": f"10.20.1.{10 + i}",
+         "mac": f"00:11:22:33:55:{i:02x}", "address_state": "active"}
+        for i in range(used)])
+
+
+scope_rule9 = alerts9.rule_by_key("dhcp_scope_exhaustion")
+scope_entity9 = f"{server9}:{SCOPE['scope_id']}"
+engine9._tick()
+dhcp_poll9(18)
+engine9._tick()
+scope9 = open_rows(alerts9, scope_rule9["id"], scope_entity9)
+assert len(scope9) == 1, scope9
+assert alerts9.resolve_many([scope9[0]["id"]], "operator") == 1
+dhcp_poll9(16)                # 80 %: in the band, one lease handed back
+engine9._tick()
+dhcp_poll9(18)
+engine9._tick()
+assert open_rows(alerts9, scope_rule9["id"], scope_entity9) == [], \
+    "a scope dipping to 80 % has not recovered; the resolved alert stays shut"
+assert len(alerts9.alerts(rule_id=scope_rule9["id"])) == 1
+print("a DHCP scope dipping into its band and filling again: no new row OK")
+nodes9.close(); alerts9.close(); netpath9.close()
+
+
+# ============ 9. a parent's cover ends when the device answers, not on a clock
+# _operator_resolves only reaches back OPERATOR_RESOLVE_WINDOW_S (seven days),
+# so a device hand-resolved and left down was covered right up to the moment
+# the resolve aged out of that window — and then every still-breaching child
+# opened in one tick, a week later, with no parent beside it. The cover is now
+# remembered by the engine and ends on the device answering.
+nodes10, alerts10, netpath10, engine10 = build(rollup=True, suffix="_cover")
+
+
+class CaptureLog:
+    """Just enough of eventlog to count what the engine wrote."""
+
+    def __init__(self):
+        self.lines = []
+
+    def add(self, category, message, target="", detail=""):
+        self.lines.append((category, message))
+
+
+engine10.log = CaptureLog()
+did10 = add_device(nodes10, "10.11.11.11", "far-sw")
+engine10._tick()
+down_rule10 = alerts10.rule_by_key("device_down")
+loss_rule10 = alerts10.rule_by_key("packet_loss_high")
+
+base10 = time.time()
+down_poll(nodes10, did10, base10)
+nodes10.record_device_event(did10, "down", "not responding")
+engine10._tick()
+down_poll(nodes10, did10, base10 + 70)
+engine10._tick()
+parent10 = open_rows(alerts10, down_rule10["id"], did10)
+assert len(parent10) == 1, parent10
+assert alerts10.resolve_many([parent10[0]["id"]], "operator") == 1
+down_poll(nodes10, did10, base10 + 140)
+engine10._tick()
+assert open_rows(alerts10, loss_rule10["id"], did10) == [], \
+    "the cover takes effect on the first tick after the resolve"
+nodes_lines = [m for c, m in engine10.log.lines if c == "nodes"]
+assert len(nodes_lines) == 1, nodes_lines
+assert "still down" in nodes_lines[0], nodes_lines[0]
+print(f"the cover takes effect and says so once in the Nodes log: "
+      f"{nodes_lines[0][:60]}... OK")
+
+# Now age the resolve out of the window entirely, which is what seven days
+# of the device staying down did. The engine can no longer see the resolve at
+# all — and the children must still be covered, because the device is still
+# not answering.
+import netpath.alertengine as alertengine_module
+alertengine_module.OPERATOR_RESOLVE_WINDOW_S = 0.0
+assert alerts10.operator_resolved_since(time.time()) == {}, \
+    "the resolve really has aged out of the engine's window"
+for i in range(3):
+    down_poll(nodes10, did10, base10 + 210 + i * 70)
+    engine10._tick()
+assert open_rows(alerts10, loss_rule10["id"], did10) == [], \
+    "a device that is still down must stay covered past the resolve window"
+assert len([m for c, m in engine10.log.lines if c == "nodes"]) == 1, \
+    "and the cover is announced once, not once per tick"
+print("the resolve ages out of the window while the device stays down: "
+      "still covered, still silent OK")
+
+# The device answers again, still lossy. That, and only that, ends the cover.
+up_poll(nodes10, did10, base10 + 500, 30.0)
+engine10._tick()
+released10 = open_rows(alerts10, loss_rule10["id"], did10)
+assert len(released10) == 1, \
+    f"a device that answers again releases its children: {released10}"
+print("the device answers again while still lossy: packet loss opens on its "
+      "own account OK")
+alertengine_module.OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
+nodes10.close(); alerts10.close(); netpath10.close()
 
 
 print("\nALL OPERATOR-RESOLVE ASSERTIONS PASSED")
