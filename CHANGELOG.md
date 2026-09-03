@@ -102,7 +102,59 @@ Listed newest first. Version numbers are build order, not dates.
 
 ### 4.37.0 — unreleased
 
-Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`). Entries are grouped by area and added as each change lands; the package version stays 4.36.1 until release.
+Two reviews, implemented. The first is the network-engineer review in
+`REVIEW-NETWORK-ENGINEER.md` — a fortnight of a very large mixed fleet held
+against this product, which found that a good path monitor was not yet a fleet
+monitor. The second is a review of that review, and of the tenth of the code the
+review never opened: the MIB parser, the name resolver, the event log, the IPAM
+scanner, the service console and the SSH terminal that shipped in 4.36.x. The
+worst single defect in the release came out of the second pass, not the first —
+one MIB upload froze the whole appliance for seventeen seconds. Both are
+recorded, finding by finding, in §9 and Appendix C of that report. The package
+version stays 4.36.1 until release.
+
+Most of this is invisible on upgrade: things that were broken start working.
+Nine changes are not, and an operator should read them before updating.
+
+- **Trap and syslog alerts are keyed differently.** A trap alert is now one per
+  source device and a syslog alert one per message signature, where both used to
+  collapse. Alerts already open under the old keys are re-keyed or closed once,
+  on first start; the migration runs one time and says so in the log.
+- **An outage upstream suppresses the outages behind it.** Devices gain an
+  **Upstream device** field. It is blank on upgrade and nothing changes until it
+  is filled in — but once a device points at its upstream, a failure of that
+  upstream produces one `device_down` alert and one email instead of one per
+  device behind it.
+- **`cpu_high`, `mem_high` and `disk_high` start firing on gear that was
+  silent.** The poller now reads health from Cisco, Fortinet, Juniper and
+  HOST-RESOURCES agents, not only from net-snmp. The thresholds are unchanged,
+  so a fleet whose CPUs were always above them and never measured will see the
+  alerts on the first poll after upgrading.
+- **A forged SNMPv3 trap is dropped instead of stored.** A trap whose
+  authentication fails is discarded and counted; before, it was stored and
+  alerted on. If a sender was quietly failing authentication, its traps stop
+  arriving — the counter on the collector strip says how many and why.
+- **Raw samples are kept for three days, not four hundred.** Retention moves to
+  three days of raw samples with a cap of 5,000 rows per metric, and hourly
+  minimum/average/maximum rollups kept for 400 days. This is more history than
+  before, not less: the old whole-table cap of 50,000 rows meant a large fleet
+  held minutes.
+- **Self-update is off until an administrator turns it on.** `updates_enabled`
+  ships off, is administrator-only, and the update path installs a published
+  release tag verified against a published SHA-256 rather than the tip of a
+  branch.
+- **Administering the application is its own capability.** A new `admin` grant
+  covers user accounts, permission changes, password resets, maintenance,
+  self-update and the audit log. Accounts holding **Settings: write** receive it
+  automatically, once, on upgrade — so nobody loses access — but from here it can
+  be granted and taken away on its own.
+- **Stored configuration backups are redacted.** Every capture has its
+  secret-bearing directives replaced before it reaches the database, and reading
+  a backup's text now needs ConfigRX **write**. A device whose backup is only
+  useful with its keys in it can be opted out, per device.
+- **The alert engine ignores a stale reading.** A metric sample older than
+  `threshold_stale_s` (900 seconds) counts as absent rather than as the current
+  value, so a threshold alert cannot be held open by a fortnight-old sample.
 
 #### Foundation
 
@@ -111,23 +163,422 @@ Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`)
 
 #### Alerts
 
-- *(pending — filled from workstream A)*
+- **A site outage is one alert and one email, not one per device behind it.**
+  A device gains an **Upstream device** field on its edit form. When a device is
+  down and something above it in that chain is also down, the outage behind is
+  rolled up under the outage in front — so a failed distribution switch reports
+  the switch, not the forty access points that hang off it. The chain is
+  followed to a depth of eight and a loop in it terminates rather than spinning
+  the engine. Emails the hourly cap drops are now recorded against the alert
+  they belonged to, instead of a line in a debug ring that the poller overwrites
+  within two minutes.
+- **A trap alert names the device that sent it, and there is one per device.**
+  Two hundred `linkDown` traps from two hundred switches used to collapse into a
+  single alert naming nobody; they are now two hundred alerts, each carrying the
+  sending device's name. Syslog alerts are keyed on the message itself — the
+  Cisco `%FACILITY-SEVERITY-MNEMONIC` where there is one — so three different
+  faults from one host are three rows rather than one row overwritten twice.
+  Rule device filters apply to traps and syslog for the first time. Alerts open
+  under the old keys are re-keyed or closed once, on upgrade.
+- **The severity floor applies to traps.** It only ever applied to syslog, which
+  is why fifty informational configuration-save traps could open a severity-2
+  "Critical SNMP trap".
+- **Alerts that describe a moment now close themselves.** "Device recovered",
+  "device rebooted", "interface flapping", a one-off trap, a syslog line — none
+  of these ever had a clearing condition, so they accumulated on the list until
+  somebody clicked Resolve. A rule can now carry an auto-resolve interval,
+  measured from its last occurrence and editable in the rule dialog; the
+  built-ins ship with sensible values (an hour for recoveries, a day for reboots
+  and traps) and "device not responding" keeps its blank, which means never.
+  Resolving an IPAM address conflict now resolves the alert it raised.
+- **Re-notification works.** `renotify_minutes` never fired: an open,
+  unacknowledged alert is now re-notified from a sweep over the open list every
+  tick, including an outage that produces no further events — which is exactly
+  the case the setting exists for.
+- **A dead mail relay no longer freezes alerting.** Email leaves the evaluation
+  thread for a worker with a bounded queue and a circuit breaker that opens
+  after five consecutive failures. Five hundred devices down against a relay
+  that is not answering used to be about two hours of frozen engine. Failed
+  sends consume the hourly quota like successful ones, and a new built-in rule,
+  `smtp_failing`, alerts on the mail path itself — the one failure that
+  previously had no way to tell anybody.
+- **Alerts that are not outages stop arriving titled "is not responding".** Six
+  unrelated rules were bound to the outage email template. They now use a
+  generic notice template, and a rule can be told not to email at all while
+  still opening and tracking alerts: `mib_missing` ships that way, because
+  adding 250 devices to a new installation used to produce 250 emails in the
+  first minute. Two rules are new — an SNMP agent that has stopped answering on
+  a device that still answers ping, and a poll pool that has been saturated for
+  five minutes.
+- **A stale reading is not a breach.** A sample older than `threshold_stale_s`
+  (900 seconds by default) is treated as absent rather than as the current
+  value, so a device that stopped answering cannot hold a CPU alert open forever
+  and re-raise it every five seconds. The tick now reads the metrics it needs in
+  one keyed query rather than one per device, and streak state for a deleted
+  device is dropped with the device.
+- **"Occurred 8640 time(s)" is gone.** A threshold alert's occurrence count now
+  counts the polls that breached, not the engine ticks that noticed.
+- **Alert emails carry a time zone, and a sub-second outage says nothing.**
+  Every timestamp in a notification now ends with its UTC offset, and a recovery
+  from an outage shorter than half a second no longer reports "0 s down" — the
+  exact case the code's own comment said it avoided.
+- **The engine finishes what it starts, and catches up when it falls behind.**
+  A drain used to commit its cursor before applying the batch, so one bad
+  occurrence discarded the rest of it silently. The cursor now advances only
+  after the batch has been applied, each occurrence is guarded on its own, and
+  the trap, syslog and event sources accept a per-tick row budget and report
+  their highest stored id — so a backlog is drained within a tick and is
+  visible, as `backlog` and `apply_errors`, rather than being a queue that
+  quietly never catches up.
+- **Trimming the alert database no longer stalls the engine.** `alerts.db` is
+  opened owner-only and reclaims space in short steps instead of running a
+  whole-file `VACUUM` under the lock.
 
 #### Poller and storage
 
-- *(pending — filled from workstream B)*
+- **CPU, memory, disk, temperature and firewall session counts are read from
+  real gear.** Health came from UCD-SNMP alone, which meant a fleet of switches
+  and firewalls had no health at all; Cisco, Fortinet, Juniper and
+  HOST-RESOURCES agents are now read as well, so `cpu_high`, `mem_high` and
+  `disk_high` work outside net-snmp. Each device's other IP addresses are
+  learned from its address table at the same time.
+- **Interfaces on SNMPv1 gear are no longer blank.** A v1 agent answers one
+  error for a mixed request, so every port on every v1 device showed nothing at
+  all while the device itself showed up. The read is now split for v1, has a
+  wall-clock budget so a device that goes quiet mid-walk cannot hold a poll
+  worker for over an hour, and a partial read no longer deletes the ports it
+  never reached along with their event history. Utilisation, error and discard
+  rates are recorded per port and as a device-level worst case — which makes six
+  shipped alert rules able to fire for the first time.
+- **History survives.** The raw-sample cap was applied to the whole table, so
+  every fifteen minutes a large fleet's entire metric history was trimmed to
+  50,000 rows — under a third of one poll cycle at 2,000 devices, which is why
+  charts were empty and threshold streaks reset. The cap is now per metric
+  (5,000 rows), applied in chunks that release the database lock. Hourly
+  rollups are filled for the first time — they had no caller at all, so any
+  chart window wider than the raw one drew nothing — and no longer delete the
+  raw samples a short chart reads. Raw samples are kept for three days by
+  default and the rollups for 400.
+- **SNMPv3 devices stop failing every few polls.** Engine time was cached at
+  discovery and never advanced, so a v3 device drifted out of its own time
+  window and returned a spurious authentication failure about every third poll.
+  It now advances with the clock, a device that restarts is resynchronised
+  inside the same poll, and a v3 refusal names its cause instead of being
+  reported as "engine resync required" whatever it was.
+- **A reply is only an answer when it matches the request.** Datagrams from
+  another address, or carrying a request id that was not sent, are dropped —
+  a late answer to a previous attempt used to be stored as the answer to the
+  current one.
+- **A device that reboots between polls no longer invents a traffic spike.**
+  That poll's rates are dropped and its counters kept as the new baseline,
+  instead of a counter reset being read as a wrap.
+- **One poll writes four transactions instead of one per sample.** A 24-port
+  device took about a hundred commits and a 500-port chassis about 2,500; both
+  now take four. Batched writing sustains roughly 69 times the row rate of the
+  one-row-per-commit path on a large table.
+- **The scheduler reads six columns per device, not the whole fleet.** It used
+  to reload the entire device table and re-derive every device's configuration
+  once a second — around 4,000 statements a second at 2,000 devices, under the
+  lock every worker needs — and a single transient database error stopped all
+  polling permanently and silently. The pass now rebuilds only when something
+  has actually changed, and a failure in it is reported and retried.
+- **Walks use GETBULK, and the pool reports itself honestly.** OID-browser,
+  full-device and vendor-identification walks run over one socket with GETBULK;
+  a device that is down stops re-trying every stored credential on every poll;
+  forwarding-table walks have a pool of their own so they cannot crowd out
+  polling; and the poller reports busy and queued workers separately, raising
+  an alert when the pool has been saturated for five minutes.
+- **Devices on IPv6 addresses can be polled, discovered and traced**, and IPv6
+  subnets can be swept within the usual address limit.
+- **A switch whose SNMP agent has died no longer sits green.** A device that
+  answers ping while its agent does not now records an `snmp_error` event and
+  raises an alert.
+- **Reclaiming space in the Nodes database no longer stalls the process**, and
+  the file is readable only by its owner. The schema gains interface discard
+  counters, a counter-discontinuity timestamp and a table of the other
+  addresses a device answers on — all added in place, so an existing database
+  upgrades without a rebuild.
 
 #### Collectors
 
-- *(pending — filled from workstream C)*
+- **One malformed datagram can no longer kill a collector.** A single 18-byte
+  packet stopped the NetFlow listener outright, and the status line then read
+  "Collector stopped" as though an operator had done it. All three receive loops
+  now survive packet content, and a collector that does stop unexpectedly says
+  which it was.
+- **A forged SNMPv3 trap is discarded, not stored.** Trap authentication was
+  computed, counted and then ignored: 401 forged traps were stored and alerted
+  on. Failures are now dropped and counted (`reject_failed_auth`, on by
+  default), and traps from a v3 user nobody has configured are counted
+  separately as unverified.
+- **Datagrams the kernel drops are counted and shown.** 300,000 syslog messages
+  arriving at 38,000 a second stored 93,000 and lost 206,000 with every counter
+  reading zero. All three collectors now report `kernel_dropped` on Linux, with
+  a warning when the system's receive-buffer ceiling is what clamped the socket.
+- **NetFlow decoding survives what exporters actually send.** A template with
+  zero-length fields spun a core at 100% behind a green light and is now
+  refused; a v9 field of length 65535 is fixed rather than variable; a
+  dual-stack record decodes as IPv6 instead of `0.0.0.0`; and every cache keyed
+  on data an exporter chooses is bounded.
+- **Syslog handles the messages a real network sends.** Every RFC 5424
+  structured-data element is stripped rather than only the first, an empty
+  message body parses, a device timestamp far from now falls back to arrival
+  time instead of filing six months ahead where nothing can prune it, a priority
+  above 191 is treated as text, RFC 6587 framing is validated so a line
+  beginning with a number cannot desynchronise a TCP connection, client threads
+  are capped and reaped, each source has a rate limit, and a line repeated by a
+  device in a loop is collapsed into one row with a count.
+- **Syslog and traps from a loopback or management-VRF address name their
+  device.** Correlation was exact-IP equality, so a switch logging from
+  `Loopback0` while polled on its management VLAN matched nothing at all: no
+  name in the Host column, no name on the alert.
+- **Pruning and trimming stop holding the write lock.** Deleting one syslog row
+  from a table of 60,000 rebuilt the entire search index — 807 ms, every fifteen
+  minutes — and is now 1.0 ms. Trimming a database under its size cap deletes in
+  adaptive batches and reclaims in slices rather than running `VACUUM` up to six
+  times inside the lock: on a 75 MB trap database the worst lock hold falls from
+  4.1 s to 81 ms, and the file actually reaches its target. Five databases now
+  reclaim incrementally.
+- **NetPath probes within a real budget.** Hop probing is bounded and written
+  one round per transaction instead of a new unbounded round of subprocesses
+  every four seconds; the traceroute budget matches the parallelism the platform
+  actually uses (27 s where it assumed 195 s on Linux); a refused hop is
+  recognised by shape rather than by an English phrase table, so a non-English
+  Windows host no longer loses the hop entirely; an anycast or round-robin
+  target is no longer recorded as never reached; and all three collectors bind
+  dual-stack.
+- **Exporters keep their own NetFlow version and sampling rate.** A flush used
+  to stamp every exporter in the batch with the first flow's version and commit
+  once per exporter; it now records each exporter's own version in one commit.
+  Sampling is kept per sampler rather than one rate per exporter, and a rate
+  announced late corrects the flows it applies to instead of leaving them
+  under-scaled forever.
+- **BGP traps read correctly.** The peer address and the peer state were
+  transposed in the OID table, so a live `bgpBackwardTransition` rendered as
+  `bgpPeerState.198.51.100.75=198.51.100.75`. The state is now rendered by name,
+  and a trap truncated at the varbind cap is counted and shown as truncated
+  rather than silently shortened.
 
 #### Security
 
-- *(pending — filled from workstream D)*
+- **The forced password change is enforced by the server.** It was enforced only
+  by the bundled interface, so anything talking to the API signed in as
+  `admin`/`admin` and had the whole install. A session whose account still
+  carries the flag may now reach only sign-in, sign-out, state, heartbeat and
+  the password change itself.
+- **Administering the application is its own capability.** **Settings: write**
+  was undeclared root — it granted itself every module, reset any password and
+  triggered a self-update. A new `admin` grant now covers user accounts,
+  permission changes, password resets, maintenance, self-update and the audit
+  log; nobody can edit their own grants, and the last administrator cannot be
+  reduced. Accounts holding **Settings: write** receive `admin` once, on
+  upgrade.
+- **Self-update installs a published release, or nothing.** It used to execute
+  unsigned code from the tip of a mutable branch, with no signature, no hash, no
+  tag pin and no way to turn it off: push access to the repository was code
+  execution on every host holding the plant's credentials. It now installs a
+  published tag verified against a published SHA-256, is off by default
+  (`updates_enabled`, administrator-only), caps the download at 64 MiB, discards
+  the archive's mode bits and quiesces every worker before the swap. `RELEASE.md`
+  documents how a release is published.
+- **A stored configuration backup does not carry the device's secrets.** Every
+  capture passes a redaction pass — Cisco IOS/NX-OS and FortiOS directives —
+  before it reaches the database, the row records whether it was redacted, and
+  downloading a backup's text needs ConfigRX **write** rather than read. A
+  device whose backup is only useful with its key material intact can be opted
+  out of redaction on its own.
+- **A settings scope is authorized against the code that actually handles it.**
+  A scope with no handler fell through to the global writer, so `debug: write`
+  could set the bind address, the TLS paths, the session lifetimes and the DNS
+  servers, and read them all back. Both settings endpoints now hide those from
+  accounts without Settings read.
+- **A stored credential is only ever offered to the host it was stored for.**
+  The SMTP test used to send the saved password in cleartext to any host and
+  port named in the request body; it now refuses the stored password when the
+  body moves the destination, and never sends one over an unprotected transport
+  unless `smtp_allow_plain_auth` says so. Changing a DHCP server's address or a
+  controller's IP clears the credential that belonged to the old one.
+- **Guessing a password at the sign-in endpoint is materially harder.** The
+  dummy hash used for an unknown username ran at a quarter of the real cost —
+  a nine-fold timing oracle that told an attacker which usernames exist —
+  and the throttle was a delay that diluted under concurrency. Verification now
+  runs under a semaphore with the live parameters, twenty failures in fifteen
+  minutes lock out a username or an address, and the failure table is bounded.
+- **State-changing requests must come from this application's own pages.**
+  `POST`, `PUT` and `DELETE` refuse a cross-site `Origin` or `Sec-Fetch-Site`;
+  an origin is now compared as a scheme as well as a host and a port, so
+  `https://host:port` is no longer accepted by a plain-HTTP listener. The
+  Content-Security-Policy gains `base-uri` and `form-action`, HSTS is sent under
+  TLS, a chunked body is refused with 411 rather than read as empty, the body
+  cap is 16 MiB, the handler has a socket timeout, and the `Server` header is
+  gone.
+- **There is an audit trail that survives a restart and nobody can flush.** The
+  only record of who did what was a 3,000-entry ring in memory that a `debug:
+  write` account could empty. An append-only log now covers sign-ins and
+  failures, account and permission changes, settings changes (the keys, never
+  the values), every credential store and clear, every maintenance action with
+  its row count, and self-update. Destructive maintenance additionally requires
+  an explicit confirmation, rather than "prune" quietly meaning "delete
+  everything, including every configuration backup".
+- **The data folder and the files holding secrets are owner-only.** Databases
+  were created world-readable in a world-readable directory. The folder is now
+  0700 and every database and its write-ahead companions 0600 on POSIX hosts.
+  `allow_legacy_ssh` defaults off.
+- **A community string is shown only to callers who could change it anyway.**
+  It used to be returned in full to any account with Nodes **read**; a read-only
+  caller now gets `has_community` instead of the string.
+- **Discovery probes at a rate, and never into a segment marked off.** Sweeps
+  were 64 parallel pings followed by unpaced SNMP probes, with no way to exclude
+  the fragile equipment that a scan can upset. There is now a probe rate and a
+  `never_scan_cidrs` list, honoured by device discovery and by IPAM's own subnet
+  scans. The high-frequency `/focus` endpoint moves to Nodes **write**, and the
+  MIB catalog fetch uses the vendored CA bundle and verifies a per-file SHA-256
+  where one is published.
+- **The access log's client table is bounded** at 1,000 addresses, instead of
+  growing one entry per source address forever.
+- **Nothing in the product tells operators there is no authentication.** Three
+  shipped strings still said so — in the headless banner, in the server's own
+  docstring, and under the service console's listener card, repainted every
+  second — four years after sign-in shipped. The test suite fails if any of them
+  returns.
 
 #### Web UI
 
-- *(pending — filled from workstream E)*
+- **The Dashboard is a screen a shift can start on.** It has been a
+  385-byte placeholder while being the page every sign-in lands on. It now shows
+  fleet health, open alerts by severity coloured by the worst one open, the
+  three collectors with their drop and throttle counters, each database against
+  its size cap, the poll pool, and six "worst ten in the last 24 hours" lists.
+  Every count is a link into the tab that can act on it, and a section the
+  signed-in account cannot read is left out rather than drawn as a zero.
+- **Every selection has a URL.** Back walks the tabs, a reload lands where you
+  were, and a link pasted into a ticket opens the device, port, alert, path or
+  backup it names.
+- **A server that stops answering says so in words.** "Failed to fetch" in 11 px
+  grey, with two thousand stale rows still on screen looking live, is replaced
+  by a plain sentence naming the time of the last update; after two missed
+  cycles the stale content is dimmed behind a banner, and a "reconnected" flash
+  says when it came back. Every request has a 30-second deadline, and a hidden
+  tab stops polling entirely instead of refreshing forever.
+- **The alert list says what it is not showing.** "300 shown" with no total
+  becomes "300 of 532 shown", and the select-all tick is renamed "Select the 300
+  shown" when the list is truncated — so acknowledging a selection can no longer
+  silently miss what the server never sent.
+- **Screen readers can use the interface.** Every data table names its columns,
+  announces its sort order, can be sorted from the keyboard and carries a
+  caption naming its panel. Dialogs are real dialogs — role, modal state, a
+  title that labels them, Tab kept inside the box, and focus returned to the
+  control that opened them. The connection indicator, the idle banner and the
+  bulk-action result are announced when they change.
+- **Nothing depends on colour alone, and the small grey text is readable.** Hint
+  text — which renders every device's IP address — and the severity-7 label move
+  from 2.50:1 contrast to a colour that meets WCAG AA. Every status on the
+  availability timeline and the NetPath lane carries a texture as well as a
+  colour, and each segment is reachable from the keyboard and announces its
+  state and its window.
+- **The tab bar scrolls instead of losing its tail.** Below about 1,400 pixels
+  the right-hand tabs, Account and Sign out were simply unreachable.
+- **A favicon, an alert count in the tab title, and an optional desktop
+  notification** for a new severity 1 or 2 alert, off until it is turned on.
+  Every page load used to 404 on the favicon.
+- **A host that cannot store credentials says so instead of showing a form.**
+  On a non-Windows host the password fields are replaced by one sentence, and
+  IPAM's DHCP subtab explains what it needs rather than rendering a form that
+  could never work.
+- **The keyboard shortcuts the documentation promised now exist.** The NetFlow
+  chart's zoom and pan shortcuts have been documented for several releases and
+  were never implemented; they are joined by 1–9 to switch tab and `/` to focus
+  search. A read-only account no longer gets a 403 every time it opens Settings,
+  and a slow response arriving after another dialog has opened can no longer
+  paint into it.
+- **The new fields are on the forms that need them.** The device form gains
+  **Upstream device**, the rule editor gains auto-resolve and a per-rule email
+  switch, the collector strips render their new drop, backlog, bad-auth and
+  throttle counters, and Nodes settings gains the hourly-rollup retention input.
+- **Under the hood.** The HTML escape helper had been copied into twelve files
+  and omitted the single quote in every copy; there is now one implementation
+  covering both quote characters. The Debug event table appends rows instead of
+  rebuilding two thousand of them on every poll and every keystroke, and its
+  search is debounced. 46 browser checks in `tests/ui/walk.mjs` cover the
+  accessibility, dialog, routing, dashboard, offline and read-only behaviour
+  above, and fail rather than record.
+
+#### MIB parsing and housekeeping
+
+- **Importing a MIB no longer freezes the appliance.** The parser walked each
+  file from every candidate starting position, so a truncated or hand-edited
+  module cost time quadratic in its size with the interpreter lock held: 66
+  seconds for a 64 KB `IMPORTS` list with no `FROM`, 220 seconds for 1 MB of
+  macro headers — every poll, every collector write and every open browser
+  stopped for the duration, on an upload any account with Nodes write could
+  make. Every pass is now linear, a parse budget caps anything that still runs
+  long, and the same 1 MB inputs take under 0.6 seconds. The upload ceiling
+  drops from 8 MB to 1 MB, which is still two orders of magnitude above a real
+  module.
+- **Resolving a MIB follows the dependency chain instead of re-sweeping it.** A
+  10,000-object file went from 5.9 seconds to 0.08; a 20,000-object one from 26
+  seconds to 1.3. Uploads also use a fraction of the memory and time before any
+  pattern is matched — an 8 MB file went from 3.6 seconds and 72 MB to 0.19
+  seconds — and a file the parser cannot read now says so on its own row instead
+  of being skipped silently on every re-resolve.
+- **A module that defines only textual conventions reports success**, rather
+  than "nothing was recognized in this file" for a file that was recognised
+  perfectly well and simply contains no objects.
+- **One vendor, one row in the Nodes filter.** HPE's five enterprise arcs,
+  Dell's three, F5's and Brocade's two shared no canonical key, so one
+  manufacturer's fleet was split across several rows. Rockwell Automation /
+  Allen-Bradley gear is identified for the first time, and a Stratix switch says
+  so in its evidence while still being polled as the Cisco platform underneath.
+  The claim behind `confidence: high` is now stated accurately: both tiers are
+  hand-authored from IANA's public registry, and high means cross-checked
+  against a real device's sysObjectID or a bundled MIB.
+- **Reverse DNS stops changing a process-wide setting.** The resolver set the
+  default socket timeout for the whole process from eight threads, and left it
+  set — a hidden three-second deadline every other socket inherited, which
+  showed up as SSH backups failing on slow links. The direct PTR/TXT resolver
+  now accepts answers only from the server it asked, uses unpredictable query
+  ids and bounds the whole exchange.
+- **IPAM stops scanning every subnet at once.** Every enabled subnet started its
+  first scan on the same tick, each with 64 concurrent pings — up to 3,200 on a
+  50-subnet install. First scans are spread across five minutes and at most four
+  run at a time.
+- **The Debug page and the service console draw bounded lists.** The event log
+  remembered every target it had ever seen and `Clear` did not clear them; it is
+  now bounded in both collections, cached rather than re-sorted on every poll,
+  and emptied by Clear. The console draws the 200 most recently seen clients and
+  repaints only on change. The availability timeline clamps its own window and
+  block count, so a hand-made request cannot ask the server to allocate millions
+  of objects.
+- **The port-name table loses eleven duplicate keys and three editorial
+  labels** — 4444 is no longer "Metasploit".
+
+#### SSH terminal
+
+- **An idle terminal no longer burns a CPU core.** The socket waits on a call
+  with no descriptor ceiling, so a terminal opened on a busy appliance — where
+  the descriptor number is above 1,024 — waits instead of spinning.
+- **Refused logins are counted per account and device, not per window.** The cap
+  was per socket, so the page was still a password oracle: close the window,
+  open it again, five more guesses. Five refusals now end the session and the
+  next attempt is refused for five minutes without the device being contacted at
+  all. A successful login clears the count.
+- **A window that never finished opening gives its place back.** A socket that
+  never sent its first message held a session slot, a thread and its
+  authorisation indefinitely; it is now released after fifteen seconds, and
+  signing out closes open terminals — so a slept laptop can no longer lock an
+  account out of its own terminals.
+- **Stopping the service stops terminals together.** Sessions are ended
+  concurrently inside a three-second budget rather than one at a time, where
+  sixteen sessions against browsers that had stopped reading could take minutes.
+  The per-session watchdog — the only thing enforcing the idle timeout, the
+  sign-out check and the permission check — now survives a failed tick instead
+  of dying silently and leaving the shell it was watching unlimited.
+- **Opening a terminal records that the device presented its remembered host
+  key**, so ConfigRX's "last seen" is the truth rather than the moment the key
+  was first stored. The idle timeout counts keystrokes again, so a window that
+  only reports its size no longer holds a shell open indefinitely.
+- **Reserved WebSocket frame types fail the connection**, as RFC 6455 requires,
+  rather than being reassembled as terminal data.
 
 #### Documentation
 
