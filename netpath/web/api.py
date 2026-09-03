@@ -74,6 +74,26 @@ _STATE_MODULE_KEYS = {
     "settings": ("storage",),
 }
 
+# Global settings only a Settings reader may see. "settings" itself stays in
+# every response — every module's own refresh cadence lives in it and every
+# tab needs those — but these keys are server internals with no reason to
+# reach an account without Settings access: where the listener binds and
+# which TLS material it loads, how long a sign-in lasts, and which resolver
+# the nslookup subprocesses are pointed at.
+SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
+                      "session_idle_minutes", "session_max_hours",
+                      "dns_server", "asn_server")
+
+
+def _visible_settings(settings: dict, granted: dict) -> dict:
+    """`settings` as this caller may see it. One rule, used by both the
+    endpoint that reads the settings and the one that writes them — they
+    disagreed before, and post_settings echoing the unfiltered dict was
+    half of the escalation the review found."""
+    if _permissions.allows(granted.get("settings"), _permissions.READ):
+        return settings
+    return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
+
 
 def get_state(service, params, body) -> dict:
     from .. import __version__
@@ -204,18 +224,11 @@ def get_state(service, params, body) -> dict:
         if not _permissions.allows(granted.get(module), _permissions.READ):
             for key in keys:
                 result.pop(key, None)
-    if not _permissions.allows(granted.get("settings"), _permissions.READ):
-        # "settings" itself stays present even without Settings access —
-        # every module's own refresh cadence (nodes_refresh_s and so on)
-        # and cross-cutting config (DNS/ASN) live in it, and every tab
-        # needs to read those regardless of its own module's grant. Only
-        # the web-listener detail (bind address, port, and — in
-        # particular — the TLS cert/key file paths) is Settings-specific
-        # server internals with no reason to reach a user without
-        # Settings access, so it alone is stripped out here rather than
-        # the whole key.
-        result["settings"] = {k: v for k, v in result["settings"].items()
-                              if k not in ("web_host", "web_port", "web_cert", "web_key")}
+    # "settings" itself stays present even without Settings access — every
+    # module's own refresh cadence (nodes_refresh_s and so on) lives in it,
+    # and every tab needs to read those regardless of its own module's
+    # grant. Only the keys in SETTINGS_ONLY_KEYS are stripped.
+    result["settings"] = _visible_settings(result["settings"], granted)
     return result
 
 
@@ -884,28 +897,40 @@ def post_debug_clear(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- settings
 
+# Which module owns each settings scope, and what POST /api/settings does
+# with it: {scope: (Service method name, response key)}. The route table
+# derives the permission from THIS table (server._settings_requirement)
+# rather than from permissions.MODULES — a module in MODULES with no entry
+# here (`debug` was one) used to be authorized against itself and then fall
+# through to the global writer, which is how a debug:write account rewrote
+# the listener's bind address, TLS paths and the DNS server. Anything not
+# named here is the Settings module's, by construction.
+SETTINGS_SCOPES = {
+    "netpath": ("apply_netpath_settings", "settings"),
+    "netflow": ("apply_netflow_settings", "flow_settings"),
+    "syslog": ("apply_syslog_settings", "syslog_settings"),
+    "snmp": ("apply_snmp_settings", "snmp_settings"),
+    "ipam": ("apply_ipam_settings", "ipam_settings"),
+    "nodes": ("apply_nodes_settings", "nodes_settings"),
+    "alerts": ("apply_alerts_settings", "alerts_settings"),
+    "wireless": ("apply_wireless_settings", "wireless_settings"),
+    "configrx": ("apply_configrx_settings", "configrx_settings"),
+}
+
+
 def post_settings(service, params, body) -> dict:
     scope = str(body.get("scope", "global"))
     values = body.get("values") or {}
-    if scope == "netpath":
-        return {"settings": service.apply_netpath_settings(values)}
-    if scope == "netflow":
-        return {"flow_settings": service.apply_netflow_settings(values)}
-    if scope == "syslog":
-        return {"syslog_settings": service.apply_syslog_settings(values)}
-    if scope == "snmp":
-        return {"snmp_settings": service.apply_snmp_settings(values)}
-    if scope == "ipam":
-        return {"ipam_settings": service.apply_ipam_settings(values)}
-    if scope == "nodes":
-        return {"nodes_settings": service.apply_nodes_settings(values)}
-    if scope == "alerts":
-        return {"alerts_settings": service.apply_alerts_settings(values)}
-    if scope == "wireless":
-        return {"wireless_settings": service.apply_wireless_settings(values)}
-    if scope == "configrx":
-        return {"configrx_settings": service.apply_configrx_settings(values)}
-    return {"settings": service.apply_global_settings(values)}
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    entry = SETTINGS_SCOPES.get(scope)
+    if entry is None:
+        applied = service.apply_global_settings(values)
+        return {"settings": _visible_settings(applied, granted)}
+    method, key = entry
+    applied = getattr(service, method)(values)
+    # NetPath's apply returns the merged settings dict, which carries the
+    # global keys too; every other scope returns only its own module's.
+    return {key: _visible_settings(applied, granted) if key == "settings" else applied}
 
 
 def post_update(service, params, body) -> dict:

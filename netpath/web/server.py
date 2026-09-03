@@ -48,11 +48,20 @@ def _password_requirement(params, body):
 
 def _settings_requirement(params, body):
     """post_settings is one generic dispatcher for every module's own
-    settings (body['scope']); the module that gates it is whichever one
-    the scope names, not a fixed tag — 'global' (or anything unrecognized)
-    falls to the Settings module itself."""
+    settings (body['scope']); the module that gates it is whichever one the
+    scope names, not a fixed tag — 'global' (or anything unrecognized)
+    falls to the Settings module itself.
+
+    Derived from post_settings' own dispatch table, not from
+    permissions.MODULES: a module listed there with no branch in
+    post_settings was authorized against itself and then fell through to
+    the global writer. `debug` was exactly that, so a debug:write account
+    could rewrite the listener's bind address, port, TLS certificate and
+    key paths, the DNS server the nslookup subprocesses use, and the
+    session lifetimes. Reading the requirement from the table that decides
+    what actually happens keeps the two from drifting apart again."""
     scope = str(body.get("scope", "global"))
-    module = scope if scope in permissions.MODULES else "settings"
+    module = scope if scope in api.SETTINGS_SCOPES else "settings"
     return (module, W)
 
 

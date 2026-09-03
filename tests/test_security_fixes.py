@@ -149,6 +149,69 @@ def main() -> int:
     check("D1 after the change the API opens up",
           status == 200 and req("GET", "/api/users", cookie=admin_cookie)[0] == 200)
 
+    # ---------------------------------------------------- D2 settings scope
+    def make_user(username, grants, password="Corr3ct-Horse-Battery"):
+        """An account with exactly these grants, ready to use (the
+        must_change flag D1 sets on every new account is cleared here the
+        way an operator's first sign-in would clear it)."""
+        status, _h, payload = req("POST", "/api/users",
+                                  {"username": username, "password": password,
+                                   "grants": grants}, cookie=admin_cookie)
+        assert status == 200, (username, status, payload)
+        row = SERVICE.app_db.user(username)
+        SERVICE.app_db.set_password(username, row["password"], must_change=False)
+        cookie, status, _p = login(username, password)
+        assert status == 200, (username, status)
+        return cookie
+
+    debug_cookie = make_user("debugonly", {"debug": "write"})
+
+    status, _h, payload = req("POST", "/api/settings",
+                              {"scope": "debug",
+                               "values": {"web_port": 31337, "dns_server": "10.6.6.6",
+                                          "session_idle_minutes": 1}},
+                              cookie=debug_cookie)
+    check("D2 an unlisted scope needs Settings write", status == 403, f"{status} {payload}")
+    check("D2 …and nothing was applied",
+          SERVICE.settings.get("web_port") != 31337
+          and SERVICE.settings.get("dns_server") != "10.6.6.6",
+          str(SERVICE.settings.get("web_port")))
+
+    status, _h, payload = req("POST", "/api/settings",
+                              {"scope": "netpath", "values": {"web_cert": "/tmp/evil.pem"}},
+                              cookie=debug_cookie)
+    check("D2 a netpath scope still needs netpath write", status == 403, str(status))
+
+    netpath_cookie = make_user("netpathonly", {"netpath": "write"})
+    status, _h, payload = req("POST", "/api/settings",
+                              {"scope": "netpath",
+                               "values": {"trace_workers": 4, "web_cert": "/tmp/evil.pem",
+                                          "session_idle_minutes": 1}},
+                              cookie=netpath_cookie)
+    check("D2 a netpath scope write is accepted", status == 200, f"{status} {payload}")
+    check("D2 …but does not carry global keys into the shared settings",
+          SERVICE.settings.get("web_cert") != "/tmp/evil.pem"
+          and SERVICE.settings.get("session_idle_minutes") != 1,
+          f"{SERVICE.settings.get('web_cert')!r} "
+          f"{SERVICE.settings.get('session_idle_minutes')!r}")
+    check("D2 …and the response hides the Settings-only keys",
+          isinstance(payload, dict)
+          and not (set(payload.get("settings", {}))
+                   & {"web_cert", "web_key", "web_host", "web_port",
+                      "session_idle_minutes", "dns_server", "asn_server"}),
+          str(sorted(payload.get("settings", {}))[:12]))
+
+    status, _h, payload = req("GET", "/api/state", cookie=netpath_cookie)
+    check("D2 /api/state hides them too",
+          status == 200 and not (set(payload.get("settings", {}))
+                                 & {"web_cert", "session_idle_minutes", "dns_server"}),
+          str(status))
+
+    status, _h, payload = req("GET", "/api/state", cookie=admin_cookie)
+    check("D2 a Settings reader still sees them",
+          "web_cert" in payload.get("settings", {})
+          and "session_idle_minutes" in payload.get("settings", {}))
+
     return 0
 
 

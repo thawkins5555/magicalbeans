@@ -271,7 +271,14 @@ class Service:
         return self.settings
 
     def apply_netpath_settings(self, values: dict) -> dict:
-        self.settings.update(values)
+        # Only the keys netpath.db actually owns. self.settings is one dict
+        # holding both the global and the NetPath keys, so an unfiltered
+        # update() let a netpath:write account inject web_host, web_cert or
+        # session_idle_minutes into the live settings every other part of
+        # the app reads — persisted or not, save_settings only writes the
+        # NetPath subset, so the injected values simply sat there.
+        from ..db import APP_DEFAULTS as NETPATH_KEYS
+        self.settings.update({k: v for k, v in values.items() if k in NETPATH_KEYS})
         self.db.save_settings(self.settings)
         self.monitor.set_workers(int(self.settings["trace_workers"]))
         self.log.add(SYSTEM, "NetPath settings applied")
