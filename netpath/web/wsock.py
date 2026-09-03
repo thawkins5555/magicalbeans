@@ -19,7 +19,9 @@ What this implements, and what it deliberately does not:
   of the page asking — is settled in server.py before this is reached.
 * Text, binary and continuation frames, with masked payloads (a client
   frame that is not masked is a protocol error, per the RFC), ping answered
-  with pong, and the close handshake echoed.
+  with pong, and the close handshake echoed. Every other opcode is
+  reserved, and a reserved one fails the connection (§5.2) rather than
+  being reassembled as though it were data.
 * One lock around *all* socket I/O, not merely around sending. A session
   has two threads on one socket — the one reading it and the one pumping
   the SSH channel into it — and under TLS that would be a concurrent
@@ -71,6 +73,14 @@ OP_PING = 0x9
 OP_PONG = 0xA
 
 _CONTROL_OPS = (OP_CLOSE, OP_PING, OP_PONG)
+# Every opcode the RFC defines. The rest — 0x3-0x7 (reserved non-control)
+# and 0xB-0xF (reserved control) — "MUST fail the WebSocket connection"
+# (§5.2). Without that they missed the control branch and the continuation
+# branch alike and were reassembled as if they were text or binary, and a
+# reserved *control* opcode also escaped the "fragmented control frame" and
+# "oversized control frame" guards, since those ask whether the opcode is
+# one of the three above.
+_DEFINED_OPS = (OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG)
 
 # One frame, and one reassembled message, may not exceed this. Generous for
 # a terminal by three orders of magnitude, small enough that a bad length
@@ -297,6 +307,8 @@ class WebSocket:
         if first & 0x70:
             raise WebSocketError("Reserved bits set")
         opcode = first & 0x0F
+        if opcode not in _DEFINED_OPS:
+            raise WebSocketError("Reserved opcode")
         masked = bool(second & 0x80)
         length = second & 0x7F
         if not masked:

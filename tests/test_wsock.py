@@ -217,6 +217,34 @@ assert struct.unpack("!H", payload[:2])[0] == wsock.CLOSE_PROTOCOL_ERROR
 print("PASS: a reserved bit closes the connection with 1002")
 sock.close()
 
+# And a reserved *opcode*: 0x3-0x7 and 0xB-0xF are undefined, and RFC 6455
+# §5.2 requires the connection to fail on one. They used to miss the
+# control branch and the continuation branch alike and be reassembled as
+# if they were text or binary — and a reserved control opcode escaped the
+# fragmented/oversized control-frame guards with them, since those ask
+# whether the opcode is one of the three defined control ones.
+for reserved_op in (0x3, 0x7, 0xB, 0xF):
+    sock, ws = pair()
+    sock.sendall(wsock.client_frame(reserved_op, b"pretending to be data"))
+    assert ws.recv() is None, reserved_op
+    _, opcode, payload = read_frame(sock)
+    assert opcode == wsock.OP_CLOSE, (reserved_op, opcode)
+    assert struct.unpack("!H", payload[:2])[0] == wsock.CLOSE_PROTOCOL_ERROR, \
+        (reserved_op, payload)
+    sock.close()
+print("PASS: reserved opcodes 0x3-0x7 and 0xB-0xF close the connection with "
+      "1002 instead of being delivered as a message")
+
+# The one that used to slip past two guards at once: a reserved control
+# opcode, fragmented and far past the 125-byte control-frame ceiling.
+sock, ws = pair()
+sock.sendall(fragment(0xB, b"x" * 200, False))
+assert ws.recv() is None
+_, opcode, payload = read_frame(sock)
+assert struct.unpack("!H", payload[:2])[0] == wsock.CLOSE_PROTOCOL_ERROR, payload
+print("PASS: a fragmented, oversized reserved control frame is refused too")
+sock.close()
+
 # The size cap is enforced on the length field, before any payload is read:
 # a header claiming 3 MB must never allocate 3 MB.
 sock, ws = pair()
