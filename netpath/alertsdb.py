@@ -21,6 +21,9 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint
+from . import dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
@@ -460,12 +463,16 @@ class AlertsDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # dbopen.connect narrows the file (and its -wal/-shm companions) to
+        # the owner: this database holds the SMTP credential blob and every
+        # recipient address, and the process umask was leaving it 0644.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._enable_incremental_vacuum()
             self._conn.executescript(SCHEMA)
             self._conn.executescript(PENDING_SCHEMA)
             self._migrate()
@@ -473,6 +480,29 @@ class AlertsDatabase:
         self._seed_templates()
         self._seed_rules()
         self._run_named_migrations()
+
+    def _enable_incremental_vacuum(self) -> None:
+        """dbmaint.enable_incremental_vacuum, with the empty-file case covered.
+
+        auto_vacuum can only be changed on a database that has no tables yet,
+        or by a VACUUM that rewrites the file — and in WAL mode the pragma
+        alone does not take even on an empty file. dbopen.connect switches to
+        WAL as it opens, so it can tighten the -wal/-shm modes immediately,
+        which means by the time this runs a brand-new alerts.db is already in
+        WAL. The helper's own VACUUM fallback is guarded on page_count > 1
+        and therefore does not fire for a file that has only its header page,
+        so without this a fresh install would stay on auto_vacuum=NONE and
+        trim_to_size would reclaim nothing. One VACUUM of an empty file costs
+        nothing; on an existing database the helper has already handled it.
+        """
+        if dbmaint.enable_incremental_vacuum(self._conn, "alerts"):
+            return
+        try:
+            if self._conn.execute("PRAGMA page_count").fetchone()[0] <= 1:
+                self._conn.execute("VACUUM")
+                dbmaint.enable_incremental_vacuum(self._conn, "alerts")
+        except sqlite3.DatabaseError:
+            pass
 
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created.
@@ -1402,6 +1432,17 @@ class AlertsDatabase:
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest resolved alerts until the file fits, reclaiming
+        the freed pages between passes.
+
+        The reclaim runs OUTSIDE the delete's lock block, not inside it.
+        VACUUM rewrites the whole file under an exclusive lock, and on a
+        connection shared with the engine's tick thread it cannot be issued
+        outside the module lock without interleaving with other statements —
+        which is why it used to sit inside. Incremental vacuum frees pages in
+        short steps that each take and release the lock, so a trim never
+        blocks a write for longer than one step.
+        """
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -1412,15 +1453,18 @@ class AlertsDatabase:
                 total = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM alerts WHERE state = 'resolved'"
                 ).fetchone()["n"]
-                if total <= 500:
-                    break
-                chunk = max(int(total * 0.15), 200)
-                cursor = self._conn.execute(
-                    "DELETE FROM alerts WHERE id IN (SELECT id FROM alerts"
-                    " WHERE state = 'resolved' ORDER BY resolved_ts ASC LIMIT ?)",
-                    (chunk,))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                # A floor, not a target: below this there is nothing left to
+                # delete that is not an operator's own history.
+                exhausted = total <= 500
+                if not exhausted:
+                    chunk = max(int(total * 0.15), 200)
+                    cursor = self._conn.execute(
+                        "DELETE FROM alerts WHERE id IN (SELECT id FROM alerts"
+                        " WHERE state = 'resolved' ORDER BY resolved_ts ASC LIMIT ?)",
+                        (chunk,))
+                    removed += cursor.rowcount or 0
+                    self._conn.commit()
+            if exhausted:
+                break
+            dbmaint.reclaim(self._conn, self._lock, label="alerts")
         return removed

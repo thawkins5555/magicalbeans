@@ -1110,4 +1110,50 @@ ok("PUT refuses a device as its own upstream, and an unknown device id")
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# ============================================================ storage trim
+print("\nStorage — alerts.db opens tightly and reclaims without VACUUM")
+
+import stat  # noqa: E402
+
+folder = os.path.join(TMPDIR, "trim")
+os.makedirs(folder, exist_ok=True)
+trim_path = os.path.join(folder, "alerts.db")
+store = AlertsDatabase(trim_path)
+
+if os.name != "nt":
+    mode = stat.S_IMODE(os.stat(trim_path).st_mode)
+    assert not mode & 0o077, oct(mode)
+    ok(f"the database holding the SMTP credential opens {oct(mode)}, not 0o644")
+
+assert store._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2, \
+    store._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+ok("a fresh alerts.db is in incremental auto-vacuum mode")
+
+rule = store.rule_by_key("device_down")
+now = time.time()
+padding = "x" * 400
+for i in range(4000):
+    store._conn.execute(
+        "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
+        " entity_label, severity, message, detail, state, opened_ts, last_ts,"
+        " resolved_ts, resolved_by) VALUES (?,?,?,?,?,3,?,?,'resolved',?,?,?,'')",
+        (rule["id"], f"k{i}", "device", str(i), padding, padding, padding,
+         now - i, now - i, now - i))
+store._conn.commit()
+before = store.size_bytes()
+assert before > 4_000_000, before
+removed = store.trim_to_size(1_500_000)
+after = store.size_bytes()
+assert removed > 0, removed
+assert after < before / 2, (before, after)
+ok(f"trim_to_size removed {removed} rows and shrank the file "
+   f"{before // 1024} KiB -> {after // 1024} KiB with no VACUUM")
+
+store.close()
+reopened = AlertsDatabase(trim_path)
+assert reopened._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+reopened.close()
+ok("the mode survives a reopen")
+
+
 print(f"\nALL {len(PASSED)} ALERT-ENGINE ASSERTIONS PASSED")
