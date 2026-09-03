@@ -1,15 +1,16 @@
-"""The parsers and the small in-memory tables around them, under the inputs
-a fuzz run and a fresh-eyes review found: a MIB whose IMPORTS block never
+"""The parsers, resolvers and small in-memory tables, under the inputs a
+fuzz run and a fresh-eyes review found: a MIB whose IMPORTS block never
 closes, a truncated MIB that is all macro headers and no clauses, a reversed
-dependency chain, an enum value longer than Python's own integer guard, and
-the vendor/port/name-lookup tables that back them.
+dependency chain, an enum value longer than Python's own integer guard, a
+DNS answer from the wrong host, and the vendor and port tables around them.
 
-No network, no database, no subprocess: everything here is a pure function
-or an in-memory object, so the suite is deterministic and finishes in a few
-seconds. The timing assertions carry a wide margin on purpose — each one is
-two to three orders of magnitude below what the unfixed code measured, so a
-loaded build machine cannot make them flap, and a return of the quadratic
-behaviour cannot make them pass.
+No database and no subprocess; the only sockets are loopback UDP, from a
+fake resolver this file starts and stops itself. Everything else is a pure
+function or an in-memory object, so the suite is deterministic and finishes
+in a few seconds. The timing assertions carry a wide margin on purpose —
+each one is two to three orders of magnitude below what the unfixed code
+measured, so a loaded build machine cannot make them flap, and a return of
+the quadratic behaviour cannot make them pass.
 """
 import hashlib
 import json
@@ -476,6 +477,207 @@ check("every alias points at an arc that exists", targets <= keys,
 check("no alias points at another alias",
       not (targets & set(enterprises.VENDOR_ALIASES)),
       str(targets & set(enterprises.VENDOR_ALIASES)))
+
+
+# ------------------------------------------------------------ H6: namelookup
+
+print("H6  name lookup: no global timeout, no off-path answers, checked args")
+
+import ast                                           # noqa: E402
+import inspect                                       # noqa: E402
+import socket                                        # noqa: E402
+import struct                                        # noqa: E402
+import threading                                     # noqa: E402
+
+from netpath import namelookup                       # noqa: E402
+
+source = inspect.getsource(namelookup)
+# Read as code, not as text: the docstring names setdefaulttimeout to explain
+# why it is gone, and that mention must not make this check pass or fail.
+called = {node.func.attr for node in ast.walk(ast.parse(source))
+          if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+check("reverse() no longer calls the process-global socket timeout setter",
+      "setdefaulttimeout" not in called)
+check("the query id no longer comes from the Mersenne Twister",
+      "random.randint" not in source and "os.urandom" in source)
+
+# The leak the review reproduced: while reverse() ran, every socket created
+# anywhere in the process was born with the resolver's timeout, and eight
+# concurrent workers left the global set for good.
+socket.setdefaulttimeout(None)
+observed: set = set()
+stop = threading.Event()
+
+
+def watch_new_sockets() -> None:
+    while not stop.is_set():
+        probe = socket.socket()
+        observed.add(probe.gettimeout())
+        probe.close()
+
+
+watcher = threading.Thread(target=watch_new_sockets, daemon=True)
+watcher.start()
+barrier = threading.Barrier(8)
+
+
+def resolve_worker() -> None:
+    barrier.wait()
+    for _ in range(4):
+        namelookup.reverse("127.0.0.1", timeout_s=3.0, use_nslookup=False)
+
+
+workers = [threading.Thread(target=resolve_worker) for _ in range(8)]
+for worker in workers:
+    worker.start()
+for worker in workers:
+    worker.join()
+stop.set()
+watcher.join(2.0)
+check("no unrelated socket inherits a timeout while reverse() runs",
+      observed == {None}, str(sorted(observed, key=str)))
+check("...and eight concurrent resolvers leave the global default alone",
+      socket.getdefaulttimeout() is None, str(socket.getdefaulttimeout()))
+
+
+class FakeResolver:
+    """A UDP server on loopback that answers however the test tells it to.
+
+    `spoof_from` is a second socket on a different port, standing in for an
+    off-path host that guessed the query id.
+    """
+
+    def __init__(self, mode: str, answer: str = "host.example."):
+        self.mode, self.answer = mode, answer
+        self.ids: list[int] = []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.25)
+        self.spoof = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.spoof.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _reply(self, query: bytes, name: str, question: bytes | None = None) -> bytes:
+        question = query[12:] if question is None else question
+        rdata = namelookup._encode(name)
+        return (query[:2] + struct.pack("!HHHHH", 0x8180, 1, 1, 0, 0) + question
+                + b"\xc0\x0c" + struct.pack("!HHIH", namelookup.PTR, 1, 60,
+                                            len(rdata)) + rdata)
+
+    def _serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                query, client = self.sock.recvfrom(4096)
+            except OSError:
+                continue
+            self.ids.append(struct.unpack("!H", query[:2])[0])
+            if self.mode == "answer":
+                self.sock.sendto(self._reply(query, self.answer), client)
+            elif self.mode == "spoof":
+                # Correct id, correct question, wrong source address.
+                self.spoof.sendto(self._reply(query, "forged.example."), client)
+            elif self.mode == "wrong-question":
+                other = namelookup._encode("9.9.9.9.in-addr.arpa") + \
+                    struct.pack("!HH", namelookup.PTR, namelookup.IN)
+                self.sock.sendto(self._reply(query, self.answer, other), client)
+            elif self.mode == "junk":
+                # A wrong-id datagram every 0.15 s, forever: each one used to
+                # restart the per-recv clock and could hold a worker for good.
+                while not self.stop.is_set():
+                    bad = struct.pack("!H", (struct.unpack("!H", query[:2])[0]
+                                             ^ 0xFFFF)) + query[2:]
+                    try:
+                        self.sock.sendto(self._reply(bad, "junk.example."), client)
+                    except OSError:
+                        return
+                    time.sleep(0.15)
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(2.0)
+        self.sock.close()
+        self.spoof.close()
+
+
+server = FakeResolver("answer")
+try:
+    got, elapsed = timed(namelookup.query_ptr, "10.1.2.3", "127.0.0.1",
+                         2.0, server.port)
+    check("a genuine reply from the nominated server is accepted",
+          got == "host.example", str(got))
+finally:
+    server.close()
+
+server = FakeResolver("spoof")
+try:
+    got, elapsed = timed(namelookup.query_ptr, "10.1.2.3", "127.0.0.1",
+                         1.0, server.port)
+    check("an answer from any other source address is not accepted",
+          got is None, str(got))
+    check("...and the query still ends at its deadline", elapsed < 3.0,
+          f"{elapsed:.2f}s")
+finally:
+    server.close()
+
+server = FakeResolver("wrong-question")
+try:
+    got = namelookup.query_ptr("10.1.2.3", "127.0.0.1", 1.0, server.port)
+    check("a reply whose question section is not the one asked is rejected",
+          got is None, str(got))
+finally:
+    server.close()
+
+server = FakeResolver("junk")
+try:
+    got, elapsed = timed(namelookup.query_ptr, "10.1.2.3", "127.0.0.1",
+                         1.0, server.port)
+    check("a stream of wrong-id datagrams cannot extend the deadline",
+          got is None and elapsed < 3.0, f"{got}, {elapsed:.2f}s")
+finally:
+    server.close()
+
+server = FakeResolver("answer")
+try:
+    for _ in range(40):
+        namelookup.query_ptr("10.1.2.3", "127.0.0.1", 2.0, server.port)
+    ids = server.ids
+finally:
+    server.close()
+check("query ids do not repeat across 40 queries", len(set(ids)) >= 36,
+      f"{len(set(ids))} distinct of {len(ids)}")
+check("...and are not a sequence",
+      not all(b - a == 1 for a, b in zip(ids, ids[1:])), str(ids[:4]))
+
+# G-20: nslookup's arguments are checked here, not assumed from the callers.
+ran: list = []
+real_run = namelookup.subprocess.run
+namelookup.subprocess.run = lambda *a, **k: ran.append(a) or real_run(*a, **k)
+try:
+    check("nslookup refuses an argument that is not an address",
+          namelookup.nslookup("-debug") is None
+          and namelookup.nslookup("example.com; id") is None
+          and namelookup.nslookup("") is None)
+    check("...and refuses a nominated server that is not one",
+          namelookup.nslookup("10.1.2.3", "-port=9999") is None
+          and namelookup.nslookup("10.1.2.3", "$(id)") is None)
+    check("...without ever starting a process", ran == [], str(ran))
+    check("reverse() refuses an argument that is not an address",
+          namelookup.reverse("-debug", use_nslookup=True) == (None, "none")
+          and namelookup.reverse("evil.example", use_nslookup=True) == (None, "none"))
+    check("...without ever starting a process either", ran == [], str(ran))
+finally:
+    namelookup.subprocess.run = real_run
+
+check("an ordinary address and resolver are still accepted",
+      namelookup.is_ip_literal("10.1.2.3") and namelookup.is_ip_literal("fe80::1")
+      and namelookup.is_resolver_address("10.0.0.53")
+      and namelookup.is_resolver_address("ns1.example.com")
+      and not namelookup.is_resolver_address("-timeout=1")
+      and not namelookup.is_resolver_address("a b")
+      and not namelookup.is_resolver_address(""))
 
 
 if failures:
