@@ -73,6 +73,68 @@ HOST_RESOURCES = {     # HOST-RESOURCES-MIB — Windows, many appliances
     "hr_storage_table":  "1.3.6.1.2.1.25.2.3.1",      # table: size/used per storage unit
 }
 
+# ------------------------------------------------------------ vendor health
+#
+# The review's §4.1 S9: the poller read no vendor health at all — no CPU or
+# memory from Cisco, Fortinet or Juniper, HOST-RESOURCES-MIB defined above
+# and never referenced — so `cpu_high`, `mem_high` and `disk_high` could
+# only ever fire on a device running net-snmp. These are the scalars that
+# make those rules live on real network gear, keyed by the vendor's own
+# enterprise arc so a device is only ever asked for objects its maker
+# defines.
+#
+# Each probe is (metric key, label, unit, OID, how):
+#   "scalar"       the OID is already an instance; read it in the GET
+#   "column_first" a table column; the first numeric row (a chassis's first
+#                  routing engine, its first CPU)
+#   "column_max"   a table column; the worst row (temperatures, where the
+#                  hottest sensor is the one that matters)
+#   "column_avg"   a table column; the mean (per-core CPU load)
+VENDOR_HEALTH = {
+    9: (        # Cisco — CISCO-PROCESS-MIB cpmCPUTotal5minRev
+        ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.9.9.109.1.1.1.1.8", "column_first"),
+    ),
+    12356: (    # Fortinet — FORTINET-FORTIGATE-MIB, all plain scalars
+        ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.12356.101.4.1.3.0", "scalar"),
+        ("mem_pct", "Memory", "%", "1.3.6.1.4.1.12356.101.4.1.4.0", "scalar"),
+        ("session_count", "Firewall sessions", "sessions",
+         "1.3.6.1.4.1.12356.101.4.1.8.0", "scalar"),
+    ),
+    2636: (     # Juniper — JUNIPER-MIB jnxOperatingTable
+        ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.2636.3.1.13.1.8", "column_first"),
+        ("temp_c", "Temperature", "°C", "1.3.6.1.4.1.2636.3.1.13.1.7", "column_max"),
+    ),
+}
+
+# CISCO-MEMORY-POOL-MIB: used and free per pool, in bytes. A percentage
+# needs both columns, so it does not fit the single-column shape above.
+CISCO_MEMORY_USED = "1.3.6.1.4.1.9.9.48.1.1.1.5"
+CISCO_MEMORY_FREE = "1.3.6.1.4.1.9.9.48.1.1.1.6"
+
+# HOST-RESOURCES-MIB, the fallback for everything else — Windows, Palo Alto,
+# most appliances. Only read when the vendor table above named nothing and
+# UCD-SNMP did not answer either, so a net-snmp box costs no extra requests.
+GENERIC_HEALTH = (
+    ("cpu_pct", "CPU", "%", "1.3.6.1.2.1.25.3.3.1.2", "column_avg"),
+)
+
+# hrStorageTable: type, allocation unit, size and used, per storage unit.
+# hrStorageFixedDisk is the row an operator means by "disk"; RAM and virtual
+# memory rows live in the same table and would report a machine using its
+# page cache as a full disk.
+HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
+HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
+HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
+HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"
+HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
+
+# ipAddrTable's ipAdEntAddr column: every IPv4 address this device answers
+# on. Its own traps and syslog messages come from whichever of them the
+# device chose, which is how a message from a loopback ends up belonging to
+# nobody. Walked rarely (see nodepoll._ADDRESS_REFRESH_S), not every poll.
+IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
+
+
 ENUMS = {
     "if_admin_status": {1: "up", 2: "down", 3: "testing"},
     "if_oper_status": {1: "up", 2: "down", 3: "testing", 4: "unknown",

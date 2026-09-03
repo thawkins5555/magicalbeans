@@ -652,6 +652,9 @@ class NodePoller:
         self._configs: dict | None = None
         self._configs_generation: int = -1
         self._configs_loaded: float = 0.0
+        # device_id -> when its ipAddrTable was last read. See
+        # _refresh_addresses: once an hour, not once a poll.
+        self._addresses_read: dict[int, float] = {}
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
         # mixed-vendor subnet, say) costs one extra request only on a
@@ -1639,7 +1642,169 @@ class NodePoller:
         except SnmpError:
             pass   # best-effort: UCD-SNMP-MIB not present on this device
 
+        metrics.extend(self._poll_vendor_health(device, config, identity,
+                                                already={m[0] for m in metrics}))
         return identity, uptime_ticks, metrics
+
+    # How often a device's ipAddrTable is re-read. Its addresses change when
+    # somebody reconfigures it, not between polls, and the walk exists to
+    # correlate traps and syslog rather than to chart anything — so once an
+    # hour, not on the poll cycle.
+    _ADDRESS_REFRESH_S = 3600.0
+
+    def _health_column(self, device, config: dict, oid: str, how: str):
+        """One vendor table column, reduced to a single number.
+
+        Best-effort throughout: a device that does not implement the column
+        answers nothing and contributes nothing, exactly like the UCD-SNMP
+        read above. Errors are swallowed for the same reason — not
+        answering a vendor object is the normal case, not a poll failure.
+        """
+        try:
+            values = self._walk_column(device, config, oid)
+        except SnmpError:
+            return None
+        numbers = [float(value) for value in values.values()
+                   if isinstance(value, (int, float))]
+        if not numbers:
+            return None
+        if how == "column_max":
+            return max(numbers)
+        if how == "column_avg":
+            return sum(numbers) / len(numbers)
+        return numbers[0]
+
+    def _cisco_memory_pct(self, device, config: dict):
+        """Cisco reports memory as used and free bytes per pool rather than
+        as a percentage. Pools are summed: a router with a processor pool
+        and an I/O pool has one memory figure, not two."""
+        try:
+            used = self._walk_column(device, config, nodeoids.CISCO_MEMORY_USED)
+            free = self._walk_column(device, config, nodeoids.CISCO_MEMORY_FREE)
+        except SnmpError:
+            return None
+        used_total = sum(float(v) for v in used.values()
+                         if isinstance(v, (int, float)))
+        free_total = sum(float(v) for v in free.values()
+                         if isinstance(v, (int, float)))
+        total = used_total + free_total
+        if total <= 0:
+            return None
+        return 100.0 * used_total / total
+
+    def _host_resources_disk_pct(self, device, config: dict):
+        """The busiest fixed disk, as a percentage.
+
+        hrStorageTable also holds RAM and virtual memory rows; reporting
+        those as disk would make a machine using its page cache look full.
+        Only hrStorageFixedDisk rows count, and the fullest of them is what
+        an operator means by "the disk is filling up"."""
+        try:
+            types = self._walk_column(device, config, nodeoids.HR_STORAGE_TYPE)
+            if not types:
+                return None
+            sizes = self._walk_column(device, config, nodeoids.HR_STORAGE_SIZE)
+            used = self._walk_column(device, config, nodeoids.HR_STORAGE_USED)
+        except SnmpError:
+            return None
+        worst = None
+        for index, kind in types.items():
+            if str(kind).strip(".") != nodeoids.HR_STORAGE_FIXED_DISK:
+                continue
+            size = sizes.get(index)
+            taken = used.get(index)
+            if not isinstance(size, (int, float)) or not isinstance(taken, (int, float)):
+                continue
+            if size <= 0:
+                continue
+            pct = 100.0 * float(taken) / float(size)
+            worst = pct if worst is None else max(worst, pct)
+        return worst
+
+    def _refresh_addresses(self, device, config: dict) -> None:
+        """Remember every address this device answers on.
+
+        A switch sends its traps from a loopback and its syslog from a
+        management VRF, and neither address is in the devices table, so the
+        alert engine could not tell whose message it was. ipAddrTable says
+        which addresses are the device's own. Walked at most once an hour
+        per device — see _ADDRESS_REFRESH_S."""
+        device_id = device["id"]
+        now = time.time()
+        if now - self._addresses_read.get(device_id, 0.0) < self._ADDRESS_REFRESH_S:
+            return
+        self._addresses_read[device_id] = now
+        try:
+            rows = self._walk_column(device, config, nodeoids.IP_ADDR_TABLE)
+        except SnmpError:
+            return
+        addresses = [str(value) for value in rows.values() if value]
+        if addresses:
+            self.db.record_device_addresses(device_id, addresses, "ipAddrTable")
+
+    def _poll_vendor_health(self, device, config: dict, identity: dict,
+                            already=()) -> list[tuple]:
+        """CPU, memory, disk, temperature and session count for real network
+        gear, keyed on the vendor arc SNMP identification worked out.
+
+        Everything here is best-effort and additive: the thresholds are
+        unchanged, so a device that starts answering cpu_pct can now open
+        `cpu_high` where it previously reported nothing at all. Only the
+        objects the device's own maker defines are asked for; the
+        HOST-RESOURCES fallback runs only when neither the vendor table nor
+        UCD-SNMP produced a figure, so a net-snmp box costs nothing extra.
+        """
+        arc = identity.get("vendor_arc") if identity else None
+        if arc is None:
+            arc = nodeoids.enterprise_arc(
+                (identity or {}).get("sys_object_id") or "")
+        metrics: list[tuple] = []
+        # `already` is what the UCD-SNMP read produced. A vendor's own
+        # object beats it — a FortiGate that also answers UCD-SNMP is still
+        # better described by fgSysCpuUsage — so the vendor probes below
+        # ignore it and record_metric_samples keeps the last value per key.
+        # Only the generic HOST-RESOURCES fallback respects it, so a
+        # net-snmp box costs no extra requests at all.
+        produced: set = set()
+
+        def add(key, label, unit, value):
+            if value is None or key in produced:
+                return
+            produced.add(key)
+            metrics.append((key, label, unit, "gauge", float(value)))
+
+        probes = nodeoids.VENDOR_HEALTH.get(arc, ())
+        scalars = [probe for probe in probes if probe[4] == "scalar"]
+        if scalars:
+            try:
+                response = self._snmp_get(device, config,
+                                          [probe[3] for probe in scalars])
+                values = {vb["oid"]: vb for vb in response.varbinds}
+            except SnmpError:
+                values = {}
+            for key, label, unit, oid, _how in scalars:
+                vb = values.get(oid)
+                if vb and vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                             "endOfMibView", "null") \
+                        and isinstance(vb["value"], (int, float)):
+                    add(key, label, unit, vb["value"])
+        for key, label, unit, oid, how in probes:
+            if how == "scalar" or key in produced:
+                continue
+            add(key, label, unit, self._health_column(device, config, oid, how))
+        if arc == 9:
+            add("mem_pct", "Memory", "%",
+                self._cisco_memory_pct(device, config))
+        known = produced | set(already)
+        if "cpu_pct" not in known:
+            for key, label, unit, oid, how in nodeoids.GENERIC_HEALTH:
+                add(key, label, unit,
+                    self._health_column(device, config, oid, how))
+        if "disk_pct" not in known:
+            add("disk_pct", "Storage", "%",
+                self._host_resources_disk_pct(device, config))
+        self._refresh_addresses(device, config)
+        return metrics
 
     def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
                           defer_assignment: bool = False) -> None:

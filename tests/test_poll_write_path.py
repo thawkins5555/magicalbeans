@@ -158,6 +158,79 @@ def v3_engine_time():
         proc.kill()
 
 
+def vendor_health():
+    """§4.1 S9: the poller read no vendor health at all, so cpu_high,
+    mem_high and disk_high could only ever fire on a device running
+    net-snmp — every Cisco, Fortinet and Juniper box in the estate was
+    silent on the metrics the shipped rules watch."""
+    print("\n-- vendor health")
+
+    proc, port = spawn_stub("stub_agent_iftable.py", "fortigate")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "fortigate.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "fw-01", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        metrics = {r["key"]: r for r in db.metrics(device_id)}
+        check(metrics.get("cpu_pct") and metrics["cpu_pct"]["last_value"] == 95.0,
+              f"a FortiGate reports its CPU "
+              f"({metrics.get('cpu_pct') and metrics['cpu_pct']['last_value']})")
+        check(metrics.get("mem_pct") and metrics["mem_pct"]["last_value"] == 61.0,
+              "…its memory")
+        check(metrics.get("session_count")
+              and metrics["session_count"]["last_value"] == 1234.0,
+              "…and its session count")
+        # cpu_high opens at 90% and warns at 80%: the shipped threshold is
+        # unchanged, and 95% is above it. That is the behaviour change.
+        check(metrics["cpu_pct"]["last_value"] > 90.0,
+              "…which is above the shipped cpu_high threshold of 90%")
+
+        # ipAddrTable: the loopback the device also answers on resolves to
+        # it, so a trap or syslog message from there is attributable.
+        check(db.device_id_for_address("10.9.9.9") == device_id,
+              "an address from ipAddrTable resolves to the device")
+        check(db.device_id_for_address("127.0.0.1") == device_id,
+              "…and so does its own primary address")
+        # Walked at most once an hour, not once a poll.
+        reads = dict(poller._addresses_read)
+        _poll_once(poller, db, device_id)
+        check(poller._addresses_read == reads,
+              "…and the address walk does not repeat on the next poll")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    proc, port = spawn_stub("stub_agent_iftable.py", "cisco")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "cisco.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "core-01", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        metrics = {r["key"]: r for r in db.metrics(device_id)}
+        check(metrics.get("cpu_pct") and metrics["cpu_pct"]["last_value"] == 42.0,
+              f"a Cisco device reports cpmCPUTotal5minRev "
+              f"({metrics.get('cpu_pct') and metrics['cpu_pct']['last_value']})")
+        # 300 MB used of 400 MB across both pools.
+        value = metrics.get("mem_pct") and metrics["mem_pct"]["last_value"]
+        check(value is not None and abs(value - 75.0) < 0.01,
+              f"…and its memory pools summed to a percentage ({value})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def _poll_once(poller, db, device_id):
     device = db.device(device_id)
     poller._poll_device(device, db.effective_config(device))
@@ -477,6 +550,7 @@ def main():
 
     reboot_suppression()
     interface_reads()
+    vendor_health()
     request_matching()
     v3_engine_time()
 

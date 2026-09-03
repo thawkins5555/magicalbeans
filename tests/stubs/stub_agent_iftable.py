@@ -30,6 +30,12 @@ Modes:
                    the first datagram off the socket stores the wrong
                    answer — which is what a late reply to a previous
                    attempt does on a real network.
+  fortigate        answers as a FortiGate: a Fortinet sysObjectID and the
+                   FORTINET-FORTIGATE-MIB CPU, memory and session scalars,
+                   plus an ipAddrTable naming a management address the
+                   devices table has never seen.
+  cisco            answers as a Cisco router: a Cisco sysObjectID,
+                   cpmCPUTotal5minRev and a two-pool ciscoMemoryPool table.
   v3               speaks SNMPv3 noAuthNoPriv with an authoritative engine
                    id, engineBoots and a real engineTime clock, and applies
                    an RFC 3414 §3.2 time window of --window seconds:
@@ -88,6 +94,10 @@ class Agent:
         self.reboot_after = reboot_after
         self.uptime_reads = 0
         self.sys_name = "iftable-stub"
+        # Extra instance OIDs this mode serves, beyond the scalars and the
+        # ifTable: vendor health tables, ipAddrTable. Walked as well as
+        # GET-able, so the poller's column walks find them.
+        self.extra = self._vendor_objects()
         self.window = window
         self.dark_after = dark_after
         self.gets = 0
@@ -204,12 +214,45 @@ class Agent:
             rows.insert(1, "1.5")
         return rows
 
+    _SYS_OBJECT_IDS = {
+        "fortigate": "1.3.6.1.4.1.12356.101.1.1000",
+        "cisco": "1.3.6.1.4.1.9.1.1208",
+    }
+
+    def _vendor_objects(self) -> dict:
+        """The vendor health and address objects for this mode, as
+        instance OID -> encoded value."""
+        if self.mode == "fortigate":
+            return {
+                # fgSysCpuUsage / fgSysMemUsage / fgSysSesCount
+                "1.3.6.1.4.1.12356.101.4.1.3.0": enc_unsigned(T_GAUGE32, 95),
+                "1.3.6.1.4.1.12356.101.4.1.4.0": enc_unsigned(T_GAUGE32, 61),
+                "1.3.6.1.4.1.12356.101.4.1.8.0": enc_unsigned(T_GAUGE32, 1234),
+                # ipAddrTable: the address the devices table knows, and a
+                # loopback the device also answers on and sends traps from.
+                "1.3.6.1.2.1.4.20.1.1.127.0.0.1": enc_octets("127.0.0.1"),
+                "1.3.6.1.2.1.4.20.1.1.10.9.9.9": enc_octets("10.9.9.9"),
+            }
+        if self.mode == "cisco":
+            return {
+                # cpmCPUTotal5minRev, one CPU
+                "1.3.6.1.4.1.9.9.109.1.1.1.1.8.1": enc_unsigned(T_GAUGE32, 42),
+                # ciscoMemoryPoolUsed / Free, processor and I/O pools:
+                # 300 MB used of 400 MB total = 75%.
+                "1.3.6.1.4.1.9.9.48.1.1.1.5.1": enc_unsigned(T_GAUGE32, 200_000_000),
+                "1.3.6.1.4.1.9.9.48.1.1.1.5.2": enc_unsigned(T_GAUGE32, 100_000_000),
+                "1.3.6.1.4.1.9.9.48.1.1.1.6.1": enc_unsigned(T_GAUGE32, 60_000_000),
+                "1.3.6.1.4.1.9.9.48.1.1.1.6.2": enc_unsigned(T_GAUGE32, 40_000_000),
+            }
+        return {}
+
     def _scalar(self, oid: str):
         S = nodeoids.SYSTEM_SCALARS
         if oid == S["sys_descr"]:
             return enc_octets("ifTable stub agent")
         if oid == S["sys_object_id"]:
-            return enc_octets("1.3.6.1.4.1.99999.1")
+            return enc_octets(self._SYS_OBJECT_IDS.get(
+                self.mode, "1.3.6.1.4.1.99999.1"))
         if oid == S["sys_uptime"]:
             self.uptime_reads += 1
             if self.rebooted():
@@ -221,6 +264,10 @@ class Agent:
             return enc_octets(self.sys_name)
         if oid == S["sys_location"]:
             return enc_octets("lab")
+        if self.mode in self._SYS_OBJECT_IDS:
+            # Real vendor gear does not implement UCD-SNMP-MIB; answering
+            # it here would hide whether the vendor objects were read.
+            return None
         U = nodeoids.UCD_SNMP
         if oid == U["cpu_raw_idle"]:
             return enc_unsigned(T_GAUGE32, 75)      # 25% busy
@@ -297,6 +344,8 @@ class Agent:
     def value_for(self, oid: str):
         """The encoded value for one instance OID, or None when this agent
         does not implement it."""
+        if oid in self.extra:
+            return self.extra[oid]
         value = self._scalar(oid)
         if value is not None:
             return value
@@ -340,25 +389,27 @@ class Agent:
                 oid, value if value is not None else _tlv(T_NO_SUCH_OBJECT, b""))
         return self._response(req.version, request_id, body)
 
+    @staticmethod
+    def _key(oid: str):
+        return tuple((0, int(a)) if a.isdigit() else (1, a)
+                     for a in oid.split("."))
+
     def _next_after(self, oid: str):
-        """The lexicographic successor inside the ifIndex column only —
-        every walk this stub serves is of that one column."""
+        """The lexicographic successor across everything this agent serves:
+        the ifIndex column, and whatever vendor table the mode adds."""
         base = nodeoids.IF_TABLE["if_index"]
-        suffixes = self.indexes()
-        if oid == base:
-            self.walked = True
-            return f"{base}.{suffixes[0]}", enc_int(1)
-        if oid.startswith(base + "."):
-            current = oid[len(base) + 1:]
-            if current in suffixes:
-                position = suffixes.index(current) + 1
-                if position < len(suffixes):
-                    nxt = suffixes[position]
-                    self.walked = True
-                    return f"{base}.{nxt}", enc_int(position + 1)
-        # Out of the subtree: the walk is over.
         self.walked = True
-        return "1.3.6.1.2.1.2.2.1.2.1", enc_octets("past-the-column")
+        walkable = [(f"{base}.{suffix}", enc_int(position + 1))
+                    for position, suffix in enumerate(self.indexes())]
+        walkable += sorted(self.extra.items(), key=lambda item: self._key(item[0]))
+        walkable.sort(key=lambda item: self._key(item[0]))
+        wanted = self._key(oid)
+        for candidate, value in walkable:
+            if self._key(candidate) > wanted:
+                return candidate, value
+        # Past everything: an OID outside any subtree being walked, which
+        # is how an agent says the table ended.
+        return "9.9.9.9", enc_octets("past-the-end")
 
     def handle(self, data: bytes) -> list:
         """Every datagram this agent wants to send back, in order. A list
