@@ -931,11 +931,15 @@ SETTINGS_SCOPES = {
 ADMIN_ONLY_SETTINGS = ("updates_enabled",)
 
 
+def _is_admin(service, params) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get("admin"), _permissions.WRITE)
+
+
 def _may_change_admin_settings(service, params) -> bool:
     """Whether this caller may change ADMIN_ONLY_SETTINGS. Its own function
-    so there is exactly one place the answer is decided; the capability it
-    consults arrives with the `admin` module."""
-    return True
+    so there is exactly one place the answer is decided."""
+    return _is_admin(service, params)
 
 
 def post_settings(service, params, body) -> dict:
@@ -4278,13 +4282,44 @@ def post_user(service, params, body) -> dict:
     return {"username": username}
 
 
+def _last_admin_guard(service, target: str, keeps_admin: bool) -> None:
+    """Refuse a change that would leave the install with no administrator.
+
+    Deleting the last *account* was already refused; losing the last
+    administrator is the same trap by a different route — an install with
+    no admin has no way back into its own user management short of editing
+    app.db by hand.
+    """
+    if keeps_admin:
+        return
+    admins = service.app_db.usernames_with("admin", _permissions.WRITE)
+    if [name for name in admins if name.lower() != target.lower()]:
+        return
+    if any(name.lower() == target.lower() for name in admins):
+        raise ValueError(
+            f"{target} is the only account with administrator access. Give "
+            f"another account administrator access first, or there would be "
+            f"no way to manage accounts at all.")
+
+
 def post_user_permissions(service, params, body) -> dict:
     username = str(body.get("username", "")).strip()
     if not username:
         raise ValueError("Which account?")
     if not service.app_db.user(username):
         raise ValueError(f"No account called {username}")
+    me = params.get("_username", "")
+    # Nobody edits their own grants. An administrator who wants a different
+    # set asks another administrator for it, which is what makes the grid a
+    # record of a decision rather than of a self-service action — and it
+    # closes the "grant yourself every module" step the review found.
+    if username.lower() == me.lower():
+        raise ValueError(
+            "You cannot change your own permissions. Ask another "
+            "administrator to make the change.")
     grants = body.get("grants") or {}
+    _last_admin_guard(service, username,
+                      grants.get("admin") == _permissions.WRITE)
     service.app_db.set_permissions(username, grants)
     service.log.add(SYSTEM_CATEGORY,
                     f"Permissions for {username} changed by "
@@ -4307,6 +4342,7 @@ def delete_user(service, params, body, username: str = "") -> dict:
         raise ValueError(f"No account called {target}")
     if service.app_db.user_count() <= 1:
         raise ValueError("That is the only account; there would be no way back in")
+    _last_admin_guard(service, target, keeps_admin=False)
 
     service.app_db.remove_user(target)
     ended = service.sessions.destroy_user(target)

@@ -27,6 +27,16 @@ MODULES = (
     # slotted in beside configrx so the grid a user already knows does not
     # reshuffle.
     "ssh",
+    # Not a tab either: administering the application itself — accounts and
+    # their grants, password resets for other people, the maintenance
+    # actions that delete retention data, the audit log, and whether this
+    # host may replace its own code from GitHub. It exists because
+    # `settings: write` was quietly all of that as well as "may change the
+    # poll interval": the lowest-privilege way to hold Settings was also the
+    # way to grant yourself every module. Appended, again, so the grid does
+    # not reshuffle; migrated onto the accounts that already held
+    # settings:write, so nobody loses access on upgrade.
+    "admin",
 )
 
 READ = "read"

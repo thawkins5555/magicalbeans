@@ -40,13 +40,17 @@ R, W = permissions.READ, permissions.WRITE
 
 def _password_requirement(params, body):
     """Changing your own password is always allowed (per-route None); only
-    resetting a *different* account's needs the same Settings-write gate
+    resetting a *different* account's needs the same administrator gate
     user management itself sits behind — mirrors post_password's own
     `resetting = target.lower() != me.lower()` check, since the route
-    table can't see into the request body on its own."""
+    table can't see into the request body on its own.
+
+    Administrator rather than Settings write since 4.37: resetting someone
+    else's password is taking their account, and that belongs with creating
+    and deleting accounts, not with changing a refresh interval."""
     me = params.get("_username", "")
     target = str(body.get("username", "") or me)
-    return ("settings", W) if target.lower() != me.lower() else None
+    return ("admin", W) if target.lower() != me.lower() else None
 
 
 def _settings_requirement(params, body):
@@ -78,10 +82,14 @@ ROUTES = [
     ("POST", r"^/api/logout$", api.post_logout, None),
     ("POST", r"^/api/heartbeat$", api.post_heartbeat, None),
     ("GET", r"^/api/session$", api.get_session, None),
-    ("GET", r"^/api/users$", api.get_users, ("settings", W)),
-    ("POST", r"^/api/users$", api.post_user, ("settings", W)),
-    ("DELETE", r"^/api/users$", api.delete_user, ("settings", W)),
-    ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("settings", W)),
+    # Accounts and their grants are the `admin` capability's, not
+    # Settings'. Settings write used to be all of this as well: an account
+    # granted it to change a retention cap could grant itself every module,
+    # reset anyone's password and trigger the self-update.
+    ("GET", r"^/api/users$", api.get_users, ("admin", W)),
+    ("POST", r"^/api/users$", api.post_user, ("admin", W)),
+    ("DELETE", r"^/api/users$", api.delete_user, ("admin", W)),
+    ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
     ("GET", r"^/api/state$", api.get_state, None),
     ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
@@ -261,8 +269,10 @@ ROUTES = [
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
-    ("POST", r"^/api/maintenance$", api.post_maintenance, ("settings", W)),
-    ("POST", r"^/api/update$", api.post_update, ("settings", W)),
+    # Maintenance deletes retention data outright and self-update replaces
+    # this host's own code: both are administrator acts, not settings.
+    ("POST", r"^/api/maintenance$", api.post_maintenance, ("admin", W)),
+    ("POST", r"^/api/update$", api.post_update, ("admin", W)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)

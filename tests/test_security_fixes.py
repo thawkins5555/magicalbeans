@@ -647,12 +647,113 @@ def main() -> int:
     check("D7 the real threshold locks the account out with 429",
           status == 429 and "Try again" in str(payload.get("error", "")),
           f"{status} {payload}")
-    SERVICE.throttle.clear("lockme")
+    # Every failure above came from 127.0.0.1, so the ADDRESS is locked out
+    # too — which is the point of counting it separately, and would stop
+    # the rest of this suite signing in. Stand in for the fifteen minutes
+    # passing.
+    SERVICE.throttle._failures.clear()
 
     # Concurrency cannot dilute the throttle: the verifications serialise.
     check("D7 password verification is bounded by a semaphore",
           getattr(__import__("netpath.web.api", fromlist=["x"]),
                   "_LOGIN_SLOTS")._value <= 4)
+
+    # ------------------------------------------------ D8 the admin capability
+    check("D8 admin is appended after ssh in MODULES",
+          permissions.MODULES[-2:] == ("ssh", "admin"),
+          str(permissions.MODULES))
+    check("D8 the seeded account holds it",
+          SERVICE.app_db.permissions_for("admin").get("admin") == "write")
+
+    settings_cookie = make_user("settingswrite", {"settings": "write"})
+    for method, path, payload in (("GET", "/api/users", None),
+                                  ("POST", "/api/users",
+                                   {"username": "sneaky", "password": "Corr3ct-Horse-B4t"}),
+                                  ("POST", "/api/users/permissions",
+                                   {"username": "settingswrite",
+                                    "grants": {"admin": "write"}}),
+                                  ("POST", "/api/maintenance", {"action": "redns"}),
+                                  ("POST", "/api/update", {})):
+        status, _h, body_out = req(method, path, payload, cookie=settings_cookie)
+        check(f"D8 settings:write is refused {method} {path}",
+              status == 403, f"{status} {body_out}")
+
+    status, _h, payload = req("POST", "/api/settings",
+                              {"scope": "global", "values": {"updates_enabled": True}},
+                              cookie=settings_cookie)
+    check("D8 settings:write cannot turn self-update on",
+          status == 401 and "administrator" in str(payload.get("error", "")),
+          f"{status} {payload}")
+    check("D8 …and it stayed off",
+          SERVICE.app_db.settings().get("updates_enabled") is False)
+
+    status, _h, payload = req("POST", "/api/password",
+                              {"username": "debugonly",
+                               "new_password": "An0ther-Horse-Battery"},
+                              cookie=settings_cookie)
+    check("D8 settings:write cannot reset another account's password",
+          status == 403, f"{status} {payload}")
+
+    # An administrator cannot edit their own grants, and the last one
+    # cannot be reduced or removed.
+    status, _h, payload = req("POST", "/api/users/permissions",
+                              {"username": "admin", "grants": {"nodes": "read"}},
+                              cookie=admin_cookie)
+    check("D8 an administrator cannot change their own permissions",
+          status == 400 and "your own" in str(payload.get("error", "")),
+          f"{status} {payload}")
+
+    make_user("admin2", {m: "write" for m in permissions.MODULES})
+    status, _h, payload = req("POST", "/api/users/permissions",
+                              {"username": "admin2", "grants": {"nodes": "read"}},
+                              cookie=admin_cookie)
+    check("D8 one administrator may reduce another", status == 200,
+          f"{status} {payload}")
+
+    make_user("admin3", {m: "write" for m in permissions.MODULES})
+    status, _h, payload = req("DELETE", "/api/users", {"username": "admin3"},
+                              cookie=admin_cookie)
+    check("D8 …and remove another", status == 200, f"{status} {payload}")
+
+    # The last-administrator guard is a backstop rather than a reachable
+    # route: the caller must be an administrator and cannot target
+    # themselves, so the two routes above can never leave zero. Exercised
+    # directly, which is the only honest way to show it holds.
+    import netpath.web.api as api_mod
+    admins_now = SERVICE.app_db.usernames_with("admin", "write")
+    try:
+        api_mod._last_admin_guard(SERVICE, admins_now[0], keeps_admin=False)
+        refused = False
+    except ValueError:
+        refused = True
+    check("D8 the last administrator cannot be reduced away",
+          admins_now == ["admin"] and refused, str(admins_now))
+
+    # The migration: an account holding settings:write before the upgrade
+    # receives admin, once, and revoking it afterwards sticks.
+    from netpath.appdb import AppDatabase
+    migrated_path = os.path.join(TMPDIR, "migrated.db")
+    # Opened once so the permission table exists, then reopened: that is an
+    # install that already had per-module grants, which is the case the
+    # admin backfill is about. (A database with no permission table at all
+    # predates the whole feature and gets write on everything, admin
+    # included — the separate, older backfill.)
+    AppDatabase(migrated_path).close()
+    legacy = AppDatabase(migrated_path)
+    legacy.add_user("olduser", "x", must_change=False)
+    legacy.add_user("reader", "x", must_change=False)
+    legacy.set_permissions("olduser", {"settings": "write", "nodes": "write"})
+    legacy.set_permissions("reader", {"settings": "read", "nodes": "read"})
+    legacy.backfill_permissions()
+    check("D8 the migration grants admin to settings:write accounts",
+          legacy.permissions_for("olduser").get("admin") == "write")
+    check("D8 …and to nobody else",
+          legacy.permissions_for("reader").get("admin") is None)
+    legacy.set_permissions("olduser", {"settings": "write", "nodes": "write"})
+    legacy.backfill_permissions()
+    check("D8 the migration is idempotent — revoking it sticks",
+          legacy.permissions_for("olduser").get("admin") is None)
+    legacy.close()
 
     return 0
 

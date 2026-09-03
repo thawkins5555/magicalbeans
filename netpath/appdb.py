@@ -24,12 +24,15 @@ tokens out of any file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 
 from . import dbopen
+
+log_module = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -90,6 +93,8 @@ MIGRATION_MARKER = "migrated_from_netpath_db"
 # administrator who deliberately takes the permission away is not handed it
 # back on the next restart.
 SSH_BACKFILL_MARKER = "ssh_permission_backfilled"
+# The same, for the `admin` capability split out of `settings` in 4.37.
+ADMIN_BACKFILL_MARKER = "admin_permission_backfilled"
 
 HOSTNAME_TTL_S = 7 * 86400
 ASN_TTL_S = 30 * 86400
@@ -182,19 +187,71 @@ class AppDatabase:
         # the ssh marker having granted nobody, permanently.
         self._needs_full_backfill = not had_permissions_table
 
-    def backfill_permissions(self) -> None:
+    def backfill_permissions(self, log=None) -> None:
         """Grants the permissions an upgrade owes existing accounts. Call it
         once the `users` table is final — that is, after migrate_from() has
-        had its chance to bring accounts in from a legacy netpath.db. Both
-        halves are idempotent (the full backfill only runs when this database
-        had no user_permissions table when it was opened, and each is an
-        INSERT OR IGNORE behind a marker), so a second call does nothing."""
+        had its chance to bring accounts in from a legacy netpath.db. Every
+        half is idempotent (the full backfill only runs when this database
+        had no user_permissions table when it was opened, and each of the
+        others is an INSERT OR IGNORE behind a marker), so a second call
+        does nothing.
+
+        `log` is the application's event log when the caller has one, so an
+        operator sees which accounts were granted what; the module logger
+        gets the same line either way.
+        """
         with self._lock:
             if self._needs_full_backfill:
                 self._backfill_full_permissions()
                 self._needs_full_backfill = False
             self._backfill_ssh_permission()
+            self._backfill_admin_permission(log)
             self._conn.commit()
+
+    def _backfill_admin_permission(self, log=None) -> None:
+        """`admin` is new in 4.37: it is the half of `settings` that was
+        never named — creating and deleting accounts, changing anyone's
+        grants, resetting other people's passwords, the maintenance actions
+        that delete retention data, reading the audit log, and letting this
+        host replace its own code. Every existing account that holds
+        `settings: write` was already able to do all of it, so taking it
+        away on upgrade would lock an install out of its own user
+        management. They get `admin: write`; nobody else does.
+
+        Exactly once: the marker is written whether or not anything is
+        granted, so revoking the capability afterwards sticks. A fresh
+        install has no users at this point (the default admin is seeded
+        later, in Service.__init__, with every module including this one),
+        so it is a no-op there.
+
+        Called from backfill_permissions(), which holds the lock, commits,
+        and only runs once the accounts have been migrated in — the marker
+        must not be spent on an empty table.
+        """
+        from . import permissions
+        if self._conn.execute("SELECT 1 FROM meta WHERE key = ?",
+                              (ADMIN_BACKFILL_MARKER,)).fetchone():
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+            (ADMIN_BACKFILL_MARKER, str(time.time())))
+        granted = [row["username"] for row in self._conn.execute(
+            "SELECT username FROM user_permissions WHERE module = 'settings'"
+            " AND level = ? ORDER BY username COLLATE NOCASE",
+            (permissions.WRITE,)).fetchall()]
+        for username in granted:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO user_permissions(username, module, level)"
+                " VALUES (?,?,?)", (username, "admin", permissions.WRITE))
+        if granted:
+            message = ("Administrator access is now its own permission. "
+                       + ", ".join(granted) + " already held Settings write, "
+                       "which included it, so they keep it; every other "
+                       "account starts without it.")
+            log_module.info("admin backfill granted: %s", ", ".join(granted))
+            if log is not None:
+                from .eventlog import SYSTEM
+                log.add(SYSTEM, message)
 
     def _backfill_full_permissions(self) -> None:
         """user_permissions is new — an install upgrading from before this
@@ -245,7 +302,13 @@ class AppDatabase:
         self._conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
             (SSH_BACKFILL_MARKER, str(time.time())))
-        others = [module for module in permissions.MODULES if module != "ssh"]
+        # Every module that predates BOTH capabilities. `admin` has to be
+        # excluded as well as `ssh`: it was appended in 4.37, so no existing
+        # account has a row for it, and comparing against it would mean
+        # "holds write on everything" was true of nobody and this backfill
+        # silently granted ssh to no one on the upgrade path it exists for.
+        others = [module for module in permissions.MODULES
+                  if module not in ("ssh", "admin")]
         for row in self._conn.execute("SELECT username FROM users").fetchall():
             username = row["username"]
             grants = {grant["module"]: grant["level"] for grant in
@@ -370,6 +433,18 @@ class AppDatabase:
                 "SELECT module, level FROM user_permissions"
                 " WHERE username = ? COLLATE NOCASE", (username,)).fetchall()
         return {row["module"]: row["level"] for row in rows}
+
+    def usernames_with(self, module: str, level: str) -> list[str]:
+        """Every account holding exactly `level` on `module`. Used to keep
+        the last administrator from being reduced or removed — an install
+        with no administrator left has no way back into its own user
+        management short of editing the database by hand."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT username FROM user_permissions WHERE module = ?"
+                " AND level = ? ORDER BY username COLLATE NOCASE",
+                (module, level)).fetchall()
+        return [row["username"] for row in rows]
 
     def set_permissions(self, username: str, grants: dict[str, str]) -> None:
         """Replaces this account's entire permission set with `grants`
