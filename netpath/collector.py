@@ -14,6 +14,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 
 from .eventlog import ERROR, NETFLOW, NullLog
 from .flowdb import FlowDatabase
@@ -51,6 +52,13 @@ class Collector:
         self.started_at = 0.0
         self.counters = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
                          "errors": 0, "last_packet": 0.0, "last_template": 0.0}
+        # A receive thread must never be able to die on packet content, so its
+        # per-datagram work is guarded and the failures counted here; _crash
+        # records a thread that ended anyway, so the status strip can say
+        # "stopped unexpectedly" instead of looking like an operator stop.
+        self._loop_errors = 0
+        self._last_error_log = 0.0
+        self._crash: str | None = None
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
@@ -65,6 +73,8 @@ class Collector:
         self.stop()
         self._settings = dict(settings)
         self.error = None
+        self._crash = None
+        self._loop_errors = 0
         self._stop.clear()
 
         self._versions = set()
@@ -122,10 +132,12 @@ class Collector:
 
         self._sock = sock
         self.bound = (address, port)
-        self._rx_thread = threading.Thread(target=self._receive, name="netflow-rx",
-                                           daemon=True)
-        self._wr_thread = threading.Thread(target=self._write, name="netflow-wr",
-                                           daemon=True)
+        self._rx_thread = threading.Thread(
+            target=lambda: self._guard(self._receive, "netflow-rx"),
+            name="netflow-rx", daemon=True)
+        self._wr_thread = threading.Thread(
+            target=lambda: self._guard(self._write, "netflow-wr"),
+            name="netflow-wr", daemon=True)
         self.started_at = time.time()
         self._seen_exporters.clear()
         self._rx_thread.start()
@@ -155,6 +167,34 @@ class Collector:
 
     # ---------------------------------------------------------------- threads
 
+    def _guard(self, target, name: str) -> None:
+        """Run a collector thread and remember how it ended.
+
+        Without this an exception simply printed itself to stderr and the
+        listener was gone with `status_text` still reading "Collector
+        stopped", which is what an operator sees after a deliberate stop.
+        """
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set():
+                self._crash = f"{name} ended unexpectedly"
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a datagram the receive path could not process, and log at
+        most one traceback a minute so a flood cannot fill the event log."""
+        self._loop_errors += 1
+        self.counters["errors"] = self.decoder.stats["errors"] + self._loop_errors
+        now = time.time()
+        if now - self._last_error_log >= 60:
+            self._last_error_log = now
+            self.log.add(ERROR, f"Receive error: {exc}",
+                         detail=traceback.format_exc())
+
     def _receive(self) -> None:
         sock = self._sock
         while not self._stop.is_set() and sock is not None:
@@ -164,49 +204,54 @@ class Collector:
                 continue
             except OSError:
                 break
-
-            exporter = address[0]
-            if self._allowed and exporter not in self._allowed:
-                self.counters["rejected"] += 1
-                continue
-            if not self._settings.get("auto_accept_exporters", True) and not self._allowed:
-                self.counters["rejected"] += 1
-                continue
-            if len(data) >= 2:
-                version = int.from_bytes(data[:2], "big")
-                if version not in self._versions:
-                    self.counters["rejected"] += 1
-                    continue
-
-            self.counters["packets"] += 1
-            self.counters["last_packet"] = time.time()
-            templates_before = self.decoder.stats["templates"]
-            errors_before = self.decoder.stats["errors"]
-            flows = self.decoder.decode(data, exporter)
-
-            if exporter not in self._seen_exporters:
-                self._seen_exporters.add(exporter)
-                self.log.add(NETFLOW, f"First packet from exporter {exporter}",
-                             target=exporter,
-                             detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
-                                    f"bytes    {len(data)}\n"
-                                    f"sampling {self.decoder.sampling_for(exporter)}")
-            gained = self.decoder.stats["templates"] - templates_before
-            if gained:
-                self.counters["last_template"] = time.time()
-                self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
-                             target=exporter)
-            if self.decoder.stats["errors"] > errors_before:
-                self.log.add(ERROR, f"Undecodable packet from {exporter}",
-                             target=exporter,
-                             detail=f"{len(data)} bytes, first 32: {data[:32].hex(' ')}")
-            self.counters["errors"] = self.decoder.stats["errors"]
-            if not flows:
-                continue
             try:
-                self._queue.put_nowait((exporter, flows))
-            except queue.Full:
-                self.counters["dropped"] += len(flows)
+                self._handle(data, address)
+            except Exception as exc:
+                self._note_error(exc)
+
+    def _handle(self, data: bytes, address) -> None:
+        exporter = address[0]
+        if self._allowed and exporter not in self._allowed:
+            self.counters["rejected"] += 1
+            return
+        if not self._settings.get("auto_accept_exporters", True) and not self._allowed:
+            self.counters["rejected"] += 1
+            return
+        if len(data) >= 2:
+            version = int.from_bytes(data[:2], "big")
+            if version not in self._versions:
+                self.counters["rejected"] += 1
+                return
+
+        self.counters["packets"] += 1
+        self.counters["last_packet"] = time.time()
+        templates_before = self.decoder.stats["templates"]
+        errors_before = self.decoder.stats["errors"]
+        flows = self.decoder.decode(data, exporter)
+
+        if exporter not in self._seen_exporters:
+            self._seen_exporters.add(exporter)
+            self.log.add(NETFLOW, f"First packet from exporter {exporter}",
+                         target=exporter,
+                         detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
+                                f"bytes    {len(data)}\n"
+                                f"sampling {self.decoder.sampling_for(exporter)}")
+        gained = self.decoder.stats["templates"] - templates_before
+        if gained:
+            self.counters["last_template"] = time.time()
+            self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
+                         target=exporter)
+        if self.decoder.stats["errors"] > errors_before:
+            self.log.add(ERROR, f"Undecodable packet from {exporter}",
+                         target=exporter,
+                         detail=f"{len(data)} bytes, first 32: {data[:32].hex(' ')}")
+        self.counters["errors"] = self.decoder.stats["errors"] + self._loop_errors
+        if not flows:
+            return
+        try:
+            self._queue.put_nowait((exporter, flows))
+        except queue.Full:
+            self.counters["dropped"] += len(flows)
 
     def _write(self) -> None:
         pending: list = []
@@ -246,6 +291,8 @@ class Collector:
         if self.error:
             return self.error
         if not self.running:
+            if self._crash:
+                return f"Collector stopped unexpectedly: {self._crash}"
             return "Collector stopped"
         address, port = self.bound or ("?", 0)
         base = f"Listening on {address}:{port} (UDP)"

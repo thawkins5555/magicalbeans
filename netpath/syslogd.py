@@ -13,6 +13,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 
 from .eventlog import ERROR, NullLog, SYSTEM
 from .syslogdb import SyslogDatabase
@@ -48,7 +49,13 @@ class SyslogCollector:
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
         self.counters = {"messages": 0, "stored": 0, "dropped": 0,
-                         "rejected": 0, "filtered": 0, "last_message": 0.0}
+                         "rejected": 0, "filtered": 0, "errors": 0,
+                         "last_message": 0.0}
+        # A receive thread must never die on message content; failures are
+        # counted here and _crash records a thread that ended anyway so the
+        # status strip does not read like a deliberate stop.
+        self._last_error_log = 0.0
+        self._crash: str | None = None
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
@@ -66,6 +73,7 @@ class SyslogCollector:
     def start(self, settings: dict) -> bool:
         self.stop()
         self.error = None
+        self._crash = None
         self._stop.clear()
         self._seen.clear()
 
@@ -145,9 +153,33 @@ class SyslogCollector:
         return sock
 
     def _spawn(self, target, name: str) -> None:
-        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread = threading.Thread(target=lambda: self._guard(target, name),
+                                  name=name, daemon=True)
         thread.start()
         self._threads.append(thread)
+
+    def _guard(self, target, name: str) -> None:
+        """Run a collector thread and remember how it ended, so a crash reads
+        as "stopped unexpectedly" rather than as an operator stop."""
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set() and name != "syslog-tcp-client":
+                self._crash = f"{name} ended unexpectedly"
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a message the receive path could not process; log at most one
+        traceback a minute so a flood cannot fill the event log."""
+        self.counters["errors"] += 1
+        now = time.time()
+        if now - self._last_error_log >= 60:
+            self._last_error_log = now
+            self.log.add(ERROR, f"Receive error: {exc}",
+                         detail=traceback.format_exc())
 
     def stop(self) -> None:
         self._stop.set()
@@ -205,7 +237,10 @@ class SyslogCollector:
                 continue
             except OSError:
                 break
-            self._enqueue(data, address[0])
+            try:
+                self._enqueue(data, address[0])
+            except Exception as exc:
+                self._note_error(exc)
 
     def _receive_tcp(self) -> None:
         sock = self._tcp
@@ -251,6 +286,9 @@ class SyslogCollector:
                     buffer = buffer[newline + 1:]
         except (OSError, ValueError):
             pass
+        except Exception as exc:
+            # One malformed stream must not take the whole receiver down.
+            self._note_error(exc)
         finally:
             try:
                 client.close()
@@ -288,6 +326,8 @@ class SyslogCollector:
         if self.error:
             return self.error
         if not self.running:
+            if self._crash:
+                return f"Collector stopped unexpectedly: {self._crash}"
             return "Collector stopped"
         address, _ = self.bound or ("?", 0)
         where = ", ".join(f"{name} {value}" for name, value in self.ports.items())

@@ -147,7 +147,11 @@ class Decoder:
             else:
                 self.stats["errors"] += 1
                 return []
-        except (struct.error, IndexError, ValueError):
+        except (DecodeError, struct.error, IndexError, ValueError):
+            # DecodeError belongs in this tuple: the short-header guards below
+            # raise it, and without it one runt datagram unwound out of the
+            # receive thread and killed the listener for the life of the
+            # process.
             self.stats["errors"] += 1
             return []
         self.stats["flows"] += len(flows)

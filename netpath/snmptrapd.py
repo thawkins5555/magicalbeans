@@ -12,6 +12,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 
 from .eventlog import ERROR, NullLog, SNMP
 from .snmptrapdb import SnmpTrapDatabase
@@ -48,7 +49,13 @@ class TrapCollector:
         self.bound: tuple[str, int] | None = None
         self.counters = {"packets": 0, "traps": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "bad_community": 0, "undecodable": 0,
-                         "filtered": 0, "informs_acked": 0, "last_trap": 0.0}
+                         "filtered": 0, "informs_acked": 0, "errors": 0,
+                         "last_trap": 0.0}
+        # A receive thread must never die on packet content; failures are
+        # counted here and _crash records a thread that ended anyway so the
+        # status strip does not read like a deliberate stop.
+        self._last_error_log = 0.0
+        self._crash: str | None = None
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
@@ -68,6 +75,7 @@ class TrapCollector:
     def start(self, settings: dict) -> bool:
         self.stop()
         self.error = None
+        self._crash = None
         self._stop.clear()
         self._seen.clear()
 
@@ -144,9 +152,33 @@ class TrapCollector:
         return sock
 
     def _spawn(self, target, name: str) -> None:
-        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread = threading.Thread(target=lambda: self._guard(target, name),
+                                  name=name, daemon=True)
         thread.start()
         self._threads.append(thread)
+
+    def _guard(self, target, name: str) -> None:
+        """Run a receiver thread and remember how it ended, so a crash reads
+        as "stopped unexpectedly" rather than as an operator stop."""
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set():
+                self._crash = f"{name} ended unexpectedly"
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a datagram the receive path could not process; log at most
+        one traceback a minute so a flood cannot fill the event log."""
+        self.counters["errors"] += 1
+        now = time.time()
+        if now - self._last_error_log >= 60:
+            self._last_error_log = now
+            self.log.add(ERROR, f"Receive error: {exc}",
+                         detail=traceback.format_exc())
 
     def stop(self) -> None:
         self._stop.set()
@@ -189,7 +221,10 @@ class TrapCollector:
                 continue
             except OSError:
                 break
-            self._enqueue(data, address)
+            try:
+                self._enqueue(data, address)
+            except Exception as exc:
+                self._note_error(exc)
 
     def _enqueue(self, data: bytes, address) -> None:
         source = address[0]
@@ -280,6 +315,8 @@ class TrapCollector:
         if self.error:
             return self.error
         if not self.running:
+            if self._crash:
+                return f"Receiver stopped unexpectedly: {self._crash}"
             return "Receiver stopped"
         address, port = self.bound or ("?", 0)
         base = f"Listening on {address} (UDP {port})"
