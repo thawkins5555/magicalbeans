@@ -13,6 +13,7 @@ Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`)
 #### Foundation
 
 - `netpath/dbopen.py`: one `connect()` helper that opens a database and narrows the file and its WAL/SHM companions to owner-only (0600) on POSIX hosts. Modules adopt it as they are touched.
+- `netpath/dbmaint.py`: `enable_incremental_vacuum()` converts a database to incremental auto-vacuum once, and `reclaim()` frees pages in short locked steps followed by a WAL truncate, replacing the whole-file `VACUUM` that stalled every writer during prunes and size trims.
 
 ### 4.35.0 — A question mark beside the setting
 
