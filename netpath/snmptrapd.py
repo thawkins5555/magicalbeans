@@ -41,8 +41,13 @@ def _ago(ts: float) -> str:
 
 
 class TrapCollector:
-    def __init__(self, db: SnmpTrapDatabase, log=None, on_batch=None):
+    def __init__(self, db: SnmpTrapDatabase, log=None, on_batch=None,
+                 nodes_db=None):
         self.db = db
+        # Optional: when the Nodes database is available, a v1 trap's
+        # agent-address is recorded as another address of the sending device,
+        # so the next message from that address correlates by name.
+        self.nodes_db = nodes_db
         self.log = log or NullLog()
         self.on_batch = on_batch
         self.decoder = Decoder()
@@ -74,6 +79,10 @@ class TrapCollector:
         self._last_bad_auth_log = 0.0
         self._min_severity = 7
         self._seen: collections.OrderedDict = collections.OrderedDict()
+        # (source, agent address) pairs already written to the alias table, so
+        # a steady stream of v1 traps costs one database write, not one per
+        # trap. Keyed on spoofable data, so bounded and LRU.
+        self._learned: collections.OrderedDict = collections.OrderedDict()
 
     @property
     def running(self) -> bool:
@@ -322,6 +331,7 @@ class TrapCollector:
 
         self.counters["traps"] += 1
         self.counters["last_trap"] = time.time()
+        self._learn_agent_address(trap)
         if self._first_from(source):
             self.log.add(SNMP, f"First SNMP trap from {source} "
                                f"({VERSION_NAMES.get(trap.version, '?')}, "
@@ -337,6 +347,40 @@ class TrapCollector:
             self._queue.put_nowait(trap)
         except queue.Full:
             self.counters["dropped"] += 1
+
+    def _learn_agent_address(self, trap) -> None:
+        """Record a v1 trap's agent-address as another address of the sender.
+
+        RFC 1157 traps carry the agent's own idea of its address, which on a
+        device with a management VRF or a loopback trap-source is not the
+        address the datagram came from. The decoder has always parsed it and
+        the database has always stored it; nothing used it for correlation.
+        Writing it into the Nodes alias table means the operator sees the
+        device's name against those traps from then on.
+        """
+        if trap.version != 0 or not trap.agent_addr:
+            return
+        if trap.agent_addr == trap.source or trap.agent_addr == "0.0.0.0":
+            return
+        key = (trap.source, trap.agent_addr)
+        if key in self._learned:
+            self._learned.move_to_end(key)
+            return
+        self._learned[key] = None
+        while len(self._learned) > MAX_SEEN_SOURCES:
+            self._learned.popitem(last=False)
+
+        record = getattr(self.nodes_db, "record_device_addresses", None)
+        if record is None:
+            return
+        try:
+            device = self.nodes_db.device_by_ip(trap.source)
+            if device is None:
+                return
+            record(device["id"], [trap.agent_addr], "trap_agent_addr")
+        except Exception as exc:
+            # Correlation is a convenience; never let it cost a trap.
+            self._note_error(exc)
 
     def _accepted_auth(self, trap) -> bool:
         """Enforce the SNMPv3 digest the decoder already computed.

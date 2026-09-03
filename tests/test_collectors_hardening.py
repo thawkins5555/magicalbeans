@@ -20,7 +20,7 @@ from _paths import free_udp_port, tmpdir
 
 TMPDIR = tmpdir("collectors_hardening_")
 
-from netpath import kerneldrops, nfdecode, trapdecode
+from netpath import hostresolve, kerneldrops, nfdecode, trapdecode
 from netpath.collector import Collector
 from netpath.flowdb import FlowDatabase
 from netpath.snmptrapd import TrapCollector
@@ -667,6 +667,23 @@ def test_c6_forged_v3_traps_are_dropped() -> None:
           "the setting ships on by default")
 
 
+def v1_trap(agent_addr: str = "192.168.255.7",
+            enterprise: str = "1.3.6.1.4.1.9") -> bytes:
+    """An RFC 1157 v1 linkDown trap whose agent-address differs from the
+    address it is sent from, as a device with a loopback trap-source does."""
+    octets = bytes(int(part) for part in agent_addr.split("."))
+    varbinds = _tlv(0x30, _tlv(0x30, _oid_tlv("1.3.6.1.2.1.2.2.1.1.3")
+                               + _int_tlv(3)))
+    pdu = _tlv(0xA4,
+               _oid_tlv(enterprise)
+               + _tlv(0x40, octets)              # agent-addr, IpAddress
+               + _int_tlv(2)                     # generic-trap: linkDown
+               + _int_tlv(0)                     # specific-trap
+               + _tlv(0x43, b"\x00\x01\x00\x00")  # time-stamp
+               + varbinds)
+    return _tlv(0x30, _int_tlv(0) + _tlv(0x04, b"public") + pdu)
+
+
 # ----------------------------------------------------------------------- C7
 
 def test_c7_syslog_robustness() -> None:
@@ -852,6 +869,119 @@ def test_c7_syslog_robustness() -> None:
         syslog_db.close()
 
 
+# ----------------------------------------------------------------------- C8
+
+class FakeNodes:
+    """Enough of NodesDatabase to exercise the alias path.
+
+    device_id_for_address and record_device_addresses are workstream B's
+    (they come with the device_addresses table); this stands in for them so
+    the collector side can be proved on its own, and proves the getattr
+    fallbacks for a database that does not have them yet.
+    """
+
+    def __init__(self, devices, aliases=None):
+        self.devices = devices                    # ip -> dict row
+        self.aliases = dict(aliases or {})        # ip -> device id
+        self.recorded = []
+
+    def device_by_ip(self, ip):
+        return self.devices.get(ip)
+
+    def device(self, device_id):
+        for row in self.devices.values():
+            if row["id"] == device_id:
+                return row
+        return None
+
+    def device_id_for_address(self, ip):
+        return self.aliases.get(ip)
+
+    def record_device_addresses(self, device_id, addresses, source):
+        self.recorded.append((device_id, list(addresses), source))
+        for address in addresses:
+            self.aliases[address] = device_id
+
+
+class LegacyNodes(FakeNodes):
+    """A 4.35-era nodes database: no alias table, no alias methods."""
+
+    device_id_for_address = None
+    record_device_addresses = None
+
+    def __getattribute__(self, name):
+        if name in ("device_id_for_address", "record_device_addresses"):
+            raise AttributeError(name)
+        return object.__getattribute__(self, name)
+
+
+def _device_row(device_id, ip, name, sys_name=""):
+    return {"id": device_id, "ip": ip, "name": name, "sys_name": sys_name,
+            "display_name_source": "auto"}
+
+
+def test_c8_device_correlation_through_aliases() -> None:
+    """Correlation was exact IP-string equality against devices.ip, so a
+    switch polled at its management VLAN address but logging from Loopback0 —
+    the standard build wherever there is a management VRF — matched nothing.
+    The v1 agent-address was parsed and stored and never used."""
+    print("C8: traps and syslog from a loopback address name the device")
+
+    core = _device_row(7, "10.0.0.1", "10.0.0.1", "core-sw-a")
+    nodes = FakeNodes({"10.0.0.1": core})
+
+    check(hostresolve.resolve_name(nodes, None, "10.0.0.1") == "core-sw-a",
+          "the polling address still resolves as before")
+    check(hostresolve.resolve_name(nodes, None, "192.168.255.7") is None,
+          "an address the device is not known to own resolves to nothing")
+
+    nodes.aliases["192.168.255.7"] = 7
+    check(hostresolve.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
+          "once the alias is known, the loopback address names the device")
+
+    names = {"192.168.255.7": ""}
+    filled = hostresolve.fill_from_nodes(nodes, names, ["192.168.255.7"])
+    check(names["192.168.255.7"] == "core-sw-a" and filled,
+          "NetPath hop labels resolve through the alias table too")
+
+    legacy = LegacyNodes({"10.0.0.1": core})
+    check(hostresolve.resolve_name(legacy, None, "192.168.255.7") is None
+          and hostresolve.resolve_name(legacy, None, "10.0.0.1") == "core-sw-a",
+          "a nodes database without the alias table is simply skipped")
+
+    # --- the v1 agent address is learned from the trap --------------------
+    nodes = FakeNodes({"10.0.0.1": core})
+    trap_db = SnmpTrapDatabase(db_path("c8-traps.db"))
+    traps = TrapCollector(trap_db, nodes_db=nodes)
+    try:
+        for _ in range(50):
+            traps._enqueue(v1_trap(agent_addr="192.168.255.7"),
+                           ("10.0.0.1", 40000))
+        check(nodes.recorded == [(7, ["192.168.255.7"], "trap_agent_addr")],
+              f"the agent address is recorded once, not once per trap "
+              f"({len(nodes.recorded)} write(s))")
+        check(hostresolve.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
+              "so the next message from that address names the device")
+
+        # An unknown source teaches nothing, and must not cost the trap.
+        before = len(nodes.recorded)
+        traps._enqueue(v1_trap(agent_addr="192.168.255.9"), ("10.99.99.99", 40000))
+        check(len(nodes.recorded) == before,
+              "a trap from a source that maps to no device records nothing")
+        check(traps.counters["traps"] == 51,
+              "and every trap is still counted and queued")
+    finally:
+        trap_db.close()
+
+    # Without a nodes database at all the collector behaves exactly as before.
+    trap_db = SnmpTrapDatabase(db_path("c8-nonodes.db"))
+    traps = TrapCollector(trap_db)
+    traps._enqueue(v1_trap(agent_addr="192.168.255.7"), ("10.0.0.1", 40000))
+    check(traps.counters["traps"] == 1,
+          "a collector with no nodes database still accepts the trap")
+    trap_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -860,6 +990,7 @@ TESTS = [
     test_c5_drain_sources_can_be_caught_up,
     test_c6_forged_v3_traps_are_dropped,
     test_c7_syslog_robustness,
+    test_c8_device_correlation_through_aliases,
 ]
 
 
