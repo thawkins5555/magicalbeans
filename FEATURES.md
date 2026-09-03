@@ -7,6 +7,23 @@ rules are in `README.md` and `NETWORK-AND-STORAGE-REQUIREMENTS.md`; the
 build history is in `CHANGELOG.md`; exactly how passwords and credentials
 are protected is in `CREDENTIAL-SECURITY.md`.
 
+## Contents
+
+- [How it runs](#how-it-runs)
+- [Nodes — SNMP poller and device inventory](#nodes--snmp-poller-and-device-inventory)
+- [Alerts — rule-based alerting and email notification](#alerts--rule-based-alerting-and-email-notification)
+- [NetPath — path monitoring](#netpath--path-monitoring)
+- [NetFlow — flow collection](#netflow--flow-collection)
+- [SNMP Trap — trap and inform receiver](#snmp-trap--trap-and-inform-receiver)
+- [Syslog — message collection](#syslog--message-collection)
+- [IPAM — address inventory, conflicts, DHCP visibility](#ipam--address-inventory-conflicts-dhcp-visibility)
+- [Wireless — Fortinet AP dashboard](#wireless--fortinet-ap-dashboard)
+- [ConfigRX — SSH config backups](#configrx--ssh-config-backups)
+- [Debug](#debug)
+- [Settings](#settings)
+- [Data](#data)
+- [Deliberate limits](#deliberate-limits)
+
 **Dashboard**, **Nodes**, **Alerts**, **NetPath**, **NetFlow**, **SNMP
 Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
 and **Settings**, which stay rightmost so adding a module never moves
@@ -92,8 +109,22 @@ own subtabs.
   in the standard library and this app takes no third-party dependency),
   or **ping alone** for a device with SNMP switched off entirely. A
   device's identity (`sysDescr`, `sysName`, vendor), interface table and
-  scalar metrics (CPU/memory where UCD-SNMP-MIB or HOST-RESOURCES-MIB is
-  present) all come from the same poll.
+  scalar metrics all come from the same poll. **What "scalar metrics"
+  means, exactly**, because an earlier edition of this file overstated it:
+  CPU and memory came from **UCD-SNMP-MIB only** — `ssCpuRawIdle`,
+  `memAvailReal`, `memTotalReal`, `laLoad` — which in practice means
+  net-snmp on a Linux or BSD host and nothing else. HOST-RESOURCES-MIB was
+  named here and never actually read. From 4.37.0 both are true: a
+  best-effort vendor-health GET rides the same poll and reads
+  `hrProcessorLoad` and `hrStorageTable` where they answer, plus Cisco
+  (`cpmCPUTotal5minRev`, `ciscoMemoryPool`), Fortinet (`fgSysCpuUsage`,
+  `fgSysMemUsage`, `fgSysSesCount`) and Juniper (`jnxOperatingCPU`,
+  `jnxOperatingTemp`) health objects chosen by the device's detected
+  enterprise arc. They are recorded as `cpu_pct`, `mem_pct`, `disk_pct`,
+  `session_count` and `temp_c`, which is what makes the shipped
+  `cpu_high`, `mem_high` and `disk_high` rules live on a switch or a
+  firewall rather than only on a Linux host. Thresholds are unchanged, so
+  a device that was silent may start alerting once it starts reporting.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -380,8 +411,15 @@ own subtabs.
   decodes gets "This looks like a Ubiquiti — Install the Ubiquiti MIBs"
   with the install one click away.
 - **Arcs with no MIB still get a name** from a bundled enterprise-number
-  list; entries verified from MIB text decide at high confidence, curated
-  ones at medium, always with the arc number in the evidence.
+  list, at one of two confidence levels, always with the arc number shown as
+  the evidence. Be clear about what that confidence is: both tiers are
+  hand-authored from IANA's public Private Enterprise Number registry, and the
+  application has no way to reach that registry to check itself. **High**
+  means the arc was cross-checked against the sysObjectID a real device of that
+  make reports, or against a MIB bundled here; **medium** means it was not. A
+  wrong arc would produce a confidently wrong vendor name, so the arc number is
+  always displayed beside the name — if it disagrees with what you know the
+  device to be, the number is the thing to trust.
 - **Discovery sweeps list each device's arcs** (a few extra requests per
   device that answers SNMP, switchable off under Settings → Nodes), mark
   confidence in the results table, hint at the bundle to install, and carry
@@ -727,6 +765,30 @@ alerts and optionally emailing about them.
   is not itself polling, a critical syslog line, a new IPAM address
   conflict, an access point removed from its controller or gone offline, a
   DHCP scope running out of leases, and three NetPath path rules (below).
+  Seven of the interface and disk thresholds among those could never fire
+  before 4.37.0, because nothing wrote the metric key they read: the poller
+  now records `if_in_util_pct`, `if_out_util_pct`, `if_in_error_rate`,
+  `if_out_error_rate`, `if_in_discard_rate`, `if_out_discard_rate` and
+  `disk_pct`, both per port and as a device-level maximum, so they are live.
+- **A rule can resolve itself after a set time.** `auto_resolve_after_s` on
+  a rule, measured from the last occurrence, closes an alert that describes
+  a moment rather than a condition — "device recovered", "device rebooted",
+  "interface flapping", a trap, a syslog line — instead of leaving it on the
+  list until somebody clicks Resolve. Blank means never, which is the right
+  answer for "device not responding". The built-ins are seeded with
+  sensible values (an hour for recoveries and poll overruns, a day for
+  traps and reboots, a week for "device requires unsupported SNMP privacy")
+  and every one is editable in the rule dialog as "Auto-resolve after …
+  minutes (blank = never)".
+- **A rule can be told not to email.** `rules.notify` defaults to 1; setting
+  it to 0 leaves the rule opening and tracking alerts in the list while
+  sending nothing. `mib_missing` ships this way, because adding 250 devices
+  to a new installation used to produce 250 emails in the first minute.
+- **A threshold whose metric has gone stale is not a breach.** A sample
+  older than `threshold_stale_s` (900 seconds by default) is treated as
+  absent rather than as the current value, so a device that stopped
+  answering does not hold a CPU alert open forever with a fortnight-old
+  reading, and does not re-raise it on every tick.
 - **A built-in rule can be edited** (severity, enabled, which devices it
   applies to by a substring filter, its threshold/clear-threshold/
   consecutive-polls-before-firing where relevant, which template it
@@ -779,6 +841,31 @@ alerts and optionally emailing about them.
   duplicate — enforced by the database itself (an alert's dedup key can
   only be open or acknowledged once at a time), not by application logic
   that could race.
+
+### One outage, one alert
+
+A device can be given an **upstream device** on its own form: the switch,
+router or firewall it sits behind. It is one optional field and nothing infers
+it for you — there is no LLDP or CDP discovery in this release — but it is what
+turns a site outage into a single alert.
+
+When a device stops answering and its upstream is also down, the alert rolls up
+under the upstream's rather than opening on its own, with a note saying which
+device it was implied by. A core switch taking five hundred access switches
+with it is one "Device not responding" alert and one email instead of five
+hundred of each. When the upstream recovers, every device still down below it
+has its own alert re-opened, so nothing is quietly lost in the rollup.
+
+Two details worth knowing. Resolving the parent by hand does **not** release
+the children while the parent device is still `down` — that used to produce a
+burst of fresh alerts and emails within seconds of an operator tidying the
+list. And the chain is followed upward with a depth limit and a cycle guard, so
+a mis-typed loop (A upstream of B, B upstream of A) terminates rather than
+hanging the engine.
+
+Interface alerts are deliberately **not** rolled up under a neighbouring
+device's outage: without a neighbour map there is nothing to roll them up
+under, and guessing would hide real faults.
 
 ### NetPath destinations
 
@@ -834,6 +921,25 @@ hard to trip — a path monitor that cries wolf gets turned off.
   off is a deliberate, explicit opt-out, never a silent downgrade). A
   rate limit caps emails per hour; past it, sending is suspended for the
   rest of that hour and logged once, not per suppressed alert.
+- **Mail is sent off the engine's tick.** From 4.37.0 a notification is
+  handed to a queue drained by its own thread, so a relay that has stopped
+  answering delays mail and nothing else: the rule engine keeps evaluating,
+  opening and resolving at its normal cadence. Five consecutive failures
+  open a circuit breaker for fifteen minutes — queued mail is completed as
+  failed without a connection attempt, and the first job after the cooldown
+  is the probe that closes it again. A breaker that opens raises its own
+  alert (`smtp_failing`), because "the monitor cannot tell you anything"
+  is the one failure that cannot be delivered by email. Every attempt,
+  successful or not, is recorded against the alert and counts towards the
+  hourly cap, so a suppressed notification leaves a trace instead of
+  vanishing into a log ring.
+- **Six rules no longer email "is not responding".** `device_auth_fail`,
+  `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down` and
+  `interface_flapping` were bound to the outage template, so a missing
+  vendor MIB arrived in the inbox with the subject "acc-sw-070 is not
+  responding". They now use a generic `event_notice` template —
+  "SappiWhere: <rule> — <what>" — and an operator's own template choice is
+  never overwritten by the change.
 - **An open alert emails once by default**; a re-notify interval can be
   set to repeat while it stays open. An alert that clears — resolved
   automatically by a matching recovery occurrence, or a threshold
@@ -1161,8 +1267,21 @@ trace scheduler. Retention, a row cap and a file size cap all apply.
 ## SNMP Trap — trap and inform receiver
 
 A receiver, a search, and an hourly histogram, graphically the same shape as
-Syslog. Receive-only: there is no SNMP polling (GET/GETBULK) yet, and no
-alerting engine ties traps, syslog and future ping/SNMP polling together yet.
+Syslog. Receive-only in the sense that matters here — this module never sends
+an SNMP request; it listens. (Two sentences that used to sit in this paragraph
+said there was "no SNMP polling yet" and "no alerting engine yet". Both have
+been wrong for several releases: **Nodes** polls with GET and GETBULK, and
+**Alerts** is a rule engine over device events, traps, syslog, IPAM conflicts
+and thresholds. Traps reaching this receiver are evaluated by it.)
+
+From 4.37.0 a trap whose SNMPv3 authentication **fails** is dropped rather than
+stored. The digest was always computed and counted; it was never enforced, so a
+forged v3 trap was stored and could open an alert. The `reject_failed_auth`
+setting controls this and defaults to on; traps that cannot be verified at all
+(an unknown user name, or noAuthNoPriv) are counted separately as "unverified"
+and still stored, because refusing them would silently discard the v1 and v2c
+world. A per-source rate limit bounds what one device in a debug loop can do to
+everyone else's history.
 
 ### Collection
 
@@ -1874,8 +1993,6 @@ Default location is `%APPDATA%\netpath-monitor\` on Windows and
 schema automatically on launch, and an install that predates `app.db`
 moves its settings, accounts and name cache into it on the first start.
 
-**Data > Export window to CSV** writes the current window's traces.
-
 ---
 
 ## Deliberate limits
@@ -1894,6 +2011,27 @@ moves its settings, accounts and name cache into it on the first start.
 - **Permissions are per-module, not per-object.** An account with Nodes
   write access can edit or delete any device, not a subset of them —
   there is no per-device or per-group access control within a module.
+  There is one capability above the modules: **`admin`**, which gates user
+  administration, permission changes, the in-application update and the
+  destructive maintenance actions. It exists because "Settings: write" used
+  to imply all of those without saying so. Accounts that held Settings
+  write when the database was upgraded were granted `admin` automatically,
+  nobody can grant it to themselves, and the last account holding it cannot
+  be stripped of it.
+- **Credentials cannot be stored on anything but Windows.** Every stored
+  secret goes through Windows DPAPI, and there is no portable equivalent in
+  this release: on Linux, macOS or BSD the SNMPv3 authentication password,
+  the SSH password ConfigRX and the terminal need, an authenticated SMTP
+  password, the wireless controller's SNMP credential and the DHCP
+  credential can none of them be saved, and the API says so plainly rather
+  than accepting the value and losing it. A headless Linux deployment
+  therefore polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a
+  server that does not require authentication, and does not run config
+  backups. The forms concerned say this before you type into them rather
+  than after you submit. A portable secret store was considered for 4.37.0
+  and deliberately deferred — `CREDENTIAL-SECURITY.md` sets out what it
+  would have to promise and why a weak version of it is worse than an
+  honest refusal.
 - **Sessions do not survive a restart.** They are held in memory deliberately;
   restarting the service signs everyone out.
 - **IPAM discovery is ARP-based, so MAC addresses and conflict detection only

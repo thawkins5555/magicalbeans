@@ -1,0 +1,190 @@
+name: tests
+
+# The review's finding U-N11/§6 #13: the suites in tests/ are good and nothing
+# ran them. Two jobs here — the Python suites on both platforms this
+# application ships to, and the browser walk that PERFORMANCE_REVIEW.md used to
+# claim existed. See tests/README.md.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    name: suites (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # test_upgrade_from_previous.py checks out the previous main commit
+          # and creates every database with the previous release's own code.
+          # With a shallow clone it finds no history and skips that half.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install ping and traceroute (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends iputils-ping traceroute
+          # Deliberate. test_nodepoll_e2e.py used to pass only on machines with
+          # no `ping` binary: 127.0.0.1 answers ICMP, unreachable_ping_only kept
+          # the device 'up', and it never reached 'down'. It now disables ping
+          # on the test profile, and this line is what keeps that honest.
+          ping -c1 -W1 127.0.0.1
+
+      - name: Install paramiko (Linux)
+        if: runner.os == 'Linux'
+        # The only third-party package this repository allows, and only for
+        # ConfigRX and the SSH terminal. Without it test_ssh_hostkeys.py and
+        # test_ssh_terminal.py exit 77 and run_all.py reports SKIP, so the
+        # Windows leg of this matrix runs everything else and skips those two.
+        run: python -m pip install --disable-pip-version-check "paramiko<5"
+
+      - name: Report the environment
+        shell: bash
+        run: |
+          python -c "import sys, sqlite3; print('python', sys.version); print('sqlite', sqlite3.sqlite_version)"
+          python -c "import importlib.util as u; print('paramiko', 'yes' if u.find_spec('paramiko') else 'no')"
+
+      - name: Run the suites (Linux)
+        if: runner.os == 'Linux'
+        run: python3 tests/run_all.py
+
+      - name: Run the suites (Windows)
+        if: runner.os == 'Windows'
+        # `python3` is not reliably on PATH on the Windows images; setup-python
+        # always provides `python`. Same script, same behaviour.
+        run: python tests/run_all.py
+
+  ui-walk:
+    name: browser walk (250 devices)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+      APP_PORT: "8443"
+      CONTROL_PORT: "8099"
+      FLEET_COUNT: "50"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install ping and traceroute
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends iputils-ping traceroute
+
+      - name: Install Playwright
+        run: |
+          npm install -g playwright@1.56.1
+          sudo mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+          sudo chown "$USER" "$PLAYWRIGHT_BROWSERS_PATH"
+          npx --yes playwright@1.56.1 install --with-deps chromium
+
+      - name: Start the simulated fleet
+        run: |
+          # One UDP socket per simulated device on 127.0.0.2 upwards, all on
+          # port 161, so the unmodified poller polls them as it would real gear.
+          # Port 161 is privileged, hence sudo; -E keeps the environment and the
+          # explicit PATH keeps the setup-python interpreter.
+          ulimit -n 8192
+          mkdir -p demo/out
+          sudo -E env "PATH=$PATH" python3 -u demo/fleet.py \
+              --count "$FLEET_COUNT" --control-port "$CONTROL_PORT" \
+              > demo/out/fleet.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q listening demo/out/fleet.log && break
+            sleep 1
+          done
+          grep -q listening demo/out/fleet.log || { echo "fleet never listened"; cat demo/out/fleet.log; exit 1; }
+          curl -sf "http://127.0.0.1:$CONTROL_PORT/state" > /dev/null
+
+      - name: Start the application
+        run: |
+          # demo/bin goes first on PATH so NetPath's traceroute and the poller's
+          # ping are the scripted stand-ins that know about the simulated fleet.
+          # Root again: the trap (162), syslog (514) and NetFlow (2055)
+          # listeners bind privileged ports once seeding enables them.
+          mkdir -p demo/out/data
+          sudo -E env "PATH=$PWD/demo/bin:$PATH" python3 -u -m netpath --headless \
+              --host 127.0.0.1 --port "$APP_PORT" \
+              --db "$PWD/demo/out/data/netpath.db" \
+              > demo/out/app.log 2>&1 &
+          for i in $(seq 1 180); do
+            grep -q serving demo/out/app.log && break
+            sleep 1
+          done
+          grep -q serving demo/out/app.log || { echo "app never served"; cat demo/out/app.log; exit 1; }
+
+      - name: Seed devices, profiles and targets
+        run: |
+          # Writes demo/out/creds.txt, which the walk signs in with. It also
+          # clears the forced first-run password change, which the walk cannot
+          # do for itself.
+          sudo chown -R "$USER" demo/out
+          python3 demo/seed.py --base "http://127.0.0.1:$APP_PORT" \
+              --count "$FLEET_COUNT" --out demo/out
+          test -s demo/out/creds.txt
+
+      - name: Let the first poll cycle complete
+        run: sleep 60
+
+      - name: Run the browser walk
+        if: hashFiles('tests/ui/walk.mjs') != ''
+        run: |
+          mkdir -p demo/out/ui
+          node tests/ui/walk.mjs --base "http://127.0.0.1:$APP_PORT" \
+              --creds demo/out/creds.txt --out demo/out/ui --tag ci
+
+      - name: No browser walk in this tree
+        if: hashFiles('tests/ui/walk.mjs') == ''
+        run: |
+          echo "::warning::tests/ui/walk.mjs is not present in this tree; the browser checks did not run."
+
+      - name: Collect the logs
+        if: always()
+        run: |
+          sudo chown -R "$USER" demo/out || true
+          tail -n 200 demo/out/app.log   || true
+          tail -n 60  demo/out/fleet.log || true
+
+      - name: Upload screenshots and console output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-walk
+          path: |
+            demo/out/ui/
+            demo/out/app.log
+            demo/out/fleet.log
+          if-no-files-found: ignore
+          retention-days: 7

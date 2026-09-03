@@ -28,6 +28,24 @@ covered in full in `CREDENTIAL-SECURITY.md`, not repeated here.
 | ICMP Echo Reply (type 0) from the destination | ICMP | — | Windows only, for NetPath |
 | UDP Port Unreachable replies from the destination | ICMP | — | macOS/Linux only, for NetPath |
 
+**IPv6.** From 4.37.0 the three collectors bind dual-stack where the operating
+system allows it (`AF_INET6` with `IPV6_V6ONLY` off, falling back to IPv4 if
+that is refused), and a source arriving as an IPv4-mapped address is normalised
+back to its plain form so it still matches a device. NetPath resolves and
+traces to IPv6 destinations, and the SNMP poller reaches a device whose address
+contains a colon. Earlier releases were IPv4-only throughout, silently: a
+device on an IPv6 management plane was unreachable and nothing said so.
+
+**Credential storage is a Windows-only capability.** This is a network and
+storage requirement in practice, because it decides what a Linux host can
+actually do. Encrypted credentials use Windows DPAPI and there is no portable
+equivalent in this release, so on a non-Windows host SNMPv3 authNoPriv polling,
+ConfigRX backups, the SSH terminal's stored password, authenticated SMTP and
+the DHCP credential are all unavailable — the API refuses to store the secret
+rather than keeping it weakly. Plan a Linux deployment around SNMPv1/v2c or v3
+noAuthNoPriv and an unauthenticated relay, or run the service on Windows. See
+`CREDENTIAL-SECURITY.md`.
+
 The collector port is set under **Settings** on the NetFlow tab. Common
 alternatives are 2056, 4739 (the IPFIX default) and 9995. Ports below 1024
 require administrator rights to bind.
@@ -266,11 +284,63 @@ Rough shapes to start from:
 | NetPath | destinations × polls per day × hops | a few MB per destination per month |
 | NetFlow | flow records exported | tens of MB to several GB per day |
 | SNMP Trap | traps per device per day | ~200 bytes per trap; normally the smallest of the record files |
-| Syslog | messages per second | ~150 bytes per message |
-| Nodes | devices × poll frequency × metrics per device | a few hundred bytes per device per poll; raw samples roll up into hourly min/avg/max after 3 days |
+| Syslog | messages per second | **~455 bytes per message**, measured, not the ~150 this table used to claim — a stored row is the decoded fields *plus* the original line *plus* its entry in the FTS5 trigram search index, and the index is most of the difference. Budget for it: 10 messages/s is about 390 MB a day. |
+| Nodes | devices × poll frequency × metrics per device | ~33 bytes per sample row; see the per-port arithmetic below. Raw samples are kept for `sample_retention_days` (3 by default) and rolled up into hourly min/avg/max, which are kept for `rollup_retention_days` (400). **The rollup genuinely runs from 4.37.0**; in every earlier release `compact_rollup()` had no caller, `samples_hourly` was always empty, and a chart wider than the raw window drew nothing. |
 | Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
 | Wireless | controller count × AP count | a few KB per AP; normally tiny, since a site has a handful of controllers, not hundreds |
 | ConfigRX | device count × how often configs actually change | a device's own config text, compressed, once per change — most devices add nothing between backups |
+
+### What a port costs
+
+Nodes is the module whose storage is easiest to get wrong, because the cost is
+per *interface*, not per device, and a 48-port switch is 48 interfaces plus the
+device itself.
+
+A poll of one interface records six metrics: inbound and outbound bits per
+second, error rate, discard rate, and inbound and outbound utilisation
+percentage. A sample row is about **33 bytes**. So, per device per poll:
+
+    ports × 6 samples × 33 B  +  ~5 device-level samples (RTT, loss, CPU, memory, uptime)
+
+| Fleet | Interval | Raw samples per day | Raw bytes per day |
+| --- | --- | --- | --- |
+| 100 × 48-port switches | 120 s | 20.9 M | ~690 MB |
+| 1,000 × 48-port switches | 120 s | 209 M | ~6.9 GB |
+| 2,000 × 48-port switches | 120 s | 418 M | ~13.8 GB |
+| 2,000 × 48-port switches | 60 s | 836 M | ~27.6 GB |
+| one 500-port chassis | 120 s | 2.2 M | ~71 MB |
+
+At the shipped three-day raw retention, the 2,000-device row above settles at
+roughly **41 GB** of raw samples, which is why `sample_row_cap_per_metric`
+exists and why it is applied per metric rather than to the table as a whole.
+The hourly rollups that survive beyond three days are three rows (min, average,
+max) per metric per hour: for the same fleet that is about **17 GB for the
+full 400 days**, so the long tail costs less than half of one day of raw data
+per month.
+
+Two practical consequences. First, if you only need trends, shorten
+`sample_retention_days` rather than lowering the row cap — the rollups keep the
+shape of the history at a fiftieth of the size. Second, doubling the poll rate
+doubles the storage exactly, with no economies anywhere; 60 seconds is a
+meaningful decision, not a free one.
+
+### How many devices
+
+The honest answer is that it depends on ports per device, poll interval and
+disk, and that this application is a single process with a single database
+connection, so every ceiling compounds in one place. Measured on one Linux
+container with a local disk, a 60-second interval and 48-port switches: a
+fleet of **250** is comfortable, at **1,000** the poll pool saturates and an
+outage takes several minutes to be seen, and at **2,000** an outage may not be
+detected at all because each device is only reached every few minutes. Doubling
+the interval to the shipped 120 seconds roughly doubles all three numbers.
+
+Those figures are from before the 4.37.0 write-path work (batched sample
+writes, cached scheduler configuration, one keyed query per alert tick, GETBULK
+for the interface columns) which raises the write ceiling by about seventy
+times on its own; re-measure on your own hardware rather than trusting either
+set of numbers. `FEATURES.md` says "hundreds of devices" in one place; read
+that as the size at which nothing needs thinking about, not as a limit.
 
 ### What keeps it bounded
 

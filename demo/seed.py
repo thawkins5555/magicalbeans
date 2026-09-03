@@ -17,6 +17,14 @@ evidence — see `netpath/web/api.py:2453` and friends.
 The script is idempotent: it looks up device groups, polling profiles,
 NetPath targets, subnets and controllers by name before creating them, and
 skips devices whose IP is already present.
+
+By default it tunes six settings away from what the application ships so a
+20-minute run on a loopback fleet exercises paths that would otherwise take
+days to reach — a 60 s poll interval, 32 workers, `cpu_high` at 20%,
+`response_time_high` at 5 ms, no new-device grace, and a raised email cap.
+Those overrides are exactly why campaign numbers cannot be read as capacity
+figures. `--defaults` makes none of them, so the same campaign can be run once
+at the shipped configuration and the two columns compared like for like.
 """
 
 from __future__ import annotations
@@ -338,6 +346,24 @@ PROFILES = [
                 "snmp_retries": 1, "mac_table_interval_s": 300}),
 ]
 
+# The three keys `--defaults` drops from every profile body. Left out, the
+# group row takes its schema defaults (120 s, 3.0 s, 2 retries — `nodesdb.py`
+# `groups`), which is what the application ships. `mac_table_interval_s` goes
+# too: 0, meaning off, is the shipped value, and the demo only sets 300 so the
+# MAC-table walks are exercised.
+_TUNED_PROFILE_KEYS = ("poll_interval_s", "snmp_timeout_s", "snmp_retries",
+                       "mac_table_interval_s")
+
+
+def profiles(defaults: bool = False):
+    """The polling profiles to create, tuned for the campaign or as shipped."""
+    if not defaults:
+        return PROFILES
+    return [(name, {k: v for k, v in fields.items()
+                    if k not in _TUNED_PROFILE_KEYS})
+            for name, fields in PROFILES]
+
+
 PROFILE_COMMUNITY = {"v2c-public": "public", "v1-public": "public",
                      "v3-noauth": "", "v3-sha": ""}
 
@@ -396,7 +422,8 @@ def step_login(client: Client, log: SeedLog, creds_path: str) -> dict:
     return {"password": new, "changed": True}
 
 
-def step_groups_and_profiles(client: Client, log: SeedLog) -> dict:
+def step_groups_and_profiles(client: Client, log: SeedLog,
+                             defaults: bool = False) -> dict:
     """2. Device groups (sites) and polling profiles."""
     client.step = "2-groups"
     existing = {g["name"]: g["id"]
@@ -417,7 +444,11 @@ def step_groups_and_profiles(client: Client, log: SeedLog) -> dict:
     have = {g["name"]: g for g in client.get("/api/nodes/groups")["groups"]}
     profile_ids = {}
     created = 0
-    for name, fields in PROFILES:
+    wanted = profiles(defaults)
+    if defaults:
+        print("[2] --defaults: profiles take the shipped 120 s interval, "
+              "3.0 s timeout, 2 retries, MAC walks off")
+    for name, fields in wanted:
         if name in have:
             profile_ids[name] = have[name]["id"]
             continue
@@ -587,11 +618,21 @@ def step_configrx(client: Client, log: SeedLog, device_ids: dict) -> dict:
     return {"devices": configured, "credential_refusal": refusal}
 
 
-def step_settings(client: Client, log: SeedLog, workers: int) -> dict:
+def step_settings(client: Client, log: SeedLog, workers: int,
+                  defaults: bool = False) -> dict:
     """8. Alerts/syslog/nodes settings, the alert engine, and two lowered
-    thresholds so the fleet actually trips something."""
+    thresholds so the fleet actually trips something.
+
+    Under `defaults`, none of the tuning happens: the alert grace and the
+    hourly email cap keep the values the application ships, `poll_workers` is
+    left alone, and the two thresholds are not touched. What still happens is
+    plumbing rather than tuning — pointing SMTP at the local sink so mail can
+    be counted, accepting syslog over TCP so both framings are exercised, and
+    starting the alert engine. None of those changes how hard the application
+    has to work; all three are needed for the run to measure anything.
+    """
     client.step = "8-settings"
-    results = {}
+    results = {"defaults": bool(defaults)}
 
     alerts_values = {
         "email_enabled": True,
@@ -601,11 +642,18 @@ def step_settings(client: Client, log: SeedLog, workers: int) -> dict:
         "smtp_from": "sappiwhere@demo.invalid",
         "smtp_from_name": "SappiWhere Demo",
         "smtp_to_default": ["noc@demo.invalid"],
-        "new_device_grace_s": 0,
         "notify_on_clear": True,
-        "max_emails_per_hour": 10000,
         "renotify_minutes": 0,
     }
+    if not defaults:
+        # 300 s of grace hides everything a 25-minute run does to a device it
+        # has just added; 60 emails an hour is reached in the first minute of
+        # a 250-device outage, and the rest would not be counted at the sink.
+        alerts_values["new_device_grace_s"] = 0
+        alerts_values["max_emails_per_hour"] = 10000
+    else:
+        print("[8] --defaults: new_device_grace_s and max_emails_per_hour "
+              "left at the shipped 300 s / 60 per hour")
     payload = client.post("/api/settings", {"scope": "alerts",
                                             "values": alerts_values})
     saved = payload.get("alerts_settings", {})
@@ -623,7 +671,14 @@ def step_settings(client: Client, log: SeedLog, workers: int) -> dict:
     results["syslog_accept_tcp"] = payload.get(
         "syslog_settings", {}).get("accept_tcp")
 
-    if workers:
+    if defaults:
+        # There is no GET /api/settings; /api/state carries every module's
+        # settings block (api.py get_state).
+        got = client.get("/api/state").get(
+            "nodes_settings", {}).get("poll_workers")
+        print("[8] --defaults: poll_workers left as shipped (%s)" % got)
+        results["poll_workers"] = got
+    elif workers:
         payload = client.post("/api/settings", {"scope": "nodes",
                                                 "values": {"poll_workers": workers}})
         got = payload.get("nodes_settings", {}).get("poll_workers")
@@ -636,13 +691,21 @@ def step_settings(client: Client, log: SeedLog, workers: int) -> dict:
           % (status, payload.get("running")))
     results["alert_engine_running"] = payload.get("running")
 
-    # Lower two thresholds so a 250-device loopback fleet trips them.
+    # Lower two thresholds so a 250-device loopback fleet trips them. A
+    # net-snmp persona idles well under 90% and loopback RTT is ~0.05 ms
+    # against a 500 ms threshold, so at shipped values neither rule ever fires
+    # and the threshold path is never exercised. Under --defaults that is
+    # accepted: the point of the run is what the shipped configuration does.
     client.step = "8-rules"
     rules = client.get("/api/alerts/rules")["rules"]
     by_key = {r["key"]: r for r in rules}
     tuned = {}
-    for key, threshold, clear, for_polls in (("cpu_high", 20.0, 10.0, 1),
-                                             ("response_time_high", 5.0, 2.0, 1)):
+    tuning = () if defaults else (("cpu_high", 20.0, 10.0, 1),
+                                  ("response_time_high", 5.0, 2.0, 1))
+    if defaults:
+        print("[8] --defaults: cpu_high and response_time_high left at their "
+              "shipped thresholds (neither will fire on a loopback fleet)")
+    for key, threshold, clear, for_polls in tuning:
         rule = by_key.get(key)
         if not rule:
             print("[8] rule %s not found (built-in list changed?)" % key)
@@ -788,7 +851,18 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=os.path.join(HERE, "out"),
                         help="output directory (default demo/out)")
     parser.add_argument("--workers", type=int, default=32,
-                        help="nodes poll_workers to set; 0 leaves the default")
+                        help="nodes poll_workers to set; 0 leaves the default. "
+                             "Ignored with --defaults")
+    parser.add_argument("--defaults", action="store_true",
+                        help="seed the fleet without tuning anything the "
+                             "application ships: 120 s poll interval, 3.0 s "
+                             "timeout, 2 retries, MAC walks off, 16 poll "
+                             "workers, 300 s new-device grace, 60 emails an "
+                             "hour, and the built-in cpu_high and "
+                             "response_time_high thresholds untouched. Use it "
+                             "for a like-for-like column beside a tuned "
+                             "campaign run; run it against a fresh database, "
+                             "since it changes nothing a previous run set")
     args = parser.parse_args(argv)
 
     out = os.path.abspath(args.out)
@@ -804,11 +878,15 @@ def main(argv=None) -> int:
     client = Client(args.base)
     client.log = log
     summary = {"base": args.base, "count": args.count,
-               "plan_source": plan_source, "started": time.time()}
+               "plan_source": plan_source, "started": time.time(),
+               "defaults": bool(args.defaults)}
+    if args.defaults:
+        print("[0] --defaults: seeding at the shipped configuration; no "
+              "interval, worker, threshold, grace or email-cap override")
     started = time.time()
     try:
         summary["login"] = step_login(client, log, creds_path)
-        ids = step_groups_and_profiles(client, log)
+        ids = step_groups_and_profiles(client, log, args.defaults)
         summary["groups"] = ids
         summary["devices"] = step_devices(client, log, plan, ids["sites"],
                                           ids["profiles"])
@@ -817,7 +895,8 @@ def main(argv=None) -> int:
         summary["wireless"] = step_wireless(client, log)
         summary["configrx"] = step_configrx(
             client, log, summary["devices"]["ids_by_name"])
-        summary["settings"] = step_settings(client, log, args.workers)
+        summary["settings"] = step_settings(client, log, args.workers,
+                                            args.defaults)
         summary["users"] = step_users(client, log, args.base, creds_path)
         summary["verify"] = step_verify(client, log, args.count)
     finally:
