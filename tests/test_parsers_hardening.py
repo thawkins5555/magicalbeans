@@ -680,6 +680,66 @@ check("an ordinary address and resolver are still accepted",
       and not namelookup.is_resolver_address(""))
 
 
+# ------------------------------------------------------- H7: EventLog targets
+
+print("H7  the event log is bounded in both of its collections")
+
+from netpath import eventlog                         # noqa: E402
+
+log = eventlog.EventLog()
+for i in range(eventlog.TARGET_LIMIT + 500):
+    log.add(eventlog.DNS, "resolved", target=f"10.0.{i // 256}.{i % 256}")
+check("the target set stops at its limit",
+      len(log.targets()) == eventlog.TARGET_LIMIT, str(len(log.targets())))
+check("...keeping the most recently seen, dropping the oldest",
+      "10.0.1.244" in log.targets() and "10.0.0.0" not in log.targets())
+
+# LRU, not FIFO: a target seen again is not the next one evicted.
+log = eventlog.EventLog(target_limit=4)
+for name in ("a", "b", "c", "d"):
+    log.add(eventlog.DNS, "x", target=name)
+log.add(eventlog.DNS, "x", target="a")               # refreshes 'a'
+log.add(eventlog.DNS, "x", target="e")               # evicts 'b', not 'a'
+check("a target seen again survives the next eviction",
+      log.targets() == ["a", "c", "d", "e"], str(log.targets()))
+
+# The sort is cached: repeats must not re-sort, but a new target must.
+log = eventlog.EventLog(target_limit=10)
+for name in ("z", "y", "x"):
+    log.add(eventlog.SNMP, "x", target=name)
+check("targets() comes back sorted", log.targets() == ["x", "y", "z"],
+      str(log.targets()))
+first = log.targets()
+log.add(eventlog.SNMP, "x", target="z")
+check("...and a repeat does not change it", log.targets() == first)
+log.add(eventlog.SNMP, "x", target="a")
+check("...while a new target does", log.targets() == ["a", "x", "y", "z"],
+      str(log.targets()))
+
+# clear() cleared the events and left the targets, so the debug page's filter
+# went on offering every device the log had ever mentioned.
+log.clear()
+check("clear() empties the targets as well as the events",
+      log.targets() == [] and log.all() == [], str(log.targets()))
+log.add(eventlog.TRACE, "after clear", target="10.9.9.9")
+check("...and the log still works afterwards",
+      log.targets() == ["10.9.9.9"] and len(log.all()) == 1, str(log.targets()))
+
+# Reading targets() is on the debug-page poll path, so it must stay cheap
+# with a full set. 20,000 remembered targets sorted under the lock on every
+# poll was the shape being fixed; 1,000 cached is the shape now.
+log = eventlog.EventLog()
+for i in range(eventlog.TARGET_LIMIT):
+    log.add(eventlog.NODES, "x", target=f"device-{i:05d}")
+_, elapsed = timed(lambda: [log.targets() for _ in range(2000)])
+check("2,000 polls of a full target list take under 1 s", elapsed < 1.0,
+      f"{elapsed:.3f}s")
+
+check("an event with no target adds nothing",
+      (lambda fresh: (fresh.add(eventlog.SYSTEM, "started"),
+                      fresh.targets() == [])[1])(eventlog.EventLog()))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
