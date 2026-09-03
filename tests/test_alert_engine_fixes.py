@@ -295,3 +295,89 @@ try:
 finally:
     alertmail.send = real_send
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== A3
+print("\nA3 — renotify actually fires")
+
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    renotify_minutes=1, **MAIL_SETTINGS)
+sent = FakeMail()
+alertmail.send = sent
+try:
+    engine._tick()
+    did = add_device(nodes, "10.4.0.1", "core-sw-a")
+    base = time.time()
+    # cpu_high: threshold 90, clear 80, for_polls 2 — a threshold rule, so
+    # the alert also has extras worth rendering in the renotify.
+    for offset in (0, 65):
+        nodes.record_metric_sample(did, "cpu_pct", "CPU", "%", "gauge",
+                                   base + offset, 97.0)
+        engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    opened = open_rows(alerts, "cpu_high", did)
+    assert len(opened) == 1, [dict(o) for o in opened]
+    alert_id = opened[0]["id"]
+    kinds = [n["kind"] for n in alerts.notifications_for(alert_id)]
+    assert kinds == ["alert"], kinds
+    ok("the first breach sends exactly one message")
+
+    # Twenty more minutes of breaching polls: under the old code this was the
+    # reproduction that produced one email and a count of 228.
+    for i in range(1, 21):
+        nodes.record_metric_sample(did, "cpu_pct", "CPU", "%", "gauge",
+                                   base + 65 + i * 60, 97.0)
+        engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    kinds = [n["kind"] for n in alerts.notifications_for(alert_id)]
+    assert kinds == ["alert"], kinds
+    ok("nothing is re-sent while the renotify interval has not elapsed")
+
+    alerts.mark_notified(alert_id, time.time() - 3600)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    notes = alerts.notifications_for(alert_id)
+    renotifies = [n for n in notes if n["kind"] == "renotify"]
+    assert len(renotifies) == 1, [dict(n) for n in notes]
+    ok("once the interval has elapsed the sweep sends a renotify")
+
+    assert "97.0" in renotifies[0]["subject"], renotifies[0]["subject"]
+    ok("a threshold renotify still renders {{value}} from the stored extras")
+
+    alerts.acknowledge(alert_id, "operator", "on it")
+    alerts.mark_notified(alert_id, time.time() - 3600)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    after = [n for n in alerts.notifications_for(alert_id) if n["kind"] == "renotify"]
+    assert len(after) == 1, [dict(n) for n in after]
+    ok("an acknowledged alert is never re-notified about")
+finally:
+    alertmail.send = real_send
+engine.stop()
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# The case the occurrence path could never serve: an event-driven rule that
+# produces exactly one occurrence and then nothing at all.
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    renotify_minutes=1, **MAIL_SETTINGS)
+sent = FakeMail()
+alertmail.send = sent
+try:
+    engine._tick()
+    did = add_device(nodes, "10.4.1.1", "edge-sw-b")
+    nodes.record_device_event(did, "down", "stopped responding")
+    engine._tick()
+    down = open_rows(alerts, "device_down", did)
+    assert len(down) == 1, [dict(d) for d in down]
+    alerts.mark_notified(down[0]["id"], time.time() - 3600)
+    for _ in range(3):                 # no further events of any kind
+        engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    kinds = [n["kind"] for n in alerts.notifications_for(down[0]["id"])]
+    assert kinds.count("renotify") == 1, kinds
+    ok("a device that stays down is re-notified about with no new event")
+finally:
+    alertmail.send = real_send
+engine.stop()
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()

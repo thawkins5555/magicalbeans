@@ -242,6 +242,7 @@ class AlertEngine:
         # Only now, once every occurrence above has been applied (or
         # deliberately skipped), does any source's cursor move.
         self._flush_cursors()
+        self._sweep_renotify(settings)
 
     # -------------------------------------------------- system occurrences
 
@@ -1358,18 +1359,60 @@ class AlertEngine:
             row, is_new = self.db.open_or_increment(
                 rule["id"], key, occurrence.entity_kind, occurrence.entity_id,
                 occurrence.entity_label, rule["severity"], occurrence.message,
-                occurrence.detail, occurrence.ts)
+                occurrence.detail, occurrence.ts, extra=occurrence.extra)
             if is_new:
                 self.counters["opened"] += 1
                 if rollup and (rule["key"] or "") in ROLLS_UP:
                     self._absorb_subordinates(rule, occurrence, row)
-            renotify_minutes = float(settings.get("renotify_minutes", 0))
-            should_notify = is_new
-            if not is_new and renotify_minutes > 0 and row["state"] == "open":
-                if time.time() - row["last_ts"] >= renotify_minutes * 60 - TICK_S:
-                    should_notify = True
-            if should_notify:
-                self._notify(row, rule, occurrence, settings, renotify=not is_new)
+                self._notify(row, rule, occurrence, settings)
+            # Renotify is NOT decided here any more. It used to compare
+            # against row["last_ts"], which open_or_increment had just set to
+            # this occurrence's timestamp a statement earlier, so the
+            # difference was always about zero and the condition could not be
+            # satisfied for any renotify_minutes above five seconds. Worse,
+            # this path is only reached when a NEW occurrence arrives, and an
+            # event-driven rule (a device that stays down, a trap) produces
+            # exactly one. _sweep_renotify sweeps open alerts instead.
+
+    # ------------------------------------------------------------ renotify
+
+    def _sweep_renotify(self, settings) -> None:
+        """Tell the operator again about alerts still open and unacknowledged.
+
+        A sweep over open alerts rather than a branch on the occurrence path,
+        because most alerts worth re-notifying about produce no further
+        occurrences at all: a device that stays down records one `down`
+        event, a trap arrives once, an IPAM conflict is detected once. An
+        admin who sets "re-notify every 30 minutes" for an unattended
+        overnight shift means "keep telling me until somebody deals with it",
+        and the occurrence path could only ever have honoured that for
+        threshold rules.
+
+        The occurrence handed to _notify is rebuilt from the alert row, with
+        its stored extras, so a threshold renotify still renders {{value}}
+        and a trap renotify still renders {{trap_name}}.
+        """
+        minutes = float(settings.get("renotify_minutes", 0) or 0)
+        if minutes <= 0:
+            return
+        # Minus one tick, so an alert due at exactly N minutes is not
+        # deferred to the following tick every single time.
+        cutoff = time.time() - (minutes * 60 - TICK_S)
+        for row in self.db.alerts_due_renotify(cutoff):
+            rule = self.db.rule(row["rule_id"])
+            if rule is None or not rule["enabled"]:
+                continue
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+            except (TypeError, ValueError):
+                extra = {}
+            occurrence = Occurrence(
+                kind=rule["kind"], source_kind=rule["source_kind"] or "",
+                entity_kind=row["entity_kind"], entity_id=row["entity_id"],
+                entity_label=row["entity_label"], ts=row["last_ts"],
+                message=row["message"], detail=row["detail"] or "",
+                extra=extra if isinstance(extra, dict) else {})
+            self._notify(row, rule, occurrence, settings, renotify=True)
 
     # -------------------------------------------------------------- notify
 
@@ -1452,6 +1495,10 @@ class AlertEngine:
         # full SMTP timeout. An attempt is what costs time, so an attempt is
         # what is rationed.
         self._sent_this_hour.append(now)
+        # Stamped on submit even when the queue refuses below: the renotify
+        # clock measures "how long since we last tried to tell anyone", and
+        # re-trying a full queue every tick would only fill it faster.
+        self.db.mark_notified(alert_row["id"], now)
         if not self._mail.submit(job):
             # Bounded on purpose; a refusal is recorded against the alert so
             # the drop shows in its own detail pane rather than only in a

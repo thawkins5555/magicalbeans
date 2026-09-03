@@ -80,7 +80,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     acked_by        TEXT,
     ack_note        TEXT,
     resolved_ts     REAL,
-    resolved_by     TEXT
+    resolved_by     TEXT,
+    -- When a notification was last SUBMITTED for this alert, which is not
+    -- last_ts: open_or_increment refreshes last_ts on every recurrence, so
+    -- comparing against it made renotify_minutes unsatisfiable. See
+    -- alerts_due_renotify.
+    last_notified_ts REAL,
+    -- The occurrence's template extras as JSON, so a renotify raised by the
+    -- per-tick sweep (rather than by a fresh occurrence) can still render
+    -- {{value}}, {{trap_name}} and the rest.
+    extra_json      TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_state_ts ON alerts(state, last_ts);
 CREATE INDEX IF NOT EXISTS ix_alerts_rule ON alerts(rule_id);
@@ -377,6 +386,12 @@ class AlertsDatabase:
         self._migrate_templates()
         alerts = {row["name"] for row in
                   self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        for column, kind, default in (("last_notified_ts", "REAL", None),
+                                      ("extra_json", "TEXT", "'{}'")):
+            if column not in alerts:
+                self._conn.execute(
+                    f"ALTER TABLE alerts ADD COLUMN {column} {kind}"
+                    + (f" NOT NULL DEFAULT {default}" if default else ""))
         if "rollup_note" not in alerts:
             # What this alert absorbed, one line per rolled-up alert. Its own
             # column rather than appended to `detail`, which open_or_increment
@@ -704,7 +719,13 @@ class AlertsDatabase:
 
     def open_or_increment(self, rule_id: int, dedup_key: str, entity_kind: str,
                           entity_id: str, entity_label: str, severity: int,
-                          message: str, detail: str, ts: float) -> tuple[sqlite3.Row, bool]:
+                          message: str, detail: str, ts: float,
+                          extra: dict | None = None) -> tuple[sqlite3.Row, bool]:
+        """`extra` is the occurrence's template extras, kept on the row so a
+        renotify built by the engine's sweep — which has no occurrence to
+        read them from — renders the same tokens the first notification
+        did."""
+        extra_json = json.dumps(extra or {}, separators=(",", ":"))
         with self._lock:
             existing = self._conn.execute(
                 "SELECT id FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
@@ -712,22 +733,53 @@ class AlertsDatabase:
             if existing:
                 self._conn.execute(
                     "UPDATE alerts SET count = count + 1, last_ts = ?,"
-                    " entity_label = ?, message = ?, detail = ? WHERE id = ?",
-                    (ts, entity_label, message, detail, existing["id"]))
+                    " entity_label = ?, message = ?, detail = ?, extra_json = ?"
+                    " WHERE id = ?",
+                    (ts, entity_label, message, detail, extra_json, existing["id"]))
                 self._conn.commit()
                 row = self._conn.execute(
                     "SELECT * FROM alerts WHERE id = ?", (existing["id"],)).fetchone()
                 return row, False
             cur = self._conn.execute(
                 "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
-                " entity_label, severity, message, detail, opened_ts, last_ts)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " entity_label, severity, message, detail, opened_ts, last_ts,"
+                " extra_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (rule_id, dedup_key, entity_kind, entity_id, entity_label,
-                 severity, message, detail, ts, ts))
+                 severity, message, detail, ts, ts, extra_json))
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
             return row, True
+
+    def mark_notified(self, alert_id: int, ts: float | None = None) -> None:
+        """Stamp when a notification was last submitted for this alert.
+
+        Written at SUBMIT rather than on delivery: what renotify measures is
+        "how long since we last told anyone", and a message sitting in the
+        sender queue has already been told. Kept apart from last_ts, which
+        every recurrence refreshes.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE alerts SET last_notified_ts = ? WHERE id = ?",
+                (time.time() if ts is None else ts, alert_id))
+            self._conn.commit()
+
+    def alerts_due_renotify(self, cutoff_ts: float) -> list[sqlite3.Row]:
+        """Open alerts nobody has been told about since cutoff_ts.
+
+        Acknowledged alerts are excluded on purpose: acknowledging is an
+        operator saying "I have this", and continuing to nag them is the
+        thing acknowledgement exists to stop. COALESCE falls back to
+        opened_ts so an alert that opened while email was disabled starts its
+        renotify clock from when it opened, not from never.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alerts WHERE state = 'open'"
+                " AND COALESCE(last_notified_ts, opened_ts) <= ?"
+                " ORDER BY severity, last_ts", (cutoff_ts,)).fetchall()
 
     def resolve(self, alert_id: int, by: str = "") -> None:
         with self._lock:
