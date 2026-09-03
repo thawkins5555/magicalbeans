@@ -27,14 +27,8 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return 'never';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    return `${(age / 3600).toFixed(1)}h ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = App.ago;
 
   /* Fortinet's AP states mapped onto the five tones App.statusMark draws.
      out_of_service is an administrator's marking rather than something the
@@ -132,7 +126,7 @@
     { key: 'channels', label: 'Channels', width: 110 },
     { key: 'radio_station_count', label: 'Radio clients', width: 100, numeric: true },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true, align: 'left',
-      cell: (r) => ago(r.last_seen_ts), value: (r) => r.last_seen_ts || 0 },
+      cell: (r) => App.agoCell(r.last_seen_ts), value: (r) => r.last_seen_ts || 0 },
   ];
 
   /* The chosen-column set lives in the wireless settings scope
@@ -209,7 +203,7 @@
       `model       ${row.model || '—'}`,
       `MAC         ${row.mac_address || '—'}`,
       `clients     ${row.station_count ?? '—'}`,
-      `last seen   ${new Date((row.last_seen_ts || 0) * 1000).toLocaleString()}`,
+      `last seen   ${App.when(row.last_seen_ts)}`,
       '', `radios (${row.radios.length})`, '-'.repeat(40),
     ];
     for (const radio of row.radios) {
@@ -344,8 +338,19 @@
     }
     for (const btn of box.querySelectorAll('[data-poll]')) {
       btn.onclick = async () => {
-        await App.post(`/api/wireless/controllers/${btn.dataset.poll}/poll`, {});
+        // The label used to be set to "Polling…" after the request and never
+        // reset, and a refusal left it reading "Poll now" — the two outcomes
+        // inverted. Held down while queued, restored after, failures said.
+        if (btn.disabled) return;
+        btn.disabled = true;
         btn.textContent = 'Polling…';
+        try {
+          await App.post(`/api/wireless/controllers/${btn.dataset.poll}/poll`, {});
+          App.announce('Poll queued');
+        } catch (error) {
+          App.toast(`Could not poll the controller: ${error.message}`, 'fail');
+        }
+        setTimeout(() => { btn.disabled = false; btn.textContent = 'Poll now'; }, 2500);
       };
     }
     return box;

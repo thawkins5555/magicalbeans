@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.44.0 — Since when, in which zone](#4440--since-when-in-which-zone)
 - [4.43.0 — Less over the wire](#4430--less-over-the-wire)
 - [4.42.0 — One place the colours live](#4420--one-place-the-colours-live)
 - [4.41.0 — A dialog that says no](#4410--a-dialog-that-says-no)
@@ -106,6 +107,80 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.44.0 — Since when, in which zone
+
+Seven modules each carried their own `ago()`, in three behaviours: four
+capped at hours, so a device unpolled for a week read `168.0h ago`; two had a
+days tier; one turned into a bare wall clock after ninety minutes. Six
+"Time" columns showed `HH:MM:SS` with no date over windows up to four months
+wide. Sixteen detail lines called `toLocaleString()` each their own way. And
+nothing, anywhere, said which time zone any of it was in — the Debug page
+alone showed one event stream in three (server-local table, browser-local
+detail pane, UTC export). The vocabulary for "the thing that runs" was as
+scattered: SNMP was a *receiver* on its strip, a *listener* in its settings
+and *SNMP traps* under a *Collectors* tile; IPAM was a *worker* with no way
+to start it.
+
+- **One time vocabulary.** `App.ago`, `App.when`, `App.timeCell`,
+  `App.agoCell`, `App.isoLocal` and `App.timeZoneLabel` replace the seven
+  `ago()`s, an eighth `when()`, and every module's own `Date` formatting.
+  Relative figures have a days tier everywhere now (`7.0d ago`, not
+  `168.0h ago`) and carry the absolute in their tooltip. A Time column shows
+  the clock alone for today's rows and the date as well for older ones, with
+  the full stamp in the title. Every Time header's tooltip names the zone,
+  and Settings states it in a sentence.
+- **The Debug page is in one zone.** The table is rendered by the browser
+  from the epoch, like every other table (the server-formatted `clock` field
+  still feeds the desktop console). The export is ISO 8601 with the offset,
+  in the same zone as the screen, and its first line names it.
+- **"Up since".** The device summary said `status up` and nothing else,
+  while the payload carried the fields to answer "since when" and no script
+  read them. The server now derives `status_since_ts` — a device that is up
+  has been up since it was last seen down, and the reverse — and
+  `sys_uptime_s` from the sysUpTime pair reboot detection already keeps. The
+  summary reads `status up since 4 Mar 09:14 (2 d 03 h) · uptime 12 d 04 h`,
+  and every status-timeline segment's label carries its duration, which is
+  the only channel a keyboard user has to it.
+- **One noun per module.** Nodes and Wireless have a *poller*, Alerts an
+  *alert engine*, NetFlow and Syslog a *collector*, SNMP a *receiver*, IPAM
+  and ConfigRX a *worker* — on the strip, on the toggle, in the settings
+  legend and on the Dashboard, whose tile is now *Workers* and lists all
+  eight rather than three. Every strip starts in the stopped form until
+  state arrives; two shipped as `Stop …` before anything had run.
+- **IPAM can be started from its strip.** The only control was a checkbox
+  inside its settings dialog. `POST /api/ipam/worker` goes through the same
+  settings path, so the choice persists exactly as that checkbox does.
+- **All eleven refresh rates have a control.** Dashboard, Wireless and
+  ConfigRX rates were read by the refresh loop and settable only by editing
+  the store; the save confirmation named seven of them and left out IPAM,
+  which had a field. Debug's input no longer accepts a fraction of a second
+  the one-second floor ignores.
+- **One unset convention in the device form.** The overrides fieldset said
+  "unset" seven ways — `(profile)`, `(none)`, `Inherit`, `inherit`,
+  `automatic`, `standard detection`, and a bare blank. Blank means inherit
+  now, and every field's placeholder or first option says what it would
+  inherit — `(profile: v2c)`, `inherit · 5 probes` — resolved from the
+  device's effective configuration on Edit and from the chosen profile plus
+  the Nodes settings on Add, following the profile as it is changed.
+  **Blanking a field clears its override**: five fields were omitted from
+  the save when blank, so emptying one changed nothing while the legend
+  promised the profile's value. The community stays send-when-typed, because
+  a blank there may mean "hidden from this account", not "clear".
+- **Honest counts.** Syslog and SNMP said `300 shown` for a window holding
+  four million. They now read `300 of 4,120 shown` using the total already
+  computed for the histogram on the same tick; the two search responses say
+  `truncated`, `limit` and `cap`, and the cap is one named constant instead
+  of an inline 2000 in two handlers. Alerts, which had this right, uses the
+  same `App.countLabel`.
+- **Labels that follow state.** "Expand silent hops" now becomes "Collapse
+  silent hops" and exposes `aria-pressed`; the Wireless controllers' "Poll
+  now" is held down while queued, restored after, and reports a refusal —
+  it used to stay "Polling…" for the life of the dialog on success and
+  "Poll now" on failure. The discovery jobs' button column has a header.
+- **Found on the way.** The Edit-rule dialog rendered its auto-resolve and
+  notify fields twice with the same ids; the browser read the first pair, so
+  edits made in the lower, visible pair were silently discarded on Save.
 
 ### 4.43.0 — Less over the wire
 

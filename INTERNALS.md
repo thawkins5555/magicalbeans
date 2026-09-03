@@ -3910,6 +3910,39 @@ operator's own `input`/`change` events rather than by diffing a snapshot,
 because several dialogs redraw their contents from a poll while open and a
 snapshot would call that redraw an unsaved edit.
 
+**Time (4.44.0).** Every timestamp the browser shows goes through one set of
+functions in `app.js`, and nothing else formats a `Date`: `App.ago(ts,
+empty)` for a relative figure (`just now`, `3.2h ago`, `7.0d ago`, `in 40s`
+— the tiers are `App.span`'s), `App.when(ts)` for the absolute form with the
+date always present and the year when it is not this one, `App.timeCell(ts)`
+for a Time column (the clock alone if the row is from today, the date as well
+otherwise, `when()` in the title), `App.agoCell` for a relative figure
+carrying its absolute in the title, `App.isoLocal` for an export
+(`2026-09-03T14:32:07+02:00`), and `App.timeZoneLabel()` — this browser's
+zone, which every Time header's `title` and the Settings page state. The
+wire is epoch seconds everywhere; the server formats nothing for the
+browser (the `clock` string on `/api/debug` is server-local and feeds the
+desktop console only). Seven modules used to carry their own `ago()` in
+three behaviours, and the Debug page showed one event stream in three zones.
+`tests/test_time_contracts.py` fails on a private `ago()`, a `toLocale*`
+call on a `Date`, or `App.clock` in a module.
+
+`_device_json` (`api.py`) derives **`status_since_ts`** — `last_up_ts` is the
+last poll that saw the device up and is rewritten on every up poll, so a
+device that is up has been up since `last_down_ts` (else `created_ts`), and
+the reverse — and **`sys_uptime_s`** from `last_uptime_ticks` aged forward
+from `last_uptime_ts`, the pair reboot detection compares. Before this no
+script read any of those five fields and the summary said `status up`.
+
+**Nouns.** One per module wherever it is named — strip, toggle, settings
+legend, Dashboard (`Workers`, all eight): Nodes and Wireless *poller*,
+Alerts *alert engine*, NetFlow and Syslog *collector*, SNMP *receiver*, IPAM
+and ConfigRX *worker*. `POST /api/ipam/worker {action}` is the IPAM toggle
+the other seven already had, implemented by `apply_ipam_settings` so it
+persists like the settings checkbox. The two search handlers name their cap
+(`SEARCH_ROW_CAP`) and return `limit`/`cap`/`truncated`; `App.countLabel`
+renders "N of M shown" for every list.
+
 `App.tooltip(content, event)` takes either a string — assigned with
 `textContent`, which is what every caller that has one still does — or an array
 of `{text, color}` rows. Rows are built with `createElement`/`textContent` and

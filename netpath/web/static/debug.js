@@ -34,21 +34,16 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return '—';
-    const delta = Date.now() / 1000 - ts;
-    if (delta < 0) return `in ${Math.round(-delta)}s`;
-    if (delta < 90) return `${Math.round(delta)}s ago`;
-    if (delta < 5400) return `${Math.round(delta / 60)}m ago`;
-    return App.clock(ts);
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  // This copy used to turn into a bare wall clock after ninety minutes, so a
+  // worker last run three days ago read "03:14:22".
+  const ago = (ts) => App.ago(ts, '\u2014');
 
   function until(ts) {
-    if (!ts) return '—';
+    if (!ts) return '\u2014';
     const delta = ts - Date.now() / 1000;
     if (delta <= 0) return 'due';
-    if (delta < 90) return `in ${Math.round(delta)}s`;
-    return `in ${Math.round(delta / 60)}m`;
+    return `in ${App.span(delta)}`;
   }
 
   const WORKER_COLUMNS = ['Destination', 'Host', 'State', 'Elapsed', 'Last run',
@@ -132,7 +127,7 @@
         `<span style="color:${worker.state === 'tracing' ? 'var(--accent)' : 'inherit'}">${
           worker.state === 'tracing' ? 'tracing…' : escape(worker.state)}</span>`,
         `<span style="color:${colour}">${elapsed}</span>`,
-        ago(worker.last_run),
+        App.agoCell(worker.last_run, '\u2014'),
         worker.duration ? `${worker.duration.toFixed(1)}s` : '—',
         until(worker.next_run),
         `${worker.interval_s}s`,
@@ -282,7 +277,11 @@
     const tr = document.createElement('tr');
     tr.className = 'clickable' + (view.selected === event.seq ? ' selected' : '');
     const time = document.createElement('td');
-    time.textContent = event.clock;
+    // The browser formats the time, in its own zone, like every other table.
+    // `event.clock` is the server's local time and still feeds the desktop
+    // console; here it made the Debug table the one page in a different
+    // zone from the detail pane beside it.
+    time.innerHTML = App.timeCell(event.ts);
     const category = document.createElement('td');
     category.className = `cat-${event.category}`;
     category.textContent = CATEGORY_LABEL[event.category] || event.category;
@@ -372,7 +371,7 @@
   }
 
   function showDetail(event) {
-    const when = new Date(event.ts * 1000).toLocaleString();
+    const when = App.when(event.ts);
     let body = `${when}  [${CATEGORY_LABEL[event.category] || event.category}]\n`;
     if (event.target) body += `destination: ${event.target}\n`;
     body += event.message;
@@ -381,9 +380,14 @@
   }
 
   function exportLog() {
-    const lines = [];
+    // ISO 8601 with the offset, in the same zone as the screen, and a first
+    // line that names it. The export used to be UTC while the table beside
+    // it was server-local and the detail pane browser-local — one event
+    // stream in three zones, none of them stated.
+    const lines = [`# SappiWhere debug log, exported ${App.isoLocal(Date.now() / 1000)}` +
+                   ` — times are ${App.timeZoneLabel()}`];
     for (const event of view.events.filter(passes)) {
-      lines.push(`${new Date(event.ts * 1000).toISOString()} [${event.category}] ` +
+      lines.push(`${App.isoLocal(event.ts)} [${event.category}] ` +
                  `${event.target || '-'} :: ${event.message}`);
       if (event.detail) {
         for (const line of event.detail.split('\n')) lines.push(`    ${line}`);

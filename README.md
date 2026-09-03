@@ -277,7 +277,7 @@ Settings tab):
 | --- | --- |
 | **Fleet** | devices up, down, unknown and failing authentication, as counts that link through to the Nodes tab filtered to each |
 | **Open alerts** | a count per severity, coloured by the worst severity open — not by the total, so one severity-1 outage is never hidden behind forty severity-6 notices |
-| **Collectors** | NetFlow, trap and syslog listeners: running or not, packets in, `kernel_dropped` if the kernel has discarded anything, and the alert engine's `backlog` if it is behind |
+| **Workers** | all eight background processes — the Nodes poller, alert engine, NetFlow collector, SNMP trap receiver, Syslog collector, IPAM worker, Wireless poller and ConfigRX worker: running or not, packets in, `kernel_dropped` if the kernel has discarded anything, and the alert engine's `backlog` if it is behind |
 | **Storage** | each database's size against its cap, worst first |
 | **Poller** | busy and queued work against the pool size, and whether the pool has been saturated long enough to raise `poll_pool_saturated` |
 | **Top offenders** | ten worst by device events in 24 h, interface events, alerts, round-trip time, packet loss and CPU — six short lists, each row linking to the device |

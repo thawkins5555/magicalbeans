@@ -24,15 +24,8 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return 'never';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    if (age < 172800) return `${(age / 3600).toFixed(1)}h ago`;
-    return `${(age / 86400).toFixed(1)}d ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = App.ago;
 
   /* A small utilization donut, drawn with the standard stroke-dasharray
      trick — one circle per slice, each dashed to show only its own arc —
@@ -158,6 +151,8 @@
     dot.style.background = ipam.running ? 'var(--ok)' : 'var(--line)';
     App.el('ipam-status').textContent = ipam.running
       ? 'Worker running' : 'Worker stopped';
+    const toggle = App.el('ipam-toggle');
+    if (toggle) toggle.textContent = ipam.running ? 'Stop worker' : 'Start worker';
     const parts = [];
     if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
     if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
@@ -322,11 +317,11 @@
       value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
     { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
       align: 'left', descendingFirst: true, value: (r) => r.last_up,
-      cell: (r) => ago(r.last_up) },
+      cell: (r) => App.agoCell(r.last_up) },
     { key: 'first_seen', label: 'First probed', width: 120, numeric: true, on: true,
-      align: 'left', value: (r) => r.first_seen, cell: (r) => ago(r.first_seen) },
+      align: 'left', value: (r) => r.first_seen, cell: (r) => App.agoCell(r.first_seen) },
     { key: 'last_seen', label: 'Last probed', width: 120, numeric: true,
-      align: 'left', value: (r) => r.last_seen, cell: (r) => ago(r.last_seen) },
+      align: 'left', value: (r) => r.last_seen, cell: (r) => App.agoCell(r.last_seen) },
   ];
 
   const hostColumns = () => App.visibleColumns(
@@ -379,7 +374,7 @@
         ? 'wire vs. DHCP lease' : 'wire, two scans';
       tr.innerHTML =
         `<td>${escape(c.ip)}</td><td>${escape(c.mac_a)}</td><td>${escape(c.mac_b)}</td>` +
-        `<td>${sourceText}</td><td>${ago(c.detected)}</td><td>${ago(c.last_seen)}</td><td></td>`;
+        `<td>${sourceText}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
       if (!c.resolved) {
         const button = document.createElement('button');
         button.textContent = 'Mark resolved';
@@ -843,7 +838,7 @@
     // One point's line under the cursor, not the whole series dumped into
     // one tooltip on every move — same nearest-sample idiom netflow.js's
     // own chart tooltip already uses.
-    const tipFor = (p) => `${new Date(p.ts * 1000).toLocaleString()}  ${p.leased} leased` +
+    const tipFor = (p) => `${App.when(p.ts)}  ${p.leased} leased` +
       (p.total ? ` (${Math.round((p.leased / p.total) * 100)}%)` : '');
     svg.addEventListener('mousemove', (event) => {
       const cx = event.offsetX * (width / svg.clientWidth);
@@ -883,7 +878,7 @@
         : escape(r.address_state || '')) },
     { key: 'expires', label: 'Lease expires', width: 150, numeric: true, on: true,
       align: 'left', value: (r) => r.lease_expires || 0,
-      cell: (r) => (r.lease_expires ? App.stamp(r.lease_expires) : '') },
+      cell: (r) => (r.lease_expires ? App.when(r.lease_expires) : '') },
     { key: 'scope_id', label: 'Scope', width: 130,
       cell: (r) => escape(r.scope_id || '\u2014') },
     { key: 'server_label', label: 'Server', width: 160,
@@ -1109,6 +1104,16 @@
         selectSub(btn.dataset.subtab);
       };
     }
+    // The one module whose strip said "Worker stopped" with no way to start
+    // it: the only control was a checkbox inside the settings dialog. Same
+    // route shape as the other seven toggles, and it persists like that
+    // checkbox does.
+    App.el('ipam-toggle').onclick = async () => {
+      const running = ((App.state.serverState || {}).ipam || {}).running;
+      await App.post('/api/ipam/worker', { action: running ? 'stop' : 'start' });
+      await App.loadState();
+      drawStatus();
+    };
     App.el('ipam-settings').onclick = settingsDialog;
     App.el('ipam-add-subnet').onclick = addSubnet;
     App.el('ipam-edit-subnet').onclick = editSubnet;

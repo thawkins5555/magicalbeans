@@ -57,14 +57,12 @@
 
   const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
 
-  function ago(ts) {
-    if (!ts) return 'never';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    return `${(age / 3600).toFixed(1)}h ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = App.ago;
+  // How many flow records the table asks the server for. The select's three
+  // labels and its title are written from this in init(), so the number
+  // lives in one place instead of four copies of "250" in the markup.
+  const RECORD_LIMIT = 250;
 
   function showWindow() {
     const span = view.t1 - view.t0;
@@ -403,7 +401,7 @@
      else only needs room for what it actually holds. */
   const COLUMNS = [
     { key: 'ts', label: 'Time', numeric: true, descendingFirst: true, on: true,
-      width: 92, value: (r) => r.ts, cell: (r) => App.clock(r.ts) },
+      width: 92, value: (r) => r.ts, title: App.timeZoneTitle(), cell: (r) => App.timeCell(r.ts) },
     // Second, immediately after Time: which device reported a flow is
     // context for reading the rest of the row, not a footnote to it. Sorts
     // on the name where there is one, the way Source and Destination do.
@@ -493,7 +491,7 @@
         routeCell.title = 'No NetPath target has traced a route to this destination';
       }
       const tip = [
-        new Date(record.ts * 1000).toLocaleString(),
+        App.when(record.ts),
         `${record.src_ip}:${record.src_port} → ${record.dst_ip}:${record.dst_port}`,
       ];
       if (record.src_name) tip.push(`source      ${record.src_name}`);
@@ -821,6 +819,13 @@
         setWindow(Date.now() / 1000 - span, Date.now() / 1000);
       }
     };
+    const order = App.el('nf-order');
+    order.title = `Which ${RECORD_LIMIT} records the server returns. Click a column heading to arrange them.`;
+    for (const option of order.options) {
+      option.textContent = { bytes: `Top ${RECORD_LIMIT} by volume`,
+        packets: `Top ${RECORD_LIMIT} by packets`,
+        time: `Most recent ${RECORD_LIMIT}` }[option.value] || option.textContent;
+    }
     for (const id of ['nf-dimension', 'nf-protocol', 'nf-exporter', 'nf-order']) {
       App.el(id).onchange = () => App.refreshNow('netflow');
     }

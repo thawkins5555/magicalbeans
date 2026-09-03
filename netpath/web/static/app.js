@@ -741,11 +741,89 @@ const App = (() => {
     return `${(seconds / 86400).toFixed(1)}d`;
   }
 
+  /* ------------------------------------------------ one time vocabulary
+
+     Seven modules each carried their own ago(), in three behaviours: four
+     capped at hours (a device unpolled for a week read "168.0h ago"), two
+     had a days tier, one turned into a bare wall clock after ninety minutes.
+     Six "Time" columns showed HH:MM:SS with no date over windows up to four
+     months wide. Sixteen detail lines called toLocaleString() each their
+     own way, and nothing anywhere said which time zone any of it was in.
+     Every timestamp the browser shows now goes through one of these:
+
+       ago(ts)        "just now", "3.2h ago", "7.0d ago", "in 40s"  — relative
+       when(ts)       "4 Mar 14:32:07", with the year when it is not this one
+       timeCell(ts)   for a Time column: the clock alone if today, else the
+                      date too; the full when() in the title
+       agoCell(ts)    a relative figure with the absolute in its title
+       isoLocal(ts)   "2026-09-03T14:32:07+02:00", for an export
+       timeZoneLabel  "Europe/Berlin (UTC+02:00)" — this browser's zone
+
+     Everything is the browser's local zone, and says so where it can (the
+     Time headers' titles, the Settings page). The wire carries epoch seconds
+     everywhere; the server never formats a time for the browser. */
+  function ago(ts, empty = 'never') {
+    if (!ts) return empty;
+    const age = Date.now() / 1000 - ts;
+    if (age < 0) return `in ${span(-age)}`;
+    if (age < 5) return 'just now';
+    return `${span(age)} ago`;
+  }
+
+  function dateShort(d, now = new Date()) {
+    const options = { month: 'short', day: 'numeric' };
+    if (d.getFullYear() !== now.getFullYear()) options.year = 'numeric';
+    return d.toLocaleDateString(undefined, options);
+  }
+
+  function when(ts, empty = 'never') {
+    if (!ts) return empty;
+    return `${dateShort(new Date(ts * 1000))} ${clock(ts)}`;
+  }
+
+  function timeCell(ts, empty = '\u2014') {
+    if (!ts) return empty;
+    const d = new Date(ts * 1000);
+    const now = new Date();
+    const today = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    const text = today ? clock(ts) : `${dateShort(d, now)} ${clock(ts)}`;
+    return `<span class="when" title="${escapeHtml(when(ts))}">${text}</span>`;
+  }
+
+  function agoCell(ts, empty = 'never') {
+    if (!ts) return empty;
+    return `<span class="when" title="${escapeHtml(when(ts))}">${ago(ts)}</span>`;
+  }
+
+  function isoLocal(ts) {
+    const d = new Date(ts * 1000);
+    const offset = -d.getTimezoneOffset();
+    const sign = offset >= 0 ? '+' : '-';
+    const hh = pad(Math.floor(Math.abs(offset) / 60));
+    const mm = pad(Math.abs(offset) % 60);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+      `T${clock(ts)}${sign}${hh}:${mm}`;
+  }
+
+  function timeZoneLabel() {
+    let zone = 'local time';
+    try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || zone; } catch (error) { /* keep */ }
+    const offset = -new Date().getTimezoneOffset();
+    const sign = offset >= 0 ? '+' : '-';
+    return `${zone} (UTC${sign}${pad(Math.floor(Math.abs(offset) / 60))}:${pad(Math.abs(offset) % 60)})`;
+  }
+
+  // The title every Time column header carries, so the zone is one hover
+  // away from any timestamp in the product.
+  function timeZoneTitle() {
+    return `Local time, ${timeZoneLabel()}`;
+  }
+
   // Two units, for a length somebody is going to write down. span() answers
-  // "how long ago, roughly" in one unit and is what every relative timestamp
-  // in the app uses; "3.5h" is a fine answer to that and a poor answer to
-  // "how long was the outage". Kept separate rather than changing span(),
-  // which six modules render with.
+  // "how long ago, roughly" in one unit and is what ago() above renders with;
+  // "3.5h" is a fine answer to that and a poor answer to "how long was the
+  // outage".
   function duration(seconds) {
     const total = Math.round(Number(seconds) || 0);
     if (total <= 0) return '';
@@ -755,6 +833,19 @@ const App = (() => {
     const h = Math.floor(m / 60), rm = m % 60;
     if (h < 48) return `${h} h ${String(rm).padStart(2, '0')} m`;
     return `${Math.floor(h / 24)} d ${String(h % 24).padStart(2, '0')} h`;
+  }
+
+  /* "300 of 4,120 shown", never "300 shown" on its own. `shown` is what came
+     back; `total` is how many match (or null when the caller has no figure);
+     `totalCapped` says the total itself was cut off, so it reads "of more
+     than". The three forms came from alerts.js, which was the one list
+     honest about its cap; Syslog and SNMP said "300 shown" for a window
+     holding four million. */
+  function countLabel(shown, total, totalCapped = false) {
+    if (typeof total !== 'number') return `${shown} shown`;
+    if (totalCapped) return `${shown} of more than ${total.toLocaleString()} shown`;
+    if (total <= shown) return `${shown} shown`;
+    return `${shown} of ${total.toLocaleString()} shown`;
   }
 
   function bytes(value) {
@@ -2015,6 +2106,8 @@ const App = (() => {
       } else {
         th.appendChild(document.createTextNode(column.label));
       }
+      // A Time column says which zone it is in, one hover away.
+      if (column.title) th.title = column.title;
       // `numeric` governs how the column sorts. Right-alignment is a
       // separate question: "14s ago" sorts by a timestamp but reads as text,
       // and aligning the header right while the cells stayed left was what
@@ -2941,7 +3034,9 @@ const App = (() => {
     state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
     parseRoute, buildRoute, setRoute, applyRoute,
     get, post, put, del,
-    clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
+    clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
+    timeZoneLabel, timeZoneTitle, countLabel,
+    bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,

@@ -1187,6 +1187,12 @@
     };
     App.el('route-expand').onclick = () => {
       view.expandAll = !view.expandAll;
+      // A toggle names its other half: this read "Expand silent hops" in
+      // both states, while the graph's own affordance said "click to
+      // collapse".
+      const btn = App.el('route-expand');
+      btn.textContent = view.expandAll ? 'Collapse silent hops' : 'Expand silent hops';
+      btn.setAttribute('aria-pressed', String(view.expandAll));
       if (!view.expandAll) view.expanded.clear();
       else for (const [a, b] of silentRuns(view.topology || {})) view.expanded.add(`${a}-${b}`);
       drawRoute();

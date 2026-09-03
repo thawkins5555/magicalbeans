@@ -201,7 +201,7 @@ class AlertEngine:
         if self.error:
             return self.error
         if not self.running:
-            return "Engine stopped"
+            return "Alert engine stopped"
         return f"Running · last tick {_ago(self._last_tick_ts)}"
 
     def state(self) -> dict:

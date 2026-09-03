@@ -133,7 +133,7 @@ the application already had, refreshed on the interval in
 | --- | --- |
 | Fleet | Total devices, and how many are up, down, unknown or failing authentication, with the poll pool's busy and queued worker counts beneath |
 | Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices |
-| Collectors | NetFlow, SNMP Trap and Syslog: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
+| Workers | Every background process, by the noun its own tab uses — the Nodes poller, the alert engine, the NetFlow collector, the SNMP trap receiver, the Syslog collector, the IPAM worker, the Wireless poller, the ConfigRX worker: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
 | Storage headroom | Each database against its own size cap |
 | Worst ten (24 h) | Six lists: most device events, most interface events, most alerts, slowest to answer, worst packet loss, highest CPU |
 

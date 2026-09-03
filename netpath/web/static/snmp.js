@@ -125,7 +125,7 @@
         x, y: plot.y, width: w, height: plot.h, fill: 'transparent',
         style: 'cursor:pointer',
       });
-      const lines = [new Date(bucket.t0 * 1000).toLocaleString(),
+      const lines = [App.when(bucket.t0),
                      `${bucket.total} traps`];
       for (const severity of severities) {
         lines.push(`${App.state.severities[severity] || severity}: ` +
@@ -160,7 +160,7 @@
 
   const COLUMNS = [
     { key: 'ts', label: 'Time', width: 92, numeric: true, on: true,
-      align: 'left', cell: (r) => App.clock(r.ts) },
+      align: 'left', title: App.timeZoneTitle(), cell: (r) => App.timeCell(r.ts) },
     { key: 'severity', label: 'Severity', width: 90, numeric: true, on: true,
       align: 'left',
       cell: (r) => `<span class="sev sev-${r.severity}">${escape(r.severity_name)}</span>` },
@@ -224,7 +224,7 @@
 
   function showDetail(row) {
     const lines = [
-      new Date(row.ts * 1000).toLocaleString(),
+      App.when(row.ts),
       '',
       `severity    ${row.severity_name} (${row.severity})`,
       `source      ${row.source}${row.source_name ? `  (${row.source_name})` : ''}`,
@@ -271,7 +271,7 @@
     const number = (id, label, value, attrs = '') =>
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
     const box = App.modal('SNMP trap settings', `
-      <fieldset><legend>LISTENER</legend>
+      <fieldset><legend>RECEIVER</legend>
         ${check('sp-enabled', 'Run the receiver', s.enabled)}
         <label>Bind address <input id="sp-bind" value="${escape(s.bind_address)}"></label>
         ${number('sp-port', 'UDP port', s.port, 'min=1 max=65535')}
@@ -481,7 +481,9 @@
     App.el('sn-hist-summary').textContent =
       `${total.toLocaleString()} traps · ${App.stamp(t0, span)} – ${App.stamp(t1, span)}` +
       ` · ${overview.stats.rows.toLocaleString()} stored in total`;
-    App.el('sn-count').textContent = `${search.traps.length} shown`;
+    // "300 of 4,120 shown": the total is the histogram's own sum over the
+    // same window and filters, already in hand on this tick.
+    App.el('sn-count').textContent = App.countLabel(search.traps.length, total);
     App.el('sn-took').textContent = `search ${search.took_ms} ms`;
 
     drawHistogram();

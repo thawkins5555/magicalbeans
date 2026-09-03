@@ -76,7 +76,7 @@
     <span class="grow"></span>
     <button id="nd-add-device" class="primary" data-requires-write="nodes">Add device</button>
     <button id="nd-manage-devgroups" data-requires-write="nodes">Manage groups</button>
-    <button id="nd-toggle" data-requires-write="nodes">Stop poller</button>
+    <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
 
@@ -226,11 +226,11 @@
 <section id="page-alerts" class="page">
   <div class="card strip">
     <span id="alerts-dot" class="dot"></span>
-    <span id="alerts-status" class="stat">Engine stopped</span>
+    <span id="alerts-status" class="stat">Alert engine stopped</span>
     <span id="alerts-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="alerts-ack-all" data-requires-write="alerts">Acknowledge all</button>
-    <button id="alerts-toggle" data-requires-write="alerts">Stop engine</button>
+    <button id="alerts-toggle" data-requires-write="alerts">Start alert engine</button>
     <button id="alerts-settings" class="module-settings" data-requires-write="alerts">Settings</button>
   </div>
 
@@ -337,7 +337,7 @@
       <span id="route-summary" class="hint"></span>
       <span class="grow"></span>
       <button id="route-live" class="primary" hidden>Return to live</button>
-      <button id="route-expand">Expand silent hops</button>
+      <button id="route-expand" aria-pressed="false">Expand silent hops</button>
       <button id="route-zoom-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
       <button id="route-zoom-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
       <span id="route-zoom" class="hint zoom">100%</span>
@@ -568,6 +568,7 @@
     <label>Find <input id="ipam-search-q" size="30" placeholder="hostname, IP or MAC address"></label>
     <button id="ipam-search-btn">Search</button>
     <span class="grow"></span>
+    <button id="ipam-toggle" data-requires-write="ipam">Start worker</button>
     <button id="ipam-settings" class="module-settings" data-requires-write="ipam">Settings</button>
   </div>
 
@@ -883,13 +884,17 @@
       <label>SNMP <input type="number" id="set-refresh-snmp" min="1" max="3600" step="5"> s</label>
       <label>Syslog <input type="number" id="set-refresh-syslog" min="1" max="3600" step="5"> s</label>
       <label>IPAM <input type="number" id="set-refresh-ipam" min="1" max="3600" step="5"> s</label>
-      <label>Debug <input type="number" id="set-refresh-debug" min="0.1" max="60" step="0.5"> s</label>
+      <label>Wireless <input type="number" id="set-refresh-wireless" min="1" max="3600" step="1"> s</label>
+      <label>ConfigRX <input type="number" id="set-refresh-configrx" min="1" max="3600" step="1"> s</label>
+      <label>Dashboard <input type="number" id="set-refresh-dashboard" min="1" max="3600" step="1"> s</label>
+      <label>Debug <input type="number" id="set-refresh-debug" min="1" max="60" step="1"> s</label>
       <p class="hint">Set per module because they want different rates. The route graph is
         cheap and benefits from feeling live; the flow charts are aggregations over a whole
         window and barely change in a few seconds, so a slow rate costs nothing and saves a
         lot of work. The Debug page's elapsed counters advance smoothly ten times a second
         without asking the server again, so its rate only controls how often new events and
         worker state are fetched.</p>
+      <p class="hint" id="set-timezone"></p>
     </fieldset>
     <fieldset>
       <legend>DATA FILES</legend>

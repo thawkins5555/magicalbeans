@@ -169,7 +169,7 @@
         ${notes ? `<span class="dash-row-note">${notes}</span>` : ''}
       </a>`;
     }).join('');
-    return tile('Collectors', rows || '<p class="hint">No collector is readable '
+    return tile('Workers', rows || '<p class="hint">No worker is readable '
                 + 'with your access.</p>', { wide: true });
   }
 

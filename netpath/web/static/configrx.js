@@ -22,15 +22,8 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return 'never';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    if (age < 172800) return `${(age / 3600).toFixed(1)}h ago`;
-    return `${(age / 86400).toFixed(1)}d ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = App.ago;
 
   function bytesText(n) {
     if (n < 1024) return `${n} B`;
@@ -109,7 +102,7 @@
           ? `<span title="${escape(r.last_backup_error)}">error</span>`
           : escape(r.last_backup_status || (r.backup_enabled ? 'pending' : '\u2014'))) },
     { key: 'last_backup_ts', label: 'When', width: 100, numeric: true, on: true,
-      value: (r) => r.last_backup_ts || 0, cell: (r) => ago(r.last_backup_ts) },
+      value: (r) => r.last_backup_ts || 0, cell: (r) => App.agoCell(r.last_backup_ts) },
     { key: 'detected_vendor', label: 'Detected vendor', width: 130,
       value: (r) => r.vendor || '', cell: (r) => escape(r.vendor || '\u2014') },
     { key: 'ssh_username', label: 'SSH user', width: 120,
@@ -347,7 +340,7 @@
         view.backupsChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'ts', label: 'Taken', width: 150, numeric: true, on: true,
       align: 'left', descendingFirst: true,
-      cell: (r) => escape(new Date(r.ts * 1000).toLocaleString()) },
+      title: App.timeZoneTitle(), cell: (r) => App.timeCell(r.ts) },
     { key: 'size_bytes', label: 'Size', width: 80, numeric: true, on: true,
       cell: (r) => bytesText(r.size_bytes) },
     { key: 'sha256', label: 'Digest', width: 110,
@@ -521,7 +514,7 @@
     }
     target.innerHTML =
       `<p>Host key: <b style="font-family:var(--mono)">${escape(key.fingerprint)}</b>`
-      + ` (${escape(key.key_type)}), first seen ${App.stamp(key.first_seen_ts)}`
+      + ` (${escape(key.key_type)}), first seen ${App.when(key.first_seen_ts)}`
       + `${key.trusted_by ? `, trusted by ${escape(key.trusted_by)}` : ''}.</p>`
       + (App.canWrite('configrx')
         ? '<p><button id="cx-hostkey-forget">Forget</button>'

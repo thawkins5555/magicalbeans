@@ -21,6 +21,13 @@
     App.el('set-refresh-syslog').value = s.syslog_refresh_s;
     App.el('set-refresh-ipam').value = s.ipam_refresh_s;
     App.el('set-refresh-debug').value = s.debug_refresh_s;
+    App.el('set-refresh-dashboard').value = s.dashboard_refresh_s ?? 5;
+    App.el('set-refresh-wireless').value = s.wireless_refresh_s ?? 2;
+    App.el('set-refresh-configrx').value = s.configrx_refresh_s ?? 2;
+    // Every time the interface shows is this browser's, and this is where
+    // it says which zone that is.
+    App.el('set-timezone').textContent =
+      `Times everywhere in this interface are shown in this browser's zone: ${App.timeZoneLabel()}.`;
     App.el('set-trace-cap').value = s.max_trace_db_mb;
     App.el('set-flow-cap').value = s.max_flow_db_mb;
     App.el('set-snmp-cap').value = s.max_snmp_db_mb;
@@ -229,6 +236,9 @@
       syslog_refresh_s: Number(App.el('set-refresh-syslog').value),
       ipam_refresh_s: Number(App.el('set-refresh-ipam').value),
       debug_refresh_s: Number(App.el('set-refresh-debug').value),
+      dashboard_refresh_s: Number(App.el('set-refresh-dashboard').value),
+      wireless_refresh_s: Number(App.el('set-refresh-wireless').value),
+      configrx_refresh_s: Number(App.el('set-refresh-configrx').value),
       max_trace_db_mb: Number(App.el('set-trace-cap').value),
       max_flow_db_mb: Number(App.el('set-flow-cap').value),
       max_snmp_db_mb: Number(App.el('set-snmp-cap').value),
@@ -241,15 +251,10 @@
     };
     await App.post('/api/settings', { scope: 'global', values });
     await App.loadState();
+    // The list used to name seven of the eleven refresh rates (IPAM had a
+    // field and was left out; three had no field at all).
     status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
-           `NetPath ${values.netpath_refresh_s}s · ` +
-           `Nodes ${values.nodes_refresh_s}s · ` +
-           `Alerts ${values.alerts_refresh_s}s · ` +
-           `NetFlow ${values.netflow_refresh_s}s · ` +
-           `SNMP ${values.snmp_refresh_s}s · ` +
-           `Syslog ${values.syslog_refresh_s}s · ` +
-           `Debug ${values.debug_refresh_s}s · ` +
-           `idle timeout ${values.session_idle_minutes}min`, 'var(--ok)');
+           `eleven refresh rates · idle timeout ${values.session_idle_minutes} min`, 'var(--ok)');
   }
 
   /* What each maintenance action actually destroys. Several of these are
@@ -306,9 +311,7 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function when(ts) {
-    return ts ? new Date(ts * 1000).toLocaleString() : 'never';
-  }
+  const when = App.when;
 
   let modules = [];
 

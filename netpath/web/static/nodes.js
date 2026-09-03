@@ -47,14 +47,8 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return 'never';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    return `${(age / 3600).toFixed(1)}h ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = App.ago;
 
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--line)' };
@@ -134,7 +128,7 @@
      muted_until comes from the Alerts module via the devices endpoint. */
   function mutedTag(row) {
     if (!row.muted_until) return '';
-    const until = new Date(row.muted_until * 1000).toLocaleString();
+    const until = App.when(row.muted_until);
     return ` · <span class="warn-text muted-tag" title="New alerts for this ` +
       `device are suppressed until ${escape(until)}">alerts muted</span>`;
   }
@@ -175,7 +169,7 @@
         ? (r.ping_rtt_ms != null ? `${r.ping_rtt_ms.toFixed(0)} ms` : 'ok')
         : (r.ping_ok ? `${(r.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '\u2014')) },
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true, on: true,
-      value: (r) => r.last_poll_ts || 0, cell: (r) => ago(r.last_poll_ts) },
+      value: (r) => r.last_poll_ts || 0, cell: (r) => App.agoCell(r.last_poll_ts) },
     // Available but off by default — sysLocation is empty on plenty of gear,
     // and a column of dashes helps nobody. Worth offering now that it can be
     // pointed at a custom OID.
@@ -654,13 +648,22 @@
         ? `v${{ 0: '1', 1: '2c', 3: '3' }[d.effective_config.snmp_version]
               || d.effective_config.snmp_version}` : '')),
     };
+    // "up" on its own answered the wrong question. The operator opening a
+    // device wants "since when" — status_since_ts is derived on the server
+    // from the last poll that saw the opposite state — and the device's own
+    // sysUpTime, aged forward from when it was read, says whether it has
+    // rebooted since.
+    const sinceText = d.status_since_ts
+      ? ` since ${App.when(d.status_since_ts)} (${App.duration(Date.now() / 1000 - d.status_since_ts)})`
+      : '';
     const parts = [
       field('IP', d.ip),
-      field('status', d.status),
+      field('status', d.status ? `${d.status}${sinceText}` : ''),
+      d.sys_uptime_s != null ? field('uptime', App.duration(d.sys_uptime_s)) : '',
       // Sits right after the status, because it changes what the status
       // means to the person reading it: quiet here is a choice, not health.
       d.muted_until
-        ? field('alerts', `muted until ${new Date(d.muted_until * 1000).toLocaleString()}`,
+        ? field('alerts', `muted until ${App.when(d.muted_until)}`,
                 'nd-v warn-text')
         : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
@@ -911,8 +914,12 @@
     for (const seg of segments) {
       const x0 = x(seg.ts_start);
       const w = Math.max(x(seg.ts_end) - x0, 1);
+      // Two endpoints and how long between them: this label is the only
+      // channel a keyboard or screen-reader user has to the timeline, and
+      // "Down 14:02 – 14:47" left them doing the subtraction.
       const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
+        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
+        ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
       // The segment is a <g> rather than a bare rect so the colour, the
       // texture over it and the keyboard focus are one thing the operator
       // can Tab to and read, instead of a colour with a mouse-only tooltip.
@@ -979,7 +986,7 @@
     { key: 'out_error_rate', label: 'Out err/s', width: 95, numeric: true,
       cell: (r) => (r.out_error_rate != null ? r.out_error_rate.toFixed(2) : '\u2014') },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
-      cell: (r) => ago(r.last_seen_ts) },
+      cell: (r) => App.agoCell(r.last_seen_ts) },
   ];
 
   const ifaceColumns = () => App.visibleColumns(
@@ -1199,7 +1206,7 @@
       ? `<p class="hint">Walked ${ev.walk.objects} object(s) in ${ev.hop.requests + (ev.walk.requests || 0)} ` +
         `request(s), ${(ev.walk.elapsed_s || 0).toFixed(1)}s` +
         `${ev.walk.stopped && ev.walk.stopped !== 'complete' ? ` — ${escape(ev.walk.stopped)}` : ''}` +
-        `${ev.ts ? ` · ${new Date(ev.ts * 1000).toLocaleString()}` : ''}` +
+        `${ev.ts ? ` · ${App.when(ev.ts)}` : ''}` +
         `${ev.trigger ? ` (${escape(ev.trigger.replace('_', ' '))})` : ''}</p>` : '';
     const chosen = (ev.candidates || []).find((c) => c.mib_file_id === d.mib_file_id);
     const mib = d.mib_file_id
@@ -1332,7 +1339,7 @@
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
     return `<div class="table-wrap" style="max-height:120px"><table><caption class="sr-only">Recent events on this port</caption>` +
-      events.map((e) => `<tr><td>${App.clock(e.ts)}</td><td>${escape(e.kind)}</td>` +
+      events.map((e) => `<tr><td>${App.timeCell(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
       '</table></div>';
   }
@@ -1865,14 +1872,14 @@
   function drawEventTable(el, payload) {
     const table = el || App.el('nd-ev-table');
     const events = payload || view.events || {};
-    table.innerHTML = '<caption class="sr-only">Device events</caption><thead><tr><th scope="col">Time</th><th scope="col">Kind</th><th scope="col">Detail</th></tr></thead>';
+    table.innerHTML = `<caption class="sr-only">Device events</caption><thead><tr><th scope="col" title="${App.timeZoneTitle()}">Time</th><th scope="col">Kind</th><th scope="col">Detail</th></tr></thead>`;
     const body = document.createElement('tbody');
     const all = [...(events.device_events || []).map((e) => ({ ...e, scope: 'device' })),
                 ...(events.interface_events || []).map((e) => ({ ...e, scope: `if ${e.if_index}` }))]
       .sort((a, b) => b.ts - a.ts);
     for (const e of all) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${App.clock(e.ts)}</td>` +
+      tr.innerHTML = `<td>${App.timeCell(e.ts)}</td>` +
         `<td>${escape(e.scope === 'device' ? e.kind : `${e.scope}: ${e.kind}`)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td>`;
       body.appendChild(tr);
@@ -1894,6 +1901,88 @@
       `<option value="${g.id}" ${g.id === selectedId ? 'selected' : ''}>${escape(g.name)}</option>`
     ).join('');
     return `<option value="" ${!selectedId ? 'selected' : ''}>(none)</option>${options}`;
+  }
+
+  /* What a blank field in the device form would inherit.
+
+     On Edit the single-device endpoint has already resolved the whole chain
+     — device, then profile, then Nodes settings — into effective_config. On
+     Add there is no device yet, so the chain is walked here from the
+     profile the form currently shows plus the Nodes settings underneath it.
+     Community is a secret and may be absent from effective_config for an
+     account that cannot read secrets; it then shows "(profile)" alone. */
+  function inheritedValues(d, groupId) {
+    if (d && d.effective_config) return d.effective_config;
+    const groups = view.groups || [];
+    const id = groupId != null ? Number(groupId)
+      : (d && d.group_id != null ? d.group_id : (groups.find((g) => g.is_default) || {}).id);
+    const profile = groups.find((g) => g.id === id) || {};
+    const settings = App.state.nodesSettings || {};
+    const pick = (key) => (profile[key] != null ? profile[key] : settings[key]);
+    return {
+      snmp_version: profile.snmp_version, community: profile.community,
+      v3_user: profile.v3_user, v3_auth_proto: profile.v3_auth_proto,
+      poll_interval_s: profile.poll_interval_s, snmp_timeout_s: profile.snmp_timeout_s,
+      ping_enabled: profile.ping_enabled, snmp_enabled: profile.snmp_enabled,
+      ping_count: pick('ping_count'), ping_timeout_ms: pick('ping_timeout_ms'),
+      unreachable_ping_only: pick('unreachable_ping_only'),
+      mac_table_interval_s: pick('mac_table_interval_s'),
+      mib_file_id: profile.mib_file_id,
+      vendor_oid: profile.vendor_oid, location_oid: profile.location_oid,
+    };
+  }
+
+  /* The one convention: a blank field inherits, and its placeholder (or its
+     first option) says what it would inherit. Before this the same fieldset
+     said "unset" seven ways — "(profile)", "(none)", "Inherit", "inherit",
+     "automatic", "standard detection", and a bare blank with no hint. */
+  const VERSION_NAMES = { 0: 'v1', 1: 'v2c', 3: 'v3' };
+  function inheritText(value, format) {
+    if (value === undefined || value === null || value === '') return 'inherit';
+    const shown = format ? format(value) : String(value);
+    return `inherit \u00b7 ${shown}`;
+  }
+  function inheritOption(value, format) {
+    if (value === undefined || value === null || value === '') return '(profile)';
+    return `(profile: ${format ? format(value) : value})`;
+  }
+  const yesNo = (v) => (v === true || v === 1 || v === '1' ? 'yes' : v === false || v === 0 || v === '0' ? 'no' : String(v));
+  const onOff = (v) => (v === true || v === 1 ? 'on' : v === false || v === 0 ? 'off' : String(v));
+
+  // Rewrites every inherit hint in an open form from `eff`, so Add can follow
+  // the profile the operator picks without rebuilding the dialog.
+  function applyInheritHints(box, eff) {
+    const q = (id) => box.querySelector(id);
+    const set = (id, text) => { const el = q(id); if (el) el.placeholder = text; };
+    const opt = (id, text) => { const el = q(id); if (el && el.options[0]) el.options[0].textContent = text; };
+    opt('#nd-f-version', inheritOption(eff.snmp_version, (v) => VERSION_NAMES[v] || v));
+    set('#nd-f-community', eff.community ? inheritText(eff.community) : 'inherit (stored value not shown)');
+    set('#nd-f-v3user', inheritText(eff.v3_user));
+    opt('#nd-f-authproto', inheritOption(eff.v3_auth_proto));
+    set('#nd-f-interval', inheritText(eff.poll_interval_s, (v) => `${v} s`));
+    set('#nd-f-timeout', inheritText(eff.snmp_timeout_s, (v) => `${v} s`));
+    opt('#nd-f-ping', inheritOption(eff.ping_enabled, onOff));
+    opt('#nd-f-snmp', inheritOption(eff.snmp_enabled, onOff));
+    set('#nd-f-pingcount', inheritText(eff.ping_count, (v) => `${v} probes`));
+    set('#nd-f-pingtimeout', inheritText(eff.ping_timeout_ms, (v) => `${v} ms`));
+    opt('#nd-f-pingonly', inheritOption(eff.unreachable_ping_only, yesNo));
+    set('#nd-f-mactable', inheritText(eff.mac_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
+    const mib = (view.mibFiles || []).find((f) => f.id === eff.mib_file_id);
+    opt('#nd-f-mib', inheritOption(mib ? (mib.module || mib.filename) : (eff.mib_file_id ? eff.mib_file_id : null)));
+    set('#nd-f-vendoroid', inheritText(eff.vendor_oid));
+    set('#nd-f-locationoid', inheritText(eff.location_oid));
+  }
+
+  function wireInheritHints(box, d) {
+    applyInheritHints(box, inheritedValues(d));
+    const group = box.querySelector('#nd-f-group');
+    if (group) {
+      group.addEventListener('change', () => {
+        // On Edit the resolved chain is for the saved profile; once the
+        // operator picks another, walk it from that profile instead.
+        applyInheritHints(box, inheritedValues({ ...d, effective_config: null }, group.value));
+      });
+    }
   }
 
   function deviceForm(device) {
@@ -1919,7 +2008,11 @@
         switch, its site router. When the upstream goes down, alerts for
         everything behind it are folded into the upstream's own alert instead
         of arriving as a storm. Blank means nothing is in front of it.</p>
-      <fieldset><legend>OVERRIDES (blank = use the profile's value)</legend>
+      <fieldset><legend>OVERRIDES</legend>
+        <p class="hint">Blank means inherit. Each field says what it would
+          inherit from the polling profile above (and, for the ping fields,
+          from the Nodes settings under that). Blanking a field that had a
+          value clears the override.</p>
         <label>SNMP version <select id="nd-f-version">
           <option value="">(profile)</option>
           <option value="0" ${cfg.snmp_version === 0 ? 'selected' : ''}>v1</option>
@@ -1942,16 +2035,16 @@
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${App.helpLink('nodes.profile.ping')}
         <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>${App.helpLink('nodes.profile.snmp')}
         <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="1" max="20"
-          placeholder="inherit" value="${d.ping_count ?? ''}"></label>
+          value="${d.ping_count ?? ''}"></label>
         <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="100" step="100"
-          placeholder="inherit" value="${d.ping_timeout_ms ?? ''}"> ms</label>
+          value="${d.ping_timeout_ms ?? ''}"> ms</label>
         <label>Down needs both ping and SNMP to fail <select id="nd-f-pingonly">
-          <option value="" ${d.unreachable_ping_only == null ? 'selected' : ''}>Inherit</option>
+          <option value="" ${d.unreachable_ping_only == null ? 'selected' : ''}>(profile)</option>
           <option value="1" ${d.unreachable_ping_only === 1 ? 'selected' : ''}>Yes — SNMP failing alone is not down</option>
           <option value="0" ${d.unreachable_ping_only === 0 ? 'selected' : ''}>No — SNMP failing alone is down</option>
         </select></label>
         <label>Learn MAC addresses every <input id="nd-f-mactable" type="number"
-          min="0" step="60" placeholder="inherit"
+          min="0" step="60"
           value="${d.mac_table_interval_s ?? ''}"> s</label>
         <p class="hint">Walks this switch's forwarding table on its own slower
           schedule, so a MAC address on it can be found from the Find box. A
@@ -1960,9 +2053,9 @@
           this device whatever the profile says.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
-          shown under its own names — see Nodes → MIBs to upload one first. Leave as
-          "(profile)" to inherit whatever the polling profile has assigned, or "None"
-          to poll no custom MIB regardless of the profile.</p>
+          shown under its own names — see Nodes → MIBs to upload one first. The
+          first option inherits whatever the polling profile has assigned and
+          says which.</p>
       </fieldset>
       <fieldset><legend>IDENTITY</legend>
         ${identityOidFieldsHtml(d)}
@@ -1978,7 +2071,7 @@
      Shared verbatim by the device form and the profile form — a device's
      blank inherits the profile's, exactly like every other override here. */
   function identityOidFieldsHtml(d, forGroup = false) {
-    const inherit = forGroup ? 'standard detection' : 'inherit';
+    const inherit = forGroup ? 'standard detection' : 'inherit';   // device forms get the real value from applyInheritHints
     const p = forGroup ? 'nd-p' : 'nd-f';
     // The manual vendor is a device fact, not a profile setting, so only
     // the device form offers it; the profile form gets the two OIDs only.
@@ -2081,12 +2174,18 @@
   function deviceOverrides(box) {
     const val = (id) => box.querySelector(id).value.trim();
     const overrides = {};
-    if (val('#nd-f-version') !== '') overrides.snmp_version = Number(val('#nd-f-version'));
+    // Blank is sent as null so it CLEARS an override — these used to be
+    // omitted when blank, so emptying a field the operator had filled in
+    // changed nothing, while the legend promised the profile's value.
+    overrides.snmp_version = val('#nd-f-version') === '' ? null : Number(val('#nd-f-version'));
+    overrides.v3_user = val('#nd-f-v3user') || null;
+    overrides.v3_auth_proto = val('#nd-f-authproto') || null;
+    overrides.poll_interval_s = val('#nd-f-interval') ? Number(val('#nd-f-interval')) : null;
+    overrides.snmp_timeout_s = val('#nd-f-timeout') ? Number(val('#nd-f-timeout')) : null;
+    // The one exception, on purpose: the community is a secret the form is
+    // not shown for an account that cannot read secrets, so a blank here
+    // may mean "hidden", not "clear". It is only sent when typed.
     if (val('#nd-f-community')) overrides.community = val('#nd-f-community');
-    if (val('#nd-f-v3user')) overrides.v3_user = val('#nd-f-v3user');
-    if (val('#nd-f-authproto')) overrides.v3_auth_proto = val('#nd-f-authproto');
-    if (val('#nd-f-interval')) overrides.poll_interval_s = Number(val('#nd-f-interval'));
-    if (val('#nd-f-timeout')) overrides.snmp_timeout_s = Number(val('#nd-f-timeout'));
     overrides.ping_enabled = triValue(box, '#nd-f-ping');
     overrides.snmp_enabled = triValue(box, '#nd-f-snmp');
     // Always sent, like the tri-states above: the select always has a
@@ -2156,6 +2255,7 @@
         App.refreshNow('nodes');
       } },
     ]);
+    wireInheritHints(box, {});
     // No id yet, so borrow any existing device's candidate list; the server
     // only excludes the device asked about, and a new device is in neither.
     const anyDevice = (view.devices || [])[0];
@@ -2200,6 +2300,7 @@
         App.refreshNow('nodes');
       } },
     ]);
+    wireInheritHints(box, d);
     fillUpstream(box, d.id);
   }
 
@@ -2759,7 +2860,7 @@
 
   function drawDiscJobsTable() {
     const table = App.el('disc-jobs-table');
-    table.innerHTML = '<caption class="sr-only">Discovery jobs</caption><thead><tr><th scope="col">Target</th><th scope="col">State</th><th scope="col">Found</th><th scope="col"></th></tr></thead>';
+    table.innerHTML = '<caption class="sr-only">Discovery jobs</caption><thead><tr><th scope="col">Target</th><th scope="col">State</th><th scope="col">Found</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead>';
     const body = document.createElement('tbody');
     for (const job of view.discJobs) {
       const tr = document.createElement('tr');

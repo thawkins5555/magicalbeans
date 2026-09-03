@@ -1210,6 +1210,12 @@ def get_syslog_overview(service, params, body) -> dict:
     }
 
 
+# The most rows a search returns whatever limit is asked for. Was an inline
+# 2000 in two handlers; named so the response can say so and the page can
+# read "300 of 4,120 shown" instead of "300 shown".
+SEARCH_ROW_CAP = 2000
+
+
 def get_syslog_search(service, params, body) -> dict:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
@@ -1217,7 +1223,8 @@ def get_syslog_search(service, params, body) -> dict:
     filters = _syslog_filters(params)
 
     started = time.time()
-    rows = service.syslog_db.search(t0, t1, filters, limit=min(limit, 2000))
+    effective = min(limit, SEARCH_ROW_CAP)
+    rows = service.syslog_db.search(t0, t1, filters, limit=effective)
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
@@ -1244,6 +1251,8 @@ def get_syslog_search(service, params, body) -> dict:
 
     return {
         "took_ms": round(elapsed_ms, 1),
+        "limit": effective, "cap": SEARCH_ROW_CAP,
+        "truncated": len(rows) >= effective,
         "fts": service.syslog_db.fts,
         "messages": [
             {
@@ -1348,7 +1357,8 @@ def get_snmp_traps(service, params, body) -> dict:
     filters = _snmp_filters(params)
 
     started = time.time()
-    rows = service.snmp_db.search(t0, t1, filters, limit=min(limit, 2000))
+    effective = min(limit, SEARCH_ROW_CAP)
+    rows = service.snmp_db.search(t0, t1, filters, limit=effective)
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
@@ -1389,7 +1399,8 @@ def get_snmp_traps(service, params, body) -> dict:
             "varbind_n": row["varbind_n"],
             "varbinds": varbinds,
         })
-    return {"took_ms": round(elapsed_ms, 1), "traps": traps}
+    return {"took_ms": round(elapsed_ms, 1), "limit": effective, "cap": SEARCH_ROW_CAP,
+            "truncated": len(rows) >= effective, "traps": traps}
 
 
 def post_snmp_collector(service, params, body) -> dict:
@@ -1882,7 +1893,36 @@ def _device_json(row, reveal: bool = False) -> dict:
         "last_down_ts": row["last_down_ts"],
         "last_uptime_ticks": row["last_uptime_ticks"],
         "last_uptime_ts": row["last_uptime_ts"], "created_ts": row["created_ts"],
+        "status_since_ts": _status_since(row),
+        "sys_uptime_s": _sys_uptime_s(row),
     }
+
+
+def _status_since(row):
+    """When the device entered its current state — the question "is it up"
+    is always followed by "since when", and the summary could not answer it.
+
+    last_up_ts is the last poll that saw the device up (rewritten on every
+    up poll), last_down_ts the last that saw it down. So a device that is up
+    has been up since the last time it was seen down, and one that is down
+    since it was last seen up; a device never seen in the other state has
+    been in this one since it was added. Unknown states have no since."""
+    status = row["status"]
+    if status == "up":
+        return row["last_down_ts"] or row["created_ts"]
+    if status == "down":
+        return row["last_up_ts"] or row["created_ts"]
+    return None
+
+
+def _sys_uptime_s(row):
+    """The device's own sysUpTime, aged forward from when it was last read —
+    the same pair reboot detection compares (nodepoll). None until read."""
+    ticks = row["last_uptime_ticks"]
+    read_at = row["last_uptime_ts"]
+    if ticks is None or not read_at:
+        return None
+    return round(ticks / 100 + max(0.0, time.time() - read_at))
 
 
 def _group_json(service, row, reveal: bool = False) -> dict:
@@ -4094,6 +4134,18 @@ def post_wireless_collector(service, params, body) -> dict:
             "status": service.wireless.status_text()}
 
 
+def post_ipam_worker(service, params, body) -> dict:
+    """Start or stop the IPAM worker from its strip. Goes through
+    apply_ipam_settings so the choice persists exactly as the checkbox in
+    the settings dialog does — the only control there used to be."""
+    action = str(body.get("action", "")).lower()
+    if action not in ("start", "stop"):
+        raise ValueError("action must be start or stop")
+    service.apply_ipam_settings({"enabled": action == "start"})
+    return {"running": service.ipam.running,
+            "enabled": bool(service.ipam_settings.get("enabled", True))}
+
+
 # ----------------------------------------------------------------- configrx
 
 def _configrx_device_json(service, device_row, worker_state=None) -> dict:
@@ -4921,11 +4973,19 @@ def get_dashboard(service, params, body) -> dict:
             "counters": service.alert_engine.counters,
         }
 
+    # Every background process, each by the noun its own tab uses for it.
+    # This tile used to list three of the eight and call them all
+    # "collectors".
     collectors = []
     for module, name, obj in (
-            ("netflow", "NetFlow", getattr(service, "collector", None)),
-            ("snmp", "SNMP traps", getattr(service, "snmp", None)),
-            ("syslog", "Syslog", getattr(service, "syslog", None))):
+            ("nodes", "Nodes poller", getattr(service, "node_poller", None)),
+            ("alerts", "Alert engine", getattr(service, "alert_engine", None)),
+            ("netflow", "NetFlow collector", getattr(service, "collector", None)),
+            ("snmp", "SNMP trap receiver", getattr(service, "snmp", None)),
+            ("syslog", "Syslog collector", getattr(service, "syslog", None)),
+            ("ipam", "IPAM worker", getattr(service, "ipam", None)),
+            ("wireless", "Wireless poller", getattr(service, "wireless", None)),
+            ("configrx", "ConfigRX worker", getattr(service, "configrx", None))):
         if obj is None or not _dash_can(service, params, module):
             continue
         counters = dict(getattr(obj, "counters", {}) or {})

@@ -361,6 +361,7 @@ ROUTES = [
     ("POST", r"^/api/wireless/aps/(\d+)/service$", api.post_wireless_ap_service, ("wireless", W)),
     ("DELETE", r"^/api/wireless/aps/(\d+)$", api.delete_wireless_ap, ("wireless", W)),
     ("POST", r"^/api/wireless/collector$", api.post_wireless_collector, ("wireless", W)),
+    ("POST", r"^/api/ipam/worker$", api.post_ipam_worker, ("ipam", W)),
     ("GET", r"^/api/configrx/overview$", api.get_configrx_overview, ("configrx", R)),
     ("GET", r"^/api/configrx/devices$", api.get_configrx_devices, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/bulk-config$", api.post_configrx_devices_bulk_config, ("configrx", W)),

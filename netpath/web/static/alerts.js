@@ -56,14 +56,8 @@
   // others were not — this copy omitted the apostrophe.
   const escape = App.escapeHtml;
 
-  function ago(ts) {
-    if (!ts) return '—';
-    const age = Date.now() / 1000 - ts;
-    if (age < 5) return 'just now';
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    return `${(age / 3600).toFixed(1)}h ago`;
-  }
+  // One relative-time vocabulary for the whole product: App.ago (app.js).
+  const ago = (ts) => App.ago(ts, '\u2014');
 
   function window_() {
     const seconds = Number(App.el('alerts-range').value) || 86400;
@@ -92,9 +86,9 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const alerts = server.alerts || { counters: {} };
-    App.el('alerts-status').textContent = alerts.status || 'Engine stopped';
+    App.el('alerts-status').textContent = alerts.status || 'Alert engine stopped';
     App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--line)';
-    App.el('alerts-toggle').textContent = alerts.running ? 'Stop engine' : 'Start engine';
+    App.el('alerts-toggle').textContent = alerts.running ? 'Stop alert engine' : 'Start alert engine';
     const c = alerts.counters || {};
     App.el('alerts-counters').textContent =
       `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
@@ -160,7 +154,7 @@
       const hit = App.svgNode('rect', { x, y: plot.y, width: w, height: plot.h,
         fill: 'transparent', style: 'cursor:pointer' });
       hit.addEventListener('mousemove', (event) =>
-        App.tooltip(`${new Date(bucket.t0 * 1000).toLocaleString()}\n${bucket.total} alert(s)`, event));
+        App.tooltip(`${App.when(bucket.t0)}\n${bucket.total} alert(s)`, event));
       hit.addEventListener('mouseleave', App.hideTooltip);
       svg.appendChild(hit);
     });
@@ -194,14 +188,14 @@
     { key: 'count', label: 'Count', width: 60, numeric: true, on: true,
       cell: (r) => (r.count > 1 ? r.count : '') },
     { key: 'opened_ts', label: 'Opened', width: 90, numeric: true, on: true,
-      cell: (r) => ago(r.opened_ts) },
+      cell: (r) => App.agoCell(r.opened_ts, '\u2014') },
     { key: 'last_ts', label: 'Last seen', width: 90, numeric: true, on: true,
-      cell: (r) => ago(r.last_ts) },
+      cell: (r) => App.agoCell(r.last_ts, '\u2014') },
     { key: 'severity_name', label: 'Severity name', width: 110 },
     { key: 'acked_by', label: 'Acknowledged by', width: 140,
       cell: (r) => escape(r.acked_by || '\u2014') },
     { key: 'resolved_ts', label: 'Resolved', width: 90, numeric: true,
-      cell: (r) => (r.resolved_ts ? ago(r.resolved_ts) : '\u2014') },
+      cell: (r) => App.agoCell(r.resolved_ts, '\u2014') },
     { key: 'entity_kind', label: 'Kind', width: 80 },
   ];
 
@@ -274,12 +268,9 @@
   }
 
   function countLabel() {
-    const shown = view.alerts.length;
-    const t = view.alertTotal;
-    if (!t || typeof t.total !== 'number') return `${shown} shown`;
-    if (t.capped) return `${shown} of more than ${t.total.toLocaleString()} shown`;
-    if (t.total <= shown) return `${shown} shown`;
-    return `${shown} of ${t.total.toLocaleString()} shown`;
+    const t = view.alertTotal || {};
+    return App.countLabel(view.alerts.length,
+      typeof t.total === 'number' ? t.total : null, !!t.capped);
   }
 
   /* ------------------------------------------------------- bulk actions */
@@ -450,7 +441,7 @@
           `${KIND_LABELS[row.entity_kind] || 'an object outside Nodes'}`);
     let muteHtml;
     if (mutedUntil) {
-      const until = escape(new Date(mutedUntil * 1000).toLocaleTimeString());
+      const until = escape(App.when(mutedUntil));
       muteHtml = `<span class="hint" id="alerts-d-muted">Muted until ${until}</span>` +
         (muteable
           ? `<button id="alerts-d-unmute">Lift mute</button>`
@@ -479,10 +470,10 @@
       ${row.detail ? `<p class="hint">${escape(row.detail)}</p>` : ''}
       ${row.rollup_note ? `<p class="hint"><b>Rolled up into this alert</b><br>` +
         `${escape(row.rollup_note).split('\n').join('<br>')}</p>` : ''}
-      <p class="hint">Opened ${new Date(row.opened_ts * 1000).toLocaleString()} · ` +
-        `last seen ${new Date(row.last_ts * 1000).toLocaleString()} · occurred ${row.count} time(s)</p>
+      <p class="hint">Opened ${App.when(row.opened_ts)} · ` +
+        `last seen ${App.when(row.last_ts)} · occurred ${row.count} time(s)</p>
       ${row.acked_by ? `<p class="hint">Acknowledged by ${escape(row.acked_by)}${row.ack_note ? `: ${escape(row.ack_note)}` : ''}</p>` : ''}
-      ${row.resolved_ts ? `<p class="hint">Resolved ${new Date(row.resolved_ts * 1000).toLocaleString()}${row.resolved_by ? ` by ${escape(row.resolved_by)}` : ' automatically'}` +
+      ${row.resolved_ts ? `<p class="hint">Resolved ${App.when(row.resolved_ts)}${row.resolved_by ? ` by ${escape(row.resolved_by)}` : ' automatically'}` +
         // How long it stood, which is the question a resolved alert is
         // usually opened to answer. Both timestamps are already on the row,
         // so this costs nothing.
@@ -509,7 +500,7 @@
       if (!box) return;
       if (!full.notifications.length) { box.textContent = 'None sent.'; return; }
       box.innerHTML = full.notifications.map((n) =>
-        `<div>${new Date(n.ts * 1000).toLocaleString()} — ${escape(n.kind)} to ${escape(n.to_addr)}: ` +
+        `<div>${App.when(n.ts)} — ${escape(n.kind)} to ${escape(n.to_addr)}: ` +
         `${n.ok ? 'sent' : `<span class="err">failed (${escape(n.error)})</span>`}</div>`).join('');
     }).catch(() => {});
   }
@@ -579,19 +570,6 @@
       <p class="hint">Off makes the rule raise alerts that appear in the list
         and the badge but never reach a mailbox — for the noisy ones nobody
         wants paged about, which used to mean disabling the rule outright.</p>
-      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
-        placeholder="never" value="${extras.auto_resolve_after_s
-          ? Math.round(extras.auto_resolve_after_s / 60) : ''}"> minutes
-        (blank = never)</label>
-      <p class="hint">For a rule that fires on something momentary — a reboot,
-        a trap, a syslog line — where nothing will ever arrive to clear it.
-        The alert resolves itself this long after its last occurrence. Blank
-        leaves it open until somebody resolves it or the condition clears.</p>
-      <label class="check"><input type="checkbox" id="ar-notify"
-        ${extras.notify !== false ? 'checked' : ''}> Send email for this rule</label>
-      <p class="hint">Off makes the rule raise alerts that appear in the list
-        and the badge but never reach a mailbox — for the noisy ones nobody
-        wants paged about, which used to be turned off entirely instead.</p>
       ${isThreshold ? `
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>

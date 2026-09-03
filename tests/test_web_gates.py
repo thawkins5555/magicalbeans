@@ -166,6 +166,45 @@ try:
     check("session carries the absolute countdown",
           session.get("max_seconds_remaining") is not None, session)
 
+    # --------------------------------------------- 4.44.0: since, counts, toggle
+    print("since when, honest counts, the IPAM toggle")
+    status, payload, _ = call("GET", "/api/nodes/devices", token=token)
+    devices = payload.get("devices") or payload if isinstance(payload, dict) else payload
+    if isinstance(devices, dict):
+        devices = devices.get("devices", [])
+    device_id = devices[0]["id"] if devices else None
+    check("a device exists to inspect", device_id is not None, str(payload)[:120])
+    if device_id is not None:
+        status, detail, _ = call("GET", f"/api/nodes/devices/{device_id}", token=token)
+        d = detail.get("device", detail)
+        check("the device carries status_since_ts and sys_uptime_s",
+              "status_since_ts" in d and "sys_uptime_s" in d, sorted(d)[:8])
+        if d.get("status") == "up":
+            check("up since the last time it was seen down",
+                  d["status_since_ts"] == (d.get("last_down_ts") or d.get("created_ts")))
+        elif d.get("status") == "down":
+            check("down since the last time it was seen up",
+                  d["status_since_ts"] == (d.get("last_up_ts") or d.get("created_ts")))
+        else:
+            check("an unknown state has no since", d["status_since_ts"] is None, d.get("status"))
+    for path in ("/api/syslog/search?limit=5", "/api/snmp/traps?limit=5"):
+        status, payload, _ = call("GET", path, token=token)
+        check(f"{path.split('?')[0]} says whether it was cut off",
+              status == 200 and "truncated" in payload and payload.get("cap") == 2000
+              and payload.get("limit") == 5, str(payload)[:100])
+    status, before, _ = call("GET", "/api/state", token=token)
+    status, payload, _ = call("POST", "/api/ipam/worker", {"action": "stop"}, token=token)
+    check("the IPAM worker can be stopped from its strip", status == 200 and payload.get("enabled") is False,
+          f"{status} {payload}")
+    status, config, _ = call("GET", "/api/config", token=token)
+    check("and the choice is persisted like the settings checkbox",
+          config.get("ipam_settings", {}).get("enabled") is False
+          and config["config_version"] > before["config_version"])
+    status, payload, _ = call("POST", "/api/ipam/worker", {"action": "start"}, token=token)
+    check("and started again", status == 200 and payload.get("enabled") is True, f"{status} {payload}")
+    status, payload, _ = call("POST", "/api/ipam/worker", {"action": "dance"}, token=token)
+    check("an unknown action is refused", status == 400, status)
+
     print("FAILED: " + ", ".join(failures) if failures else "ALL WEB GATE ASSERTIONS PASSED")
 finally:
     server.stop()
