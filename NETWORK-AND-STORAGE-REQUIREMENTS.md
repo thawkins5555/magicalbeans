@@ -250,6 +250,18 @@ The `-wal` and `-shm` files appear while the service runs and normally
 disappear on a clean stop. Copy all three together, or stop the service first,
 or the most recent data is lost.
 
+**File modes, on POSIX hosts.** From 4.37.0 the data folder is created `0700`
+and every database, along with its `-wal` and `-shm` companions, is narrowed to
+`0600` when it is opened. Before that they were created with the process umask
+— typically a `0644` file in a `0755` directory — so any local account on the
+host could read stored settings, encrypted credential blobs, syslog, traps and
+configuration backups. A folder or file from an older install is tightened on
+the next start; if you have deliberately widened them (a backup agent running
+as another account, say) that widening is undone, and the right answer is to
+give the agent group access to a copy rather than to the live folder. Windows
+hosts are unchanged: NTFS inheritance from the data folder governs there, and
+nothing in the application alters an ACL.
+
 ### Why each one is written
 
 **Traces** are the point of the NetPath module: a route graph and a timeline
@@ -285,7 +297,7 @@ Rough shapes to start from:
 | NetFlow | flow records exported | tens of MB to several GB per day |
 | SNMP Trap | traps per device per day | ~200 bytes per trap; normally the smallest of the record files |
 | Syslog | messages per second | **~455 bytes per message**, measured, not the ~150 this table used to claim — a stored row is the decoded fields *plus* the original line *plus* its entry in the FTS5 trigram search index, and the index is most of the difference. Budget for it: 10 messages/s is about 390 MB a day. |
-| Nodes | devices × poll frequency × metrics per device | ~33 bytes per sample row; see the per-port arithmetic below. Raw samples are kept for `sample_retention_days` (3 by default) and rolled up into hourly min/avg/max, which are kept for `rollup_retention_days` (400). **The rollup genuinely runs from 4.37.0**; in every earlier release `compact_rollup()` had no caller, `samples_hourly` was always empty, and a chart wider than the raw window drew nothing. |
+| Nodes | devices × poll frequency × metrics per device | ~33 bytes per sample row; see the per-port arithmetic below. Raw samples are kept for `sample_retention_days` (3 by default) and rolled up into hourly min/avg/max, which are kept for `rollup_retention_days` (400). A second limit runs beside the day count: `sample_row_cap_per_metric` (5,000) is the most raw rows any one metric keeps, and from 4.37.0 it is applied per metric rather than to the whole `samples` table — as a whole-table cap of 50,000 rows it left a 2,000-device fleet with under a third of one poll cycle of history. **The rollup genuinely runs from 4.37.0** too; in every earlier release `compact_rollup()` had no caller, `samples_hourly` was always empty, and a chart wider than the raw window drew nothing. |
 | Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
 | Wireless | controller count × AP count | a few KB per AP; normally tiny, since a site has a handful of controllers, not hundreds |
 | ConfigRX | device count × how often configs actually change | a device's own config text, compressed, once per change — most devices add nothing between backups |

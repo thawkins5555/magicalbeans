@@ -10,6 +10,7 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 ## Contents
 
 - [How it runs](#how-it-runs)
+- [Dashboard — the screen a shift starts on](#dashboard--the-screen-a-shift-starts-on)
 - [Nodes — SNMP poller and device inventory](#nodes--snmp-poller-and-device-inventory)
 - [Alerts — rule-based alerting and email notification](#alerts--rule-based-alerting-and-email-notification)
 - [NetPath — path monitoring](#netpath--path-monitoring)
@@ -27,10 +28,11 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 **Dashboard**, **Nodes**, **Alerts**, **NetPath**, **NetFlow**, **SNMP
 Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
 and **Settings**, which stay rightmost so adding a module never moves
-them. Dashboard aggregates a summary of whatever other modules the
-signed-in account can read — see Permissions, under Settings — rather
-than being its own tab with data of its own. A tab the signed-in account
-has no read access to is hidden from the tab bar entirely.
+them. Dashboard aggregates whatever other modules the signed-in account
+can read — see Permissions, under Settings — rather than holding data of
+its own; from 4.37.0 it is a real page rather than a placeholder, and it
+is described under **Dashboard** below. A tab the signed-in account has no
+read access to is hidden from the tab bar entirely.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -39,12 +41,23 @@ them all. The chrome also tightens automatically below 900 pixels of viewport
 height, and again below 700, so a laptop gets a usable layout before anything
 is dragged.
 
-**Reloading the page returns to whichever tab was open**, not back to
-NetPath — the browser remembers the last tab the same way it remembers
-panel sizes and column widths, per browser rather than per account.
-**Signing in always opens on Dashboard**, though: a fresh login is a new
-visit, not a reload, so it starts from the same place every time rather
-than wherever a previous session happened to leave off.
+**Every selection has a URL.** From 4.37.0 the address bar carries the
+open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
+`#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
+`#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
+`#/syslog/8801` and `#/wireless/3` for a trap, a message and an access
+point. Back walks the selections, a reload lands where you were,
+and a link pasted into a ticket or an email opens what it names for
+anybody who can sign in and read that module. A route naming something the
+account cannot read, or that no longer exists, falls back to the tab.
+
+**Reloading the page returns to whichever tab was open**, then, from its
+URL; where there is no URL to read — a bookmark to the bare address —
+the browser's remembered last tab is used, the same way it remembers panel
+sizes and column widths, per browser rather than per account. **Signing in
+always opens on Dashboard**: a fresh login is a new visit, not a reload,
+so it starts from the same place every time rather than wherever a
+previous session happened to leave off.
 
 ## How it runs
 
@@ -93,6 +106,32 @@ The Debug page is deliberately outside this: its tables are live worker state
 rather than records to work through.
 
 ---
+
+## Dashboard — the screen a shift starts on
+
+The landing page after every sign-in. Until 4.37.0 it said "nothing here
+yet" — which it had said for several releases while being the first thing
+every operator saw. It now answers "what should I look at first" from data
+the application already had, refreshed on the interval in
+`dashboard_refresh_s` (five seconds by default).
+
+| Tile | Shows |
+| --- | --- |
+| Fleet | Total devices, and how many are up, down, unknown or failing authentication, with the poll pool's busy and queued worker counts beneath |
+| Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices |
+| Collectors | NetFlow, SNMP Trap and Syslog: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
+| Storage headroom | Each database against its own size cap |
+| Worst ten (24 h) | Six lists: most device events, most interface events, most alerts, slowest to answer, worst packet loss, highest CPU |
+
+**Every count is a link**, and a real one — an anchor with an `href`, so it
+can be middle-clicked into a second tab or copied into a ticket. Clicking
+"14 down" opens Nodes showing those fourteen rather than the whole fleet.
+
+**A section the signed-in account cannot read is left out**, not drawn as a
+zero: the Dashboard is the one tab that is always visible, and it omits
+what the account has no grant for rather than showing a number that would
+be a lie. The six 24-hour lists are refreshed on a slower cadence than the
+tiles, since they are history rather than live state.
 
 ## Nodes — SNMP poller and device inventory
 
@@ -755,7 +794,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **32 built-in rules** ship enabled: a device not responding, a device
+- **35 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
@@ -770,6 +809,21 @@ alerts and optionally emailing about them.
   now records `if_in_util_pct`, `if_out_util_pct`, `if_in_error_rate`,
   `if_out_error_rate`, `if_in_discard_rate`, `if_out_discard_rate` and
   `disk_pct`, both per port and as a device-level maximum, so they are live.
+- **Three of those 35 are new in 4.37.0**, and each one reports a failure
+  that previously had nobody to report it. `snmp_failing_ping_ok` fires
+  when a device answers ping while its SNMP agent has stopped answering —
+  the case where a switch sat green with no counters behind it.
+  `poll_pool_saturated` fires when every poll worker has been busy for five
+  minutes, which is the fleet outgrowing its worker count rather than any
+  one device failing. `smtp_failing` fires when the mail path itself stops
+  working, and is the one rule whose notification cannot be delivered by
+  the mechanism it is about — it exists so the alert list says so.
+- **A rule carries three attributes that the rule dialog now edits.**
+  Beyond severity, enablement, device filter and thresholds: an
+  auto-resolve interval (`auto_resolve_after_s`, blank meaning never), an
+  email switch (`notify`, on by default), and the template it uses — which
+  for a rule that is not an outage is the generic `event_notice` rather
+  than the "is not responding" wording six rules used to borrow.
 - **A rule can resolve itself after a set time.** `auto_resolve_after_s` on
   a rule, measured from the last occurrence, closes an alert that describes
   a moment rather than a condition — "device recovered", "device rebooted",
@@ -1929,8 +1983,9 @@ password ends every session on that account, this one included.
 
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
-ConfigRX, SSH, Settings, Debug — set from **Settings → Users** (itself gated
-on Settings write access). Write implies read; no grant at all means no
+ConfigRX, SSH, Settings, Debug and — new in 4.37.0 — Admin, set from
+**Settings → Users** (itself gated on Admin write access). Write implies
+read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
 bar, and a write-gated control (add/edit/delete buttons, a module's
 Settings gear) is hidden within a tab the account can only read — both
@@ -1940,11 +1995,25 @@ tab is the one exception: it's always visible and simply omits whatever
 sections the signed-in account can't read, rather than being gated as a
 whole.
 
+**Administering the application is its own grant, from 4.37.0.** Settings
+write used to be root by accident: it could grant itself every other
+module, reset anybody's password and make the host replace its own code.
+**Admin** now covers exactly that work — adding, editing and removing
+accounts, changing anybody's grants, resetting another account's password,
+the maintenance actions that delete retention data, reading the audit log,
+and the `updates_enabled` setting that decides whether self-update may run
+at all — while Settings write goes back to meaning "may change how the
+application is configured". Nobody can edit their own grants, and the last
+account holding Admin write cannot be reduced, so an install cannot lock
+itself out. On upgrade every account that held Settings write is given
+Admin once, so nothing an operator could do the day before stops working;
+from there the two can be granted and taken away separately.
+
 **Changing your own password always works**, even with zero access to
 Settings — it lives in an "Account" control in the top bar, independent
 of the Settings tab, rather than being gated like everything else there.
-Resetting a *different* account's password still requires Settings write
-access, same as adding, editing or removing an account.
+Resetting a *different* account's password requires Admin write, same as
+adding, editing or removing an account.
 
 An install upgrading from a version before this shipped keeps every
 existing account's access exactly as it was — the first time the
