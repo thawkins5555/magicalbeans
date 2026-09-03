@@ -29,7 +29,7 @@ from netpath.syslogd import SyslogCollector
 from netpath.db import Database as NetPathDatabase
 from netpath.ipamdb import IpamDatabase
 from netpath.syslogdb import SyslogDatabase
-from netpath.syslogparse import LogEntry
+from netpath.syslogparse import LogEntry, parse
 
 FAILURES: list[str] = []
 
@@ -667,6 +667,191 @@ def test_c6_forged_v3_traps_are_dropped() -> None:
           "the setting ships on by default")
 
 
+# ----------------------------------------------------------------------- C7
+
+def test_c7_syslog_robustness() -> None:
+    """The parser dropped only the first of several RFC 5424 structured-data
+    elements, refused a 5424 message with an empty MSG, believed any device's
+    clock, and read a PRI above 191; the framer treated any leading digits as
+    an RFC 6587 length; TCP spawned an uncapped thread per connection; and one
+    device in a debug loop could evict every other device's messages."""
+    print("C7: syslog parsing, framing, throttling and repeat collapsing")
+
+    now = time.time()
+
+    relayed = (b'<165>1 2003-10-11T22:14:15.003Z host app - - '
+               b'[timeQuality tzKnown="1" isSynced="0"]'
+               b'[origin ip="10.1.1.1" software="rsyslogd"] real message')
+    entry = parse(relayed, "10.1.1.1", now=now)
+    check(entry.message == "real message",
+          f"every structured-data element is stripped, not just the first "
+          f"({entry.message!r})")
+
+    escaped = (b'<165>1 2003-10-11T22:14:15.003Z m.example.com evntslog - ID47 '
+               b'[exampleSDID@32473 eventSource="App\\]lication"] the message')
+    check(parse(escaped, "10.1.1.1", now=now).message == "the message",
+          "an escaped bracket inside a parameter still ends the element correctly")
+
+    unterminated = (b'<165>1 2003-10-11T22:14:15.003Z host app - - '
+                    b'[unterminated k="v" the rest')
+    check(parse(unterminated, "10.1.1.1", now=now).message.startswith("[unterminated"),
+          "an unterminated element is kept rather than guessed at")
+
+    empty = parse(b'<165>1 2003-10-11T22:14:15.003Z host app - -', "10.1.1.1", now=now)
+    check(empty.message == "" and empty.host == "host" and empty.app == "app",
+          f"a 5424 heartbeat with an empty MSG parses its header "
+          f"(host={empty.host!r} app={empty.app!r} msg={empty.message!r})")
+
+    high = parse(b"<999>hi there", "10.1.1.1", now=now)
+    check(high.facility == 1 and high.severity == 6
+          and high.message == "<999>hi there",
+          f"a PRI above 191 is message text, not facility {high.facility}")
+    ok_pri = parse(b"<191>local7 debug", "10.1.1.1", now=now)
+    check(ok_pri.facility == 23 and ok_pri.severity == 7,
+          "191 itself is still a valid PRI")
+
+    june = time.mktime((2026, 6, 2, 0, 30, 0, 0, 0, -1))
+    far = parse(b"<134>Dec 31 23:59:00 sw1 x: y", "10.1.1.1", now=june)
+    check(abs(far.ts - june) < 1.0,
+          "a December timestamp read in June falls back to the arrival time")
+    near = parse(b"<134>Jun  2 00:29:30 sw1 x: y", "10.1.1.1", now=june)
+    check(abs(near.ts - (june - 30)) < 1.0,
+          "a timestamp within the hour window is still believed")
+
+    # --- rows already stored with a future timestamp can be pruned ---------
+    syslog_db = SyslogDatabase(db_path("c7-future.db"))
+    syslog_db.insert([LogEntry(ts=time.time() + 400 * 86400, source="10.9.9.9",
+                               message="from a device set years ahead"),
+                      LogEntry(ts=time.time(), source="10.9.9.9",
+                               message="a normal message")])
+    removed = syslog_db.prune(retention_days=30, max_rows=0)
+    check(removed == 1 and syslog_db.max_id() >= 1,
+          f"prune removes a row timestamped in the future ({removed} removed)")
+    rows = syslog_db.rows_since(0, limit=None)
+    check(len(rows) == 1 and rows[0]["message"] == "a normal message",
+          "and leaves the good one alone")
+    syslog_db.close()
+
+    # --- consecutive duplicates collapse into one row ---------------------
+    syslog_db = SyslogDatabase(db_path("c7-repeat.db"))
+    syslog_db.collapse_repeats_s = 5.0
+    base = time.time()
+    for index in range(50):
+        syslog_db.insert([LogEntry(ts=base + index * 0.01, source="10.2.2.2",
+                                   severity=3, app="BGP",
+                                   message="%BGP-3-NOTIFICATION: neighbour reset")])
+    syslog_db.insert([LogEntry(ts=base + 1, source="10.2.2.2", severity=3,
+                               app="BGP", message="something else")])
+    rows = syslog_db.rows_since(0, limit=None)
+    check(len(rows) == 2, f"50 identical lines collapse to one row plus the "
+                          f"next different one ({len(rows)} rows)")
+    check(rows[0]["repeat_count"] == 50,
+          f"the row carries repeat_count={rows[0]['repeat_count']}")
+    check(abs(rows[0]["ts"] - base) < 0.001,
+          "and keeps the first occurrence's timestamp")
+    counts = syslog_db._conn.execute(
+        "SELECT SUM(n) AS n FROM log_counts").fetchone()["n"]
+    check(counts == 51,
+          f"the hourly timeline still counts every message that arrived ({counts})")
+    # A different source in between must not break the run.
+    syslog_db.close()
+
+    # --- the per-source token bucket --------------------------------------
+    syslog_db = SyslogDatabase(db_path("c7-rate.db"))
+    syslog = SyslogCollector(syslog_db)
+    port = free_udp_port()
+    assert syslog.start({"port": port, "bind_address": "127.0.0.1",
+                         "per_source_rate": 20})
+    try:
+        for index in range(500):
+            syslog._enqueue(b"<134>flood %d" % index, "10.3.3.3")
+        check(syslog.counters["throttled"] > 400,
+              f"a source above its rate is throttled "
+              f"({syslog.counters['throttled']} of 500)")
+        check(syslog.counters["messages"] <= 25,
+              f"only the bucket's worth got through "
+              f"({syslog.counters['messages']})")
+        for index in range(10):
+            syslog._enqueue(b"<134>quiet %d" % index, "10.4.4.4")
+        check(syslog.counters["messages"] <= 35 and syslog.counters["messages"] >= 15,
+              "a different source is unaffected by the noisy one's bucket")
+        check(len(syslog._buckets) == 2, "one bucket per source, and no more")
+        # Bounded: five thousand distinct sources leave at most MAX_RATE_SOURCES.
+        for index in range(5000):
+            syslog._within_rate(f"10.20.{index // 256}.{index % 256}", time.time())
+        check(len(syslog._buckets) <= 4096,
+              f"the bucket table is bounded ({len(syslog._buckets)})")
+        check("throttled" in syslog.status_text(),
+              "the status strip says it is throttling")
+    finally:
+        syslog.stop()
+        syslog_db.close()
+
+    # --- rejected sources no longer refresh "last message just now" --------
+    syslog_db = SyslogDatabase(db_path("c7-reject.db"))
+    syslog = SyslogCollector(syslog_db)
+    assert syslog.start({"port": free_udp_port(), "bind_address": "127.0.0.1",
+                         "allowed_sources": "10.5.5.5"})
+    try:
+        syslog._enqueue(b"<134>from a source nobody allowed", "10.6.6.6")
+        check(syslog.counters["rejected"] == 1
+              and syslog.counters["messages"] == 0
+              and syslog.counters["last_message"] == 0.0,
+              "a rejected source is counted without refreshing 'last message'")
+    finally:
+        syslog.stop()
+        syslog_db.close()
+
+    # --- RFC 6587 framing and the TCP client cap --------------------------
+    syslog_db = SyslogDatabase(db_path("c7-tcp.db"))
+    syslog = SyslogCollector(syslog_db)
+    tcp_port = free_udp_port()
+    assert syslog.start({"port": free_udp_port(), "bind_address": "127.0.0.1",
+                         "accept_udp": True, "accept_tcp": True,
+                         "tcp_port": tcp_port, "max_tcp_clients": 4,
+                         "collapse_repeats_s": 0})
+    clients = []
+    try:
+        sock = socket.create_connection(("127.0.0.1", tcp_port), timeout=5)
+        clients.append(sock)
+        # A newline-framed line that merely starts with a number.
+        sock.sendall(b"123 packets dropped on Gi0/1\n<134>the next line\n")
+        # ... and a real RFC 6587 frame.
+        frame = b"<134>counted frame"
+        sock.sendall(b"%d %s" % (len(frame), frame))
+        check(wait_for(lambda: syslog_db.max_id() >= 3, 8.0),
+              f"all three TCP messages are stored ({syslog_db.max_id()})")
+        stored = [row["message"] for row in syslog_db.rows_since(0, limit=None)]
+        check(any("packets dropped on Gi0/1" in text for text in stored),
+              f"the numeric line is a message, not a length prefix ({stored})")
+        check(any("counted frame" in text for text in stored),
+              "and a real octet-counted frame is still framed correctly")
+
+        for _ in range(8):
+            try:
+                clients.append(socket.create_connection(("127.0.0.1", tcp_port),
+                                                        timeout=5))
+            except OSError:
+                break
+            time.sleep(0.05)
+        check(wait_for(lambda: syslog.counters["tcp_refused"] > 0, 8.0),
+              f"connections past the cap are refused "
+              f"({syslog.counters['tcp_refused']})")
+        check(len(syslog._clients) <= 4,
+              f"at most the cap's worth of client threads live "
+              f"({len(syslog._clients)})")
+        check(all("syslog-tcp-client" != thread.name for thread in syslog._threads),
+              "client threads are kept out of the listener list")
+    finally:
+        for sock in clients:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        syslog.stop()
+        syslog_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -674,6 +859,7 @@ TESTS = [
     test_c4_prune_does_not_rebuild_the_index,
     test_c5_drain_sources_can_be_caught_up,
     test_c6_forged_v3_traps_are_dropped,
+    test_c7_syslog_robustness,
 ]
 
 

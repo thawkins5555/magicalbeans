@@ -19,6 +19,7 @@ trigram cannot index. The app says which one is in use.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sqlite3
@@ -93,6 +94,12 @@ DEFAULTS = {
     # and survives Reset layout, which clears per-browser column widths
     # but must not eat a settings choice.
     "table_columns": "",
+    # Volume controls for one noisy source, so a single device in a debug loop
+    # cannot evict every other device's messages from the queue.
+    "per_source_rate": 200,       # messages a second, 0 disables the limit
+    "collapse_repeats_s": 5.0,    # merge identical consecutive lines within
+                                  # this many seconds into one row, 0 disables
+    "max_tcp_clients": 64,
 }
 
 
@@ -106,6 +113,10 @@ class SyslogDatabase:
         self._conn.row_factory = sqlite3.Row
         self.fts = False
         self._last_rebuild: float | None = None
+        # Last row stored per source, for consecutive-duplicate collapsing.
+        # Keyed on a spoofable source address, so bounded and LRU.
+        self._last_row: collections.OrderedDict = collections.OrderedDict()
+        self.collapse_repeats_s = 0.0
         # Set when an index from an older build had to be dropped; the refill
         # runs on a thread so opening the database stays instant.
         self._backfill_wanted = False
@@ -116,8 +127,22 @@ class SyslogDatabase:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             dbmaint.enable_incremental_vacuum(self._conn, "syslog.db")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._enable_fts()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an
+        install from before repeat collapsing needs the column added
+        explicitly or the next insert fails.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(logs)").fetchall()}
+        if "repeat_count" not in columns:
+            self._conn.execute("ALTER TABLE logs ADD COLUMN repeat_count"
+                               " INTEGER NOT NULL DEFAULT 1")
 
     def _enable_fts(self) -> None:
         """Create the search index, rebuilding it if its shape has changed.
@@ -246,10 +271,45 @@ class SyslogDatabase:
 
     # ------------------------------------------------------------------ write
 
+    def _collapse(self, entries) -> tuple[list, list[int]]:
+        """Split a batch into rows to insert and rows to fold into a repeat.
+
+        A device in a debug loop sends the same line thousands of times; one
+        row per line buries every other message and inflates the index for no
+        information. A consecutive identical line from the same source within
+        the window bumps the previous row's repeat_count instead. Both halves
+        are O(1) per message: the previous row per source is remembered in a
+        bounded LRU rather than looked up.
+        """
+        window = self.collapse_repeats_s
+        if window <= 0:
+            return list(entries), []
+        fresh, bumps = [], []
+        for entry in entries:
+            key = entry.source
+            previous = self._last_row.get(key)
+            if (previous is not None and previous[1] == entry.message
+                    and entry.ts - previous[2] <= window):
+                bumps.append(previous[0])
+                # The run's row keeps the first occurrence's timestamp — when
+                # it started is the useful figure — but the window walks
+                # forward so a steady repeat stays one row.
+                self._last_row[key] = (previous[0], previous[1], entry.ts)
+                self._last_row.move_to_end(key)
+                continue
+            fresh.append(entry)
+        return fresh, bumps
+
+    def _remember(self, first_id: int, entries) -> None:
+        for index, entry in enumerate(entries):
+            self._last_row[entry.source] = (first_id + index, entry.message,
+                                            entry.ts)
+            self._last_row.move_to_end(entry.source)
+        while len(self._last_row) > 4096:
+            self._last_row.popitem(last=False)
+
     def insert(self, entries) -> int:
-        rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
-                 e.procid, e.msgid, e.message, e.raw) for e in entries]
-        if not rows:
+        if not entries:
             return 0
         counts: dict[tuple[int, int], int] = {}
         for entry in entries:
@@ -257,6 +317,24 @@ class SyslogDatabase:
             counts[key] = counts.get(key, 0) + 1
 
         with self._lock:
+            # Collapsing is decided under the lock so two writers cannot bump
+            # the same row concurrently.
+            entries, bumps = self._collapse(entries)
+            rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
+                     e.procid, e.msgid, e.message, e.raw) for e in entries]
+            if bumps:
+                self._conn.executemany(
+                    "UPDATE logs SET repeat_count = repeat_count + 1"
+                    " WHERE id = ?", [(row_id,) for row_id in bumps])
+            if not rows:
+                # The hourly timeline still counts every message that arrived:
+                # a storm that collapses to one row is still a storm.
+                self._conn.executemany(
+                    "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
+                    " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
+                    [(hour, severity, n) for (hour, severity), n in counts.items()])
+                self._conn.commit()
+                return 0
             self._conn.executemany(
                 "INSERT INTO logs(ts, source, host, facility, severity, app,"
                 " procid, msgid, message, raw) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -273,6 +351,11 @@ class SyslogDatabase:
                     [(first_id + index, entry.message, entry.app, entry.host,
                       entry.source)
                      for index, entry in enumerate(entries)])
+            else:
+                last_id = self._conn.execute(
+                    "SELECT last_insert_rowid()").fetchone()[0]
+                first_id = last_id - len(rows) + 1
+            self._remember(first_id, entries)
             self._conn.executemany(
                 "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
                 " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
@@ -532,9 +615,15 @@ class SyslogDatabase:
 
     def prune(self, retention_days: float, max_rows: int) -> int:
         removed = 0
-        cutoff = time.time() - retention_days * 86400
+        now = time.time()
+        cutoff = now - retention_days * 86400
         with self._lock:
             removed += self._delete_logs("ts < ?", (cutoff,))
+            # A device whose clock is set years ahead files rows that sort to
+            # the top of every newest-first search and that `ts < cutoff` can
+            # never reach. Arrival-time clamping stops new ones; this removes
+            # the ones already stored.
+            removed += self._delete_logs("ts > ?", (now + 86400,))
             self._conn.execute("DELETE FROM log_counts WHERE hour < ?", (cutoff,))
             total = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]

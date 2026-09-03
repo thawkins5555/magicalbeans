@@ -23,9 +23,11 @@ from .syslogparse import parse
 
 BATCH = 500
 FLUSH_S = 1.0
-# Cap on the "first message from ..." memory: the key is a spoofable source
-# address, so it is an LRU rather than an unbounded set.
+# Cap on the "first message from ..." memory and on the per-source rate
+# buckets: both are keyed on a spoofable source address, so both are LRUs
+# rather than unbounded dicts.
 MAX_SEEN_SOURCES = 4096
+MAX_RATE_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -55,6 +57,7 @@ class SyslogCollector:
         self.bound: tuple[str, int] | None = None
         self.counters = {"messages": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "filtered": 0, "errors": 0,
+                         "throttled": 0, "tcp_refused": 0, "tcp_clients": 0,
                          "last_message": 0.0}
         # A receive thread must never die on message content; failures are
         # counted here and _crash records a thread that ended anyway so the
@@ -70,6 +73,14 @@ class SyslogCollector:
         self._min_severity = 7
         self._max_chars = 2048
         self._seen: collections.OrderedDict = collections.OrderedDict()
+        # source -> [tokens, last refill]. One float pair per source, refilled
+        # lazily on arrival, so throttling costs O(1) per message and cannot
+        # grow past MAX_RATE_SOURCES entries however many addresses appear.
+        self._buckets: collections.OrderedDict = collections.OrderedDict()
+        self._rate = 0.0
+        self._last_throttle_log = 0.0
+        self._max_tcp_clients = 64
+        self._clients: list[threading.Thread] = []
 
     @property
     def running(self) -> bool:
@@ -91,6 +102,11 @@ class SyslogCollector:
         self._use_receive_time = bool(settings.get("use_receive_time", False))
         self._min_severity = int(settings.get("min_severity", 7))
         self._max_chars = max(int(settings.get("max_message_chars", 2048)), 80)
+        self._rate = max(0.0, float(settings.get("per_source_rate", 200) or 0))
+        self._max_tcp_clients = max(1, int(settings.get("max_tcp_clients", 64)))
+        self._buckets.clear()
+        self.db.collapse_repeats_s = max(
+            0.0, float(settings.get("collapse_repeats_s", 5.0) or 0))
 
         address = settings.get("bind_address", "0.0.0.0")
         port = int(settings.get("port", 514))
@@ -244,10 +260,12 @@ class SyslogCollector:
                 except OSError:
                     pass
         self._udp = self._tcp = None
-        for thread in self._threads:
+        for thread in self._threads + self._clients:
             if thread.is_alive():
                 thread.join(timeout=2)
         self._threads = []
+        self._clients = []
+        self.counters["tcp_clients"] = 0
         self.bound = None
 
     # ----------------------------------------------------------------- threads
@@ -273,12 +291,55 @@ class SyslogCollector:
             return source in self._allowed
         return self._auto_accept
 
+    def _within_rate(self, source: str, now: float) -> bool:
+        """A token bucket per source, refilled lazily.
+
+        The only volume controls were a global severity floor and a global
+        queue, so one device in a debug loop consumed the whole queue and
+        evicted every other device's messages — and `dropped` could not say
+        whose. O(1) per message and bounded in memory.
+        """
+        if self._rate <= 0:
+            return True
+        bucket = self._buckets.get(source)
+        if bucket is None:
+            bucket = [self._rate, now]
+            self._buckets[source] = bucket
+            while len(self._buckets) > MAX_RATE_SOURCES:
+                self._buckets.popitem(last=False)
+        else:
+            self._buckets.move_to_end(source)
+            bucket[0] = min(self._rate, bucket[0] + (now - bucket[1]) * self._rate)
+            bucket[1] = now
+        if bucket[0] < 1.0:
+            return False
+        bucket[0] -= 1.0
+        return True
+
     def _enqueue(self, data: bytes, source: str) -> None:
-        self.counters["messages"] += 1
-        self.counters["last_message"] = time.time()
+        # Counted after the access check, not before: a rejected source used
+        # to refresh "last message just now", so the status strip read healthy
+        # while every packet was being thrown away.
         if not self._accepted(source):
             self.counters["rejected"] += 1
             return
+        now = time.time()
+        if not self._within_rate(source, now):
+            self.counters["throttled"] += 1
+            if now - self._last_throttle_log >= 60:
+                self._last_throttle_log = now
+                self.log.add(ERROR,
+                             f"Throttling syslog from {source}: more than "
+                             f"{self._rate:.0f} messages a second",
+                             target=source,
+                             detail="Messages above the per-source rate are "
+                                    "discarded so one noisy device cannot "
+                                    "evict everyone else's. Raise or clear "
+                                    "the per-source rate in Settings to keep "
+                                    "them all.")
+            return
+        self.counters["messages"] += 1
+        self.counters["last_message"] = now
         if self._first_from(source):
             self.log.add(SYSTEM, f"First syslog message from {source}",
                          target=source)
@@ -320,8 +381,25 @@ class SyslogCollector:
                 continue
             except OSError:
                 break
-            self._spawn(lambda c=client, a=address[0]: self._read_stream(c, a),
-                        "syslog-tcp-client")
+            # One thread per connection with no cap and a list that only ever
+            # grew: a device that reconnects per message, or a scanner,
+            # exhausted threads and then memory. Dead ones are reaped on every
+            # accept and the live ones are capped.
+            self._clients = [t for t in self._clients if t.is_alive()]
+            self.counters["tcp_clients"] = len(self._clients)
+            if len(self._clients) >= self._max_tcp_clients:
+                self.counters["tcp_refused"] += 1
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            thread = threading.Thread(
+                target=lambda c=client, a=address[0]: self._read_stream(c, a),
+                name="syslog-tcp-client", daemon=True)
+            self._clients.append(thread)
+            self.counters["tcp_clients"] = len(self._clients)
+            thread.start()
 
     def _read_stream(self, client: socket.socket, source: str) -> None:
         """A TCP stream is a byte stream, so messages must be reassembled.
@@ -339,7 +417,13 @@ class SyslogCollector:
                 buffer += chunk
                 while buffer:
                     space = buffer.find(b" ")
-                    if 0 < space <= 10 and buffer[:space].isdigit():
+                    # RFC 6587 octet counting: "<count> <message>", and the
+                    # message always starts with a PRI. Without the "<" test a
+                    # newline-framed line that merely starts with a number
+                    # ("123 packets dropped") was read as a length prefix and
+                    # the connection desynchronised from there on.
+                    if (0 < space <= 10 and buffer[:space].isdigit()
+                            and buffer[space + 1:space + 2] == b"<"):
                         length = int(buffer[:space])
                         if len(buffer) < space + 1 + length:
                             break
@@ -405,5 +489,12 @@ class SyslogCollector:
         last = self.counters["last_message"]
         text = (f"{base} \u00b7 last message {_ago(last)}" if last
                 else f"{base} \u00b7 waiting for messages")
+        parts = [text]
         lost = self.counters.get("kernel_dropped", 0)
-        return f"{text} \u00b7 {lost} dropped by the kernel" if lost else text
+        if lost:
+            parts.append(f"{lost} dropped by the kernel")
+        if self.counters["throttled"]:
+            parts.append(f"{self.counters['throttled']} throttled")
+        if self.counters["tcp_clients"]:
+            parts.append(f"{self.counters['tcp_clients']} TCP clients")
+        return " \u00b7 ".join(parts)
