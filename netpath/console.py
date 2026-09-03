@@ -12,6 +12,7 @@ unattended wants the headless mode instead — see `--headless`.
 from __future__ import annotations
 
 import ctypes
+import heapq
 import os
 import sys
 import threading
@@ -117,6 +118,17 @@ class _Tee:
         return False
 
 CLIENT_COLUMNS = ["Client", "Requests", "Errors", "First seen", "Last seen", "Agent"]
+
+# How many client rows the table draws. AccessLog.clients is described in its
+# own docstring as "a live view, not an audit trail" and keeps one entry per
+# source address for the life of the process -- every port-scanner source,
+# every health-check probe, every DHCP-reassigned laptop. This table redrew
+# all of them once a second on the GUI thread: at 20,000 remembered clients
+# that is a 20,000-element sort plus 120,000 QTableWidgetItem allocations
+# per tick, and the window becomes unusable long before the memory matters.
+# The most recent 200 is what anyone reads; the header says how many there
+# are in total.
+CLIENT_ROWS = 200
 REQUEST_COLUMNS = ["Time", "Client", "Method", "Path", "Status", "Took"]
 
 
@@ -137,6 +149,21 @@ def _ago(ts: float) -> str:
     if age < 5400:
         return f"{age / 60:.0f}m ago"
     return datetime.fromtimestamp(ts).strftime("%H:%M")
+
+
+def client_rows(clients: dict, limit: int = CLIENT_ROWS) -> tuple[int, list[tuple]]:
+    """(clients seen in total, the `limit` most recently seen as table rows).
+
+    nlargest rather than sorting the whole dict: the caller runs once a
+    second on the GUI thread and the dict holds one entry per source address
+    the process has ever answered."""
+    newest = heapq.nlargest(limit, clients.items(),
+                            key=lambda item: item[1]["last_seen"])
+    return len(clients), [
+        (address, str(info["requests"]), str(info["errors"]),
+         _ago(info["first_seen"]), _ago(info["last_seen"]),
+         info["agent"] or "—", bool(info["errors"]))
+        for address, info in newest]
 
 
 def _size(total: float) -> str:
@@ -164,6 +191,7 @@ class ConsoleWindow(QMainWindow):
         self.server = server
         self.capture = capture
         self._output_seen = -1
+        self._clients_seen: tuple = ()
 
         from . import __version__
 
@@ -195,7 +223,8 @@ class ConsoleWindow(QMainWindow):
         clients = QWidget()
         clients_layout = QVBoxLayout(clients)
         clients_layout.setContentsMargins(0, 0, 0, 0)
-        clients_layout.addWidget(section("Connected clients"))
+        self.clients_heading = section("Connected clients")
+        clients_layout.addWidget(self.clients_heading)
         self.client_table = self._table(CLIENT_COLUMNS)
         clients_layout.addWidget(self.client_table)
         splitter.addWidget(clients)
@@ -520,10 +549,24 @@ class ConsoleWindow(QMainWindow):
             self.state_label.setText("Server stopped")
             self.url_label.setText(self.server.error or "")
 
+        # What is actually true and worth knowing at a glance: whether the
+        # traffic is encrypted, and how far the listener reaches. Until
+        # 4.37.0 this card told the operator, once a second, that the product
+        # had no sign-in -- text left over from before auth.py, the login
+        # page, the per-module read/write permissions, the forced first-run
+        # password change and the sign-in throttling existed. Someone who
+        # believes it either fronts the appliance with a reverse proxy it does
+        # not need, or reads it after deploying and concludes that the login
+        # page they have been using is decorative.
+        reach = ("reachable from every interface on this host"
+                 if str(self.server.host) in ("", "0.0.0.0", "::")
+                 else f"reachable on {self.server.host} only")
         self.listener_hint.setText(
-            "There is no authentication yet, so bind to an interface you trust "
-            "or to 127.0.0.1 behind something that authenticates. Without a "
-            "certificate the server is plain HTTP whatever the port number."
+            ("Encrypted with TLS." if self.server.certfile else
+             "Plain HTTP: no certificate is configured, so sign-ins and "
+             "session cookies cross the network in the clear.")
+            + f" The listener is {reach}. Sign-in is required for every page "
+              "except the login page itself."
             + (f"  Last error: {self.server.error}" if self.server.error else ""))
 
         self._refresh_collectors()
@@ -567,16 +610,24 @@ class ConsoleWindow(QMainWindow):
         self.collectors_label.setText("\n".join(parts))
 
     def _fill_clients(self, snapshot: dict) -> None:
-        clients = sorted(snapshot["clients"].items(),
-                         key=lambda item: -item[1]["last_seen"])
-        self.client_table.setRowCount(len(clients))
-        for row, (address, info) in enumerate(clients):
-            values = [address, str(info["requests"]), str(info["errors"]),
-                      _ago(info["first_seen"]), _ago(info["last_seen"]),
-                      info["agent"] or "—"]
-            for column, value in enumerate(values):
+        """The CLIENT_ROWS most recently seen clients, redrawn only when
+        something about them changed -- the same guard _refresh_output()
+        already uses for the log view, because this runs once a second on
+        the GUI thread."""
+        total, rows = client_rows(snapshot["clients"])
+        if (total, rows) == self._clients_seen:
+            return
+        self._clients_seen = (total, rows)
+
+        self.clients_heading.setText(
+            "Connected clients" if total <= CLIENT_ROWS else
+            f"Connected clients — {total:,} seen, showing the "
+            f"{CLIENT_ROWS} most recent")
+        self.client_table.setRowCount(len(rows))
+        for row, entry in enumerate(rows):
+            for column, value in enumerate(entry[:6]):
                 item = QTableWidgetItem(value)
-                if column == 2 and info["errors"]:
+                if column == 2 and entry[6]:
                     item.setForeground(QColor(theme.WARN))
                 self.client_table.setItem(row, column, item)
 

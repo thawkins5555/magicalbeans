@@ -807,6 +807,72 @@ check("...and each block still carries its own trace",
                                                  for b in buckets))
 
 
+# ------------------------------------ H9: the console's client list and hint
+
+print("H9  the service console renders a bounded client list and true text")
+
+# console.py imports PySide6 at module level and PySide6 is not a dependency
+# of this application, so the Qt-free parts are lifted out of its source and
+# run on their own rather than imported.
+CONSOLE_PATH = os.path.join(REPO_ROOT, "netpath", "console.py")
+with open(CONSOLE_PATH, encoding="utf-8") as handle:
+    console_source = handle.read()
+console_tree = ast.parse(console_source)
+wanted = {"client_rows", "_ago", "CLIENT_ROWS"}
+lifted: list = []
+for node in console_tree.body:
+    if isinstance(node, ast.FunctionDef) and node.name in wanted:
+        lifted.append(node)
+    elif isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") in wanted:
+        lifted.append(node)
+    elif isinstance(node, ast.Assign) and any(
+            getattr(t, "id", "") in wanted for t in node.targets):
+        lifted.append(node)
+console = {"heapq": __import__("heapq"), "time": time,
+           "datetime": __import__("datetime").datetime}
+exec(compile(ast.Module(body=lifted, type_ignores=[]), CONSOLE_PATH, "exec"),
+     console)
+check("console.py still exposes the row selection on its own",
+      "client_rows" in console and console.get("CLIENT_ROWS") == 200,
+      str(sorted(k for k in console if not k.startswith("__"))))
+
+# The shape being fixed: one entry per source address for the life of the
+# process — every port-scanner source, every health-check probe, every
+# DHCP-reassigned laptop — sorted and redrawn as 6 widgets per row, once a
+# second, on the GUI thread.
+many = {f"198.51.{i // 256}.{i % 256}": {
+    "requests": i, "errors": i % 3, "first_seen": now - 10000 + i,
+    "last_seen": now - 20000 + i, "agent": "probe"} for i in range(20000)}
+(total, rows), elapsed = timed(console["client_rows"], many)
+check("20,000 remembered clients render as 200 rows",
+      total == 20000 and len(rows) == console["CLIENT_ROWS"],
+      f"{total} seen, {len(rows)} rows")
+newest_first = sorted(many, key=lambda a: -many[a]["last_seen"])
+check("...and they are the 200 most recently seen, newest first",
+      [row[0] for row in rows] == newest_first[:console["CLIENT_ROWS"]],
+      f"{rows[0][0]} vs {newest_first[0]}")
+check("...selected in well under a second", elapsed < 0.5, f"{elapsed:.3f}s")
+check("a small fleet is unaffected",
+      console["client_rows"]({k: many[k] for k in list(many)[:5]})[1].__len__() == 5)
+
+# The redraw guard: the same snapshot twice must produce the same rows, so
+# the caller's `!=` check skips the repaint.
+check("the same clients produce equal rows, so the table is not repainted",
+      console["client_rows"](many) == console["client_rows"](many))
+
+# G-23, the console's copy. auth.py, the login page, PUBLIC_PATHS gating,
+# per-module permissions, a forced first-run password change and sign-in
+# throttling all exist; this card said otherwise, once a second, forever.
+hint_source = console_source[console_source.index("self.listener_hint.setText("):]
+hint_source = hint_source[:hint_source.index("\n\n")]
+check("the listener card no longer claims there is no authentication",
+      "no authentication" not in console_source.lower()
+      and "authentication yet" not in console_source.lower())
+check("...and says what is true instead: TLS, reach, and that sign-in applies",
+      "TLS" in hint_source and "reach" in hint_source
+      and "Sign-in is required" in hint_source, hint_source[:80])
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
