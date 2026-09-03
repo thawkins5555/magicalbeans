@@ -268,6 +268,22 @@ def main() -> int:
     swapped = []
     modes = []
 
+    # NTFS has no POSIX mode concept, so os.stat().st_mode on Windows is
+    # synthesized from the read-only attribute and file type rather than
+    # reflecting what os.chmod was asked to set — reading it back cannot
+    # prove the archive's mode bits were discarded there. tarfile's own
+    # extraction calls os.chmod(path, member.mode) on every platform
+    # (hasattr(os, "chmod") is true on Windows too), so recording those
+    # calls proves the same property in a way both platforms can observe.
+    chmod_calls = []
+    real_chmod = os.chmod
+
+    def spy_chmod(path, mode, *a, **kw):
+        chmod_calls.append((path, mode))
+        return real_chmod(path, mode, *a, **kw)
+
+    os.chmod = spy_chmod
+
     def fake_swap(path):
         # The temp tree is removed as soon as apply() returns, so the mode
         # the extraction left behind is read here, while it still exists.
@@ -321,9 +337,19 @@ def main() -> int:
               str(SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)))
 
         # The unpacked tree must not carry the archive's own mode bits
-        # (the tarball above asks for 0777 on every file).
-        check("D3 the archive's mode bits are discarded",
-              modes == [0o644], str([oct(m) for m in modes]))
+        # (the tarball above asks for 0777 on every file). On POSIX this is
+        # asked directly of the filesystem; on Windows, where st_mode is not
+        # a real POSIX mode, it is asked of the chmod call tarfile itself
+        # made, which is the only place the property is observable there.
+        if sys.platform == "win32":
+            init_calls = [mode for path, mode in chmod_calls
+                         if os.path.basename(path) == "__init__.py"]
+            check("D3 the archive's mode bits are discarded",
+                  bool(init_calls) and all(m == 0o644 for m in init_calls),
+                  str([oct(m) for m in init_calls]))
+        else:
+            check("D3 the archive's mode bits are discarded",
+                  modes == [0o644], str([oct(m) for m in modes]))
 
         result = selfupdate.apply(SERVICE.app_db)
         check("D3 the same tag again is 'up to date'",
@@ -340,6 +366,7 @@ def main() -> int:
         selfupdate._fetch_json, selfupdate._fetch_bytes = real_json, real_bytes
         selfupdate._swap_in, selfupdate.schedule_restart = real_swap, real_restart
         selfupdate.set_before_restart_hook(real_hook)
+        os.chmod = real_chmod
         SERVICE.app_db.save_settings({"updates_enabled": False})
 
     # -------------------------------------------- D4 credential retargeting
