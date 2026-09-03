@@ -446,6 +446,8 @@ Type scale (rem on a 13 px base): 11 / 12 / 13 / 14 / 16 / 20 with line heights 
 | 2 | Systematic design system — components rebuilt on tokens, same IA | L, ~3 weeks | one panel, one button set, one status glyph, segmented third-level tabs, merged header, rem scale, focusable rows, empty/toast primitives, one breakpoint, validated chart palette | wall legibility, wordmark, kiosk, white route canvas, the Overview |
 | 3 | Instrument-panel rebrand — wordmark, grouped nav, high-contrast base, KPI tiles, wall density, kiosk, Ctrl+K | L, 5–6 weeks incl. 2 | everything in 2 plus identity and wallboard use | triage model, URL state, permissions, Overview content (the UX proposals it is designed to carry) |
 
+The three boards are also side by side, at scale, on the design canvas: https://claude.ai/code/artifact/873c6aaf-2a7d-4294-a1b4-f979d70bc141
+
 ---
 
 ## Roadmap
