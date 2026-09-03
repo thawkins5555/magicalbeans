@@ -55,6 +55,8 @@ the network described above, for four structural reasons:
    Juniper, Fortinet or Palo Alto health OIDs, environment sensors, PoE, LLDP,
    ARP, BGP, firewall sessions or wireless RF metrics. Seven of the 32 built-in
    alert rules can never fire because nothing produces their metric key.
+   *(4.37.0 ships 35 built-in rules and all seven of those are live; see §9
+   A-F1 and P-S9.)*
 3. **A site outage is N alerts, not one.** Rollup is same-device only
    (`netpath/alertrules.py:142-189`); there is no topology, no upstream field,
    no LLDP/CDP discovery to build one from, no maintenance calendar (device
@@ -933,17 +935,252 @@ These are genuinely good and should survive any refactor.
 
 ## 9. What was implemented
 
-This section is filled in as the work lands. One row per finding actually closed,
-naming the step from the implementation plan, the commit that closed it and the
-test that proves it. A finding with no row here is still open; a finding closed
-by 4.36.x rather than by this work says so in the Commit column.
+One row per finding actually closed, naming the step from the implementation
+plan, the commit that closed it and the test that proves it. A finding with no
+row here, and not in the Deferred list beneath the table, is still open; a
+finding closed by 4.36.x rather than by this work says so in the Commit column.
+Where a finding had two halves and only one was in scope, the Finding column
+says which half.
+
+The documentation-truth rows at the end of §4.6 (D1–D28) are not repeated here:
+all twenty-eight are closed by the documentation workstream, in `35e5a2d`,
+`1c52ac5`, `c90b5fa`, `e9da3d6`, `fbead48` and `07317d3`, and the
+`CHANGELOG.md` 4.37.0 Documentation block lists them one by one.
+
+Suites named `§X` refer to the section marker of that name inside the file;
+`tests/test_poll_write_path.py` is organised as named functions instead.
 
 | Finding | Step | Commit | Test |
 |---|---|---|---|
-| | | | |
+| P-B1 | B2 | `d390b7e` | `tests/test_series_buckets.py` — per-metric sample cap |
+| P-B2 | B3 | `389b36c` | `tests/test_series_buckets.py` — hourly rollups |
+| P-B3 | B6 | `3ecadd6` | `tests/test_poll_write_path.py` `interface_reads()` |
+| P-S1 | B6 | `3ecadd6` | `tests/test_poll_write_path.py` `interface_reads()` |
+| P-S2 | B5 | `9551ae9` | `tests/test_scheduler.py` |
+| P-S3 | B8 | `2483eda` | `tests/test_poll_write_path.py` `v3_engine_time()` |
+| P-S4 (the misreporting half; see Deferred for authPriv) | B8 | `2483eda` | `tests/test_poll_write_path.py` `v3_engine_time()` |
+| P-S5 | B5 | `9551ae9` | `tests/test_scheduler.py` |
+| P-S6 | B1 | `456c16f` | `tests/test_poll_write_path.py` — COMMIT trace |
+| P-S7 | B12 | `b9ed558` | `tests/test_poll_write_path.py` `pool_and_walks()` |
+| P-S8 | B0, B7 | `2dae599`, `20b61d7` | `tests/test_poll_write_path.py` `reboot_suppression()` |
+| P-S9 (health OIDs; see Deferred for PoE/STP/LLDP/ARP/BGP) | B10 | `b94aede` | `tests/test_poll_write_path.py` `vendor_health()` |
+| P-N2 | B9 | `4b371d8` | `tests/test_poll_write_path.py` `request_matching()` |
+| P-N3 (the IPv6 half; see Deferred for the per-device port) | B11 | `07c7c7d` | `tests/test_poll_write_path.py` `ipv6_polling()` |
+| P-N6 | B12 | `b9ed558` | `tests/test_poll_write_path.py` `pool_and_walks()` |
+| P-N7 | B6 | `3ecadd6` | `tests/test_poll_write_path.py` `interface_reads()` |
+| P-N9 | B12 | `b9ed558` | `tests/test_poll_write_path.py` `pool_and_walks()` |
+| P-N11 | B13 | `c830f73` | `tests/test_nodepoll_e2e.py` |
+| C-B1 | C1 | `aa2b3e9` | `tests/test_collectors_hardening.py` §C1 |
+| C-B2 | C2 | `b032dc3` | `tests/test_collectors_hardening.py` §C2 |
+| C-B3 | C3 | `75f63c8` | `tests/test_collectors_hardening.py` §C3 |
+| C-B4 | C4 | `da2b5a6` | `tests/test_collectors_hardening.py` §C4 |
+| C-B5 | C5, A1 | `537f3cb`, `be5ca8a` | `tests/test_collectors_hardening.py` §C5; `tests/test_alert_engine_fixes.py` §A1 |
+| C-S1 | C6 | `fdf7f3c` | `tests/test_collectors_hardening.py` §C6 |
+| C-S2 (the unbounded cache; the 1 MiB-per-trap claim was withdrawn — Appendix C) | C2, C6 | `b032dc3`, `fdf7f3c` | `tests/test_collectors_hardening.py` §C2, §C6 |
+| C-S3 | C2 | `b032dc3` | `tests/test_collectors_hardening.py` §C2 |
+| C-S4 | C9 | `e041124` | `tests/test_collectors_hardening.py` §C9 |
+| C-S5 | C9, B11 | `e041124`, `07c7c7d` | `tests/test_collectors_hardening.py` §C9; `tests/test_poll_write_path.py` `ipv6_polling()` |
+| C-S6 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-S7 | C8 | `da75aca`, `3b44726` | `tests/test_collectors_hardening.py` §C8 |
+| C-S8 | A5 | `7494b99` | `tests/test_alert_engine_fixes.py` §A5 |
+| C-S9 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-N1 | C9 | `e041124` | `tests/test_collectors_hardening.py` §C9 |
+| C-N2 | C2 | `b032dc3` | `tests/test_collectors_hardening.py` §C2 |
+| C-N3 | C10 | `aacc9fe` | `tests/test_collectors_hardening.py` §C10 |
+| C-N4 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-N5 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-N6 | C10 | `aacc9fe` | `tests/test_collectors_hardening.py` §C10 |
+| C-N7 (the documented figure, corrected) | F2 | `1c52ac5` | none — `NETWORK-AND-STORAGE-REQUIREMENTS.md` |
+| C-N10 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-N11 | C11 | `64079d5` | `tests/test_collectors_hardening.py` §C11 |
+| C-N12 | C7 | `91427ca` | `tests/test_collectors_hardening.py` §C7 |
+| C-N13 | C9 | `e041124` | `tests/test_collectors_hardening.py` §C9 |
+| C-N14 | C9 | `e041124` | `tests/test_collectors_hardening.py` §C9 |
+| A-F1 | B6, B10 | `3ecadd6`, `b94aede` | `tests/test_poll_write_path.py` `interface_reads()`, `vendor_health()` |
+| A-F2 | A2 | `cc3b5a5` | `tests/test_alert_engine_fixes.py` §A2 |
+| A-F3 | A11 | `a77b1b7` | `tests/test_alert_engine_fixes.py` §A11 |
+| A-F5 | A4 | `0744b62` | `tests/test_alert_engine_fixes.py` §A4 |
+| A-F6 | A4, A5 | `0744b62`, `7494b99` | `tests/test_alert_engine_fixes.py` §A4, §A5 |
+| A-F7 | A4 | `0744b62` | `tests/test_alert_engine_fixes.py` §A4 — syslog identity |
+| A-F8 | A3 | `49ec57d` | `tests/test_alert_engine_fixes.py` §A3 |
+| A-F9 | A6 | `8366da7` | `tests/test_alert_engine_fixes.py` §A6 |
+| A-F10 | A7 | `af9bcab` | `tests/test_alert_engine_fixes.py` §A7 |
+| A-F11 | A11 | `a77b1b7` | `tests/test_alert_engine_fixes.py` §A11 — F11 |
+| A-F12 | A1 | `be5ca8a` | `tests/test_alert_engine_fixes.py` §A1 |
+| A-F14 | A7, B0 | `af9bcab`, `2dae599` | `tests/test_alert_engine_fixes.py` §A7 |
+| A-F20 | E6 | `3ff71cb`, `58366e3` | `tests/ui/walk.mjs` — misc |
+| A-F21 | A9 | `c6b544e` | `tests/test_alert_engine_fixes.py` §A9 |
+| A-F22 | A10 | `ee43b4a` | `tests/test_alert_engine_fixes.py` §A10 |
+| A-F23 | A9 | `c6b544e` | `tests/test_alert_engine_fixes.py` §A9 |
+| A-F24 | A11, B0 | `a77b1b7`, `2dae599` | `tests/test_alert_engine_fixes.py` §A11 |
+| A-F26 | A8 | `2557217` | `tests/test_alert_engine_fixes.py` §A8 |
+| A-F27 (the email storm; the alerts themselves still open) | A8 | `2557217` | `tests/test_alert_engine_fixes.py` §A8 |
+| S-B1 | D3 | `48ba132` | `tests/test_security_fixes.py` §D3 |
+| S-B2 | D1 | `ae02159` | `tests/test_security_fixes.py` §D1 |
+| S-B3 | D2 | `fdddbf1` | `tests/test_security_fixes.py` §D2 |
+| S-S1 | D4 | `5a6eb5e` | `tests/test_security_fixes.py` §D4 |
+| S-S2 | — (4.36.0/4.36.1), plus D5 for `allow_legacy_ssh` | 4.36.x; `4155c36` | `tests/test_ssh_hostkeys.py` |
+| S-S3 | D11 | `ad8bc94` | `tests/test_security_fixes.py` §D11 |
+| S-S4 | D5, B4, A12 | `4155c36`, `ca8bf68`, `6cb6868` | `tests/test_security_fixes.py` §D5 |
+| S-S6 (the banner; see Deferred for the default bind) | D15, H9 | `8f15dc3`, `953b2ad` | `tests/test_security_fixes.py` §D15; `tests/test_parsers_hardening.py` §H9 |
+| S-S7 | D8 | `15f1487` | `tests/test_security_fixes.py` §D8 |
+| S-N1 | D7 | `0276397` | `tests/test_security_fixes.py` §D7 |
+| S-N2 | D7 | `0276397` | `tests/test_security_fixes.py` §D7 |
+| S-N3 | D6, D13 | `6257679`, `ad7c261` | `tests/test_security_fixes.py` §D6, §D13 |
+| S-N4 | D6 | `6257679` | `tests/test_security_fixes.py` §D6 |
+| S-N5 | E2, E15 | `9c71c60`, `54635c3` | `tests/ui/walk.mjs` — dialog |
+| S-N6 | D6 | `6257679` | `tests/test_security_fixes.py` §D6 |
+| S-N8 | D12 | `e4bb4c3` | `tests/test_security_fixes.py` §D12 |
+| S-N9 | D9 | `7e739fa` | `tests/test_security_fixes.py` §D9 |
+| S-N11 | D12 | `e4bb4c3`, `62de1f4` | `tests/test_security_fixes.py` §D12 |
+| S-N12 | D9 | `7e739fa` | `tests/test_security_fixes.py` §D9 |
+| S-N13 | D6 | `6257679` | `tests/test_security_fixes.py` §D6 |
+| S-N14 | D6 | `6257679` | `tests/test_security_fixes.py` §D6 |
+| S-N16 | D10 | `1d0469a` | `tests/test_security_fixes.py` §D10 |
+| X-F1 ★ | B2 | `d390b7e` | `tests/test_series_buckets.py` — per-metric sample cap |
+| X-F2 ★ | B3 | `389b36c` | `tests/test_series_buckets.py` — hourly rollups |
+| X-F3 ★ | B1 | `456c16f` | `tests/test_poll_write_path.py` — COMMIT trace; `tests/bench_record_samples.py` |
+| X-F4 ★ | B5 | `9551ae9` | `tests/test_scheduler.py` |
+| X-F5 | B4, C4, A12 | `ca8bf68`, `da2b5a6` + `b568b02`, `6cb6868` | `tests/test_series_buckets.py`; `tests/test_collectors_hardening.py` §C4, §C4 (G-24); `tests/test_alert_engine_fixes.py` — storage trim |
+| X-F8 | A7 | `af9bcab` | `tests/test_alert_engine_fixes.py` §A7 |
+| X-F11 | B3 | `389b36c` | `tests/test_series_buckets.py` — hourly rollups |
+| X-F13 | B1 | `456c16f` | `tests/test_poll_write_path.py` — `replace_interfaces` id map |
+| X-F19 | E4/E14 | `bb7a0af` | `tests/ui/walk.mjs` — offline |
+| U-F1 | E11 | `7e78111` | `tests/ui/walk.mjs` — routing |
+| U-F10 | E6 | `3ff71cb`, `58366e3` | `tests/ui/walk.mjs` — misc |
+| U-F12 | E10 | `fa1df44` | `tests/ui/walk.mjs` — dashboard |
+| U-F13 | E9 | `153d808` | `tests/ui/walk.mjs` — misc |
+| U-F15 | E1, E2 | `6e60afa`, `9c71c60` | `tests/ui/walk.mjs` — tabs and ARIA |
+| U-F16 | E1 | `6e60afa` | `tests/ui/walk.mjs` — tabs and ARIA |
+| U-F17 | E1 | `6e60afa` | `tests/ui/walk.mjs` — tabs and ARIA |
+| U-F18 | E2 | `9c71c60` | `tests/ui/walk.mjs` — dialog |
+| U-F19 | E2 | `9c71c60` | `tests/ui/walk.mjs` — tabs and ARIA |
+| U-F20 | E3 | `1c7c0e7` | `tests/ui/walk.mjs` — misc |
+| U-F21 | E3 | `1c7c0e7` | `tests/ui/walk.mjs` — misc |
+| U-F23 | E4/E14 | `bb7a0af` | `tests/ui/walk.mjs` — offline |
+| U-F24 (the request timeout; see Deferred for spinners and `aria-busy`) | E4/E14 | `bb7a0af` | `tests/ui/walk.mjs` — offline |
+| U-F27 (the tab-bar half; see Deferred for the narrow layout) | E8 | `4ab5da8` | none — one CSS rule |
+| U-F28 | E5 | `ad6576b`, `58366e3` | `tests/ui/walk.mjs` — misc |
+| U-F32 | E7 | `c03cd1c` | `tests/ui/walk.mjs` — misc |
+| U-F36 | D5 | `4155c36` | none — the lock is unobservable from outside |
+| U-C1 | E9 | `153d808` | `tests/ui/walk.mjs` — misc |
+| U-C2 | E9 | `153d808` | `tests/ui/walk.mjs` — misc |
+| U-C3 | E9 | `153d808` | `tests/ui/walk.mjs` — read-only |
+| G-1 | I1 | `677a59a` | `tests/test_wsock.py`; `tests/test_ssh_terminal.py` |
+| G-2 | I2 | `7b55941` | `tests/test_ssh_terminal.py` |
+| G-3 | I4 | `31139cc` | `tests/test_ssh_terminal.py` |
+| G-4 | I4 | `31139cc` | `tests/test_ssh_terminal.py` |
+| G-5 | I3 | `0dfa814` | `tests/test_ssh_terminal.py` |
+| G-6 | I5 | `2ca65bf` | `tests/test_ssh_terminal.py`; `tests/test_ssh_hostkeys.py` |
+| G-7 | D13 | `ad7c261` | `tests/test_security_fixes.py` §D13 |
+| G-8 | I6 | `7a6b016` | `tests/test_wsock.py` |
+| G-9 | I5 | `2ca65bf` | `tests/test_ssh_terminal.py` |
+| G-10 | H1 | `67de5ff`, `57ed61e` | `tests/test_parsers_hardening.py` §H1 |
+| G-11 | H1 | `67de5ff` | `tests/test_parsers_hardening.py` §H1 |
+| G-12 | H2 | `2335f18` | `tests/test_parsers_hardening.py` §H2 |
+| G-13 | H3 | `500e4b9` | `tests/test_parsers_hardening.py` §H3 |
+| G-14 | H3 | `500e4b9` | `tests/test_parsers_hardening.py` §H3 |
+| G-15 | H5, F6 | `e96c9d3`, `07317d3` | `tests/test_parsers_hardening.py` §H5 |
+| G-16 | H5 | `e96c9d3`, `57ed61e` | `tests/test_parsers_hardening.py` §H5 |
+| G-17 | H5 | `e96c9d3` | `tests/test_parsers_hardening.py` §H5 |
+| G-18 | H6 | `af183da` | `tests/test_parsers_hardening.py` §H6 |
+| G-19 | H6 | `af183da` | `tests/test_parsers_hardening.py` §H6 |
+| G-20 | H6 | `af183da` | `tests/test_parsers_hardening.py` §H6 |
+| G-21 | H7 | `84d41bc`, `62de1f4` | `tests/test_parsers_hardening.py` §H7 |
+| G-22 | D14, H9 | `22e1350`, `953b2ad` | `tests/test_security_fixes.py` §D14; `tests/test_parsers_hardening.py` §H9 |
+| G-23 | D15, H9, F6 | `8f15dc3`, `953b2ad`, `07317d3` | `tests/test_security_fixes.py` §D15; `tests/test_parsers_hardening.py` §H9 |
+| G-24 | C4 | `b568b02` | `tests/test_collectors_hardening.py` §C4 (G-24) |
+| G-25 | H10 | `6dc4d86` | `tests/test_parsers_hardening.py` §H10 |
+| G-27 | H8 | `38e7611` | `tests/test_parsers_hardening.py` §H8 |
+| G-28 | E4/E14 | `bb7a0af` | `tests/ui/walk.mjs` — offline |
+| G-29 | E15 | `54635c3` | `tests/ui/walk.mjs` — misc |
+| G-30 | E16 | `a876d3d` | `tests/ui/walk.mjs` — misc |
+| G-31 | H11 | `0175cf5` | `tests/test_parsers_hardening.py` §H11 |
+| G-32 | F6 | `07317d3` | none — `netpath/mibs/NOTICE.md` |
+| G-33 | H4 | `eb2734b` | `tests/test_parsers_hardening.py` §H4 |
 
-Findings deliberately **not** implemented, with the reason, belong in the
-follow-on list at the end of §6 rather than here.
+### Deferred
+
+Everything below was read, and left. Each line says why. The plan's "out of
+scope" list is the source for most of them: this release was three weeks of
+correctness and safety work, not a feature release, and a finding that asks for
+a new subsystem was ruled out at the start rather than attempted badly.
+
+- **A portable secret store** — S-S5, A-F15, and the first structural reason in
+  the Verdict. Deliberately not built. Writing a weak one is worse than
+  documenting the limitation, which `CREDENTIAL-SECURITY.md` §10 now does at
+  length.
+- **Alert routing and workflow** — A-F4 (digest and correlation window), A-F16
+  (webhook, Slack, Teams, PagerDuty, SMS, trap forwarding), A-F17 (per-rule
+  recipients, escalation, on-call), A-F18 and U-F7 (maintenance windows, muting
+  anything that is not a device), A-F19 (un-acknowledge), A-F25 (top-N,
+  MTTR/SLA reporting, ticket and runbook links). Each is a feature, and the
+  dependency map A-F24 needed had to land first.
+- **Pattern-matched event rules** — A-F13 (sub-poll-interval flap detection),
+  C-N9 (trap varbind conditions, syslog regex, "N in M minutes"). Out of scope:
+  a rule language is its own design, and A4's per-signature syslog keying takes
+  the immediate pain out of C-N9's second half.
+- **Paging and virtualisation** — X-F7, X-F18, U-F3, X-F20 (`localeCompare` per
+  comparison), X-F21 (`series()` returning every raw point). Approved as
+  "defer; ship only the tab-bar scroll fix"; the Dashboard (E10) is the answer
+  to "what do I look at first" that paging was being asked for.
+- **Import and export** — U-F5 (CSV/clipboard/print), U-F6 (bulk import),
+  P-N4 (bulk device import and the 1,024-address discovery cap). The
+  documentation claiming an export that never existed is corrected (D7); the
+  export itself is not built.
+- **Remaining poller coverage** — P-S9's other half (PoE, STP, LLDP/CDP, ARP,
+  BGP, ENTITY-SENSOR on a schedule), P-S4's authPriv half (SNMPv3 privacy is on
+  the out-of-scope list), P-N3's per-device SNMP port, P-N1 (unchunked custom-MIB
+  GET), P-N8 (non-ASCII octet strings rendered as hex), P-N10 (`fortipoll`'s
+  missing non-increasing-OID guard), P-N5/X-F15 (ping is still three serial
+  subprocess spawns per device per poll). B10 took the health OIDs that make the
+  shipped rules fire; the rest is a second pass.
+- **Metric display** — P-S10. `cpu_pct` now reaches an operator through the
+  Dashboard's "Highest CPU" list (E10), but the device pane still has no chart
+  for a custom-MIB metric key. Device-pane metric charts are out of scope.
+- **Search and comparison** — U-F2 (search covers ip/name/sys_name only),
+  X-F10 (MAC prefix search uses `LIKE` and defeats its index), U-F4 (sites,
+  tags, saved views), U-F8 (side-by-side comparison), U-F9 (the interface
+  bandwidth dialog's fixed window), U-F11 (bulk mute), U-F33 (ConfigRX diff),
+  U-F22 (the help "?" covers 2 of ~150 settings), U-F29/U-F30 (browser-local
+  timestamps with no zone in the UI — alert *email* is fixed by A9), U-F31
+  (Wireless is FortiGate-only and does not say so; the tab relabel was the one
+  UI item explicitly not approved), U-F34 (`snmp_version: "2c"` is still
+  accepted and still raises on every poll of that device), U-F25/U-F26/U-F35
+  (nits and positives, no action intended).
+- **Architecture** — X-F28 (single process, no remote pollers or sharding),
+  X-F12 (one lock and one connection serialising every writer), X-F17
+  (`/api/state`'s fan-out across ten databases), X-F16 (`_extra_resolve_targets`
+  full-scanning every fifteen seconds), X-F9 (`resolve_name` inside the
+  per-rule loop — A7 removed the metric fan-out around it, not the call),
+  X-F14 (`replace_interfaces` still UPDATEs rows whose every field is
+  identical), X-F22 (pure-Python BER), X-F23 (unbounded `IN (…)` lists, which
+  do not fire on the SQLite this ships against), X-F25 (`settings()` re-reads
+  the whole table per call — B5 removed the scheduler's copy of the problem,
+  not the poll and tick copies), X-F26 (`busy_timeout`, `cache_size` and
+  `mmap_size` still unset), X-F24 (`metrics()`'s discarded `ORDER BY label`).
+  X-F27 is recorded in §4.5 as correct as written and needs nothing.
+- **Directory authentication and session policy** — S-A1 in full (LDAP/AD/SAML,
+  MFA, API tokens, per-site RBAC, password expiry), S-N10 (no session
+  revocation, and `debug: read` reading every module's events), S-N15 (a
+  polling script is still signed out after the idle timeout, because only
+  POST/PUT/DELETE and the browser heartbeat count as presence), S-N7
+  (`apply_netpath_settings` mutating the shared settings dict), and S-S6's other
+  half — the default bind is still plain HTTP on `0.0.0.0`, which is a
+  deployment decision the documentation now covers rather than a default this
+  release changed.
+- **G-26** — `ipam_scan.read_arp_table` still catches only `OSError` and not the
+  `subprocess.TimeoutExpired` its own ten-second timeout can raise. The only
+  fresh-eyes finding not closed; it was routed to a workstream whose remaining
+  steps ran out of budget, and it is a two-line fix waiting for the next pass.
+- **Follow-ons this work created**, recorded so they are not lost: rejecting a
+  cycle in `upstream_id` at the API rather than only surviving one; ordering
+  `device_down` occurrences upstream-first within a tick so a fan-out sends
+  exactly one email instead of one per branch; a table of previous built-in rule
+  defaults so a changed default reaches an existing install; cursor pushdown for
+  the IPAM conflict drain, which is the one source still reading from the start;
+  and retiring the two temporary API routes that E12's forms used before
+  `58366e3` put the fields on the objects themselves.
 
 ---
 
@@ -1097,41 +1334,45 @@ trust. And `snmptrapdb.py` and `ipamdb.py` carry the same VACUUM-under-the-lock
 shape as §4.5 X-F5, which the report had guessed at ("Same shape in five other
 DB modules") without checking: it is there, in both (G-24).
 
-| id | Where | Sev | Tag | What | Owner |
-|---|---|---|---|---|---|
-| G-1 | `web/wsock.py:347-360` | high | CONFIRMED | An idle terminal burns a whole CPU core once the socket's fd is ≥ 1024 | D |
-| G-2 | `sshterm.py:271-294` | high | CONFIRMED | A socket that never sends `open` holds a session slot, a thread and its authorisation forever | D |
-| G-3 | `sshterm.py:540-569` | medium | PLAUSIBLE | One exception kills the watchdog, and with it every limit on a live shell | D |
-| G-4 | `sshterm.py:170-180` | medium | PLAUSIBLE | Shutting the service down can take minutes because sessions are stopped one at a time | D |
-| G-5 | `sshterm.py:71, 296-316` | medium | CONFIRMED | The failed-login cap is per socket, so the page is still a password oracle | D |
-| G-6 | `sshterm.py:415-434` | low | CONFIRMED | The terminal never records that a remembered host key was presented again | D |
-| G-7 | `web/server.py:546-550` | low | CONFIRMED | The WebSocket Origin check ignores the scheme | D |
-| G-8 | `web/wsock.py:244-263` | low | CONFIRMED | Reserved WebSocket opcodes are accepted as data | D |
-| G-9 | `sshterm.py:243, 483` | low | CONFIRMED | Any frame refreshes the idle timer, so a shell need never be typed at | D |
-| G-10 | `mibparse.py:105, 169-172` | **critical** | CONFIRMED | `_IMPORT_GROUP_RE` is quadratic: one 32 KB upload freezes the whole application for 17 seconds | B (+ D) |
-| G-11 | `mibparse.py:107-123` | **critical** | CONFIRMED | The four macro regexes rescan the whole file from every candidate start | B (+ D) |
-| G-12 | `mibparse.py:288-299, 344-353` | high | CONFIRMED | `resolve()` is O(n²) in the number of objects, and `resolve_all()` runs it eight times over every file | B |
-| G-13 | `mibparse.py:77-100` | medium | CONFIRMED | `_strip_comments_and_strings` costs nine bytes of memory per input byte | B |
-| G-14 | `mibparse.py:185, 338-339` | low | CONFIRMED | An enum value with more than 4,300 digits raises Python's integer guard out of `parse()` | B |
-| G-15 | `enterprises.py:1-19, 24-77` | medium | PLAUSIBLE | `enterprises.VERIFIED` claims a provenance the repository contradicts | F (+ B) |
-| G-16 | `enterprises.py:66, 73, 102, 110, 124, 129` | low | CONFIRMED | One vendor, several keys — the vendor filter splits a fleet across rows | B |
-| G-17 | `enterprises.py:184-187`, `nodeoids.py:171` | low | CONFIRMED | Nothing can identify Rockwell Automation / Allen-Bradley gear | B |
-| G-18 | `namelookup.py:283-292` | high | CONFIRMED | `reverse()` sets a process-global socket timeout, and concurrent resolver workers leave it set permanently | C |
-| G-19 | `namelookup.py:107, 116-123, 151-167` | medium | CONFIRMED | The raw PTR/TXT resolver accepts an answer from any host and has no overall deadline | C |
-| G-20 | `namelookup.py:263-265` | low | PLAUSIBLE | `nslookup` arguments are not validated | C |
-| G-21 | `eventlog.py:60, 70-71, 91-93` | medium | CONFIRMED | `EventLog` remembers every target it has ever seen, and `clear()` does not clear them | C |
-| G-22 | `web/server.py:297-305`, `console.py:569-581` | medium | CONFIRMED | `AccessLog.clients` grows one entry per source address forever, and the console re-sorts it every second | D (+ E) |
-| G-23 | `web/server.py:8`, `console.py:524`, `__main__.py:177` | medium | CONFIRMED | Three shipped places tell the operator there is no authentication | F (+ D, E) |
-| G-24 | `snmptrapdb.py:375-395`, `ipamdb.py:715-747` | high | CONFIRMED | `trim_to_size()` runs VACUUM up to six times while holding the write lock — §4.5 X-F5's guess, confirmed | C |
-| G-25 | `ipam_worker.py:96-131` | high | CONFIRMED | Every enabled subnet scans at once on the first tick, each with 64 ping subprocesses | C |
-| G-26 | `ipam_scan.py:180-185` | low | CONFIRMED | `read_arp_table` does not catch the timeout it sets | C |
-| G-27 | `analysis.py:278-284`, `web/api.py:50-55, 290-308` | high | CONFIRMED | One GET allocates a bucket per time slot from two unclamped query parameters | D |
-| G-28 | `web/static/app.js:100-117, 1038-1086` | medium | CONFIRMED | A 10 Hz timer that never stops, and not one fetch that can be cancelled | E |
-| G-29 | `web/static/debug.js:21, 117-127` | low | CONFIRMED | `escape()` leaves single quotes alone, and two server fields skip it entirely | E |
-| G-30 | `web/static/debug.js:258-275, 386-388` | low | CONFIRMED | The debug event table re-renders 2,000 rows on every keystroke | E |
-| G-31 | `services.py:18-69` | low | CONFIRMED | Duplicate keys and editorial labels in `PORTS` | C |
-| G-32 | `netpath/mibs/*.mib` | low | CONFIRMED | No attribution or licence notice for any of the 21 bundled MIBs | F |
-| G-33 | `netpath/mibs/SNMPv2-TC.mib` | low | CONFIRMED | `SNMPv2-TC.mib` is shipped, seeded, and yields nothing | B |
+The last column records what 4.37.0 did with each row. Thirty-two of the
+thirty-three are closed in this release; only G-26 is not, and §9's Deferred
+list says why. §9 carries the commit and the test for every one of them.
+
+| id | Where | Sev | Tag | What | Owner | Fixed in 4.37.0 |
+|---|---|---|---|---|---|---|
+| G-1 | `web/wsock.py:347-360` | high | CONFIRMED | An idle terminal burns a whole CPU core once the socket's fd is ≥ 1024 | D | yes — I1 |
+| G-2 | `sshterm.py:271-294` | high | CONFIRMED | A socket that never sends `open` holds a session slot, a thread and its authorisation forever | D | yes — I2 |
+| G-3 | `sshterm.py:540-569` | medium | PLAUSIBLE | One exception kills the watchdog, and with it every limit on a live shell | D | yes — I4 |
+| G-4 | `sshterm.py:170-180` | medium | PLAUSIBLE | Shutting the service down can take minutes because sessions are stopped one at a time | D | yes — I4 |
+| G-5 | `sshterm.py:71, 296-316` | medium | CONFIRMED | The failed-login cap is per socket, so the page is still a password oracle | D | yes — I3 |
+| G-6 | `sshterm.py:415-434` | low | CONFIRMED | The terminal never records that a remembered host key was presented again | D | yes — I5 |
+| G-7 | `web/server.py:546-550` | low | CONFIRMED | The WebSocket Origin check ignores the scheme | D | yes — D13 |
+| G-8 | `web/wsock.py:244-263` | low | CONFIRMED | Reserved WebSocket opcodes are accepted as data | D | yes — I6 |
+| G-9 | `sshterm.py:243, 483` | low | CONFIRMED | Any frame refreshes the idle timer, so a shell need never be typed at | D | yes — I5 |
+| G-10 | `mibparse.py:105, 169-172` | **critical** | CONFIRMED | `_IMPORT_GROUP_RE` is quadratic: one 32 KB upload freezes the whole application for 17 seconds | B (+ D) | yes — H1 |
+| G-11 | `mibparse.py:107-123` | **critical** | CONFIRMED | The four macro regexes rescan the whole file from every candidate start | B (+ D) | yes — H1 |
+| G-12 | `mibparse.py:288-299, 344-353` | high | CONFIRMED | `resolve()` is O(n²) in the number of objects, and `resolve_all()` runs it eight times over every file | B | yes — H2 |
+| G-13 | `mibparse.py:77-100` | medium | CONFIRMED | `_strip_comments_and_strings` costs nine bytes of memory per input byte | B | yes — H3 |
+| G-14 | `mibparse.py:185, 338-339` | low | CONFIRMED | An enum value with more than 4,300 digits raises Python's integer guard out of `parse()` | B | yes — H3 |
+| G-15 | `enterprises.py:1-19, 24-77` | medium | PLAUSIBLE | `enterprises.VERIFIED` claims a provenance the repository contradicts | F (+ B) | yes — H5, F6 |
+| G-16 | `enterprises.py:66, 73, 102, 110, 124, 129` | low | CONFIRMED | One vendor, several keys — the vendor filter splits a fleet across rows | B | yes — H5 |
+| G-17 | `enterprises.py:184-187`, `nodeoids.py:171` | low | CONFIRMED | Nothing can identify Rockwell Automation / Allen-Bradley gear | B | yes — H5 |
+| G-18 | `namelookup.py:283-292` | high | CONFIRMED | `reverse()` sets a process-global socket timeout, and concurrent resolver workers leave it set permanently | C | yes — H6 |
+| G-19 | `namelookup.py:107, 116-123, 151-167` | medium | CONFIRMED | The raw PTR/TXT resolver accepts an answer from any host and has no overall deadline | C | yes — H6 |
+| G-20 | `namelookup.py:263-265` | low | PLAUSIBLE | `nslookup` arguments are not validated | C | yes — H6 |
+| G-21 | `eventlog.py:60, 70-71, 91-93` | medium | CONFIRMED | `EventLog` remembers every target it has ever seen, and `clear()` does not clear them | C | yes — H7 |
+| G-22 | `web/server.py:297-305`, `console.py:569-581` | medium | CONFIRMED | `AccessLog.clients` grows one entry per source address forever, and the console re-sorts it every second | D (+ E) | yes — D14, H9 |
+| G-23 | `web/server.py:8`, `console.py:524`, `__main__.py:177` | medium | CONFIRMED | Three shipped places tell the operator there is no authentication | F (+ D, E) | yes — D15, H9, F6 |
+| G-24 | `snmptrapdb.py:375-395`, `ipamdb.py:715-747` | high | CONFIRMED | `trim_to_size()` runs VACUUM up to six times while holding the write lock — §4.5 X-F5's guess, confirmed | C | yes — C4 |
+| G-25 | `ipam_worker.py:96-131` | high | CONFIRMED | Every enabled subnet scans at once on the first tick, each with 64 ping subprocesses | C | yes — H10 |
+| G-26 | `ipam_scan.py:180-185` | low | CONFIRMED | `read_arp_table` does not catch the timeout it sets | C | **no** — deferred |
+| G-27 | `analysis.py:278-284`, `web/api.py:50-55, 290-308` | high | CONFIRMED | One GET allocates a bucket per time slot from two unclamped query parameters | D | yes — H8 |
+| G-28 | `web/static/app.js:100-117, 1038-1086` | medium | CONFIRMED | A 10 Hz timer that never stops, and not one fetch that can be cancelled | E | yes — E4/E14 |
+| G-29 | `web/static/debug.js:21, 117-127` | low | CONFIRMED | `escape()` leaves single quotes alone, and two server fields skip it entirely | E | yes — E15 |
+| G-30 | `web/static/debug.js:258-275, 386-388` | low | CONFIRMED | The debug event table re-renders 2,000 rows on every keystroke | E | yes — E16 |
+| G-31 | `services.py:18-69` | low | CONFIRMED | Duplicate keys and editorial labels in `PORTS` | C | yes — H11 |
+| G-32 | `netpath/mibs/*.mib` | low | CONFIRMED | No attribution or licence notice for any of the 21 bundled MIBs | F | yes — F6 |
+| G-33 | `netpath/mibs/SNMPv2-TC.mib` | low | CONFIRMED | `SNMPv2-TC.mib` is shipped, seeded, and yields nothing | B | yes — H4 |
 
 The full write-ups, with the reproduction script for each CONFIRMED row, are
 the seventh reviewer's own report. Findings are routed to the workstream that
