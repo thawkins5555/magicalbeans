@@ -873,6 +873,141 @@ check("...and says what is true instead: TLS, reach, and that sign-in applies",
       and "Sign-in is required" in hint_source, hint_source[:80])
 
 
+# --------------------------------------------- H10: IPAM scans are staggered
+
+print("H10 IPAM scans are staggered and capped, not fanned out at once")
+
+from netpath import ipam_worker                      # noqa: E402
+
+
+class FakeIpamDb:
+    """The three IpamWorker scheduling methods read, and nothing else: the
+    scan body itself is replaced below, so no ping, no ARP table and no
+    database are involved."""
+
+    def __init__(self, subnets: int, **settings):
+        self.rows = [{"id": i + 1, "enabled": 1, "cidr": f"10.{i}.0.0/24",
+                      "label": f"subnet-{i}"} for i in range(subnets)]
+        self._settings = {"enabled": True, "scan_interval_minutes": 60,
+                          "ping_workers": 64, **settings}
+
+    def settings(self) -> dict:
+        return dict(self._settings)
+
+    def subnets(self) -> list:
+        return list(self.rows)
+
+    def dhcp_servers(self) -> list:
+        return []
+
+
+class CountingWorker(ipam_worker.IpamWorker):
+    """Records how many scans were in flight at once, and for how long."""
+
+    def __init__(self, db):
+        super().__init__(db)
+        self.counter_lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+        self.ran: list = []
+
+    def _scan(self, subnet_id, settings):
+        with self.counter_lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            self.ran.append(subnet_id)
+        time.sleep(0.05)
+        with self.counter_lock:
+            self.in_flight -= 1
+
+
+def drain(worker, expected, seconds=20.0):
+    """Wait until `expected` scans have run, or give up."""
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        with worker.counter_lock:
+            if len(worker.ran) >= expected and worker.in_flight == 0:
+                return True
+        time.sleep(0.02)
+    return False
+
+
+# G-25, the first tick: _next_scan starts empty, so `now >= _next_scan.get(id, 0)`
+# was true for every enabled subnet at once — 50 subnets meant 50 scan threads
+# and up to 3,200 concurrent ping subprocesses on a box already polling a fleet.
+worker = CountingWorker(FakeIpamDb(50))
+try:
+    started_at = time.time()
+    worker._tick()
+    check("the first tick starts one subnet, not all fifty",
+          len(worker.ran) <= 1, f"{len(worker.ran)} started")
+finally:
+    worker.stop()
+
+# The stagger itself, without the scheduling that follows it: every subnet
+# gets its own first due time inside the spread window.
+spread_worker = CountingWorker(FakeIpamDb(50))
+try:
+    started_at = time.time()
+    spread_worker._stagger_first_scans(spread_worker.db.subnets(),
+                                       spread_worker.db.settings(), started_at)
+    due = [spread_worker._next_scan[row["id"]] for row in spread_worker.db.rows]
+    check("every subnet's first scan lands inside the stagger window",
+          all(started_at <= t <= started_at + ipam_worker.FIRST_SCAN_SPREAD_S
+              for t in due) and len(set(due)) == 50,
+          f"{min(due) - started_at:.1f}s..{max(due) - started_at:.1f}s, "
+          f"{len(set(due))} distinct")
+    check("...so nothing is left in lockstep", max(due) - min(due) > 60,
+          f"{max(due) - min(due):.0f}s apart")
+    check("...and a subnet added afterwards is still due immediately",
+          spread_worker._next_scan.get(999, 0) == 0)
+finally:
+    spread_worker.stop()
+
+# The cap: with everything due at once, no more than max_concurrent_scans run
+# together, and every subnet still gets scanned.
+worker = CountingWorker(FakeIpamDb(20, max_concurrent_scans=4))
+try:
+    worker._tick()                    # stagger
+    worker._next_scan.clear()         # ...then make everything due
+    worker._tick()
+    check("every due subnet is eventually scanned", drain(worker, 20),
+          f"{len(worker.ran)} of 20")
+    check("...but never more than max_concurrent_scans at a time",
+          worker.peak <= 4, f"peak {worker.peak}")
+    check("...and each was scanned once", sorted(worker.ran) == list(range(1, 21)),
+          str(sorted(worker.ran)[:5]))
+finally:
+    worker.stop()
+
+# scan_now() reaches the same pool, so a bulk "scan all subnets" from the API
+# is capped too rather than fanning out with no limit.
+worker = CountingWorker(FakeIpamDb(20, max_concurrent_scans=3))
+try:
+    for row in worker.db.rows:
+        worker.scan_now(row["id"])
+    check("a bulk scan-all from the API is capped as well", drain(worker, 20)
+          and worker.peak <= 3, f"peak {worker.peak}, {len(worker.ran)} ran")
+finally:
+    worker.stop()
+
+# A subnet already queued or running is not handed in again.
+worker = CountingWorker(FakeIpamDb(1, max_concurrent_scans=1))
+try:
+    for _ in range(10):
+        worker.scan_now(1)
+    drain(worker, 1)
+    time.sleep(0.2)
+    check("asking for the same subnet ten times runs it once",
+          worker.ran.count(1) == 1, str(worker.ran))
+finally:
+    worker.stop()
+
+check("the default cap is small enough to matter",
+      1 <= ipam_worker.DEFAULT_MAX_CONCURRENT_SCANS <= 8,
+      str(ipam_worker.DEFAULT_MAX_CONCURRENT_SCANS))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
