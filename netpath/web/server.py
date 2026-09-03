@@ -260,6 +260,13 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
 PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css", "/favicon.ico"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
+# Reachable by an account that still owes a password change: signing out,
+# the state poll that raises the prompt in the browser, the heartbeat that
+# keeps the session alive while the new password is being typed, and the
+# change itself. Everything else waits until it is done.
+MUST_CHANGE_API = PUBLIC_API | {"/api/state", "/api/password", "/api/logout",
+                                "/api/heartbeat"}
+
 SESSION_COOKIE = "sw_session"
 
 
@@ -486,6 +493,21 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(302, b"", "text/plain", {"Location": "/login"})
             return
+
+        # An initial password is a secret the administrator also knows, so
+        # "must change it" has to be a gate and not merely a prompt. It was
+        # only ever a prompt: the browser raised a modal that Escape closed,
+        # re-asked on the next reload, and never stopped the account being
+        # used in between. The exemptions above are what the change itself
+        # needs; the lookup only runs for calls outside them, so the state
+        # poll every open tab makes costs nothing extra.
+        if (session and path.startswith("/api/")
+                and path not in MUST_CHANGE_API):
+            row = self.service.app_db.user(session["username"])
+            if row is not None and row["must_change"]:
+                self._json({"error": "Set a new password before using "
+                                     "SappiWhere."}, 403)
+                return
 
         # A cross-site form can send a POST but cannot set this content type
         # without a preflight the browser will refuse. With SameSite=Strict on

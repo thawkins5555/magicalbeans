@@ -181,42 +181,24 @@ button.linkish:hover { color: var(--accent); }
 .page.active { display: flex; flex-direction: column; }
 #page-netpath.active { flex-direction: row; }
 
-/* First paint only: index.html's own inline <head> script sets data-tab on
-   <html>, synchronously, before any of the markup above has been parsed —
-   so these rules are what actually paints on a reload, not the .active
-   classes above, which only exist once app.js's selectTab() has run
-   (seconds later, after every module script and the first API call).
-   Without these, .page's default (display:none) and .tab's default (no
-   accent underline) apply to everything until then, which read as
-   "NetPath" only because NetPath used to be the one page/tab marked
-   .active in the raw HTML — removing that static default in favor of
-   this is what actually closes the flash, not just narrows it. */
-html[data-tab="dashboard"] .tab[data-tab="dashboard"],
-html[data-tab="nodes"] .tab[data-tab="nodes"],
-html[data-tab="alerts"] .tab[data-tab="alerts"],
-html[data-tab="netpath"] .tab[data-tab="netpath"],
-html[data-tab="netflow"] .tab[data-tab="netflow"],
-html[data-tab="snmp"] .tab[data-tab="snmp"],
-html[data-tab="syslog"] .tab[data-tab="syslog"],
-html[data-tab="ipam"] .tab[data-tab="ipam"],
-html[data-tab="debug"] .tab[data-tab="debug"],
-html[data-tab="settings"] .tab[data-tab="settings"] {
-  color: var(--text);
-  border-bottom-color: var(--accent);
-}
-html[data-tab="dashboard"] #page-dashboard,
-html[data-tab="nodes"] #page-nodes,
-html[data-tab="alerts"] #page-alerts,
-html[data-tab="netflow"] #page-netflow,
-html[data-tab="snmp"] #page-snmp,
-html[data-tab="syslog"] #page-syslog,
-html[data-tab="ipam"] #page-ipam,
-html[data-tab="debug"] #page-debug,
-html[data-tab="settings"] #page-settings {
-  display: flex;
-  flex-direction: column;
-}
-html[data-tab="netpath"] #page-netpath { display: flex; flex-direction: row; }
+/* First paint only. boot.js sets data-tab on <html> synchronously, before
+   any of the markup above has been parsed, and generates the matching rule
+   pair into a <style> of its own — so what paints on a reload is that rule,
+   not the .active classes above, which only exist once app.js's selectTab()
+   has run (seconds later, after every module script and the first API call).
+
+   The rule used to be written out here, one selector per tab, and that is
+   exactly how it rotted: the list named ten tabs while the product shipped
+   twelve, so an operator whose last tab was Wireless or ConfigRX reloaded
+   into a blank page with no tab underlined until the scripts had finished.
+   Generating it from the stored name cannot drift.
+
+   NetPath is the one page that lays its panes out in a row rather than a
+   column, and it needs to say so before the scripts run like every other
+   page does. The extra .page here is not decoration: it outweighs the
+   generated rule, which is appended after this stylesheet and would
+   otherwise win on source order and stand the page up in a column. */
+html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }
 
 /* --------------------------------------------------------------- widgets */
 button {
@@ -285,7 +267,22 @@ body.tiny .terms { display: none; }
    The title is the part that gives way; the controls keep their size. */
 .bar > .section { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar > button { flex: none; }
+/* A status line in a bar carries a sentence — a DHCP server's connection
+   error, say. A flex item's minimum width is its longest word, so between a
+   fixed select and the spacer it was squeezed to about sixty pixels and
+   wrapped one word per line. It gives way like the pane titles above do:
+   the full text stays in the title attribute the module already sets. */
+.bar > .hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row { display: flex; gap: 6px; }
+/* Opt-in, like .bar.wrap: a dialog's button row wants to stay on one line
+   even when it is tight, but a row of nine equal actions would rather take
+   a second row than squeeze every label onto two lines. */
+.row.wrap { flex-wrap: wrap; }
+/* flex-wrap alone changed nothing here: .row's buttons are flex: 1, so they
+   shrank past their labels instead of wrapping — nine buttons stayed on one
+   line with every label folded onto two. Natural width plus nowrap is what
+   makes the ROW wrap rather than the words. */
+.row.wrap button { flex: 0 1 auto; white-space: nowrap; }
 .row button { flex: 1; }
 .row button.half { flex: 0 1 50%; }
 
@@ -628,7 +625,14 @@ fieldset .hint { margin: 8px 0 0; }
   margin-left: 10px;
   white-space: nowrap;
 }
-.usage .bar {
+/* `.meter`, not `.bar`: this used to be `.usage .bar`, which inherited the
+   toolbar `.bar` rule's `padding: 8px 12px` above. Under the global
+   `box-sizing: border-box` that leaves a 6px-high element with a zero-height
+   content box, so the fill inside it computed to 0px and every storage meter
+   on the Settings page rendered as an empty grey pill — the width was always
+   right and never visible. A name of its own is what stops it happening
+   again; a padding reset would only have fixed today's collision. */
+.usage .meter {
   display: inline-block;
   width: 90px;
   height: 6px;
@@ -638,9 +642,9 @@ fieldset .hint { margin: 8px 0 0; }
   vertical-align: middle;
   overflow: hidden;
 }
-.usage .bar i { display: block; height: 100%; background: var(--accent); }
-.usage.warn .bar i { background: var(--warn); }
-.usage.full .bar i { background: var(--fail); }
+.usage .meter i { display: block; height: 100%; background: var(--accent); }
+.usage.warn .meter i { background: var(--warn); }
+.usage.full .meter i { background: var(--fail); }
 
 /* A visible scrollbar: this page scrolls and a thin auto-hiding bar gives no
    hint that there is more below. */

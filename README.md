@@ -6,7 +6,7 @@ each one actually works — file by file, mechanism by mechanism —
 for the build history, and `CREDENTIAL-SECURITY.md` for exactly how passwords
 and stored credentials are protected.
 
-Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Debug**, a live view of what the background threads are doing; and **Settings**.
+Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Wireless**, a Fortinet access-point dashboard; **ConfigRX**, SSH configuration backups; **Debug**, a live view of what the background threads are doing; and **Settings**.
 
 ## NetPath
 

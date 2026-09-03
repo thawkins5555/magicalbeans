@@ -83,6 +83,13 @@ def get_state(service, params, body) -> dict:
     session = service.sessions.get(params.get("_token", ""))
     idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
                       if session else None)
+    # The absolute ceiling is the other way a session ends, and staying at the
+    # keyboard does not move it. It used to arrive with no warning at all: a
+    # wallboard left up overnight simply became the sign-in page. Sent the
+    # same way as the idle figure — server-authoritative, so a browser clock
+    # that disagrees cannot make the countdown lie.
+    max_remaining = (service.sessions.max_seconds - (time.time() - session["created"])
+                     if session else None)
     granted = service.app_db.permissions_for(params.get("_username", ""))
     result = {
         "version": __version__,
@@ -99,6 +106,8 @@ def get_state(service, params, body) -> dict:
             "idle_timeout_minutes": service.sessions.idle_seconds // 60,
             "idle_seconds_remaining":
                 max(0, round(idle_remaining)) if idle_remaining is not None else None,
+            "max_seconds_remaining":
+                max(0, round(max_remaining)) if max_remaining is not None else None,
         },
         "settings": service.settings,
         "flow_settings": service.flow_settings,
@@ -1817,9 +1826,7 @@ def get_nodes_mac_search(service, params, body) -> dict:
 
 
 def post_nodes_device(service, params, body) -> dict:
-    ip = str(body.get("ip", "")).strip()
-    if not ip:
-        raise ValueError("An IP address is required")
+    ip = _device_address(body)
     if service.nodes_db.device_by_ip(ip):
         raise ValueError(f"{ip} is already a device")
     group_id = body.get("group_id")
@@ -1905,6 +1912,30 @@ def _check_display_name_source(body) -> None:
     value = body.get("display_name_source")
     if value is not None and value not in ("auto", "manual"):
         raise ValueError("display_name_source must be 'auto' or 'manual'")
+
+
+def _device_address(body) -> str:
+    """The address a device is being added at, or a readable refusal.
+
+    Devices are keyed by address and nothing here resolves names — the poller
+    speaks SNMP and ICMP straight to what is stored — so a hostname is not a
+    device address, and neither is `999.999.1.oops`, which this used to accept
+    without a word. An unpollable row looked exactly like a device that was
+    merely down, forever, which is the worst way to be told about a typo.
+
+    IPv6 is allowed because the rest of the stack already handles it; a
+    zone index is not, since it means nothing on another machine.
+    """
+    ip = str(body.get("ip", "")).strip()
+    if not ip:
+        raise ValueError("An IP address is required")
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise ValueError(
+            f"{ip!r} is not an IP address. Devices are polled by address, "
+            "so a name cannot be used here.") from None
+    return ip
 
 
 def put_nodes_device(service, params, body, device_id) -> dict:

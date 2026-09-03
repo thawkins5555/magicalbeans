@@ -477,7 +477,7 @@
   /* ---------------------------------------------------------- settings */
 
   function settingsDialog() {
-    const s = App.state.flowSettings;
+    const s = App.state.flowSettings || {};
     const check = (id, label, on) =>
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
@@ -542,7 +542,7 @@
             box.querySelector('#cols-netflow'), COLUMNS),
         } });
         await App.loadState();
-        App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
+        App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
         App.closeModal();
         App.refreshNow('netflow');
       } },
@@ -665,7 +665,13 @@
   function init() {
     App.fillRanges(App.el('nf-range'), 'Last hour');
     const dimension = App.el('nf-dimension');
-    for (const name of App.state.dimensions) {
+    // `dimensions` — like every other block in /api/state — is omitted
+    // entirely for an account that cannot read this module (see
+    // _STATE_MODULE_KEYS in api.py), and init() runs for every module
+    // whatever the account may read. Defaulting rather than assuming is the
+    // rule for anything that comes out of state: the tab is hidden anyway,
+    // so an empty list here is exactly right.
+    for (const name of App.state.dimensions || []) {
       const option = document.createElement('option');
       option.value = name;
       option.textContent = name;
@@ -712,7 +718,7 @@
         if (event.key === 'Enter') App.refreshNow('netflow');
       };
     }
-    App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
+    App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
     App.el('nf-resolve').onchange = async (event) => {
       await App.post('/api/settings', {
         scope: 'netflow', values: { resolve_addresses: event.target.checked },

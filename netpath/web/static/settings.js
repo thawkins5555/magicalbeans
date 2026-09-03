@@ -165,7 +165,7 @@
       const pct = cap ? Math.round(share * 100) : 0;
       el.className = 'usage' + (share >= 0.9 ? ' full' : share >= 0.75 ? ' warn' : '');
       el.innerHTML =
-        `<span class="bar"><i style="width:${share * 100}%"></i></span>` +
+        `<span class="meter"><i style="width:${share * 100}%"></i></span>` +
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
     const total = (storage.trace_bytes || 0) + (storage.flow_bytes || 0)

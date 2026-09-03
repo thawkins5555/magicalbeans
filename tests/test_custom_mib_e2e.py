@@ -56,6 +56,22 @@ def login(username, password):
     return headers.get("Set-Cookie", "").split("sw_session=")[1].split(";")[0]
 
 
+# The default account is created owing a password change, and the server now
+# refuses everything except the change itself until it is done — so a test
+# that wants to call the API has to do what an operator does on a fresh
+# install. Changing it also destroys the session, hence the second sign-in.
+FIRST_PASSWORD = "TestSuiteFirstPass2026"
+
+
+def login_ready(username, password):
+    token = login(username, password)
+    status, payload, _ = call("POST", "/api/password",
+                              {"current_password": password,
+                               "new_password": FIRST_PASSWORD}, token=token)
+    assert status == 200, (status, payload)
+    return login(username, FIRST_PASSWORD)
+
+
 TEST_MIB = """
 TEST-MIB DEFINITIONS ::= BEGIN
 testEnterprise OBJECT IDENTIFIER ::= { enterprises 99999 }
@@ -69,7 +85,7 @@ END
 """
 
 try:
-    admin_token = login(DEFAULT_USER, DEFAULT_PASSWORD)
+    admin_token = login_ready(DEFAULT_USER, DEFAULT_PASSWORD)
 
     content_b64 = base64.b64encode(TEST_MIB.encode()).decode()
     status, payload, _ = call("POST", "/api/nodes/mibs",

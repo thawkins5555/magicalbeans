@@ -425,8 +425,16 @@
       : 'never polled';
     const authText = server.has_credential
       ? `stored credential · ${escape(server.username || '')}` : 'ambient identity';
-    statusEl.className = server.last_status === 'error' ? 'sev sev-1' : 'hint';
+    // `hint err`, not `sev sev-1`: .sev is the syslog table's severity chip,
+    // a fixed 62px inline-block, and borrowing it here purely for its red
+    // meant this whole line was laid out in a 62px column — one word per
+    // line down the bar. .err is the colour on its own, which is all this
+    // ever wanted.
+    statusEl.className = server.last_status === 'error' ? 'hint err' : 'hint';
     statusEl.textContent = `${server.address} · ${authText} · ${statusText}`;
+    // The line ellipsises when the bar is tight (see .bar > .hint), so the
+    // whole of it has to stay reachable on hover.
+    statusEl.title = statusEl.textContent;
   }
 
   function dhcpServerForm(server) {

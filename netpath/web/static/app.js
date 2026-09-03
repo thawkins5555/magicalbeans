@@ -41,7 +41,17 @@ const App = (() => {
       <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
         session using this account, including this one.</p>`,
       [
-        ...(forced ? [] : [{ label: 'Cancel', onClick: closeModal }]),
+        // Forced, this dialog is the only thing the account can do — the
+        // server refuses everything else until the password is replaced — so
+        // Cancel would be a lie. Sign out takes its place: leaving is a real
+        // option, carrying on as if nothing were owed is not.
+        ...(forced
+          ? [{ label: 'Sign out', onClick: async () => {
+              state.modalLocked = false;
+              try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
+              window.location.href = '/login';
+            } }]
+          : [{ label: 'Cancel', onClick: closeModal }]),
         { label: 'Change password', primary: true, onClick: async () => {
           const status = document.getElementById('am-status');
           const next = document.getElementById('am-new').value;
@@ -65,6 +75,10 @@ const App = (() => {
           }
         } },
       ]);
+    // Escape and a backdrop click must not dismiss this one. Without the
+    // lock the prompt was advisory: it closed on a stray keypress, came back
+    // only on the next reload, and the account stayed usable throughout.
+    if (forced) state.modalLocked = true;
     return box;
   }
 
@@ -88,14 +102,31 @@ const App = (() => {
     for (const el of document.querySelectorAll('[data-requires-write]')) {
       if (!canWrite(el.dataset.requiresWrite)) el.hidden = true;
     }
-    const activeTab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
-    if (activeTab && activeTab.hidden) {
-      const firstVisible = document.querySelector('.tab:not([hidden])');
-      if (firstVisible) selectTab(firstVisible.dataset.tab);
+    // The open tab can stop being showable underneath the operator — access
+    // revoked, or its module hidden after a failed init — so move off it
+    // rather than leaving an empty page behind a still-highlighted tab.
+    if (state.tab && !usableTab(state.tab)) {
+      const next = [...document.querySelectorAll('.tab:not([hidden])')]
+        .map((tab) => tab.dataset.tab).find(usableTab);
+      if (next) selectTab(next);
     }
   }
 
   const pages = {};
+
+  /* Modules whose init() threw during start(). Their tabs are hidden and
+     never selected, so a module that cannot start takes only itself out
+     rather than the whole application. Populated once, at startup; a reload
+     is what clears it, since init() only ever runs there. */
+  const brokenPages = new Set();
+
+  /* A tab worth painting: it exists, this account may read it, and its
+     module actually started. Used both at startup and by applyPermissions
+     when the open tab stops being readable. */
+  function usableTab(name) {
+    if (!name || brokenPages.has(name)) return false;
+    return Boolean(document.querySelector(`.tab[data-tab="${name}"]:not([hidden])`));
+  }
 
   /* ------------------------------------------------------------ server */
 
@@ -151,6 +182,7 @@ const App = (() => {
   let lastActivity = Date.now();
   let lastHeartbeat = 0;
   let idleRemainingMs = null;   // null until the first /api/state reply
+  let maxRemainingMs = null;    // the absolute ceiling, which activity cannot move
   let idleBanner = null;
 
   for (const name of ACTIVITY_EVENTS) {
@@ -163,17 +195,29 @@ const App = (() => {
   function applySessionIdle(session) {
     if (!session || session.idle_seconds_remaining == null) {
       idleRemainingMs = null;
+      maxRemainingMs = null;
       hideIdleWarning();
       return;
     }
     // The server's figure is authoritative and immune to clock skew between
     // browser and server; it resyncs the local countdown on every poll.
     idleRemainingMs = session.idle_seconds_remaining * 1000;
+    maxRemainingMs = session.max_seconds_remaining == null
+      ? null : session.max_seconds_remaining * 1000;
   }
 
   async function idleTick(now) {
     if (idleRemainingMs == null) return;
     idleRemainingMs = Math.max(0, idleRemainingMs - MASTER_MS);
+    if (maxRemainingMs != null) maxRemainingMs = Math.max(0, maxRemainingMs - MASTER_MS);
+
+    // The ceiling comes first, because it is the one a heartbeat cannot
+    // move: warning "you have gone idle" to someone actively typing, sixty
+    // seconds before they are signed out anyway, would be a lie.
+    if (maxRemainingMs != null && maxRemainingMs <= WARNING_MS) {
+      showSessionEndWarning(Math.max(0, Math.ceil(maxRemainingMs / 1000)));
+      return;
+    }
 
     const active = now - lastActivity < HEARTBEAT_GAP_MS;
     if (active && now - lastHeartbeat >= HEARTBEAT_GAP_MS) {
@@ -194,7 +238,11 @@ const App = (() => {
     }
   }
 
-  function showIdleWarning(secondsLeft) {
+  /* The absolute ceiling, reached whether or not anyone is at the keyboard.
+     Deliberately has no "Stay signed in": nothing this session can do will
+     extend it, and offering a button that cannot work would be worse than
+     the silence this replaces. It says what to expect instead. */
+  function ensureIdleBanner() {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
@@ -208,8 +256,25 @@ const App = (() => {
       };
     }
     idleBanner.hidden = false;
-    document.getElementById('idle-banner-text').textContent =
-      `Signing out in ${secondsLeft}s from inactivity`;
+    return document.getElementById('idle-banner-text');
+  }
+
+  function showIdleWarning(secondsLeft) {
+    const text = ensureIdleBanner();
+    document.getElementById('idle-banner-stay').hidden = false;
+    text.textContent = `Signing out in ${secondsLeft}s from inactivity`;
+  }
+
+  /* The absolute ceiling, reached whether or not anyone is at the keyboard.
+     Deliberately has no "Stay signed in": nothing this session can do will
+     extend it, and offering a button that cannot work would be worse than
+     the silence this replaces. It says what to expect instead. */
+  function showSessionEndWarning(secondsLeft) {
+    const text = ensureIdleBanner();
+    document.getElementById('idle-banner-stay').hidden = true;
+    text.textContent =
+      `Signing out in ${secondsLeft}s — this session has reached its maximum ` +
+      'length. Sign in again to carry on.';
   }
 
   function hideIdleWarning() {
@@ -1136,18 +1201,48 @@ const App = (() => {
     window.addEventListener('resize', applyDensity);
     initSplitters();
 
-    for (const page of Object.values(pages)) {
-      if (page.init) page.init();
+    // Every module initialises inside its own try/catch, because this loop
+    // used to be the single point of failure for the entire application: one
+    // module throwing here meant selectTab() and restartTimer() below were
+    // never reached, so the page painted whatever boot.js had marked and then
+    // sat there, frozen, with no error anywhere a user could see.
+    //
+    // That was not hypothetical. /api/state deliberately omits a module's
+    // block for an account that cannot read it (_STATE_MODULE_KEYS in
+    // api.py), so an account without NetFlow access reached a `for` over an
+    // undefined `dimensions` list and lost the whole app — including the
+    // modules it *could* read. Each module now fails alone: its tab is
+    // hidden, the rest of the app starts normally.
+    for (const [name, page] of Object.entries(pages)) {
+      if (!page.init) continue;
+      try {
+        page.init();
+      } catch (error) {
+        // Hiding matches applyPermissions' one-way rule: a tab whose module
+        // never initialised cannot render, and clicking it would be a worse
+        // experience than not offering it. A reload is the way back, exactly
+        // as it is for a permission granted mid-session.
+        brokenPages.add(name);
+        const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+        if (tab) tab.hidden = true;
+        console.error(`${name}: module failed to start, tab hidden`, error);
+      }
     }
-    // A refresh should land back on whichever module was open, not reset to
-    // NetPath — but only if that tab still exists (a build could drop one).
+    // A refresh should land back on whichever module was open, rather than
+    // resetting to NetPath — but only if that tab is one this browser can
+    // actually show: a build could drop it, the account may not be allowed
+    // to read it, or its module may have just failed above.
     let initialTab = 'netpath';
     try {
       const stored = localStorage.getItem(TAB_KEY);
-      if (stored && document.querySelector(`.tab[data-tab="${stored}"]`)) {
-        initialTab = stored;
-      }
+      if (stored) initialTab = stored;
     } catch (error) { /* private browsing, or storage full: default to netpath */ }
+    if (!usableTab(initialTab)) {
+      // Dashboard is the last resort rather than an error page: it is never
+      // permission-gated and has no module state of its own to break.
+      initialTab = [...document.querySelectorAll('.tab:not([hidden])')]
+        .map((tab) => tab.dataset.tab).find(usableTab) || 'dashboard';
+    }
     selectTab(initialTab);
     restartTimer();
   }

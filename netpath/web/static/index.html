@@ -935,7 +935,10 @@
 
     <fieldset>
       <legend>MAINTENANCE</legend>
-      <div class="row">
+      <!-- .wrap because this row carries nine buttons with sentence-length
+           labels: .row alone cannot wrap, so every label folded onto two
+           lines at 1366px rather than the row folding onto two rows. -->
+      <div class="row wrap">
         <button data-maint="redns" data-requires-write="settings">Re-run reverse DNS</button>
         <button data-maint="prune_traces" data-requires-write="settings">Delete old traces</button>
         <button data-maint="prune_flows" data-requires-write="settings">Delete stored flows</button>

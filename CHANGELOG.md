@@ -6,6 +6,57 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.36.2 — UI/UX review: the defects it found
+
+The first of four passes over the interface, following the review recorded
+in `UI-UX-REVIEW.md`. This one is only the defects — nothing is redesigned,
+nine things are made to work.
+
+- **One module can no longer take down the whole application.** Every
+  module is started inside its own guard. It used to be one loop with no
+  isolation, so the first exception meant the tab was never selected and
+  the refresh timer never started: the page painted whatever had been
+  stored and then sat there, frozen, with nothing on screen to say why.
+  An account without NetFlow access hit exactly that — `/api/state`
+  correctly omits a module's block for someone who cannot read it, and the
+  NetFlow module read it without checking — so the accounts an
+  administrator creates first, the read-only ones, got a dead page. A
+  module that fails now hides its own tab and the rest of the app starts.
+- **A device must be given an address.** `999.999.1.oops` was accepted and
+  stored, and the row that resulted looked exactly like a device that was
+  merely down, forever. Addresses are now checked on the server, and the
+  Add device dialog reports a blank or refused address instead of appearing
+  to do nothing.
+- **"You must change your password" is now a rule rather than a request.**
+  It was a dialog the browser raised, which Escape closed, which re-asked
+  only on the next reload, and which nothing enforced: the account was
+  fully usable throughout. The server now refuses everything except the
+  change itself, signing out, and the polling that keeps the prompt on
+  screen; the dialog cannot be dismissed, and offers Sign out instead of a
+  Cancel that would have been a lie.
+- **The storage meters on Settings show how full each database is.** All
+  eight rendered as empty grey pills whatever the number behind them,
+  because the meter shared a class name with the toolbar and inherited its
+  padding — which, under `border-box`, left the bar exactly zero pixels of
+  height to fill.
+- **Wireless and ConfigRX no longer reload into a blank page.** The rule
+  that paints the first frame, before any script has run, was a
+  hand-written list of ten tabs; the product has had twelve since those two
+  shipped. It is now generated from the tab being restored, so it cannot
+  fall behind the tab strip again.
+- **Small things that were wrong.** The nine Maintenance buttons wrap onto
+  a second row instead of folding every label onto two lines; a DHCP
+  server's error reads along the bar instead of down a sixty-pixel column,
+  having borrowed the syslog severity chip's fixed width for its colour;
+  the Debug event log names all eleven of its categories rather than six,
+  with the other five showing their raw keys; and a session about to hit
+  its twelve-hour ceiling now says so a minute beforehand, where it used to
+  arrive as a sudden return to the sign-in page.
+- **Tests.** `tests/test_web_gates.py` covers the three halves a browser
+  must not be trusted with: the must-change gate, device address
+  validation, and the shape of `/api/state` for each permission set — the
+  last being the defect that produced the dead page above.
+
 ### 4.36.1 — Review of the SSH terminal
 
 A security-focused review of 4.36.0 before it reached main. Nothing about
