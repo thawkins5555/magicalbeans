@@ -8,9 +8,28 @@ monitoring and maintaining that fleet faster, and what has to change before it
 does?*
 
 Nothing in `netpath/` or `tests/` was modified for this review. Every finding
-below carries a `file:line` reference and is marked **CONFIRMED** (reproduced by
-running code, or traced unambiguously) or **PLAUSIBLE** (traced, not executed).
+row in §4 carries a `file:line` reference and a tag, and the tags mean exactly
+this:
+
+- **CONFIRMED** — either the behaviour was produced by running code (one of the
+  reviewers' benchmarks, fuzzers, stub agents or experiment scripts, or the live
+  campaign in §3), or the finding is the *absence* of something and that absence
+  was established by exhaustive search of the shipped source. A CONFIRMED row
+  states what was run or searched.
+- **PLAUSIBLE** — traced in the source and reasoned about, but never executed.
+  The mechanism is real in the code; the consequence is an inference. Four rows
+  carry this tag (P-S7, P-S8, S-N13, X-F23) and each says why.
+
+Identifiers are prefixed by section — `P-` polling core (§4.1), `C-` collectors
+(§4.2), `A-` alerting (§4.3), `S-` security (§4.4), `X-` performance (§4.5),
+`U-` UX and documentation (§4.6) — because the first draft of this report reused
+`B1`, `S1`, `N1` and `F1` in several sections at once and its own cross-references
+became ambiguous. Every row in the documentation-truth table at the end of §4.6
+was checked against the code or the running application and is CONFIRMED.
+
 Bugs are documented here with proposed patches; none were applied, by request.
+Appendix C records what a re-review of this document withdrew, corrected and
+added, and §9 records what was subsequently implemented.
 
 Companion material: the `demo/` directory holds the reproducible harness used
 for the live demonstration (see §2 and `demo/README.md`).
@@ -62,9 +81,42 @@ through the existing best-effort GET, add an upstream-device field and a webhook
 channel to the alert engine, and build the empty Dashboard. That turns a good
 path monitor into a usable fleet monitor.
 
+**Already resolved upstream while this review was being written.** Releases
+4.36.0 and 4.36.1 shipped an SSH host-key store (`netpath/hostkeys.py`) and an
+interactive SSH terminal. Two findings in this report are closed by them and are
+marked **RESOLVED UPSTREAM in 4.36.x** where they appear: ConfigRX accepting any
+SSH host key on every connection (§4.4 S-S2, §7 #29) and the absence of any way
+to forget a pinned key — a "Forget host key" action now exists and is gated on
+`configrx: write`. The rest of the verdict stands as measured; see §1 for what
+else 4.36.x changed.
+
 ---
 
 ## 1. How the review was done
+
+**The software moved during the review.** Every measurement, line number and
+finding below was taken against **4.35.0** at commit `05259ae`. While the review
+was being written `origin/main` advanced fourteen commits to **4.36.1**, and the
+work that follows from this report is based on that. The report has not been
+re-measured against 4.36.1; where a line number was checked against the newer
+tree it is cited as such, and where a finding is already closed it is marked
+**RESOLVED UPSTREAM in 4.36.x** rather than deleted, so the evidence stays
+readable.
+
+The 4.36.x delta, in one paragraph: 4.36.0 added an SSH host-key store
+(`netpath/hostkeys.py`, table `ssh_host_keys` in `configrx.db`, keyed on
+host+port, pinned on first sight and refused on change, with `forget_host_key`
+behind `configrx: write`) and an interactive SSH terminal reached from the device
+pane (`netpath/sshterm.py`, `netpath/web/wsock.py`, `netpath/web/static/ssh.*`
+with a vendored xterm.js), which brought a new `ssh` permission module, an Origin
+check on the WebSocket upgrade, per-account session caps and refused logins
+recorded as device events; the CSP gained `frame-ancestors 'none'` and
+`connect-src 'self'`; `tests/run_all.py` learned to read exit code 77 as SKIP;
+and three suites were added (`test_ssh_hostkeys.py`, `test_ssh_terminal.py`,
+`test_wsock.py`). 4.36.1 was a review pass over that work. Nothing in 4.36.x
+touched the poller, the retention path, the alert engine or the collectors, so
+§4.1, §4.2, §4.3 and §4.5 are unaffected; §4.4 loses S-S2 and gains the terminal
+as new attack surface that this review never examined (Appendix C).
 
 - **Code review by six parallel reviewers**, each owning one area and required
   to reproduce findings rather than assert them: SNMP polling core; receive-side
@@ -91,7 +143,7 @@ path monitor into a usable fleet monitor.
   their own right: a simulated device that stops answering SNMP is still *up*
   while loopback answers ping, so the ping shim now consults the fleet; and the
   API session signed the campaign script out after ten minutes, so the client
-  now re-authenticates on 401. See §4.4 N15 and §4.3 F27.) Alerts, emails at a local SMTP sink, poll counters,
+  now re-authenticates on 401. See §4.4 S-N15 and §4.1 P-N11.) Alerts, emails at a local SMTP sink, poll counters,
   overruns, process CPU and RSS were sampled before and after each step.
 - **A Playwright walk** (`demo/ui_walk.mjs`) of all twelve tabs, every subtab
   and every dialog, capturing screenshots, console errors, failed requests and
@@ -126,7 +178,11 @@ MikroTik, Siemens Scalance and Moxa industrial switches, Rockwell and Siemens S7
 PLCs (two-port agents identified by sysDescr), and net-snmp Linux hosts (the
 only persona whose CPU and memory the app can read).
 
-Thirteen special devices exercise the poller's edge paths:
+Thirteen devices are fixed rather than drawn from the weighted mix: index 0
+(the core switch) and index 1 (the wireless controller) named above, plus the
+**eleven** at indices 2–12 below, which exercise the poller's edge paths
+(`demo/personas.py` `SPECIALS`). An earlier draft of this report called all
+thirteen "special devices", which did not match the eleven rows in the table.
 
 | Index | IP | Behaviour |
 |---|---|---|
@@ -146,13 +202,13 @@ Thirteen special devices exercise the poller's edge paths:
 
 | Area | Exercised | Outcome |
 |---|---|---|
-| Nodes: add devices, profiles (v1, v2c, v3-noauth), sites | API, 250–2,000 devices | works; 430–630 devices/s over single POSTs; no bulk-add endpoint |
+| Nodes: add devices, profiles (v1, v2c, v3-noauth), sites | API, 250–2,000 devices | works, but **27–333 devices/s** over single POSTs and falling with fleet size (250 in 0.75 s = 333/s; 1,000 in 23.0 s = 43/s; 2,000 in 73.0 s = 27/s — §3.1). An earlier draft quoted "430–630/s" from a warm-cache micro-benchmark that no tier reproduced. No bulk-add endpoint |
 | Nodes: identity, vendor identification, arc-hop walk | all personas | correct vendor for every arc persona; Rockwell via sysDescr only |
 | Nodes: interface tables, 64-bit and 32-bit counters, rates | all personas | correct; one GET per interface (513 requests per poll of the chassis) |
 | Nodes: link events, flapping, reboot detection | flap storm, reboot step | events recorded; flap rule blunted by poll-interval sampling |
 | Nodes: MAC tables (Q-BRIDGE, dot1d, Cisco per-VLAN) and MAC search | access and core personas | works; excellent search-to-port interaction |
 | Nodes: DOM/optics in the interface dialog | core persona sensors | works, on demand only |
-| Nodes: v1-only device | special 2 | identity fine, **every interface blank** (§4.1 B3) |
+| Nodes: v1-only device | special 2 | identity fine, **every interface blank** (§4.1 P-B3) |
 | Nodes: wrong community, auth failure, slow, tooBig, wrap | specials 3–7 | timeout, auth_fail event, intermittent timeouts, halve-and-retry, wrap handled |
 | Nodes: SNMPv3 | specials 9–10 | noAuth works; authNoPriv cannot be configured on Linux |
 | Nodes: discovery sweep of 127.0.0.0/24 | API | works; SNMP phase serial per address |
@@ -174,13 +230,45 @@ Thirteen special devices exercise the poller's edge paths:
 ## 3. Demonstration results
 
 All three tiers ran the same nine-step campaign against the same application
-build on one Linux container (Python 3.11, local disk), with the polling
-profile at a 60 s interval, 32 poll workers, the `cpu_high` threshold lowered to
-20% and `response_time_high` to 5 ms so the fleet would trip them, the
-new-device grace set to 0, and the email cap raised so every notification was
-counted at the sink. Numbers are from `demo/out/results-<N>.json`; "alerts"
-are rows opened or resolved during the step's window, "emails" are messages
-received by the local SMTP sink during it.
+build on one Linux container (Python 3.11, local disk). The campaign deliberately
+overrode six shipped settings so that a 25-minute run would exercise paths that
+would otherwise take days to reach, and **every number in §3 is a number taken
+under those overrides**:
+
+| Setting | Shipped default | Campaign value | Why |
+|---|---|---|---|
+| `poll_interval_s` (profile) | 120 s | **60 s** | two poll cycles per campaign step |
+| `poll_workers` | **16** | **32** | the reviewers wanted the pool, not the worker count, to be the limit |
+| `cpu_high` threshold | 90% | **20%** | loopback personas never reach 90% |
+| `response_time_high` | 500 ms | **5 ms** | loopback RTT is ~0.05 ms |
+| new-device grace | 300 s | **0 s** | onboarding behaviour visible inside a step |
+| hourly email cap | 60 | raised | so every notification was counted at the sink |
+
+Numbers are from `demo/out/results-<N>.json`; "alerts" are rows opened or
+resolved during the step's window, "emails" are messages received by the local
+SMTP sink during it.
+
+**What the numbers do not mean.** This is a simulated fleet on one loopback
+interface, and four things follow from that which a reader must carry into every
+table below. **One:** the fleet ran at *twice* the shipped poll rate on *twice*
+the shipped worker count, so the saturation in §3.3 is not the shipped
+configuration failing — it is the shipped configuration's ceiling located by
+pushing past it, and a like-for-like column at shipped defaults is the first
+thing the verification phase must produce (`demo/seed.py --defaults` exists for
+exactly that). **Two:** loopback round-trip time is ~0.05 ms against a real
+management network's 1–30 ms, so every per-device cost here is a floor; the SNMP
+request counts (§4.5 X-F6) matter far more on real wire than these timings
+suggest, and the two thresholds lowered to 20% and 5 ms fired on noise rather
+than on load — the `cpu_high` and `response_time_high` counts in §3.2 measure the
+alert path, not the fleet. **Three:** reachability is shimmed. A simulated device
+that stops answering SNMP still answers ICMP on loopback, so `demo/` gives the
+poller a `ping` shim that consults the fleet's own state; without it no device
+ever reaches `down` and the outage steps measure nothing (this is §4.1 P-N11 seen
+from the harness side). **Four:** the process had a whole container to itself with
+a local filesystem and no other tenant. A Windows host, a network share or a
+shared VM will be slower, in the write path especially. Nothing here is a
+capacity guarantee; it is a comparison between three tiers of the same fleet
+under the same overrides.
 
 ### 3.1 Cross-tier summary
 
@@ -195,13 +283,34 @@ received by the local SMTP sink during it.
 | Emails over the whole run | 1,338 | 3,349 | 4,441 |
 | Poll-overrun events recorded over the run | 9 | 6,420 | 26,361 |
 | Longest single device poll observed (interval 60 s) | 160 s | 129 s | 159 s |
-| Average / peak busy poll workers (of 32) | 11 / 33 | 31 / 47 | 28 / 48 |
+| Average / peak busy poll workers (of 32 configured; shipped default is 16) | 11 / 33 | 31 / 47 | 28 / 48 |
 | App CPU during the trap + syslog burst | 63% | 84% | 86% |
 | `samples` rows / `samples_hourly` rows at the end | 162,766 / 0 | 441,991 / 0 | 585,259 / 0 |
-| Nodes table fill time after refresh | 181 ms | 1,854 ms | 1,488 ms |
+| Nodes table fill time after refresh | 181 ms | 1,854 ms | 1,488 ms (see note) |
 | `/api/nodes/devices` payload per refresh | 332 KB | 1.32 MB in 653 ms | 2.64 MB in 201 ms |
 | Browser long tasks during the walk (longest) | 52 (230 ms) | 122 (429 ms) | 251 (1,460 ms) |
 | Uncaught page errors / failed requests | 0 / 0 (two 403s for the read-only user on Settings) | 0 / 0 (same two 403s) | 0 / 0 (same two 403s) |
+
+Three rows in that table need reading carefully:
+
+- **"Busy poll workers … 33 / 47 / 48 of 32" is not a contradiction.** The gauge
+  reported by `NodePoller.status_text()` counts *queued plus running* work items,
+  not threads, so it can and does exceed the pool size — a peak of 48 against 32
+  workers means 32 polls in flight and 16 waiting. Read the peak as backlog
+  depth, not as concurrency. B12 in the implementation plan renames it for
+  exactly this reason.
+- **The Nodes fill time is not monotonic** (1,854 ms at 1,000 devices against
+  1,488 ms at 2,000). The 1,000-device walk overlapped the outage step's alert
+  backlog, so the browser was competing with a busy server for the same lock; the
+  2,000-device walk ran in a quieter window. Treat the pair as noise around
+  "roughly 1.5–1.9 s at four-figure device counts", not as a trend.
+- **Three different payload sizes appear for `/api/nodes/devices` at 2,000
+  devices** — 2.18 MB (§4.5 X-F7), 2.19 MB (§4.6 U-F3) and 2.64 MB (above).
+  They are three different database states: the first two were measured against a
+  seeded 2,000-device table early in a run, the third at the end of a full
+  campaign with every device's identity fields, `sys_descr` and vendor evidence
+  populated. All three are "over two megabytes per refresh per tab"; the spread
+  is what identity data costs.
 
 ### 3.2 What each step showed (250-device tier; the larger tiers are read against it in §3.3)
 
@@ -219,17 +328,17 @@ received by the local SMTP sink during it.
 
 Reading the 250-tier run against the findings:
 
-- **Outage fan-out (§4.3 F3, F4, F24).** 143 devices behind one core produced 143
+- **Outage fan-out (§4.3 A-F3, A-F4, A-F24).** 143 devices behind one core produced 143
   independent "Device not responding" alerts and 238 emails, then 143 "Device
   recovered" alerts and 292 more emails. Nothing correlated them to the core
   switch. The per-device `packet_loss_high` alerts (94) did roll up under
   `device_down` once the third failed poll landed, which is the same-device
   rollup working as designed.
-- **Recoveries never close (§4.3 F9).** After the outage was fully recovered the
+- **Recoveries never close (§4.3 A-F9).** After the outage was fully recovered the
   open-alert count was 405, up from 258 before it: the 143 `device_up` rows stay
   open until someone clicks Resolve. By the end of the run, with nothing failing,
   636 alerts were open.
-- **Flapping is detected late and partially (§4.3 F13).** A port toggling every
+- **Flapping is detected late and partially (§4.3 A-F13).** A port toggling every
   20–40 s on 100 switches produced 56 `interface_down` and 34 `interface_up`
   alerts in its first two minutes but only 1 `interface_flapping`; the flapping
   rule caught up during the *following* steps (17, 19, 6, 10) because it needs
@@ -238,22 +347,39 @@ Reading the 250-tier run against the findings:
 - **Reboots, auth failures, traps and syslog fired correctly** (20 of 20
   reboots, 5 of 5 auth failures, 17 critical syslog, 5 trap alerts). The
   `trap_critical` rule opened on `linkUp` and config-save traps as well as real
-  faults (§4.3 F5), and one `linkDown` from a *managed* switch also opened
-  "Link-down trap from an unmanaged device" (F6).
-- **Poll pool saturation is visible (§4.1 S1, S5).** With 32 workers, the busiest
+  faults (§4.3 A-F5), and one `linkDown` from a *managed* switch also opened
+  "Link-down trap from an unmanaged device" (A-F6).
+- **Poll pool saturation is visible (§4.1 P-S1, P-S5).** With 32 workers, the busiest
   sample had 33 in flight and the longest single poll took 160 s against a 60 s
   interval: the dark devices each cost three SNMP timeouts plus three ping
   timeouts per poll, and the 500-port chassis costs 513 requests. `poll_overrun`
   events were recorded but nothing said "the pool is full".
-- **History is not being kept (§4.1 B1, B2).** 162,766 raw sample rows and an
-  hourly rollup table with zero rows after 25 minutes; at this tier the 50,000-row
-  global cap had not yet bitten because the 15-minute prune had run only once.
-- **Onboarding storm (§4.3 F27).** 235 `mib_missing` alerts opened within the
-  first poll of seeding, every one emailed with the subject "… is not responding"
-  (§4.3 F26).
+- **History is not being kept (§4.1 P-B1, P-B2).** 162,766 raw sample rows and an
+  hourly rollup table with **zero** rows after 25 minutes. An earlier draft of
+  this report said the 50,000-row global cap "had not yet bitten"; that was wrong,
+  and the truth is worse. The cap *had* bitten. The `samples` table at the end of
+  each run spans only the last **7.8 / 9.1 / 11.9 minutes** of a ~25-minute run at
+  250 / 1,000 / 2,000 devices: the 15-minute prune ran, deleted everything older
+  than the newest 50,000 rows, and the fleet then rewrote the table back up to
+  162,766 / 441,991 / 585,259 rows in the minutes that followed. The row count at
+  the end of a run is not history — it is the few minutes of writes that happened
+  to land after the last prune. What survives *a* prune is 50,000 rows shared
+  across every metric of every device: with 23,432 / 84,257 / 171,910 rows in
+  `metrics` (≈94 / 84 / 86 metrics per device), that is **2.13 / 0.59 / 0.29
+  samples per metric** at the three tiers. At 2,000 devices, fewer than one sample
+  in three metrics survives — no chart can draw a line and no threshold streak can
+  span a prune. §4.5 X-F1 carried "1.29 samples per metric"; the measured figure
+  is 0.29.
+- **Onboarding storm (§4.3 A-F27).** **235** `mib_missing` alert rows opened
+  within the first poll of seeding, and **234** messages with the subject "… is
+  not responding" arrived at the sink inside the same window (§4.3 A-F26). The two
+  counters differ by one because they are read from different ends of the same
+  window — the rows from `alerts.db`, the messages at the SMTP sink — and one
+  message landed just after it closed. Use 235 for alerts opened and 234 for
+  emails delivered; earlier drafts used the two interchangeably.
 - **The UI held up at this size.** 250 rows filled in 181 ms, no uncaught page
   errors across 12 tabs, 10 subtabs and 21 dialogs; the read-only user saw every
-  tab with zero write controls, and hit two 403s opening Settings (§4.6 C3).
+  tab with zero write controls, and hit two 403s opening Settings (§4.6 U-C3).
 
 ### 3.3 Scale tiers
 
@@ -272,6 +398,14 @@ workers at a 60 s interval:
 | 8 NetFlow burst (76 s) | interface_* 40, response_time_high 1 | interface_down 36 | 117 | 797 / 1 / 8 | 364 | 65 |
 | 9 flaps stop, credentials restored (151 s) | interface_* 33 | interface_down 43 | 79 | 1,572 / 1 / 9 | 745 | 61 |
 
+The per-step columns above and in §3.1 do not add up to the run totals, and are
+not meant to: a step's row covers only that step's own window. At 250 devices the
+nine steps account for 1,251 of 1,338 emails, at 1,000 for 3,109 of 3,349, at
+2,000 for 3,885 of 4,441 and 21,001 of 26,361 overruns. The nine windows sum to
+about 19 minutes of a ~25-minute run; the balance falls in seeding and in the
+inter-step gaps where the harness snapshots counters and reconfigures the fleet,
+and the poller keeps running throughout.
+
 What changed between 250 and 1,000 devices:
 
 - **The poller fell behind before anything failed.** With nothing wrong, the
@@ -286,17 +420,20 @@ What changed between 250 and 1,000 devices:
   60 s interval could not be met: 1,015 timeouts against 971 successful polls.
   The operator's first signal was 371 `packet_loss_high` alerts and 563
   `poll_overrun` alerts, not "site A is down", and 1,783 emails in four
-  minutes. This is §4.1 S1, S5, N5 and §4.5 F15 measured together.
-- **The alert list stopped being complete.** From step 2 onward the API's
-  2,000-row cap was hit and every later snapshot is a truncated view; the UI's
-  own default of 300 rows would have shown less than a fifth of it (§4.3 F20,
-  §4.6 F10).
+  minutes. This is §4.1 P-S1, P-S5, P-N5 and §4.5 X-F15 measured together.
+- **The alert list stopped being complete.** `GET /api/alerts` takes a `limit`
+  that **defaults to 300** and is **hard-capped at 2,000** (`api.py:3027`,
+  `:3031`); both numbers appear in this report and they describe different things.
+  The campaign asked for the maximum, so from step 2 onward it hit the 2,000-row
+  cap and every later snapshot is a truncated view. An operator's browser, which
+  does not raise the limit, would have seen 300 — less than a fifth of it (§4.3
+  A-F20, §4.6 U-F10).
 - **The onboarding storm scaled linearly:** 948 `mib_missing` alerts on the
-  first poll, each emailed as "is not responding" (§4.3 F26, F27).
+  first poll, each emailed as "is not responding" (§4.3 A-F26, A-F27).
 - **The browser cost scaled linearly too:** 1,000 rows took 1.85 s to fill after
   a refresh from a 1.32 MB payload that took 653 ms to serve, with 122 long
-  tasks (longest 429 ms) during the walk (§4.5 F7, F20).
-- Still no rows in the hourly rollup table after 442k raw samples (§4.1 B2).
+  tasks (longest 429 ms) during the walk (§4.5 X-F7, X-F20).
+- Still no rows in the hourly rollup table after 442k raw samples (§4.1 P-B2).
 
 **2,000 devices.** The first full poll cycle took 219 s to reach 95% of the
 fleet and never reached 100%; the baseline sat at 70% CPU with 1,822 overruns
@@ -322,13 +459,19 @@ What the 2,000-device run shows:
   polled about once every four minutes against a 60 s profile, so no device
   reached three consecutive failures. The only signals were 5,423 poll overruns
   and 1,639 emails, almost all of them `poll_overrun` and `mib_missing` noise.
-  At this size, on this hardware, with 32 workers, **the poller cannot see a
-  site outage**. This is the capacity ceiling §4.5 predicted (~1,350 devices at
-  48 ports and 120 s; roughly half that at 60 s) measured end to end.
+  At this size, on this hardware, with 32 workers and a 60 s interval, **the
+  poller cannot see a site outage**. This is consistent with the capacity ceiling
+  §4.5 estimated (~1,350 devices at 48 ports and 120 s; ~680 at 60 s), but it does
+  not measure it: the tiers were 250, 1,000 and 2,000, so the ~680-device figure
+  falls between two tiers and was never bracketed. What was measured end to end is
+  narrower and still decisive — at 1,000 devices detection is late (16 of 499
+  inside four minutes) and at 2,000 it does not happen at all. An earlier draft
+  claimed the ~680 ceiling itself was "measured end to end"; it was extrapolated
+  from the write-path benchmarks and is corroborated, not measured, by the tiers.
 - **The alert list was capped for the entire campaign from step 2**, so the
   campaign's own per-step "alerts opened" column went blind; the rows above
   marked "in the DB" were read directly from `alerts.db`. An operator's browser,
-  defaulting to 300 rows, would have seen 15% of it (§4.3 F20, §4.6 F10).
+  defaulting to 300 rows, would have seen 15% of it (§4.3 A-F20, §4.6 U-F10).
 - **Every device raised `poll_overrun`** (2,000 alerts, 26,361 events) — the
   one alert that fires reliably at this scale is the one saying the monitor
   itself is late.
@@ -338,7 +481,7 @@ What the 2,000-device run shows:
 - **UI:** 2,000 rows filled in 1.5 s from a 2.64 MB payload (served in 201 ms);
   251 long tasks during the walk, the longest 1.46 s; still no uncaught page
   errors. RSS grew from 167 MB to 268 MB over the run.
-- 585,259 raw samples, hourly rollup still empty (§4.1 B2).
+- 585,259 raw samples, hourly rollup still empty (§4.1 P-B2).
 
 ### 3.4 What the three tiers say together
 
@@ -354,7 +497,7 @@ The poller works correctly and the alert semantics hold at 250 devices; by
 The five ★ fixes in §4.5 (batched sample writes, a fixed retention cap with the
 rollup running, cached settings in the scheduler, one keyed alert query, and
 GETBULK for the interface columns) plus concurrent pings with back-off for
-failing devices (§4.5 F15) are what move that ceiling; none of them is large.
+failing devices (§4.5 X-F15) are what move that ceiling; none of them is large.
 
 ---
 
@@ -365,65 +508,65 @@ Severity: **blocker** (stops the product working for this fleet), **severe**,
 
 ### 4.1 SNMP polling core
 
-| # | Sev | Finding | Evidence | Fix / effort |
-|---|---|---|---|---|
-| B1 | blocker | `sample_row_cap_per_metric` is a whole-table cap: 50,000 rows total survive each 15-minute prune, i.e. under a third of one poll cycle at 2,000 devices. Charts empty, threshold streaks reset. CONFIRMED (3 metrics × 100 samples, cap 150 → 50 each). | `nodesdb.py:342`, `service.py:715-719`, `nodesdb.py:2171-2179` | per-metric `ROW_NUMBER()` delete in chunks; **S** |
-| B2 | blocker | `compact_rollup()` is never called; `samples_hourly` is always empty; any chart window over 3 days returns 0 points; storage doc promises rollups. CONFIRMED. | `nodesdb.py:1480-1503`, `nodes.js:951-954`, `NETWORK-AND-STORAGE-REQUIREMENTS.md:270` | call from `run_maintenance()`, prune by `rollup_days`; **M** |
-| B3 | blocker (v1 gear) | Every interface on an SNMPv1 device is blank: the per-interface GET mixes ifXTable OIDs, a v1 agent answers `noSuchName` for the whole PDU, and only status 16 raises. Device shows *up* with no counters, no link events. CONFIRMED against a v1 stub. The identity GET already has the v1 split. | `nodepoll.py:1642-1645`, `:1173-1176`, `:1240-1259` | split the GET on v1 as `_identity_extras` does, or walk columns; **S** |
-| S1 | severe | `_poll_interfaces` has no wall-clock budget: a device that answers its ifIndex walk then goes quiet holds a worker for N × timeout × retries (77 min at defaults for 512 ports). CONFIRMED (6.02 s = 10 × 0.3 × 2). | `nodepoll.py:1641` | deadline of 0.5 × interval, abandon after 3 consecutive timeouts; **S** |
-| S2 | severe | The scheduler thread has no exception guard; one transient DB error stops all polling permanently and silently (`poller.error` stays `None`). CONFIRMED. | `nodepoll.py:690-721` | `try/except` + `self.error`, as `monitor.py:376-402` does; **S** |
-| S3 | severe | SNMPv3 engineTime is cached at discovery and never advanced, so every v3 device fails about every third poll with a spurious auth_fail event. CONFIRMED by trace. | `nodepoll.py:56-58`, `:1145`, `:1164-1171` | send `engine_time + (now - learned_at)`; **S** |
-| S4 | severe | authPriv is unsupported (no priv columns), and the failure is misreported twice: the agent's `unsupportedSecLevels` Report becomes "engine resync required", and the `"unsupported" in msg` substring never matches its own message, so the whole `unsupported` status/event/rule path is dead. CONFIRMED. | `nodepoll.py:917`, `:1153-1158`, `snmppoll.py:232-235`, `alertsdb.py:218` | decode `usmStats*` and classify by type; **M** (priv itself **L**) |
-| S5 | severe | Scheduler reloads the whole device table and calls `effective_config` per device once a second: 4,001 SQLite statements/s at 2,000 devices, ~12% of a core, under the lock every worker needs. CONFIRMED (118 ms/iteration). | `nodepoll.py:694-697`, `nodesdb.py:1081-1119` | cache settings and groups; select only loop columns; **S** |
-| S6 | severe | ~2,500 commits per poll of a 500-port chassis (`record_metric_sample` commits per sample); ~288,000 commits per cycle fleet-wide. CONFIRMED (0.212 s for 500 ports). | `nodesdb.py:1379-1420`, `nodepoll.py:1053-1064` | one transaction per device poll, `executemany`; **M** |
-| S7 | severe | MAC-table walks run on the poll pool; Cisco per-VLAN walks check the 15 s budget only between VLANs, so the last VLAN can run two unbounded walks. | `nodepoll.py:752`, `:2196-2233` | own executor, deadline inside `_walk_column`; **S/M** |
-| S8 | severe | A reboot produces a phantom 220 Mbps spike: `counter_rate` treats any decrease as a wrap and `ifCounterDiscontinuityTime` is never polled. | `nodepoll.py:122-148`, `nodeoids.py:48-53` | poll discontinuity time, suppress one poll after `detect_reboot`; **S** |
-| S9 | severe | No vendor health polling at all: no Cisco/Aruba/Juniper/PAN/Fortinet CPU or memory, no ENTITY-SENSOR or ENVMON on a schedule, no PoE (MIB ships, unread), no STP, no LLDP/CDP, no ARP, no BGP, no firewall sessions/VPN/HA, no RF metrics. `HOST_RESOURCES` defined, never referenced. CONFIRMED by grep. | `nodeoids.py:58-67`, `nodepoll.py:1306` | per-vendor scalar table keyed on `detected_vendor`, ride the existing best-effort GET; **M**, tables **L** |
-| S10 | severe | `cpu_pct`, `mem_pct` and every custom-MIB metric are stored and never displayed; the only charts are hard-coded interface and loss keys. | `nodes.js:16-19`, `:506`, `:1649-1650` | render `view.metrics` with the existing chart renderer; **S** |
-| N1 | notable | Custom-MIB polling sends one unchunked GET of every object in the MIB (267 varbinds = 4 KB request), including table columns; `tooBig` yields zero metrics with no error. | `nodepoll.py:1582-1625` | filter table columns, chunk to 25, honour tooBig; **M** |
-| N2 | notable | A reply is accepted without checking request-id or source address; a late reply to attempt 1 is consumed as the answer to attempt 2 (observed with the 2.6 s device). v3 msgID also unchecked; v3 response digests are never verified (`_verify_v3` exists, used for traps only). CONFIRMED. | `nodepoll.py:82-97`, `:1125-1160`, `:2438`, `:2473` | compare ids and address, drain mismatches; verify inbound HMAC; **S** |
-| N3 | notable | No per-device SNMP port; no IPv6 polling (`AF_INET` hardcoded). | `nodeoids.py:12`, `nodepoll.py:73` | `snmp_port` override column, `getaddrinfo`; **S** each |
-| N4 | notable | No bulk device import; discovery capped at 1,024 addresses per job with a serial SNMP phase (2 versions × N communities × timeout per silent address). | `api.py:1773`, `nodesdb.py:353`, `nodediscover.py:176-231` | CSV import endpoint, parallel probe phase; **S/M** |
-| N5 | notable | Ping is three serial subprocess spawns per device per poll on the poll worker; a down device costs ~12 s of worker time per cycle; 160 down devices saturate the pool. | `ipam_scan.py:127-157`, `nodepoll.py:846` | concurrent probes, back-off for failing devices; **M** |
-| N6 | notable | A down device re-sweeps every credential candidate every poll (36 s of worker time with four candidates); the on-demand path already has negative caching. | `nodepoll.py:1195-1209`, `:1099-1101` | reuse `_credential_probe_failed`; **S** |
-| N7 | notable | `_walk_indexes` breaks on the first non-integer suffix, and `replace_interfaces` then deletes the missing rows and their events. | `nodepoll.py:1810-1819`, `nodesdb.py:1368-1375` | `continue`; refuse deletes on an unclean walk; **S** |
-| N8 | notable | Non-ASCII octet strings render as hex (`Wärmetauscher 3` → `57 C3 A4 …`); a 6-byte one renders as a MAC. Stored `sys_descr` is uncapped. | `trapdecode.py:195-214` | try UTF-8 then latin-1; cap stored size; **S** |
-| N9 | notable | `_walk_from` (OID browser, full walk, vendor identification) is GETNEXT-only and opens a socket per row; fleet-wide first identification ≈ 2.8 h. | `nodepoll.py:2305-2368`, `:2331` | share `_walk_column`'s GETBULK path; **S/M** |
-| N10 | notable | `fortipoll._walk_column` has no non-increasing-OID guard and hardcodes timeouts. | `fortipoll.py:252-271` | reuse `nodepoll._walk_column`; **S** |
-| N11 | notable | The shipped test suite fails on any machine with `ping` installed (`test_nodepoll_e2e.py:287`): the device answers ICMP so it never reaches `down`. Passes with ping removed from PATH. CONFIRMED both ways. The substantive half: a switch whose SNMP agent is dead but which answers ping never fires `device_down`. | `tests/test_nodepoll_e2e.py:219`, `tests/README.md:3-6` | disable ping in the test profile; add an "SNMP failing, ping OK" rule; **S** |
+| # | Sev | Tag | Finding | Evidence | Fix / effort |
+|---|---|---|---|---|---|
+| P-B1 | blocker | **CONFIRMED** | `sample_row_cap_per_metric` is a whole-table cap: 50,000 rows total survive each 15-minute prune, i.e. under a third of one poll cycle at 2,000 devices. Charts empty, threshold streaks reset. CONFIRMED (3 metrics × 100 samples, cap 150 → 50 each). | `nodesdb.py:342`, `service.py:715-719`, `nodesdb.py:2171-2179` | per-metric `ROW_NUMBER()` delete in chunks; **S** |
+| P-B2 | blocker | **CONFIRMED** | `compact_rollup()` is never called; `samples_hourly` is always empty; any chart window over 3 days returns 0 points; storage doc promises rollups. CONFIRMED. | `nodesdb.py:1480-1503`, `nodes.js:951-954`, `NETWORK-AND-STORAGE-REQUIREMENTS.md:270` | call from `run_maintenance()`, prune by `rollup_days`; **M** |
+| P-B3 | blocker (v1 gear) | **CONFIRMED** | Every interface on an SNMPv1 device is blank: the per-interface GET mixes ifXTable OIDs, a v1 agent answers `noSuchName` for the whole PDU, and only status 16 raises. Device shows *up* with no counters, no link events. CONFIRMED against a v1 stub. The identity GET already has the v1 split. | `nodepoll.py:1642-1645`, `:1173-1176`, `:1240-1259` | split the GET on v1 as `_identity_extras` does, or walk columns; **S** |
+| P-S1 | severe | **CONFIRMED** | `_poll_interfaces` has no wall-clock budget: a device that answers its ifIndex walk and then goes quiet holds a pool worker for ports × timeout × attempts. Measured against a stub: **6.02 s for 10 ports** at `snmp_timeout_s` 0.3 and two attempts per port (10 × 0.3 × 2). Extrapolating needs the attempt count stated, because `_Session.request` loops `range(self.retries + 1)` (`nodepoll.py:86`): the shipped defaults are `snmp_timeout_s` **3.0** and `snmp_retries` **2**, i.e. **three** attempts, so the 500-port chassis persona costs 500 × 3.0 × 3 = **4,500 s ≈ 75 min** and a 512-port device 4,608 s ≈ 77 min. The measured 6.02 s used two attempts, not three; both figures are right, and the 77 min quoted in the first draft holds only under the shipped `snmp_retries = 2`. | `nodepoll.py:1641`, `:86`, `nodesdb.py:33-34`, `:323-324` | deadline of 0.5 × interval, abandon after 3 consecutive timeouts; **S** |
+| P-S2 | severe | **CONFIRMED** | The scheduler thread has no exception guard; one transient DB error stops all polling permanently and silently (`poller.error` stays `None`). | `nodepoll.py:690-721` | `try/except` **and** `self.error`. The first draft said "as `monitor.py:376-402` does"; `monitor.py` guards its loop but does not set an error field either, so there is no pattern to copy — the status surface is new work, and the fix must also clear `self.error` on the next clean pass or the UI will show a stale failure forever; **S** |
+| P-S3 | severe | **CONFIRMED** | SNMPv3 engineTime is cached at discovery and never advanced, so every v3 device fails about every third poll with a spurious auth_fail event. CONFIRMED by trace. | `nodepoll.py:56-58`, `:1145`, `:1164-1171` | send `engine_time + (now - learned_at)`; **S** |
+| P-S4 | severe | **CONFIRMED** | authPriv is unsupported (no priv columns), and the failure is misreported twice: the agent's `unsupportedSecLevels` Report becomes "engine resync required", and the `"unsupported" in msg` substring never matches its own message, so the whole `unsupported` status/event/rule path is dead. CONFIRMED. | `nodepoll.py:917`, `:1153-1158`, `snmppoll.py:232-235`, `alertsdb.py:218` | decode `usmStats*` and classify by type; **M** (priv itself **L**) |
+| P-S5 | severe | **CONFIRMED** | Scheduler reloads the whole device table and calls `effective_config` per device once a second: 4,001 SQLite statements/s at 2,000 devices, ~12% of a core, under the lock every worker needs. CONFIRMED (118 ms/iteration). | `nodepoll.py:694-697`, `nodesdb.py:1081-1119` | cache settings and groups; select only loop columns; **S** |
+| P-S6 | severe | **CONFIRMED** | `record_metric_sample` commits once per sample: ~2,500 commits in a single poll of the 500-port chassis (0.212 s for 500 ports, measured). Fleet-wide the figure depends on metrics per device, and the campaign settled that: 171,910 rows in `metrics` at 2,000 devices is **≈86 metrics per device**, so ~172,000 commits per poll cycle — **2,870/s at a 60 s interval**, 1,435/s at the shipped 120 s. An earlier draft said "~288,000 per cycle" from an assumed 144 metrics/device, and §4.5 X-F3's "fleet needs 3,233/s" used 97; at the measured ~86 both become ~2,870/s at 60 s. Use that number. | `nodesdb.py:1379-1420`, `nodepoll.py:1053-1064` | one transaction per device poll, `executemany`; **M** |
+| P-S7 | severe | **PLAUSIBLE** | MAC-table walks run on the poll pool rather than an executor of their own, and the Cisco per-VLAN path checks its 15 s budget only *between* VLANs, so the last VLAN entered can run two unbounded column walks past the deadline. The budget check is plainly in the wrong place in the loop; no device was made to hold a worker this way, which is why this is PLAUSIBLE rather than CONFIRMED. | `nodepoll.py:752`, `:2196-2233` | own executor, deadline inside `_walk_column`; **S/M** |
+| P-S8 | severe | **PLAUSIBLE** | `counter_rate` treats any decrease as a counter wrap and `ifCounterDiscontinuityTime` is never polled, so a reboot is indistinguishable from a wrap and should produce a phantom spike — the 220 Mbps figure is arithmetic on a 32-bit counter, not an observed sample. The mechanism is plain in the code; the spike itself was never reproduced, which is why this row is PLAUSIBLE. | `nodepoll.py:122-148`, `nodeoids.py:48-53` | poll discontinuity time and suppress one poll after `detect_reboot`. Not **S**: it needs an `interfaces.discontinuity_ts` column through the `_migrate()` pattern, and the suppression has to survive the poll that discovers the reboot, so **S/M** |
+| P-S9 | severe | **CONFIRMED** | No vendor health polling at all: no Cisco/Aruba/Juniper/PAN/Fortinet CPU or memory, no ENTITY-SENSOR or ENVMON on a schedule, no PoE (MIB ships, unread), no STP, no LLDP/CDP, no ARP, no BGP, no firewall sessions/VPN/HA, no RF metrics. `HOST_RESOURCES` defined, never referenced. CONFIRMED by grep. | `nodeoids.py:58-67`, `nodepoll.py:1306` | per-vendor scalar table keyed on `detected_vendor`, ride the existing best-effort GET; **M**, tables **L** |
+| P-S10 | severe | **CONFIRMED** | `cpu_pct`, `mem_pct` and every custom-MIB metric are stored and never displayed; the only charts are hard-coded interface and loss keys. | `nodes.js:16-19`, `:506`, `:1649-1650` | render `view.metrics` with the existing chart renderer; **S** |
+| P-N1 | notable | **CONFIRMED** | Custom-MIB polling sends one unchunked GET of every object in the MIB (267 varbinds = 4 KB request), including table columns; `tooBig` yields zero metrics with no error. | `nodepoll.py:1582-1625` | filter table columns, chunk to 25, honour tooBig; **M** |
+| P-N2 | notable | **CONFIRMED** | A reply is accepted without checking request-id or source address; a late reply to attempt 1 is consumed as the answer to attempt 2 (observed with the 2.6 s device). v3 msgID also unchecked; v3 response digests are never verified (`_verify_v3` exists, used for traps only). CONFIRMED. | `nodepoll.py:82-97`, `:1125-1160`, `:2438`, `:2473` | compare ids and address, drain mismatches; verify inbound HMAC; **S** |
+| P-N3 | notable | **CONFIRMED** | No per-device SNMP port; no IPv6 polling (`AF_INET` hardcoded). | `nodeoids.py:12`, `nodepoll.py:73` | `snmp_port` override column, `getaddrinfo`; **S** each |
+| P-N4 | notable | **CONFIRMED** | No bulk device import; discovery capped at 1,024 addresses per job with a serial SNMP phase (2 versions × N communities × timeout per silent address). | `api.py:1773`, `nodesdb.py:353`, `nodediscover.py:176-231` | CSV import endpoint, parallel probe phase; **S/M** |
+| P-N5 | notable | **CONFIRMED** | Ping is three serial subprocess spawns per device per poll on the poll worker; a down device costs ~12 s of worker time per cycle; 160 down devices saturate the pool. | `ipam_scan.py:127-157`, `nodepoll.py:846` | concurrent probes, back-off for failing devices; **M** |
+| P-N6 | notable | **CONFIRMED** | A down device re-sweeps every credential candidate every poll (36 s of worker time with four candidates); the on-demand path already has negative caching. | `nodepoll.py:1195-1209`, `:1099-1101` | reuse `_credential_probe_failed`; **S** |
+| P-N7 | notable | **CONFIRMED** | `_walk_indexes` breaks on the first non-integer suffix, and `replace_interfaces` then deletes the missing rows and their events. | `nodepoll.py:1810-1819`, `nodesdb.py:1368-1375` | `continue`; refuse deletes on an unclean walk; **S** |
+| P-N8 | notable | **CONFIRMED** | Non-ASCII octet strings render as hex (`Wärmetauscher 3` → `57 C3 A4 …`); a 6-byte one renders as a MAC. Stored `sys_descr` is uncapped. | `trapdecode.py:195-214` | try UTF-8 then latin-1; cap stored size; **S** |
+| P-N9 | notable | **CONFIRMED** | `_walk_from` (OID browser, full walk, vendor identification) is GETNEXT-only and opens a socket per row; fleet-wide first identification ≈ 2.8 h. | `nodepoll.py:2305-2368`, `:2331` | share `_walk_column`'s GETBULK path; **S/M** |
+| P-N10 | notable | **CONFIRMED** | `fortipoll._walk_column` has no non-increasing-OID guard and hardcodes timeouts. | `fortipoll.py:252-271` | reuse `nodepoll._walk_column`; **S** |
+| P-N11 | notable | **CONFIRMED** | The shipped test suite fails on any machine with `ping` installed (`test_nodepoll_e2e.py:287`): the device answers ICMP so it never reaches `down`. Passes with ping removed from PATH. CONFIRMED both ways. The substantive half: a switch whose SNMP agent is dead but which answers ping never fires `device_down`. | `tests/test_nodepoll_e2e.py:219`, `tests/README.md:3-6` | disable ping in the test profile; add an "SNMP failing, ping OK" rule; **S** |
 
 ### 4.2 Collectors and decoders
 
-| # | Sev | Finding | Evidence | Fix / effort |
-|---|---|---|---|---|
-| B1 | blocker | One 18-byte datagram kills the NetFlow listener: `DecodeError` is not in the decoder's except tuple and the receive loop has no guard. Status reads "Collector stopped" as if an operator did it. CONFIRMED live. | `nfdecode.py:150,160`, `collector.py:185` | add to the tuple and wrap the loop (same for traps and syslog); **S** |
-| B2 | blocker | A v9/IPFIX template with zero-length fields spins the receive thread at 100% CPU forever with `running` still true. CONFIRMED. | `nfdecode.py:89-96`, `:316-337` | reject `length <= 0` templates; **S** |
-| B3 | blocker | Kernel socket-buffer drops are invisible: 300k syslog messages at 38k/s → 93k stored, 206k dropped, `counters["dropped"] == 0`. CONFIRMED. | `syslogd.py:199-208`, `collector.py:158-209`, `snmptrapd.py:183-192` | read `SO_RXQ_OVFL` or `/proc/net/udp` drops; surface it; **M** |
-| B4 | blocker | Every syslog prune rebuilds the entire FTS5 index under the write lock: 18.6 s to delete one row from a 1M-row table, every 15 minutes. CONFIRMED. | `syslogdb.py:482-484`, `:504-506` | targeted FTS `delete`; **S** |
-| B5 | blocker | The alert engine drains 500 rows per 5 s tick per source (100 rows/s) against a measured ingest of ~11,800/s; a busy site falls behind forever with no lag indicator. CONFIRMED. | `alertengine.py:499,520`, `:28` | loop to catch up with a budget; show backlog; **M** |
-| S1 | severe | SNMPv3 trap authentication is computed and counted but never enforced: 401 forged traps stored and alerted. CONFIRMED. | `snmptrapd.py:172-179`, `:194-231` | `reject_failed_auth` default on; **S** |
-| S2 | severe | Each forged v3 trap with a fresh engine id costs a 1 MiB hash on the receive thread (~430 traps/s ceiling) and grows `_KEY_CACHE` unbounded; templates and `_seen` dicts likewise. | `trapdecode.py:323-345`, `nfdecode.py:122-123` | bounded LRU caches; **S** |
-| S3 | severe | Dual-stack templates render IPv6 flows as `0.0.0.0` (zero-filled v4 field is truthy). CONFIRMED. | `nfdecode.py:409-411` | pick by content; **S** |
-| S4 | severe | `HopProber` submits a new unbounded round of ping subprocesses every 4 s with no in-flight tracking and commits per probe. | `monitor.py:634-646`, `db.py:449-474` | in-flight set as `Monitor` has; batch upserts; **M** |
-| S5 | severe | All three listeners and NetPath are IPv4-only; a device on an IPv6 management plane is silently unreachable. | `collector.py:90`, `syslogd.py:130`, `snmptrapd.py:126`, `tracer.py:380-384` | dual-stack bind; `getaddrinfo`; **M** |
-| S6 | severe | Syslog over TCP spawns a thread per connection with no cap and never reaps the list. | `syslogd.py:210-221` | cap and prune; **S** |
-| S7 | severe | Device correlation is exact-IP equality: a switch logging from `Loopback0` while polled on its management VLAN matches nothing (no name in the Host column, no name on the alert). | `hostresolve.py:33-34`, `nodesdb.py:950-953` | `device_addresses` alias table fed from `ipAddrTable`; **M** |
-| S8 | severe | Syslog and trap occurrences never set `device_name`, so name-scoped rules silently never match. | `alertengine.py:504-509`, `:535-539` | set it; **S** |
-| S9 | severe | RFC 5424 structured data: only the first element is stripped; relayed rsyslog messages carry `[origin …]` into the message column and index. CONFIRMED. | `syslogparse.py:168-188` | loop; **S** |
-| N1 | notable | Non-English Windows `tracert` loses the ICMP-unreachable hop entirely (English phrase table). | `tracer.py:46-53`, `:294-296` | match on structure; **S** |
-| N2 | notable | v9 field length 0xFFFF misread as IPFIX variable-length; silent corruption. | `nfdecode.py:89-96` | version-aware; **S** |
-| N3 | notable | `touch_exporter` stamps every exporter in a flush batch with the first flow's version (observed live with mixed v5/v9); commits per exporter. | `collector.py:231-233`, `flowdb.py:177-190` | carry version per exporter; **S** |
-| N4 | notable | RFC 3164 timestamps get no future clamp and assume the server's timezone; a December message read in June files six months ahead and can never be pruned. | `syslogparse.py:91-109`, `syslogdb.py:468-474` | clamp to now ± 1 h; **S** |
-| N5 | notable | RFC 5424 with an empty MSG stores the header as the message. | `syslogparse.py:131-142` | accept 5 parts; **S** |
-| N6 | notable | Sampling is one rate per exporter applied only to flows after the options template; earlier flows are stored under-scaled forever. | `nfdecode.py:369-374`, `flowdb.py:322` | resolve rate at query time; **M** |
-| N7 | notable | Syslog storage is ~455 B/message measured vs the documented ~150 B. | `NETWORK-AND-STORAGE-REQUIREMENTS.md:269` | fix the figure; **S** |
-| N8 | notable | Exporter interface names are hand-typed `ip:ifIndex=name` lines while `nodes.db` already holds `if_index`, `descr`, `speed_bps` for every managed device. | `flowdb.py:53-58`, `service.py:492-504` | seed from Nodes; add utilisation %; **M** |
-| N9 | notable | No trap varbind conditions and no syslog regex or "N in M minutes" rules; the two rules a NOC actually writes are impossible. All syslog alerts from one host collapse into one row whose message is overwritten. | `alertsdb.py:26-50`, `alertrules.py:39-54` | `match_text`/`match_field`/`count_window_s` on rules; **M/L** |
-| N10 | notable | No per-source rate limiting or repeat suppression on syslog or traps; one device in a debug loop evicts everyone else's messages. | `syslogd.py:174-197` | per-source token bucket; **M** |
-| N11 | notable | `trapoids.py:51` labels `1.3.6.1.2.1.15.3.1.7` as `bgpPeerState`; it is `bgpPeerRemoteAddr` (state is `.1.2`). Rendered live as `bgpPeerState.198.51.100.75=198.51.100.75`. | `trapoids.py:51`, `:174` | correct the arc; **S** |
-| N12 | notable | TCP syslog framer treats any leading `<digits><space>` as an RFC 6587 length; a newline-framed line starting with a number desynchronises the connection. | `syslogd.py:236-244` | require `<` after the count; **S** |
-| N13 | notable | `Database.prune` (NetPath) VACUUMs unconditionally, even when nothing was deleted. | `db.py:590-602` | only when rows removed; **S** |
-| N14 | notable | `reached` is decided against the app's own DNS answer; round-robin or anycast names record as never reached. | `tracer.py:399`, `:453` | parse the address from the traceroute header; **S** |
+| # | Sev | Tag | Finding | Evidence | Fix / effort |
+|---|---|---|---|---|---|
+| C-B1 | blocker | **CONFIRMED** | One 18-byte datagram kills the NetFlow listener: `DecodeError` is not in the decoder's except tuple and the receive loop has no guard. Status reads "Collector stopped" as if an operator did it. CONFIRMED live. | `nfdecode.py:150,160`, `collector.py:185` | add to the tuple and wrap the loop (same for traps and syslog); **S** |
+| C-B2 | blocker | **CONFIRMED** | A v9/IPFIX template with zero-length fields spins the receive thread at 100% CPU forever with `running` still true. CONFIRMED. | `nfdecode.py:89-96`, `:316-337` | reject `length <= 0` templates; **S** |
+| C-B3 | blocker | **CONFIRMED** | Kernel socket-buffer drops are invisible: 300k syslog messages at 38k/s → 93k stored, 206k dropped, `counters["dropped"] == 0`. CONFIRMED. | `syslogd.py:199-208`, `collector.py:158-209`, `snmptrapd.py:183-192` | read `SO_RXQ_OVFL` or `/proc/net/udp` drops; surface it; **M** |
+| C-B4 | blocker | **CONFIRMED** | Every syslog prune rebuilds the entire FTS5 index under the write lock: 18.6 s to delete one row from a 1M-row table, every 15 minutes. CONFIRMED. | `syslogdb.py:482-484`, `:504-506` | targeted FTS `delete`; **S** |
+| C-B5 | blocker | **CONFIRMED** | The alert engine drains 500 rows per 5 s tick per source (100 rows/s) against a measured ingest of ~11,800/s; a busy site falls behind forever with no lag indicator. CONFIRMED. | `alertengine.py:499,520`, `:28` | loop to catch up with a budget; show backlog; **M** |
+| C-S1 | severe | **CONFIRMED** | SNMPv3 trap authentication is computed and counted but never enforced: 401 forged traps stored and alerted. CONFIRMED. | `snmptrapd.py:172-179`, `:194-231` | `reject_failed_auth` default on; **S** |
+| C-S2 | severe | **CONFIRMED**, with a corrected precondition | A v3 trap whose user name **is one of the configured `v3_users`** and whose engine id is new costs a 1 MiB password-to-key hash on the receive thread (~430 traps/s ceiling) and adds an entry to a `_KEY_CACHE` that is never evicted. The first draft said this happened for *any* forged trap; it does not — `_verify_v3` looks the user up first and returns `"unverified"` before deriving anything when the name is unknown (`trapdecode.py:659-662`), so an attacker who does not know a configured v3 user name pays nothing. The attack needs a known user name (readable from any captured trap, and often the same across a fleet), after which the engine id is attacker-chosen and the cache grows without bound. The template and `_seen` dicts in the NetFlow decoder are unbounded for anyone. | `trapdecode.py:321`, `:323-346`, `:658-682`, `nfdecode.py:122-123` | bounded LRU caches; **S** |
+| C-S3 | severe | **CONFIRMED** | Dual-stack templates render IPv6 flows as `0.0.0.0` (zero-filled v4 field is truthy). CONFIRMED. | `nfdecode.py:409-411` | pick by content; **S** |
+| C-S4 | severe | **CONFIRMED** | `HopProber` submits a new unbounded round of ping subprocesses every 4 s with no in-flight tracking and commits per probe. | `monitor.py:634-646`, `db.py:449-474` | in-flight set as `Monitor` has; batch upserts; **M** |
+| C-S5 | severe | **CONFIRMED** | All three listeners and NetPath are IPv4-only; a device on an IPv6 management plane is silently unreachable. | `collector.py:90`, `syslogd.py:130`, `snmptrapd.py:126`, `tracer.py:380-384` | dual-stack bind; `getaddrinfo`; **M** |
+| C-S6 | severe | **CONFIRMED** | Syslog over TCP spawns a thread per connection with no cap and never reaps the list. | `syslogd.py:210-221` | cap and prune; **S** |
+| C-S7 | severe | **CONFIRMED** | Device correlation is exact-IP equality: a switch logging from `Loopback0` while polled on its management VLAN matches nothing (no name in the Host column, no name on the alert). | `hostresolve.py:33-34`, `nodesdb.py:950-953` | `device_addresses` alias table fed from `ipAddrTable`; **M** |
+| C-S8 | severe | **CONFIRMED** | Syslog and trap occurrences never set `device_name`, so name-scoped rules silently never match. | `alertengine.py:504-509`, `:535-539` | set it; **S** |
+| C-S9 | severe | **CONFIRMED** | RFC 5424 structured data: only the first element is stripped; relayed rsyslog messages carry `[origin …]` into the message column and index. CONFIRMED. | `syslogparse.py:168-188` | loop; **S** |
+| C-N1 | notable | **CONFIRMED** | Non-English Windows `tracert` loses the ICMP-unreachable hop entirely (English phrase table). | `tracer.py:46-53`, `:294-296` | match on structure; **S** |
+| C-N2 | notable | **CONFIRMED** | v9 field length 0xFFFF misread as IPFIX variable-length; silent corruption. | `nfdecode.py:89-96` | version-aware; **S** |
+| C-N3 | notable | **CONFIRMED** | `touch_exporter` stamps every exporter in a flush batch with the first flow's version (observed live with mixed v5/v9); commits per exporter. | `collector.py:231-233`, `flowdb.py:177-190` | carry version per exporter; **S** |
+| C-N4 | notable | **CONFIRMED** | RFC 3164 timestamps get no future clamp and assume the server's timezone; a December message read in June files six months ahead and can never be pruned. | `syslogparse.py:91-109`, `syslogdb.py:468-474` | clamp to now ± 1 h; **S** |
+| C-N5 | notable | **CONFIRMED** | RFC 5424 with an empty MSG stores the header as the message. | `syslogparse.py:131-142` | accept 5 parts; **S** |
+| C-N6 | notable | **CONFIRMED** | Sampling is one rate per exporter applied only to flows after the options template; earlier flows are stored under-scaled forever. | `nfdecode.py:369-374`, `flowdb.py:322` | resolve rate at query time; **M** |
+| C-N7 | notable | **CONFIRMED** | Syslog storage is ~455 B/message measured vs the documented ~150 B. | `NETWORK-AND-STORAGE-REQUIREMENTS.md:269` | fix the figure; **S** |
+| C-N8 | notable | **CONFIRMED** | Exporter interface names are hand-typed `ip:ifIndex=name` lines while `nodes.db` already holds `if_index`, `descr`, `speed_bps` for every managed device. | `flowdb.py:53-58`, `service.py:492-504` | seed from Nodes; add utilisation %; **M** |
+| C-N9 | notable | **CONFIRMED** | No trap varbind conditions and no syslog regex or "N in M minutes" rules; the two rules a NOC actually writes are impossible. All syslog alerts from one host collapse into one row whose message is overwritten. | `alertsdb.py:26-50`, `alertrules.py:39-54` | `match_text`/`match_field`/`count_window_s` on rules; **M/L** |
+| C-N10 | notable | **CONFIRMED** | No per-source rate limiting or repeat suppression on syslog or traps; one device in a debug loop evicts everyone else's messages. | `syslogd.py:174-197` | per-source token bucket; **M** |
+| C-N11 | notable | **CONFIRMED** | `trapoids.py:51` labels `1.3.6.1.2.1.15.3.1.7` as `bgpPeerState`; it is `bgpPeerRemoteAddr` (state is `.1.2`). Rendered live as `bgpPeerState.198.51.100.75=198.51.100.75`. | `trapoids.py:51`, `:174` | correct the arc; **S** |
+| C-N12 | notable | **CONFIRMED** | TCP syslog framer treats any leading `<digits><space>` as an RFC 6587 length; a newline-framed line starting with a number desynchronises the connection. | `syslogd.py:236-244` | require `<` after the count; **S** |
+| C-N13 | notable | **CONFIRMED** | `Database.prune` (NetPath) VACUUMs unconditionally, even when nothing was deleted. | `db.py:590-602` | only when rows removed; **S** |
+| C-N14 | notable | **CONFIRMED** | `reached` is decided against the app's own DNS answer; round-robin or anycast names record as never reached. | `tracer.py:399`, `:453` | parse the address from the traceroute header; **S** |
 
 ### 4.3 Alerting
 
@@ -436,146 +579,190 @@ poller writes per-port keys (`if_in_bps.3`) that no single rule can match.
 `cpu_high`/`mem_high` are UCD-only, so on a switch/firewall fleet the live device
 thresholds are `ping_rtt_ms` and `ping_loss_pct`.
 
-| # | Sev | Finding | Evidence | Fix / effort |
-|---|---|---|---|---|
-| F1 | blocker | Seven dead threshold rules, enabled and documented; `source_kind` is not editable on built-ins. | `alertsdb.py:226-232`, `alertengine.py:653-655`, `alertsdb.py:201-204` | compute util % from `in_bps`/`speed_bps`, poll discards, walk `hrStorageTable`; per-port key patterns; **L** (labelling **S**) |
-| F2 | blocker | SMTP is sent inline on the engine tick with no circuit breaker; failures do not consume the hourly quota. 500 devices down with a dead relay = 500 × 15 s ≈ 2 h of frozen engine. CONFIRMED (25.7 s at a 0.05 s simulated failure; 12.3 s with a healthy relay vs a 5 s tick). | `alertengine.py:1218-1228`, `:1146-1152`, `alertmail.py:262-273` | sender queue thread + breaker; **M** |
-| F3 | severe | 500 outages → 500 alerts, 60 emails, 440 dropped with no `notifications` row; the only trace is one line in a 3,000-entry in-memory ring that the poller overwrites in ~90 s. CONFIRMED. | `alertengine.py:1159-1170`, `eventlog.py:56-58` | write a rate-limited row per alert; digest email; **S/M** |
-| F4 | severe | No digest, batching or correlation window: one email per alert. | `alertengine.py:1096-1152` | `digest_seconds`; **M** |
-| F5 | severe | `trap_critical` fires on every trap of any severity (severity gate is syslog-only); 50 informational config-save traps opened a severity-2 "Critical SNMP trap". CONFIRMED. | `alertengine.py:504-509`, `:1111-1122`, `alertsdb.py:238` | carry trap severity, gate it; **S** |
-| F6 | severe | Trap dedup key is the trap OID, not the source: 200 `linkDown` traps from 200 switches collapse into one alert naming no device; `trap_link_down_unmanaged` never checks whether the source is managed. CONFIRMED. | `alertrules.py:43`, `alertengine.py:494-512` | `source:oid` entity, real unmanaged gate; **S** |
-| F7 | severe | Syslog alerts collapse per host; three distinct faults become one row, first two lost. CONFIRMED. | `alertengine.py:535-539`, `alertsdb.py:697-712` | message signature in the dedup key; **M** |
-| F8 | severe | `renotify_minutes` never fires: `open_or_increment` refreshes `last_ts` and returns the re-read row before the comparison; event-driven rules see no new occurrence anyway. CONFIRMED (renotify 1 min, 20 min breach → 1 email). | `alertengine.py:1146-1152`, `alertsdb.py:697-712` | `last_notified_ts`, per-tick sweep; **M** |
-| F9 | severe | Eleven rules have no auto-resolve path (`device_up`, `device_rebooted`, `poll_overrun`, `interface_up`, `interface_flapping`, `trap_*`, `syslog_critical`, `ipam_new_conflict`); recoveries accumulate as open alerts. CONFIRMED. | `alertrules.py:115-135`, `alertengine.py:696-704` | `auto_resolve_after_s`; pair IPAM conflict-resolved; **M** |
-| F10 | severe | A stale metric holds a threshold alert open forever and re-raises it every tick (opened from a 45-day-old sample; `last_ts` = now), sorting it to the top. CONFIRMED. | `alertengine.py:672-695`, `alertsdb.py:644` | treat samples older than N × interval as absent; **S** |
-| F11 | severe | Hand-resolving "Device not responding" un-suppresses every child: three fresh alerts and emails within 5 s for a device still down. CONFIRMED. | `alertengine.py:1042-1051`, `:1126-1137` | extend sticky-resolve to `ROLLS_UP` children while `status == 'down'`; **M** |
-| F12 | severe | Drain cursors commit before the apply loop; one exception mid-loop permanently discards the rest of the batch (injected failure lost 8 of 10 outages). CONFIRMED. | `alertengine.py:156-177`, `:418-419` | per-occurrence guard, commit cursor after apply; **S/M** |
-| F13 | notable | Flapping detection only sees transitions slower than the poll interval; true fast flapping is invisible, and the device's own linkDown/linkUp traps land in F6's collapsed alert. | `nodepoll.py:1046-1053`, `alertrules.py:56-66` | count trap transitions per source; read `ifLastChange`; **M** |
-| F14 | notable | `_evaluate_thresholds` reads ~400,000 metric rows every 5 s to evaluate four live rules (0.96 s/tick at 2,000 × 200, 88% fetching rows no rule reads). CONFIRMED. | `alertengine.py:646-705`, `nodesdb.py:1422-1426` | one keyed query; **S** |
-| F15 | notable | SMTP auth cannot be configured on Linux (DPAPI). | `api.py:3237-3251` | platform-neutral secret store (§6) |
-| F16 | notable | Email is the only channel: no webhook, Slack, Teams, PagerDuty, SMS, syslog or trap forwarding. | `alertengine.py:1156-1230` | generic webhook with the existing template engine; **M** |
-| F17 | notable | No per-rule recipients, escalation, on-call or shift awareness; every alert goes to `smtp_to_default`. | `alertengine.py:1199-1205` | `recipients` column; **S**; escalation **M** |
-| F18 | notable | Mute is device-only, capped at 24 h, cannot be scheduled; traps, syslog, IPAM, NetPath targets and APs cannot be muted at all. | `alertengine.py:170,179-215`, `alertsdb.py:199` | maintenance windows table keyed on `(entity_kind, entity_id)` with schedule; **M** |
-| F19 | notable | Acknowledge is irreversible; "Acknowledge all" zeroes the fleet badge; the badge has no severity colour though `open_summary()` computes `worst`. | `alertsdb.py:936-949`, `app.js:1008-1013` | un-ack; badge shows open + acked with colour; **S** |
-| F20 | notable | Alert list silently truncates at 300 with no total; bulk actions act on the page. | `api.py:2981`, `alerts.js:57-65`, `:213` | return `total`, act on the filter; **S/M** |
-| F21 | notable | Emails carry an unlabelled server-local timestamp. | `alertmail.py:104-108` | add offset; **S** |
-| F22 | notable | `count` inflates by 12/minute on threshold alerts and is printed in the email ("occurred 8640 time(s)"). | `alertengine.py:678-695` | increment on new sample only; **S** |
-| F23 | notable | `duration_text(0.4)` renders "0 s" — the case its docstring says it avoids. Seen live in a recovery mail. | `alertmail.py:132-138` | round first; **S** |
-| F24 | severe | No dependency map: a core failure is N independent alerts; interface alerts on the upstream's ports are excluded from rollup by design. | `alertrules.py:142-189`, `:158-162` | upstream-device field (manual or seeded from NetPath), consulted before opening `device_down`; **L**, very high value |
-| F26 | severe | Six unrelated rules are bound to the `device_down` email template, whose subject is "{{device_name}} is not responding": `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down`, `interface_flapping`. CONFIRMED in the demo: adding 250 devices produced 234 emails titled "acc-sw-070 is not responding" that were actually "vendor MIB not uploaded". An operator reading the inbox sees a site outage that is not happening. | `alertsdb.py:217-222`, `alertmail.py:20` | one generic "{{rule_name}}: {{entity_label}}" template for non-outage rules; **S** |
-| F27 | severe | Onboarding storm: every device with a recognised enterprise arc and no uploaded MIB opens `mib_missing` on its first poll. 234 alerts and their emails within the first minute of seeding 250 devices; with the default 300 s grace they are held, then fire anyway because the condition persists. Nothing bulk-resolves them and the rule has no auto-resolve. CONFIRMED. | `nodepoll.py:1390`, `alertsdb.py:220` | ship `mib_missing` disabled or severity 7 with no email; bulk-resolve by rule; **S** |
-| F25 | notable | Missing NOC essentials: top-N noisy devices, alert history/MTTR report, SLA/uptime report (segments already computed in `device_status_segments`), per-site filter, export, ticket link, runbook URL, appendable notes, desktop notification. | `alertsdb.py:675-695`, `nodesdb.py:1558-1592` | top-N and CSV **S**; runbook column **S**; site filter and SLA **M** |
+| # | Sev | Tag | Finding | Evidence | Fix / effort |
+|---|---|---|---|---|---|
+| A-F1 | blocker | **CONFIRMED** | Seven dead threshold rules, enabled and documented; `source_kind` is not editable on built-ins. | `alertsdb.py:226-232`, `alertengine.py:653-655`, `alertsdb.py:201-204` | compute util % from `in_bps`/`speed_bps`, poll discards, walk `hrStorageTable`; per-port key patterns; **L** (labelling **S**) |
+| A-F2 | blocker | **CONFIRMED** | SMTP is sent inline on the engine tick with no circuit breaker; failures do not consume the hourly quota. 500 devices down with a dead relay = 500 × 15 s ≈ 2 h of frozen engine. CONFIRMED (25.7 s at a 0.05 s simulated failure; 12.3 s with a healthy relay vs a 5 s tick). | `alertengine.py:1218-1228`, `:1146-1152`, `alertmail.py:262-273` | sender queue thread + breaker; **M** |
+| A-F3 | severe | **CONFIRMED** | 500 outages → 500 alerts, 60 emails, 440 dropped with no `notifications` row; the only trace is one line in a 3,000-entry in-memory ring that the poller overwrites in ~90 s. CONFIRMED. | `alertengine.py:1159-1170`, `eventlog.py:56-58` | write a rate-limited row per alert; digest email; **S/M** |
+| A-F4 | severe | **CONFIRMED** | No digest, batching or correlation window: one email per alert. | `alertengine.py:1096-1152` | `digest_seconds`; **M** |
+| A-F5 | severe | **CONFIRMED** | `trap_critical` fires on every trap of any severity (severity gate is syslog-only); 50 informational config-save traps opened a severity-2 "Critical SNMP trap". CONFIRMED. | `alertengine.py:504-509`, `:1111-1122`, `alertsdb.py:238` | carry trap severity, gate it; **S** |
+| A-F6 | severe | **CONFIRMED** | Trap dedup key is the trap OID, not the source: 200 `linkDown` traps from 200 switches collapse into one alert naming no device; `trap_link_down_unmanaged` never checks whether the source is managed. CONFIRMED. | `alertrules.py:43`, `alertengine.py:494-512` | `source:oid` entity, real unmanaged gate; **S** |
+| A-F7 | severe | **CONFIRMED** | Syslog alerts collapse per host; three distinct faults become one row, first two lost. CONFIRMED. | `alertengine.py:535-539`, `alertsdb.py:697-712` | message signature in the dedup key; **M** |
+| A-F8 | severe | **CONFIRMED** | `renotify_minutes` never fires: `open_or_increment` refreshes `last_ts` and returns the re-read row before the comparison; event-driven rules see no new occurrence anyway. CONFIRMED (renotify 1 min, 20 min breach → 1 email). | `alertengine.py:1146-1152`, `alertsdb.py:697-712` | `last_notified_ts`, per-tick sweep; **M** |
+| A-F9 | severe | **CONFIRMED** | Eleven rules have no auto-resolve path (`device_up`, `device_rebooted`, `poll_overrun`, `interface_up`, `interface_flapping`, `trap_*`, `syslog_critical`, `ipam_new_conflict`); recoveries accumulate as open alerts. CONFIRMED. | `alertrules.py:115-135`, `alertengine.py:696-704` | `auto_resolve_after_s`; pair IPAM conflict-resolved; **M** |
+| A-F10 | severe | **CONFIRMED** | A stale metric holds a threshold alert open forever and re-raises it every tick (opened from a 45-day-old sample; `last_ts` = now), sorting it to the top. CONFIRMED. | `alertengine.py:672-695`, `alertsdb.py:644` | treat samples older than N × interval as absent; **S** |
+| A-F11 | severe | **CONFIRMED** | Hand-resolving "Device not responding" un-suppresses every child: three fresh alerts and emails within 5 s for a device still down. CONFIRMED. | `alertengine.py:1042-1051`, `:1126-1137` | extend sticky-resolve to `ROLLS_UP` children while `status == 'down'`; **M** |
+| A-F12 | severe | **CONFIRMED** | Drain cursors commit before the apply loop; one exception mid-loop permanently discards the rest of the batch (injected failure lost 8 of 10 outages). CONFIRMED. | `alertengine.py:156-177`, `:418-419` | per-occurrence guard, commit cursor after apply; **S/M** |
+| A-F13 | notable | **CONFIRMED** | Flapping detection only sees transitions slower than the poll interval; true fast flapping is invisible, and the device's own linkDown/linkUp traps land in F6's collapsed alert. | `nodepoll.py:1046-1053`, `alertrules.py:56-66` | count trap transitions per source; read `ifLastChange`; **M** |
+| A-F14 | notable | **CONFIRMED** | `_evaluate_thresholds` walks every enabled device and reads every one of its metrics on every 5 s tick, to evaluate four live rules — ~400,000 rows fetched of which 88% no rule reads. Cost scales with metrics per device, which is why two figures appear in this report and neither is wrong: **0.96 s/tick** (this row) and **0.85 s/tick** (§4.5 X-F8) are two runs at ~200 metrics per device, and **436 ms** is the same benchmark at 100. At the ~86 metrics per device the campaign actually measured (§4.1 P-S6) the tick costs ≈0.40 s — still a tenth of the interval spent re-reading rows nothing wants. | `alertengine.py:615-705` (the function; device loop at `:650-705`), `nodesdb.py:1422-1426` | one keyed query; **S** |
+| A-F15 | notable | **CONFIRMED** | SMTP auth cannot be configured on Linux (DPAPI). | `api.py:3237-3251` | platform-neutral secret store (§6) |
+| A-F16 | notable | **CONFIRMED** | Email is the only channel: no webhook, Slack, Teams, PagerDuty, SMS, syslog or trap forwarding. | `alertengine.py:1156-1230` | generic webhook with the existing template engine; **M** |
+| A-F17 | notable | **CONFIRMED** | No per-rule recipients, escalation, on-call or shift awareness; every alert goes to `smtp_to_default`. | `alertengine.py:1199-1205` | `recipients` column; **S**; escalation **M** |
+| A-F18 | notable | **CONFIRMED** | Mute is device-only, capped at 24 h, cannot be scheduled; traps, syslog, IPAM, NetPath targets and APs cannot be muted at all. | `alertengine.py:170,179-215`, `alertsdb.py:199` | maintenance windows table keyed on `(entity_kind, entity_id)` with schedule; **M** |
+| A-F19 | notable | **CONFIRMED** | Acknowledge is irreversible; "Acknowledge all" zeroes the fleet badge; the badge has no severity colour though `open_summary()` computes `worst`. | `alertsdb.py:936-949`, `app.js:1008-1013` | un-ack; badge shows open + acked with colour; **S** |
+| A-F20 | notable | **CONFIRMED** | Alert list silently truncates at 300 with no total; bulk actions act on the page. | `api.py:2981`, `alerts.js:57-65`, `:213` | return `total`, act on the filter; **S/M** |
+| A-F21 | notable | **CONFIRMED** | Emails carry an unlabelled server-local timestamp. | `alertmail.py:104-108` | add offset; **S** |
+| A-F22 | notable | **CONFIRMED** | `count` inflates by 12/minute on threshold alerts and is printed in the email ("occurred 8640 time(s)"). | `alertengine.py:678-695` | increment on new sample only; **S** |
+| A-F23 | notable | **CONFIRMED** | `duration_text(0.4)` renders "0 s" — the case its docstring says it avoids. Seen live in a recovery mail. | `alertmail.py:132-138` | round first; **S** |
+| A-F24 | severe | **CONFIRMED** | No dependency map: a core failure is N independent alerts; interface alerts on the upstream's ports are excluded from rollup by design. | `alertrules.py:142-189`, `:158-162` | upstream-device field (manual or seeded from NetPath), consulted before opening `device_down`; **L**, very high value |
+| A-F25 | notable | **CONFIRMED** | Missing NOC essentials: top-N noisy devices, alert history/MTTR report, SLA/uptime report (segments already computed in `device_status_segments`), per-site filter, export, ticket link, runbook URL, appendable notes, desktop notification. | `alertsdb.py:675-695`, `nodesdb.py:1558-1592` | top-N and CSV **S**; runbook column **S**; site filter and SLA **M** |
+| A-F26 | severe | **CONFIRMED** | Six unrelated rules are bound to the `device_down` email template, whose subject is "{{device_name}} is not responding": `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing` (`alertsdb.py:217-220`), `interface_down` (`:221`) and `interface_flapping` (`:223`) — plus the two wireless rules at `:243` and `:248`. The first draft cited the block as `217-222`, which wrongly included `interface_up` at `:222`; that rule is bound to `device_up` and is correct. CONFIRMED in the demo: adding 250 devices produced 234 emails titled "acc-sw-070 is not responding" that were actually "vendor MIB not uploaded". An operator reading the inbox sees a site outage that is not happening. | `alertsdb.py:217-221`, `:223`, `alertmail.py:20` | one generic "{{rule_name}}: {{entity_label}}" template for non-outage rules; **S** |
+| A-F27 | severe | **CONFIRMED** | Onboarding storm: every device with a recognised enterprise arc and no uploaded MIB opens `mib_missing` on its first poll. 234 alerts and their emails within the first minute of seeding 250 devices; with the default 300 s grace they are held, then fire anyway because the condition persists. Nothing bulk-resolves them and the rule has no auto-resolve. CONFIRMED. | `nodepoll.py:1390`, `alertsdb.py:220` | ship `mib_missing` disabled or severity 7 with no email; bulk-resolve by rule; **S** |
 
 ### 4.4 Security and credentials
 
-| # | Sev | Finding | Evidence | Fix / effort |
-|---|---|---|---|---|
-| B1 | blocker | Self-update executes unsigned code from the tip of a mutable GitHub branch: no signature, hash, tag pin or disable setting. Push access to the repo is RCE on every host holding the plant's credentials. CONFIRMED. | `selfupdate.py:54-56`, `:86-108`, `:261-322`, `server.py:238` | signed tags or pinned digest; `updates_enabled` default off; **M** |
-| B2 | blocker | The forced admin password change is enforced only in `app.js:1019`; `admin`/`admin` with `must_change` set gets 200 from every API route. CONFIRMED. | `api.py:3887-3927`, `server.py:437-520` | refuse routes except session/password while set; **S** |
-| B3 | blocker | Privilege escalation: `debug: write` → `POST /api/settings {scope:"debug"}` falls through to `apply_global_settings` (bind address, port, TLS paths, DNS server, session lifetimes) and echoes the unfiltered settings. CONFIRMED with a debug-only user. | `server.py:48-56`, `api.py:841-862`, `service.py:229-253` | derive the module from the dispatch table; filter the response; **S** |
-| S1 | severe | `POST /api/alerts/smtp/test` sends the stored SMTP password in cleartext AUTH PLAIN to any host and port in the body (also an SSRF primitive). CONFIRMED against a listener. Same class: DHCP and device edit before test/poll. | `api.py:3265-3298`, `alertmail.py:262-272` | refuse the stored secret with a body-supplied host; **M** |
-| S2 | severe | ConfigRX accepts any SSH host key on every connection; no known_hosts; `allow_legacy_ssh` default true; password auth only. | `configrx.py:288-299`, `:655-662`, `:503-504` | persist and pin host keys; default legacy off; **M** |
-| S3 | severe | Config backups (communities, TACACS keys, IPsec PSKs, enable secrets) are zlib-only and served to any `configrx: read` user; not listed in `CREDENTIAL-SECURITY.md`'s inventory. | `configrxdb.py:224-229`, `api.py:3846-3851`, `server.py:229` | gate content on WRITE; redact known secret lines; **M** |
-| S4 | severe | Database files are created 0644 in a 0755 directory; no chmod or umask anywhere. CONFIRMED. | `__main__.py:20-27` | `mode=0o700`, `chmod 0o600`; **S** |
-| S5 | severe | DPAPI-only secret storage: nothing credentialed works on Linux (see Verdict). | `dpapi.py:47-49`, eight `api.py` endpoints | platform-neutral `secretstore`; **L** |
-| S6 | severe | Default bind is plain HTTP on 0.0.0.0 and the headless banner still says "There is no authentication yet" on every start (auth shipped in 4.22). CONFIRMED. | `__main__.py:144-145`, `:177`, `server.py:8-10` | delete the claims; default to loopback; warn without TLS; **S** |
-| S7 | severe | `settings: write` is undeclared root: grants itself every module, resets any password, triggers self-update; no self-escalation guard. | `server.py:68-71`, `api.py:3977-4013` | explicit admin capability; **M** |
-| N1 | notable | Username enumeration: the dummy hash uses N=2^14 vs real 2^17 (0.055 s vs 0.48 s). CONFIRMED. | `api.py:3903-3907` | build from live constants; **S** |
-| N2 | notable | Login throttle is delay-only, dilutes under concurrency (12 parallel guesses in 10.7 s), any successful login clears the whole client key; ~134 MiB scrypt per attempt on a public endpoint. | `auth.py:265-304`, `api.py:3895-3897` | semaphore, lockout, never clear on another user's success; **M** |
-| N3 | notable | No CSRF token; Origin never checked (SameSite + JSON content type only). | `server.py:466-472` | require same-origin `Origin`/`Sec-Fetch-Site`; **S** |
-| N4 | notable | No `frame-ancestors`, `form-action`, `base-uri` or HSTS. | `server.py:345-350` | extend CSP; **S** |
-| N5 | notable | `App.modal()` interpolates device `sysName` into `innerHTML` unescaped (markup injection; CSP blocks script). | `app.js:386-392`, `nodes.js:1971`, `configrx.js:346` | escape in `modal()`; **S** |
-| N6 | notable | Body `_agent` overrides the real User-Agent in the session list; underscore keys are stripped from the query only. | `server.py:441-443`, `api.py:3924` | filter body keys; **S** |
-| N7 | notable | `apply_netpath_settings` mutates the shared global settings dict. | `service.py:66`, `:258-263` | separate dicts; **S** |
-| N8 | notable | MIB catalog downloads use no vendored CA bundle and no integrity pin. | `mibcatalog.py:626-650` | reuse `selfupdate._ssl_context()`, pin SHA-256; **S** |
-| N9 | notable | The audit trail is a 3,000-entry in-memory ring a `debug: write` user can flush; a 200 KB username evicts it. | `eventlog.py:55-70`, `api.py:3908` | on-disk append-only audit log; **M** |
-| N10 | notable | No session revocation; `debug: read` reads every module's events. | `api.py:3963-3975`, `:687-830` | delete-session route; filter events by grant; **S** |
-| N11 | notable | Discovery sweeps have no pacing (64 parallel pings, then SNMP probes) and no never-scan list — a known way to upset fragile PLC stacks; `/focus` (3 s polling) is gated on READ. | `ipam_scan.py:225-235`, `nodediscover.py:138-172`, `server.py:130` | probes/s ceiling, deny-list, WRITE on focus; **M** |
-| N12 | notable | Maintenance "prune" actions delete *everything* (`prune(0, 0)`), including all config backups, with no typed confirmation. | `api.py:876-913` | require `confirm` and log counts; **S** |
-| N13 | notable | Slowloris: no handler timeout, no connection cap, 128 MiB max body. PLAUSIBLE. | `server.py:316`, `:367`, `:565-568` | `timeout = 30`, bounded pool; **S** |
-| N14 | notable | Chunked request bodies are treated as empty (a proxy forwarding chunked POSTs would execute defaults). CONFIRMED. | `server.py:369-381` | reject `Transfer-Encoding`; **S** |
-| N15 | notable | Scripts are signed out after the idle timeout regardless of API activity: the timeout counts browser heartbeats only, so a polling automation loses its session after 10 min (the campaign's snapshots went blank at exactly that point) and must re-login; there is no API token or service account and no documented heartbeat for non-browser clients. CONFIRMED in the demo. | `auth.py:180-193`, `app.js:136-216` | API tokens, or a documented `/api/heartbeat` for scripts; **S/M** |
-| — | absent | LDAP/AD/SAML/RADIUS/TACACS+, MFA, API tokens or service accounts, per-site RBAC, password expiry, persisted failed-login records, on-disk audit log. | `permissions.py:16-19`, `FEATURES.md:48` | procurement gates for a regulated network; **L** |
+| # | Sev | Tag | Finding | Evidence | Fix / effort |
+|---|---|---|---|---|---|
+| S-B1 | blocker | **CONFIRMED** | Self-update executes unsigned code from the tip of a mutable GitHub branch: no signature, hash, tag pin or disable setting. Push access to the repo is RCE on every host holding the plant's credentials. CONFIRMED. | `selfupdate.py:54-56`, `:86-108`, `:261-322`, `server.py:238` | signed tags or pinned digest; `updates_enabled` default off; **M** |
+| S-B2 | blocker | **CONFIRMED** | The forced admin password change is enforced only in `app.js:1019`; `admin`/`admin` with `must_change` set gets 200 from every API route. CONFIRMED. | `api.py:3887-3927`, `server.py:437-520` | refuse routes except session/password while set; **S** |
+| S-B3 | blocker | **CONFIRMED** | Privilege escalation: `debug: write` → `POST /api/settings {scope:"debug"}` falls through to `apply_global_settings` (bind address, port, TLS paths, DNS server, session lifetimes) and echoes the unfiltered settings. CONFIRMED with a debug-only user. | `server.py:48-56`, `api.py:841-862`, `service.py:229-253` | derive the module from the dispatch table; filter the response; **S** |
+| S-S1 | severe | **CONFIRMED** | `POST /api/alerts/smtp/test` sends the stored SMTP password in cleartext AUTH PLAIN to any host and port in the body (also an SSRF primitive). CONFIRMED against a listener. Same class: DHCP and device edit before test/poll. | `api.py:3265-3298`, `alertmail.py:262-272` | refuse the stored secret with a body-supplied host; **M** |
+| S-S2 | severe | **CONFIRMED** — **RESOLVED UPSTREAM in 4.36.x** | ConfigRX accepted any SSH host key on every connection: no `known_hosts`, no pinning, `allow_legacy_ssh` default true, password auth only. As measured against 4.35.0 this was a man-in-the-middle away from every stored device password. **Closed by 4.36.0**, which added `netpath/hostkeys.py` — a host-key store in `configrx.db` keyed on host and port, pinned on first sight and refused on change, shared by ConfigRX and the SSH terminal — with a "Forget host key" action gated on `configrx: write`. The row is kept because the evidence and the reasoning still apply to any 4.35 install. `allow_legacy_ssh` defaulting to true is **not** closed and remains in scope (D5). | `configrx.py:288-299`, `:655-662`, `:503-504`; fixed in `netpath/hostkeys.py` | persist and pin host keys (**done in 4.36.0**); default legacy off; **M** |
+| S-S3 | severe | **CONFIRMED** | Config backups (communities, TACACS keys, IPsec PSKs, enable secrets) are zlib-only and served to any `configrx: read` user; not listed in `CREDENTIAL-SECURITY.md`'s inventory. | `configrxdb.py:224-229`, `api.py:3846-3851`, `server.py:229` | gate content on WRITE; redact known secret lines; **M** |
+| S-S4 | severe | **CONFIRMED** | Database files are created 0644 in a 0755 directory; no chmod or umask anywhere. CONFIRMED. | `__main__.py:20-27` | `mode=0o700`, `chmod 0o600`; **S** |
+| S-S5 | severe | **CONFIRMED** | DPAPI-only secret storage: nothing credentialed works on Linux (see Verdict). | `dpapi.py:47-49`, eight `api.py` endpoints | platform-neutral `secretstore`; **L** |
+| S-S6 | severe | **CONFIRMED** | Default bind is plain HTTP on 0.0.0.0 and the headless banner still says "There is no authentication yet" on every start (auth shipped in 4.22). CONFIRMED. | `__main__.py:144-145`, `:177`, `server.py:8-10` | delete the claims; default to loopback; warn without TLS; **S** |
+| S-S7 | severe | **CONFIRMED** | `settings: write` is undeclared root: grants itself every module, resets any password, triggers self-update; no self-escalation guard. | `server.py:68-71`, `api.py:3977-4013` | explicit admin capability; **M** |
+| S-N1 | notable | **CONFIRMED** | Username enumeration: the dummy hash uses N=2^14 vs real 2^17 (0.055 s vs 0.48 s). CONFIRMED. | `api.py:3903-3907` | build from live constants; **S** |
+| S-N2 | notable | **CONFIRMED** | Login throttle is delay-only, dilutes under concurrency (12 parallel guesses in 10.7 s), any successful login clears the whole client key; ~134 MiB scrypt per attempt on a public endpoint. | `auth.py:265-304`, `api.py:3895-3897` | semaphore, lockout, never clear on another user's success; **M** |
+| S-N3 | notable | **CONFIRMED** | No CSRF token; Origin never checked (SameSite + JSON content type only). | `server.py:466-472` | require same-origin `Origin`/`Sec-Fetch-Site`; **S** |
+| S-N4 | notable | **CONFIRMED** | No `frame-ancestors`, `form-action`, `base-uri` or HSTS. | `server.py:345-350` | extend CSP; **S** |
+| S-N5 | notable | **CONFIRMED** | `App.modal()` interpolates device `sysName` into `innerHTML` unescaped (markup injection; CSP blocks script). | `app.js:386-392`, `nodes.js:1971`, `configrx.js:346` | escape in `modal()`; **S** |
+| S-N6 | notable | **CONFIRMED** | Body `_agent` overrides the real User-Agent in the session list; underscore keys are stripped from the query only. | `server.py:441-443`, `api.py:3924` | filter body keys; **S** |
+| S-N7 | notable | **CONFIRMED** | `apply_netpath_settings` mutates the shared global settings dict. | `service.py:66`, `:258-263` | separate dicts; **S** |
+| S-N8 | notable | **CONFIRMED** | MIB catalog downloads use no vendored CA bundle and no integrity pin. | `mibcatalog.py:626-650` | reuse `selfupdate._ssl_context()`, pin SHA-256; **S** |
+| S-N9 | notable | **CONFIRMED** | The audit trail is a 3,000-entry in-memory ring a `debug: write` user can flush; a 200 KB username evicts it. | `eventlog.py:55-70`, `api.py:3908` | on-disk append-only audit log; **M** |
+| S-N10 | notable | **CONFIRMED** | No session revocation; `debug: read` reads every module's events. | `api.py:3963-3975`, `:687-830` | delete-session route; filter events by grant; **S** |
+| S-N11 | notable | **CONFIRMED** | Discovery sweeps have no pacing (64 parallel pings, then SNMP probes) and no never-scan list — a known way to upset fragile PLC stacks; `/focus` (3 s polling) is gated on READ. | `ipam_scan.py:225-235`, `nodediscover.py:138-172`, `server.py:130` | probes/s ceiling, deny-list, WRITE on focus; **M** |
+| S-N12 | notable | **CONFIRMED** | Maintenance "prune" actions delete *everything* (`prune(0, 0)`), including all config backups, with no typed confirmation. | `api.py:876-913` | require `confirm` and log counts; **S** |
+| S-N13 | notable | **PLAUSIBLE** | Slowloris: no handler timeout, no connection cap, 128 MiB max body. PLAUSIBLE. | `server.py:316`, `:367`, `:565-568` | `timeout = 30`, bounded pool; **S** |
+| S-N14 | notable | **CONFIRMED** | Chunked request bodies are treated as empty (a proxy forwarding chunked POSTs would execute defaults). CONFIRMED. | `server.py:369-381` | reject `Transfer-Encoding`; **S** |
+| S-N15 | notable | **CONFIRMED** | Scripts are signed out after the idle timeout regardless of API activity: the timeout counts browser heartbeats only, so a polling automation loses its session after 10 min (the campaign's snapshots went blank at exactly that point) and must re-login; there is no API token or service account and no documented heartbeat for non-browser clients. CONFIRMED in the demo. | `auth.py:180-193`, `app.js:136-216` | API tokens, or a documented `/api/heartbeat` for scripts; **S/M** |
+| S-N16 | notable | **CONFIRMED** | SNMP community strings are stored in cleartext and returned in full to any account with `nodes: read`: `_device_json`, `_group_json`, `_group_credential_json` and `_controller_json` all copy `community` into the response. A read-only operator can read every device's write-community-in-practice string. | `api.py:1531-1609`, `:3321` | return `has_community` for READ, the value only for WRITE; **S** |
+| S-A1 | absent | **CONFIRMED** | LDAP/AD/SAML/RADIUS/TACACS+, MFA, API tokens or service accounts, per-site RBAC, password expiry, persisted failed-login records, on-disk audit log. | `permissions.py:16-19`, `FEATURES.md:48` | procurement gates for a regulated network; **L** |
 
 ### 4.5 Performance and scale
 
 All eight fixes claimed in `PERFORMANCE_REVIEW.md` are present and correct; that
-review only looked at request-path N+1s. Measured capacity as shipped (bound by
-per-sample commits on a realistically sized `samples` table): **~1,350 devices**
-at 48 ports and 120 s, ~680 at 60 s, ~130 for 500-port chassis. After the five
-fixes marked ★ below: ~4,000–5,000 at 120 s.
+review only looked at request-path N+1s. **Estimated** capacity as shipped (bound
+by per-sample commits on a realistically sized `samples` table): **~1,350
+devices** at 48 ports and 120 s, ~680 at 60 s, ~130 for 500-port chassis. After
+the five fixes marked ★ below: ~4,000–5,000 at 120 s.
 
-| # | Sev | Finding | Measured | Fix / effort |
-|---|---|---|---|---|
-| F1 ★ | blocker | Global sample cap (see 4.1 B1): 1.29 samples per metric survive at 2,000 devices; the DELETE of ~11.1M rows holds the process lock ~44 s every 15 min. | 1.11M rows / 4.42 s at 1/10 scale | per-metric cap, chunked; **S** |
-| F2 ★ | blocker | `compact_rollup()` dead; 400-day windows return 0 points. | 0 points | call from maintenance; **M** |
-| F3 ★ | blocker | One commit per metric sample: 13,731/s empty → 2,181/s at 5M rows; fleet needs 3,233/s; batching is 62× faster. | 150,832/s batched | `record_metric_samples`, one transaction per device poll; **M** |
-| F4 ★ | severe | Scheduler loop: 4,001 queries/s at 2,000 devices. | 118 ms/iteration | cache settings/groups; **S** |
-| F5 | severe | `trim_to_size()` runs VACUUM inside the lock up to six times (6.49 s each at 2M rows). Same shape in five other DB modules. | 38.9 s stall | VACUUM outside the lock or incremental; **M** |
-| F6 ★ | severe | One SNMP GET per port: 500-port chassis at 30 ms RTT = 15.2 s serial per poll. | — | GETBULK the columns (machinery at `nodepoll.py:1742-1778`); **M** |
-| F7 | severe | `/api/nodes/devices` unpaged: 2.18 MB and 115 ms of lock-held CPU per refresh per tab (default every 10 s; the UI walk saw it every 2 s). | 2,175.9 KiB | paging + drop `sys_descr` from the list; **M** |
-| F8 | severe | Alert tick reads every metric of every device every 5 s (0.85 s/tick at real metric counts). | 436 ms at 100/device | keyed query; **M** |
-| F10 | notable | MAC prefix search uses `LIKE`, defeating its index: 528× slower than a range scan; fired per keystroke. | 10.57 ms vs 0.02 ms | range predicate; **S** |
-| F11 | severe | Raw samples: 9.1 GB/day at 2,000 × 48 ports; 400-day default = 3.6 TB (only survivable because F1 throws it away). | 33 B/row | fix F2, document per-port cost; **S** |
-| F12 | severe | One `RLock` and one connection serialise 16 workers, the scheduler, the alert tick, maintenance and every HTTP handler; WAL buys nothing. | 16 threads = 3.5× not 16× | per-worker connections with `busy_timeout`; **L** |
-| F15 | notable | Ping = 3 serial subprocess spawns per device per poll; a down device costs ~12 s of worker time. | 2.3 ms/spawn | concurrent probes, back-off; **M** |
-| F17 | notable | `/api/state` fans out across ten databases and 30 `stat()` calls every 2 s per tab. | — | COUNT queries, cache sizes; **S** |
-| F19 | notable | No `visibilitychange` handling; a minimised tab polls forever. | — | pause hidden tabs; **S** |
-| F20 | notable | Table sort calls `localeCompare` per comparison (19 of 29 ms per redraw at 2,000 rows); no virtual scrolling (24,000 live cells). | 29.4 ms JS | hoist an `Intl.Collator` **S**; virtual rows **L** |
-| F21 | notable | `series()` returns every raw point (28,800 for 24 h at focus cadence); the chart cannot show more than ~800. | 26.8 ms/50k | default `bucket_s` from pixel width; **S** |
-| F22 | notable | Pure-Python BER: 22% of one core at 2,000 × 48 ports at 120 s, 44% at 60 s. | 122 µs encode | F6 removes most of it |
-| F28 | severe | Single process, no remote pollers, no sharding: every ceiling compounds in one process and a datacentre failure takes monitoring with it. | — | remote-poller agent; **L** |
+These are extrapolations from the write-path benchmarks below, not tier
+measurements: the campaign ran at 250, 1,000 and 2,000 devices, so no tier sits
+near ~680 and none of these figures was bracketed by a run. What the tiers do
+show (§3.3) is consistent with them — detection is late at 1,000 and absent at
+2,000, both at a 60 s interval.
+
+| # | Sev | Tag | Finding | Measured | Fix / effort |
+|---|---|---|---|---|---|
+| X-F1 ★ | blocker | **CONFIRMED** | Global sample cap (see §4.1 P-B1): the 50,000 surviving rows are shared across every metric of every device, so at 2,000 devices — 171,910 rows in `metrics`, ≈86 metrics per device — **0.29 samples per metric** survive a prune, not the 1.29 the first draft printed (that figure divided by an assumed metric count instead of the measured one). Under one sample in three metrics survives; the DELETE of ~11.1M rows holds the process lock ~44 s every 15 min. | 1.11M rows / 4.42 s at 1/10 scale; 50,000 ÷ 171,910 = 0.29 | per-metric cap, chunked; **S** |
+| X-F2 ★ | blocker | **CONFIRMED** | `compact_rollup()` dead; 400-day windows return 0 points. | 0 points | call from maintenance; **M** |
+| X-F3 ★ | blocker | **CONFIRMED** | One commit per metric sample: 13,731/s on an empty table → **2,181/s** at 5M rows, while batching sustains **150,832/s** — **69×**, not the 62× the first draft printed (2,181 → 150,832 is 69.2). The fleet's requirement is ~2,870/s at 2,000 devices and a 60 s interval, computed from the measured ≈86 metrics per device (§4.1 P-S6); an earlier draft said 3,233/s from an assumed 97. Either way the shipped write path cannot meet it and the batched one clears it fifty times over. | 2,181/s per-row → 150,832/s batched = 69× | `record_metric_samples`, one transaction per device poll; **M** |
+| X-F4 ★ | severe | **CONFIRMED** | Scheduler loop: 4,001 queries/s at 2,000 devices. | 118 ms/iteration | cache settings/groups; **S** |
+| X-F5 | severe | **CONFIRMED** | `trim_to_size()` runs VACUUM inside the lock up to six times (6.49 s each at 2M rows). Same shape in five other DB modules. | 38.9 s stall | VACUUM outside the lock or incremental; **M** |
+| X-F6 ★ | severe | **CONFIRMED** | One SNMP GET per port: 500-port chassis at 30 ms RTT = 15.2 s serial per poll. | — | GETBULK the columns (machinery at `nodepoll.py:1742-1778`); **M** |
+| X-F7 | severe | **CONFIRMED** | `/api/nodes/devices` unpaged: 2.18 MB and 115 ms of lock-held CPU per refresh per tab (default every 10 s; the UI walk saw it every 2 s). Measured on a freshly seeded 2,000-device table; the same endpoint served 2.64 MB at the end of a full campaign once identity fields were populated (§3.1). | 2,175.9 KiB | paging + drop `sys_descr` from the list; **M** |
+| X-F8 | severe | **CONFIRMED** | Alert tick reads every metric of every device every 5 s. 0.85 s/tick at ~200 metrics per device; see §4.3 A-F14 for why this report carries 0.85, 0.96 and 0.436 for the same operation. | 436 ms at 100/device; ≈0.40 s at the 86/device measured live | keyed query; **M** |
+| X-F10 | notable | **CONFIRMED** | MAC prefix search uses `LIKE`, defeating its index: 528× slower than a range scan; fired per keystroke. | 10.57 ms vs 0.02 ms | range predicate; **S** |
+| X-F11 | severe | **CONFIRMED** | Raw samples: 9.1 GB/day at 2,000 × 48 ports; 400-day default = 3.6 TB (only survivable because F1 throws it away). | 33 B/row | fix F2, document per-port cost; **S** |
+| X-F12 | severe | **CONFIRMED** | One `RLock` and one connection serialise 16 workers, the scheduler, the alert tick, maintenance and every HTTP handler; WAL buys nothing. | 16 threads = 3.5× not 16× | per-worker connections with `busy_timeout`; **L** |
+| X-F15 | notable | **CONFIRMED** | Ping = 3 serial subprocess spawns per device per poll; a down device costs ~12 s of worker time. | 2.3 ms/spawn | concurrent probes, back-off; **M** |
+| X-F17 | notable | **CONFIRMED** | `/api/state` fans out across ten databases and 30 `stat()` calls every 2 s per tab. | — | COUNT queries, cache sizes; **S** |
+| X-F19 | notable | **CONFIRMED** | No `visibilitychange` handling; a minimised tab polls forever. | — | pause hidden tabs; **S** |
+| X-F20 | notable | **CONFIRMED** | Table sort calls `localeCompare` per comparison (19 of 29 ms per redraw at 2,000 rows); no virtual scrolling (24,000 live cells). | 29.4 ms JS | hoist an `Intl.Collator` **S**; virtual rows **L** |
+| X-F21 | notable | **CONFIRMED** | `series()` returns every raw point (28,800 for 24 h at focus cadence); the chart cannot show more than ~800. | 26.8 ms/50k | default `bucket_s` from pixel width; **S** |
+| X-F22 | notable | **CONFIRMED** | Pure-Python BER: 22% of one core at 2,000 × 48 ports at 120 s, 44% at 60 s. | 122 µs encode | F6 removes most of it |
+| X-F9 | notable | **CONFIRMED** | `hostresolve.resolve_name()` is called inside the per-rule loop of `_evaluate_thresholds`, so it runs devices × rules times per tick; on a fleet mid-discovery each miss costs one `app_db.hostnames([ip])` query. 2,000 devices × 6 live rules = 12,000 calls per 5 s tick. | traced | hoist `label` out of the rule loop (`alertengine.py:676`); **S** |
+| X-F13 | notable | **CONFIRMED** | `_poll_device` calls `interface_id_for()` for an id it already holds in the `existing` dict two lines above: one avoidable SELECT per interface per poll, ~800 queries/s at 2,000 × 48 ports and 120 s, each taking the global lock. | traced | use `prior["id"]` (`nodepoll.py:1005`, `:1043`); **S** |
+| X-F14 | notable | **CONFIRMED** | `replace_interfaces` matches on `if_index` and UPDATEs — the right shape — but UPDATEs unconditionally, including the polls where every compared field is identical: 500 no-op row rewrites per poll of the chassis, each dirtying a page that must be journalled and checkpointed. | traced + benchmarked | compare against the already-loaded `prior` row (`nodesdb.py:1341`, `:1358`); **S** |
+| X-F16 | notable | **CONFIRMED** | `_extra_resolve_targets()` full-table-scans the IPAM hosts and the device table every 15 s whether or not anything needs resolving, then discards the result whenever the primary hop batch already has 40 entries: ~1.7 device-table scans a minute on the poll writers' lock, for nothing. | 25 ms/scan at 2,000 | move the block behind the existing `len(batch) < 40` test (`service.py:604-622`, `monitor.py:381-385`); **S** |
+| X-F18 | notable | **CONFIRMED** | One open Nodes tab is ~1.6 requests/s: `refresh()` fires five parallel requests and `loadDetail()` five more, four of which (groups, device-groups, MIB files, the column set) only ever change on operator action. | traced | fetch those four once and on mutation (`nodes.js:3160-3166`, `:498-504`); **S** |
+| X-F23 | notable | **PLAUSIBLE** | Unbounded `IN (...)` lists: a "select all → bulk poll" at 2,000 devices builds a 2,000-element list. SQLite 3.45 allows 32,766 host parameters, so this does not fire here — but older builds, including the system SQLite in some Windows Python distributions, default to 999. Not reproduced. | not reproduced | chunk at 500 in `_rows_by_ids` and `devices_by_ids` (`nodesdb.py:955-963`, `:1036-1050`, `ipamdb.py:313-323`); **S** |
+| X-F24 | nit | **CONFIRMED** | `metrics()` carries an `ORDER BY label` that its hottest caller throws away into a dict on the next line: 388,000 rows sorted every 5 s for nothing at 2,000 devices. | traced | drop the `ORDER BY`, sort in the one caller that displays it (`nodesdb.py:1422-1426`, `api.py:2288`); **S** — subsumed by X-F8 |
+| X-F25 | nit | **CONFIRMED** | `settings()` re-reads the whole settings table and re-runs `json.loads` per row on every call, and it is called from `effective_config()`, `_poll_device` and `_tick` — the three hottest paths in the process. | ~0.05 ms/call | memoise behind a generation counter bumped by `save_settings()` (`nodesdb.py:686-696`); **S** — subsumed by X-F4 |
+| X-F26 | nit | **CONFIRMED** | `journal_mode=WAL`, `synchronous=NORMAL` and `foreign_keys=ON` are the right choices; `busy_timeout`, `cache_size` and `mmap_size` are unset. `cache_size` defaults to 2 MB against databases that reach a gigabyte, and `busy_timeout` becomes mandatory the moment X-F12 is fixed. | — | `PRAGMA cache_size=-65536`, `PRAGMA busy_timeout=5000` (`nodesdb.py:495-497`); **S** |
+| X-F27 | nit | **CONFIRMED** | `_migrate()` runs six `PRAGMA table_info` calls and several `CREATE INDEX IF NOT EXISTS` statements on every open. Startup-only, idempotent, ~10 ms — correct as written. Recorded so a slow first `/api/state` is not mistaken for a steady-state cost. | ~10 ms at open | none needed (`nodesdb.py:507-654`) |
+| X-F28 | severe | **CONFIRMED** | Single process, no remote pollers, no sharding: every ceiling compounds in one process and a datacentre failure takes monitoring with it. | — | remote-poller agent; **L** |
 
 ### 4.6 UX, accessibility and documentation truth
 
-| # | Sev | Finding | Evidence | Fix / effort |
-|---|---|---|---|---|
-| F12 | blocker | The Dashboard is a 385-byte placeholder, and `login.js:44` makes it the landing page after every sign-in. | `dashboard.js`, `index.html:41-47` | tile grid over existing endpoints; **M** |
-| F27 | blocker (on-call) | Zero media queries; `body{overflow:hidden}` clips rather than scrolls; at 390 px six of twelve tabs are unreachable and every device name is cut. CONFIRMED with a screenshot. | `app.css:51-59`, `app.js:956-960` | `nav{overflow-x:auto}` **S**; narrow layout **L** |
-| D14 | blocker (intermittent) | ConfigRX reported "paramiko is not installed" beside "paramiko 4.0.0" in the same `/api/state`; the unlocked `_paramiko_ok` cache is written from two threads, and when it caches `False` the module is disabled fleet-wide and legacy SSH is never applied. Reproduced once. | `configrx.py:78`, `:105-120`, `:493` | put the cache behind the lock; **S** |
-| F1 | severe | No URL routing: nothing can be linked to, Back does nothing, escalations are prose. CONFIRMED. | `app.js:963-985` | hash routes; **M** |
-| F2 | severe | Search is `LIKE %q%` over ip, name, sys_name only: `q="Cisco"` returns 0 rows with Vendor visible as a column. | `nodesdb.py:932-937` | add vendor/location/contact, CIDR, field qualifiers; **S/M** |
-| F3 | severe | No paging or virtualisation; 2.19 MB per refresh, 25,402 DOM nodes at 2,000 devices. | `api.py`, `nodes.js:196-230` | server paging; **M** |
-| F4 | severe | One flat group level; no sites, tags or saved views; column layout is global. | `nodes.js:145-150`, `:185-186` | tags + per-user saved views; **L** |
-| F5/F6 | severe | No export of any table; no CSV import (500 devices is 500 dialogs). README documents an "Export window to CSV" that does not exist. | grep, `README.md:592` | generic export endpoint, paste-CSV import; **M** each |
-| F7 | severe | Maintenance windows impossible (see 4.3 F18). | `alerts.js:36`, `:307`, `api.py:3049-3056` | **M** |
-| F10 | severe | Alerts list truncates at 300 and the label says "300 shown" with no total; select-all acknowledges 300 of N. | `api.py:2981`, `alerts.js:213` | total + honest label; **S** |
-| F15–F18 | severe | Zero ARIA outside the 4.35 help panel: 29 tables with no `scope`, `aria-sort` or caption; sorting mouse-only; the main modal has no dialog role, no focus trap and drops focus to `body` on close — while the help panel ten lines away does all three correctly. CONFIRMED in the DOM. | `app.js:385-415`, `:455-476` | one change in the shared grid helper; lift help-panel behaviour into `modal()`; **S** |
-| F20 | severe | Under deuteranopia `--ok`, `--fail`, `--blocked` collapse to three khakis (1.34:1 apart); `--fail` and `--error` have identical luminance; timelines are colour-only with mouse-only tooltips. | `theme.py:38-44`, `nodes.js:826-833` | extend the existing hatch/stripe vocabulary; **S** |
-| F21 | severe | `.hint` is 2.50:1 contrast at 11 px and it renders every device's IP address. | `app.css:264`, `nodes.js:143` | use `--muted`; **S** |
-| F23 | severe | Server loss shows the raw string "Failed to fetch" in 11 px grey while 2,000 stale rows stay on screen looking live; no staleness marking, no reconnect signal. CONFIRMED offline. | `app.js:130-134`, `:1076-1096` | operator-language message, dim stale content; **S/M** |
-| F24 | notable | No spinners, no `aria-busy`, no request timeout. | `app.js:104-116` | **S** |
-| F13 | notable | The README's NetFlow keyboard shortcuts (Ctrl+=/−/arrows/0/Home) do not exist; no modifier-key handler exists anywhere. CONFIRMED by grep and in the browser. | `README.md:280-293` | implement or delete; **S** |
-| F22 | notable | The help "?" covers 2 of ~150 settings. | `nodes.js:2356` | content, not code; **M** |
-| F28 | notable | No favicon (404 on every load), no alert count in the title, no desktop notification. | `server.py:245`, static | **S** |
-| F29 | notable | Timestamps are browser-local with no zone indicator anywhere. | `app.js:223-235` | zone label, UTC toggle; **S/M** |
-| F31 | severe | Wireless is FortiGate-only and the UI never says so. | `wirelessdb.py:1`, `wireless.js` | say it in the tab and empty state; **S** |
-| F32 | severe | IPAM's DHCP form renders fully on Linux with Windows-only help text; `IS_WINDOWS` is defined and never used. | `ipam_dhcp.py:54`, `ipam.js:445` | gate the form; **S** |
-| F33 | severe | ConfigRX detects a change (SHA-256) and cannot show a diff. | `configrx.js:452-456` | `difflib` unified diff endpoint; **M** |
-| F34 | notable | `POST /api/nodes/devices` accepts `snmp_version: "2c"` and the poller then raises `ValueError` on every poll of that device. CONFIRMED. | `api.py`, `nodepoll.py:1261` | validate and coerce; **S** |
-| C1 | notable | `window.App` does not exist (`const App` in a classic script); documentation and any automation assuming a window global is wrong. | `app.js:3` | expose it; **S** |
-| C2 | notable | Uncaught `TypeError` from the OID browser when another dialog replaces the modal mid-walk (`#oid-status` gone); same pattern in `deviceDialog`. CONFIRMED in the console log. | `nodes.js:1261`, `:1346`, `:922` | check the dialog identity, not the modal; **S** |
-| C3 | notable | Read-only users get a 403 every time they open Settings (`loadUsers()` called unconditionally; route needs WRITE); the grid is silently empty. | `settings.js:442`, `server.py:68` | gate on the grant; **S** |
+| # | Sev | Tag | Finding | Evidence | Fix / effort |
+|---|---|---|---|---|---|
+| U-F12 | blocker | **CONFIRMED** | The Dashboard is a 385-byte placeholder, and `login.js:44` makes it the landing page after every sign-in. | `dashboard.js`, `index.html:41-47` | tile grid over existing endpoints; **M** |
+| U-F27 | blocker (on-call) | **CONFIRMED** | Zero media queries; `body{overflow:hidden}` clips rather than scrolls; at 390 px six of twelve tabs are unreachable and every device name is cut. CONFIRMED with a screenshot. | `app.css:51-59`, `app.js:956-960` | `nav{overflow-x:auto}` **S**; narrow layout **L** |
+| U-F36 | blocker (intermittent) | **CONFIRMED** | ConfigRX reported "paramiko is not installed" beside "paramiko 4.0.0" in the same `/api/state`; the unlocked `_paramiko_ok` cache is written from two threads, and when it caches `False` the module is disabled fleet-wide and legacy SSH is never applied. Reproduced once. | `configrx.py:78`, `:105-120`, `:493` | put the cache behind the lock; **S** |
+| U-F1 | severe | **CONFIRMED** | No URL routing: nothing can be linked to, Back does nothing, escalations are prose. CONFIRMED. | `app.js:963-985` | hash routes; **M** |
+| U-F2 | severe | **CONFIRMED** | Search is `LIKE %q%` over ip, name, sys_name only: `q="Cisco"` returns 0 rows with Vendor visible as a column. | `nodesdb.py:932-937` | add vendor/location/contact, CIDR, field qualifiers; **S/M** |
+| U-F3 | severe | **CONFIRMED** | No paging or virtualisation; 2.19 MB per refresh, 25,402 DOM nodes at 2,000 devices. | `api.py`, `nodes.js:196-230` | server paging; **M** |
+| U-F4 | severe | **CONFIRMED** | One flat group level; no sites, tags or saved views; column layout is global. | `nodes.js:145-150`, `:185-186` | tags + per-user saved views; **L** |
+| U-F5 | severe | **CONFIRMED** | No export of any table, in any tab: no CSV, no clipboard, no print view. README documents a "Data > Export window to CSV" that does not exist. | grep, `README.md:592`, `FEATURES.md:1850` | generic `GET /api/<module>/export.csv` honouring the current filter; **M** |
+| U-F6 | severe | **CONFIRMED** | No CSV or bulk import: onboarding 500 devices is 500 dialogs (`POST /api/nodes/devices` is one device per call). | `api.py:1773`, `nodes.js` add-device dialog | paste-CSV import behind `POST /api/nodes/devices/bulk`; **M** |
+| U-F7 | severe | **CONFIRMED** | Maintenance windows impossible (see §4.3 A-F18). | `alerts.js:36`, `:307`, `api.py:3049-3056` | **M** |
+| U-F10 | severe | **CONFIRMED** | Alerts list truncates at 300 and the label says "300 shown" with no total; select-all acknowledges 300 of N. | `api.py:2981`, `alerts.js:213` | total + honest label; **S** |
+| U-F15 | severe | **CONFIRMED** | Zero ARIA anywhere outside the 4.35 help panel: no `role`, no `aria-*` on any control the operator uses all day. CONFIRMED in the DOM at 2,000 devices. | `app.js:385-415`, `:455-476` | lift the help panel's own patterns into the shared helpers; **S** |
+| U-F16 | severe | **CONFIRMED** | 29 tables, 30 `<th>`, zero `scope`, zero `<caption>`, zero `aria-sort`: a screen reader cannot say which column a cell belongs to. | `app.js:692-796` (`App.grid`) | one change in the shared grid helper; **S** |
+| U-F17 | severe | **CONFIRMED** | Sorting is mouse-only — headers are `<th>` with a click handler, no `tabindex`, no key handler. | `app.js:692-796` | `tabindex="0"` + Enter/Space in the grid helper; **S** |
+| U-F18 | severe | **CONFIRMED** | The main modal has no dialog role, no `aria-modal`, no focus trap and drops focus to `body` on close — while the help panel ten lines away does all three correctly. | `app.js:385-425`, `:455-476` | lift help-panel behaviour into `modal()`; **S** |
+| U-F19 | severe | **CONFIRMED** | Nothing is announced: no `aria-live`/`role="status"` on the connection state, the idle banner or the bulk-action result, so a screen-reader user never learns the server went away. | `app.js:130-134`, `:197-213` | `role="status"` on `#conn` and the bulk notice, `role="alert"` on the idle banner; **S** |
+| U-F20 | severe | **CONFIRMED** | Under deuteranopia `--ok`, `--fail`, `--blocked` collapse to three khakis (1.34:1 apart); `--fail` and `--error` have identical luminance; timelines are colour-only with mouse-only tooltips. | `theme.py:38-44`, `nodes.js:826-833` | extend the existing hatch/stripe vocabulary; **S** |
+| U-F21 | severe | **CONFIRMED** | `.hint` is 2.50:1 contrast at 11 px and it renders every device's IP address. | `app.css:264`, `nodes.js:143` | use `--muted`; **S** |
+| U-F23 | severe | **CONFIRMED** | Server loss shows the raw string "Failed to fetch" in 11 px grey while 2,000 stale rows stay on screen looking live; no staleness marking, no reconnect signal. CONFIRMED offline. | `app.js:130-134`, `:1076-1096` | operator-language message, dim stale content; **S/M** |
+| U-F24 | notable | **CONFIRMED** | No spinners, no `aria-busy`, no request timeout. | `app.js:104-116` | **S** |
+| U-F13 | notable | **CONFIRMED** | The README's NetFlow keyboard shortcuts (Ctrl+=/−/arrows/0/Home) do not exist; no modifier-key handler exists anywhere. CONFIRMED by grep and in the browser. | `README.md:280-293` | implement or delete; **S** |
+| U-F22 | notable | **CONFIRMED** | The help "?" covers 2 of ~150 settings. | `nodes.js:2356` | content, not code; **M** |
+| U-F28 | notable | **CONFIRMED** | No favicon (404 on every load — `/favicon.ico` is in `PUBLIC_PATHS` and no file answers it), no alert count in the title, no desktop notification. | `server.py:260` (`PUBLIC_PATHS`; `:245` in the 4.35.0 tree), `web/static/` | **S** |
+| U-F29 | notable | **CONFIRMED** | Timestamps are browser-local with no zone indicator anywhere. | `app.js:223-235` | zone label, UTC toggle; **S/M** |
+| U-F31 | severe | **CONFIRMED** | Wireless is FortiGate-only and the UI never says so. | `wirelessdb.py:1`, `wireless.js` | say it in the tab and empty state; **S** |
+| U-F32 | severe | **CONFIRMED** | IPAM's DHCP form renders fully on Linux with Windows-only help text; `IS_WINDOWS` is defined and never used. | `ipam_dhcp.py:54`, `ipam.js:445` | gate the form; **S** |
+| U-F33 | severe | **CONFIRMED** | ConfigRX detects a change (SHA-256) and cannot show a diff. | `configrx.js:452-456` | `difflib` unified diff endpoint; **M** |
+| U-F34 | notable | **CONFIRMED** | `POST /api/nodes/devices` accepts `snmp_version: "2c"` and the poller then raises `ValueError` on every poll of that device. CONFIRMED. | `api.py`, `nodepoll.py:1261` | validate and coerce; **S** |
+| U-F8 | notable | **CONFIRMED** | No side-by-side device comparison: the detail pane is bound to `view.selected`, so "why is this switch slower than its twin" is answered by alt-tabbing and remembering numbers. | `nodes.js:3175-3179` | "Pin to compare" over the existing splitter machinery (`app.js:577`); **M** |
+| U-F9 | notable | **CONFIRMED** | The interface bandwidth dialog is hard-coded to a one-hour window with no range control, so a nightly backup saturating a link cannot be seen. | `nodes.js:1566` | reuse the existing `RANGES` select (`app.js:299`); **S** |
+| U-F11 | notable | **CONFIRMED** | Bulk actions exist for poll, re-identify, profile, group, delete, ack and resolve, but not for **mute**, tag, credential change, enable/disable polling, export or add — and bulk mute is the one an on-call operator needs at 02:00. | `index.html:89-100`, `:201`, `:229-234` | bulk mute on top of U-F7's work; **S** |
+| U-F14 | notable | **CONFIRMED** | "Ctrl+click bulk select" headlines the 4.21.0 CHANGELOG entry and no longer exists (checkboxes replaced it; no `ctrlKey` handler ships). Historically accurate as a changelog entry, but a reader scanning headlines for "how do I multi-select" is sent to a removed feature. | `CHANGELOG.md:1024`, `:641`, `:666`, `:673`, `FEATURES.md:162`, `:586` | a "(removed in 4.2x — use the row checkboxes)" note on the heading; **S** |
+| U-F25 | nit | **CONFIRMED** | Empty states are a strength — IPAM, NetPath, Wireless, ConfigRX and the two detail panes all name the next action — with two gaps: the Nodes table at zero devices shows a bare header and "0 device(s)", and the Wireless and ConfigRX tables render empty headers with no guidance. | `configrx.js:452-456`, `index.html:108`, `:243` | one call-to-action line per empty table; **S** |
+| U-F26 | nit (positive) | **CONFIRMED** | 401-after-idle is handled better than most commercial NMS: any non-login 401 redirects to `/login`, and the idle clock is genuinely presence-based (only real input resets it, heartbeats throttled to 20 s, the server's figure authoritative against clock skew) with a "Signing out in N s" banner at 60 s. Only defect: no `aria-live` (U-F19). | `app.js:110-113`, `:136-216` | keep it |
+| U-F30 | nit | **CONFIRMED** | `stamp()` uses `toLocaleDateString` while `clock()` hand-builds `HH:MM`, so one string mixes a localised date with a forced 24 h time; no i18n framework, all strings inline. 24 h is right for network operations — this is a consistency nit. | `app.js:223-235` | one formatter; **S** |
+| U-F35 | nit (positive) | **CONFIRMED** | Interface events, the MAC-table cascade and the on-demand optics/sensor readout are the best interactions in the product, and discovery partly covers the missing bulk import (U-F6). | UI walk, all tiers | keep them |
+| U-C1 | notable | **CONFIRMED** | `window.App` does not exist (`const App` in a classic script); documentation and any automation assuming a window global is wrong. | `app.js:3` | expose it; **S** |
+| U-C2 | notable | **CONFIRMED** | Uncaught `TypeError` from the OID browser when another dialog replaces the modal mid-walk (`#oid-status` gone); same pattern in `deviceDialog`. CONFIRMED in the console log. | `nodes.js:1261`, `:1346`, `:922` | check the dialog identity, not the modal; **S** |
+| U-C3 | notable | **CONFIRMED** | Read-only users get a 403 every time they open Settings (`loadUsers()` called unconditionally; route needs WRITE); the grid is silently empty. | `settings.js:442`, `server.py:68` | gate on the grant; **S** |
 
-Documentation truth table (each row checked against code or the running app):
+Documentation truth table. Every row was checked against the code or the running
+application and is therefore **CONFIRMED**; no row here is an inference. The
+first draft left four rows unnumbered and merged three pairs, so ids in earlier
+correspondence may not match — D11, D14, D23 and D24 are the four that had none,
+and D25 is new (see Appendix C).
 
 | # | Claim | Where | Reality |
 |---|---|---|---|
-| D1/D2 | `deploy\Install-Shortcut.ps1`, `deploy\Update-SappiWhere.ps1` | `README.md:99, 102, 453, 459` | no `deploy/` directory exists; the only documented update path is a missing script |
-| D3/D4 | "There is no authentication yet" | `__main__.py:177` (printed every start), `web/server.py:8-10` | auth, sessions, permissions since 4.22 |
-| D5 | NetFlow chart Ctrl shortcuts | `README.md:280-289` | not implemented |
+| D1 | "`deploy\Install-Shortcut.ps1` builds it", with a usage example | `README.md:99`, `:102` | no `deploy/` directory exists in the repository |
+| D2 | "`deploy\Update-SappiWhere.ps1` wraps that", with a usage example | `README.md:453`, `:459` | same: the only documented update path is a missing script |
+| D3 | "There is no authentication yet: bind somewhere you trust." | `__main__.py:177-180`, printed on every headless start | auth, sessions and permissions since 4.22 |
+| D4 | The same claim in the server's module docstring | `web/server.py:8-10` | as D3 |
+| D5 | NetFlow chart Ctrl shortcuts (Ctrl+=/−, Ctrl+←/→, Ctrl+0, Home) | `README.md:280-293` | not implemented; no modifier-key handler exists anywhere |
 | D6 | "there is no SNMP polling … and no alerting engine … yet" | `FEATURES.md:1141-1143` | both exist (`nodepoll.py`, `alertengine.py`) |
-| D7 | "Data > Export window to CSV" | `README.md:592`, `FEATURES.md:1850` | no CSV export exists |
-| D8/D9 | "Verified with a Playwright test" (twice) | `PERFORMANCE_REVIEW.md:69-79, 93-95` | no Playwright test is in the repository |
+| D7 | "Data > Export window to CSV" | `README.md:592`, `FEATURES.md:1850` | no CSV export exists, in any tab |
+| D8 | "Verified with a Playwright test" | `PERFORMANCE_REVIEW.md:69-79` | no Playwright test is in the repository |
+| D9 | "Verified with a Playwright test" (second occurrence) | `PERFORMANCE_REVIEW.md:93-95` | as D8 |
 | D10 | "Worth adding next — alerting on status transitions" | `README.md:598-600` | shipped |
-| D12 | "SHOW RUN — available once SSH integration is added" | `nodes.js:1577` (in the UI) | ConfigRX shipped |
-| D13 | "hundreds of devices" | `FEATURES.md:177` | the only scale figure in 470 KB of docs |
-| — | "raw samples roll up into hourly min/avg/max after 3 days" | `NETWORK-AND-STORAGE-REQUIREMENTS.md:270` | rollup never runs |
-| — | "~150 bytes per syslog message" | `NETWORK-AND-STORAGE-REQUIREMENTS.md:269` | ~455 B measured |
-| — | "CPU/memory where UCD-SNMP-MIB or HOST-RESOURCES-MIB is present" | `FEATURES.md:94-96` | HOST-RESOURCES is never polled |
-| — | engine parameters "only need refreshing if the target reboots" | `nodepoll.py:44-46`, `INTERNALS.md:445` | engineTime is never advanced (4.1 S3) |
+| D11 | "raw samples roll up into hourly min/avg/max after 3 days" | `NETWORK-AND-STORAGE-REQUIREMENTS.md:270` | the rollup never runs: `compact_rollup()` has no caller (§4.1 P-B2) |
+| D12 | "SHOW RUN — available once SSH integration is added" | `nodes.js:1577` (in the UI) | ConfigRX shipped; and since 4.36.0 there is an SSH terminal too |
+| D13 | "hundreds of devices" | `FEATURES.md:177` | the only scale figure in 470 KB of documentation |
+| D14 | "~150 bytes per syslog message" | `NETWORK-AND-STORAGE-REQUIREMENTS.md:269` | ~455 B measured (§4.2 C-N7), three times the estimate |
 | D15 | ports table | `NETWORK-AND-STORAGE-REQUIREMENTS.md:21-25` | correct throughout; the most trustworthy document in the set |
-| D16–D22 | no table of contents in any document; no quick-start; no API reference for 170 routes; no backup/restore guide for ten WAL databases; no runbook; upgrade guide is Windows-only; README covers 4 of 12 tabs (not Nodes or Alerts) | all `.md` | — |
+| D16 | — | all `.md` | no table of contents in any document, including the 245 KB `INTERNALS.md` |
+| D17 | — | all `.md` | no quick-start: nothing takes a new operator from "installed" to "first device polled" |
+| D18 | — | all `.md` | no API reference, for ~170 routes |
+| D19 | — | all `.md` | no backup or restore guide, for a product with ten WAL databases |
+| D20 | — | all `.md` | no runbook for the failures this review found (poller stopped, collector stopped, cap reached) |
+| D21 | upgrade guide | `README.md` | Windows-only, though Linux/systemd is a documented deployment |
+| D22 | — | `README.md` | covers 4 of 12 tabs; neither Nodes nor Alerts is among them |
+| D23 | "CPU/memory where UCD-SNMP-MIB **or HOST-RESOURCES-MIB** is present" | `FEATURES.md:94-96` | `HOST_RESOURCES` is defined at `nodeoids.py:64-67` and referenced nowhere (§4.1 P-S9) |
+| D24 | engine parameters "only need refreshing if the target reboots" | `nodepoll.py:44-46`, `INTERNALS.md:445` | engineTime is never advanced (§4.1 P-S3) |
+| D25 | "Never phones home. There is no telemetry, **no update check**…" | `CREDENTIAL-SECURITY.md:573` (§8) | the Update button calls `selfupdate.latest_commit()`, which requests `https://api.github.com/repos/…/commits/<branch>` on every press (`selfupdate.py:86-92`). Nothing is *sent* — no telemetry, no credential — but an outbound request to GitHub is made, and the sentence as written says it is not. Added by the re-review (Appendix C) |
 
 ---
 
@@ -598,6 +785,15 @@ unconfigurable on Linux, so a hardened OT policy forces v2c everywhere; no
 per-device SNMP port; no IPv6; a device that logs from a loopback address
 different from its polled address correlates with nothing.
 
+Two lines of this table have moved since it was measured against 4.35.0. The
+Config column's "no host-key checking" caveat is closed — 4.36.0 pins a device's
+SSH host key on first sight and refuses a changed one for both ConfigRX and the
+new terminal (§4.4 S-S2) — and switches, firewalls and PLCs now have an
+interactive SSH session from the device pane, which is a genuine addition to the
+Config column for every class that speaks SSH. The credential problem underneath
+is unchanged: on Linux there is still nowhere to store the password that session
+or a backup needs.
+
 ---
 
 ## 6. Recommendations, ranked
@@ -609,12 +805,12 @@ weighted by effort. "Where" names the code that already carries the mechanism.
 
 1. **Per-metric sample cap and chunked prune** — `nodesdb.py:2171-2179`, `service.py:719`. Without this nothing charts and the process stalls 44 s every 15 minutes.
 2. **Call `compact_rollup()` from maintenance and prune it by age** — `service.py:715`, `nodesdb.py:1480`. **M.**
-3. **Batch each poll's samples into one transaction** — `nodesdb.py:1398`, `nodepoll.py:1055-1064`. 62× write throughput; raises the ceiling past 5,000 devices on its own. **M.**
+3. **Batch each poll's samples into one transaction** — `nodesdb.py:1398`, `nodepoll.py:1055-1064`. **69×** write throughput (2,181/s → 150,832/s, §4.5 X-F3); raises the ceiling past 5,000 devices on its own. **M.**
 4. **Exception guards on every loop that must not die**: `NodePoller._loop` (`nodepoll.py:690`), the NetFlow/trap/syslog receive loops (`collector.py:185`, and `DecodeError` in `nfdecode.py:150`), the alert apply loop with cursor commit after apply (`alertengine.py:156-177`).
 5. **SMTP off the tick**: sender queue thread, failures count against the quota, breaker after N failures — `alertengine.py:1218-1228`. **M.**
 6. **Fix `renotify_minutes`** (`last_notified_ts`) and give momentary-event rules an `auto_resolve_after_s` — `alertengine.py:1146-1152`, `alertrules.py:115-135`. **M.**
 7. **Trap identity and severity**: entity `source:oid`, carry `traps.severity`, apply the gate to traps, real "unmanaged" check — `alertengine.py:504-509`, `:1116`. Syslog dedup on a message signature — `:535-539`.
-7a. **Stop non-outage rules emailing "is not responding"**: give `mib_missing`, `device_auth_fail`, `device_unsupported`, `poll_overrun`, `interface_down` and `interface_flapping` their own subjects — `alertsdb.py:217-222`; ship `mib_missing` without email.
+7a. **Stop non-outage rules emailing "is not responding"**: give `mib_missing`, `device_auth_fail`, `device_unsupported`, `poll_overrun`, `interface_down` and `interface_flapping` their own subjects — `alertsdb.py:217-221`, `:223` (and the two wireless rules at `:243`, `:248`); ship `mib_missing` without email. Not **S**: see §7 #22a.
 8. **SNMPv1 interface GET split** — `nodepoll.py:1642-1645`. Every v1-only switch and PLC is invisible until this lands.
 9. **Advance SNMPv3 engineTime** — `nodepoll.py:1145`, `:1164-1171`.
 10. **Security blockers**: server-side `must_change` (`server.py:_route`), the `debug` settings scope escalation (`server.py:48-56`), signed or pinned self-update with an off switch (`selfupdate.py`), stored-SMTP-password exfiltration (`api.py:3265-3298`), database file modes (`__main__.py:20-27`), and the two stale "no authentication yet" strings.
@@ -662,21 +858,24 @@ weighted by effort. "Where" names the code that already carries the mechanism.
 
 ## 7. Bugs and documentation defects, with proposed patches
 
-Documented only, per the reviewer's instruction. Each is CONFIRMED unless noted.
+Documented only, per the reviewer's instruction. Each is CONFIRMED unless the
+row it belongs to in §4 says otherwise, and each carries the effort the
+re-review settled on rather than the first draft's estimate — five of these were
+understated and say so in place (#2, #4, #6, #12, #22a).
 
 1. `netpath/nodesdb.py:2171-2179` — replace the global `LIMIT (total - max_samples)` delete with a per-metric window:
    `DELETE FROM samples WHERE rowid IN (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY metric_id ORDER BY ts DESC) rn FROM samples) WHERE rn > ?)`, executed in chunks outside the lock.
-2. `netpath/web/service.py:715` — after `nodes_db.prune(...)`, call `nodes_db.compact_rollup(...)` and prune `samples_hourly` by `rollup_days`.
+2. `netpath/web/service.py:715` — after `nodes_db.prune(...)`, call `nodes_db.compact_rollup(...)` and prune `samples_hourly` by age. **Larger than it looks:** `compact_rollup()` as written *deletes every raw sample older than one hour* once it has aggregated, so it cannot simply be called — it has to stop deleting first, or calling it destroys more history than the cap does. It also needs a new `rollup_retention_days` setting (there is no age to prune `samples_hourly` by today; `sample_retention_days` covers raw rows only), an index on `samples_hourly(hour)` for the prune to use, and a watermark so a second pass over the same hour writes nothing. Effort **M**, not S.
 3. `netpath/nodesdb.py:1398` — add `record_metric_samples(device_id, rows)` (one `metrics` upsert pass, one `executemany`, one commit); call it once from `_poll_device` with the poll's accumulated rows.
-4. `netpath/nodepoll.py:690-721` — wrap the loop body in `try/except Exception as exc: self.error = str(exc); self.log.add(ERROR, ...)`; continue.
+4. `netpath/nodepoll.py:690-721` — wrap the loop body in `try/except Exception as exc: self.error = str(exc); self.log.add(ERROR, ...)`; continue, and clear `self.error` on the next clean pass. The first draft pointed at `monitor.py:376-402` as the pattern to copy; that is only half true — `monitor.py` has the `try/except` but no error field, so the status half is new code and `status_text()` has to learn to render it.
 5. `netpath/nodepoll.py:1642-1645` — on `is_v1`, issue the IF-MIB GET and the ifXTable GET separately, tolerating `noSuchName` on the second, as `_identity_extras` (`:1211-1229`) already does.
-6. `netpath/nodepoll.py:1145, 2453, 2492` — use `engine_time + int(now - learned_at)`; on a Report, rediscover and retry once in the same call.
+6. `netpath/nodepoll.py:1145, 2453, 2492` — use `engine_time + int(now - learned_at)`. There are **three** v3 send sites, not one, and the second half of the fix is missing from two of them: only `_snmp_get` has any Report-PDU handling at all; `_snmp_get_next` and `_walk_request` have none, so a Report arriving there is decoded as an ordinary response with no varbinds and the poll silently returns nothing. Doing this properly means one `_v3_exchange()` helper used by all three, which invalidates the cached engine parameters, rediscovers, retries once, and raises a typed failure on a second Report with the `usmStats*` OID decoded (#8). Effort **M**, not S.
 7. `netpath/nodepoll.py:82-97` — compare `response.request_id` to the sent id and `_addr[0]` to `self.ip`; keep receiving until the deadline on mismatch. Thread the v3 `msgID` the same way. Verify inbound v3 digests with `trapdecode.find_auth_span` + HMAC as the trap receiver does.
 8. `netpath/nodepoll.py:917` — classify `status = "unsupported"` from the exception type (`SnmpUnsupported`), and decode the Report's `usmStats*` OID into a real message in `_snmp_get`.
 9. `netpath/nfdecode.py:150` — add `DecodeError` to the except tuple; `netpath/collector.py:185` — wrap the receive body in `try/except Exception`, count and log. Same for `snmptrapd._receive`/`_enqueue` and `syslogd._receive_udp`/`_enqueue`.
 10. `netpath/nfdecode.py:316-337` — treat `fixed is not None and fixed <= 0` as a broken template: count, drop the cache entry, return `[]`; refuse `count == 0` templates at `:250-265`.
 11. `netpath/nfdecode.py:409-411` — choose the address field by content: skip `None`, `b""` and all-zero bytes before falling back.
-12. `netpath/syslogdb.py:482-484, 504-506` — replace `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` with per-row `'delete'` entries for the ids removed (collect with `RETURNING id`).
+12. `netpath/syslogdb.py:482-484, 504-506` — replace `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` with per-row `'delete'` entries for the rows removed. `RETURNING id` alone is not enough: an FTS5 external-content `'delete'` command must be given **the original column values as well as the rowid**, so the DELETE has to be `RETURNING id, message, app, host, source` and each returned row replayed into `logs_fts`. `RETURNING` needs SQLite ≥ 3.35, so the statement needs a `sqlite3.sqlite_version_info` guard with the existing rebuild kept as the fallback — throttled to at most once an hour, since that is the 18.6 s stall. Effort **S/M**, not S.
 13. `netpath/alertengine.py:499, 520` — loop the drain until `max_id` is reached or a per-tick budget expires; expose `max_id - cursor` as `backlog` in `counters`.
 14. `netpath/snmptrapd.py:194-231` — after the community check, drop rows whose `auth_state == "failed"` when a new `reject_failed_auth` setting (default on) is set; count them.
 15. `netpath/alertengine.py:504-509` — `entity_id = f"{row['source']}:{row['trap_oid']}"`, `severity=row["severity"]`, `device_name=<resolved>`; `:1116` — extend the severity gate to `kind in ("syslog", "trap")`; `trap_link_down_unmanaged` gets `nodes_db.device_by_ip(source) is None`.
@@ -687,7 +886,7 @@ Documented only, per the reviewer's instruction. Each is CONFIRMED unless noted.
 20. `netpath/alertengine.py:672-676` — treat a metric whose `last_ts` is older than 3 × the device's poll interval as absent: clear the streak and resolve.
 21. `netpath/alertengine.py:1042-1051` — while `nodes_db.device(id)["status"] == "down"`, keep `ROLLS_UP` children suppressed even if the parent alert was operator-resolved.
 22. `netpath/alertmail.py:132-138` — `total = int(round(total))` before the `<= 0` test. `:104-108` — append `%z`.
-22a. `netpath/alertsdb.py:217-222` — bind `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down` and `interface_flapping` to a new generic template (`subject: "SappiWhere: {{rule_name}} — {{entity_label}}"`) instead of `device_down`; seed `mib_missing` with `notify = 0`.
+22a. `netpath/alertsdb.py:217-221`, `:223` (and the wireless rules at `:243`, `:248`) — bind `device_auth_fail`, `device_unsupported`, `poll_overrun`, `mib_missing`, `interface_down` and `interface_flapping` to a new generic template (`subject: "SappiWhere: {{rule_name}} — {{entity_label}}"`) instead of `device_down`. Note `:222` is `interface_up`, which is bound to `device_up` and is correct — the first draft's `217-222` swept it in. **Two things make this more than a one-line edit.** First, `_seed_rules()` is `INSERT OR IGNORE`, so editing the seed list changes nothing on an existing database: the re-binding needs a named, run-once migration that re-points only rules still bound to the shipped `device_down` template, so an operator's own choice is never overwritten. Second, `notify = 0` for `mib_missing` is not a value that exists — `rules` has no `notify` column, so it must be added through `_migrate()` and honoured in `_notify()`. Effort **S/M**, not S.
 22b. `netpath/auth.py:180-193` — accept a `heartbeat` on any authenticated API request that carries an `X-Sappiwhere-Client: script` header, or add long-lived API tokens (`api_tokens` table, `Authorization: Bearer`), so automation is not signed out by the browser idle rule.
 23. `netpath/web/server.py:_route` — when `app_db.user(username)["must_change"]`, refuse every route except `/api/session`, `/api/logout`, `/api/state`, `/api/password`.
 24. `netpath/web/server.py:48-56` — return `("settings", W)` for any scope `post_settings` does not dispatch explicitly; `api.py:841-862` — filter the returned settings through the same rule `get_state` uses.
@@ -695,7 +894,7 @@ Documented only, per the reviewer's instruction. Each is CONFIRMED unless noted.
 26. `netpath/web/api.py:3265-3298` — refuse to use the stored SMTP password when the body overrides host/port/security; reject `smtp_security` values that disable transport security when a password will be sent.
 27. `netpath/__main__.py:20-27` — `os.makedirs(folder, mode=0o700)`; `os.chmod(path, 0o600)` after every `sqlite3.connect`. `:177-180` — delete the "no authentication yet" lines; `web/server.py:8-10` likewise.
 28. `netpath/configrx.py:78, 105-120` — guard `_paramiko_ok` with the module lock or derive it from `paramiko_identity()`.
-29. `netpath/configrx.py:288-299` — persist host keys in `configrx.db`, pin on first success, refuse or require acknowledgement on change; default `allow_legacy_ssh` to false.
+29. `netpath/configrx.py:288-299` — **RESOLVED UPSTREAM in 4.36.x.** Host keys are persisted in `configrx.db` by `netpath/hostkeys.py`, pinned on first sight, refused on change, and forgettable through an action gated on `configrx: write`; ConfigRX and the SSH terminal share the store. What is **not** done and remains in scope: `allow_legacy_ssh` still defaults to true, and `_paramiko_ok` is still an unlocked cache (#28).
 30. `netpath/trapoids.py:51, 174` — `1.3.6.1.2.1.15.3.1.7` is `bgpPeerRemoteAddr`; `bgpPeerState` is `1.3.6.1.2.1.15.3.1.2`; move the enum.
 31. `netpath/syslogd.py:236-244` — require the byte after the count to be `<` before treating a prefix as an RFC 6587 length. `:210-221` — cap client threads and prune the list.
 32. `netpath/syslogparse.py:168-188` — loop over consecutive `[...]` elements; `:131-142` — accept 5 parts with an empty MSG; `:91-109` — clamp 3164 timestamps to now ± 1 h.
@@ -707,7 +906,7 @@ Documented only, per the reviewer's instruction. Each is CONFIRMED unless noted.
 38. `netpath/web/api.py` device create/update — validate `snmp_version` against `{0, 1, 3, "1", "2c", "3"}` and coerce.
 39. `netpath/web/static/app.css:264` — `.hint { color: var(--muted) }`; `nav { overflow-x: auto }`.
 40. `tests/test_nodepoll_e2e.py:219` — set `ping_enabled=0` on the profile (or patch the ping function as `test_nodediscover_e2e.py:104` does).
-41. Docs: delete `README.md:99-103, 280-293, 453-460, 592`; rewrite `FEATURES.md:1141-1143`; strike or commit the Playwright tests claimed in `PERFORMANCE_REVIEW.md:69-79, 93-95`; correct `NETWORK-AND-STORAGE-REQUIREMENTS.md:269-270`; correct `FEATURES.md:94-96`; note in `NETWORK-AND-STORAGE-REQUIREMENTS.md` that on non-Windows hosts no credential feature is available and that the collectors are IPv4-only; add a ConfigRX backup row to `CREDENTIAL-SECURITY.md`'s inventory.
+41. Docs: delete the `deploy\` script references at `README.md:99-103, 453-460` and document Linux/systemd and Windows NSSM instead; **keep** `README.md:280-293` (the NetFlow shortcuts) and implement them, since the README has promised them for four releases; delete `README.md:592` and `FEATURES.md:1850` ("Export window to CSV"); rewrite `FEATURES.md:1141-1143`; strike or commit the Playwright tests claimed in `PERFORMANCE_REVIEW.md:69-79, 93-95`; correct `NETWORK-AND-STORAGE-REQUIREMENTS.md:269-270`; correct `FEATURES.md:94-96`; note in `NETWORK-AND-STORAGE-REQUIREMENTS.md` that on non-Windows hosts no credential feature is available and that the collectors are IPv4-only; add a ConfigRX backup row to `CREDENTIAL-SECURITY.md`'s inventory; and correct `CREDENTIAL-SECURITY.md:573`, which says the application performs "no update check" while the Update button calls `selfupdate.latest_commit()` against `api.github.com` on every press (D25). Add what D16–D22 say is missing: a table of contents per long document, a `QUICKSTART.md`, a `BACKUP-RESTORE.md` for the ten WAL databases, and a `RUNBOOK.md`.
 
 ---
 
@@ -726,6 +925,22 @@ These are genuinely good and should survive any refactor.
 - **NetPath** path monitoring, silent-hop collapsing, refused-vs-no-reply distinction with hatching, point-in-time snapshots, window-relative hop aging, and the honest exclusion of `error`/`overrun` from reachability.
 - **UI details**: the presence-based idle timeout with a countdown banner, bulk alert handling with server-reported counts and a warning that "Acknowledge all" ignores the filter, mute state surfaced in the Nodes table, empty states that name the next action, one confirm shape for destructive actions, draggable persistent splitters, and the 4.35 help panel as a mechanism.
 - **Documentation candour**: `FEATURES.md`'s "Deliberate limits", `NETWORK-AND-STORAGE-REQUIREMENTS.md` (verified accurate on ports), and `CREDENTIAL-SECURITY.md`'s argued trade-offs. The load-bearing comments throughout the code explain *why*, which is what made a review of this depth possible in a day.
+
+---
+
+## 9. What was implemented
+
+This section is filled in as the work lands. One row per finding actually closed,
+naming the step from the implementation plan, the commit that closed it and the
+test that proves it. A finding with no row here is still open; a finding closed
+by 4.36.x rather than by this work says so in the Commit column.
+
+| Finding | Step | Commit | Test |
+|---|---|---|---|
+| | | | |
+
+Findings deliberately **not** implemented, with the reason, belong in the
+follow-on list at the end of §6 rather than here.
 
 ---
 
@@ -757,3 +972,110 @@ the v1 and misbehaving-agent cases, Playwright DOM audits at 2,000 devices, and
 decoder fuzzers) informed §4; the numbers quoted there come from those runs on a
 Linux container with a local filesystem and are therefore optimistic for a
 Windows host or a network share.
+
+
+## Appendix C — review of this review
+
+This report was re-read against the code and against the reviewers' own notes
+before any of it was implemented, on the principle that a document which asks for
+three weeks of work should survive the same scrutiny it applies. It mostly did.
+What follows is everything the re-review changed, so that anyone holding an
+earlier copy can tell which numbers moved and why.
+
+### Withdrawn
+
+- **"At this tier the 50,000-row global cap had not yet bitten"** (§3.2). Wrong,
+  and wrong in the safe direction. The cap had bitten at every tier; the row
+  counts quoted are the few minutes of writes that landed after the last prune,
+  not history retained. Replaced with the measured window (7.8 / 9.1 / 11.9
+  minutes) and the surviving samples per metric.
+- **"~680 devices … measured end to end"** (§3.3). Extrapolated, not measured:
+  the tiers were 250, 1,000 and 2,000, so no run bracketed it. Softened to
+  "consistent with", with the two things that *were* measured stated instead.
+- **"430–630 devices/s" seeding** (§2.2). A warm-cache micro-benchmark that no
+  tier reproduced. The tiers measured 333 / 43 / 27 per second.
+- **"Each forged v3 trap costs a 1 MiB hash"** (§4.2 C-S2). Only true for a trap
+  claiming a *configured* v3 user name; an unknown name returns "unverified"
+  before any derivation (`trapdecode.py:659-662`). The finding stands with the
+  precondition stated; the attacker model does not.
+- **"as `monitor.py:376-402` does"** (§4.1 P-S2, §7 #4). `monitor.py` guards its
+  loop but sets no error field, so there was no pattern to copy and the status
+  half of the fix is new work.
+- **"Thirteen special devices"** (§2.1) against a table of eleven rows.
+
+### Corrected
+
+| What | Was | Is |
+|---|---|---|
+| Samples surviving a prune per metric, 2,000 devices | 1.29 | **0.29** (50,000 ÷ 171,910 metrics) |
+| Batched-write speed-up | 62× | **69×** (2,181/s → 150,832/s) |
+| Fleet write requirement at 2,000 devices, 60 s | 3,233/s (97 metrics/device assumed) | **~2,870/s** (≈86 metrics/device measured) |
+| Commits per poll cycle, fleet-wide | ~288,000 | **~172,000** |
+| Alert tick cost | 0.85 s and 0.96 s quoted as if identical | both are ~200 metrics/device runs; ≈**0.40 s** at the 86/device measured |
+| `mib_missing` at 250 devices | 234 and 235 used interchangeably | **235** alert rows, **234** emails |
+| `alertsdb.py` non-outage template bindings | `217-222` | `217-221`, `223` (`:222` is `interface_up`, correctly bound) |
+| `_poll_interfaces` worst case | "77 min at defaults" beside a 2-attempt measurement | 75 min for 500 ports at the shipped 3.0 s × 3 attempts; the assumption is now stated |
+| `/api/alerts` limit | "300" and "2,000" in different sections | default **300**, hard cap **2,000**; both stated together |
+| `PUBLIC_PATHS` | `server.py:245` | `server.py:260` in the 4.36.1 tree |
+| `_evaluate_thresholds` | `alertengine.py:646-705` | function is `615-705` |
+| Effort estimates | S | **M** for §7 #2 and #6; **S/M** for #12, #22a and §4.1 P-S8 |
+| Finding identifiers | `B1`/`S1`/`N1`/`F1` reused across five sections | prefixed `P-` `C-` `A-` `S-` `X-` `U-`, all 34 cross-references updated |
+| Tags | 99 of 149 rows untagged, §4.5 entirely untagged | every row tagged; the preamble now says what the tags mean |
+
+Two cross-references were simply pointing at the wrong finding: §1's note about
+the ping shim cited §4.3 F27 (the onboarding storm) where it meant §4.1 P-N11,
+and §4.6's ConfigRX `_paramiko_ok` race carried a `D`-series identifier that
+belongs to the documentation-truth table. It is now U-F36.
+
+### Added
+
+- **Twenty finding rows** the first draft dropped although its own reviewers had
+  written them up: §4.5 X-F9, X-F13, X-F14, X-F16, X-F18, X-F23, X-F24, X-F25,
+  X-F26, X-F27; §4.6 U-F8, U-F9, U-F11, U-F14, U-F25, U-F26, U-F30, U-F35; §4.4
+  S-N16 (community strings returned in full to `nodes: read`). The §4.6 rows that
+  had been merged — "F5/F6" and "F15–F18" — are split, so U-F5, U-F6, U-F15,
+  U-F16, U-F17, U-F18 and U-F19 each stand on their own.
+- **Ids for the eleven documentation-truth rows that had none or shared one**:
+  D11, D14, D23, D24, and D16–D22 split into seven.
+- **D25**, a documentation claim the first draft missed: `CREDENTIAL-SECURITY.md`
+  says the application performs "no update check" while the Update button calls
+  `api.github.com` on every press.
+- **The §3 caveat paragraph** ("What the numbers do not mean"), the table of the
+  six settings the campaign overrode, and the note that the per-step columns do
+  not sum to the run totals.
+- **§1's statement that the software moved to 4.36.1** during the review, and
+  **RESOLVED UPSTREAM** marks on the findings that release closed.
+- **§9**, for what is actually implemented.
+
+### Not carried forward
+
+Three findings the reviewers raised are absent from §4 and are recorded here
+rather than lost: `namelookup.reverse` mutating the process-global socket
+timeout from eight threads (PLAUSIBLE, `namelookup.py`); the traceroute
+worst-case guidance being calibrated for serial probes (PLAUSIBLE); and
+`performance` F17's `/api/state` fan-out, which *is* carried as X-F17. The first
+two are read-only observations with no reproduction and no owner; they belong to
+the fresh-eyes pass below.
+
+### Files this review never read
+
+The report's 395 `file:line` references touch most of the package and miss
+twenty-five files entirely. Four of them did not exist when the review started
+and are the most security-relevant code in the product — an interactive shell
+carried over a WebSocket. The table is filled in from the fresh-eyes pass.
+
+| File | Why it matters | Findings |
+|---|---|---|
+| `netpath/sshterm.py` | new in 4.36.0; PTY-backed SSH sessions, per-account caps | *pending* |
+| `netpath/web/wsock.py` | new in 4.36.0; the WebSocket upgrade, Origin check and framing | *pending* |
+| `netpath/hostkeys.py` | new in 4.36.0; the host-key store both SSH paths trust | *pending* |
+| `netpath/web/static/ssh.js` | new in 4.36.0; terminal front end and vendored xterm.js | *pending* |
+| `netpath/mibparse.py` | a parser reachable from `POST /api/nodes/mibs`, never fuzzed | *pending* |
+| `netpath/snmptrapdb.py` | same FTS-rebuild shape as `syslogdb`? (§4.2 C-B4) | *pending* |
+| `netpath/ipamdb.py`, `netpath/ipam_worker.py` | the IPAM write path and its sweep worker | *pending* |
+| `netpath/appdb.py` | users, sessions, hostname cache | *pending* |
+| `netpath/vendorid.py`, `netpath/enterprises.py` | praised in §8 without being read | *pending* |
+| `netpath/console.py`, `netpath/analysis.py`, `netpath/namelookup.py` | unreviewed | *pending* |
+| `netpath/web/static/netpath.js` | the largest JS file, absent from the ARIA audit | *pending* |
+| `netpath/web/static/netflow.js`, `snmp.js`, `syslog.js`, `debug.js` | unreviewed | *pending* |
+| `netpath/mibs/*.mib` | shipped content, never validated | *pending* |
