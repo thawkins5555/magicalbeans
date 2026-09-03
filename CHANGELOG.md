@@ -2,6 +2,100 @@
 
 Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`. A guide to what the application does is in `FEATURES.md`, and how it does it in `INTERNALS.md`. How credentials are protected is in `CREDENTIAL-SECURITY.md`.
 
+## Contents
+
+- [4.37.0 — unreleased](#4370-unreleased)
+- [4.36.1 — Review of the SSH terminal](#4361-review-of-the-ssh-terminal)
+- [4.36.0 — SSH from the device pane, with host keys that are remembered](#4360-ssh-from-the-device-pane-with-host-keys-that-are-remembered)
+- [4.35.0 — A question mark beside the setting](#4350-a-question-mark-beside-the-setting)
+- [4.34.1 — Starts again on an existing database](#4341-starts-again-on-an-existing-database)
+- [4.34.0 — Resolves that stick, MAC tables you can afford, charts that hold still](#4340-resolves-that-stick-mac-tables-you-can-afford-charts-that-hold-still)
+- [4.33.1 — Tests you can actually run](#4331-tests-you-can-actually-run)
+- [4.33.0 — How long it was down, loss you can see, and paths that alert](#4330-how-long-it-was-down-loss-you-can-see-and-paths-that-alert)
+- [4.32.0 — Know what you are polling](#4320-know-what-you-are-polling)
+- [4.31.0 — Mute a device, sustain a threshold, find a MAC](#4310-mute-a-device-sustain-a-threshold-find-a-mac)
+- [4.30.0 — Tables you can shape, identity you can point at an OID](#4300-tables-you-can-shape-identity-you-can-point-at-an-oid)
+- [4.29.0 — Backups that wait for the whole config, and one alert per outage](#4290-backups-that-wait-for-the-whole-config-and-one-alert-per-outage)
+- [4.28.1 — The OID browser actually walks, and two buttons that said nothing](#4281-the-oid-browser-actually-walks-and-two-buttons-that-said-nothing)
+- [4.28.0 — Which paramiko, vendor identification, an OID browser, per-AP latency, checkboxes](#4280-which-paramiko-vendor-identification-an-oid-browser-per-ap-latency-checkboxes)
+- [4.27.0 — Alert checkboxes, MAC tables that answer, per-destination windows, NetFlow speed](#4270-alert-checkboxes-mac-tables-that-answer-per-destination-windows-netflow-speed)
+- [4.26.0 — Named exporters, coloured tooltips, Scan radios, 15 more MIB vendors, legacy SSH](#4260-named-exporters-coloured-tooltips-scan-radios-15-more-mib-vendors-legacy-ssh)
+- [4.25.0 — Confirmations everywhere, a MIB catalog, ping-measured packet loss](#4250-confirmations-everywhere-a-mib-catalog-ping-measured-packet-loss)
+- [4.24.0 — Wireless AP lifecycle and table controls, leaner Nodes detail, ConfigRX fixes](#4240-wireless-ap-lifecycle-and-table-controls-leaner-nodes-detail-configrx-fixes)
+- [4.23.0 — Custom-MIB polling, MAC address table, ConfigRX bulk edit, bug fixes](#4230-custom-mib-polling-mac-address-table-configrx-bulk-edit-bug-fixes)
+- [4.22.0 — Per-module permissions, Wireless module, ConfigRX module, device status timeline](#4220-per-module-permissions-wireless-module-configrx-module-device-status-timeline)
+- [4.21.0 — Hostname resolution fixes, IPAM reorder/chart, Ctrl+click bulk select, recipients list](#4210-hostname-resolution-fixes-ipam-reorderchart-ctrlclick-bulk-select-recipients-list)
+- [4.20.0 — Bulk resolve alerts, poll-on-add, false recovery fix, syslog severity fix](#4200-bulk-resolve-alerts-poll-on-add-false-recovery-fix-syslog-severity-fix)
+- [4.19.0 — Syslog Host column cross-referenced from Nodes/DNS](#4190-syslog-host-column-cross-referenced-from-nodesdns)
+- [4.18.0 — Bulk device operations, offline filter, chart smoothing, IPAM tooltip fix](#4180-bulk-device-operations-offline-filter-chart-smoothing-ipam-tooltip-fix)
+- [4.17.1 — Code-review fixes for the 4.17.0 chart work](#4171-code-review-fixes-for-the-4170-chart-work)
+- [4.17.0 — Combined in/out graphs, chart fixes, sortable interfaces](#4170-combined-inout-graphs-chart-fixes-sortable-interfaces)
+- [4.16.0 — Discovery scan controls, cancel/discard flow, debug visibility](#4160-discovery-scan-controls-canceldiscard-flow-debug-visibility)
+- [4.15.0 — Selected-device fast poll, interface drill-down dialog, visible splitters](#4150-selected-device-fast-poll-interface-drill-down-dialog-visible-splitters)
+- [4.14.0 — Device naming, discovery approval flow, detail-field settings](#4140-device-naming-discovery-approval-flow-detail-field-settings)
+- [4.13.0 — Discovery profiles, node groups, debug visibility, bundled MIBs](#4130-discovery-profiles-node-groups-debug-visibility-bundled-mibs)
+- [4.12.0 — Multiple SNMP credentials per polling profile](#4120-multiple-snmp-credentials-per-polling-profile)
+- [4.11.3 — A silent hop is no longer flagged "MTR: High Loss"](#4113-a-silent-hop-is-no-longer-flagged-mtr-high-loss)
+- [4.11.2 — The application database's own size shown on Settings](#4112-the-application-databases-own-size-shown-on-settings)
+- [4.11.1 — Live MTR coloring on the route graph, ASN fallback names](#4111-live-mtr-coloring-on-the-route-graph-asn-fallback-names)
+- [4.11.0 — Nodes and Alerts](#4110-nodes-and-alerts)
+- [4.10.0 — SNMP trap receiver](#4100-snmp-trap-receiver)
+- [4.9.3 — NetPath flash on reload actually fixed this time](#493-netpath-flash-on-reload-actually-fixed-this-time)
+- [4.9.2 — No more NetPath flash on reload](#492-no-more-netpath-flash-on-reload)
+- [4.9.1 — Sign-in always opens on Dashboard](#491-sign-in-always-opens-on-dashboard)
+- [4.9.0 — DHCP leased-IP trend chart, tab persists on reload, Dashboard tab](#490-dhcp-leased-ip-trend-chart-tab-persists-on-reload-dashboard-tab)
+- [4.8.1 — Resizable Syslog and NetFlow columns](#481-resizable-syslog-and-netflow-columns)
+- [4.8.0 — Flow-to-path correlation, continuous per-hop probing, ASN/owner lookup](#480-flow-to-path-correlation-continuous-per-hop-probing-asnowner-lookup)
+- [4.7.0 — Scope sort by IP, half-width buttons, IPAM as a DNS fallback](#470-scope-sort-by-ip-half-width-buttons-ipam-as-a-dns-fallback)
+- [4.6.0 – 4.6.3 — DHCP reformatted to match Subnets & Hosts](#460-463-dhcp-reformatted-to-match-subnets-hosts)
+- [4.5.0 – 4.5.1 — Find: search IPAM by hostname, IP or MAC](#450-451-find-search-ipam-by-hostname-ip-or-mac)
+- [4.5.2 – 4.5.7 — DHCP Test Connection: reliability and readable errors](#452-457-dhcp-test-connection-reliability-and-readable-errors)
+- [4.4.0 — A blocking restart dialog, and an IPAM database cap](#440-a-blocking-restart-dialog-and-an-ipam-database-cap)
+- [4.2.0 – 4.3.6 — A self-update button](#420-436-a-self-update-button)
+- [2.7.0 — Three IPAM display bugs fixed](#270-three-ipam-display-bugs-fixed)
+- [2.6.0 — Live agent visibility on Debug, per-subnet utilization charts, and a way to reset a subnet's inventory](#260-live-agent-visibility-on-debug-per-subnet-utilization-charts-and-a-way-to-reset-a-subnets-inventory)
+- [2.5.0 — A stored credential option for DHCP polling](#250-a-stored-credential-option-for-dhcp-polling)
+- [2.4.0 — IPAM: discovery, conflicts, read-only Windows DHCP](#240-ipam-discovery-conflicts-read-only-windows-dhcp)
+- [2.3.0 — Idle sign-out for the web login](#230-idle-sign-out-for-the-web-login)
+- [2.2.0 — Substring search, sortable flow records](#220-substring-search-sortable-flow-records)
+- [2.1.0 — Application data split out of the trace database](#210-application-data-split-out-of-the-trace-database)
+- [2.0.0 — Browser interface](#200-browser-interface)
+- [4.1.0 — Database sizes on show, and a storage document](#410-database-sizes-on-show-and-a-storage-document)
+- [4.0.1 — Overlapping labels, and browsers holding stale scripts](#401-overlapping-labels-and-browsers-holding-stale-scripts)
+- [4.0.0 — Sign-in, local users, and thresholds on the NetPath page](#400-sign-in-local-users-and-thresholds-on-the-netpath-page)
+- [3.4.1 — A console window flashed for every trace](#341-a-console-window-flashed-for-every-trace)
+- [3.4.0 — Run without a terminal window](#340-run-without-a-terminal-window)
+- [3.3.1 — The Syslog page laid out sideways](#331-the-syslog-page-laid-out-sideways)
+- [3.3.0 — Deployment, versions, and a drag-select fix](#330-deployment-versions-and-a-drag-select-fix)
+- [3.2.1 — A long status could hide the module buttons](#321-a-long-status-could-hide-the-module-buttons)
+- [3.2.0 — Syslog listener and volume settings](#320-syslog-listener-and-volume-settings)
+- [3.1.0 — The desktop application becomes a service console](#310-the-desktop-application-becomes-a-service-console)
+- [3.0.0 — SappiWhere, Syslog, and resizable panels](#300-sappiwhere-syslog-and-resizable-panels)
+- [2.3.0 — Overrunning traces, and Save at the top](#230-overrunning-traces-and-save-at-the-top)
+- [2.2.0 — Template age, port names, reverse-DNS fallbacks](#220-template-age-port-names-reverse-dns-fallbacks)
+- [2.1.0 — Per-module refresh rates](#210-per-module-refresh-rates)
+- [2.0.4 — Hover panels in the browser](#204-hover-panels-in-the-browser)
+- [2.0.3 — Wheel zoom on both time axes](#203-wheel-zoom-on-both-time-axes)
+- [2.0.2 — Route graph pan and wheel zoom in the browser](#202-route-graph-pan-and-wheel-zoom-in-the-browser)
+- [2.0.1 — Browser interface fixes](#201-browser-interface-fixes)
+- [1.15.0 — Names in the flow table](#1150-names-in-the-flow-table)
+- [1.14.0 — Interface corrections](#1140-interface-corrections)
+- [1.13.0 — Settings restructured by scope](#1130-settings-restructured-by-scope)
+- [1.12.0 — Settings tab](#1120-settings-tab)
+- [1.11.0 — Adjustable concurrency and timeouts](#1110-adjustable-concurrency-and-timeouts)
+- [1.10.0 — Elapsed time for running traces](#1100-elapsed-time-for-running-traces)
+- [1.9.0 — Refused vs no reply](#190-refused-vs-no-reply)
+- [1.8.0 — Debug page](#180-debug-page)
+- [1.7.0 — Zoom that survives a refresh](#170-zoom-that-survives-a-refresh)
+- [1.6.0 — Wheel-free zoom on NetFlow](#160-wheel-free-zoom-on-netflow)
+- [1.5.0 — NetFlow module](#150-netflow-module)
+- [1.4.0 — Point-in-time snapshots](#140-point-in-time-snapshots)
+- [1.3.0 — Three timeline lanes](#130-three-timeline-lanes)
+- [1.2.0 — Readability](#120-readability)
+- [1.1.0 — One block per poll](#110-one-block-per-poll)
+- [1.0.1 — Names and silent hops](#101-names-and-silent-hops)
+- [1.0.0 — Initial release](#100-initial-release)
+
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
@@ -14,6 +108,40 @@ Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`)
 
 - `netpath/dbopen.py`: one `connect()` helper that opens a database and narrows the file and its WAL/SHM companions to owner-only (0600) on POSIX hosts. Modules adopt it as they are touched.
 - `netpath/dbmaint.py`: `enable_incremental_vacuum()` converts a database to incremental auto-vacuum once, and `reclaim()` frees pages in short locked steps followed by a WAL truncate, replacing the whole-file `VACUUM` that stalled every writer during prunes and size trims.
+
+#### Alerts
+
+- *(pending — filled from workstream A)*
+
+#### Poller and storage
+
+- *(pending — filled from workstream B)*
+
+#### Collectors
+
+- *(pending — filled from workstream C)*
+
+#### Security
+
+- *(pending — filled from workstream D)*
+
+#### Web UI
+
+- *(pending — filled from workstream E)*
+
+#### Documentation
+
+- **`REVIEW-NETWORK-ENGINEER.md` corrected in place.** The review that motivates this release was itself re-reviewed before any of it was implemented. Finding identifiers are prefixed by section (`P-` poller, `C-` collectors, `A-` alerts, `S-` security, `X-` performance, `U-` UX and documentation), because `B1`, `S1`, `N1` and `F1` each meant three different things and the report's own cross-references were ambiguous; all 34 cross-references follow, and two of them pointed at the wrong finding. Every row is now tagged CONFIRMED or PLAUSIBLE, which the preamble had promised and 99 of 149 rows did not carry, and the preamble says exactly what the two words mean. Twenty rows the reviewers wrote and the first draft dropped are restored. Nine numbers that contradicted each other are reconciled in place with the measurement and the reason — the surviving samples per metric at 2,000 devices is 0.29, not 1.29; batching is 69× faster, not 62×; there are eleven scripted special devices, not thirteen. Five effort estimates were understated and say so. §3 gains a "what the numbers do not mean" paragraph and the table of six settings the campaign overrode; §1 states that the software moved to 4.36.1 mid-review and marks what that release already closed; Appendix C records what was withdrawn, corrected and added; §9 records what is implemented as it lands.
+- **Sixteen documentation claims the code contradicts are corrected**, each verified by grep rather than by memory. The two `deploy\` PowerShell scripts `README.md` told you to run never existed, and there is no `deploy/` directory — the shortcut and remote-update sections now describe what to actually do, and "Running as a service" gains a real NSSM recipe beside the systemd unit. "Data > Export window to CSV" does not exist, in any tab. `FEATURES.md` claimed CPU and memory came from "UCD-SNMP-MIB **or HOST-RESOURCES-MIB**" when `HOST_RESOURCES` was defined and never referenced, and still said there was "no SNMP polling yet" and "no alerting engine yet" three years after both shipped. `INTERNALS.md` said SNMPv3 engine parameters "only need refreshing if the target reboots", which is true of the engine id and false of the engine time — the reason every v3 device failed about every third poll. `NETWORK-AND-STORAGE-REQUIREMENTS.md` estimated 150 bytes per syslog message against 455 measured, and promised an hourly rollup that had no caller. `PERFORMANCE_REVIEW.md` twice claimed work was "verified with a Playwright test" that was not in the repository. `CREDENTIAL-SECURITY.md` said the application performs "no update check" while the Update button calls GitHub on every press.
+- **Three new documents**, from the seven the review found missing. `QUICKSTART.md` takes a new installation from unpacked to first device polled, first path watched and first alert emailed — including the point at which a Linux host stops being able to store a credential. `BACKUP-RESTORE.md` covers the ten WAL databases: why copying a `.db` on its own gives a torn backup, `sqlite3 .backup` for a live instance, the restore order, and what DPAPI means for a restore onto different hardware. `RUNBOOK.md` is twelve symptoms an operator can see on a screen and what to do about each — poller stopped, collector stopped unexpectedly, kernel drops, alert backlog, empty charts, disk full, mail stopped, a changed SSH host key, a saturated poll pool, an alert flood, nobody can sign in, a corrupt database.
+- **A table of contents** in `README.md`, `FEATURES.md`, `INTERNALS.md` and this file. `INTERNALS.md` is 245 KB and had no way in.
+- **`CREDENTIAL-SECURITY.md` gains three sections.** §6a says what is inside a stored ConfigRX backup — a device's own communities, enable secrets, TACACS and RADIUS keys and IPsec pre-shared keys, which were never SappiWhere's credentials and so never went through DPAPI — and what the new redaction pass does and does not cover. §8a describes the audit log. §10 sets out, for the first time in one place, exactly what a non-Windows host cannot do, and why a portable secret store was designed and deliberately deferred rather than shipped weakly. The credential inventory at the top of the file gains the backups row it was missing.
+- **A CI workflow** (`.github/workflows/tests.yml`). `tests/run_all.py` on ubuntu-latest and windows-latest against Python 3.11 and 3.12, with `iputils-ping` installed on Linux deliberately — the suite that used to fail wherever `ping` existed now has to keep passing with it there — and a second job that stands up the demo fleet and runs the browser checks in `tests/ui/`. There was no CI, no Makefile and no build file of any kind before this.
+- **`demo/seed.py --defaults`** seeds a fleet without tuning anything the application ships: 120-second poll interval, 3.0 s timeout, 2 retries, MAC walks off, 16 poll workers, 300 seconds of new-device grace, 60 emails an hour, and the built-in `cpu_high` and `response_time_high` thresholds untouched. The verification campaign runs once with it, so the report carries a like-for-like column beside the tuned run rather than only numbers taken under six overrides. `demo/README.md` tabulates the difference.
+- `tests/README.md` gains a row for each new suite, a section on the browser checks, and a correction: "no `ping` binary" described the machine the suites were written on, not a property of the suites.
+- **`netpath/mibs/NOTICE.md`.** Eighteen of the twenty-one bundled MIB modules are other people's work — IETF standards-track modules redistributed under the Simplified BSD terms of BCP 78, IEEE Std 802.1AB, IANA's `IANAifType-MIB`, and Net-SNMP's `UCD-SNMP-MIB` — and they shipped with no attribution or licence notice of any kind, while the vendored xterm.js beside them correctly ships its MIT licence. Three of them carry no copyright block inside the file either. `INTERNALS.md` now points at the notice from the same paragraph that covers xterm.js.
+- **What "high confidence" means in vendor identification, corrected.** `enterprises.VERIFIED`'s docstring claimed every arc was read from the vendor's own MIB text; the repository contains vendor MIB text for exactly one of its 53 arcs, and that claim is what `confidence: high` in the device pane rests on. `INTERNALS.md` and `FEATURES.md` now say what the two tiers actually rest on — both hand-authored from IANA's public registry, high meaning cross-checked against a real device's sysObjectID or a bundled MIB, medium meaning not — and why the arc number is always shown beside the name.
+- **A third "there is no authentication yet".** The review found the two in `__main__.py` and `web/server.py`; there is another in `console.py`, under the listener card, repainted every second. All three are recorded in the report's documentation-truth table; the strings themselves belong to the modules that print them.
 
 ### 4.36.1 — Review of the SSH terminal
 
@@ -1126,6 +1254,11 @@ all that is needed to finish it.
   happened to sort first alphabetically.
 
 ### 4.21.0 — Hostname resolution fixes, IPAM reorder/chart, Ctrl+click bulk select, recipients list
+
+> **Ctrl+click bulk select was removed in 4.28.0** — row checkboxes replaced it,
+> and no Ctrl-click handler ships any more. This heading is left as written
+> because a changelog records what happened; if you arrived here looking for how
+> to multi-select, it is the checkbox in each row's first column.
 
 - **Fixed the Syslog Host column not showing a device's SNMP-polled
   name.** The lookup logic was already correct, but it was wired behind

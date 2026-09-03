@@ -66,16 +66,21 @@ signature and falls back to a full rebuild for that row, since a cell-level
 diff isn't meaningful across a different column set. Cache entries for
 devices no longer present are pruned each draw.
 
-Verified with a Playwright test driving the actual production
-`index.html`/`app.js`/`nodes.js` in a real Chromium browser (network calls
-intercepted and mocked), proving via live DOM node reference identity
-(`document.body.contains()`/`td.contains()` on captured node handles, not
-just comparing rendered HTML strings) that: an unchanged refresh reuses every
-row and every cell untouched; a refresh with one field changed on one device
-reuses that row's `<tr>` and patches only the changed cell, leaving its other
-cells and every other device's row completely untouched; a reorder moves
-existing nodes rather than recreating them; and device removal/re-addition
-behave correctly with no cache corruption.
+This was verified at the time in a browser, against the production
+`index.html`/`app.js`/`nodes.js` with network calls intercepted, checking live
+DOM node reference identity rather than comparing rendered HTML strings: an
+unchanged refresh reuses every row and every cell untouched; a refresh with one
+field changed on one device reuses that row's `<tr>` and patches only the
+changed cell; a reorder moves existing nodes rather than recreating them; and
+device removal and re-addition behave correctly with no cache corruption.
+
+**That verification was never committed.** Earlier editions of this document
+said "verified with a Playwright test" as though the test were in the
+repository; it was not, and a reader looking for it found nothing. The browser
+checks now live in `tests/ui/walk.mjs`, run by the `ui-walk` job in
+`.github/workflows/tests.yml` against a seeded demo fleet, and `tests/README.md`
+says how to run them locally. Treat the paragraph above as a record of what was
+observed in September 2026, and `tests/ui/` as the thing that keeps it true.
 
 ### Pre-merge review (2026-09-02) — 4 findings, all verified and addressed
 
@@ -90,8 +95,10 @@ all four held up.
    recomputed markup matched the stale cache, the cell was left alone, and
    the box stayed in the wrong state. I had originally removed the explicit
    `box.checked = …` sync as redundant — it wasn't. Restored, unconditionally.
-   Covered by a new Playwright test exercising both the reported case
-   (hand-tick → Clear) and its mirror (select-all → hand-untick → select-all).
+   Covered by a browser check exercising both the reported case (hand-tick →
+   Clear) and its mirror (select-all → hand-untick → select-all). As above,
+   that check was not committed at the time; it is now part of
+   `tests/ui/walk.mjs`.
 
 2. **Events endpoint silently changed contract**
    (`interface_events_for_device`). The first version replaced "newest 300

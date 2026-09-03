@@ -24,13 +24,10 @@ INCREMENTAL = 2
 def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool:
     """Switch ``conn``'s database to incremental auto-vacuum.
 
-    A database with no pages yet takes the pragma directly.  Any database
-    that already has a page — including an *empty* one that a
-    ``PRAGMA journal_mode=WAL`` has already touched, which is every caller
-    that goes through ``dbopen.connect`` — needs one ``VACUUM`` to rebuild
-    the page map, instant on an empty file and a one-time startup cost on a
-    populated one, logged either way.  Returns True when the database is in
-    incremental mode afterwards.
+    A new (empty) database takes the pragma directly.  An existing database
+    created with ``auto_vacuum=NONE`` needs one ``VACUUM`` to rebuild the
+    page map — a one-time cost at startup that is logged.  Returns True when
+    the database is in incremental mode afterwards.
     """
     try:
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
@@ -40,13 +37,17 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
         return True
     try:
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        pages = conn.execute("PRAGMA page_count").fetchone()[0]
-        if pages > 0:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode != INCREMENTAL:
+            # The pragma only takes effect on a database with no pages at
+            # all. A WAL-mode file already has its first page by the time
+            # the caller gets here, so a VACUUM (cheap on a new file, a
+            # one-time cost on an old one) is what actually converts it.
             started = time.monotonic()
             conn.execute("VACUUM")
             log.info("%s: converted to incremental auto-vacuum in %.1f s",
                      label or "database", time.monotonic() - started)
-        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+            mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         log.warning("%s: could not enable incremental vacuum: %s", label or "database", exc)
         return False

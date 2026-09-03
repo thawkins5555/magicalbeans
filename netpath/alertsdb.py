@@ -21,17 +21,26 @@ import sqlite3
 import threading
 import time
 
+from . import dbmaint
+from . import dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
-    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'
+    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
     source_kind     TEXT,                   -- meaning depends on kind, see nodesdb/alertrules
     severity        INTEGER NOT NULL DEFAULT 4,   -- syslog 0-7 scale, shared across every module
     enabled         INTEGER NOT NULL DEFAULT 1,
     is_builtin      INTEGER NOT NULL DEFAULT 0,
     device_filter   TEXT NOT NULL DEFAULT '',
+    -- Whether this rule's alerts send email at all. A rule can be worth
+    -- recording and not worth mailing about: mib_missing opens on every
+    -- device with a recognised enterprise arc and no uploaded MIB, which on
+    -- a fresh 250-device install is 234 emails in the first minute about a
+    -- housekeeping task.
+    notify          INTEGER NOT NULL DEFAULT 1,
     threshold       REAL,
     clear_threshold REAL,
     for_polls       INTEGER NOT NULL DEFAULT 1,
@@ -45,6 +54,13 @@ CREATE TABLE IF NOT EXISTS rules (
     -- for_polls" — the same NULL-is-the-shipped-default convention as the
     -- two flapping columns above. See alertrules.evaluate_threshold.
     for_seconds          INTEGER,
+    -- Resolve an alert this rule opened once its last occurrence is this
+    -- many seconds old. NULL (the default, and right for every rule about a
+    -- STATE) means never: a device that is still down must stay open until
+    -- it comes back. Set for the rules about a momentary EVENT — a reboot,
+    -- a recovery notice, a trap — where nothing will ever clear the alert
+    -- because the thing it reports already finished happening.
+    auto_resolve_after_s INTEGER,
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     created_ts      REAL NOT NULL
 );
@@ -80,7 +96,16 @@ CREATE TABLE IF NOT EXISTS alerts (
     acked_by        TEXT,
     ack_note        TEXT,
     resolved_ts     REAL,
-    resolved_by     TEXT
+    resolved_by     TEXT,
+    -- When a notification was last SUBMITTED for this alert, which is not
+    -- last_ts: open_or_increment refreshes last_ts on every recurrence, so
+    -- comparing against it made renotify_minutes unsatisfiable. See
+    -- alerts_due_renotify.
+    last_notified_ts REAL,
+    -- The occurrence's template extras as JSON, so a renotify raised by the
+    -- per-tick sweep (rather than by a fresh occurrence) can still render
+    -- {{value}}, {{trap_name}} and the rest.
+    extra_json      TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS ix_alerts_state_ts ON alerts(state, last_ts);
 CREATE INDEX IF NOT EXISTS ix_alerts_rule ON alerts(rule_id);
@@ -110,6 +135,15 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Migrations that cannot run inside _migrate() because they depend on the
+-- built-in templates and rules having been seeded first (_migrate runs
+-- before _seed_templates/_seed_rules, and must, since seeding needs the
+-- columns it adds). Each runs once, ever, keyed by name.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name       TEXT PRIMARY KEY,
+    applied_ts REAL NOT NULL
 );
 
 -- A DPAPI blob cannot live in the generic JSON `settings` table alongside
@@ -148,6 +182,14 @@ DEFAULTS = {
     # metric — leaving one "Device not responding". See alertrules.ROLLED_UP_BY
     # for exactly which, and why interface alerts are not among them.
     "rollup_enabled": True,
+    # A metric sample older than this is treated as absent by the threshold
+    # evaluator: the streak resets and no occurrence is raised from it. Not a
+    # multiple of the poll interval, because the interval is per profile and
+    # per device while this is one number an operator can reason about; 900 s
+    # is comfortably longer than the shipped 120 s interval with room for a
+    # slow poll and a missed one. 0 disables the check, restoring the
+    # pre-4.37 behaviour of alerting from a value of any age.
+    "threshold_stale_s": 900,
     # Comma-joined column keys the alert table shows; "" means the
     # frontend's defaults. Lives here rather than in the browser's
     # localStorage so it sits beside the rest of the module's settings
@@ -200,27 +242,34 @@ MAX_MUTE_HOURS = 24.0
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
-                  "flap_window_s", "flap_min_transitions")
+                  "flap_window_s", "flap_min_transitions", "auto_resolve_after_s",
+                  "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 32 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
+# 35 built-in rules: 8 device_event + 3 interface_event + 11 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold. Each `template` name is a
+# 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
-# one, since only 5 ship; an admin can point any rule at any template.
+# one, since only 6 ship; an admin can point any rule at any template.
 _BUILTIN_RULES = [
     # key, name, kind, source_kind, severity, template, threshold, clear_threshold, for_polls
     ("device_down", "Device not responding", "device_event", "down", 1, "device_down", None, None, 1),
     ("device_up", "Device recovered", "device_event", "up", 5, "device_up", None, None, 1),
     ("device_rebooted", "Device rebooted", "device_event", "rebooted", 4, "device_rebooted", None, None, 1),
-    ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "device_down", None, None, 1),
-    ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "device_down", None, None, 1),
-    ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "device_down", None, None, 1),
-    ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "device_down", None, None, 1),
-    ("interface_down", "Interface down", "interface_event", "link_down", 3, "device_down", None, None, 1),
+    ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "event_notice", None, None, 1),
+    ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "event_notice", None, None, 1),
+    ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "event_notice", None, None, 1),
+    ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "event_notice", None, None, 1),
+    # A device that answers ping while SNMP fails is invisible to
+    # device_down (which is about reachability) and to every threshold rule
+    # (whose metrics simply stop arriving), so the most common half-failure
+    # in a fleet had no rule at all. The poller records an snmp_error device
+    # event for it.
+    ("snmp_failing_ping_ok", "SNMP failing while the device answers ping", "device_event", "snmp_error", 3, "event_notice", None, None, 1),
+    ("interface_down", "Interface down", "interface_event", "link_down", 3, "event_notice", None, None, 1),
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
-    ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "device_down", None, None, 1),
+    ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("mem_high", "Memory utilization high", "threshold", "mem_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("if_in_util_high", "Interface inbound utilization high", "threshold", "if_in_util_pct", 4, "threshold_breach", 90.0, 80.0, 2),
@@ -240,12 +289,12 @@ _BUILTIN_RULES = [
     ("trap_link_down_unmanaged", "Link-down trap from an unmanaged device", "trap", "linkDown", 3, "trap_forwarded", None, None, 1),
     ("syslog_critical", "Critical syslog message", "syslog", "", 2, "trap_forwarded", None, None, 1),
     ("ipam_new_conflict", "New IPAM address conflict", "ipam", "", 4, "trap_forwarded", None, None, 1),
-    ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "device_down", None, None, 1),
+    ("wireless_ap_removed", "Access point removed from its controller", "wireless_event", "ap_removed", 3, "event_notice", None, None, 1),
     # Distinct from ap_removed, and deliberately not rolled up under it: "the
     # controller lost this AP" and "the controller has it but it is not
     # working" are different facts with different remedies. An AP marked out
     # of service raises neither.
-    ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "device_down", None, None, 1),
+    ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "event_notice", None, None, 1),
     # DHCP scope utilization, as a percentage of the scope's address range
     # that is leased or reserved. Its own kind rather than a "threshold"
     # rule because the threshold evaluator reads Nodes' metrics table for a
@@ -288,6 +337,19 @@ _BUILTIN_RULES = [
     ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 100.0, 3),
     ("netpath_path_unstable", "NetPath path repeatedly failing", "netpath_threshold", "trace_unreached_pct", 4, "threshold_breach", 50.0, 20.0, 1),
     ("netpath_latency_high", "NetPath latency far above normal", "netpath_threshold", "trace_rtt_warn_pct", 4, "threshold_breach", 300.0, 150.0, 3),
+    # kind='system' is the application reporting on itself. Its occurrences
+    # come from AlertEngine.system_occurrence rather than from a source
+    # cursor, and source_kind is the rule key so one system condition matches
+    # one system rule. No email is ever sent for a system rule (see
+    # AlertEngine._notify): this one exists precisely because email is not
+    # working, and the others would be reporting a fault in the machinery
+    # they would have to use.
+    ("smtp_failing", "Alert email is not being delivered", "system", "smtp_failing", 2, "event_notice", None, None, 1),
+    # Raised by the poller when every worker is busy and the queue is not
+    # draining: polls are being skipped, so every other rule in this table is
+    # quietly evaluating stale data. Its own rule rather than a log line,
+    # because "why did nothing alert" deserves an answer on the Alerts page.
+    ("poll_pool_saturated", "Polling pool saturated — polls are being skipped", "system", "poll_pool_saturated", 3, "event_notice", None, None, 1),
 ]
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
@@ -301,8 +363,77 @@ _BUILTIN_RULES = [
 # mean "this link is lossy" rather than "a packet went missing".
 _BUILTIN_FOR_SECONDS = {"packet_loss_high": 60}
 
+# Shipped auto_resolve_after_s, kept apart from _BUILTIN_RULES for the same
+# reason as _BUILTIN_FOR_SECONDS. Absent means NULL, which is "never".
+#
+# Eleven built-in rules had no auto-resolve path at all: not in the CLEARS
+# map, and not a threshold that can drop below a clear value. A device that
+# went down and came back left a "Device recovered" alert (severity 5,
+# "responding again at ...") sitting in the open list until somebody clicked
+# Resolve, and on a fleet with normal daily flapping that is hundreds of rows
+# a day of pure bookkeeping — after which the open count stops meaning
+# "things that are wrong" and people stop reading the badge.
+#
+# Every rule here reports a momentary EVENT rather than a state, so the
+# question "is it still true" has no answer: it happened, once, at a known
+# time. The intervals are how long that fact is worth keeping in front of an
+# operator, which is why a reboot (worth noticing tomorrow morning) outlasts
+# a recovery notice (worth noticing this shift) and an unsupported-privacy
+# verdict (a procurement problem, not an incident) outlasts both.
+#
+# Deliberately absent: device_down, mib_missing, device_auth_fail,
+# interface_down and every threshold. Those are states with a real clear —
+# a device answering, a MIB uploaded, a value dropping — and expiring one
+# would mean closing an alert about a fault that is still happening.
+_BUILTIN_AUTO_RESOLVE_S = {
+    "device_up": 3600,
+    "device_rebooted": 86400,
+    "device_unsupported": 604800,
+    "poll_overrun": 3600,
+    "interface_up": 3600,
+    "interface_flapping": 1800,
+    "trap_critical": 86400,
+    "trap_cold_start": 3600,
+    "trap_link_down_unmanaged": 86400,
+    "syslog_critical": 86400,
+    "ipam_new_conflict": 604800,
+    # Both of these report a CONDITION through repeated events rather than
+    # through a state with a clear, so last_ts is what says whether it is
+    # still happening: while the condition holds the events keep arriving and
+    # the alert stays current, and when it stops the alert closes on its own.
+    # An hour is comfortably longer than any poll interval; fifteen minutes
+    # matches how quickly a poll pool recovers once the backlog clears.
+    "snmp_failing_ping_ok": 3600,
+    "poll_pool_saturated": 900,
+}
+
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
-                         "threshold_breach", "trap_forwarded")
+                         "threshold_breach", "trap_forwarded", "event_notice")
+
+# key -> the template a rule was bound to BEFORE 4.37, for the rules whose
+# shipped binding changed to event_notice. The migration only re-points a
+# rule still on exactly this template, so an admin who has already pointed
+# one somewhere of their own keeps their choice.
+_EVENT_NOTICE_REBIND = {
+    "device_auth_fail": "device_down",
+    "device_unsupported": "device_down",
+    "poll_overrun": "device_down",
+    "mib_missing": "device_down",
+    "interface_down": "device_down",
+    "interface_flapping": "device_down",
+    "wireless_ap_removed": "device_down",
+    "wireless_ap_offline": "device_down",
+    # New in this release and never in an operator's hands bound to
+    # trap_forwarded, whose body would render three empty trap fields.
+    "smtp_failing": "trap_forwarded",
+}
+
+# Rules that ship with email off. mib_missing is the onboarding storm: every
+# device with a recognised enterprise arc and no uploaded MIB opens one on
+# its first poll, which is 234 alerts and 234 emails within a minute of
+# seeding 250 devices. The alerts are useful — they are the to-do list for
+# MIB uploads — and mailing them is not.
+_BUILTIN_NOTIFY_OFF = ("mib_missing",)
 
 # Template text as shipped by the PREVIOUS release, verbatim, for every
 # built-in whose wording has since changed.
@@ -332,18 +463,46 @@ class AlertsDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # dbopen.connect narrows the file (and its -wal/-shm companions) to
+        # the owner: this database holds the SMTP credential blob and every
+        # recipient address, and the process umask was leaving it 0644.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._enable_incremental_vacuum()
             self._conn.executescript(SCHEMA)
             self._conn.executescript(PENDING_SCHEMA)
             self._migrate()
             self._conn.commit()
         self._seed_templates()
         self._seed_rules()
+        self._run_named_migrations()
+
+    def _enable_incremental_vacuum(self) -> None:
+        """dbmaint.enable_incremental_vacuum, with the empty-file case covered.
+
+        auto_vacuum can only be changed on a database that has no tables yet,
+        or by a VACUUM that rewrites the file — and in WAL mode the pragma
+        alone does not take even on an empty file. dbopen.connect switches to
+        WAL as it opens, so it can tighten the -wal/-shm modes immediately,
+        which means by the time this runs a brand-new alerts.db is already in
+        WAL. The helper's own VACUUM fallback is guarded on page_count > 1
+        and therefore does not fire for a file that has only its header page,
+        so without this a fresh install would stay on auto_vacuum=NONE and
+        trim_to_size would reclaim nothing. One VACUUM of an empty file costs
+        nothing; on an existing database the helper has already handled it.
+        """
+        if dbmaint.enable_incremental_vacuum(self._conn, "alerts"):
+            return
+        try:
+            if self._conn.execute("PRAGMA page_count").fetchone()[0] <= 1:
+                self._conn.execute("VACUUM")
+                dbmaint.enable_incremental_vacuum(self._conn, "alerts")
+        except sqlite3.DatabaseError:
+            pass
 
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created.
@@ -355,10 +514,16 @@ class AlertsDatabase:
         """
         rules = {row["name"] for row in
                  self._conn.execute("PRAGMA table_info(rules)").fetchall()}
-        for column in ("flap_window_s", "flap_min_transitions", "for_seconds"):
+        for column in ("flap_window_s", "flap_min_transitions", "for_seconds",
+                       "auto_resolve_after_s"):
             if column not in rules:
                 self._conn.execute(
                     f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
+        if "notify" not in rules:
+            self._conn.execute(
+                "ALTER TABLE rules ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
+            self._conn.execute(
+                "UPDATE rules SET notify = 0 WHERE key = 'mib_missing'")
         if "for_seconds" not in rules:
             # Seed the shipped default onto an existing database, so an
             # install that already has alerts.db gets sustained packet loss
@@ -369,6 +534,12 @@ class AlertsDatabase:
         self._migrate_templates()
         alerts = {row["name"] for row in
                   self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        for column, kind, default in (("last_notified_ts", "REAL", None),
+                                      ("extra_json", "TEXT", "'{}'")):
+            if column not in alerts:
+                self._conn.execute(
+                    f"ALTER TABLE alerts ADD COLUMN {column} {kind}"
+                    + (f" NOT NULL DEFAULT {default}" if default else ""))
         if "rollup_note" not in alerts:
             # What this alert absorbed, one line per rolled-up alert. Its own
             # column rather than appended to `detail`, which open_or_increment
@@ -382,6 +553,150 @@ class AlertsDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_alerts_dedup_state"
             " ON alerts(dedup_key, state, resolved_ts)")
+
+    # Post-seed migrations, in the order they were introduced. A migration
+    # belongs here rather than in _migrate() when it has to read or rewrite
+    # the seeded built-ins — _migrate runs before seeding and has to, because
+    # seeding needs the columns it adds.
+    def _named_migrations(self) -> tuple:
+        return (
+            ("rekey_trap_syslog_alerts_1", self._rekey_trap_syslog_alerts),
+            ("seed_auto_resolve_1", self._seed_auto_resolve),
+            ("rebind_event_notice_1", self._rebind_event_notice),
+        )
+
+    def _run_named_migrations(self) -> None:
+        for name, run in self._named_migrations():
+            with self._lock:
+                done = self._conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE name = ?",
+                    (name,)).fetchone()
+            if done:
+                continue
+            run()
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(name, applied_ts)"
+                    " VALUES (?,?)", (name, time.time()))
+                self._conn.commit()
+
+    def _note(self, alert_id: int, line: str) -> None:
+        """add_rollup_note without its own transaction, for use inside a
+        migration that is already holding the lock and batching a commit."""
+        row = self._conn.execute(
+            "SELECT rollup_note FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        existing = (row["rollup_note"] if row else "") or ""
+        if line in existing.split("\n"):
+            return
+        merged = (existing + "\n" + line).strip() if existing else line
+        self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",
+                           (merged, alert_id))
+
+    def _seed_auto_resolve(self) -> None:
+        """Give the shipped momentary-event rules their auto-resolve interval
+        on a database that already existed.
+
+        _seed_rules is INSERT OR IGNORE, so it cannot reach a rule that is
+        already there; this is the other half. Only where the column is still
+        NULL and only on built-ins, so an operator who has already chosen an
+        interval (or deliberately blanked one) keeps their choice.
+        """
+        with self._lock:
+            for key, seconds in _BUILTIN_AUTO_RESOLVE_S.items():
+                self._conn.execute(
+                    "UPDATE rules SET auto_resolve_after_s = ? WHERE key = ?"
+                    " AND is_builtin = 1 AND auto_resolve_after_s IS NULL",
+                    (seconds, key))
+            self._conn.commit()
+
+    def _rebind_event_notice(self) -> None:
+        """Move the non-outage rules off the "is not responding" template.
+
+        Only a rule still bound to exactly the template it shipped with is
+        moved — the same "an operator's edit is not ours to touch" rule
+        _migrate_templates already follows for template text. A rule someone
+        has already pointed at a template of their own keeps that binding.
+        """
+        with self._lock:
+            templates = {row["key"]: row["id"] for row in self._conn.execute(
+                "SELECT key, id FROM templates").fetchall()}
+            target = templates.get("event_notice")
+            if target is None:
+                return
+            for key, previous_key in _EVENT_NOTICE_REBIND.items():
+                previous = templates.get(previous_key)
+                if previous is None:
+                    continue
+                self._conn.execute(
+                    "UPDATE rules SET template_id = ? WHERE key = ?"
+                    " AND is_builtin = 1 AND template_id = ?",
+                    (target, key, previous))
+            self._conn.commit()
+
+    def _rekey_trap_syslog_alerts(self) -> None:
+        """Bring open trap and syslog alerts onto the 4.37 dedup keys.
+
+        Trap alerts were keyed on the trap OID alone and syslog alerts on the
+        sending host alone; both now carry the source and, for syslog, a
+        signature of the message. Leaving the old rows alone was not an
+        option: their keys can never match again, so they would sit open
+        forever while a new row opened beside each of them.
+
+        Syslog rows are re-keyed exactly — the stored message is the same
+        message the signature is computed from, so the operator's open alert
+        keeps its history, its count and its acknowledgement. Two old rows
+        that map onto one new key (the same host, two messages that share a
+        signature) cannot both exist, since one open alert per dedup key is a
+        database constraint; the later one is resolved with a note saying so.
+
+        Trap rows cannot be re-keyed at all: the old key never recorded which
+        device sent the trap, and that fact is not recoverable from the row.
+        They are resolved with an explanation. resolved_by is '' throughout,
+        the same convention every engine auto-resolve uses, so none of this
+        is mistaken for a hand resolve later.
+        """
+        from .alertrules import syslog_signature
+        now = time.time()
+        with self._lock:
+            rules = {row["id"]: row["key"] for row in
+                     self._conn.execute("SELECT id, key FROM rules").fetchall()}
+            taken = {row["dedup_key"] for row in self._conn.execute(
+                "SELECT dedup_key FROM alerts WHERE state IN ('open','acked')"
+            ).fetchall()}
+            rows = self._conn.execute(
+                "SELECT id, rule_id, dedup_key, entity_id, message FROM alerts"
+                " WHERE state IN ('open','acked') AND entity_kind IN ('trap','syslog')"
+                " ORDER BY id").fetchall()
+            for row in rows:
+                rule_key = rules.get(row["rule_id"])
+                if not rule_key:
+                    continue
+                if row["dedup_key"].startswith(f"{rule_key}:trap:"):
+                    self._conn.execute(
+                        "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                        " resolved_by='' WHERE id=?", (now, row["id"]))
+                    self._note(row["id"], "Resolved on upgrade: trap alerts "
+                                          "are now keyed per source device")
+                    taken.discard(row["dedup_key"])
+                    continue
+                entity_id = f'{row["entity_id"]}:{syslog_signature(row["message"] or "")}'
+                new_key = f"{rule_key}:syslog:{entity_id}"
+                if new_key == row["dedup_key"]:
+                    continue
+                if new_key in taken:
+                    self._conn.execute(
+                        "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                        " resolved_by='' WHERE id=?", (now, row["id"]))
+                    self._note(row["id"], "Resolved on upgrade: another open "
+                                          "alert now covers this message")
+                    taken.discard(row["dedup_key"])
+                    continue
+                self._conn.execute(
+                    "UPDATE alerts SET dedup_key=?, entity_id=? WHERE id=?",
+                    (new_key, entity_id, row["id"]))
+                taken.discard(row["dedup_key"])
+                taken.add(new_key)
+            self._conn.commit()
 
     def _migrate_templates(self) -> None:
         """Bring a built-in template whose shipped wording changed up to date,
@@ -441,11 +756,14 @@ class AlertsDatabase:
                  threshold, clear_threshold, for_polls) in _BUILTIN_RULES:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO rules(key, name, kind, source_kind,"
-                    " severity, enabled, is_builtin, device_filter, threshold,"
-                    " clear_threshold, for_polls, for_seconds, template_id,"
-                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?)",
-                    (key, name, kind, source_kind, severity, threshold,
+                    " severity, enabled, is_builtin, device_filter, notify,"
+                    " threshold, clear_threshold, for_polls, for_seconds,"
+                    " auto_resolve_after_s, template_id,"
+                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?,?)",
+                    (key, name, kind, source_kind, severity,
+                     0 if key in _BUILTIN_NOTIFY_OFF else 1, threshold,
                      clear_threshold, for_polls, _BUILTIN_FOR_SECONDS.get(key),
+                     _BUILTIN_AUTO_RESOLVE_S.get(key),
                      template_ids.get(template_key), now))
             self._conn.commit()
 
@@ -696,7 +1014,13 @@ class AlertsDatabase:
 
     def open_or_increment(self, rule_id: int, dedup_key: str, entity_kind: str,
                           entity_id: str, entity_label: str, severity: int,
-                          message: str, detail: str, ts: float) -> tuple[sqlite3.Row, bool]:
+                          message: str, detail: str, ts: float,
+                          extra: dict | None = None) -> tuple[sqlite3.Row, bool]:
+        """`extra` is the occurrence's template extras, kept on the row so a
+        renotify built by the engine's sweep — which has no occurrence to
+        read them from — renders the same tokens the first notification
+        did."""
+        extra_json = json.dumps(extra or {}, separators=(",", ":"))
         with self._lock:
             existing = self._conn.execute(
                 "SELECT id FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
@@ -704,22 +1028,72 @@ class AlertsDatabase:
             if existing:
                 self._conn.execute(
                     "UPDATE alerts SET count = count + 1, last_ts = ?,"
-                    " entity_label = ?, message = ?, detail = ? WHERE id = ?",
-                    (ts, entity_label, message, detail, existing["id"]))
+                    " entity_label = ?, message = ?, detail = ?, extra_json = ?"
+                    " WHERE id = ?",
+                    (ts, entity_label, message, detail, extra_json, existing["id"]))
                 self._conn.commit()
                 row = self._conn.execute(
                     "SELECT * FROM alerts WHERE id = ?", (existing["id"],)).fetchone()
                 return row, False
             cur = self._conn.execute(
                 "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
-                " entity_label, severity, message, detail, opened_ts, last_ts)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " entity_label, severity, message, detail, opened_ts, last_ts,"
+                " extra_json)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (rule_id, dedup_key, entity_kind, entity_id, entity_label,
-                 severity, message, detail, ts, ts))
+                 severity, message, detail, ts, ts, extra_json))
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
             return row, True
+
+    def mark_notified(self, alert_id: int, ts: float | None = None) -> None:
+        """Stamp when a notification was last submitted for this alert.
+
+        Written at SUBMIT rather than on delivery: what renotify measures is
+        "how long since we last told anyone", and a message sitting in the
+        sender queue has already been told. Kept apart from last_ts, which
+        every recurrence refreshes.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE alerts SET last_notified_ts = ? WHERE id = ?",
+                (time.time() if ts is None else ts, alert_id))
+            self._conn.commit()
+
+    def alerts_due_renotify(self, cutoff_ts: float) -> list[sqlite3.Row]:
+        """Open alerts nobody has been told about since cutoff_ts.
+
+        Acknowledged alerts are excluded on purpose: acknowledging is an
+        operator saying "I have this", and continuing to nag them is the
+        thing acknowledgement exists to stop. COALESCE falls back to
+        opened_ts so an alert that opened while email was disabled starts its
+        renotify clock from when it opened, not from never.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alerts WHERE state = 'open'"
+                " AND COALESCE(last_notified_ts, opened_ts) <= ?"
+                " ORDER BY severity, last_ts", (cutoff_ts,)).fetchall()
+
+    def expired_alerts(self, now: float) -> list[sqlite3.Row]:
+        """Alerts whose rule gives them a lifetime that has run out.
+
+        Measured from last_ts, not opened_ts: a trap that keeps arriving is
+        still current, and its alert should expire an hour after the last one
+        rather than an hour after the first. Acknowledged rows are included —
+        acknowledging says "seen", not "keep this forever" — and the sweep
+        that calls this resolves them without a clear email, because nobody
+        needs telling that a week-old reboot notice has been tidied away.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.* FROM alerts a JOIN rules r ON r.id = a.rule_id"
+                " WHERE a.state IN ('open','acked')"
+                " AND r.auto_resolve_after_s IS NOT NULL"
+                " AND r.auto_resolve_after_s > 0"
+                " AND a.last_ts <= ? - r.auto_resolve_after_s",
+                (now,)).fetchall()
 
     def resolve(self, alert_id: int, by: str = "") -> None:
         with self._lock:
@@ -905,6 +1279,20 @@ class AlertsDatabase:
                 (cutoff_ts,)).fetchall()
         return {row["dedup_key"]: row["ts"] for row in rows}
 
+    def open_dedup_keys(self) -> set:
+        """Every dedup_key with an open or acknowledged alert.
+
+        One query for the whole set rather than open_by_dedup per candidate:
+        the threshold evaluator asks "does this already have an alert" for
+        every breaching device on every tick, and during a site outage that
+        is hundreds of lookups a tick for an answer that is almost always
+        yes.
+        """
+        with self._lock:
+            return {row["dedup_key"] for row in self._conn.execute(
+                "SELECT dedup_key FROM alerts WHERE state IN ('open','acked')"
+            ).fetchall()}
+
     def open_by_dedup(self, dedup_key: str) -> sqlite3.Row | None:
         """The open (or acknowledged) alert for this dedup key, if any.
 
@@ -917,6 +1305,14 @@ class AlertsDatabase:
                 "SELECT * FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
                 (dedup_key,)).fetchone()
 
+    # How many lines an alert's rollup note may hold. Distinct lines, not
+    # repeats — those are skipped below — so this only bites where a single
+    # outage genuinely absorbed dozens of different alerts, which since the
+    # topology rollup means a site's worth of downstream devices. The note is
+    # read by a person; past a screenful it stops informing and starts
+    # costing a row rewrite per absorbed alert.
+    MAX_ROLLUP_NOTE_LINES = 50
+
     def add_rollup_note(self, alert_id: int, line: str) -> None:
         """Appends one line to an alert's rollup note, skipping duplicates so
         a flapping device does not grow the same line hundreds of times."""
@@ -926,7 +1322,10 @@ class AlertsDatabase:
             if row is None:
                 return
             existing = row["rollup_note"] or ""
-            if line in existing.split("\n"):
+            lines = existing.split("\n") if existing else []
+            if line in lines:
+                return
+            if len(lines) >= self.MAX_ROLLUP_NOTE_LINES:
                 return
             merged = (existing + "\n" + line).strip() if existing else line
             self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",
@@ -1033,6 +1432,17 @@ class AlertsDatabase:
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest resolved alerts until the file fits, reclaiming
+        the freed pages between passes.
+
+        The reclaim runs OUTSIDE the delete's lock block, not inside it.
+        VACUUM rewrites the whole file under an exclusive lock, and on a
+        connection shared with the engine's tick thread it cannot be issued
+        outside the module lock without interleaving with other statements —
+        which is why it used to sit inside. Incremental vacuum frees pages in
+        short steps that each take and release the lock, so a trim never
+        blocks a write for longer than one step.
+        """
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -1043,15 +1453,18 @@ class AlertsDatabase:
                 total = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM alerts WHERE state = 'resolved'"
                 ).fetchone()["n"]
-                if total <= 500:
-                    break
-                chunk = max(int(total * 0.15), 200)
-                cursor = self._conn.execute(
-                    "DELETE FROM alerts WHERE id IN (SELECT id FROM alerts"
-                    " WHERE state = 'resolved' ORDER BY resolved_ts ASC LIMIT ?)",
-                    (chunk,))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                # A floor, not a target: below this there is nothing left to
+                # delete that is not an operator's own history.
+                exhausted = total <= 500
+                if not exhausted:
+                    chunk = max(int(total * 0.15), 200)
+                    cursor = self._conn.execute(
+                        "DELETE FROM alerts WHERE id IN (SELECT id FROM alerts"
+                        " WHERE state = 'resolved' ORDER BY resolved_ts ASC LIMIT ?)",
+                        (chunk,))
+                    removed += cursor.rowcount or 0
+                    self._conn.commit()
+            if exhausted:
+                break
+            dbmaint.reclaim(self._conn, self._lock, label="alerts")
         return removed

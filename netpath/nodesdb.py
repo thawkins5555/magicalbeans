@@ -473,7 +473,7 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
 # vendor_override is deliberately NOT an _OVERRIDE_COLUMNS entry: a vendor is a
 # fact about one box, not something a polling profile should hand down.
 _DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
-                    "enabled", "vendor_override") + _OVERRIDE_COLUMNS
+                    "enabled", "vendor_override", "upstream_id") + _OVERRIDE_COLUMNS
 
 
 # The separators a MAC address is written with in the wild. '.' covers the
@@ -732,6 +732,27 @@ class NodesDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
             " ON mac_entries(mac, present, seen_ts)")
+        # The alert engine asks for one metric key across the whole fleet
+        # twelve times a minute (metrics_for_keys). Without this the plan is
+        # a full scan of `metrics`, which at 2,000 devices × ~90 keys is
+        # 180,000 rows per lookup; the UNIQUE(device_id, key) index leads
+        # with device_id and cannot serve a key-first query.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key)")
+        # The device this one sits behind: the access switch's uplink, the
+        # site's edge router. Operator-set, nullable, and self-referential
+        # without a foreign key on purpose — a REFERENCES devices(id) here
+        # would need ON DELETE SET NULL to be enforced, and this database
+        # opens with foreign_keys off on some upgrade paths. The alert engine
+        # treats an id that no longer exists as no upstream at all, which is
+        # the same outcome without depending on the pragma.
+        if "upstream_id" not in devices:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN upstream_id INTEGER")
+        # Walked downwards ("what is behind this outage") far more often than
+        # upwards, and the upward walk is by primary key anyway.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_devices_upstream"
+            " ON devices(upstream_id)")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -1076,6 +1097,93 @@ class NodesDatabase:
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM devices WHERE id IN ({marks})", device_ids).fetchall()
+
+    def upstream_chain(self, device_id: int, max_depth: int = 8) -> list[int]:
+        """Device ids above this one, nearest first.
+
+        Cycle-safe and depth-capped, because upstream_id is a free-text-ish
+        operator field with no constraint stopping A -> B -> A: a walk that
+        trusted it would spin forever on the alert engine's tick thread. A
+        cycle simply ends the walk at the repeat, and eight levels is deeper
+        than any real access/distribution/core/edge chain.
+        """
+        chain: list[int] = []
+        seen = {int(device_id)}
+        current = int(device_id)
+        with self._lock:
+            for _ in range(max(0, int(max_depth))):
+                row = self._conn.execute(
+                    "SELECT upstream_id FROM devices WHERE id = ?",
+                    (current,)).fetchone()
+                if row is None or row["upstream_id"] is None:
+                    break
+                parent = int(row["upstream_id"])
+                if parent in seen:
+                    break
+                seen.add(parent)
+                chain.append(parent)
+                current = parent
+        return chain
+
+    def downstream_ids(self, device_id: int, max_total: int = 2000) -> list[int]:
+        """Every device beneath this one, transitively, nearest level first.
+
+        Breadth-first a level at a time rather than one query per device: a
+        site outage asks this once for a core switch with hundreds of access
+        switches behind it. Cycle-safe by the same `seen` set as
+        upstream_chain, and capped so a mis-typed topology cannot turn one
+        outage into an unbounded query.
+        """
+        out: list[int] = []
+        seen = {int(device_id)}
+        frontier = [int(device_id)]
+        with self._lock:
+            while frontier and len(out) < max_total:
+                found: list[int] = []
+                # Chunked: SQLite's bound-variable limit is generous but not
+                # infinite, and a wide level can be thousands of ids.
+                for start in range(0, len(frontier), 500):
+                    batch = frontier[start:start + 500]
+                    marks = ",".join("?" * len(batch))
+                    for row in self._conn.execute(
+                            f"SELECT id FROM devices WHERE upstream_id IN ({marks})"
+                            " ORDER BY id", batch).fetchall():
+                        child = int(row["id"])
+                        if child in seen:
+                            continue
+                        seen.add(child)
+                        out.append(child)
+                        found.append(child)
+                        if len(out) >= max_total:
+                            break
+                    if len(out) >= max_total:
+                        break
+                frontier = found
+        return out
+
+    def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
+        """The newest value of each named metric key, fleet-wide, in one query.
+
+        The alert engine used to read `SELECT * FROM metrics WHERE device_id
+        = ?` once per device per tick — at 2,000 devices and ~90 metrics
+        each, 400,000 full rows every five seconds through the same
+        connection and lock the poller writes with, to evaluate a handful of
+        threshold rules. It reads four columns for the keys that have a rule
+        instead.
+
+        Disabled devices are excluded here rather than by the caller: a
+        device somebody turned off is not being polled, so its last value is
+        by definition stale and must not hold an alert open.
+        """
+        keys = [str(k) for k in keys if k]
+        if not keys:
+            return []
+        marks = ",".join("?" * len(keys))
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
+                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
+                f" WHERE d.enabled = 1 AND m.key IN ({marks})", keys).fetchall()
 
     def device_count(self) -> int:
         with self._lock:

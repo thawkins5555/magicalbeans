@@ -6,6 +6,29 @@ each one actually works — file by file, mechanism by mechanism —
 for the build history, and `CREDENTIAL-SECURITY.md` for exactly how passwords
 and stored credentials are protected.
 
+New in this release: `QUICKSTART.md` takes a new installation from unpacked to
+first device polled, `BACKUP-RESTORE.md` covers the ten database files, and
+`RUNBOOK.md` is what to do at 02:00 when something has stopped.
+
+## Contents
+
+- [NetPath](#netpath) — the traceroute monitor this application started as
+- [Install and run](#install-and-run) · [Accounts](#accounts)
+- [A shortcut with no terminal window](#a-shortcut-with-no-terminal-window)
+- [The service console](#the-service-console)
+- [Using it](#using-it) — [concurrency](#concurrency-and-timeouts), [the three lanes](#the-three-lanes), [snapshots](#snapshot-vs-aggregate), [hop names](#hop-names), [silent hops](#silent-hops)
+- [How status is decided](#how-status-is-decided) · [No reply vs refused](#no-reply-vs-refused)
+- [Dashboard](#dashboard) — the landing page and its tiles
+- [Linking to a device, a port or an alert](#linking-to-a-device-a-port-or-an-alert)
+- [NetFlow](#netflow) — [protocols](#protocol-support), [settings](#settings-1), [views](#views), [zooming](#zooming-without-a-wheel), [storage](#storage), [troubleshooting](#when-no-flows-arrive)
+- [IPAM](#ipam) — [subnets and hosts](#subnets--hosts), [conflicts](#conflicts), [DHCP](#dhcp)
+- [Debug](#debug)
+- [Settings](#settings-2) · [Retention and rollups](#retention-and-rollups)
+- [Updating a remote server](#updating-a-remote-server)
+- [Running as a service](#running-as-a-service) — systemd and NSSM
+- [Layout](#layout)
+- [Notes and limits](#notes-and-limits)
+
 Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Debug**, a live view of what the background threads are doing; and **Settings**.
 
 ## NetPath
@@ -96,14 +119,17 @@ Target:     C:\Python312\pythonw.exe -m netpath
 Start in:   C:\apps\sappiwhere
 ```
 
-`deploy\Install-Shortcut.ps1` builds it, on the desktop and in the Start Menu:
+Make it by hand — right-click the desktop, **New → Shortcut**, paste the target
+above, then set **Start in** on the shortcut's Properties page. Copy it into
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs` for the Start Menu, or into
+`%ProgramData%\Microsoft\Windows\Start Menu\Programs` for every user on the
+machine.
 
-```powershell
-.\deploy\Install-Shortcut.ps1 -Path C:\apps\sappiwhere
-```
-
-Add `-AllUsers` for the shared desktop and Start Menu, or `-StartMenuOnly` to
-skip the desktop.
+(Earlier releases of this file described a `deploy\Install-Shortcut.ps1` that
+would build the shortcut for you. There is no `deploy/` directory in this
+repository and there never was; the reference has been removed rather than
+left to send you looking. On a server you almost certainly want a real service
+instead — see [Running as a service](#running-as-a-service).)
 
 Nothing is lost by hiding the terminal. Everything that would have been printed
 to it — collector errors, tracebacks from a worker — is captured and shown in
@@ -239,6 +265,53 @@ Existing stored traces are not reclassified. Only the verdict is kept in the dat
 One consequence worth knowing: a refused trace often shows 0% loss, because the router that refused did reply. The status lane carries the verdict; the loss lane is measuring something real but not the thing that failed.
 
 Route changes are recorded as a path signature per trace and drawn as ticks, but they do not change the colour on their own — a route change with no latency or loss impact isn't a fault.
+
+## Dashboard
+
+The tab every sign-in lands on, and until 4.37.0 an empty placeholder. It is now
+a grid of tiles built entirely from data the application already had, refreshed
+on its own timer (`dashboard_refresh_s`, five seconds by default, on the
+Settings tab):
+
+| Tile | Shows |
+| --- | --- |
+| **Fleet** | devices up, down, unknown and failing authentication, as counts that link through to the Nodes tab filtered to each |
+| **Open alerts** | a count per severity, coloured by the worst severity open — not by the total, so one severity-1 outage is never hidden behind forty severity-6 notices |
+| **Collectors** | NetFlow, trap and syslog listeners: running or not, packets in, `kernel_dropped` if the kernel has discarded anything, and the alert engine's `backlog` if it is behind |
+| **Storage** | each database's size against its cap, worst first |
+| **Poller** | busy and queued work against the pool size, and whether the pool has been saturated long enough to raise `poll_pool_saturated` |
+| **Top offenders** | ten worst by device events in 24 h, interface events, alerts, round-trip time, packet loss and CPU — six short lists, each row linking to the device |
+
+Every tile is a link. Clicking a count sets the destination tab's filter, so
+"14 down" opens Nodes showing those fourteen rather than the whole fleet.
+
+`kernel_dropped` deserves a note, because it is new and it is the number that
+tells you the truth. A UDP collector that is behind does not lose messages in
+the application — it loses them in the kernel's socket buffer, before any of
+this code sees them, and until 4.37.0 nothing counted that. The listeners now
+read the drop counter for their own bound port every few seconds. A non-zero
+value means messages arrived and were discarded; the application logs the first
+increase as an error and shows the count in the collector's status strip.
+
+## Linking to a device, a port or an alert
+
+The address bar now carries the current selection, so a page can be linked to,
+bookmarked, and pasted into a ticket. Back and Forward work.
+
+| Route | Opens |
+| --- | --- |
+| `#/nodes` | a tab, by name — the same for `#/alerts`, `#/netpath`, `#/netflow`, `#/snmp`, `#/syslog`, `#/ipam`, `#/wireless`, `#/configrx`, `#/debug`, `#/settings` |
+| `#/nodes/device/1234` | that device selected, detail pane open |
+| `#/nodes/device/1234/port/7` | that device with interface index 7 open |
+| `#/alerts/998` | that alert |
+| `#/netpath/12` | that destination's route graph and timeline |
+| `#/configrx/device/1234/backup/57` | one stored backup |
+| `#/snmp/551`, `#/syslog/8802`, `#/wireless/3` | one trap, one message, one access point |
+
+Switching tab pushes a history entry; changing the selection within a tab
+replaces it, so Back leaves the tab rather than walking every row you clicked.
+A route naming something that no longer exists opens the tab and says so
+instead of failing silently.
 
 ## NetFlow
 
@@ -434,6 +507,38 @@ Nothing needs a restart. The trace pool and DNS pool resize live, and the collec
 
 Destination defaults are worth a note: they seed the Add dialog only. Changing them leaves existing destinations alone, which is what you want when adding a batch of similar sites without disturbing what is already running.
 
+### Retention and rollups
+
+Three settings on the Nodes settings dialog decide how much metric history
+survives, and from 4.37.0 they mean what they say.
+
+| Setting | Default | What it bounds |
+| --- | --- | --- |
+| `sample_retention_days` | 3 | how long a raw sample is kept, per sample |
+| `sample_row_cap_per_metric` | 5,000 | the newest N samples **per metric**, not per database |
+| `rollup_retention_days` | 400 | how long the hourly min/avg/max rollups are kept |
+
+The cap is the one that changed. It used to be applied to the `samples` table as
+a whole: 50,000 rows survived each maintenance pass no matter how many devices
+were writing, so on any fleet above a hundred devices almost all history was
+deleted every fifteen minutes and no chart could draw a line. It is now applied
+per metric, in chunks, so each metric keeps its own newest N samples and a large
+fleet does not evict a small one.
+
+The hourly rollup runs. `compact_rollup()` existed since 4.30 and nothing ever
+called it, so `samples_hourly` was always empty and any chart window wider than
+the raw retention returned no points. Maintenance now aggregates each complete
+hour into min, average and max, keeps a watermark so it never re-does work, and
+— importantly — no longer deletes the raw rows it aggregated. Charts read raw
+samples inside three days and hourly rollups beyond that; the settings dialog
+says so beside the retention field.
+
+What this means in practice: a 48-port switch polled every 120 seconds writes
+about 100 metrics per poll, so three days of raw samples is roughly 65 MB per
+1,000 devices, and the hourly rollups that replace them are about a fiftieth of
+that. `NETWORK-AND-STORAGE-REQUIREMENTS.md` has the per-port arithmetic.
+
+
 ## Updating a remote server
 
 Downloading, uploading to OneDrive and downloading again works but is three
@@ -450,18 +555,32 @@ Copy-Item .\sappiwhere\* -Destination C:\apps\sappiwhere -Recurse -Force -ToSess
 Remove-PSSession $s
 ```
 
-`deploy\Update-SappiWhere.ps1` wraps that with the parts that are easy to get
-wrong: it unpacks and sanity-checks the zip before touching anything, stops the
-running service or process, keeps the previous copy as `.bak`, copies, restarts,
-and then asks the server which version it is now running.
+There is no wrapper script for this; earlier releases of this file described a
+`deploy\Update-SappiWhere.ps1`, and no `deploy/` directory exists in the
+repository. Do the same steps by hand, in this order, because the order is the
+part that matters:
 
 ```powershell
-.\deploy\Update-SappiWhere.ps1 -Zip .\sappiwhere.zip `
-    -ComputerName mill-mon-01 -Path C:\apps\sappiwhere -ServiceName SappiWhere
+$s = New-PSSession -ComputerName mill-mon-01
+Invoke-Command -Session $s { Stop-Service SappiWhere }            # 1. stop it
+Invoke-Command -Session $s { Rename-Item C:\apps\sappiwhere C:\apps\sappiwhere.bak }
+Copy-Item .\sappiwhere\* -Destination C:\apps\sappiwhere -Recurse -Force -ToSession $s
+Invoke-Command -Session $s { Start-Service SappiWhere }           # 4. start it
+Remove-PSSession $s
 ```
 
-Leave off `-ComputerName` to update the machine you are on. The databases are
-never touched — they live outside the application folder by default.
+Then confirm the version, as below. The databases are never touched by any of
+this — they live outside the application folder by default, in
+`%APPDATA%\netpath-monitor\`. Read `BACKUP-RESTORE.md` before an upgrade that
+crosses a schema change; the short version is that a copy of the ten `.db` files
+taken while the service is stopped is a complete, restorable backup.
+
+On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
+`systemctl start sappiwhere`. There is also an in-application update path — the
+**Update** button on the Settings tab — which is **disabled by default from
+4.37.0**: it does nothing until an administrator turns on the `updates_enabled`
+setting, and it now pins to a published release tag and verifies the download's
+SHA-256 rather than pulling whatever is at the tip of a branch.
 
 ### A file share, even less setup
 
@@ -499,8 +618,30 @@ reload before concluding that something is missing.
 ## Running as a service
 
 The web mode is a long-running process with no window, so on a server it wants
-a supervisor. On Windows, NSSM or a scheduled task set to run at boot works;
-on Linux, a systemd unit:
+a supervisor.
+
+On **Windows**, [NSSM](https://nssm.cc) is the least surprising option. It wraps
+any executable as a real service with automatic restart:
+
+```
+nssm install SappiWhere C:\Python312\pythonw.exe "-m netpath --web --host 127.0.0.1 --port 8443"
+nssm set SappiWhere AppDirectory C:\apps\sappiwhere
+nssm set SappiWhere Start SERVICE_AUTO_START
+nssm set SappiWhere AppExit Default Restart
+nssm start SappiWhere
+```
+
+Run it as a dedicated low-privilege account, not `LocalSystem`: stored
+credentials are encrypted with DPAPI *for the account that stored them*, so the
+account the service runs as is the account that must store them, and a service
+account that cannot log in interactively is exactly what you want holding them.
+`nssm edit SappiWhere` opens the dialog for that.
+
+A scheduled task set to "run at boot, whether or not the user is logged on"
+also works and needs nothing installed, but it will not restart the process if
+it exits.
+
+On **Linux**, a systemd unit:
 
 ```ini
 [Unit]
@@ -516,8 +657,25 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+Add `User=sappiwhere` and `Group=sappiwhere` and give that account the data
+folder; from 4.37.0 the application creates `~/.local/share/netpath-monitor/`
+mode `0700` and its database files mode `0600`, so a shared server does not
+expose one operator's SNMP communities to another. `systemctl enable --now
+sappiwhere` after `daemon-reload`.
+
 Run this way the service keeps collecting whether or not anyone has a browser
 open, and with no console window to close by accident.
+
+Note what a Linux service **cannot** do: it cannot store any credential.
+Encrypted credential storage is Windows DPAPI only, so SNMPv3 authentication
+passwords, the SSH password ConfigRX and the terminal need, an authenticated
+SMTP password, the wireless controller's SNMP credential and the DHCP
+credential can all be entered on Windows and none of them on Linux. A Linux
+deployment polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a server
+that does not ask for authentication, and does not back up configurations. This
+is a deliberate limitation, not an oversight — `CREDENTIAL-SECURITY.md`
+explains what a portable secret store would have to promise and why the
+application would rather refuse than promise it weakly.
 
 ## Layout
 
@@ -589,12 +747,14 @@ Parsing is tolerant of the common GNU, BSD/macOS and Windows output shapes, incl
 
 Traces run in a thread pool, one in flight per destination. The UI polls the database every two seconds and only rebuilds the route graph when something actually changed.
 
-**Data > Export window to CSV** writes the current window's traces.
-
 Current sizes are shown beside each cap on the Settings tab and in the service
 console. `NETWORK-AND-STORAGE-REQUIREMENTS.md` covers the file locations, what
 each database holds and why, and what bounds their growth. **Delete traces older than 90 days**, under Maintenance on the Settings tab, prunes and vacuums; roughly, one destination traced every five minutes with 15 hops is about 4 MB a month.
 
 ## Worth adding next
 
-Alerting on status transitions; a second graph pane for comparing two destinations that share upstream hops.
+A second graph pane for comparing two destinations that share upstream hops;
+CSV export of the current window's traces. (Alerting on NetPath status
+transitions used to be listed here and has shipped — the rules are
+`netpath_unreachable`, `netpath_path_unstable` and `netpath_latency_high` on the
+Alerts tab.)

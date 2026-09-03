@@ -17,6 +17,7 @@ ways:
 | An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
+| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.37.0 a redaction pass runs over every captured configuration before it is stored, and the content endpoint requires `configrx: write` rather than `configrx: read`. See §6a. |
 
 Everything below explains why each row is true.
 
@@ -464,6 +465,50 @@ one of a short, fixed, read-only list of commands, never anything an
 operator (or an attacker who somehow obtained write access to this
 module) could supply.
 
+## 6a. What is inside a stored configuration backup
+
+A ConfigRX backup is the device's own running configuration, and a network
+device's running configuration is full of secrets that belong to the device
+rather than to SappiWhere. A representative Cisco config holds
+`snmp-server community`, `enable secret`, `username … secret`,
+`tacacs-server key`, `radius-server key`, `crypto isakmp key` and
+`pre-shared-key` lines; a FortiOS one holds `set password` and
+`set psksecret`. Until 4.37.0 all of that was stored as captured, compressed
+with zlib and no more, and served in full to any account with `configrx:
+read`. Compression is not encryption — `zlib.decompress` on the blob returns
+the plaintext — so the backup table was the least protected place in the
+product holding the most valuable material in it.
+
+Three things changed.
+
+**A redaction pass runs before storage.** `configrx_redact.py` rewrites the
+known secret-bearing directives listed above, replacing the secret with
+`<redacted>` and leaving the rest of the line intact so the configuration is
+still readable and still diffable. It runs after capture and before
+`add_backup`, so the unredacted text never reaches the database at all — this
+is not a display filter. Redaction is per-device and can be turned off for a
+device where the whole point of the backup is the key material, deliberately,
+with the setting visible on the device's ConfigRX dialog.
+
+**Be clear about what redaction is and is not.** It is a pattern list. It
+covers the directives above across the vendors ConfigRX supports, and it will
+not cover a directive nobody has thought of, a vendor added later, or a secret
+an operator has put in a description field. A redacted backup is
+*substantially* safer to hand to somebody than an unredacted one; it is not a
+sanitised document you should treat as public. Read it as defence in depth
+underneath the permission change, not as a replacement for it.
+
+**Reading a backup's content now requires `configrx: write`.** Listing which
+backups exist, when they were taken and whether the configuration changed
+stays on `configrx: read`, because that is the useful read-only view; the
+configuration text itself is behind the write grant. This is the one place in
+the product where a read operation deliberately requires a write grant, and it
+is because "read a config backup" is not the same kind of act as "read the
+alert list".
+
+Everything in §6 about the SSH password that *fetches* the backup is
+unchanged, including the host-key store described there.
+
 ## 7. The interactive SSH terminal (Nodes → SSH)
 
 The SSH button on a device opens a real shell in the operator's browser
@@ -570,10 +615,66 @@ the device.
   failure for a nonexistent user still pays the same time cost as a real
   one rather than skipping it for speed.
 - Never persists a session token to disk.
-- Never phones home. There is no telemetry, no update check, and no third
-  party that could be handed a credential even by accident — see
-  `NETWORK-AND-STORAGE-REQUIREMENTS.md` for the complete, closed list of
-  every outbound connection this application makes.
+- **Never phones home.** There is no telemetry: nothing about this
+  installation, its fleet, its operators or its configuration is transmitted
+  anywhere, on any schedule, ever, and there is no third party that could be
+  handed a credential even by accident. See
+  `NETWORK-AND-STORAGE-REQUIREMENTS.md` for the complete, closed list of every
+  outbound connection this application makes.
+
+  **A correction, because an earlier edition of this sentence also said "no
+  update check" and that was not true.** Pressing **Update** on the Settings
+  tab calls `selfupdate.latest_commit()`, which makes an HTTPS request to
+  `api.github.com` to ask what the newest published release is. It is
+  operator-initiated, never scheduled and never automatic; it sends no
+  identifier, no fleet data and no credential — a plain GET with a
+  `User-Agent` — and the reply is a version string. But it *is* an outbound
+  connection to a third party, and the previous wording denied that any
+  existed. From 4.37.0 the whole update path is off unless an administrator
+  turns on the `updates_enabled` setting, so on a default installation the
+  button refuses before it reaches the network, and when it is on it pins to
+  a published release tag and verifies the download's SHA-256 against a
+  `SHA256SUMS` file fetched from the same tag rather than trusting whatever
+  is at the tip of a branch. In an air-gapped deployment, leave
+  `updates_enabled` off and the application makes no outbound connection at
+  all beyond the ones you configure — SNMP, SMTP, DNS, SSH.
+
+## 8a. The audit log
+
+Until 4.37.0 the only record of who did what was `eventlog.py`: a 3,000-entry
+ring buffer in memory. It was fine as a debugging aid and useless as an audit
+trail — it was lost on every restart, any account with `debug: write` could
+clear it, and a single 200 KB field could evict everything else in it.
+
+There is now an append-only `audit` table in `app.db`, written for the actions
+that matter and never trimmed by any retention pass, size cap or maintenance
+action:
+
+| Action | Recorded |
+| --- | --- |
+| Sign-in, success and failure | timestamp, username as supplied, client address |
+| Sign-out | timestamp, username, client |
+| User created, deleted, permissions changed, password reset | actor, target account, what changed |
+| Own password changed | actor |
+| Settings changed | actor, scope, and the keys that changed — **not** the values, so a stored secret is never written to the audit table by the act of storing it |
+| Credential stored or cleared | actor, which credential, which device or profile |
+| Maintenance actions | actor, which action, how many rows it removed |
+| Self-update triggered | actor, the version pinned |
+| Mute, acknowledge, resolve-all | actor, scope of the action |
+
+Six properties are worth stating because they are the ones an auditor asks
+about. The table is **append-only**: no route deletes or updates a row, and
+the maintenance prune does not touch it. It is **never rotated by size**,
+which is a deliberate trade — an audit trail that a busy fortnight can silently
+truncate is not an audit trail; it is bounded instead by capping any single
+message at 512 bytes. Reading it requires the **`admin`** capability, so an
+operator cannot read the record of other operators' actions. It records the
+**username as supplied** on a failed sign-in, including a username that does
+not exist, because a run of attempts against `administrator` is exactly the
+pattern you want to see — and never the password, in any form. It survives a
+restart, which the ring buffer did not. And it is separate from the Debug
+tab's live event view, which still exists, is still in memory, and is now
+filtered to the modules the reading account has a grant for.
 
 ## 9. What is still the administrator's job
 
@@ -611,4 +712,98 @@ things remain outside its reach entirely:
   application can decide on its own. Granting Settings write access in
   particular is granting the ability to change any other account's
   permissions, including its own, so treat it the same way root or
-  domain-admin access would be treated.
+  domain-admin access would be treated. Note that "Settings write" is no
+  longer the top of the tree: from 4.37.0 user administration, permission
+  changes, the update path and the destructive maintenance actions require an
+  explicit **`admin`** capability, which accounts holding Settings write were
+  granted on upgrade, which nobody can grant to themselves, and which the last
+  account holding it cannot be stripped of.
+
+---
+
+## 10. Non-Windows hosts cannot store a credential
+
+This is the largest limitation in this document and it deserves its own
+section rather than a footnote in five others.
+
+Every encrypted credential in the table at the top of this file — the DHCP
+credential, the SNMPv3 authentication password, the SMTP password, the
+wireless controller's SNMP credential, ConfigRX's SSH password, and the
+password the interactive SSH terminal reuses — goes through
+`netpath/dpapi.py`, which is a wrapper over the Windows Data Protection API.
+`dpapi.available()` is `os.name == "nt"`. On Linux, macOS or BSD it returns
+false, and the eight API endpoints that would store a secret refuse with a
+clear error instead.
+
+**So, concretely, on a Linux host:**
+
+| Feature | On Windows | On Linux |
+| --- | --- | --- |
+| SNMP v1/v2c polling | yes | yes |
+| SNMPv3 noAuthNoPriv polling | yes | yes |
+| SNMPv3 authNoPriv polling | yes | **no** — the auth password cannot be stored |
+| Authenticated SMTP for alert email | yes | **no** — relay must accept unauthenticated mail |
+| ConfigRX configuration backups | yes | **no** — the SSH password cannot be stored |
+| The interactive SSH terminal | yes | **no**, for the same reason |
+| Wireless (FortiGate controller) | yes | **no** — the controller's SNMP credential cannot be stored |
+| DHCP scope and lease visibility | yes | **no** — and PowerShell/RSAT is Windows-only anyway |
+
+Everything else — SNMP polling, NetPath, NetFlow, syslog, traps, IPAM
+scanning, alerting, the web interface, the whole browser application — works
+identically on either.
+
+The application tells you this **before** you type a secret, not after: the
+credential fields in the Nodes, Wireless, ConfigRX and Alerts dialogs render
+disabled with the text "Not available on this host (Windows DPAPI only)", and
+IPAM's DHCP form is replaced by a notice off Windows rather than accepting
+input it cannot use. `/api/state` reports `platform: {is_windows, powershell,
+secret_store: false}` so the browser can make that decision without guessing.
+
+### Why there is no portable secret store, yet
+
+A portable secret store was designed for 4.37.0 and **deliberately deferred**.
+The reasoning is worth writing down, because "just encrypt it with a key in a
+file" is the obvious answer and it is the wrong one.
+
+DPAPI's guarantee is specific and strong: the ciphertext can be decrypted only
+by the same Windows account on the same machine, with the key material held by
+the operating system and never present in this application's files. A copy of
+`nodes.db` taken to another machine is inert. Any portable scheme has to be
+honest about giving that up, and each of the three plausible designs gives up
+something different:
+
+- **A key file beside the database** protects against nothing that matters. An
+  attacker who can read `nodes.db` can read `nodes.key` in the same directory.
+  It would move the credentials from "stored in the clear" to "stored in a way
+  that looks encrypted", which is worse, because it invites trust it has not
+  earned.
+- **A passphrase supplied at start-up**, deriving the key with scrypt and
+  holding it in memory only, is genuinely equivalent to DPAPI for the
+  file-theft case. Its cost is that the service cannot start unattended: every
+  restart — a reboot at 03:00, a systemd `Restart=always` after a crash —
+  stops until somebody types the passphrase, and a monitoring system that does
+  not come back by itself after a power cut has failed at its job. Working
+  around that means caching the passphrase somewhere, which is the key file
+  again.
+- **The platform keyring** (libsecret, gnome-keyring, KWallet) is the right
+  answer for a desktop and a poor one for a headless server, where the D-Bus
+  session and the unlocking agent that make it work are usually absent. It
+  also means a third-party dependency, and this application ships on the
+  standard library alone by policy.
+
+None of those is obviously right, and shipping the wrong one is worse than
+shipping none: a credential store that quietly protects less than operators
+believe it does is a bigger problem than a refusal they can plan around. The
+refusal is at least accurate, visible in the interface, and documented here.
+
+**What to do in the meantime.** Run the service on Windows if you need any of
+the credentialed features — that is the supported answer. If it must be Linux,
+use SNMPv1/v2c or v3 noAuthNoPriv with communities scoped read-only on the
+device, and an SMTP relay on the local network that accepts unauthenticated
+mail from the monitoring host by address. From 4.37.0 the data directory is
+created mode `0700` and every database file `0600`, so at least a shared Linux
+host does not expose one service's communities to every account on the
+machine — but note that a community string is not encrypted anywhere, on any
+platform, and is returned by the API to accounts with the **write** grant on
+the module that owns it. Read-only accounts now see only whether a community
+is set, not its value.

@@ -68,7 +68,7 @@ Ports used: **8443** (app), **8099** (fleet control), **1025** (SMTP sink),
 | `fleet.py` | The simulated devices. Binds one UDP socket per address on `127.0.0.2+` and answers SNMP from the persona's OID tree. Control API on `127.0.0.1:8099`. |
 | `generators.py` | NetFlow v5/v9, SNMP traps and syslog senders, as functions and as a CLI. |
 | `bin/ping`, `bin/traceroute` | Scripted stand-ins put at the front of `PATH`, so NetPath traces a network that does not exist. Paths come from `routes.json`. |
-| `seed.py` | Fills a running app over its HTTP API: groups, profiles, devices, NetPath targets, IPAM, wireless, ConfigRX, settings, alert rules, users. |
+| `seed.py` | Fills a running app over its HTTP API: groups, profiles, devices, NetPath targets, IPAM, wireless, ConfigRX, settings, alert rules, users. `--defaults` seeds without tuning anything the application ships — see [Campaign settings vs shipped defaults](#campaign-settings-vs-shipped-defaults). |
 | `ui_walk.mjs` | Drives the browser with Playwright: every tab, every subtab, every dialog, screenshots, console log, timing metrics. |
 | `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the eight incidents, runs `ui_walk.mjs`, writes the report, stops everything. |
 | `.gitignore` | Ignores `out/`. |
@@ -124,11 +124,58 @@ Wait for `SappiWhere serving on http://127.0.0.1:8443/`. First sign-in is
 
 ```bash
 python3 demo/seed.py --base http://127.0.0.1:8443 --count 250 --out demo/out
+python3 demo/seed.py --base http://127.0.0.1:8443 --count 250 --out demo/out --defaults
 ```
 
 Idempotent — re-running it re-reads `demo/out/creds.txt`, skips devices whose
 IP already exists, and refreshes what it can. Every call is appended to
 `demo/out/seed_log.json`.
+
+### Campaign settings vs shipped defaults
+
+By default `seed.py` tunes six things away from what the application ships, so
+that a 20-minute run on a loopback fleet reaches states that would otherwise
+take days. That is the right choice for a demonstration and the wrong one for a
+capacity figure, and it is why the campaign's numbers cannot be read as "what
+this application does at 2,000 devices".
+
+`--defaults` makes none of those changes, so the same nine-step campaign can be
+run once at the shipped configuration and the two columns compared like for
+like.
+
+| Setting | Shipped | Campaign (default) | `--defaults` |
+| --- | --- | --- | --- |
+| profile `poll_interval_s` | 120 s | 60 s | 120 s |
+| profile `snmp_timeout_s` / `snmp_retries` | 3.0 s / 2 | 2 s / 1 | 3.0 s / 2 |
+| profile `mac_table_interval_s` | 0 (off) | 300 s | 0 (off) |
+| `poll_workers` | 16 | 32 (`--workers`) | 16 |
+| `new_device_grace_s` | 300 s | 0 | 300 s |
+| `max_emails_per_hour` | 60 | 10,000 | 60 |
+| `cpu_high` threshold | 90% / clear 80 / 2 polls | 20% / 10 / 1 | 90% / 80 / 2 |
+| `response_time_high` | 500 ms / 300 / 2 | 5 ms / 2 / 1 | 500 ms / 300 / 2 |
+
+What `--defaults` still does, because it is plumbing rather than tuning and the
+run measures nothing without it: points SMTP at the sink on `127.0.0.1:1025`
+so mail can be counted, turns on syslog over TCP so both framings are
+exercised, and starts the alert engine. None of those changes how hard the
+application has to work.
+
+**Run `--defaults` against a fresh database.** It does not *reset* anything — it
+simply makes no override — so pointing it at a database a tuned run already
+seeded leaves that run's 60-second interval and 20% CPU threshold in place.
+`scenario.py` uses a fresh `data-<count>/` per run, so a scenario run is always
+clean.
+
+Two things to expect from a `--defaults` run, neither of which is a fault:
+
+- **`cpu_high` and `response_time_high` never fire.** A net-snmp persona idles
+  far below 90% and loopback round-trip time is about 0.05 ms against a 500 ms
+  threshold. At shipped values the threshold path is genuinely not exercised;
+  that is the honest result, and it is what the lowered thresholds were hiding.
+- **Fewer emails, and a visible cap.** Sixty an hour is reached in the first
+  minute of a 250-device outage. The rest are recorded against their alerts as
+  failed notifications rather than arriving at the sink, so the sink's count is
+  a floor, not a total.
 
 **4. Traffic**
 
