@@ -243,6 +243,7 @@ class AlertEngine:
         # Only now, once every occurrence above has been applied (or
         # deliberately skipped), does any source's cursor move.
         self._flush_cursors()
+        self._sweep_expired()
         self._sweep_renotify(settings)
 
     # -------------------------------------------------- system occurrences
@@ -849,7 +850,40 @@ class AlertEngine:
                 device_ip=row["ip"]))
         if max_id > cursor:
             self._advance_cursor("ipam_conflicts", max_id)
+        self._pair_ipam_resolutions(all_conflicts, settings)
         return occurrences
+
+    def _pair_ipam_resolutions(self, all_conflicts, settings) -> None:
+        """Resolve the alert for an IPAM conflict a person has marked
+        resolved in the IPAM module.
+
+        The alert and the conflict row were tracked entirely separately, so
+        clearing the conflict left its alert open forever — the same pairing
+        mib_present already has with mib_missing, which this restores for the
+        one module that had the two halves and never joined them.
+
+        One query for the module's open alerts and a set intersection, rather
+        than a resolve_by_dedup per resolved conflict: the conflicts list
+        includes every conflict ever recorded, and almost all of them are
+        both resolved and long since alerted about.
+        """
+        rule = self.db.rule_by_key("ipam_new_conflict")
+        if rule is None:
+            return
+        resolved_ids = {str(row["id"]) for row in all_conflicts
+                        if row["resolved_ts"]}
+        if not resolved_ids:
+            return
+        for alert_row in self.db.alerts(state="unresolved", rule_id=rule["id"],
+                                        limit=2000):
+            if alert_row["entity_kind"] != "ipam":
+                continue
+            if alert_row["entity_id"] not in resolved_ids:
+                continue
+            resolved = self.db.resolve_by_dedup(alert_row["dedup_key"], by="")
+            if resolved:
+                self.counters["resolved"] += 1
+                self._notify_clear(resolved, rule, settings)
 
     def _drain_ap_events(self, settings) -> list[Occurrence]:
         """Wireless AP lifecycle events — today just ap_removed, raised by
@@ -1456,6 +1490,24 @@ class AlertEngine:
             # this path is only reached when a NEW occurrence arrives, and an
             # event-driven rule (a device that stays down, a trap) produces
             # exactly one. _sweep_renotify sweeps open alerts instead.
+
+    # ------------------------------------------------------------- expiry
+
+    def _sweep_expired(self) -> None:
+        """Close alerts whose rule gives them a lifetime that has run out.
+
+        No clear email: a rule with an auto-resolve interval reports
+        something that already finished happening, and "resolved: device
+        rebooted" a day later tells an operator nothing they can act on. The
+        alert leaves the open list, which is the whole point — an open count
+        that includes yesterday's recoveries is a count nobody trusts.
+
+        resolved_by is '' like every other engine auto-resolve, so an expired
+        alert never suppresses a genuine new breach run later.
+        """
+        for row in self.db.expired_alerts(time.time()):
+            self.db.resolve(row["id"], by="")
+            self.counters["resolved"] += 1
 
     # ------------------------------------------------------------ renotify
 

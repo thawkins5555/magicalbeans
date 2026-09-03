@@ -3160,7 +3160,8 @@ def post_alerts_rule(service, params, body) -> dict:
         raise ValueError(f"A rule with key '{key}' already exists")
     fields = {k: v for k, v in body.items() if k in
              ("severity", "enabled", "device_filter", "threshold",
-              "clear_threshold", "for_polls", "for_seconds", "template_id")}
+              "clear_threshold", "for_polls", "for_seconds", "template_id",
+              "auto_resolve_after_s")}
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
     return {"id": rule_id}
@@ -3172,7 +3173,8 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
         raise ValueError("No such rule")
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
                     "clear_threshold", "for_polls", "for_seconds", "template_id",
-                    "flap_window_s", "flap_min_transitions")
+                    "flap_window_s", "flap_min_transitions",
+                    "auto_resolve_after_s")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
     fields = {k: v for k, v in body.items() if k in allowed_keys}

@@ -557,3 +557,94 @@ again = AlertsDatabase(legacy_path)
 assert len(again.alerts(state="unresolved")) == 2
 ok("the migration is idempotent — reopening changes nothing")
 again.close()
+
+
+# ==================================================================== A6
+print("\nA6 — momentary-event rules resolve themselves")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+did = add_device(nodes, "10.8.0.1", "core-sw-a")
+
+up_rule = alerts.rule_by_key("device_up")
+assert up_rule["auto_resolve_after_s"] == 3600, dict(up_rule)
+down_rule = alerts.rule_by_key("device_down")
+assert down_rule["auto_resolve_after_s"] is None, dict(down_rule)
+ok("a recovery notice ships with a one-hour lifetime; an outage ships with none")
+
+nodes.record_device_event(did, "up", "responding again")
+nodes.record_device_event(did, "rebooted", "uptime went backwards")
+engine._tick()
+recovered = open_rows(alerts, "device_up", did)
+rebooted = open_rows(alerts, "device_rebooted", did)
+assert len(recovered) == 1 and len(rebooted) == 1
+alerts.acknowledge(rebooted[0]["id"], "operator", "known maintenance")
+
+engine._sweep_expired()
+assert len(open_rows(alerts, "device_up", did)) == 1, "not due yet"
+
+# Back-date both past their intervals (device_up 1 h, device_rebooted 24 h).
+conn = sqlite3.connect(alerts.path)
+conn.execute("UPDATE alerts SET last_ts = last_ts - 200000")
+conn.commit(); conn.close()
+engine._tick()
+assert open_rows(alerts, "device_up", did) == []
+ok("an open recovery notice expires once its interval has passed")
+
+assert open_rows(alerts, "device_rebooted", did) == []
+assert alerts.alert(rebooted[0]["id"])["state"] == "resolved"
+assert alerts.alert(rebooted[0]["id"])["resolved_by"] == ""
+ok("an acknowledged alert expires too, with resolved_by ''")
+
+# A state rule with no interval must never expire, however old.
+nodes.record_device_event(did, "down", "stopped responding")
+engine._tick()
+down = open_rows(alerts, "device_down", did)
+assert len(down) == 1
+conn = sqlite3.connect(alerts.path)
+conn.execute("UPDATE alerts SET last_ts = last_ts - 5000000 WHERE id = ?",
+             (down[0]["id"],))
+conn.commit(); conn.close()
+engine._tick()
+assert len(open_rows(alerts, "device_down", did)) == 1
+ok("a NULL interval never expires, so a device still down stays open")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- IPAM: resolving the conflict resolves its alert
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+ipam.record_conflict("10.8.1.5", "aa:bb:cc:dd:ee:01",
+                     "aa:bb:cc:dd:ee:02", "arp")
+conflict_id = ipam.conflicts()[0]["id"]
+engine._tick()
+conflict_alerts = open_rows(alerts, "ipam_new_conflict", conflict_id)
+assert len(conflict_alerts) == 1, [dict(a) for a in conflict_alerts]
+ipam.resolve_conflict(conflict_id)
+engine._tick()
+assert open_rows(alerts, "ipam_new_conflict", conflict_id) == []
+closed = alerts.alert(conflict_alerts[0]["id"])
+assert closed["state"] == "resolved" and closed["resolved_by"] == "", dict(closed)
+ok("marking an IPAM conflict resolved resolves its alert")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- an existing database gets the intervals on upgrade
+folder = os.path.join(TMPDIR, "autoresolve")
+os.makedirs(folder, exist_ok=True)
+legacy_path = os.path.join(folder, "alerts.db")
+legacy = AlertsDatabase(legacy_path)
+legacy.close()
+conn = sqlite3.connect(legacy_path)
+conn.execute("UPDATE rules SET auto_resolve_after_s = NULL")
+conn.execute("DELETE FROM schema_migrations WHERE name = 'seed_auto_resolve_1'")
+# One rule an operator deliberately took the interval off.
+conn.execute("UPDATE rules SET auto_resolve_after_s = 120 WHERE key = 'device_up'")
+conn.commit(); conn.close()
+upgraded = AlertsDatabase(legacy_path)
+assert upgraded.rule_by_key("poll_overrun")["auto_resolve_after_s"] == 3600
+assert upgraded.rule_by_key("device_up")["auto_resolve_after_s"] == 120
+ok("upgrading seeds the shipped intervals and leaves an operator's own alone")
+upgraded.close()

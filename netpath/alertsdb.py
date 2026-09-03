@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS rules (
     -- for_polls" — the same NULL-is-the-shipped-default convention as the
     -- two flapping columns above. See alertrules.evaluate_threshold.
     for_seconds          INTEGER,
+    -- Resolve an alert this rule opened once its last occurrence is this
+    -- many seconds old. NULL (the default, and right for every rule about a
+    -- STATE) means never: a device that is still down must stay open until
+    -- it comes back. Set for the rules about a momentary EVENT — a reboot,
+    -- a recovery notice, a trap — where nothing will ever clear the alert
+    -- because the thing it reports already finished happening.
+    auto_resolve_after_s INTEGER,
     template_id     INTEGER REFERENCES templates(id) ON DELETE SET NULL,
     created_ts      REAL NOT NULL
 );
@@ -218,7 +225,7 @@ MAX_MUTE_HOURS = 24.0
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
-                  "flap_window_s", "flap_min_transitions")
+                  "flap_window_s", "flap_min_transitions", "auto_resolve_after_s")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
 # 33 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
@@ -327,6 +334,42 @@ _BUILTIN_RULES = [
 # mean "this link is lossy" rather than "a packet went missing".
 _BUILTIN_FOR_SECONDS = {"packet_loss_high": 60}
 
+# Shipped auto_resolve_after_s, kept apart from _BUILTIN_RULES for the same
+# reason as _BUILTIN_FOR_SECONDS. Absent means NULL, which is "never".
+#
+# Eleven built-in rules had no auto-resolve path at all: not in the CLEARS
+# map, and not a threshold that can drop below a clear value. A device that
+# went down and came back left a "Device recovered" alert (severity 5,
+# "responding again at ...") sitting in the open list until somebody clicked
+# Resolve, and on a fleet with normal daily flapping that is hundreds of rows
+# a day of pure bookkeeping — after which the open count stops meaning
+# "things that are wrong" and people stop reading the badge.
+#
+# Every rule here reports a momentary EVENT rather than a state, so the
+# question "is it still true" has no answer: it happened, once, at a known
+# time. The intervals are how long that fact is worth keeping in front of an
+# operator, which is why a reboot (worth noticing tomorrow morning) outlasts
+# a recovery notice (worth noticing this shift) and an unsupported-privacy
+# verdict (a procurement problem, not an incident) outlasts both.
+#
+# Deliberately absent: device_down, mib_missing, device_auth_fail,
+# interface_down and every threshold. Those are states with a real clear —
+# a device answering, a MIB uploaded, a value dropping — and expiring one
+# would mean closing an alert about a fault that is still happening.
+_BUILTIN_AUTO_RESOLVE_S = {
+    "device_up": 3600,
+    "device_rebooted": 86400,
+    "device_unsupported": 604800,
+    "poll_overrun": 3600,
+    "interface_up": 3600,
+    "interface_flapping": 1800,
+    "trap_critical": 86400,
+    "trap_cold_start": 3600,
+    "trap_link_down_unmanaged": 86400,
+    "syslog_critical": 86400,
+    "ipam_new_conflict": 604800,
+}
+
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
                          "threshold_breach", "trap_forwarded")
 
@@ -382,7 +425,8 @@ class AlertsDatabase:
         """
         rules = {row["name"] for row in
                  self._conn.execute("PRAGMA table_info(rules)").fetchall()}
-        for column in ("flap_window_s", "flap_min_transitions", "for_seconds"):
+        for column in ("flap_window_s", "flap_min_transitions", "for_seconds",
+                       "auto_resolve_after_s"):
             if column not in rules:
                 self._conn.execute(
                     f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
@@ -423,6 +467,7 @@ class AlertsDatabase:
     def _named_migrations(self) -> tuple:
         return (
             ("rekey_trap_syslog_alerts_1", self._rekey_trap_syslog_alerts),
+            ("seed_auto_resolve_1", self._seed_auto_resolve),
         )
 
     def _run_named_migrations(self) -> None:
@@ -451,6 +496,23 @@ class AlertsDatabase:
         merged = (existing + "\n" + line).strip() if existing else line
         self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",
                            (merged, alert_id))
+
+    def _seed_auto_resolve(self) -> None:
+        """Give the shipped momentary-event rules their auto-resolve interval
+        on a database that already existed.
+
+        _seed_rules is INSERT OR IGNORE, so it cannot reach a rule that is
+        already there; this is the other half. Only where the column is still
+        NULL and only on built-ins, so an operator who has already chosen an
+        interval (or deliberately blanked one) keeps their choice.
+        """
+        with self._lock:
+            for key, seconds in _BUILTIN_AUTO_RESOLVE_S.items():
+                self._conn.execute(
+                    "UPDATE rules SET auto_resolve_after_s = ? WHERE key = ?"
+                    " AND is_builtin = 1 AND auto_resolve_after_s IS NULL",
+                    (seconds, key))
+            self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:
         """Bring open trap and syslog alerts onto the 4.37 dedup keys.
@@ -576,10 +638,12 @@ class AlertsDatabase:
                 self._conn.execute(
                     "INSERT OR IGNORE INTO rules(key, name, kind, source_kind,"
                     " severity, enabled, is_builtin, device_filter, threshold,"
-                    " clear_threshold, for_polls, for_seconds, template_id,"
-                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?)",
+                    " clear_threshold, for_polls, for_seconds,"
+                    " auto_resolve_after_s, template_id,"
+                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?)",
                     (key, name, kind, source_kind, severity, threshold,
                      clear_threshold, for_polls, _BUILTIN_FOR_SECONDS.get(key),
+                     _BUILTIN_AUTO_RESOLVE_S.get(key),
                      template_ids.get(template_key), now))
             self._conn.commit()
 
@@ -891,6 +955,25 @@ class AlertsDatabase:
                 "SELECT * FROM alerts WHERE state = 'open'"
                 " AND COALESCE(last_notified_ts, opened_ts) <= ?"
                 " ORDER BY severity, last_ts", (cutoff_ts,)).fetchall()
+
+    def expired_alerts(self, now: float) -> list[sqlite3.Row]:
+        """Alerts whose rule gives them a lifetime that has run out.
+
+        Measured from last_ts, not opened_ts: a trap that keeps arriving is
+        still current, and its alert should expire an hour after the last one
+        rather than an hour after the first. Acknowledged rows are included —
+        acknowledging says "seen", not "keep this forever" — and the sweep
+        that calls this resolves them without a clear email, because nobody
+        needs telling that a week-old reboot notice has been tidied away.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.* FROM alerts a JOIN rules r ON r.id = a.rule_id"
+                " WHERE a.state IN ('open','acked')"
+                " AND r.auto_resolve_after_s IS NOT NULL"
+                " AND r.auto_resolve_after_s > 0"
+                " AND a.last_ts <= ? - r.auto_resolve_after_s",
+                (now,)).fetchall()
 
     def resolve(self, alert_id: int, by: str = "") -> None:
         with self._lock:
