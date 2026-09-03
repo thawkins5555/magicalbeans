@@ -1327,10 +1327,24 @@ class NodePoller:
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
-        if snmp_ok is False and snmp_error and isinstance(snmp_error, str) and \
-           "auth" in snmp_error.lower():
+        auth_failed = (snmp_ok is False and snmp_error
+                       and isinstance(snmp_error, str)
+                       and "auth" in snmp_error.lower())
+        if auth_failed:
             self.db.record_device_event(device_id, "auth_fail", snmp_error)
-        elif snmp_ok:
+        elif snmp_ok is False and ping_ok and not snmp_unsupported:
+            # A switch whose SNMP agent has died but which still answers
+            # ICMP is reachable and broken, so `unreachable_ping_only`
+            # rightly keeps it out of device_down — and nothing else said
+            # anything at all. This is the event the `snmp_failing_ping_ok`
+            # rule watches. Recorded per failing poll, so the alert's
+            # occurrence count is how long it has been failing; the rule
+            # auto-resolves when the events stop.
+            self.db.record_device_event(
+                device_id, "snmp_error",
+                f"SNMP is not answering but the device replies to ping: "
+                f"{snmp_error}")
+        if snmp_ok:
             if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
                 self.db.record_device_event(device_id, "auth_ok", "")
 

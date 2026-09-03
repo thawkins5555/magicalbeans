@@ -7,6 +7,7 @@ external dependency.
 Not part of the shipped test suite — a throwaway verification script.
 """
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -216,8 +217,17 @@ def main():
     nodepoll_mod.DEFAULT_SNMP_PORT = agent.port  # redirect the poller at our stub
 
     group_id = db.ensure_default_group()
+    # ping_enabled=0 on purpose. This device is a stub SNMP agent on the
+    # loopback: wherever `ping` is installed, 127.0.0.1 answers ICMP, so
+    # with pinging on the device stays reachable when the stub goes dark
+    # and never reaches `down` — which is exactly why this suite failed on
+    # every machine with ping in PATH. The poll-5-7 section below is about
+    # SNMP failing, so SNMP is the only probe it should have. The
+    # "SNMP failing while ping succeeds" case gets its own device at the
+    # end of this file, where it is the point rather than an accident.
     device_id = db.add_device("127.0.0.1", "stub", group_id=group_id,
                               snmp_version=1, community="public",
+                              ping_enabled=0,
                               poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
 
     poller = NodePoller(db)
@@ -301,6 +311,45 @@ def main():
     reboot_events = db.device_events(device_id, kinds=["rebooted"])
     assert reboot_events, "no 'rebooted' device_event recorded despite uptime reset"
     print("poll 8: device recovers to 'up' and a 'rebooted' event fires OK")
+
+    # --- a device that answers ping but whose SNMP agent has died.
+    #     unreachable_ping_only (the default) rightly keeps it out of
+    #     device_down — it is reachable and broken, not down — and before
+    #     4.37.0 nothing else said anything at all, so a dead agent on a
+    #     live switch was invisible. It records an `snmp_error` event per
+    #     failing poll, which the snmp_failing_ping_ok rule watches.
+    if shutil.which("ping") is None:
+        print("SKIP: no ping on this machine; "
+              "the SNMP-failing-while-ping-succeeds case needs it")
+    else:
+        # The same device, now pinging as well. 127.0.0.1 always answers
+        # ICMP, so this is the "reachable and broken" case exactly.
+        db.update_device(device_id, ping_enabled=1, snmp_timeout_s=0.4,
+                         snmp_retries=0)
+        do_poll()
+        assert db.device(device_id)["status"] == "up"
+        before_snmp_error = len(db.device_events(device_id, kinds=["snmp_error"]))
+        before_down = len(db.device_events(device_id, kinds=["down"]))
+        assert before_snmp_error == 0, \
+            "a working device must not report an SNMP error"
+
+        agent.alive = False
+        for _ in range(3):
+            do_poll()
+        agent.alive = True
+        device = db.device(device_id)
+        assert device["status"] == "up", \
+            f"a device answering ping is reachable, not down: {device['status']!r}"
+        assert device["ping_ok"], "the device did answer ping"
+        assert device["snmp_ok"] == 0, device["snmp_ok"]
+        events = db.device_events(device_id, kinds=["snmp_error"])
+        assert len(events) == 3, \
+            f"expected one event per failing poll, got {len(events)}"
+        assert "replies to ping" in events[0]["detail"], events[0]["detail"]
+        assert len(db.device_events(device_id, kinds=["down"])) == before_down, \
+            "a reachable device must not record a new down event"
+        print(f"ping-ok: {len(events)} snmp_error event(s) recorded while status "
+              f"stayed {device['status']!r} OK")
 
     poller.shutdown()
     agent.stop()
