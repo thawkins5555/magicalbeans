@@ -201,7 +201,7 @@ The range control has presets from 15 minutes to 30 days, plus **All data** and 
 | Click | Pin that instant — the route graph shows that single trace |
 | Drag | Select a range — the route graph aggregates over it |
 | Right-click or double-click | Clear the pin and the selection |
-| **Follow now** | Keep the window's right edge pinned to the present |
+| **Live** | Keep the window's right edge pinned to the present |
 
 Small blue ticks above the strip mark buckets where the route changed. The line underneath the strip is average round-trip time to the destination.
 
@@ -355,7 +355,7 @@ The traffic chart has its own window, independent of the **Window** preset which
 | Ctrl+= / Ctrl+- | Zoom in / out |
 | Ctrl+Left / Ctrl+Right | Pan by a quarter window |
 | Ctrl+0 or Home | Back to the preset span, ending now |
-| **Follow now** | Keep the right edge pinned to the present |
+| **Live** | Keep the right edge pinned to the present |
 
 Zooming while following holds the right edge at the present and pulls the left edge in, so live traffic stays on screen. Zooming while not following works about the centre instead. Panning turns following off, since the two would fight. The range is shown next to the buttons and clamps between one minute and about four months.
 
@@ -481,7 +481,7 @@ A destination can also show **queued**, meaning it is waiting for a free worker 
 
 Reverse-DNS events are the ones people expect to see and often don't. Results are cached for a week, so once the first sweep has named every hop address there is genuinely nothing left to log. The status strip shows the cache state — `DNS cache 37/41 named, nothing pending` — so silence is distinguishable from a stalled resolver, and **Re-run reverse DNS** under Maintenance on the Settings tab clears the cache to force a full re-lookup, which is also what to use after your DNS team adds PTR records.
 
-Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, System, Errors), or by free text matched against both the message and its detail. **Follow** keeps the newest event visible, **Pause** stops the table updating while the log keeps recording, and **Export** writes the currently filtered view to a text file — the thing to attach to a ticket.
+Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, System, Errors), or by free text matched against both the message and its detail. **Scroll to newest** keeps the newest event visible, **Pause** stops the table updating while the log keeps recording, and **Export** writes the currently filtered view to a text file — the thing to attach to a ticket.
 
 The buffer holds the last 3000 events and each detail is capped, so a machine left running for a week costs a bounded amount of memory. Individual packets are not logged: the collector records the first packet from each exporter, each template received, and decode failures, but not the thousands of ordinary packets in between.
 

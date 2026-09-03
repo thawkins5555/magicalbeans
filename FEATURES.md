@@ -87,8 +87,9 @@ The console is not the interface — it shows whether the server is up, who is
 connected and what they requested, and lets you change the port, restart, or
 open a browser. Closing it stops the service.
 
-Signing in is required. A fresh install starts with **admin / admin** and
-insists on a new password. Accounts are local for now, managed on the Settings
+Signing in is required. A fresh install starts with **admin / admin** — the
+sign-in page says so until someone has signed in — and insists on a new
+password. Accounts are local for now, managed on the Settings
 tab; TACACS is the next step.
 
 The server uses only the Python standard library. PySide6 is needed for the
@@ -1344,7 +1345,7 @@ looked up at all while the checkbox is off.
 ### Zoom without a wheel
 
 Drag across the chart to zoom into a range, scroll to zoom about the cursor,
-or use the `‹ − + ›` buttons. **Follow now** pins the right edge to the
+or use the `‹ − + ›` buttons. **Live** pins the right edge to the
 present, and any zoom or pan releases it.
 
 Wheel zoom moves the window on every step but waits a moment before fetching,
@@ -1434,7 +1435,8 @@ without needing Syslog's trigram search index.
 
 Traps per hour for the last 24 hours, stacked by severity, from the same
 kind of hourly rollup table Syslog's histogram reads — it does not get
-slower as the database fills. Clicking an hour narrows the search to it.
+slower as the database fills. Clicking an hour narrows the search to it and
+shows **Return to live**, as on Syslog.
 
 ### Detail panel
 
@@ -1517,8 +1519,10 @@ raise the Syslog database cap if the retention matters more than the search.
 ### Histogram
 
 Messages per hour for the last 24 hours, stacked by severity so a burst of
-errors inside an otherwise busy hour is visible rather than swamped. Clicking
-an hour narrows the search to it. Hovering gives the per-severity breakdown.
+errors inside an otherwise busy hour is visible rather than swamped. A legend
+names the severities present and the axes carry counts and times. Clicking an
+hour narrows the search to it, unticks **Live** and shows **Return to live**;
+hovering gives the per-severity breakdown.
 
 The counts come from a rollup table maintained as messages arrive, so drawing
 this costs 24 rows to read rather than a scan of the message table — it does
@@ -1946,7 +1950,7 @@ disk.
   text across both messages and details. **All** and **None** beside the
   category boxes set every one at once, so narrowing to a single category
   is None then one tick rather than ten untick.
-- **Follow**, **Pause**, **Clear** and **Export** — the last writes the
+- **Scroll to newest**, **Pause**, **Clear** and **Export** — the last writes the
   filtered view to a text file, which is the thing to attach to a ticket.
 
 The status strip summarises pool usage, resolver state, DNS lookups in

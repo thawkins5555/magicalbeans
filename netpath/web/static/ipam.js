@@ -373,7 +373,7 @@
       const sourceText = c.source === 'scan_dhcp'
         ? 'wire vs. DHCP lease' : 'wire, two scans';
       tr.innerHTML =
-        `<td>${escape(c.ip)}</td><td>${escape(c.mac_a)}</td><td>${escape(c.mac_b)}</td>` +
+        `<td class="mono">${escape(c.ip)}</td><td class="mono">${escape(c.mac_a)}</td><td class="mono">${escape(c.mac_b)}</td>` +
         `<td>${sourceText}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
       if (!c.resolved) {
         const button = document.createElement('button');

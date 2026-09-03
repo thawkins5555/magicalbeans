@@ -1,9 +1,6 @@
 /* The Syslog page: an hourly histogram over the search, the matching messages,
    and the full record for whichever one is selected. */
 (() => {
-  const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
-                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--data-neutral)'];
-  const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
     // Newest first, matching the order the server already returns them
@@ -59,101 +56,36 @@
   /* ---------------------------------------------------------- histogram */
 
   function drawHistogram() {
-    const svg = App.el('sl-hist-svg');
-    const box = App.el('sl-hist').getBoundingClientRect();
-    const width = Math.max(box.width, 300);
-    const height = Math.max(box.height, 90);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    // Redrawn only when the data or the drawing area changed: this ran on
-    // every refresh and on every frame of a divider drag, tearing the SVG
-    // down and rebuilding one hit rectangle with three listeners per
-    // bucket each time, whether or not anything was different.
-    const signature = `${width}x${height}:${JSON.stringify(view.hist)}`;
-    if (svg.dataset.signature === signature) return;
-    svg.dataset.signature = signature;
-    svg.innerHTML = '';
-
-    const data = view.hist;
-    if (!data || !data.buckets.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
-      }, 'No messages in this window'));
-      return;
-    }
-
-    const plot = {
-      x: PAD.left, y: PAD.top,
-      w: Math.max(width - PAD.left - PAD.right, 10),
-      h: Math.max(height - PAD.top - PAD.bottom, 10),
-    };
-    const peak = Math.max(...data.buckets.map((b) => b.total), 1);
-
-    for (let step = 0; step <= 2; step += 1) {
-      const fraction = step / 2;
-      const y = plot.y + plot.h - plot.h * fraction;
-      svg.appendChild(App.svgNode('line', {
-        x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)',
-      }));
-      svg.appendChild(App.svgNode('text', {
-        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
-        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
-      }, String(Math.round(peak * fraction))));
-    }
-
-    const slotWidth = plot.w / data.buckets.length;
-    data.buckets.forEach((bucket, index) => {
-      const x = plot.x + index * slotWidth;
-      const w = Math.max(slotWidth - 1, 1);
-      if (!bucket.total) return;
-
-      // Stack by severity so a spike of errors is visible inside a busy hour.
-      let bottom = plot.y + plot.h;
-      const severities = Object.keys(bucket.by_severity)
-        .map(Number).sort((a, b) => b - a);
-      for (const severity of severities) {
-        const count = bucket.by_severity[String(severity)];
-        const h = (count / peak) * plot.h;
-        bottom -= h;
-        svg.appendChild(App.svgNode('rect', {
-          x, y: bottom, width: w, height: Math.max(h, count ? 1 : 0),
-          fill: SEV_COLOR[severity] || 'var(--muted)', 'fill-opacity': 0.85,
-        }));
-      }
-
-      const hit = App.svgNode('rect', {
-        x, y: plot.y, width: w, height: plot.h, fill: 'transparent',
-        style: 'cursor:pointer',
-      });
-      const lines = [App.when(bucket.t0),
-                     `${bucket.total} messages`];
-      for (const severity of severities) {
-        lines.push(`${App.state.severities[severity] || severity}: ` +
-                   `${bucket.by_severity[String(severity)]}`);
-      }
-      const tip = lines.join('\n');
-      hit.addEventListener('mousemove', (event) => App.tooltip(tip, event));
-      hit.addEventListener('mouseleave', App.hideTooltip);
-      hit.addEventListener('click', () => {
-        // Clicking an hour narrows the search to it.
-        view.follow = false;
-        App.el('sl-follow').checked = false;
-        view.t0 = bucket.t0;
-        view.t1 = bucket.t1;
-        App.refreshNow('syslog');
-      });
-      svg.appendChild(hit);
+    // The stacked histogram is App.stackedHistogram: this page, SNMP and
+    // Alerts each drew their own, two of them character-for-character the
+    // same. The click narrows the search to the hour and leaves Live.
+    App.stackedHistogram(App.el('sl-hist-svg'), App.el('sl-hist'), {
+      buckets: (view.hist || {}).buckets || [],
+      unit: 'messages', span: view.t1 - view.t0,
+      empty: 'No messages in this window',
+      onBucket: (bucket) => pinWindow(bucket.t0, bucket.t1),
     });
+  }
 
-    const every = Math.max(1, Math.floor(data.buckets.length / 8));
-    data.buckets.forEach((bucket, index) => {
-      if (index % every) return;
-      svg.appendChild(App.svgNode('text', {
-        x: plot.x + index * slotWidth + slotWidth / 2, y: height - 6,
-        'text-anchor': 'middle', fill: 'var(--dim)',
-        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
-      }, App.stamp(bucket.t0, view.t1 - view.t0)));
-    });
+  /* Narrowing to a bucket used to untick Live with no word said, leave the
+     Window select reading a span the page was no longer showing, and offer
+     nothing to get back. Now it says so, and the Return to live button
+     appears for as long as the page is pinned. */
+  function pinWindow(t0, t1) {
+    view.follow = false;
+    App.el('sl-follow').checked = false;
+    view.t0 = t0;
+    view.t1 = t1;
+    App.el('sl-live').hidden = false;
+    App.announce(`Showing ${App.when(t0)} to ${App.when(t1)}; Live is off`);
+    App.refreshNow('syslog');
+  }
+
+  function returnToLive() {
+    view.follow = true;
+    App.el('sl-follow').checked = true;
+    App.el('sl-live').hidden = true;
+    App.refreshNow('syslog');
   }
 
   /* ------------------------------------------------------------- table */
@@ -462,25 +394,13 @@
       facility.appendChild(option);
     });
 
-    App.el('sl-apply').onclick = () => App.refreshNow('syslog');
-    App.el('sl-clear').onclick = () => {
-      const cleared = ['sl-q', 'sl-source', 'sl-host', 'sl-app',
-        'sl-severity', 'sl-facility'];
-      for (const id of cleared) App.el(id).value = '';
-      // Assigning .value from script fires no event, so without this the
-      // store would keep every filter Clear has just removed and a reload
-      // would come back filtered by them.
-      App.syncControls('syslog', cleared);
-      App.refreshNow('syslog');
-    };
-    for (const id of ['sl-q', 'sl-source', 'sl-host', 'sl-app']) {
-      App.el(id).onkeydown = (event) => {
-        if (event.key === 'Enter') App.refreshNow('syslog');
-      };
-    }
-    for (const id of ['sl-severity', 'sl-facility', 'sl-limit', 'sl-range']) {
-      App.el(id).onchange = () => App.refreshNow('syslog');
-    }
+    App.filterBar('syslog', {
+      text: ['sl-q', 'sl-source', 'sl-host', 'sl-app'],
+      selects: ['sl-range', 'sl-severity', 'sl-facility'],
+      apply: 'sl-apply', clear: 'sl-clear',
+      clears: ['sl-q', 'sl-source', 'sl-host', 'sl-app', 'sl-severity', 'sl-facility'],
+    });
+    App.el('sl-live').onclick = returnToLive;
     App.el('sl-follow').onchange = (event) => {
       view.follow = event.target.checked;
       App.refreshNow('syslog');

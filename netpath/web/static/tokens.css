@@ -124,11 +124,17 @@
   --canvas-grid: #E4E9F0;
   --canvas-text: #161C24;
   --canvas-muted: #55606E;
-  --canvas-faint: #8A94A2;
+  /* Was #8A94A2, 2.8:1 on the node box — under AA for the eyebrow text and
+     share figures set in it. 4.6:1 now. */
+  --canvas-faint: #66707E;
   --canvas-accent: #2F5FC4;
   --canvas-ok: #1B7F3B;
   --canvas-warn: #9A6510;
   --canvas-fail: #B3261E;
+  /* A refused hop. The dark palette's --blocked (a light salmon) was drawn
+     on the white canvas at 2.2:1 — the single most alarming route state in
+     the least visible ink. 5.9:1 on the node box. */
+  --canvas-blocked: #A63D10;
 
   /* ------------------------------------------------------------- type
      Seven sizes, in rem so the browser's own text-size setting is honoured
@@ -172,7 +178,14 @@
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
+  /* Two shadows and one scrim. --shadow-pop lifts a dialog or the sign-in
+     card off the page; --shadow-float is the lighter lift for a toast, a
+     banner or a tooltip. The scrim is what dims the page behind a dialog.
+     There were five hand-written rgba shadows and two scrims at 0.55 and
+     0.6 before these three. */
   --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.5);
+  --shadow-float: 0 6px 20px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(0, 0, 0, 0.55);
 
   /* ------------------------------------------------------------ stacking
      Every fixed layer, in order, so nothing is ever given a z-index by

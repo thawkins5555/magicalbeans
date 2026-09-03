@@ -1,9 +1,6 @@
 /* The Alerts page: open/acked/resolved alerts with a histogram, rules and
    email templates. Table/modal patterns follow snmp.js and ipam.js. */
 (() => {
-  const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
-                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--data-neutral)'];
-  const PAD = { left: 40, right: 10, top: 8, bottom: 18 };
 
   const view = {
     t0: Date.now() / 1000 - 86400,
@@ -112,51 +109,11 @@
   /* --------------------------------------------------------- histogram */
 
   function drawHistogram() {
-    const svg = App.el('alerts-hist-svg');
-    const box = App.el('alerts-hist').getBoundingClientRect();
-    const width = Math.max(box.width, 300);
-    const height = Math.max(box.height, 70);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    // Redrawn only when the data or the drawing area changed: this ran on
-    // every refresh and on every frame of a divider drag, tearing the SVG
-    // down and rebuilding one hit rectangle with three listeners per
-    // bucket each time, whether or not anything was different.
-    const signature = `${width}x${height}:${JSON.stringify(view.hist)}`;
-    if (svg.dataset.signature === signature) return;
-    svg.dataset.signature = signature;
-    svg.innerHTML = '';
-    const data = view.hist;
-    if (!data || !data.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-xs)' }, 'No alerts in this window'));
-      return;
-    }
-    const plot = { x: PAD.left, y: PAD.top,
-      w: Math.max(width - PAD.left - PAD.right, 10),
-      h: Math.max(height - PAD.top - PAD.bottom, 10) };
-    const peak = Math.max(...data.map((b) => b.total), 1);
-    const slotWidth = plot.w / data.length;
-    data.forEach((bucket, index) => {
-      const x = plot.x + index * slotWidth;
-      const w = Math.max(slotWidth - 1, 1);
-      if (!bucket.total) return;
-      let bottom = plot.y + plot.h;
-      const severities = Object.keys(bucket.by_severity).map(Number).sort((a, b) => b - a);
-      for (const sev of severities) {
-        const count = bucket.by_severity[String(sev)];
-        const h = (count / peak) * plot.h;
-        bottom -= h;
-        svg.appendChild(App.svgNode('rect', {
-          x, y: bottom, width: w, height: Math.max(h, 1),
-          fill: SEV_COLOR[sev] || 'var(--muted)', 'fill-opacity': 0.85 }));
-      }
-      const hit = App.svgNode('rect', { x, y: plot.y, width: w, height: plot.h,
-        fill: 'transparent', style: 'cursor:pointer' });
-      hit.addEventListener('mousemove', (event) =>
-        App.tooltip(`${App.when(bucket.t0)}\n${bucket.total} alert(s)`, event));
-      hit.addEventListener('mouseleave', App.hideTooltip);
-      svg.appendChild(hit);
+    // No click here: Alerts has no pinned-window mode, so the bars carry no
+    // pointer cursor either (they used to promise a click they never had).
+    App.stackedHistogram(App.el('alerts-hist-svg'), App.el('alerts-hist'), {
+      buckets: view.hist || [], unit: 'alerts', span: view.t1 - view.t0,
+      empty: 'No alerts in this window', minHeight: 70,
     });
   }
 
@@ -173,7 +130,7 @@
       cell: (r) => `<input type="checkbox" class="alerts-check" aria-label="Select alert on ${
         escape(r.entity_label || r.object || 'this object')}"${
         view.checked.has(r.id) ? ' checked' : ''}>` },
-    { key: 'severity', label: 'Sev', width: 60, numeric: true, on: true,
+    { key: 'severity', label: 'Sev', width: 60, numeric: true, mono: false, on: true,
       // The name, not the digit. Syslog and SNMP Trap both show the word in
       // this column; Alerts showed "2" and kept the word in a column that is
       // off by default, so the one page an operator triages from was the one
@@ -1144,13 +1101,13 @@
       option.textContent = `${name} and worse`;
       sev.appendChild(option);
     });
-    App.el('alerts-apply').onclick = () => App.refreshNow('alerts');
-    for (const id of ['alerts-filter-device', 'alerts-filter-text']) {
-      App.el(id).onkeydown = (e) => { if (e.key === 'Enter') App.refreshNow('alerts'); };
-    }
-    for (const id of ['alerts-filter-sev', 'alerts-filter-state', 'alerts-filter-rule', 'alerts-range']) {
-      App.el(id).onchange = () => App.refreshNow('alerts');
-    }
+    App.filterBar('alerts', {
+      text: ['alerts-filter-device', 'alerts-filter-text'],
+      selects: ['alerts-filter-sev', 'alerts-filter-state', 'alerts-filter-rule', 'alerts-range'],
+      apply: 'alerts-apply', clear: 'alerts-clear',
+      clears: ['alerts-filter-device', 'alerts-filter-text', 'alerts-filter-sev',
+               'alerts-filter-rule'],
+    });
     // Acknowledge-all and bulk-resolve don't delete rows, but they change
     // state for everything on screen in one click and there is no undo, so
     // they get the same guard as a delete.

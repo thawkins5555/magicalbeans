@@ -4650,10 +4650,26 @@ def post_heartbeat(service, params, body) -> dict:
     return {"ok": True, "idle_timeout_minutes": service.sessions.idle_seconds // 60}
 
 
+def _first_run(service) -> bool:
+    """Whether this is a fresh install nobody has signed in to yet.
+
+    The seeded admin/admin account exists, is the only account, still owes
+    its password change and has never signed in. The sign-in page says so,
+    because a first-run administrator otherwise faces a blank form with no
+    hint that a default account exists at all. It is deliberately not a
+    password check — that would be a full scrypt on every unauthenticated
+    request — and it goes false the moment anyone signs in."""
+    from ..auth import DEFAULT_USER
+    if service.app_db.user_count() != 1:
+        return False
+    row = service.app_db.user(DEFAULT_USER)
+    return bool(row is not None and row["must_change"] and row["last_login"] is None)
+
+
 def get_session(service, params, body) -> dict:
     session = service.sessions.get(params.get("_token", ""))
     if not session:
-        return {"authenticated": False}
+        return {"authenticated": False, "first_run": _first_run(service)}
     row = service.app_db.user(session["username"])
     idle_remaining = service.sessions.idle_seconds - (time.time() - session["last_seen"])
     return {

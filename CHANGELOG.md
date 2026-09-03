@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.45.0 — Twelve modules, one set of parts](#4450--twelve-modules-one-set-of-parts)
 - [4.44.0 — Since when, in which zone](#4440--since-when-in-which-zone)
 - [4.43.0 — Less over the wire](#4430--less-over-the-wire)
 - [4.42.0 — One place the colours live](#4420--one-place-the-colours-live)
@@ -107,6 +108,90 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.45.0 — Twelve modules, one set of parts
+
+The stylesheet had six ways to draw a panel, five to draw a section
+heading, and a dialog that was the *darkest* surface on the page when it
+should have been the nearest. Every table was set in monospace, message
+text and device names included. The three severity histograms had no legend
+and no axis, and the Alerts one showed a pointer cursor over bars that did
+nothing when clicked. Seven filter bars used three verbs for the same action
+(Apply, Search, Filter), three of them had a Clear button and four did not,
+and the checkbox that keeps a chart on the present was called Follow, Follow
+now or Live depending on the page. Empty states were rendered seven ways in
+four sizes. The route canvas, which is white, painted its REFUSED marker in
+the dark theme's red at 2.9:1. The sign-in page gave a first-run
+administrator a blank form and no hint that admin/admin exists.
+
+None of this was a defect in the sense of 4.41.0's; it was twelve modules
+built by hand at different times, each right on its own. This release
+replaces the local versions with shared ones, and the visible result is that
+the twelve tabs look like one product.
+
+**One surface, one heading, one dialog.** A single rule now paints every
+panel, card, fieldset, table wrap, chart box, detail pane, the sign-in box,
+the SSH panel and the dialog box — one background, one hairline, one radius
+— and a second lists the floating variants (sign-in, SSH, dialog) that get
+the larger radius and the pop shadow. Five eyebrow styles are one rule; the
+page headings that were still at the browser's `1.5em` default are on the
+scale. The dialog is now the *lightest* surface with the deepest shadow over
+a real scrim, which is the elevation a dialog is supposed to have. The
+Settings gear is an ordinary secondary button. The device pane's inner
+sub-tabs are visually nested (`.subtabs.nested`) rather than a second copy
+of the page strip.
+
+**Prose out of monospace.** Tables are set in the UI face. Monospace is now
+opted into per column — IPs, MACs, OIDs, ports, hex, timestamps and the
+like are detected from the column key (`App.isMono`, overridable with
+`mono:` on a column) and get `td.mono`. A syslog message, a device name or
+a rule description reads as text again; the things that need to line up
+still do.
+
+**Charts you can read.** `App.stackedHistogram` replaces the three
+hand-drawn severity histograms (Alerts, SNMP, Syslog): a legend naming the
+severities present, y gridlines with counts, time ticks along the x axis,
+and a per-bucket tooltip listing the breakdown with swatches. The click that
+narrows a search to an hour is wired only where a search exists (SNMP,
+Syslog) — the Alerts histogram no longer shows a pointer over bars that do
+nothing. Pinning an hour on SNMP or Syslog unticks **Live** and shows a
+**Return to live** button, and says so in the live region, instead of
+silently unticking a checkbox at the other end of the bar. Every chart empty
+state goes through `App.emptyText`. The route canvas has `--canvas-blocked`
+(4.6:1 on white) for refused hops and its remaining literal pixel sizes are
+on the scale.
+
+**One filter bar.** `App.filterBar` wires text fields (Enter), selects
+(change), a **Search** button and a **Clear** button that empties the
+fields, forgets their saved values and re-queries. All seven bars use it:
+Nodes, Alerts, Wireless and ConfigRX gain a Clear they did not have; the
+verb is Search everywhere and no longer an accent button. The checkbox that
+holds a chart on the present is **Live** on every page; the Debug log's is
+**Scroll to newest**, because that is what it does.
+
+**Empty and busy.** A `data-empty` attribute on a detail pane draws its
+placeholder from CSS when the pane is empty, and `.empty` is the one class
+for "nothing here" rows and blocks; the seven renderings are gone. A hairline
+progress bar at the top of a page appears when a refresh has taken longer
+than 400 ms and disappears when it lands — the page is `aria-busy` for
+exactly that span.
+
+**Sign-in and SSH on the system.** `ssh.css` loses its private copies of the
+overlay, panel and heading rules and takes the shared ones. The sign-in page,
+on a fresh install nobody has signed in to yet, says "First time here? Sign in
+as **admin** with the password **admin**" and pre-fills the username;
+`/api/session` reports `first_run` (one account, the seeded one, password
+change still owed, never signed in) so the note goes away the moment anyone
+signs in and never costs a password check.
+
+Measured on the seeded instance, all twelve tabs as admin, read-only and a
+two-module account: no console errors; seven filter bars all reading
+Search/Clear; six Syslog columns as `mono, ui, mono, mono, mono, ui`; the
+three histograms carrying a legend and axis text; zero `--blocked` on the
+route canvas; the sign-in note hidden because the instance has been signed in
+to. `tests/test_design_tokens.py` gained the checks that pin all of it: one
+panel-surface rule, one eyebrow rule, no `rgba(` or `--blocked` outside the
+timeline lane, proportional tables with `td.mono`.
 
 ### 4.44.0 — Since when, in which zone
 

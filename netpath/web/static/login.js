@@ -53,9 +53,18 @@
 
   form.addEventListener('submit', submit);
 
-  // Already signed in? Do not make them type it again.
+  // Already signed in? Do not make them type it again. And on a fresh
+  // install nobody has signed in to, say that the default account exists.
   fetch('/api/session')
     .then((r) => r.json())
-    .then((d) => { if (d.authenticated) window.location.href = '/'; })
+    .then((d) => {
+      if (d.authenticated) { window.location.href = '/'; return; }
+      const note = document.getElementById('login-note');
+      if (note && d.first_run) {
+        note.hidden = false;
+        const user = document.getElementById('username');
+        if (user && !user.value) user.value = 'admin';
+      }
+    })
     .catch(() => {});
 })();

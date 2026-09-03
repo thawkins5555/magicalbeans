@@ -98,7 +98,8 @@
         <option value="auth">auth failed</option><option value="unknown">unknown</option>
       </select></label>
       <label class="check"><input type="checkbox" id="nd-filter-offline"> Only offline</label>
-      <button id="nd-apply">Apply</button>
+      <button id="nd-apply">Search</button>
+      <button id="nd-clear">Clear</button>
       <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="nd-count" class="hint"></span>
@@ -129,7 +130,7 @@
       </div>
       <div class="divider"></div>
       <aside class="pane pad-x pad-b" data-grow="3">
-        <div id="nd-detail-empty" class="hint">Select a device to see its stats.</div>
+        <div id="nd-detail-empty" class="empty">Select a device to see its stats.</div>
         <div id="nd-detail" hidden>
           <div class="bar">
             <span id="nd-d-name" class="section"></span>
@@ -160,7 +161,7 @@
             <svg id="nd-status-timeline-svg"></svg>
           </div>
           <div id="nd-d-subs">
-            <nav class="subtabs">
+            <nav class="subtabs nested">
               <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
               <button class="subtab" data-subtab="events">EVENTS</button>
             </nav>
@@ -251,8 +252,9 @@
       <label>Rule <select id="alerts-filter-rule"></select></label>
       <label>Device <input id="alerts-filter-device" size="16"></label>
       <label>Find <input id="alerts-filter-text" size="20"></label>
-      <select id="alerts-range" aria-label="Time window"></select>
-      <button id="alerts-apply">Apply</button>
+      <label>Window <select id="alerts-range"></select></label>
+      <button id="alerts-apply">Search</button>
+      <button id="alerts-clear">Clear</button>
       <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="alerts-count" class="hint"></span>
@@ -271,7 +273,7 @@
       </div>
       <div class="divider"></div>
       <aside class="pane pad-x pad-b" data-grow="3">
-        <div id="alerts-detail-empty" class="hint">Select an alert to see its detail.</div>
+        <div id="alerts-detail-empty" class="empty">Select an alert to see its detail.</div>
         <div id="alerts-detail" hidden></div>
       </aside>
     </div>
@@ -358,7 +360,7 @@
       <button id="tl-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
       <button id="tl-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
       <button id="tl-fwd" aria-label="Pan forward" title="Pan forward" class="icon">&rsaquo;</button>
-      <label class="check"><input type="checkbox" id="tl-follow" checked> Follow now</label>
+      <label class="check"><input type="checkbox" id="tl-follow" checked> Live</label>
       <button id="tl-reset">Reset</button>
     </header>
     <div id="timeline" class="timeline"><svg id="timeline-svg"></svg></div>
@@ -393,7 +395,7 @@
     <select id="nf-protocol" aria-label="Protocol"></select>
     <select id="nf-exporter" aria-label="Exporter"></select>
     <label class="check"><input type="checkbox" id="nf-resolve"> Resolve names</label>
-    <button id="nf-apply">Apply</button>
+    <button id="nf-apply">Search</button>
     <button id="nf-clear">Clear</button>
   </div>
 
@@ -406,7 +408,7 @@
     <button id="nf-out" aria-label="Zoom out" title="Zoom out" class="icon">&minus;</button>
     <button id="nf-in" aria-label="Zoom in" title="Zoom in" class="icon">+</button>
     <button id="nf-fwd" aria-label="Pan forward" title="Pan forward" class="icon">&rsaquo;</button>
-    <label class="check"><input type="checkbox" id="nf-follow" checked> Follow now</label>
+    <label class="check"><input type="checkbox" id="nf-follow" checked> Live</label>
     <button id="nf-reset">Reset</button>
   </header>
   <div class="rows" data-splitter="netflow-body">
@@ -459,8 +461,9 @@
     <label>Version <select id="sn-version"></select></label>
     <label>Source IP <input id="sn-source" size="13" placeholder="10.20.3.4"></label>
     <label>OID or name <input id="sn-oid" size="16" placeholder="linkDown"></label>
-    <button id="sn-apply" class="primary">Search</button>
+    <button id="sn-apply">Search</button>
     <button id="sn-clear">Clear</button>
+    <button id="sn-live" hidden>Return to live</button>
     <label class="check"><input type="checkbox" id="sn-follow" checked> Live</label>
     <span id="sn-took" class="took"></span>
   </div>
@@ -492,7 +495,7 @@
      </div>
      <div class="divider"></div>
      <div class="pane" data-grow="1">
-      <pre id="sn-detail" class="detail">Select a trap to see every varbind with its OID and typed value.</pre>
+      <pre id="sn-detail" class="detail" data-empty="Select a trap to see every varbind with its OID and typed value."></pre>
      </div>
     </div>
    </div>
@@ -519,8 +522,9 @@
     <label>Source IP <input id="sl-source" size="13" placeholder="10.20.3.4"></label>
     <label>Host <input id="sl-host" size="12" placeholder="core-sw-01"></label>
     <label>App <input id="sl-app" size="10"></label>
-    <button id="sl-apply" class="primary">Search</button>
+    <button id="sl-apply">Search</button>
     <button id="sl-clear">Clear</button>
+    <button id="sl-live" hidden>Return to live</button>
     <label class="check"><input type="checkbox" id="sl-follow" checked> Live</label>
     <span id="sl-took" class="took"></span>
   </div>
@@ -552,7 +556,7 @@
      </div>
      <div class="divider"></div>
      <div class="pane" data-grow="1">
-      <pre id="sl-detail" class="detail">Select a message to see all of its fields and the raw line as it arrived.</pre>
+      <pre id="sl-detail" class="detail" data-empty="Select a message to see all of its fields and the raw line as it arrived."></pre>
      </div>
     </div>
    </div>
@@ -698,7 +702,8 @@
       <option value="offline">Offline</option>
       <option value="out_of_service">Out of service</option>
     </select></label>
-    <button id="wl-apply" class="primary">Search</button>
+    <button id="wl-apply">Search</button>
+    <button id="wl-clear">Clear</button>
   </div>
 
   <div class="cols" data-splitter="wireless-body">
@@ -722,7 +727,7 @@
       <button id="wl-oos" data-requires-write="wireless" hidden>Mark out of service</button>
       <button id="wl-remove-ap" data-requires-write="wireless" hidden>Remove</button>
     </header>
-    <pre id="wl-detail" class="detail">Select an AP to see its per-radio detail.</pre>
+    <pre id="wl-detail" class="detail" data-empty="Select an AP to see its per-radio detail."></pre>
    </div>
   </div>
 </section>
@@ -742,7 +747,8 @@
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
     <label>Vendor <select id="cx-filter-vendor"></select></label>
     <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
-    <button id="cx-apply" class="primary">Search</button>
+    <button id="cx-apply">Search</button>
+    <button id="cx-clear">Clear</button>
     <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
   </div>
@@ -786,13 +792,13 @@
       <span class="grow"></span>
       <button id="cx-backup-clear">Clear</button>
     </div>
-    <div id="cx-backup-empty" class="hint" style="padding:8px">No backups stored yet.</div>
+    <div id="cx-backup-empty" class="empty">No backups stored yet.</div>
     <div id="cx-backup-wrap" class="table-wrap" hidden><table id="cx-backups"></table></div>
    </div>
    <div class="divider"></div>
    <div class="pane pad-x pad-b" data-grow="2">
     <header class="bar"><span class="section">CONFIG</span></header>
-    <pre id="cx-viewer" class="detail">Select a device to see its stored backups.</pre>
+    <pre id="cx-viewer" class="detail" data-empty="Select a device to see its stored backups."></pre>
    </div>
   </div>
 </section>
@@ -823,7 +829,7 @@
     <button id="dbg-cats-none">None</button>
     <label>Contains <input id="dbg-search" size="18" placeholder="text in event or detail"></label>
     <span class="grow"></span>
-    <label class="check"><input type="checkbox" id="dbg-follow" checked> Follow</label>
+    <label class="check"><input type="checkbox" id="dbg-follow" checked> Scroll to newest</label>
     <button id="dbg-pause">Pause</button>
     <button id="dbg-clear">Clear</button>
     <button id="dbg-export">Export</button>
@@ -831,7 +837,7 @@
   <div class="cols pad-x pad-b" data-splitter="debug-events" style="flex:1;min-height:0">
     <div class="pane" data-grow="3"><div class="table-wrap"><table id="dbg-events"></table></div></div>
     <div class="divider"></div>
-    <div class="pane" data-grow="2"><pre id="dbg-detail" class="detail">Select an event to see its detail — the exact command that ran and the raw output it returned.</pre></div>
+    <div class="pane" data-grow="2"><pre id="dbg-detail" class="detail" data-empty="Select an event to see its detail — the exact command that ran and the raw output it returned."></pre></div>
   </div>
    </div>
   </div>

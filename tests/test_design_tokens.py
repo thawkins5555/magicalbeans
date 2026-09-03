@@ -70,6 +70,10 @@ TEXT_ON = [
     ("--focus", "--bg", 4.5),
     ("--canvas-text", "--canvas", 4.5), ("--canvas-muted", "--canvas", 4.5),
     ("--canvas-accent", "--canvas", 4.5), ("--canvas-fail", "--canvas", 4.5),
+    # the route canvas node box is --canvas-panel; its eyebrow and refusal
+    # text must read there too
+    ("--canvas-faint", "--canvas-panel", 4.5), ("--canvas-blocked", "--canvas-panel", 4.5),
+    ("--canvas-fail", "--canvas-panel", 4.5), ("--canvas-warn", "--canvas-panel", 4.5),
 ]
 GRAPHIC_ON = [
     ("--line", "--raised", 3.0), ("--line", "--panel", 3.0), ("--line", "--bg", 3.0),
@@ -104,7 +108,7 @@ PAIRS = {
     "--canvas-text": "CANVAS_TEXT", "--canvas-muted": "CANVAS_TEXT_MUTED",
     "--canvas-faint": "CANVAS_TEXT_FAINT", "--canvas-accent": "CANVAS_ACCENT",
     "--canvas-ok": "CANVAS_OK", "--canvas-warn": "CANVAS_WARN",
-    "--canvas-fail": "CANVAS_FAIL",
+    "--canvas-fail": "CANVAS_FAIL", "--canvas-blocked": "CANVAS_BLOCKED",
 }
 for token_name, const in PAIRS.items():
     check(THEME.get(const, "").upper() == tok(token_name).upper(),
@@ -133,11 +137,29 @@ for sheet in SHEETS:
     check(not re.search(r"letter-spacing:\s*[\d.]+px", body),
           "%s: no pixel letter-spacing" % sheet)
     check("var(--faint)" not in body, "%s: --faint is gone" % sheet)
+    # shadows and scrims are tokens too: five hand-written rgba shadows and
+    # two scrims used to sit beside the token that existed for them
+    check("rgba(" not in body, "%s: no literal rgba (shadows and scrims are tokens)" % sheet)
 check(read(STATIC, "app.css").count(".sr-only {") == 1, "app.css defines .sr-only once")
+APP_CSS = read(STATIC, "app.css")
+check(APP_CSS.count("background: var(--panel);\n  border: 1px solid var(--hairline);") == 1,
+      "one panel surface rule (the seven copies are gone)")
+check("button.module-settings {" not in APP_CSS, "the Settings gear is an ordinary secondary button")
+check(APP_CSS.count("font: 600 var(--fs-2xs)/1 var(--ui);\n  letter-spacing: var(--track-wide);") == 1,
+      "one eyebrow rule")
+check("table { width: 100%; border-collapse: collapse; font-family: var(--ui);" in APP_CSS
+      and "td.mono" in APP_CSS, "tables are proportional with mono opt-in per column")
 
 for name in sorted(os.listdir(STATIC)):
     if name.endswith((".js", ".html")):
         body = read(STATIC, name)
+        if name == "netpath.js":
+            # the route canvas is white: the dark theme's --blocked (built for
+            # --bg) fails contrast there, so the canvas has its own token
+            # the one legitimate use left is STATUS_COLOR, which paints the
+            # timeline's status lane on the dark panel
+            check(body.count("var(--blocked)") == 1,
+                  "netpath.js: the dark --blocked is not painted on the white canvas")
         check("var(--faint)" not in body, "%s: --faint is gone" % name)
         if name.endswith(".js"):
             numeric = re.findall(r"'font-size':\s*\d+\b(?![\d.]*\s*[*+])", body)

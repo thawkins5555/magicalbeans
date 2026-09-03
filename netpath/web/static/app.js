@@ -1453,6 +1453,185 @@ const App = (() => {
     ]);
   }
 
+  /* ------------------------------------------------- charts, shared
+
+     Severity colours, indexed by syslog severity 0-7. Defined once: Alerts,
+     Syslog and SNMP each carried an identical copy. Three severities share
+     --fail on purpose (emergency, alert and critical are all "act now"). */
+  const SEV_COLOR = ['var(--fail)', 'var(--fail)', 'var(--fail)', 'var(--blocked)',
+                     'var(--warn)', 'var(--text)', 'var(--accent)', 'var(--data-neutral)'];
+
+  /* "Nothing here" inside an SVG, one size and one tone. Seven charts each
+     wrote their own at two sizes; the white route canvas passes its own
+     fill. */
+  function emptyText(svg, width, height, text, fill = 'var(--muted)') {
+    svg.appendChild(svgNode('text', {
+      x: width / 2, y: height / 2, 'text-anchor': 'middle',
+      fill, 'font-family': 'var(--ui)', 'font-size': 'var(--fs-xs)',
+    }, text));
+  }
+
+  /* The stacked-by-severity histogram three pages draw.
+
+     Syslog's and SNMP's copies were character-for-character identical apart
+     from six substitutions; Alerts' was the same shape minus everything that
+     made it readable — no axis, no gridlines, no tick labels — and with a
+     pointer cursor promising a click it never wired. One implementation now:
+     a legend naming each severity in its colour (none of the three had one,
+     so the colours were learnable only by hovering), y gridlines, x ticks,
+     a tooltip whose rows carry swatches, and a click only where the caller
+     gives one — with the cursor to match.
+
+       buckets      [{t0, t1?, total, by_severity: {sev: count}}]
+       unit         the plural noun for the tooltip: 'messages'
+       span         the window width in seconds, for the tick format
+       onBucket     optional (bucket) => void; gives the bars a click
+       empty        the sentence for no buckets */
+  const HIST_PAD = { left: 46, right: 10, top: 8, bottom: 22, legend: 18 };
+
+  function stackedHistogram(svg, host, opts) {
+    const box = host.getBoundingClientRect();
+    const width = Math.max(box.width, 300);
+    const height = Math.max(box.height, opts.minHeight || 90);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const buckets = opts.buckets || [];
+    // Redrawn only when the data or the drawing area changed.
+    const signature = `${width}x${height}:${JSON.stringify(buckets)}`;
+    if (svg.dataset.signature === signature) return;
+    svg.dataset.signature = signature;
+    svg.innerHTML = '';
+    if (!buckets.length) {
+      emptyText(svg, width, height, opts.empty || 'Nothing in this window');
+      return;
+    }
+    const names = state.severities || [];
+    const present = new Set();
+    for (const bucket of buckets) {
+      for (const sev of Object.keys(bucket.by_severity || {})) {
+        if (bucket.by_severity[sev]) present.add(Number(sev));
+      }
+    }
+    const legendSevs = [...present].sort((a, b) => a - b);
+    const plot = {
+      x: HIST_PAD.left, y: HIST_PAD.top + HIST_PAD.legend,
+      w: Math.max(width - HIST_PAD.left - HIST_PAD.right, 10),
+      h: Math.max(height - HIST_PAD.top - HIST_PAD.legend - HIST_PAD.bottom, 10),
+    };
+    // Legend: a swatch and the severity's name, in the plot's top band.
+    let legendX = plot.x;
+    for (const sev of legendSevs) {
+      const label = names[sev] || String(sev);
+      const w = label.length * 6.5 + 22;
+      if (legendX + w > plot.x + plot.w) break;
+      svg.appendChild(svgNode('rect', {
+        x: legendX, y: HIST_PAD.top + 3, width: 9, height: 9, rx: 2,
+        fill: SEV_COLOR[sev] || 'var(--muted)',
+      }));
+      svg.appendChild(svgNode('text', {
+        x: legendX + 13, y: HIST_PAD.top + 11, fill: 'var(--muted)',
+        'font-family': 'var(--ui)', 'font-size': 'var(--fs-2xs)',
+      }, label));
+      legendX += w;
+    }
+    const peak = Math.max(...buckets.map((b) => b.total || 0), 1);
+    for (let step = 0; step <= 2; step += 1) {
+      const fraction = step / 2;
+      const y = plot.y + plot.h - plot.h * fraction;
+      svg.appendChild(svgNode('line', {
+        x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)',
+      }));
+      svg.appendChild(svgNode('text', {
+        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+      }, String(Math.round(peak * fraction))));
+    }
+    const slotWidth = plot.w / buckets.length;
+    buckets.forEach((bucket, index) => {
+      const x = plot.x + index * slotWidth;
+      const w = Math.max(slotWidth - 1, 1);
+      if (!bucket.total) return;
+      let bottom = plot.y + plot.h;
+      const severities = Object.keys(bucket.by_severity || {})
+        .map(Number).sort((a, b) => b - a);
+      for (const sev of severities) {
+        const count = bucket.by_severity[String(sev)];
+        const h = (count / peak) * plot.h;
+        bottom -= h;
+        svg.appendChild(svgNode('rect', {
+          x, y: bottom, width: w, height: Math.max(h, count ? 1 : 0),
+          fill: SEV_COLOR[sev] || 'var(--muted)', 'fill-opacity': 0.85,
+        }));
+      }
+      const hit = svgNode('rect', {
+        x, y: plot.y, width: w, height: plot.h, fill: 'transparent',
+        style: opts.onBucket ? 'cursor:pointer' : null,
+      });
+      const rows = [{ text: when(bucket.t0) }, { text: `${bucket.total} ${opts.unit || ''}`.trim() }];
+      for (const sev of severities) {
+        rows.push({ text: `${names[sev] || sev}: ${bucket.by_severity[String(sev)]}`,
+                    color: SEV_COLOR[sev] || 'var(--muted)' });
+      }
+      hit.addEventListener('mousemove', (event) => tooltip(rows, event));
+      hit.addEventListener('mouseleave', hideTooltip);
+      if (opts.onBucket) hit.addEventListener('click', () => opts.onBucket(bucket));
+      svg.appendChild(hit);
+    });
+    const every = Math.max(1, Math.floor(buckets.length / 8));
+    buckets.forEach((bucket, index) => {
+      if (index % every) return;
+      svg.appendChild(svgNode('text', {
+        x: plot.x + index * slotWidth + slotWidth / 2, y: height - 6,
+        'text-anchor': 'middle', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+      }, stamp(bucket.t0, opts.span)));
+    });
+  }
+
+  /* -------------------------------------------- the filter bar, wired once
+
+     Seven list pages each hand-wrote the same four things: Enter in a text
+     box refreshes, a changed select refreshes, the Search button refreshes,
+     and Clear empties the fields and refreshes. Written here once. `onEnter`
+     is the one genuine variant — Nodes arms a MAC lookup before refreshing. */
+  function filterBar(tab, spec) {
+    const go = () => refreshNow(tab);
+    for (const id of spec.text || []) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      el.onkeydown = (event) => {
+        if (event.key !== 'Enter') return;
+        if (spec.onEnter) spec.onEnter(event);
+        go();
+      };
+    }
+    for (const id of spec.selects || []) {
+      const el = document.getElementById(id);
+      if (el) el.onchange = go;
+    }
+    if (spec.apply) {
+      const el = document.getElementById(spec.apply);
+      if (el) el.onclick = go;
+    }
+    if (spec.clear) {
+      const el = document.getElementById(spec.clear);
+      const fields = spec.clears || [...(spec.text || []), ...(spec.selects || [])];
+      if (el) el.onclick = () => {
+        for (const id of fields) {
+          const field = document.getElementById(id);
+          if (!field) continue;
+          if (field.type === 'checkbox') field.checked = false;
+          else field.value = '';
+        }
+        // Assigning .value from script fires no event, so without this the
+        // store would keep every filter Clear has just removed and a
+        // reload would come back filtered by them.
+        syncControls(tab, fields);
+        if (spec.onClear) spec.onClear();
+        go();
+      };
+    }
+  }
+
   /* One status renderer for the whole application.
 
      `tone` is the meaning — ok, warn, fail, info or none — not the colour,
@@ -2006,6 +2185,23 @@ const App = (() => {
      rebuilt from scratch on every poll. Sorting is the caller's job — this
      reports which column and which direction, since only the caller knows
      whether that means re-querying or reordering what it already has. */
+  /* Which columns are set in monospace.
+
+     The whole table used to be monospace — every message, device name and
+     status word in the type reserved for machine output. Tables are now the
+     interface face, and a column opts into --mono because of what it holds:
+     an address, an identifier, a figure, a time. A module says so with
+     `mono: true/false` on the column; when it does not, the key decides,
+     by the names this product actually uses for those things. */
+  const MONO_KEYS = /(^|_)(ip|ips|mac|oid|oids|port|ts|sha256|digest|community|wtp_id|if_index|phys_addr|mac_address|hostname|sys_name|source_name|source|src|dst|exporter|host|app|descr|suffix|value|uptime|summary|trap|trap_oid|scope_id|expires|interfaces|channels|ssh_username|ssh_port|response|version|vdom|model|count|bytes|packets|size_bytes|speed_bps|in_bps|out_bps|station_count|radio_count|radio_station_count|tx_power_dbm|response_ms|in_error_rate|out_error_rate|opened_ts|last_ts|resolved_ts|last_seen_ts|last_poll_ts|last_backup_ts|last_up|first_seen|last_seen)$/;
+  function isMono(column) {
+    if (column.mono !== undefined) return Boolean(column.mono);
+    return MONO_KEYS.test(column.key || '');
+  }
+  function cellClass(column) {
+    return [column.numeric ? 'num' : '', isMono(column) ? 'mono' : ''].filter(Boolean).join(' ');
+  }
+
   function grid(table, options) {
     const { name, columns, sort, onSort, selectAll } = options;
     const stored = loadColumns();
@@ -2026,7 +2222,7 @@ const App = (() => {
        state is updated in place rather than being part of the key, so a
        tick does not cost a rebuild either. */
     const headKey = [name, columns.map((c) => `${c.key}:${c.label}:${c.numeric ? 1 : 0}`
-      + `:${c.align || ''}:${c.sortable === false ? 0 : 1}`).join(','),
+      + `:${c.align || ''}:${c.sortable === false ? 0 : 1}:${isMono(c) ? 1 : 0}`).join(','),
       sort ? `${sort.key}:${sort.descending ? 1 : 0}` : '', onSort ? 1 : 0,
       selectAll ? selectAll.key : ''].join('|');
     if (table.dataset.headKey === headKey && table.tHead && table.querySelector('colgroup')) {
@@ -2311,10 +2507,10 @@ const App = (() => {
     for (const row of rows) {
       const tr = document.createElement('tr');
       tr.innerHTML = columns.map((c) => {
-        if (c.cell) return `<td class="${c.numeric ? 'num' : ''}">${c.cell(row)}</td>`;
+        if (c.cell) return `<td class="${cellClass(c)}">${c.cell(row)}</td>`;
         const raw = row[c.key];
         const blank = raw === null || raw === undefined || raw === '';
-        return `<td class="${c.numeric ? 'num' : ''}">` +
+        return `<td class="${cellClass(c)}">` +
           `${blank ? '\u2014' : escapeHtml(raw)}</td>`;
       }).join('');
       if (onRow) onRow(tr, row);
@@ -2781,7 +2977,15 @@ const App = (() => {
     if (now - (page.lastFetch || 0) < rateFor(state.tab)) return;
     page.lastFetch = now;
     try {
-      await page.refresh();
+      // The page in view says a refresh is in flight (app.css draws a line
+      // after 400 ms, so the ordinary two-second poll never flickers).
+      const section = document.getElementById(`page-${state.tab}`);
+      if (section) section.setAttribute('aria-busy', 'true');
+      try {
+        await page.refresh();
+      } finally {
+        if (section) section.removeAttribute('aria-busy');
+      }
       connected(true);
     } catch (error) {
       if (error && error.superseded) return;
@@ -3035,6 +3239,7 @@ const App = (() => {
     parseRoute, buildRoute, setRoute, applyRoute,
     get, post, put, del,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
+    SEV_COLOR, emptyText, stackedHistogram, filterBar, isMono,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,

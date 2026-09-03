@@ -806,10 +806,7 @@
     const { t0, t1 } = data;
     const geo = { plot, width, t0, t1 };
     if (!allValues.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
-      }, opts.emptyText || 'No data in this window'));
+      App.emptyText(svg, width, height, opts.emptyText || 'No data in this window');
       return geo;
     }
     // opts.peak pins the axis for a metric with a known full scale (a
@@ -4032,19 +4029,15 @@
       };
       setTimeout(check, 600);
     };
-    App.el('nd-apply').onclick = () => App.refreshNow('nodes');
-    App.el('nd-q').onkeydown = (e) => {
-      if (e.key !== 'Enter') return;
+    App.filterBar('nodes', {
+      text: ['nd-q'],
+      selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status', 'nd-filter-offline'],
+      apply: 'nd-apply', clear: 'nd-clear',
       // A MAC lookup runs on a deliberate search, never on the five-second
       // refresh: it can open a dialog, and a dialog that reopens itself
       // every five seconds is unusable.
-      view.macSearchPending = true;
-      App.refreshNow('nodes');
-    };
-    App.el('nd-filter-group').onchange = () => App.refreshNow('nodes');
-    App.el('nd-filter-devgroup').onchange = () => App.refreshNow('nodes');
-    App.el('nd-filter-status').onchange = () => App.refreshNow('nodes');
-    App.el('nd-filter-offline').onchange = () => App.refreshNow('nodes');
+      onEnter: () => { view.macSearchPending = true; },
+    });
     App.el('nd-manage-devgroups').onclick = manageDeviceGroups;
     App.el('nd-bulk-poll').onclick = bulkPollNow;
     App.el('nd-bulk-identify').onclick = bulkIdentify;

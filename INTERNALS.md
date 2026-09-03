@@ -3994,6 +3994,56 @@ persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
 
+### Shared components (`app.js`, `app.css`) — 4.45.0
+
+The rule for the frontend since 4.45.0 is that a module draws nothing it
+could have asked `App` for. The pieces and where they came from:
+
+- **Surfaces.** One selector list in `app.css` paints every panel-like
+  element (`.panel, .card, fieldset, .table-wrap, .canvas.chart, .detail,
+  .login-box, .ssh-panel, .modal-box, …`); a second list gives the floating
+  ones the larger radius and `--shadow-pop`. `tests/test_design_tokens.py`
+  asserts the `background: var(--panel); border: 1px solid var(--hairline)`
+  pair appears once, which is what stops a seventh copy appearing. The
+  dialog is deliberately the lightest surface (`--panel` over a `--scrim`
+  overlay with the deepest shadow): elevation reads as lightness on a dark
+  theme, and the old darker box read as a hole.
+- **Type in tables.** `table` is set in `--ui`; `td.mono`/`th.mono` opt a
+  column back into `--mono`. `grid()` decides per column with
+  `App.isMono(column)`: an explicit `column.mono` wins, otherwise the key is
+  matched against `MONO_KEYS` (ip, mac, oid, port, hex, id-like, time-like
+  keys). The class goes on both the header and the cell so sort arrows and
+  numbers line up. Hand-built tables (IPAM conflicts) add the class
+  themselves.
+- **`App.stackedHistogram(svg, host, {buckets, unit, span, onBucket, empty,
+  minHeight})`.** One drawing for the Alerts, SNMP and Syslog severity
+  histograms: legend for the severities present, gridlines with counts,
+  time ticks, swatch tooltip rows via `App.tooltip`, and a transparent hit
+  rect per bucket **only when `onBucket` is given** — so a chart without a
+  click has no pointer cursor. `App.SEV_COLOR` is the one severity→token
+  map. Syslog and SNMP wrap `onBucket` in `pinWindow`, which unticks Live,
+  reveals `#sl-live`/`#sn-live` ("Return to live") and announces the pin;
+  `returnToLive` reverses it.
+- **`App.filterBar(tab, {text, selects, apply, clear, clears, onEnter,
+  onClear})`.** Wires Enter on text fields, change on selects, the Search
+  button and the Clear button. Clear empties each field (unchecks a
+  checkbox), calls `syncControls` so the view store forgets the values —
+  assigning `.value` fires no event, and without this a reload came back
+  filtered by fields that looked empty — then refreshes. Nodes passes
+  `onEnter` to set `macSearchPending`, because a MAC lookup may open a
+  dialog and must run on a deliberate search only.
+- **Empty and busy.** `App.emptyText(svg, w, h, text)` for charts;
+  `.detail:empty::before { content: attr(data-empty) }` for detail panes,
+  so the placeholder lives in the HTML beside the pane and needs no script;
+  `.empty` for rows and blocks. `master()` sets `aria-busy="true"` on the
+  page around `await page.refresh()`; `.page::before` is a 2px accent line
+  whose opacity transitions in after a 400 ms delay, so a fast refresh never
+  flickers and a slow one is visible.
+- **Sign-in first-run note.** `GET /api/session` unauthenticated returns
+  `{authenticated: false, first_run: bool}`; `_first_run` is a user-count
+  and two column reads, never a password check. `login.js` unhides
+  `#login-note` and pre-fills the username when it is true.
+
 ### The view store (`app.js` `sappiwhere.view`)
 
 What the operator has a page *set to* — the column each table is sorted by,

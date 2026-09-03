@@ -178,7 +178,7 @@
     if (!data || !data.times.length || !data.series.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
+        fill: 'var(--muted)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-xs)',
       }, 'No flows in this window'));
       return;
     }
@@ -829,24 +829,12 @@
     for (const id of ['nf-dimension', 'nf-protocol', 'nf-exporter', 'nf-order']) {
       App.el(id).onchange = () => App.refreshNow('netflow');
     }
-    App.el('nf-apply').onclick = () => App.refreshNow('netflow');
-    App.el('nf-clear').onclick = () => {
-      const cleared = ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'];
-      for (const id of cleared) App.el(id).value = '';
-      // Assigning .value from script fires no event, so the store would keep
-      // every value Clear has just removed — and the exporter fallback in
-      // filters() would go on asking the server for one this bar no longer
-      // shows, which is what made Clear unable to clear the exporter at all.
-      App.syncControls('netflow', cleared);
-      App.refreshNow('netflow');
-    };
-    for (const id of ['nf-src', 'nf-dst', 'nf-port']) {
-      App.el(id).onkeydown = (event) => {
-        if (event.key === 'Enter') App.refreshNow('netflow');
-      };
-    }
-    // Same rule as the dimension list above: flow settings are only in the
-    // state of an account that may read NetFlow.
+    App.filterBar('netflow', {
+      text: ['nf-src', 'nf-dst', 'nf-port'],
+      selects: ['nf-range', 'nf-dimension', 'nf-protocol', 'nf-exporter'],
+      apply: 'nf-apply', clear: 'nf-clear',
+      clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
+    });
     App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
     App.el('nf-resolve').onchange = async (event) => {
       await App.post('/api/settings', {

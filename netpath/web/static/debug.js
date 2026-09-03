@@ -152,7 +152,7 @@
       `<caption class="sr-only">Name-lookup workers</caption><thead><tr>${DNS_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="hint">Nothing pending — every known address is already named or not due for a re-check</td></tr>';
+      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing pending — every known address is already named or not due for a re-check</td></tr>';
     }
     for (const worker of workers) {
       const tr = document.createElement('tr');
@@ -177,7 +177,7 @@
       `<caption class="sr-only">IPAM workers</caption><thead><tr>${IPAM_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="hint">Nothing running — no subnet scan or DHCP poll in progress right now</td></tr>';
+      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing running — no subnet scan or DHCP poll in progress right now</td></tr>';
     }
     for (const worker of workers) {
       const tr = document.createElement('tr');
@@ -203,7 +203,7 @@
       `<caption class="sr-only">Poller workers</caption><thead><tr>${NODE_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="hint">Nothing polling right now</td></tr>';
+      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing polling right now</td></tr>';
     }
     for (const worker of workers) {
       const tr = document.createElement('tr');
@@ -229,7 +229,7 @@
       `<caption class="sr-only">Discovery scans</caption><thead><tr>${DISC_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     const body = document.createElement('tbody');
     if (!scans.length) {
-      body.innerHTML = '<tr><td colspan="4" class="hint">No discovery scan running right now</td></tr>';
+      body.innerHTML = '<tr><td colspan="4" class="empty">No discovery scan running right now</td></tr>';
     }
     for (const scan of scans) {
       const tr = document.createElement('tr');

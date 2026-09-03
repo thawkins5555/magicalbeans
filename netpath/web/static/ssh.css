@@ -60,37 +60,21 @@ body.ssh-page {
   background: var(--bg);
 }
 
-/* ------------------------------------------------------------- overlays */
-.ssh-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: var(--z-modal);
-}
+/* ------------------------------------------------------------- overlays
+   The scrim, the card's surface and shadow, its heading and its labels all
+   come from app.css (.modal/.ssh-overlay, .panel.float, .panel-title, the
+   eyebrow list) — this page used to restate every one of them. What is left
+   here is the card's width and the block layout of its labels. */
 .ssh-panel {
   width: 460px;
   max-width: calc(100vw - 32px);
   max-height: calc(100vh - 32px);
   overflow: auto;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-lg);
   padding: 20px 22px 18px;
-  box-shadow: var(--shadow-pop);
 }
-.ssh-panel h2 { margin: 0 0 12px; font-size: var(--fs-lg); }
+.ssh-panel h2 { margin: 0 0 12px; }
 .ssh-panel p { margin: 0 0 10px; line-height: 1.45; }
-.ssh-panel label {
-  display: block;
-  color: var(--muted);
-  font-size: var(--fs-2xs);
-  letter-spacing: var(--track-wide);
-  text-transform: uppercase;
-  margin-top: 10px;
-}
+.ssh-panel label { display: block; margin-top: 10px; }
 .ssh-panel input { width: 100%; padding: 7px 9px; font-size: var(--fs-md); }
 .ssh-panel .row { margin-top: 16px; }
 .ssh-panel .row button { flex: 1; padding: 8px; }

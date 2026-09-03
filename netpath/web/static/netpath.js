@@ -535,7 +535,7 @@
     const g = App.svgNode('g', { transform: `translate(${x},${y})` });
     const mtr = mtrSeverity(node, currentTarget());
     let border = 'var(--canvas-hairline)', accent = 'var(--canvas-accent)';
-    if (node.refusal) { border = accent = 'var(--blocked)'; }
+    if (node.refusal) { border = accent = 'var(--canvas-blocked)'; }
     else if (node.is_timeout) { border = accent = 'var(--canvas-faint)'; }
     // A live continuous-probe problem is a more urgent, more current signal
     // than the traceroute-derived verdicts below it, so it outranks even
@@ -564,14 +564,14 @@
       'font-weight': weight || 400,
     }, value));
 
-    text(18, 20, node.label, 12, node.is_timeout ? 'var(--canvas-muted)' : 'var(--canvas-text)', 700);
+    text(18, 20, node.label, 'var(--fs-xs)', node.is_timeout ? 'var(--canvas-muted)' : 'var(--canvas-text)', 700);
     if (node.hostname) {
       const name = node.hostname.length > 26
         ? `${node.hostname.slice(0, 12)}…${node.hostname.slice(-12)}` : node.hostname;
-      text(18, 35, name, 10, 'var(--canvas-muted)');
+      text(18, 35, name, 'var(--fs-2xs)', 'var(--canvas-muted)');
     }
     text(18, 54, node.rtt === null || node.rtt === undefined
-      ? '—' : `${node.rtt.toFixed(1)} ms`, 11, 'var(--canvas-muted)');
+      ? '—' : `${node.rtt.toFixed(1)} ms`, 'var(--fs-2xs)', 'var(--canvas-muted)');
     const pct = App.svgNode('text', {
       x: NODE_W - 10, y: 54, 'text-anchor': 'end', fill: 'var(--canvas-faint)',
       'font-family': 'var(--mono)', 'font-size': 'var(--fs-xs)',
@@ -579,13 +579,13 @@
     g.appendChild(pct);
 
     if (node.refusal) {
-      text(NODE_W - 8, 18, `REFUSED ${node.refusal}`, 10, 'var(--blocked)', 700)
+      text(NODE_W - 8, 18, `REFUSED ${node.refusal}`, 'var(--fs-2xs)', 'var(--canvas-blocked)', 700)
         .setAttribute('text-anchor', 'end');
     } else if (mtr === 'fail') {
-      text(NODE_W - 8, 18, 'MTR: HIGH LOSS', 10, 'var(--canvas-fail)', 700)
+      text(NODE_W - 8, 18, 'MTR: HIGH LOSS', 'var(--fs-2xs)', 'var(--canvas-fail)', 700)
         .setAttribute('text-anchor', 'end');
     } else if (mtr === 'warn') {
-      text(NODE_W - 8, 18, 'MTR: DEGRADED', 10, 'var(--canvas-warn)', 700)
+      text(NODE_W - 8, 18, 'MTR: DEGRADED', 'var(--fs-2xs)', 'var(--canvas-warn)', 700)
         .setAttribute('text-anchor', 'end');
     } else if (node.is_destination) {
       text(NODE_W - 8, 18, 'TARGET', 10, 'var(--canvas-ok)', 700)
@@ -641,9 +641,9 @@
       x: 50, y: ty, fill: 'var(--canvas-muted)', 'font-family': 'var(--mono)',
       'font-size': size, 'font-weight': weight || 400,
     }, value));
-    text(24, `${end - start + 1} hops, no reply`, 11, 700);
-    text(40, `hops ${start}–${end}`, 10);
-    text(55, 'click to expand', 10);
+    text(24, `${end - start + 1} hops, no reply`, 'var(--fs-2xs)', 700);
+    text(40, `hops ${start}–${end}`, 'var(--fs-2xs)');
+    text(55, 'click to expand', 'var(--fs-2xs)');
     g.onclick = () => {
       if (view.dragMoved) return;   // that was a pan, not a click
       view.expanded.add(`${start}-${end}`);

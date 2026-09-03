@@ -318,7 +318,7 @@
                    '', c.last_poll_ok === false ? 'Last poll failed'
                      : (c.last_poll_ok ? 'Last poll succeeded' : 'Never polled'))
           } ${escape(c.name)}</td>
-        <td>${escape(c.ip)}</td>
+        <td class="mono">${escape(c.ip)}</td>
         <td>${c.enabled ? 'enabled' : 'disabled'}</td>
         <td>${escape(c.last_poll_error || (c.last_poll_ts ? ago(c.last_poll_ts) : 'never polled'))}</td>
         <td><button data-edit="${c.id}">Edit</button>
@@ -327,7 +327,7 @@
     const box = App.modal('Wireless controllers', `
       <table class="table-wrap"><caption class="sr-only">Wireless controllers</caption><thead><tr>
         <th scope="col">Name</th><th scope="col">IP</th><th scope="col">State</th><th scope="col">Last poll</th><th scope="col"></th>
-      </tr></thead><tbody>${rows || '<tr><td colspan="5">No controllers configured</td></tr>'}</tbody></table>`,
+      </tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">No controllers configured</td></tr>'}</tbody></table>`,
       [
         { label: 'Close', onClick: App.closeModal },
         { label: 'Add controller', primary: true, onClick: () => editController(null) },
@@ -461,11 +461,10 @@
        stays at the end; it assigns from script, which fires no event. */
     const CONTROLS = ['wl-q', 'wl-controller', 'wl-state'];
     App.rememberControls('wireless', CONTROLS);
-    App.el('wl-apply').onclick = () => App.refreshNow('wireless');
-    App.el('wl-q').onkeydown = (event) => {
-      if (event.key === 'Enter') App.refreshNow('wireless');
-    };
-    App.el('wl-controller').onchange = () => App.refreshNow('wireless');
+    App.filterBar('wireless', {
+      text: ['wl-q'], selects: ['wl-controller', 'wl-state'],
+      apply: 'wl-apply', clear: 'wl-clear', clears: ['wl-q', 'wl-controller', 'wl-state'],
+    });
     App.el('wl-state').onchange = () => App.refreshNow('wireless');
     App.el('wl-controllers').onclick = controllersModal;
     App.el('wl-settings').onclick = settingsDialog;

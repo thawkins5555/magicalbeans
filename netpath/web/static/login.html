@@ -22,6 +22,12 @@
     <p id="login-error" class="err" role="alert" hidden></p>
     <button id="login-button" type="submit" class="primary">Sign in</button>
   </form>
+  <!-- Shown only on a fresh install nobody has signed in to (the server
+       says so on /api/session). Until then a first-run administrator faced
+       this form with no hint that a default account existed. -->
+  <p id="login-note" class="hint" hidden>First time here? Sign in as
+    <b>admin</b> with the password <b>admin</b>. You will be asked to choose a
+    new password before anything else.</p>
 
 </main>
 <script src="/login.js" defer></script>

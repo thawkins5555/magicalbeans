@@ -743,12 +743,10 @@
        stays at the end and assigns from script, which fires no event. */
     const CONTROLS = ['cx-q', 'cx-filter-vendor', 'cx-enabled-only'];
     App.rememberControls('configrx', CONTROLS);
-    App.el('cx-apply').onclick = () => App.refreshNow('configrx');
-    App.el('cx-q').onkeydown = (event) => {
-      if (event.key === 'Enter') App.refreshNow('configrx');
-    };
-    App.el('cx-enabled-only').onchange = () => App.refreshNow('configrx');
-    App.el('cx-filter-vendor').onchange = () => App.refreshNow('configrx');
+    App.filterBar('configrx', {
+      text: ['cx-q'], selects: ['cx-filter-vendor'],
+      apply: 'cx-apply', clear: 'cx-clear', clears: ['cx-q', 'cx-filter-vendor', 'cx-enabled-only'],
+    });
     App.el('cx-bulk-clear').onclick = bulkClearSelection;
     App.el('cx-backup-delete').onclick = () => deleteBackups([...view.backupsChecked]);
     App.el('cx-backup-clear').onclick = () => {

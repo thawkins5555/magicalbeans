@@ -215,6 +215,12 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 }
 .subtab:hover { color: var(--text); }
 .subtab.active { color: var(--text); border-bottom-color: var(--accent); }
+/* The one sub-tab strip that lives inside a pane (the device drill-down's
+   Interfaces / Events) rather than directly under a page's strip. Same
+   grammar, one step quieter: no filled bar, no gutter, so it stops reading
+   as a second page-level strip five levels deep. */
+.subtabs.nested { background: transparent; padding: 0; }
+.subtabs.nested .subtab { padding: 6px 12px; }
 .subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .subpage.active { display: flex; }
 
@@ -234,11 +240,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
    .hint (11px --faint) — which made the pane you land on after picking a
    device the hardest thing on the page to read. The name is a title, and
    the identity line is content, so both say so. */
-#nd-d-name {
-  font: 600 var(--fs-md)/1.3 var(--ui);
-  color: var(--text);
-  letter-spacing: 0;
-}
+#nd-d-name { margin: 0; }
 /* Classed as well as id'd: the device dialog renders the same identity
    line for a device that is not the selected one, and must look identical
    to the pane's. */
@@ -307,7 +309,7 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
   padding: 9px 16px;
   font: 600 var(--fs-xs)/1.4 var(--ui);
   border-radius: var(--radius-sm);
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-float);
 }
 
 .page { display: none; flex: 1; min-height: 0; }
@@ -375,28 +377,12 @@ button.primary:disabled:hover { background: var(--grid); }
    the reason for disabling it is a sentence, not a shade. */
 .write-denied-why { margin: 4px 0 0; }
 button.icon { width: 32px; padding: 5px 0; text-align: center; }
-button.module-settings {
-  background: var(--raised);
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  font-weight: 600;
-  padding: 5px 14px;
-}
-button.module-settings:hover { background: var(--accent); color: var(--bg); }
-/* Same source-order trap as button.primary above: this rule set follows
-   button:disabled at equal specificity, so a gear the account may not use
-   kept its full accent outline and read as the most prominent control on
-   a bar of dead buttons. */
-button.module-settings:disabled {
-  background: var(--raised);
-  border-color: var(--grid);
-  color: var(--muted);
-}
-button.module-settings:disabled:hover {
-  background: var(--raised);
-  border-color: var(--grid);
-  color: var(--muted);
-}
+/* A module's Settings button is an ordinary secondary button. It used to
+   be an accent outline that inverted to a solid accent fill on hover — the
+   resting appearance of an outline primary — sitting at the far end of the
+   same strip as the real primary ("Add device"), so every strip had two
+   emphatic controls for actions of very different weight, and on the two
+   strips with no primary at all it read as the one. */
 
 input, select, textarea {
   background: var(--raised);
@@ -428,11 +414,6 @@ label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px
 label.check { cursor: pointer; }
 input[type=checkbox] { accent-color: var(--accent); }
 
-.section {
-  color: var(--muted);
-  font: 600 var(--fs-2xs)/1 var(--ui);
-  letter-spacing: var(--track-wide);
-}
 /* --faint is 2.50:1 on --bg at 11px, roughly half of what AA asks for, and
    .hint is not decorative: it carries every device's IP address, the mute
    tag, alert counts and every empty state. --muted is 5.18:1. */
@@ -488,12 +469,35 @@ body.tiny .terms { display: none; }
 .row button { flex: 1; }
 .row button.half { flex: 0 1 50%; }
 
-.card {
+/* ------------------------------------------------------------ the panel
+
+   One surface. Seven rule sets used to repeat "--panel, 1px --hairline,
+   --radius" and differ only in padding, and two more (.bars, .timeline)
+   had drifted to no border at all. The surface is declared once here and
+   every panel-shaped class joins the selector; each keeps only the
+   geometry that is genuinely its own. A new panel-shaped thing adds its
+   class to this list rather than writing the three properties again.
+
+   .panel.float is the lifted tier — a dialog, the sign-in card, the SSH
+   overlay's card — rounder and with the one dialog shadow. */
+.panel, .card, fieldset, .target-list, .detail, .subnet-detail, .table-wrap,
+.canvas.chart, .bars, .timeline,
+.login-box, .ssh-panel, .modal-box {
   background: var(--panel);
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
-  padding: 10px 12px;
 }
+.panel.float, .login-box, .ssh-panel, .modal-box {
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-pop);
+}
+/* A panel that carries a state colours its border, the way the toast and
+   the two banners already did each in their own words. */
+.panel.tone-ok, .tone-ok { border-color: var(--ok); }
+.panel.tone-warn, .tone-warn { border-color: var(--warn); }
+.panel.tone-fail, .tone-fail, .tone-bad { border-color: var(--fail); }
+
+.card { padding: 10px 12px; }
 .card.strip {
   display: flex;
   align-items: center;
@@ -514,12 +518,31 @@ body.tiny .terms { display: none; }
 .card.strip > .stat.error { color: var(--fail); }
 .card.strip > button { flex: none; }
 .card.strip > .dot { flex: none; }
-.card h3 {
-  margin: 0 0 6px;
+/* ---------------------------------------------------------- the eyebrow
+
+   The small uppercase label above a group — a card's title, a fieldset's
+   legend, a pane's section heading, the labels on the sign-in form. Six
+   copies of the same four declarations existed, differing by whether they
+   remembered text-transform. Declared once. Margins stay with the element.
+
+   .panel-title is the other heading: a thing's name, in sentence case at
+   --fs-md, for a device pane, a subnet detail, a dialog. The bare h2 rule
+   catches the two page headings that were rendering at the user agent's
+   1.5em default because nothing in the system had reached them. */
+.eyebrow, .section, .card h3, .sidebar h2, legend,
+.login-box label, .ssh-panel label {
   color: var(--muted);
   font: 600 var(--fs-2xs)/1 var(--ui);
   letter-spacing: var(--track-wide);
   text-transform: uppercase;
+}
+.card h3 { margin: 0 0 6px; }
+.panel-title, #nd-d-name, .subnet-detail-title, .modal-box h2, .ssh-panel h2, h2 {
+  font: 600 var(--fs-md)/1.3 var(--ui);
+  color: var(--text);
+  letter-spacing: 0;
+  text-transform: none;   /* #nd-d-name also carries .section; a device name is not an eyebrow */
+  margin: 0 0 8px;
 }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
 
@@ -552,20 +575,11 @@ body.tiny .terms { display: none; }
   gap: 8px;
   overflow: auto;
 }
-.sidebar h2 {
-  margin: 0;
-  color: var(--muted);
-  font: 600 var(--fs-2xs)/1 var(--ui);
-  letter-spacing: var(--track-wide);
-  text-transform: uppercase;
-}
+.sidebar h2 { margin: 0; }
 .target-list {
   list-style: none;
   margin: 0;
   padding: 4px;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
   flex: 1;
   min-height: 160px;
   overflow: auto;
@@ -613,12 +627,9 @@ body.tiny .terms { display: none; }
   gap: 20px;
   padding: 12px 14px;
   margin-bottom: 10px;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
   flex: none;
 }
-.subnet-detail-title { font: 600 var(--fs-sm)/1.3 var(--ui); color: var(--text); margin-bottom: 6px; }
+.subnet-detail-title { margin-bottom: 6px; }
 .subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-xs); margin-bottom: 4px; }
 .legend-dot {
   display: inline-block;
@@ -668,15 +679,20 @@ body.tiny .terms { display: none; }
 }
 .canvas svg.dragging { cursor: grabbing; }
 .timeline svg { user-select: none; -webkit-user-select: none; }
-.canvas.chart { background: var(--panel); border-color: var(--hairline); }
+/* The white route canvas is the exception (tokens.css); every other chart
+   is a panel and takes the panel surface from the list above. */
 /* A compact "at a glance" strip rather than a primary resizable panel —
    the Alerts histogram sits above its own splitter, not inside one. */
-.canvas.small { flex: none; height: 90px; min-height: 90px; }
+.canvas.small { flex: none; height: 120px; min-height: 120px; }
+/* The same guard the .strip rule below needed: body.compact .canvas outranks
+   .canvas.small on specificity, so without these the Alerts strip grew to
+   120px in compact mode and stayed 90px in tiny. */
+body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 /* Thinner still: a single lane of discrete state over time, sized to match
    NetPath's own status lane (STATUS_H = 26 in netpath.js) rather than
    reading as a chart panel. Used by the Nodes device up/down timeline. */
 .canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: 8px; }
-.timeline { flex: 1; min-height: 130px; background: var(--panel); border-radius: var(--radius); }
+.timeline { flex: 1; min-height: 130px; }
 .timeline svg { width: 100%; height: 100%; display: block; }
 
 /* -------------------------------------------------------------- netflow */
@@ -687,7 +703,7 @@ body.tiny .terms { display: none; }
 .pad-b { padding-bottom: 10px; }
 .pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pane.grow-pane { flex: 2; }
-.bars { flex: 1; overflow: auto; background: var(--panel); border-radius: var(--radius); padding: 6px; }
+.bars { flex: 1; overflow: auto; padding: 6px; }
 .bar-row { position: relative; height: 24px; margin-bottom: 2px; }
 .bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; opacity: 0.55; }
 .bar-label, .bar-value {
@@ -700,14 +716,18 @@ body.tiny .terms { display: none; }
 .table-wrap {
   flex: 1;
   overflow: auto;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
   min-height: 0;
 }
 .table-wrap.workers { flex: 1; min-height: 80px; margin: 0 12px; }
 .table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 12px 10px; }
-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: var(--fs-xs); }
+/* Tables are set in the interface face. Every table used to be monospace
+   — device names, alert messages, status words, all in the type reserved
+   for machine output. A column that holds an address, an identifier, a
+   figure or a time opts into --mono (App.grid decides from the column key,
+   or the module says `mono:` on the column); a hand-built cell says
+   class="mono". */
+table { width: 100%; border-collapse: collapse; font-family: var(--ui); font-size: var(--fs-xs); }
+td.mono, th.mono, .mono { font-family: var(--mono); }
 th {
   position: sticky; top: 0;
   background: var(--raised);
@@ -802,9 +822,8 @@ th .grip:hover { background: var(--accent); opacity: 0.35; }
 .sev-5 { color: var(--text); }
 .sev-6 { color: var(--muted); }
 .sev-7 { color: var(--muted); }        /* --faint was 2.50:1 — below AA */
-#syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
-#snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
-#nodes-table td.msg, #alerts-table td.msg { white-space: pre-wrap; word-break: break-word; }
+/* A message cell wraps. This was written three times, once per table id. */
+td.msg { white-space: pre-wrap; word-break: break-word; }
 .took { font-family: var(--mono); font-size: var(--fs-xs); color: var(--dim); }
 
 /* ---------------------------------------------------------------- debug */
@@ -813,9 +832,6 @@ th .grip:hover { background: var(--accent); opacity: 0.35; }
   flex: 1;
   margin: 0;
   padding: 10px;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
   overflow: auto;
   font-family: var(--mono);
   font-size: var(--fs-xs);
@@ -823,6 +839,46 @@ th .grip:hover { background: var(--accent); opacity: 0.35; }
   white-space: pre-wrap;
   min-width: 0;
 }
+/* ---------------------------------------------------------- empty states
+
+   A detail pane waiting for a selection says so from its data-empty
+   attribute, and only while it is empty: the moment a module writes
+   content the sentence is gone, and clearing the pane brings it back with
+   no code. Before this the sentence was the <pre>'s own text — English set
+   in the monospace reserved for machine output — and five panes plus two
+   .hint divs each did it their own way. The .empty class is the same look
+   for an element that is not a <pre>. */
+.detail:empty::before {
+  content: attr(data-empty);
+  font-family: var(--ui);
+  color: var(--muted);
+  white-space: normal;
+}
+.empty {
+  color: var(--muted);
+  font: var(--fs-xs)/1.5 var(--ui);
+  padding: 12px 14px;
+}
+
+/* -------------------------------------------------------------- loading
+
+   The page in view says when a refresh is in flight (app.js sets aria-busy
+   around each module refresh). A two-pixel accent line at the top of the
+   view, and only if the fetch has taken more than 400 ms — the ordinary
+   two-second poll answers in a few milliseconds and must not flicker. */
+.page { position: relative; }
+.page::before {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  height: 2px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s 0.4s;
+  pointer-events: none;
+  z-index: var(--z-sticky);
+}
+.page[aria-busy="true"]::before { opacity: 1; }
 .cat-trace { color: var(--accent); }
 .cat-dns { color: var(--muted); }
 .cat-netflow { color: var(--ok); }
@@ -833,18 +889,10 @@ th .grip:hover { background: var(--accent); opacity: 0.35; }
 /* ------------------------------------------------------------- settings */
 #page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px 16px; min-height: 0; }
 fieldset {
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius);
-  background: var(--panel);
   margin: 0 0 14px;
   padding: 10px 14px 14px;
 }
-legend {
-  color: var(--muted);
-  font: 600 var(--fs-2xs)/1 var(--ui);
-  letter-spacing: var(--track-wide);
-  padding: 0 4px;
-}
+legend { padding: 0 4px; }
 fieldset label { display: flex; margin: 8px 0; gap: 8px; align-items: center; }
 fieldset label input:not([type=checkbox]) { width: 220px; }
 fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: var(--fs-xs); }
@@ -941,7 +989,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   padding: 10px 14px;
   color: var(--text);
   font-size: var(--fs-sm);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-float);
 }
 .idle-banner button {
   background: var(--warn);
@@ -981,7 +1029,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   font-size: var(--fs-xs);
   line-height: 1.45;
   white-space: pre;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-float);
   max-width: 460px;
 }
 
@@ -1020,41 +1068,32 @@ body.login-page {
 }
 .login-box {
   width: 340px;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-lg);
   padding: 26px 28px 22px;
-  box-shadow: var(--shadow-pop);
 }
 .login-box h1 {
-  margin: 0;
+  margin: 0 0 18px;
   font-size: var(--fs-xl);
   letter-spacing: var(--track-tab);
 }
-.login-box h1 { margin-bottom: 18px; }
 .login-box form { display: flex; flex-direction: column; gap: 4px; }
-.login-box label {
-  color: var(--muted);
-  font-size: var(--fs-2xs);
-  letter-spacing: var(--track-wide);
-  text-transform: uppercase;
-  margin-top: 10px;
-}
+.login-box label { margin-top: 10px; }
 .login-box input { padding: 8px 10px; font-size: var(--fs-md); }
 .login-box button { margin-top: 18px; padding: 9px; font-size: var(--fs-md); }
 .login-box .err { margin: 12px 0 0; font-size: var(--fs-xs); }
+.login-box .hint { margin: 14px 0 0; line-height: 1.5; }
 
 /* ---------------------------------------------------------------- modal */
-.modal {
+.modal, .ssh-overlay {
   position: fixed; inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: var(--scrim);
   display: flex; align-items: center; justify-content: center;
   z-index: var(--z-modal);
 }
+/* Surface, border, radius and shadow come from the .panel.float list above.
+   The dialog used to be --bg — the page floor, darker than every card it
+   floated over — with no shadow: the one surface that most needs to read
+   as lifted was the one recessed into the scrim. */
 .modal-box {
-  background: var(--bg);
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-lg);
   padding: 18px 20px;
   min-width: 420px;
   max-width: 760px;
@@ -1092,7 +1131,7 @@ body.login-page {
    Enter submits it (see App.modal), which put one element between
    .modal-box and the labels this rule reaches. */
 .modal-box.wide > .modal-form > label { display: flex; }
-.modal-box h2 { margin: 0 0 12px; font-size: var(--fs-lg); }
+.modal-box h2 { margin: 0 0 12px; }
 /* The interface dialog's parent device name: its own line above the port
    name and inside the same h2, so it is the same size rather than dropping
    to hint text. Dimmer only so the port stays the subject of the dialog. */
@@ -1104,12 +1143,12 @@ body.login-page {
   border-bottom: 1px solid var(--hairline);
   position: sticky;
   top: 0;
-  background: var(--bg);
+  background: var(--panel);
   z-index: var(--z-sticky);
 }
 .modal-box .row button { flex: none; }
 .modal-box pre {
-  background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+  background: var(--raised); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
   padding: 10px; font-family: var(--mono); font-size: var(--fs-xs); overflow: auto;
   white-space: pre-wrap;
 }
@@ -1125,7 +1164,7 @@ body.login-page {
   border: 1px solid var(--fail);
   border-left-width: 3px;
   border-radius: var(--radius-sm);
-  background: var(--panel);
+  background: var(--raised);
   color: var(--text);
   font-size: var(--fs-xs);
 }
@@ -1181,7 +1220,7 @@ body.login-page {
   color: var(--text);
   font-size: var(--fs-xs);
   line-height: 1.45;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-float);
 }
 .toast.ok { border-left-color: var(--ok); }
 .toast.warn { border-left-color: var(--warn); }
