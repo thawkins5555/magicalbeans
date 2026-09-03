@@ -1322,8 +1322,9 @@ const App = (() => {
 
   /* The same escape every module file defines for itself, needed here now
      that app.js builds markup of its own. */
-  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const escapeHtml = (s) => String(s ?? '').replace(/[&<>"'`]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
+              "'": '&#39;', '`': '&#96;' }[c]));
 
   /* ------------------------------------------------- choosing columns
 

@@ -18,8 +18,10 @@
     discScans: [], discCells: [], discFetchedAt: 0,
   };
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return '—';
@@ -116,13 +118,15 @@
       const tr = document.createElement('tr');
       tr.innerHTML = [
         escape(worker.label), escape(worker.host),
-        `<span style="color:${worker.state === 'tracing' ? 'var(--accent)' : 'inherit'}">${worker.state === 'tracing' ? 'tracing…' : worker.state}</span>`,
+        `<span style="color:${worker.state === 'tracing' ? 'var(--accent)' : 'inherit'}">${
+          worker.state === 'tracing' ? 'tracing…' : escape(worker.state)}</span>`,
         `<span style="color:${colour}">${elapsed}</span>`,
         ago(worker.last_run),
         worker.duration ? `${worker.duration.toFixed(1)}s` : '—',
         until(worker.next_run),
         `${worker.interval_s}s`,
-        `<span style="color:${STATUS_COLOR[worker.status] || 'inherit'}">${worker.status}</span>`,
+        `<span style="color:${STATUS_COLOR[worker.status] || 'inherit'}">${
+          escape(worker.status)}</span>`,
       ].map((value) => `<td>${value}</td>`).join('');
       body.appendChild(tr);
     }

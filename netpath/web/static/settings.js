@@ -274,8 +274,10 @@
 
   /* ------------------------------------------------------------- users */
 
-  const escape = (t) => String(t ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function when(ts) {
     return ts ? new Date(ts * 1000).toLocaleString() : 'never';

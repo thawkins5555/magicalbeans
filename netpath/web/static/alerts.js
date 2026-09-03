@@ -40,8 +40,10 @@
 
   const MUTE_HOURS = [1, 6, 12, 24];
 
-  const escape = (s) => String(s ?? '').replace(/[&<>"]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // One implementation, in app.js. This was twelve copies of the same
+  // three lines, which is how one of them came to be missing a
+  // character while the others were not.
+  const escape = App.escapeHtml;
 
   function ago(ts) {
     if (!ts) return '—';
@@ -473,6 +475,19 @@
       <p class="hint">Off makes the rule raise alerts that appear in the list
         and the badge but never reach a mailbox — for the noisy ones nobody
         wants paged about, which used to mean disabling the rule outright.</p>
+      <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
+        placeholder="never" value="${extras.auto_resolve_after_s
+          ? Math.round(extras.auto_resolve_after_s / 60) : ''}"> minutes
+        (blank = never)</label>
+      <p class="hint">For a rule that fires on something momentary — a reboot,
+        a trap, a syslog line — where nothing will ever arrive to clear it.
+        The alert resolves itself this long after its last occurrence. Blank
+        leaves it open until somebody resolves it or the condition clears.</p>
+      <label class="check"><input type="checkbox" id="ar-notify"
+        ${extras.notify !== false ? 'checked' : ''}> Send email for this rule</label>
+      <p class="hint">Off makes the rule raise alerts that appear in the list
+        and the badge but never reach a mailbox — for the noisy ones nobody
+        wants paged about, which used to be turned off entirely instead.</p>
       ${isThreshold ? `
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
