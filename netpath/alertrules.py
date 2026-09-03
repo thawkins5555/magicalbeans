@@ -13,6 +13,8 @@ threshold (a live value against hysteresis, not an event at all).
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 
 SEVERITY_NAMES = ["emergency", "alert", "critical", "error", "warning",
@@ -35,12 +37,71 @@ class Occurrence:
     device_name: str = ""  # for device_filter matching, independent of entity_label's exact text
     device_ip: str = ""
     extra: dict = field(default_factory=dict)   # template context extras (trap_name, value, etc.)
+    # Whether the sender is a device this installation polls. None where the
+    # question does not apply (thresholds, device events — those are about a
+    # device by construction); True/False for traps and syslog, where it is
+    # the difference between a port flapping on a switch we monitor and one
+    # on somebody else's. New fields go at the END with a default: parked
+    # occurrences are stored as JSON and replayed through Occurrence(**row),
+    # so a row written before this field existed must still load.
+    managed: bool | None = None
 
 
 def dedup_key(rule, occurrence: Occurrence) -> str:
     """rule.key + entity — the same (device_down, device #7) pair always
     maps to the same open alert regardless of how many times it recurs."""
     return f"{rule['key']}:{occurrence.entity_kind}:{occurrence.entity_id}"
+
+
+# The Cisco/IOS-XE/NX-OS message identifier: %FACILITY-SEVERITY-MNEMONIC.
+# Anchored on the literal % and the two dashes, so it matches the identifier
+# and not, say, a percentage in the free text after it.
+_CISCO_MNEMONIC = re.compile(r"%([A-Z0-9_$]{2,32})-(\d)-([A-Z0-9_$]{2,32})")
+
+# Everything a message can carry that varies between two reports of the SAME
+# fault: interface indexes, session ids, byte counts, addresses.
+_DIGITS = re.compile(r"\d")
+
+
+def syslog_signature(message: str) -> str:
+    """A stable identifier for "the same kind of syslog message".
+
+    Syslog alerts used to dedup on the source host alone, so three unrelated
+    faults on one switch became one alert row and open_or_increment
+    overwrote the first two messages with the third. The fix is to put
+    something about the message itself in the dedup key — but not the message
+    verbatim, or "session 123 failed" and "session 456 failed" would be two
+    alerts for one problem and a flapping port would open one row per event.
+
+    Two forms, in order:
+
+    - The Cisco mnemonic where there is one. %LINK-3-UPDOWN is precisely the
+      vendor's own answer to "what kind of message is this", it is stable
+      across releases, and it deliberately excludes the interface name — a
+      switch with two ports bouncing is one fault to look at, not two.
+    - Otherwise a short hash of the message with every digit replaced by '#'
+      and whitespace collapsed, over the first 200 characters. Digits are
+      what varies between repeats; 200 characters is enough to tell two
+      messages apart and short enough that a long payload cannot make every
+      occurrence unique.
+
+    The "h" prefix keeps the two forms visibly distinct in a dedup key.
+    """
+    text = str(message or "")
+    match = _CISCO_MNEMONIC.search(text)
+    if match:
+        return f"%{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    normalized = " ".join(_DIGITS.sub("#", text).split())[:200]
+    return "h" + hashlib.sha1(
+        normalized.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+# Rules that are ONLY about senders this installation does not poll. The
+# shipped one is the link-down trap: a managed switch's port going down is
+# already reported by interface_down from polling, so raising a second
+# "unmanaged device" alert for it named the wrong thing three times over.
+# The rule has advertised this check since it shipped and never performed it.
+UNMANAGED_ONLY_RULES = frozenset({"trap_link_down_unmanaged"})
 
 
 def match_device(rule, occurrence: Occurrence) -> bool:

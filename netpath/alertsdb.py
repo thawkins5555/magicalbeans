@@ -121,6 +121,15 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- Migrations that cannot run inside _migrate() because they depend on the
+-- built-in templates and rules having been seeded first (_migrate runs
+-- before _seed_templates/_seed_rules, and must, since seeding needs the
+-- columns it adds). Each runs once, ever, keyed by name.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name       TEXT PRIMARY KEY,
+    applied_ts REAL NOT NULL
+);
+
 -- A DPAPI blob cannot live in the generic JSON `settings` table alongside
 -- ordinary string/number values, so it gets its own single-row table.
 CREATE TABLE IF NOT EXISTS smtp_credential (
@@ -361,6 +370,7 @@ class AlertsDatabase:
             self._conn.commit()
         self._seed_templates()
         self._seed_rules()
+        self._run_named_migrations()
 
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created.
@@ -405,6 +415,107 @@ class AlertsDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_alerts_dedup_state"
             " ON alerts(dedup_key, state, resolved_ts)")
+
+    # Post-seed migrations, in the order they were introduced. A migration
+    # belongs here rather than in _migrate() when it has to read or rewrite
+    # the seeded built-ins — _migrate runs before seeding and has to, because
+    # seeding needs the columns it adds.
+    def _named_migrations(self) -> tuple:
+        return (
+            ("rekey_trap_syslog_alerts_1", self._rekey_trap_syslog_alerts),
+        )
+
+    def _run_named_migrations(self) -> None:
+        for name, run in self._named_migrations():
+            with self._lock:
+                done = self._conn.execute(
+                    "SELECT 1 FROM schema_migrations WHERE name = ?",
+                    (name,)).fetchone()
+            if done:
+                continue
+            run()
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(name, applied_ts)"
+                    " VALUES (?,?)", (name, time.time()))
+                self._conn.commit()
+
+    def _note(self, alert_id: int, line: str) -> None:
+        """add_rollup_note without its own transaction, for use inside a
+        migration that is already holding the lock and batching a commit."""
+        row = self._conn.execute(
+            "SELECT rollup_note FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+        existing = (row["rollup_note"] if row else "") or ""
+        if line in existing.split("\n"):
+            return
+        merged = (existing + "\n" + line).strip() if existing else line
+        self._conn.execute("UPDATE alerts SET rollup_note = ? WHERE id = ?",
+                           (merged, alert_id))
+
+    def _rekey_trap_syslog_alerts(self) -> None:
+        """Bring open trap and syslog alerts onto the 4.37 dedup keys.
+
+        Trap alerts were keyed on the trap OID alone and syslog alerts on the
+        sending host alone; both now carry the source and, for syslog, a
+        signature of the message. Leaving the old rows alone was not an
+        option: their keys can never match again, so they would sit open
+        forever while a new row opened beside each of them.
+
+        Syslog rows are re-keyed exactly — the stored message is the same
+        message the signature is computed from, so the operator's open alert
+        keeps its history, its count and its acknowledgement. Two old rows
+        that map onto one new key (the same host, two messages that share a
+        signature) cannot both exist, since one open alert per dedup key is a
+        database constraint; the later one is resolved with a note saying so.
+
+        Trap rows cannot be re-keyed at all: the old key never recorded which
+        device sent the trap, and that fact is not recoverable from the row.
+        They are resolved with an explanation. resolved_by is '' throughout,
+        the same convention every engine auto-resolve uses, so none of this
+        is mistaken for a hand resolve later.
+        """
+        from .alertrules import syslog_signature
+        now = time.time()
+        with self._lock:
+            rules = {row["id"]: row["key"] for row in
+                     self._conn.execute("SELECT id, key FROM rules").fetchall()}
+            taken = {row["dedup_key"] for row in self._conn.execute(
+                "SELECT dedup_key FROM alerts WHERE state IN ('open','acked')"
+            ).fetchall()}
+            rows = self._conn.execute(
+                "SELECT id, rule_id, dedup_key, entity_id, message FROM alerts"
+                " WHERE state IN ('open','acked') AND entity_kind IN ('trap','syslog')"
+                " ORDER BY id").fetchall()
+            for row in rows:
+                rule_key = rules.get(row["rule_id"])
+                if not rule_key:
+                    continue
+                if row["dedup_key"].startswith(f"{rule_key}:trap:"):
+                    self._conn.execute(
+                        "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                        " resolved_by='' WHERE id=?", (now, row["id"]))
+                    self._note(row["id"], "Resolved on upgrade: trap alerts "
+                                          "are now keyed per source device")
+                    taken.discard(row["dedup_key"])
+                    continue
+                entity_id = f'{row["entity_id"]}:{syslog_signature(row["message"] or "")}'
+                new_key = f"{rule_key}:syslog:{entity_id}"
+                if new_key == row["dedup_key"]:
+                    continue
+                if new_key in taken:
+                    self._conn.execute(
+                        "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                        " resolved_by='' WHERE id=?", (now, row["id"]))
+                    self._note(row["id"], "Resolved on upgrade: another open "
+                                          "alert now covers this message")
+                    taken.discard(row["dedup_key"])
+                    continue
+                self._conn.execute(
+                    "UPDATE alerts SET dedup_key=?, entity_id=? WHERE id=?",
+                    (new_key, entity_id, row["id"]))
+                taken.discard(row["dedup_key"])
+                taken.add(new_key)
+            self._conn.commit()
 
     def _migrate_templates(self) -> None:
         """Bring a built-in template whose shipped wording changed up to date,

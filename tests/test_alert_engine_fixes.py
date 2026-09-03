@@ -419,3 +419,141 @@ assert "coldStart" in trap_alerts[0]["entity_label"], dict(trap_alerts[0])
 ok("a trap alert's label names both the sender and the trap")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== A4
+print("\nA4 — trap and syslog alert identity, and the severity gate")
+
+LINK_DOWN = "1.3.6.1.6.3.1.1.5.3"
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+for ip in ("10.6.0.1", "10.6.0.2"):
+    seed_trap(snmp, ip, LINK_DOWN, "linkDown", severity=3, kind="linkDown",
+              varbinds="ifIndex 7")
+engine._tick()
+unmanaged = open_rows(alerts, "trap_link_down_unmanaged")
+assert len(unmanaged) == 2, [dict(a) for a in unmanaged]
+assert {a["entity_id"] for a in unmanaged} == {f"10.6.0.{i}:{LINK_DOWN}"
+                                               for i in (1, 2)}, \
+    [a["entity_id"] for a in unmanaged]
+ok("the same trap OID from two senders opens two alerts, each naming its source")
+
+# trap_critical ships at severity 2 and matches every trap; the default trap
+# severity is 5, so an informational vendor trap must no longer reach it.
+seed_trap(snmp, "10.6.0.3", "1.3.6.1.4.1.9.9.43.2.0.1",
+          "ciscoConfigManEvent", severity=6, kind="")
+engine._tick()
+assert open_rows(alerts, "trap_critical", "10.6.0.3:1.3.6.1.4.1.9.9.43.2.0.1") == []
+ok("a severity-6 config-save trap no longer opens \"Critical SNMP trap received\"")
+
+seed_trap(snmp, "10.6.0.4", "1.3.6.1.4.1.9.9.43.2.0.2", "vendorPanic",
+          severity=1, kind="")
+engine._tick()
+assert len(open_rows(alerts, "trap_critical",
+                     "10.6.0.4:1.3.6.1.4.1.9.9.43.2.0.2")) == 1
+ok("a severity-1 trap still does")
+
+# coldStart ships at severity 4 while an unmapped trap decodes as 5; the gate
+# must not apply to a rule that already names one trap.
+seed_trap(snmp, "10.6.0.5", "1.3.6.1.6.3.1.1.5.1", "coldStart", severity=5,
+          kind="coldStart")
+engine._tick()
+assert len(open_rows(alerts, "trap_cold_start")) == 1
+ok("a rule naming one trap is not subject to the severity gate")
+
+# A managed sender must not raise the "unmanaged device" rule.
+add_device(nodes, "10.6.1.1", "managed-sw")
+seed_trap(snmp, "10.6.1.1", LINK_DOWN, "linkDown", severity=3,
+          kind="linkDown", varbinds="ifIndex 3")
+engine._tick()
+assert open_rows(alerts, "trap_link_down_unmanaged", f"10.6.1.1:{LINK_DOWN}") == []
+ok("a link-down trap from a device we poll raises no \"unmanaged\" alert")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- syslog identity
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+host = "10.6.2.1"
+for port in ("Gi0/1", "Gi0/9"):
+    seed_syslog(syslog, host,
+                f"%LINK-3-UPDOWN: Interface {port}, changed state to down",
+                severity=2)
+engine._tick()
+link_rows = [a for a in open_rows(alerts, "syslog_critical")
+             if a["entity_id"].endswith("%LINK-3-UPDOWN")]
+assert len(link_rows) == 1, [dict(a) for a in link_rows]
+assert link_rows[0]["count"] == 2, dict(link_rows[0])
+ok("two ports bouncing on one switch are one alert with count 2")
+
+seed_syslog(syslog, host,
+            "%LINEPROTO-5-UPDOWN: Line protocol on Gi0/1 changed state to down",
+            severity=2)
+engine._tick()
+assert len(open_rows(alerts, "syslog_critical")) == 2, \
+    [a["entity_id"] for a in open_rows(alerts, "syslog_critical")]
+ok("a different mnemonic on the same host opens its own alert")
+
+for n in (123, 456):
+    seed_syslog(syslog, host, f"session {n} failed to establish", severity=2)
+engine._tick()
+hashed = [a for a in open_rows(alerts, "syslog_critical")
+          if ":h" in a["entity_id"]]
+assert len(hashed) == 1 and hashed[0]["count"] == 2, [dict(a) for a in hashed]
+ok("two messages that differ only in their digits share one alert")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- the upgrade migration, against a database written with the old keys
+folder = os.path.join(TMPDIR, "rekey")
+os.makedirs(folder, exist_ok=True)
+legacy_path = os.path.join(folder, "alerts.db")
+legacy = AlertsDatabase(legacy_path)
+syslog_rule = legacy.rule_by_key("syslog_critical")
+trap_rule = legacy.rule_by_key("trap_critical")
+now = time.time()
+conn = sqlite3.connect(legacy_path)
+conn.execute(
+    "UPDATE schema_migrations SET name = 'x_' || name")   # replay the migration
+for dedup, kind, entity, message in (
+        (f"{syslog_rule['key']}:syslog:10.7.0.1", "syslog", "10.7.0.1",
+         "%SYS-2-MALLOCFAIL: Memory allocation of 1032 bytes failed"),
+        (f"{syslog_rule['key']}:syslog:10.7.0.2", "syslog", "10.7.0.2",
+         "%OSPF-4-ERRRCV: Received invalid packet"),
+        (f"{trap_rule['key']}:trap:1.3.6.1.6.3.1.1.5.3", "trap",
+         "1.3.6.1.6.3.1.1.5.3", "ifIndex 199")):
+    conn.execute(
+        "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
+        " entity_label, severity, message, detail, opened_ts, last_ts)"
+        " VALUES (?,?,?,?,?,2,?,'',?,?)",
+        (syslog_rule["id"] if kind == "syslog" else trap_rule["id"], dedup,
+         kind, entity, entity, message, now, now))
+conn.commit(); conn.close()
+legacy.close()
+
+upgraded = AlertsDatabase(legacy_path)
+open_now = upgraded.alerts(state="unresolved")
+assert len(open_now) == 2, [dict(a) for a in open_now]
+assert all(a["entity_kind"] == "syslog" for a in open_now), \
+    [dict(a) for a in open_now]
+for row in open_now:
+    assert row["dedup_key"].count(":") >= 3, row["dedup_key"]
+    assert row["entity_id"].startswith("10.7.0."), row["entity_id"]
+ok("upgrading re-keys open syslog alerts in place, keeping their history")
+
+trap_row = [a for a in upgraded.alerts(state="resolved")
+            if a["entity_kind"] == "trap"]
+assert len(trap_row) == 1 and trap_row[0]["resolved_by"] == "", \
+    [dict(a) for a in trap_row]
+assert "keyed per source device" in (trap_row[0]["rollup_note"] or "")
+ok("an open trap alert whose source was never stored is resolved with an "
+   "explanation")
+
+upgraded.close()
+again = AlertsDatabase(legacy_path)
+assert len(again.alerts(state="unresolved")) == 2
+ok("the migration is idempotent — reopening changes nothing")
+again.close()

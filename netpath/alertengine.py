@@ -23,7 +23,8 @@ from dataclasses import asdict
 from . import alertmail
 from . import hostresolve
 from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
-    Occurrence, dedup_key, evaluate_flapping, evaluate_threshold, match_device
+    UNMANAGED_ONLY_RULES, Occurrence, dedup_key, evaluate_flapping, \
+    evaluate_threshold, match_device, syslog_signature
 from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
@@ -763,11 +764,20 @@ class AlertEngine:
             trap_label = row["trap_name"] or row["trap_oid"] or "trap"
             occurrences.append(Occurrence(
                 kind="trap", source_kind=row["trap_kind"] or "", entity_kind="trap",
-                entity_id=row["trap_oid"] or "",
+                # Source AND oid. Keyed on the OID alone, 200 linkDown traps
+                # from 200 switches collapsed into one alert row naming no
+                # device, and open_or_increment overwrote its message with
+                # each one, so 250 faults on 250 devices read as three rows.
+                entity_id=f'{row["source"]}:{row["trap_oid"] or ""}',
                 entity_label=f"{source_label}: {trap_label}",
                 ts=row["ts"], message=row["varbind_text"] or "",
                 device_name=(device["name"] if device else "") or "",
                 device_ip=row["source"],
+                # traps.severity has been stored since the receiver shipped
+                # and the occurrence simply never carried it, so every trap
+                # of any severity satisfied a rule's severity floor.
+                severity=row["severity"],
+                managed=device is not None,
                 extra={"trap_name": row["trap_name"] or "", "trap_oid": row["trap_oid"] or "",
                       "varbinds": row["varbind_text"] or ""}))
         if max_id > cursor:
@@ -798,7 +808,11 @@ class AlertEngine:
                 label = self._source_name(device, row["source"])
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
-                entity_id=row["source"], entity_label=label,
+                # Source AND message signature: keyed on the host alone, a
+                # %SYS-2-MALLOCFAIL and an %OSPF-4-ERRRCV on the same switch
+                # were one row whose message was whichever arrived last.
+                entity_id=f'{row["source"]}:{syslog_signature(row["message"] or "")}',
+                entity_label=label,
                 ts=row["ts"], message=row["message"] or "",
                 # The device's own name where the sender is one we poll, so a
                 # rule's device_filter matches syslog the same way it matches
@@ -806,7 +820,8 @@ class AlertEngine:
                 # the only name an unmanaged sender has.
                 device_name=(device["name"] if device else "") or row["host"] or "",
                 device_ip=row["source"],
-                severity=row["severity"]))
+                severity=row["severity"],
+                managed=device is not None))
         if max_id > cursor:
             self._advance_cursor("syslog", max_id)
         return occurrences
@@ -1385,13 +1400,30 @@ class AlertEngine:
                                 "netpath_threshold", "system"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
-            if rule["kind"] == "syslog" and occurrence.severity is not None:
+            if (rule["kind"] in ("syslog", "trap")
+                    and not (rule["source_kind"] or "")
+                    and occurrence.severity is not None):
                 # Lower number = more severe (RFC 5424): the rule's own
                 # severity is the threshold it fires at — "this severity
                 # and worse" — not just a label stamped on the resulting
-                # alert.
+                # alert. Traps were exempt, so "Critical SNMP trap received"
+                # opened at severity 2 for fifty informational config-save
+                # traps.
+                #
+                # Only for a rule with NO source_kind, i.e. one that is about
+                # every trap or every message. A rule naming one trap already
+                # says exactly which fact it is about, and the shipped
+                # coldStart rule (severity 4) would otherwise never fire: a
+                # trap with no severity mapping decodes as 5, which is worse
+                # than 4 on this scale.
                 if occurrence.severity > rule["severity"]:
                     continue
+            if (rule["key"] or "") in UNMANAGED_ONLY_RULES and occurrence.managed:
+                # "Link-down trap from an unmanaged device" has advertised
+                # this check since it shipped and never performed it, so a
+                # managed switch's port flap raised three alerts: this one,
+                # trap_critical, and interface_down from polling.
+                continue
             if not match_device(rule, occurrence):
                 continue
             key = dedup_key(rule, occurrence)
