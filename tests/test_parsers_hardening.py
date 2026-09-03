@@ -740,6 +740,73 @@ check("an event with no target adds nothing",
                       fresh.targets() == [])[1])(eventlog.EventLog()))
 
 
+# ------------------------------------------------- H8: the timeline's ceilings
+
+print("H8  build_timeline clamps its own window and block count")
+
+from netpath import analysis                         # noqa: E402
+
+now = 1_700_000_000.0
+
+# The review's own reproduction: t0/t1 and the pixel width they are derived
+# from come straight off a query string that only needs the read-only role.
+# t1=1e9 with a wide viewport allocated 326,798 buckets; width=3e7 would have
+# reached about ten million, some 4 GB, from one GET.
+for label, (t0, t1, bucket_s) in {
+    "t1=1e9, 3 s blocks": (0.0, 1e9, 3.0),
+    "a decade of 1 s blocks": (now - 10 * 365 * 86400, now, 1.0),
+    "a 0.001 s block over ten minutes": (now - 600, now, 0.0),
+    "a negative block width": (now - 600, now, -5.0),
+}.items():
+    buckets, elapsed = timed(analysis.build_timeline, [], t0, t1, bucket_s)
+    check(f"{label} yields at most {analysis.MAX_BUCKETS} blocks",
+          len(buckets) <= analysis.MAX_BUCKETS, f"{len(buckets)} in {elapsed:.3f}s")
+    check(f"...and {label} still spans the whole window",
+          buckets[0].t0 <= t0 + 1 and buckets[-1].t1 >= min(t1, analysis.MAX_TIMESTAMP)
+          or len(buckets) == analysis.MAX_BUCKETS,
+          f"{buckets[0].t0:.0f}..{buckets[-1].t1:.0f}")
+
+# Values no client sends, which nothing rejected: infinities, NaN, a reversed
+# window, and strings.
+for label, args in {
+    "infinities": (float("-inf"), float("inf"), 0.0),
+    "NaN": (float("nan"), 1.0, 60.0),
+    "a reversed window": (now, now - 3600, 60.0),
+    "strings": ("x", "y", "z"),
+    "None": (None, None, None),
+}.items():
+    try:
+        buckets = analysis.build_timeline([], *args)
+        check(f"{label} produce a bounded result rather than an exception",
+              0 < len(buckets) <= analysis.MAX_BUCKETS, f"{len(buckets)} blocks")
+    except Exception as exc:                          # noqa: BLE001
+        check(f"{label} produce a bounded result rather than an exception",
+              False, f"{type(exc).__name__}: {exc}")
+
+check("clamp_window refuses a span beyond ten years",
+      analysis.clamp_window(0.0, 1e12)[1] - analysis.clamp_window(0.0, 1e12)[0]
+      <= analysis.MAX_SPAN_S,
+      str(analysis.clamp_window(0.0, 1e12)))
+check("...and a t0 before the epoch",
+      analysis.clamp_window(-1e9, now)[0] >= 0.0,
+      str(analysis.clamp_window(-1e9, now)[0]))
+check("...and leaves an ordinary window exactly as it is",
+      analysis.clamp_window(now - 3600, now) == (now - 3600, now))
+
+# What the UI actually asks for must be untouched: one hour of 60 s blocks,
+# and a trace in each one still lands in the right block.
+traces = [{"started_ts": now - 3600 + i * 60 + 5, "status": "ok",
+           "rtt_ms": float(i), "loss_pct": 0.0, "path_sig": "a",
+           "icmp_code": None, "icmp_from": None} for i in range(60)]
+buckets = analysis.build_timeline(traces, now - 3600, now, 60.0)
+check("an ordinary hour of 60 s blocks is unchanged",
+      60 <= len(buckets) <= 61 and sum(b.total for b in buckets) == 60,
+      f"{len(buckets)} blocks, {sum(b.total for b in buckets)} traces placed")
+check("...and each block still carries its own trace",
+      all(b.total <= 1 for b in buckets) and all(b.status in ("ok", "none")
+                                                 for b in buckets))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
