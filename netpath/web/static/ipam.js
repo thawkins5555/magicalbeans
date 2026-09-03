@@ -46,7 +46,7 @@
     if (!total) {
       svg.appendChild(App.svgNode('circle', {
         cx: size / 2, cy: size / 2, r: radius, fill: 'none',
-        stroke: 'var(--hairline)', 'stroke-width': 5,
+        stroke: 'var(--data-neutral)', 'stroke-width': 5,
       }));
       return svg;
     }
@@ -71,7 +71,7 @@
     return donut([
       { value: u.alive || 0, color: 'var(--ok)' },
       { value: u.seen_down || 0, color: 'var(--warn)' },
-      { value: u.never_seen || 0, color: 'var(--hairline)' },
+      { value: u.never_seen || 0, color: 'var(--data-neutral)' },
     ], size);
   }
 
@@ -80,7 +80,7 @@
     return donut([
       { value: u.leased || 0, color: 'var(--ok)' },
       { value: u.reserved || 0, color: 'var(--accent)' },
-      { value: u.available || 0, color: 'var(--hairline)' },
+      { value: u.available || 0, color: 'var(--data-neutral)' },
     ], size);
   }
 
@@ -129,7 +129,7 @@
       ` <b>${u.alive || 0}</b> <span class="hint">(${pct(u.alive || 0)})</span></div>` +
       `<div><span class="legend-dot" style="background:var(--warn)"></span>Seen before, now down` +
       ` <b>${u.seen_down || 0}</b> <span class="hint">(${pct(u.seen_down || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Never seen` +
+      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Never seen` +
       ` <b>${u.never_seen || 0}</b> <span class="hint">(${pct(u.never_seen || 0)})</span></div>` +
       `</div>` +
       `<div class="hint">${total} usable address(es) \u00b7 ${escape(scanLine)}</div>`;
@@ -699,7 +699,7 @@
       ` <b>${u.leased || 0}</b> <span class="hint">(${pct(u.leased || 0)})</span></div>` +
       `<div><span class="legend-dot" style="background:var(--accent)"></span>Reserved` +
       ` <b>${u.reserved || 0}</b> <span class="hint">(${pct(u.reserved || 0)})</span></div>` +
-      `<div><span class="legend-dot" style="background:var(--hairline)"></span>Available` +
+      `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Available` +
       ` <b>${u.available || 0}</b> <span class="hint">(${pct(u.available || 0)})</span></div>` +
       `</div>` +
       `<div class="hint">${total} address(es) in range \u00b7 ${escape(scope.state || '')} \u00b7 ` +

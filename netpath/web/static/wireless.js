@@ -34,10 +34,16 @@
     return `${(age / 3600).toFixed(1)}h ago`;
   }
 
-  function dot(status) {
-    const color = STATUS_COLOR[status] || 'var(--faint)';
-    return `<span class="dot" style="background:${color};display:inline-block;` +
-      `width:8px;height:8px;border-radius:50%;margin-right:6px"></span>`;
+  /* Fortinet's AP states mapped onto the five tones App.statusMark draws.
+     out_of_service is an administrator's marking rather than something the
+     controller reports, and stays muted so an AP somebody already knows
+     about does not read as a live failure. */
+  const STATUS_TONE = { online: 'ok', offline: 'fail', standby: 'warn',
+    downloading_image: 'warn', connected_image: 'warn', other: 'none',
+    out_of_service: 'none' };
+
+  function dot(status, label, title) {
+    return App.statusMark(STATUS_TONE[status] || 'none', label, title);
   }
 
   /* ------------------------------------------------------------ status */
@@ -93,8 +99,8 @@
     // Wide enough for "out of service" plus its dot without truncating.
     { key: 'status', label: 'Status', width: 130, on: true,
       cell: (r) => (r.out_of_service
-        ? `${dot('out_of_service')}out of service`
-        : `${dot(r.status)}${escape(r.status)}`),
+        ? dot('out_of_service', 'out of service')
+        : dot(r.status, r.status)),
       value: (r) => (r.out_of_service ? 'out of service' : r.status) },
     { key: 'name', label: 'Name', width: 200, on: true,
       cell: (r) => escape(r.name || r.wtp_id),
@@ -304,7 +310,10 @@
   function controllersModal() {
     const rows = view.controllers.map((c) => `
       <tr>
-        <td>${dot(c.last_poll_ok === false ? 'offline' : (c.last_poll_ok ? 'online' : 'other'))}${escape(c.name)}</td>
+        <td>${dot(c.last_poll_ok === false ? 'offline' : (c.last_poll_ok ? 'online' : 'other'),
+                   '', c.last_poll_ok === false ? 'Last poll failed'
+                     : (c.last_poll_ok ? 'Last poll succeeded' : 'Never polled'))
+          } ${escape(c.name)}</td>
         <td>${escape(c.ip)}</td>
         <td>${c.enabled ? 'enabled' : 'disabled'}</td>
         <td>${escape(c.last_poll_error || (c.last_poll_ts ? ago(c.last_poll_ts) : 'never polled'))}</td>

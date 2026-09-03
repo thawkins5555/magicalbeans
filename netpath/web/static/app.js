@@ -665,6 +665,36 @@ const App = (() => {
     ]);
   }
 
+  /* One status renderer for the whole application.
+
+     `tone` is the meaning — ok, warn, fail, info or none — not the colour,
+     so a module maps its own vocabulary ("up", "out_of_service", "changed")
+     onto it once and the drawing is decided here. Every tone has a distinct
+     SHAPE as well as a colour, which is what makes the state readable in
+     greyscale and to a colour-blind operator; see .status in app.css.
+
+     Returns markup rather than a node because every caller is building a
+     table cell as a string. `label` is escaped here — it is a device name
+     or a vendor's status word often enough to matter. */
+  const STATUS_MARKS = { ok: '\u25CF', warn: '\u25B2', fail: '\u25A0',
+                         info: '\u25C6', none: '\u25CB' };
+
+  function statusMark(tone, label, title) {
+    const kind = STATUS_MARKS[tone] ? tone : 'none';
+    const text = label === undefined || label === null || label === ''
+      ? '' : `<span class="status-text">${escapeHtml(label)}</span>`;
+    // A narrow icon-only column has no room for the word, so it passes one
+    // as `title` instead — and the mark stops being aria-hidden there,
+    // because then it is the only thing carrying the state.
+    const named = !text && title;
+    const mark = named
+      ? `<i class="status-mark" role="img" aria-label="${escapeHtml(title)}">`
+      : '<i class="status-mark" aria-hidden="true">';
+    const hover = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<span class="status status-${kind}"${hover}>` +
+      `${mark}${STATUS_MARKS[kind]}</i>${text}</span>`;
+  }
+
   function el(id) { return document.getElementById(id); }
 
   function svgNode(name, attrs = {}, text) {
@@ -1249,6 +1279,16 @@ const App = (() => {
       const openCount = (payload.alerts || {}).open_count || 0;
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
+      // Syslog severities: 0-2 are emergency/alert/critical, 3-4 error and
+      // warning, the rest informational. The badge takes the tone of the
+      // worst one open rather than being permanently amber.
+      const worst = (payload.alerts || {}).open_worst;
+      alertsBadge.classList.toggle('sev-fail', worst !== null && worst !== undefined && worst <= 2);
+      alertsBadge.classList.toggle('sev-warn', worst === 3 || worst === 4);
+      alertsBadge.classList.toggle('sev-info', worst !== null && worst !== undefined && worst >= 5);
+      if (!alertsBadge.hidden) {
+        alertsBadge.title = `${openCount} open alert(s)`;
+      }
     }
     if (payload.session) {
       state.session = payload.session;
@@ -1439,6 +1479,7 @@ const App = (() => {
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, sortRows, canRead, canWrite, accountModal, wireRowKeyboard, announce,
+    statusMark,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };

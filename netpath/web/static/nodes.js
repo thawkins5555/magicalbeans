@@ -50,6 +50,12 @@
 
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--faint)' };
+  /* This module's vocabulary mapped onto the five tones App.statusMark
+     draws. Kept beside STATUS_COLOR, which the timeline lanes still use for
+     their fills — a band in a chart is a different problem from a word in a
+     row, and only the row can carry a shape. */
+  const STATUS_TONE = { up: 'ok', down: 'fail', unsupported: 'warn',
+    auth: 'warn', unknown: 'none' };
 
   /* The one place display-name precedence lives: 'auto' prefers the SNMP
      hostname (sysName) and falls back to the manually entered name, then
@@ -134,10 +140,7 @@
         escape(displayName(r))}"${view.devicesChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'status', label: 'Status', width: 90, on: true,
       value: (r) => r.status || '',
-      cell: (r) => `<span class="dot" style="background:${
-        STATUS_COLOR[r.status] || 'var(--faint)'};display:inline-block;` +
-        `width:8px;height:8px;border-radius:50%;margin-right:6px"></span>` +
-        escape(r.status) },
+      cell: (r) => App.statusMark(STATUS_TONE[r.status] || 'none', r.status) },
     { key: 'name', label: 'Name / IP', width: 200, on: true,
       value: (r) => displayName(r) || r.ip || '',
       // The mute lives in Alerts but is shown here on purpose: an operator

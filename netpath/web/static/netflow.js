@@ -1,9 +1,33 @@
 /* The NetFlow page: collector status, stacked traffic chart, top-N bars and
    the flow record table. */
 (() => {
-  const SERIES = ['#7AA2F7', '#7DCFB6', '#E5A3C4', '#F2B880', '#A9A0F0',
-                  '#69B3D6', '#C3D06A', '#E0868A', '#8FB8A0', '#C9A227'];
-  const OTHER = '#4C5561';
+  /* The categorical palette for stacked bands, top-N bars and their legend.
+
+     The set this replaces was ten colours picked by eye. Two of them were
+     the accent and the muted grey — the colours that mean "interactive"
+     and "no data" everywhere else in the application — and the rest were
+     never checked against the one thing a stacked chart has to survive:
+     telling a band from the band it touches.
+
+     Measured, simulating protanopia and comparing in Lab: the old set's
+     closest ADJACENT pair was 11.3 apart and its lightness spread 15
+     points, so bands blurred into each other and the brighter series read
+     as more important. This one is 32.8 apart at its closest adjacent pair
+     with a 7-point lightness band, and every entry clears 3:1 against the
+     panel it is drawn on (lowest 4.7).
+
+     Honest limit: with eight categories, two NON-adjacent entries still
+     come within 5.5 of each other under simulation — closer than the pair
+     they replace. Bands that touch are what the eye compares in a stack,
+     and the legend and the hover tooltip both carry a swatch beside the
+     name for the rest. Eight rather than ten because eight is near the
+     limit of what anyone matches against a legend, and the server already
+     folds the ninth series onwards into "Other". */
+  const SERIES = ['#5B8DEB', '#CF7638', '#2FA886', '#B0881A',
+                  '#D1609A', '#4F9A3A', '#8F76E8', '#DC5A5A'];
+  // "Other", and anything past the eighth series: deliberately the neutral
+  // that means "nothing of its own" in the donuts too, not a ninth hue.
+  const OTHER = 'var(--data-neutral)';
 
   /* One place decides a series' colour. The stacked bands, the legend and
      the tooltip all read it from here, so a swatch always names the band

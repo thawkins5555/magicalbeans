@@ -22,6 +22,13 @@
   --overrun: #4DB6AC;
   --error: #A371F7;
   --nodata: #1E242D;
+  /* The fill for "none of this yet" in a chart — never seen, available,
+     no samples. --hairline was being used for it, which is a border colour:
+     at 1.35:1 against the panel the remaining slice of an IPAM donut was
+     invisible, so a subnet with three addresses left looked identical to
+     one that was full. 3:1 against the panel, which is the floor for a
+     graphical object that carries meaning. */
+  --data-neutral: #3A4552;
   /* Ticked-for-a-bulk-action rows. Solid rather than a translucent accent so
      the tint is identical on the odd and even table stripes — the point is a
      single unbroken bar across the row. --checked-strong is the same colour a
@@ -160,11 +167,18 @@ body {
 
 .badge {
   background: var(--warn);
-  color: #1a1a1a;
+  color: var(--bg);
   border-radius: 9px;
   padding: 1px 7px;
   font: 700 10px/1.4 var(--ui);
 }
+/* A count on its own only ever said "there are some". These say how bad the
+   worst one is, in the same three tones the rest of the application uses
+   for state — so the tab strip answers "does this need me now?" without
+   opening the tab. */
+.badge.sev-fail { background: var(--fail); color: var(--text); }
+.badge.sev-warn { background: var(--warn); color: var(--bg); }
+.badge.sev-info { background: var(--accent); color: var(--bg); }
 .conn { color: var(--faint); font: 11px var(--mono); padding-right: 4px; }
 .conn.user { color: var(--muted); }
 button.linkish {
@@ -351,6 +365,25 @@ body.tiny .terms { display: none; }
   text-transform: uppercase;
 }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--faint); }
+
+/* Status said three ways at once: a shape, a colour and a word.
+
+   Colour alone used to be the whole encoding. The ok/warn/fail hues are
+   inseparable for a protan viewer — measured 3.8 ΔE apart, where 10 is the
+   floor for a categorical set — and they collapse to three near-identical
+   greys in the screenshot somebody pastes into a ticket. The shape carries
+   the meaning on its own; the colour confirms it for everyone who can see
+   it. The Nodes device list already followed dot-plus-word and is where
+   this came from; this makes it the rule and gives the three modules that
+   had each inlined their own 8px dot one implementation to share. */
+.status { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
+.status-mark { flex: none; font-size: 9px; line-height: 1; font-style: normal; }
+.status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-ok   .status-mark { color: var(--ok); }
+.status-warn .status-mark { color: var(--warn); }
+.status-fail .status-mark { color: var(--fail); }
+.status-info .status-mark { color: var(--accent); }
+.status-none .status-mark { color: var(--faint); }
 
 /* -------------------------------------------------------------- netpath */
 .sidebar {

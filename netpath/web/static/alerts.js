@@ -145,7 +145,12 @@
         escape(r.entity_label || r.object || 'this object')}"${
         view.checked.has(r.id) ? ' checked' : ''}>` },
     { key: 'severity', label: 'Sev', width: 60, numeric: true, on: true,
-      cell: (r) => `<span class="sev sev-${r.severity}">${r.severity}</span>` },
+      // The name, not the digit. Syslog and SNMP Trap both show the word in
+      // this column; Alerts showed "2" and kept the word in a column that is
+      // off by default, so the one page an operator triages from was the one
+      // that made them remember the scale.
+      cell: (r) => `<span class="sev sev-${r.severity}">${
+        escape(App.state.severities?.[r.severity] || r.severity)}</span>` },
     { key: 'state', label: 'State', width: 80, on: true },
     { key: 'entity_label', label: 'Object', width: 170, on: true },
     { key: 'rule_name', label: 'Rule', width: 150, on: true },
@@ -387,7 +392,8 @@
       tr.className = 'clickable' + (view.rulesSelected === r.id ? ' selected' : '');
       tr.innerHTML = `<td>${escape(r.name)}${r.is_builtin ? '' : ' <span class="hint">(custom)</span>'}</td>` +
         `<td>${escape(r.kind)}${r.source_kind ? `: ${escape(r.source_kind)}` : ''}</td>` +
-        `<td><span class="sev sev-${r.severity}">${r.severity}</span></td>` +
+        `<td><span class="sev sev-${r.severity}">${
+          escape(App.state.severities?.[r.severity] || r.severity)}</span></td>` +
         `<td>${r.enabled ? 'yes' : 'no'}</td>`;
       tr.onclick = () => { view.rulesSelected = r.id; drawRulesTable(); };
       body.appendChild(tr);

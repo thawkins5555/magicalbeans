@@ -81,6 +81,29 @@ nine things are made to work.
   nine time-window and row-limit menus that had none. Anything that changes
   a status line is also announced once, through a live region the next pass
   will build its notifications on.
+- **State is no longer carried by colour alone.** A green dot and a red dot
+  are the same dot to a colour-blind operator, and the same grey in the
+  screenshot somebody pastes into a ticket. Every status now has a shape as
+  well as a colour and a word — `● up`, `■ down`, `▲ auth
+  failed`, `○ unknown` — from one renderer shared by Nodes, Wireless
+  and ConfigRX, which had each inlined their own dot. ConfigRX's "changed"
+  stops being green, which meant "healthy" on every other page: a config
+  that differs from the last copy is information, not a fault.
+- **Alerts names the severity.** The column showed a bare `2`, while Syslog
+  and SNMP Trap both showed the word, so the one page an operator triages
+  from was the one that required them to remember the scale.
+- **The tab badge says how bad, not just how many.** It was amber whatever
+  was behind it; it now takes the tone of the worst open alert, so the tab
+  strip answers "does this need me now?" without opening the tab.
+- **The empty part of an IPAM donut is visible.** "Never seen" and
+  "available" were drawn in a border colour at 1.35:1 against the panel, so
+  a subnet with three addresses left looked identical to one that was full.
+- **NetFlow's series palette was rebuilt.** Two of the ten were the accent
+  and the muted grey — the colours that mean "interactive" and "no data"
+  everywhere else — and the closest pair of touching bands was 11.3 apart
+  under simulated protanopia. The new set of eight is 32.8 apart at its
+  closest touching pair, holds a seven-point lightness band so no series
+  reads as more important than another, and clears 3:1 against the panel.
 - **Tests.** `tests/test_web_gates.py` covers the three halves a browser
   must not be trusted with: the must-change gate, device address
   validation, and the shape of `/api/state` for each permission set — the

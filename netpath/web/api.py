@@ -169,6 +169,10 @@ def get_state(service, params, body) -> dict:
             "status": service.alert_engine.status_text(),
             "counters": service.alert_engine.counters,
             "open_count": service.alerts_db.open_count(),
+            # The badge on the tab is coloured by this. A count alone
+            # said "there are alerts" in the same amber whether the
+            # worst of them was a notice or a device being down.
+            "open_worst": service.alerts_db.open_summary()["worst"],
         },
         "wireless": {
             "running": service.wireless.running,
