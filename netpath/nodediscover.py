@@ -49,7 +49,11 @@ def _snmp_identify(ip: str, version: int, community: str, timeout_s: float,
     over several community/version combinations, so a slow retry-per-guess
     would make a subnet sweep take far too long). Returns a Response or
     raises SnmpError."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # AF_INET6 for a v6 literal, the same rule nodepoll._Session uses: a
+    # colon cannot appear in a dotted quad, so the address says which
+    # family to open without any parsing.
+    family = socket.AF_INET6 if ":" in str(ip) else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(max(0.2, timeout_s))
     try:
         packet = build_request(version, community, pdu,

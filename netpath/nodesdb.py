@@ -15,10 +15,15 @@ unbounded split `ipamdb.py`'s `scans` (pruned) vs. `subnets`/`hosts`
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
+
+from . import dbmaint, dbopen
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
@@ -202,6 +207,11 @@ CREATE TABLE IF NOT EXISTS samples (
     value           REAL,
     PRIMARY KEY (metric_id, ts)
 );
+-- The primary key leads on metric_id, so the two queries that ask about
+-- time across every metric — compact_rollup's per-hour aggregate and
+-- prune's delete by age — scanned the whole table without this. On the
+-- largest table in the database that was seconds of held lock per pass.
+CREATE INDEX IF NOT EXISTS ix_samples_ts ON samples(ts);
 CREATE TABLE IF NOT EXISTS samples_hourly (
     metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
     hour            INTEGER NOT NULL,
@@ -209,6 +219,28 @@ CREATE TABLE IF NOT EXISTS samples_hourly (
     vmin            REAL, vavg REAL, vmax REAL,
     PRIMARY KEY (metric_id, hour)
 );
+-- The primary key leads on metric_id, so "every rollup row older than N
+-- days" — what prune() asks once per maintenance pass — would scan the
+-- whole table without this.
+CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour ON samples_hourly(hour);
+
+-- Every address a device is known to answer on, beside its primary `ip`.
+-- A switch sends its traps from a loopback and its syslog from a
+-- management VRF, and both are addresses the devices table has never
+-- heard of, so the alert engine could not tell whose they were. Filled
+-- best-effort from each poll's ipAddrTable read (source 'ipAddrTable');
+-- `source` is kept so a later manual or protocol-learned entry can be
+-- told apart from a polled one. The device's own `ip` is deliberately NOT
+-- mirrored here — device_id_for_address falls back to devices.ip — so
+-- there is one place a primary address is stored.
+CREATE TABLE IF NOT EXISTS device_addresses (
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    ip              TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT '',
+    seen_ts         REAL NOT NULL,
+    PRIMARY KEY (device_id, ip)
+);
+CREATE INDEX IF NOT EXISTS ix_device_addresses_ip ON device_addresses(ip);
 
 CREATE TABLE IF NOT EXISTS device_events (
     id              INTEGER PRIMARY KEY,
@@ -338,8 +370,20 @@ DEFAULTS = {
     # keep loss sampling steady on a device polled rarely, or to ping less
     # often than a fast focus poll would.
     "ping_interval_s": 0,
-    "sample_retention_days": 400,    # raw samples; hourly rollups are never pruned by age
-    "sample_row_cap_per_metric": 50_000,
+    # Raw samples are the expensive table — the review measured 9.1 GB a day
+    # at 2,000 devices with 48 ports each — and are what series() reads for
+    # a window up to three days wide. Anything wider reads samples_hourly,
+    # which compact_rollup fills, so keeping months of raw points bought
+    # nothing but disk. Three days of raw, and the rollups carry the long
+    # history at about a thousandth of the size.
+    "sample_retention_days": 3,
+    "rollup_retention_days": 400,    # hourly rollups; what a year-wide chart reads
+    # Per metric, not across the whole table: the old whole-table 50,000
+    # left a 2,000-device fleet with a third of a sample per metric. At the
+    # shipped 120 s interval this is about seven days of raw points for one
+    # metric, well past sample_retention_days, so it is a safety net rather
+    # than the thing that decides retention.
+    "sample_row_cap_per_metric": 5_000,
     "event_retention_days": 180,
     "discovery_retention_days": 30,
     "max_mib_bytes": 8 * 1024 * 1024,
@@ -351,7 +395,6 @@ DEFAULTS = {
     "max_mib_bundle_bytes": 64 * 1024 * 1024,
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
-    "rollup_enabled": True,
     "detail_fields": "sys_descr,vendor,snmp_version",  # identity fields shown in
                                                        # the device detail header
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
@@ -406,6 +449,12 @@ DEFAULTS = {
     "vendor_walk_parallel": 4,
     "discovery_arc_hop": True,
 }
+
+# How wide a chart window still reads raw samples. Wider than this reads
+# samples_hourly instead — which is why sample_retention_days defaults to
+# the same three days: raw points older than the widest raw window can
+# answer nothing a rollup does not.
+RAW_WINDOW_S = 3 * 86400
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
@@ -489,12 +538,25 @@ class NodesDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # Bumped by every write that could change what or how a device is
+        # polled. The scheduler holds one merged config per device and
+        # rebuilds it only when this moves — see config_generation().
+        self._config_generation = 0
+        self._warned_no_window = False
+        # dbopen.connect narrows the file (and its -wal/-shm companions) to
+        # the owner: nodes.db holds every profile's community string and
+        # every stored v3 credential blob.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            # Before the schema runs: auto_vacuum can be set with a plain
+            # pragma only while the database is still empty, so a new
+            # nodes.db takes it for free and only an existing one pays the
+            # one-time VACUUM that converts it (logged).
+            dbmaint.enable_incremental_vacuum(self._conn, "nodes")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -608,6 +670,24 @@ class NodesDatabase:
             if column not in interfaces:
                 self._conn.execute(
                     f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
+        # ifInDiscards/ifOutDiscards (the counters that say a link is
+        # congested rather than broken) and their rates, alongside the error
+        # pair above.
+        for column in ("last_in_discards", "last_out_discards"):
+            if column not in interfaces:
+                self._conn.execute(
+                    f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
+        for column in ("in_discard_rate", "out_discard_rate"):
+            if column not in interfaces:
+                self._conn.execute(
+                    f"ALTER TABLE interfaces ADD COLUMN {column} REAL")
+        # ifCounterDiscontinuityTime (RFC 2863): the sysUpTime at which this
+        # interface's counters were last reset. Stored so a rate is not
+        # computed across a reset — an agent that restarts its counters
+        # otherwise reads as one enormous burst of traffic.
+        if "discontinuity_ts" not in interfaces:
+            self._conn.execute(
+                "ALTER TABLE interfaces ADD COLUMN discontinuity_ts REAL")
 
         jobs = {row["name"] for row in
                 self._conn.execute("PRAGMA table_info(discovery_jobs)").fetchall()}
@@ -716,6 +796,29 @@ class NodesDatabase:
                     pass
         return values
 
+    def _private_setting(self, key: str, default=None):
+        """A settings row this module keeps for itself. Not in DEFAULTS, so
+        settings() never returns it and save_settings() cannot be made to
+        overwrite it from the settings dialog — it is bookkeeping, not a
+        preference."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return default
+
+    def _set_private_setting(self, key: str, value) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)))
+            self._conn.commit()
+
     def save_settings(self, values: dict) -> None:
         with self._lock:
             for key, value in values.items():
@@ -726,6 +829,7 @@ class NodesDatabase:
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, json.dumps(value)))
             self._conn.commit()
+            self._config_generation += 1
 
     # ----------------------------------------------------------------- groups
 
@@ -752,6 +856,7 @@ class NodesDatabase:
             cur = self._conn.execute(
                 f"INSERT INTO groups({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def update_group(self, group_id: int, **fields) -> None:
@@ -764,6 +869,7 @@ class NodesDatabase:
                 f"UPDATE groups SET {clauses} WHERE id = ?",
                 (*allowed.values(), group_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_group_credential(self, group_id: int, user: str, auth_proto: str,
                              password_enc: bytes) -> None:
@@ -772,12 +878,14 @@ class NodesDatabase:
                 "UPDATE groups SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
                 " WHERE id=?", (user, auth_proto, password_enc, group_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_group_credential(self, group_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE groups SET v3_auth_pass_enc=NULL WHERE id=?", (group_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def device_count_for_group(self, group_id: int) -> int:
         with self._lock:
@@ -810,6 +918,7 @@ class NodesDatabase:
                         "UPDATE groups SET is_default = 1 WHERE id = ?",
                         (successor["id"],))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_default_group(self, group_id: int) -> None:
         with self._lock:
@@ -817,6 +926,7 @@ class NodesDatabase:
             self._conn.execute("UPDATE groups SET is_default = 1 WHERE id = ?",
                                (group_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     # ----------------------------------------------------- group credentials
 
@@ -844,6 +954,7 @@ class NodesDatabase:
                 (group_id, label, snmp_version, community, v3_user, v3_auth_proto,
                  time.time()))
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def update_group_credential(self, credential_id: int, **fields) -> None:
@@ -857,6 +968,7 @@ class NodesDatabase:
                 f"UPDATE group_credentials SET {clauses} WHERE id = ?",
                 (*allowed.values(), credential_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def set_group_credential_password(self, credential_id: int, user: str,
                                       auth_proto: str, password_enc: bytes) -> None:
@@ -866,6 +978,7 @@ class NodesDatabase:
                 " v3_auth_pass_enc=? WHERE id=?",
                 (user, auth_proto, password_enc, credential_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_group_credential_password(self, credential_id: int) -> None:
         with self._lock:
@@ -873,12 +986,14 @@ class NodesDatabase:
                 "UPDATE group_credentials SET v3_auth_pass_enc=NULL WHERE id=?",
                 (credential_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def remove_group_credential(self, credential_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM group_credentials WHERE id = ?", (credential_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     # ---------------------------------------------------------- device groups
     #
@@ -1100,6 +1215,7 @@ class NodesDatabase:
             cur = self._conn.execute(
                 f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
             self._conn.commit()
+            self._config_generation += 1
             return cur.lastrowid
 
     def seed_identity(self, device_id: int, *, sys_descr: str = "",
@@ -1140,6 +1256,7 @@ class NodesDatabase:
                 f"UPDATE devices SET {clauses} WHERE id = ?",
                 (*allowed.values(), device_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def bulk_update_devices(self, device_ids: list[int], **fields) -> None:
         """The same field allow-list as update_device, applied to many rows
@@ -1156,6 +1273,7 @@ class NodesDatabase:
                 f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
                 (*allowed.values(), *device_ids))
             self._conn.commit()
+            self._config_generation += 1
 
     def bulk_remove_devices(self, device_ids: list[int]) -> int:
         if not device_ids:
@@ -1165,6 +1283,7 @@ class NodesDatabase:
             cursor = self._conn.execute(
                 f"DELETE FROM devices WHERE id IN ({marks})", device_ids)
             self._conn.commit()
+            self._config_generation += 1
             return cursor.rowcount or 0
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
@@ -1174,23 +1293,69 @@ class NodesDatabase:
                 "UPDATE devices SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
                 " WHERE id=?", (user, auth_proto, password_enc, device_id))
             self._conn.commit()
+            self._config_generation += 1
 
     def clear_device_credential(self, device_id: int) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET v3_auth_pass_enc=NULL WHERE id=?", (device_id,))
             self._conn.commit()
+            self._config_generation += 1
 
     def remove_device(self, device_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
             self._conn.commit()
+            self._config_generation += 1
+
+    def config_generation(self) -> int:
+        """A counter that moves whenever a settings, profile, credential or
+        device write could change how something is polled.
+
+        The scheduler used to re-read the whole device table and call
+        effective_config() — itself four settings reads and a group read —
+        once per device per second: 4,001 statements a second at 2,000
+        devices, under the same lock every poll worker needs. It now holds
+        the merged configs and rebuilds them only when this number changes.
+        A plain in-memory counter, not a stored value: it only has to be
+        comparable within one process, and the poller lives in the same
+        process as every writer.
+        """
+        return self._config_generation
+
+    def schedule_rows(self) -> list[sqlite3.Row]:
+        """Just the columns the scheduling loop reads, for enabled devices
+        only. `SELECT *` pulled sys_descr and every credential blob for
+        every device once a second to look at four integers."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, name, ip, status, consecutive_fail, last_poll_ts"
+                " FROM devices WHERE enabled = 1").fetchall()
+
+    def effective_configs(self) -> dict:
+        """effective_config() for every enabled device, with the settings
+        and groups tables read once between them all rather than once (four
+        times, in settings()' case) per device."""
+        settings = self.settings()
+        with self._lock:
+            groups = {row["id"]: row for row in
+                      self._conn.execute("SELECT * FROM groups").fetchall()}
+            devices = self._conn.execute(
+                "SELECT * FROM devices WHERE enabled = 1").fetchall()
+        return {row["id"]: self._merge_config(
+                    row, groups.get(row["group_id"]), settings)
+                for row in devices}
 
     def effective_config(self, device_row: sqlite3.Row) -> dict:
         """Merges a device's own non-NULL override columns over its group's
         row (or DEFAULTS if the device has no group). This is the single
         place "per device or per device group" is actually resolved."""
         group_row = self.group(device_row["group_id"]) if device_row["group_id"] else None
+        return self._merge_config(device_row, group_row, self.settings())
+
+    def _merge_config(self, device_row, group_row, settings: dict) -> dict:
+        """The merge itself, given rows already read. Split out so
+        effective_configs() can do the reads once for a whole fleet."""
         config = {}
         for key in _OVERRIDE_COLUMNS:
             value = device_row[key] if key in device_row.keys() else None
@@ -1199,7 +1364,6 @@ class NodesDatabase:
             config[key] = value
         if config.get("snmp_version") is None:
             config["snmp_version"] = 1
-        settings = self.settings()  # fetched once; every fallback below reuses it
         if config.get("poll_interval_s") is None:
             config["poll_interval_s"] = settings.get("default_interval_s", 120)
         if config.get("snmp_timeout_s") is None:
@@ -1316,6 +1480,73 @@ class NodesDatabase:
                 (*fields.values(), device_id))
             self._conn.commit()
             return previous
+
+    # ------------------------------------------------------- device addresses
+
+    def record_device_addresses(self, device_id: int, ips, source: str) -> int:
+        """Remember the addresses a device answers on besides its primary
+        `ip`, so a trap or syslog message from its loopback or its
+        management VRF correlates to the device that sent it.
+
+        An upsert per (device_id, ip) rather than delete-and-insert: an
+        address the device stopped advertising is still the address last
+        seen for it, and dropping it would silently un-correlate whatever
+        is still sending from there. Rows for the device's own primary
+        address are skipped — that one lives in `devices.ip` and
+        device_id_for_address already falls back to it. Loopback and
+        unspecified addresses are skipped too: every device reports
+        127.0.0.1 in its ipAddrTable, and storing that would make one
+        arbitrary device the owner of everything sent from localhost.
+        """
+        now = time.time()
+        rows = []
+        for ip in ips or ():
+            text = str(ip or "").strip()
+            if not text or text.startswith("127.") or text in ("0.0.0.0", "::1", "::"):
+                continue
+            rows.append((device_id, text, source or "", now))
+        if not rows:
+            return 0
+        with self._lock:
+            # The device's own address is not stored twice; a row that was
+            # previously learned for another device moves here, because the
+            # newest evidence is what an address currently belongs to.
+            primary = self._conn.execute(
+                "SELECT ip FROM devices WHERE id = ?", (device_id,)).fetchone()
+            primary_ip = primary["ip"] if primary else ""
+            rows = [row for row in rows if row[1] != primary_ip]
+            if not rows:
+                return 0
+            self._conn.executemany(
+                "INSERT INTO device_addresses(device_id, ip, source, seen_ts)"
+                " VALUES (?,?,?,?) ON CONFLICT(device_id, ip) DO UPDATE SET"
+                " source=excluded.source, seen_ts=excluded.seen_ts", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def device_id_for_address(self, ip: str) -> int | None:
+        """Which device answers on this address: its primary `ip` first,
+        then any alias learned for it. Primary first because that is the
+        address the operator configured, and an alias is only ever
+        supporting evidence."""
+        text = str(ip or "").strip()
+        if not text:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM devices WHERE ip = ?", (text,)).fetchone()
+            if row is not None:
+                return row["id"]
+            row = self._conn.execute(
+                "SELECT device_id FROM device_addresses WHERE ip = ?"
+                " ORDER BY seen_ts DESC LIMIT 1", (text,)).fetchone()
+        return row["device_id"] if row else None
+
+    def device_addresses(self, device_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_addresses WHERE device_id = ? ORDER BY ip",
+                (device_id,)).fetchall()
 
     # ------------------------------------------------------------- interfaces
 
@@ -1438,51 +1669,74 @@ class NodesDatabase:
             self._conn.commit()
         return cur.rowcount or 0
 
-    def replace_interfaces(self, device_id: int, rows: list[dict]) -> dict:
+    def replace_interfaces(self, device_id: int, rows: list[dict],
+                           allow_delete: bool = True) -> dict:
         """Wholesale replace of a device's interface table each poll cycle.
         Matches existing rows by if_index to carry forward
         last_in_octets/last_out_octets/last_sample_ts so a rate calc isn't
         lost across a routine poll; inserts new ones; deletes vanished
-        ones."""
+        ones.
+
+        `allow_delete=False` keeps every stored row the walk did not see.
+        A walk that was cut short — a timeout half way down the ifTable —
+        is not evidence that the interfaces it never reached are gone, and
+        deleting them takes their link-event history with them (the FK
+        cascade) and re-creates them with no counters on the next poll.
+
+        The returned dict carries `ids`: {if_index: interfaces.id} for
+        every row this device now has, because the caller needs those ids
+        to record link events and every row is already read here — one
+        SELECT per interface afterwards was pure duplication.
+        """
         now = time.time()
         with self._lock:
             existing = {row["if_index"]: row for row in self._conn.execute(
                 "SELECT * FROM interfaces WHERE device_id = ?", (device_id,)).fetchall()}
             seen_indexes = set()
             added, removed, reindexed = [], [], []
+            inserts, updates = [], []
             for row in rows:
                 if_index = row["if_index"]
                 seen_indexes.add(if_index)
                 prior = existing.get(if_index)
                 if prior is None:
                     added.append(if_index)
-                    self._conn.execute(
-                        "INSERT INTO interfaces(device_id, if_index, descr, alias,"
-                        " phys_addr, speed_bps, admin_status, oper_status,"
-                        " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?)",
+                    inserts.append(
                         (device_id, if_index, row.get("descr"), row.get("alias"),
                          row.get("phys_addr"), row.get("speed_bps"),
                          row.get("admin_status"), row.get("oper_status"), now))
                 else:
                     if prior["descr"] != row.get("descr"):
                         reindexed.append(if_index)
-                    self._conn.execute(
-                        "UPDATE interfaces SET descr=?, alias=?, phys_addr=?,"
-                        " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
-                        " WHERE device_id=? AND if_index=?",
+                    updates.append(
                         (row.get("descr"), row.get("alias"), row.get("phys_addr"),
                          row.get("speed_bps"), row.get("admin_status"),
                          row.get("oper_status"), now, device_id, if_index))
-            for if_index in existing:
-                if if_index not in seen_indexes:
-                    removed.append(if_index)
+            if inserts:
+                self._conn.executemany(
+                    "INSERT INTO interfaces(device_id, if_index, descr, alias,"
+                    " phys_addr, speed_bps, admin_status, oper_status,"
+                    " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?)", inserts)
+            if updates:
+                self._conn.executemany(
+                    "UPDATE interfaces SET descr=?, alias=?, phys_addr=?,"
+                    " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
+                    " WHERE device_id=? AND if_index=?", updates)
+            if allow_delete:
+                for if_index in existing:
+                    if if_index not in seen_indexes:
+                        removed.append(if_index)
             if removed:
                 marks = ",".join("?" * len(removed))
                 self._conn.execute(
                     f"DELETE FROM interfaces WHERE device_id=? AND if_index IN ({marks})",
                     (device_id, *removed))
+            ids = {row["if_index"]: row["id"] for row in self._conn.execute(
+                "SELECT id, if_index FROM interfaces WHERE device_id = ?",
+                (device_id,)).fetchall()}
             self._conn.commit()
-        return {"added": added, "removed": removed, "reindexed": reindexed}
+        return {"added": added, "removed": removed, "reindexed": reindexed,
+                "ids": ids}
 
     def update_interface_rate(self, device_id: int, if_index: int, *,
                               in_octets: int | None, out_octets: int | None,
@@ -1491,41 +1745,127 @@ class NodesDatabase:
                               in_bps: float | None, out_bps: float | None,
                               in_error_rate: float | None, out_error_rate: float | None,
                               ts: float) -> None:
+        """One interface's counters and rates. A one-row wrapper around
+        update_interface_rates for callers outside the poll loop."""
+        self.update_interface_rates(device_id, [{
+            "if_index": if_index, "in_octets": in_octets, "out_octets": out_octets,
+            "in_errors": in_errors, "out_errors": out_errors,
+            "in_bps": in_bps, "out_bps": out_bps,
+            "in_error_rate": in_error_rate, "out_error_rate": out_error_rate,
+            "ts": ts}])
+
+    _RATE_COLUMNS = ("last_in_octets", "last_out_octets", "last_in_errors",
+                     "last_out_errors", "last_in_discards", "last_out_discards",
+                     "last_sample_ts", "in_bps", "out_bps", "in_error_rate",
+                     "out_error_rate", "in_discard_rate", "out_discard_rate",
+                     "discontinuity_ts")
+
+    def update_interface_rates(self, device_id: int, rows: list[dict]) -> None:
+        """Every interface's counters and computed rates for one poll, in
+        one statement and one commit.
+
+        One UPDATE per interface with its own commit is what made a
+        500-port chassis cost hundreds of transactions per poll; the values
+        are all known at the same moment, so they belong in one.
+        """
+        if not rows:
+            return
+        columns = self._RATE_COLUMNS
+        clauses = ", ".join(f"{name}=?" for name in columns)
+        params = [tuple([row.get("in_octets"), row.get("out_octets"),
+                         row.get("in_errors"), row.get("out_errors"),
+                         row.get("in_discards"), row.get("out_discards"),
+                         row.get("ts"), row.get("in_bps"), row.get("out_bps"),
+                         row.get("in_error_rate"), row.get("out_error_rate"),
+                         row.get("in_discard_rate"), row.get("out_discard_rate"),
+                         row.get("discontinuity_ts"),
+                         device_id, row["if_index"]])
+                  for row in rows]
         with self._lock:
-            self._conn.execute(
-                "UPDATE interfaces SET last_in_octets=?, last_out_octets=?,"
-                " last_in_errors=?, last_out_errors=?,"
-                " last_sample_ts=?, in_bps=?, out_bps=?, in_error_rate=?,"
-                " out_error_rate=? WHERE device_id=? AND if_index=?",
-                (in_octets, out_octets, in_errors, out_errors, ts, in_bps,
-                 out_bps, in_error_rate, out_error_rate, device_id, if_index))
-            self._conn.commit()
+            try:
+                self._conn.executemany(
+                    f"UPDATE interfaces SET {clauses}"
+                    f" WHERE device_id=? AND if_index=?", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
 
     # ---------------------------------------------------------------- metrics
 
-    def record_metric_sample(self, device_id: int, key: str, label: str,
-                             unit: str, kind: str, ts: float, value: float | None) -> int:
+    def record_metric_samples(self, device_id: int, rows: list) -> dict:
+        """Every metric one poll produced, in one transaction.
+
+        `rows` is a sequence of (key, label, unit, kind, ts, value). The
+        whole poll's samples used to go through record_metric_sample one at
+        a time, each with its own commit: a 500-port chassis is ~2,000
+        fsyncs per poll, and the review measured 2,181 rows/s that way
+        against 150,832/s batched. Here it is one SELECT of the device's
+        existing metric ids, one INSERT for keys never seen before, one
+        UPDATE of the current values, and one INSERT for the samples.
+
+        `kind` is written only when the metric row is created. Changing a
+        metric's kind under a chart that has months of history in the other
+        unit is not something a poll should do silently, and the poller
+        never means to: the kind is a property of the OID, not of a
+        reading. A value of None updates last_ts and stores no sample —
+        "polled, no answer" is not a zero.
+
+        Returns {key: metric_id} for every row, so a caller that needs an
+        id (a chart link, a threshold) does not have to read them back.
+        """
+        latest: dict[str, tuple] = {}
+        for row in rows or ():
+            key, label, unit, kind, ts, value = row
+            latest[key] = (label, unit, kind, ts, value)
+        if not latest:
+            return {}
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM metrics WHERE device_id=? AND key=?",
-                (device_id, key)).fetchone()
-            if row is None:
-                cur = self._conn.execute(
-                    "INSERT INTO metrics(device_id, key, label, unit, kind,"
-                    " last_value, last_ts) VALUES (?,?,?,?,?,?,?)",
-                    (device_id, key, label, unit, kind, value, ts))
-                metric_id = cur.lastrowid
-            else:
-                metric_id = row["id"]
-                self._conn.execute(
+            try:
+                ids = {r["key"]: r["id"] for r in self._conn.execute(
+                    "SELECT id, key FROM metrics WHERE device_id = ?",
+                    (device_id,)).fetchall()}
+                missing = [(device_id, key, label, unit, kind)
+                           for key, (label, unit, kind, _ts, _value) in latest.items()
+                           if key not in ids]
+                if missing:
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO metrics(device_id, key, label, unit,"
+                        " kind) VALUES (?,?,?,?,?)", missing)
+                    marks = ",".join("?" * len(missing))
+                    for r in self._conn.execute(
+                            f"SELECT id, key FROM metrics WHERE device_id = ?"
+                            f" AND key IN ({marks})",
+                            (device_id, *[m[1] for m in missing])).fetchall():
+                        ids[r["key"]] = r["id"]
+                self._conn.executemany(
                     "UPDATE metrics SET last_value=?, last_ts=?, label=?, unit=?"
-                    " WHERE id=?", (value, ts, label, unit, metric_id))
-            if value is not None:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
-                    " VALUES (?,?,?)", (metric_id, ts, value))
-            self._conn.commit()
-            return metric_id
+                    " WHERE id=?",
+                    [(value, ts, label, unit, ids[key])
+                     for key, (label, unit, _kind, ts, value) in latest.items()
+                     if key in ids])
+                samples = [(ids[key], ts, value)
+                           for key, (_label, _unit, _kind, ts, value) in latest.items()
+                           if value is not None and key in ids]
+                if samples:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
+                        " VALUES (?,?,?)", samples)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+        return {key: ids[key] for key in latest if key in ids}
+
+    def record_metric_sample(self, device_id: int, key: str, label: str,
+                             unit: str, kind: str, ts: float,
+                             value: float | None) -> int:
+        """One metric sample — a one-row wrapper around
+        record_metric_samples, kept for the callers (tests, on-demand
+        reads) that genuinely have exactly one."""
+        ids = self.record_metric_samples(
+            device_id, [(key, label, unit, kind, ts, value)])
+        return ids[key]
 
     def metrics(self, device_id: int) -> list[sqlite3.Row]:
         with self._lock:
@@ -1537,6 +1877,25 @@ class NodesDatabase:
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
+
+    def top_metric(self, key: str, n: int = 10, *,
+                   ascending: bool = False) -> list[sqlite3.Row]:
+        """The n enabled devices with the highest (or lowest) current value
+        of one metric key — "worst packet loss", "slowest to answer" — in
+        one query rather than a metrics() call per device. NULL last_value
+        rows are excluded: a metric that has never produced a sample is not
+        a zero, and sorting it as one puts silent devices at the top of a
+        "best" list and hides real ones."""
+        order = "ASC" if ascending else "DESC"
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT m.device_id AS device_id, d.name AS name, d.ip AS ip,"
+                f" m.id AS metric_id, m.key AS key, m.label AS label,"
+                f" m.unit AS unit, m.last_value AS last_value, m.last_ts AS last_ts"
+                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
+                f" WHERE m.key = ? AND m.last_value IS NOT NULL AND d.enabled = 1"
+                f" ORDER BY m.last_value {order} LIMIT ?",
+                (key, int(n))).fetchall()
 
     def series(self, device_id: int, metric_id: int, t0: float, t1: float,
                bucket_s: float = 0) -> list[dict]:
@@ -1562,7 +1921,7 @@ class NodesDatabase:
                     "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
                     (metric_id, device_id)).fetchone():
                 return []
-            if (t1 - t0) <= 86400 * 3:
+            if (t1 - t0) <= RAW_WINDOW_S:
                 if bucket_s and bucket_s > 0:
                     rows = self._conn.execute(
                         "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
@@ -1585,30 +1944,73 @@ class NodesDatabase:
             return [{"ts": row["hour"], "min": row["vmin"], "avg": row["vavg"],
                     "max": row["vmax"], "n": row["n"]} for row in rows]
 
-    def compact_rollup(self) -> int:
-        """Aggregates any raw samples older than one hour into
-        samples_hourly, min/avg/max per (metric, hour), then deletes the
-        raw rows that were just rolled up. Idempotent: an hour already
-        fully rolled up produces nothing new to aggregate."""
-        cutoff_hour = int(time.time() // 3600) * 3600 - 3600
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT metric_id, CAST(ts / 3600 AS INTEGER) * 3600 AS hour,"
-                " COUNT(*) AS n, MIN(value) AS vmin, AVG(value) AS vavg,"
-                " MAX(value) AS vmax FROM samples WHERE ts < ?"
-                " GROUP BY metric_id, hour", (cutoff_hour,)).fetchall()
-            for row in rows:
-                self._conn.execute(
-                    "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
-                    " VALUES (?,?,?,?,?,?) ON CONFLICT(metric_id, hour) DO UPDATE SET"
-                    " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
-                    " vmax=excluded.vmax",
-                    (row["metric_id"], row["hour"], row["n"], row["vmin"],
-                     row["vavg"], row["vmax"]))
-            cursor = self._conn.execute(
-                "DELETE FROM samples WHERE ts < ?", (cutoff_hour,))
-            self._conn.commit()
-            return cursor.rowcount or 0
+    _ROLLUP_WATERMARK = "rollup_watermark_hour"
+    # Hours already rolled up that are aggregated again on the next pass, so
+    # a sample that arrived after its hour was summarised is not lost. Two
+    # covers a poll that started before the hour ended and a clock that is a
+    # little behind.
+    _ROLLUP_REDO_HOURS = 2
+
+    def compact_rollup(self, max_hours: int = 48) -> int:
+        """Summarise complete hours of raw samples into samples_hourly.
+
+        Two things were wrong with the first version. It deleted every raw
+        sample older than an hour, so the raw window a chart reads (three
+        days) could never contain anything — and it was never called, which
+        is the only reason that did not destroy every short-window chart.
+        And it re-aggregated the whole history on each call.
+
+        Now: raw rows are left alone (prune and the per-metric cap own
+        their lifetime), work starts from a private watermark rather than
+        from the beginning of time, and each hour is its own transaction so
+        the lock is never held across more than one. `max_hours` bounds a
+        single pass; the watermark makes the next pass continue where this
+        one stopped, so a long backlog is worked off over several passes
+        instead of in one stall.
+
+        Returns the number of (metric, hour) rows written.
+        """
+        now = time.time()
+        # The last hour that has fully elapsed. The current hour is still
+        # collecting samples and would be summarised wrong.
+        latest_complete = int(now // 3600) * 3600 - 3600
+        watermark = self._private_setting(self._ROLLUP_WATERMARK)
+        if watermark is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT MIN(ts) AS oldest FROM samples").fetchone()
+            oldest = row["oldest"] if row else None
+            if oldest is None:
+                self._set_private_setting(self._ROLLUP_WATERMARK,
+                                          latest_complete + 3600)
+                return 0
+            hour = int(float(oldest) // 3600) * 3600
+        else:
+            hour = int(watermark) - self._ROLLUP_REDO_HOURS * 3600
+        written = 0
+        processed = 0
+        while hour <= latest_complete and processed < max_hours:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
+                    " AVG(value) AS vavg, MAX(value) AS vmax FROM samples"
+                    " WHERE ts >= ? AND ts < ? AND value IS NOT NULL"
+                    " GROUP BY metric_id", (hour, hour + 3600)).fetchall()
+                if rows:
+                    self._conn.executemany(
+                        "INSERT INTO samples_hourly(metric_id, hour, n, vmin,"
+                        " vavg, vmax) VALUES (?,?,?,?,?,?)"
+                        " ON CONFLICT(metric_id, hour) DO UPDATE SET"
+                        " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
+                        " vmax=excluded.vmax",
+                        [(row["metric_id"], hour, row["n"], row["vmin"],
+                          row["vavg"], row["vmax"]) for row in rows])
+                    written += len(rows)
+                self._conn.commit()
+            hour += 3600
+            processed += 1
+        self._set_private_setting(self._ROLLUP_WATERMARK, hour)
+        return written
 
     # ----------------------------------------------------------------- events
 
@@ -1697,21 +2099,55 @@ class NodesDatabase:
             segments.append({"ts_start": cursor, "ts_end": t1, "status": end_status})
         return segments
 
-    def device_events_since(self, last_id: int, limit: int = 2000) -> list[sqlite3.Row]:
+    def device_events_since(self, last_id: int,
+                            limit: int | None = 2000) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first — the same cursor-read
         contract SnmpTrapDatabase.traps_since/SyslogDatabase.rows_since
         use, so the alert engine's drain functions are uniform across
-        every source."""
+        every source.
+
+        `limit=None` means "no cap": a drain that loops until it reaches
+        max_event_id() sets its own per-tick budget and does not want a
+        second, invisible one here."""
+        sql = "SELECT * FROM device_events WHERE id > ? ORDER BY id ASC"
+        args: list = [int(last_id)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
         with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM device_events WHERE id > ? ORDER BY id ASC LIMIT ?",
-                (int(last_id), int(limit))).fetchall()
+            return self._conn.execute(sql, args).fetchall()
 
     def max_device_event_id(self) -> int:
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(id) AS m FROM device_events").fetchone()
         return int(row["m"] or 0)
+
+    # The name every other source the alert engine drains uses for this
+    # (SnmpTrapDatabase.max_id, SyslogDatabase.max_id), so a drain loop can
+    # ask each source the same question instead of special-casing this one.
+    def max_event_id(self) -> int:
+        return self.max_device_event_id()
+
+    def count_events_by_device(self, since: float,
+                               kinds: list[str] | None = None) -> list[sqlite3.Row]:
+        """(device_id, name, ip, n) for the devices with the most events
+        since a wall-clock timestamp, busiest first — the "top offenders"
+        question a dashboard asks once, rather than one query per device."""
+        clauses = ["e.ts >= ?"]
+        params: list = [float(since)]
+        if kinds:
+            marks = ",".join("?" * len(kinds))
+            clauses.append(f"e.kind IN ({marks})")
+            params.extend(kinds)
+        where = " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT e.device_id AS device_id, d.name AS name, d.ip AS ip,"
+                f" COUNT(*) AS n FROM device_events e"
+                f" JOIN devices d ON d.id = e.device_id"
+                f" WHERE {where} GROUP BY e.device_id"
+                f" ORDER BY n DESC, d.name COLLATE NOCASE", params).fetchall()
 
     def record_interface_event(self, interface_id: int, kind: str, detail: str = "") -> None:
         with self._lock:
@@ -2248,12 +2684,65 @@ class NodesDatabase:
                 pass
         return total
 
-    def prune(self, *, sample_days: float = 400, rollup_days: float = 0,
+    _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
+
+    def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
+        """Keep at most the newest `n` raw samples of EACH metric.
+
+        The cap this replaces counted the whole table: 50,000 rows total
+        survived every maintenance pass, which at 2,000 devices and ~90
+        metrics each is 0.29 samples per metric — every chart empty, every
+        threshold streak reset — and the single DELETE of the other ~11
+        million rows held the process lock for tens of seconds. This
+        deletes per metric with a window function, in chunks of `chunk`
+        metrics, taking the lock for each chunk and releasing it in
+        between, so a poll worker waits for one chunk at most.
+
+        Window functions need SQLite 3.25. On anything older this does
+        nothing and says so once, rather than raising in the maintenance
+        thread — the alternative would be the whole-table delete this
+        exists to remove.
+        """
+        if n <= 0:
+            return 0
+        if sqlite3.sqlite_version_info < self._CAP_MIN_SQLITE:
+            if not self._warned_no_window:
+                self._warned_no_window = True
+                log.warning(
+                    "nodes: SQLite %s cannot cap samples per metric (needs "
+                    "%s); raw samples are bounded by sample_retention_days "
+                    "alone", sqlite3.sqlite_version,
+                    ".".join(str(part) for part in self._CAP_MIN_SQLITE))
+            return 0
+        with self._lock:
+            metric_ids = [row["id"] for row in
+                          self._conn.execute("SELECT id FROM metrics").fetchall()]
+        removed = 0
+        for start in range(0, len(metric_ids), max(1, chunk)):
+            batch = metric_ids[start:start + max(1, chunk)]
+            marks = ",".join("?" * len(batch))
+            with self._lock:
+                cursor = self._conn.execute(
+                    f"DELETE FROM samples WHERE rowid IN ("
+                    f" SELECT rowid FROM ("
+                    f"  SELECT rowid, ROW_NUMBER() OVER ("
+                    f"   PARTITION BY metric_id ORDER BY ts DESC) AS rn"
+                    f"  FROM samples WHERE metric_id IN ({marks})"
+                    f" ) WHERE rn > ?)", (*batch, int(n)))
+                removed += cursor.rowcount or 0
+                self._conn.commit()
+        return removed
+
+    def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
              event_days: float = 180, poll_days: float = 0,
-             discovery_days: float = 30, max_samples: int = 0) -> int:
+             discovery_days: float = 30,
+             max_samples_per_metric: int = 0) -> int:
         """Trims the unbounded tables only: samples, device/interface
         events, discovery jobs. Devices, groups, interfaces and MIBs are
-        current-state tables, never pruned by age here."""
+        current-state tables, never pruned by age here.
+
+        The per-metric row cap runs after this method's own transaction,
+        in its own chunked pass — see cap_samples_per_metric."""
         removed = 0
         now = time.time()
         with self._lock:
@@ -2266,6 +2755,12 @@ class NodesDatabase:
             cursor = self._conn.execute(
                 "DELETE FROM samples WHERE ts < ?", (now - sample_days * 86400,))
             removed += cursor.rowcount or 0
+            # The hourly rollups are the long history now, so they are
+            # bounded by their own retention rather than kept forever.
+            cursor = self._conn.execute(
+                "DELETE FROM samples_hourly WHERE hour < ?",
+                (now - rollup_days * 86400,))
+            removed += cursor.rowcount or 0
             cursor = self._conn.execute(
                 "DELETE FROM device_events WHERE ts < ?", (now - event_days * 86400,))
             removed += cursor.rowcount or 0
@@ -2276,19 +2771,26 @@ class NodesDatabase:
                 "DELETE FROM discovery_jobs WHERE started_ts < ? AND state != 'running'",
                 (now - discovery_days * 86400,))
             removed += cursor.rowcount or 0
-            if max_samples:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM samples")
-                total = cursor.fetchone()["n"]
-                if total > max_samples:
-                    cursor = self._conn.execute(
-                        "DELETE FROM samples WHERE rowid IN (SELECT rowid FROM samples"
-                        " ORDER BY ts ASC LIMIT ?)", (total - max_samples,))
-                    removed += cursor.rowcount or 0
             self._conn.commit()
+        removed += self.cap_samples_per_metric(max_samples_per_metric)
+        if removed:
+            # Freed pages go back to the operating system in short steps
+            # with the lock released between them, rather than through a
+            # VACUUM that rewrites the whole file under an exclusive lock.
+            dbmaint.reclaim(self._conn, self._lock, label="nodes")
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest raw samples until the file is back under its
+        cap.
+
+        The deletes are the same as before; what changed is how the space
+        comes back. This used to run VACUUM inside the module lock, up to
+        six times — the review measured 6.49 s per VACUUM at 2 million rows
+        and a 38.9 s stall for the whole call, during which every poll
+        worker, the alert tick and every HTTP handler waited. dbmaint's
+        incremental reclaim frees pages in short steps, releasing the lock
+        between them, so nothing waits longer than one step."""
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -2306,6 +2808,5 @@ class NodesDatabase:
                     " ORDER BY ts ASC LIMIT ?)", (chunk,))
                 removed += cursor.rowcount or 0
                 self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            dbmaint.reclaim(self._conn, self._lock, label="nodes")
         return removed

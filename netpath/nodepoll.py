@@ -34,6 +34,71 @@ from .trapdecode import localized_key
 
 MAX_UDP = 65535
 
+# RFC 3414 §5's usmStats counters, the objects an agent names in the
+# Report-PDU it answers a v3 request it would not process with. Reported by
+# name, because "engine resync required" told an operator nothing about
+# whether the password was wrong, the clock was out, or the security level
+# was refused — three different problems with three different fixes.
+USM_STATS = {
+    "1.3.6.1.6.3.15.1.1.1": ("unsupportedSecLevels",
+                             "the device refused this security level "
+                             "(authPriv is not supported by this poller)"),
+    "1.3.6.1.6.3.15.1.1.2": ("notInTimeWindows",
+                             "the device rejected the message's engine time"),
+    "1.3.6.1.6.3.15.1.1.3": ("unknownUserNames",
+                             "the device does not know this SNMPv3 user"),
+    "1.3.6.1.6.3.15.1.1.4": ("unknownEngineIDs",
+                             "the device did not recognise the engine id"),
+    "1.3.6.1.6.3.15.1.1.5": ("wrongDigests",
+                             "the authentication password or protocol is wrong"),
+    "1.3.6.1.6.3.15.1.1.6": ("decryptionErrors",
+                             "the device could not decrypt the message"),
+}
+
+
+# The per-interface metric keys one poll emits, in the order they are
+# recorded. `in_bps`/`out_bps` and the two `*_err` keys keep the names the
+# charts and any stored history already use; the rest are new in 4.37.0.
+def _INTERFACE_METRICS(in_bps, out_bps, in_err_rate, out_err_rate,
+                       in_disc_rate, out_disc_rate, in_util, out_util):
+    return (
+        ("in_bps", "bps", in_bps),
+        ("out_bps", "bps", out_bps),
+        ("in_err", "err/s", in_err_rate),
+        ("out_err", "err/s", out_err_rate),
+        ("in_error_rate", "err/s", in_err_rate),
+        ("out_error_rate", "err/s", out_err_rate),
+        ("in_discard_rate", "disc/s", in_disc_rate),
+        ("out_discard_rate", "disc/s", out_disc_rate),
+        ("in_util_pct", "%", in_util),
+        ("out_util_pct", "%", out_util),
+    )
+
+
+# suffix -> (unit, device-level label). A device-level key is the worst
+# value across the device's interfaces this poll, which is what a rule
+# written against a device rather than a port can usefully mean.
+_DEVICE_MAX_KEYS = {
+    "in_util_pct": ("%", "Interface inbound utilization (busiest port)"),
+    "out_util_pct": ("%", "Interface outbound utilization (busiest port)"),
+    "in_error_rate": ("err/s", "Interface inbound errors (worst port)"),
+    "out_error_rate": ("err/s", "Interface outbound errors (worst port)"),
+    "in_discard_rate": ("disc/s", "Interface inbound discards (worst port)"),
+    "out_discard_rate": ("disc/s", "Interface outbound discards (worst port)"),
+}
+
+
+def report_reason(response) -> tuple[str, str]:
+    """(usmStats name, plain explanation) for a Report-PDU, or ("", "")
+    when it names nothing this table knows."""
+    for vb in getattr(response, "varbinds", None) or ():
+        oid = str(vb.get("oid") or "")
+        # The instance is the counter's OID with .0 appended.
+        known = USM_STATS.get(oid) or USM_STATS.get(oid.rsplit(".", 1)[0])
+        if known:
+            return known
+    return "", ""
+
 
 class EngineCache:
     """One entry per device needing v3: device_id -> (engine_id, boots,
@@ -53,6 +118,26 @@ class EngineCache:
         with self._lock:
             return self._entries.get(device_id)
 
+    def current(self, device_id: int):
+        """(engine_id, boots, engine_time) with engineTime advanced to now.
+
+        engineTime is the agent's own clock in seconds, and RFC 3414 §3.2
+        rejects an authenticated message whose engineTime is more than 150
+        seconds from the agent's. Sending back the value learned at
+        discovery — as this did — means every v3 device starts failing 150
+        seconds after its first poll and keeps failing until something
+        invalidates the entry, which the review saw as a spurious
+        auth_fail roughly every third poll. The elapsed wall time since
+        the value was learned is added instead.
+        """
+        with self._lock:
+            entry = self._entries.get(device_id)
+        if entry is None:
+            return None
+        engine_id, boots, engine_time, learned_at = entry
+        elapsed = max(0.0, time.time() - learned_at)
+        return engine_id, boots, engine_time + int(elapsed)
+
     def set(self, device_id: int, engine_id: bytes, boots: int, engine_time: int) -> None:
         with self._lock:
             self._entries[device_id] = (engine_id, boots, engine_time, time.time())
@@ -60,6 +145,16 @@ class EngineCache:
     def invalidate(self, device_id: int) -> None:
         with self._lock:
             self._entries.pop(device_id, None)
+
+    def forget(self, device_ids) -> None:
+        """Drop entries for devices that no longer exist. The cache is
+        keyed by device id and kept for the process lifetime, so without
+        this a long-running install accumulates one entry per device ever
+        deleted."""
+        keep = set(device_ids)
+        with self._lock:
+            for device_id in [k for k in self._entries if k not in keep]:
+                self._entries.pop(device_id, None)
 
 
 class _Session:
@@ -70,8 +165,24 @@ class _Session:
         self.port = port
         self.timeout_s = max(0.2, float(timeout_s))
         self.retries = max(0, int(retries))
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # A device on an IPv6 management plane needs an AF_INET6 socket;
+        # AF_INET was hardcoded, so every such device timed out on every
+        # poll. A literal address is unambiguous — a colon cannot appear in
+        # a dotted-quad — and the port is separate, so there is nothing to
+        # parse.
+        self.family = socket.AF_INET6 if ":" in str(ip) else socket.AF_INET
+        self.sock = socket.socket(self.family, socket.SOCK_DGRAM)
         self.sock.settimeout(self.timeout_s)
+        # Request ids for this session's own exchanges. A counter from a
+        # random start rather than random.randint per request: two requests
+        # in one walk drawing the same id by chance is exactly the
+        # confusion the id exists to prevent.
+        self._request_id = random.randint(1, 2 ** 24)
+        self.dropped = 0        # datagrams discarded as not ours
+
+    def next_request_id(self) -> int:
+        self._request_id = (self._request_id + 1) % (2 ** 31 - 1) or 1
+        return self._request_id
 
     def close(self) -> None:
         try:
@@ -79,21 +190,87 @@ class _Session:
         except OSError:
             pass
 
-    def request(self, packet: bytes) -> Response:
-        """Send, wait for a reply, decode it. Retries on timeout up to
-        self.retries times; raises SnmpTimeout if every attempt times out."""
+    def _is_peer(self, addr) -> bool:
+        """Whether a datagram came from the device we asked. `addr` is
+        (host, port[, flow, scope]) — only the host is compared, because a
+        few agents answer from an ephemeral port rather than 161, which is
+        odd but not forgery. IPv6 literals are compared after normalising
+        both sides, since 'fe80::1' and 'fe80:0:0:0:0:0:0:1' are the same
+        address written two ways."""
+        try:
+            source = addr[0]
+        except (TypeError, IndexError):
+            return False
+        if source == self.ip:
+            return True
+        if self.family != socket.AF_INET6:
+            return False
+        try:
+            packed = socket.inet_pton(socket.AF_INET6, source.split("%")[0])
+            mine = socket.inet_pton(socket.AF_INET6, self.ip.split("%")[0])
+        except (OSError, AttributeError):
+            return False
+        return packed == mine
+
+    def request(self, packet: bytes, expect_request_id: int | None = None) -> Response:
+        """Send, wait for OUR reply, decode it.
+
+        A UDP socket accepts whatever arrives. The first reading of this
+        took the first datagram it got — so a late answer to attempt 1 was
+        consumed as the answer to attempt 2 (the review reproduced it on a
+        device that answers in 2.6 s with a 2 s timeout), and anything
+        sent from any other address could be answered with. Now a datagram
+        is dropped and the wait continues when it did not come from the
+        device, or when it carries a different request id than the one
+        sent. A Report-PDU is exempt from the id test: an agent reports an
+        engine mismatch against its own msgID, and dropping it would turn
+        one v3 resync into a timeout.
+
+        Retries on timeout up to self.retries times; raises SnmpTimeout if
+        every attempt times out.
+        """
         last_error: Exception | None = None
         for _ in range(self.retries + 1):
             try:
                 self.sock.sendto(packet, (self.ip, self.port))
-                data, _addr = self.sock.recvfrom(MAX_UDP)
-                return decode_response(data)
-            except socket.timeout:
-                last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
-                continue
             except OSError as exc:
                 last_error = SnmpError(str(exc))
                 continue
+            deadline = time.monotonic() + self.timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                    break
+                try:
+                    self.sock.settimeout(remaining)
+                    data, addr = self.sock.recvfrom(MAX_UDP)
+                except socket.timeout:
+                    last_error = SnmpTimeout(f"no reply from {self.ip}:{self.port}")
+                    break
+                except OSError as exc:
+                    last_error = SnmpError(str(exc))
+                    break
+                if not self._is_peer(addr):
+                    self.dropped += 1
+                    continue
+                try:
+                    response = decode_response(data)
+                except SnmpUnsupported:
+                    raise
+                except SnmpError as exc:
+                    # Garbage from the right address is not an answer: keep
+                    # waiting for one within this attempt's budget rather
+                    # than failing the whole request on it.
+                    self.dropped += 1
+                    last_error = exc
+                    continue
+                if (expect_request_id is not None
+                        and response.pdu_tag != PDU_REPORT
+                        and response.request_id != expect_request_id):
+                    self.dropped += 1
+                    continue
+                return response
         raise last_error or SnmpTimeout(f"no reply from {self.ip}:{self.port}")
 
 
@@ -488,6 +665,31 @@ class NodePoller:
         self._vendor_ids: dict[int, "_VendorIdJob"] = {}
         self._mib_index: tuple | None = None       # (generation, MibIndex)
         self._last_completed: float = 0.0
+        # The merged per-device configs the scheduling pass reads, and the
+        # nodesdb config generation and wall time they were built at.
+        self._configs: dict | None = None
+        self._configs_generation: int = -1
+        self._configs_loaded: float = 0.0
+        # device_id -> when its ipAddrTable was last read. See
+        # _refresh_addresses: once an hour, not once a poll.
+        self._addresses_read: dict[int, float] = {}
+        # device_id -> the GETBULK repetition count that last worked for it.
+        # A device that answers "tooBig" is retried at half as many rows, and
+        # remembering that means the next walk starts where the last one
+        # ended up rather than re-learning the same limit every time.
+        self._bulk_repetitions: dict[int, int] = {}
+        # Forwarding-table walks run here, not on the poll pool: one walk is
+        # hundreds to thousands of rows, and parking poll workers on them is
+        # what made the pool saturate.
+        self._mac_executor: ThreadPoolExecutor | None = None
+        # When the pool first looked saturated, and whether that has been
+        # reported. See _note_saturation.
+        self._saturated_since: float | None = None
+        self._saturation_reported = False
+        # Set by the application once the alert engine exists, so the poller
+        # can raise a system alert about itself. Left None (and every use
+        # guarded) so the poller runs standalone in tests and scripts.
+        self.alert_engine = None
         # device_id -> index into db.credential_candidates(device) that last
         # worked, so a profile with several alternate credentials (a
         # mixed-vendor subnet, say) costs one extra request only on a
@@ -518,6 +720,8 @@ class NodePoller:
         self._stop.clear()
         workers = max(1, int((settings or self.db.settings()).get("poll_workers", 16)))
         self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._mac_executor = ThreadPoolExecutor(
+            max_workers=self._MAC_WALK_WORKERS, thread_name_prefix="mac-walk")
         self._thread = threading.Thread(target=self._loop, name="node-poller", daemon=True)
         self._thread.start()
 
@@ -539,12 +743,17 @@ class NodePoller:
         elif self.running:
             self.stop()
 
+    _MAC_WALK_WORKERS = 4
+
     def stop(self) -> None:
         self._stop.set()
         for job in list(self._discovery_jobs.values()):
             job.cancel()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._mac_executor:
+            self._mac_executor.shutdown(wait=False, cancel_futures=True)
+            self._mac_executor = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
@@ -552,13 +761,30 @@ class NodePoller:
     def shutdown(self) -> None:
         self.stop()
 
+    def pool_state(self) -> dict:
+        """How much of the poll pool is in use right now.
+
+        The review found the gauge on this counted queued and running
+        together against the pool size, so it read "48 of 32 busy" — which
+        is not wrong so much as unsayable. The two are separate here.
+        """
+        with self._lock:
+            busy = len(self._started)
+            queued = len(self._queued)
+        workers = getattr(self._executor, "_max_workers", 0) if self._executor else 0
+        return {"busy": busy, "queued": queued, "workers": workers,
+                "saturated": bool(workers and busy >= workers and queued)}
+
     def status_text(self) -> str:
         if self.error:
             return self.error
         if not self.running:
             return "Poller stopped"
         n = self.db.device_count()
-        return f"Polling {n} device(s) · last poll {_ago(self._last_completed)}"
+        pool = self.pool_state()
+        return (f"Polling {n} device(s) · {pool['busy']} busy and "
+                f"{pool['queued']} queued of {pool['workers']} worker(s) · "
+                f"last poll {_ago(self._last_completed)}")
 
     def worker_state(self) -> dict:
         with self._lock:
@@ -687,38 +913,144 @@ class NodePoller:
 
     # ------------------------------------------------------------------ loop
 
+    # A backstop behind the generation counter: a config change made
+    # outside this process (a second copy of the app on the same file)
+    # would not bump it, so the merged configs are rebuilt at least this
+    # often regardless.
+    _CONFIG_REFRESH_S = 60.0
+
     def _loop(self) -> None:
+        """The scheduling thread. Every pass is guarded: this thread dying
+        silently — which one transient database error was enough to do —
+        stopped all polling with `poller.error` still None and the status
+        strip still reading "Polling N devices". Now the failure is
+        recorded, shown, and the thread keeps going."""
         while not self._stop.is_set():
-            now = time.time()
-            focus = self._focus
-            for device in self.db.devices():
-                if not device["enabled"]:
-                    continue
-                config = self.db.effective_config(device)
-                interval = config["poll_interval_s"]
-                # The device selected in a browser polls faster (SNMP
-                # devices only — a fast ping-only cadence shows nothing
-                # new) until its focus TTL lapses.
-                focused = (focus is not None and device["id"] == focus[0]
-                           and now < focus[1] and config.get("snmp_enabled", True))
-                if focused:
-                    interval = min(interval, focus[2])
-                due = self._next_run.get(device["id"])
-                if due is None:
-                    due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
-                    self._next_run[device["id"]] = due
-                if now >= due:
-                    self._next_run[device["id"]] = now + interval
-                    if device["id"] in self._started or device["id"] in self._queued:
-                        # A poll slower than the fast focus cadence is
-                        # expected, not an overrun worth logging — only
-                        # blowing the device's own profile interval is.
-                        if not (focused and interval < config["poll_interval_s"]):
-                            self._record_overrun(device, now)
-                    else:
-                        self._submit(device["id"])
-                self._maybe_walk_mac_table(device, config, now)
+            try:
+                self._schedule_pass()
+                if self.error:
+                    self.log.add(NODES, "Polling scheduling recovered")
+                    self.error = None
+            except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                self.error = f"Poller scheduling failed: {message}"
+                self.counters["errors"] += 1
+                self.log.add(ERROR, self.error, detail=traceback.format_exc())
             self._stop.wait(1.0)
+
+    def _schedule_pass(self) -> None:
+        """One pass over the fleet: whose turn is it to be polled.
+
+        Reads six columns per enabled device and nothing else. The merged
+        per-device config — which used to be recomputed here once per
+        device per second, four settings reads and a group read each — is
+        held between passes and rebuilt only when nodesdb's config
+        generation moves or the backstop expires.
+        """
+        now = time.time()
+        generation = self.db.config_generation()
+        if (self._configs is None or generation != self._configs_generation
+                or now - self._configs_loaded > self._CONFIG_REFRESH_S):
+            self._configs = self.db.effective_configs()
+            self._configs_generation = generation
+            self._configs_loaded = now
+            self._forget_devices(set(self._configs))
+        self._note_saturation(now)
+        focus = self._focus
+        for device in self.db.schedule_rows():
+            device_id = device["id"]
+            config = self._configs.get(device_id)
+            if config is None:
+                # Added since the last rebuild; it is picked up on the next
+                # pass, because add_device bumped the generation.
+                continue
+            interval = config["poll_interval_s"]
+            # The device selected in a browser polls faster (SNMP
+            # devices only — a fast ping-only cadence shows nothing
+            # new) until its focus TTL lapses.
+            focused = (focus is not None and device_id == focus[0]
+                       and now < focus[1] and config.get("snmp_enabled", True))
+            if focused:
+                interval = min(interval, focus[2])
+            due = self._next_run.get(device_id)
+            if due is None:
+                due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
+                self._next_run[device_id] = due
+            if now >= due:
+                self._next_run[device_id] = now + interval
+                if device_id in self._started or device_id in self._queued:
+                    # A poll slower than the fast focus cadence is
+                    # expected, not an overrun worth logging — only
+                    # blowing the device's own profile interval is.
+                    if not (focused and interval < config["poll_interval_s"]):
+                        self._record_overrun(device, now, config)
+                else:
+                    self._submit(device_id)
+            self._maybe_walk_mac_table(device, config, now)
+
+    # How long the pool has to look saturated before it is worth telling
+    # somebody. A burst at the top of a poll cycle is normal; five minutes
+    # of it means the pool is genuinely too small for the fleet.
+    _SATURATION_S = 300.0
+
+    def _note_saturation(self, now: float) -> None:
+        """Raise (and clear) a system alert when every poll worker is busy
+        and devices are still waiting.
+
+        §4.1 S5 and the review's Tier 2 list: nothing said the pool was the
+        bottleneck, so a fleet that had outgrown poll_workers looked like a
+        fleet of slow devices. The alert names the number to raise.
+        """
+        pool = self.pool_state()
+        engine = self.alert_engine
+        if not pool["saturated"]:
+            if self._saturation_reported:
+                clear = getattr(engine, "clear_system_occurrence", None)
+                if clear is not None:
+                    clear("poll_pool_saturated", "poller")
+            self._saturated_since = None
+            self._saturation_reported = False
+            return
+        if self._saturated_since is None:
+            self._saturated_since = now
+            return
+        if self._saturation_reported or now - self._saturated_since < self._SATURATION_S:
+            return
+        self._saturation_reported = True
+        raise_it = getattr(engine, "system_occurrence", None)
+        if raise_it is None:
+            return
+        minutes = (now - self._saturated_since) / 60.0
+        raise_it(
+            "poll_pool_saturated", "poller", "Polling pool", severity=3,
+            extra={"busy": pool["busy"], "queued": pool["queued"],
+                   "workers": pool["workers"],
+                   "saturated_minutes": round(minutes, 1)},
+            message=(f"Every one of the {pool['workers']} poll workers has "
+                     f"been busy with {pool['queued']} device(s) waiting for "
+                     f"{minutes:.0f} minutes. Devices are being polled later "
+                     f"than their interval. Raise Nodes → Settings → Poll "
+                     f"workers, or lengthen the polling interval."))
+
+    def _forget_devices(self, keep: set) -> None:
+        """Drop the per-device state of devices that no longer exist.
+
+        Every one of these is keyed by device id and kept for the process
+        lifetime, so without this a long-running install accumulates an
+        entry per device ever deleted — small individually, unbounded
+        together, and the review asked for the cleanup by name.
+        """
+        for cache in (self._next_run, self._last_ping, self._next_mac_walk,
+                      self._credentials, self._credential_probe_failed,
+                      self._addresses_read, self._bulk_repetitions):
+            for device_id in [k for k in cache if k not in keep]:
+                cache.pop(device_id, None)
+        with self._lock:
+            for jobs in (self._oid_walks, self._vendor_ids):
+                for device_id in [k for k in jobs if k not in keep]:
+                    if not jobs[device_id].running:
+                        jobs.pop(device_id, None)
+        self._engines.forget(keep)
 
     def _maybe_walk_mac_table(self, device, config: dict, now: float) -> None:
         """Queue a forwarding-table walk when this device's own interval has
@@ -749,7 +1081,7 @@ class NodePoller:
             self._mac_running.add(device_id)
         self._next_mac_walk[device_id] = now + interval
         try:
-            self._executor.submit(self._run_mac_table, device_id)
+            self._mac_executor.submit(self._run_mac_table, device_id)
         except (RuntimeError, AttributeError):
             with self._lock:
                 self._mac_running.discard(device_id)
@@ -763,13 +1095,15 @@ class NodePoller:
             self._queued[device_id] = time.time()
         try:
             self._executor.submit(self._run_one, device_id)
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
+            # The pool has shut down, or there is none (the scheduler being
+            # exercised without one). Either way the device is not queued.
             with self._lock:
                 self._queued.pop(device_id, None)
             return False
         return True
 
-    def _record_overrun(self, device, now) -> None:
+    def _record_overrun(self, device, now, config: dict | None = None) -> None:
         """Record that a poll was still running as the next one fell due.
 
         Not recorded while the device is not answering: a poll that spends
@@ -787,7 +1121,9 @@ class NodePoller:
             return
         self.counters["overruns"] += 1
         running_for = now - self._started.get(device["id"], now)
-        interval = self.db.effective_config(device)["poll_interval_s"]
+        if config is None:
+            config = self.db.effective_config(device)
+        interval = config["poll_interval_s"]
         self.log.add(ERROR, f"Poll overrun for {device['name'] or device['ip']}: "
                             f"still running after {running_for:.0f}s, interval is "
                             f"{interval}s — lengthen the interval or shorten the "
@@ -861,16 +1197,27 @@ class NodePoller:
 
         snmp_ok = None
         snmp_error = ""
+        # Whether SNMP failed because the device refuses something this
+        # poller does not speak, rather than because it is unreachable.
+        # Decided by exception type: the old test looked for the substring
+        # "unsupported" in the message, and no message this raises has ever
+        # contained it, so the whole `unsupported` status, its device event
+        # and the rule that watches for it were unreachable code.
+        snmp_unsupported = False
         identity = None
         uptime_ticks = None
         interfaces: list[dict] = []
+        # Whether the interface read finished. A partial read must not
+        # delete the interfaces it never reached (see replace_interfaces).
+        interfaces_complete = True
         metrics: list[tuple] = []   # (key, label, unit, kind, value)
 
         if config.get("snmp_enabled"):
             try:
                 cred_config, identity, uptime_ticks, metrics = \
                     self._poll_snmp_scalars_with_credential(device, config)
-                interfaces = self._poll_interfaces(device, cred_config)
+                interfaces, interfaces_complete = self._poll_interfaces(
+                    device, cred_config)
                 if config.get("mib_file_id"):
                     metrics = metrics + self._poll_custom_mib(
                         device, cred_config, config["mib_file_id"])
@@ -878,6 +1225,7 @@ class NodePoller:
             except SnmpUnsupported as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
+                snmp_unsupported = True
                 self.counters["unsupported"] += 1
             except SnmpTimeout as exc:
                 snmp_ok = False
@@ -914,7 +1262,7 @@ class NodePoller:
             ping_only_ok = bool(config.get("unreachable_ping_only", True))
             reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
 
-        if snmp_ok is False and snmp_error and "unsupported" in snmp_error.lower():
+        if snmp_unsupported:
             status = "unsupported"
         elif reachable:
             status = "up"
@@ -923,17 +1271,20 @@ class NodePoller:
         else:
             status = device["status"] if device["status"] in ("up", "down") else "unknown"
 
-        # Recorded before record_poll so a device that goes on to be marked
-        # down still leaves the loss sample that explains why.
+        # Every sample this poll produced, written in ONE transaction at the
+        # end (see the T4 block below) rather than one commit each. A device
+        # that goes on to be marked down still leaves the loss sample that
+        # explains why: the flush is unconditional, not part of the success
+        # path.
+        samples: list[tuple] = []   # (key, label, unit, kind, ts, value)
         if ping_loss_pct is not None:
-            self.db.record_metric_sample(
-                device_id, "ping_loss_pct", "Packet loss", "%", "gauge",
-                now, ping_loss_pct)
+            samples.append(("ping_loss_pct", "Packet loss", "%", "gauge",
+                            now, ping_loss_pct))
         if ping_rtt_ms is not None:
-            self.db.record_metric_sample(
-                device_id, "ping_rtt_ms", "Ping response time", "ms", "gauge",
-                now, ping_rtt_ms)
+            samples.append(("ping_rtt_ms", "Ping response time", "ms", "gauge",
+                            now, ping_rtt_ms))
 
+        # T1 — the device row.
         previous = self.db.record_poll(
             device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,
             snmp_error=snmp_error, identity=identity, uptime_ticks=uptime_ticks,
@@ -976,13 +1327,36 @@ class NodePoller:
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
-        if snmp_ok is False and snmp_error and isinstance(snmp_error, str) and \
-           "auth" in snmp_error.lower():
+        auth_failed = (snmp_ok is False and snmp_error
+                       and isinstance(snmp_error, str)
+                       and "auth" in snmp_error.lower())
+        if auth_failed:
             self.db.record_device_event(device_id, "auth_fail", snmp_error)
-        elif snmp_ok:
+        elif snmp_ok is False and ping_ok and not snmp_unsupported:
+            # A switch whose SNMP agent has died but which still answers
+            # ICMP is reachable and broken, so `unreachable_ping_only`
+            # rightly keeps it out of device_down — and nothing else said
+            # anything at all. This is the event the `snmp_failing_ping_ok`
+            # rule watches. Recorded per failing poll, so the alert's
+            # occurrence count is how long it has been failing; the rule
+            # auto-resolves when the events stop.
+            self.db.record_device_event(
+                device_id, "snmp_error",
+                f"SNMP is not answering but the device replies to ping: "
+                f"{snmp_error}")
+        if snmp_ok:
             if previous["snmp_ok"] is False if "snmp_ok" in previous.keys() else False:
                 self.db.record_device_event(device_id, "auth_ok", "")
 
+        # Hoisted out of the branch below: the interface block needs it too.
+        # A device that has just restarted has restarted its interface
+        # counters with it, and counter_rate cannot tell a reset apart from
+        # a 32-bit wrap — it computes (2**32 - previous + current) / dt and
+        # reports a switch that has been up for eight seconds as carrying
+        # 220 Mbps. One poll's rates are dropped instead; the counters
+        # themselves are still stored, so the poll after this one measures
+        # against the post-reboot baseline and is correct.
+        rebooted = False
         if uptime_ticks is not None:
             rebooted, note = detect_reboot(
                 uptime_ticks, now, previous["last_uptime_ticks"],
@@ -1006,7 +1380,20 @@ class NodePoller:
             # read would always compare the new value to itself and never
             # detect a link_up/link_down transition.
             existing = {row["if_index"]: row for row in self.db.interfaces(device_id)}
-            result = self.db.replace_interfaces(device_id, interfaces)
+            # T2 — the interface table. Its `ids` map replaces one
+            # interface_id_for() SELECT per port below.
+            result = self.db.replace_interfaces(
+                device_id, interfaces, allow_delete=interfaces_complete)
+            interface_ids = result["ids"]
+            rate_rows: list[dict] = []
+            # The device-level worst case of each per-interface rate. The
+            # shipped threshold rules (if_in_util_high, if_out_util_high,
+            # if_in_errors_high, if_out_errors_high, if_in_discards_high,
+            # if_out_discards_high) all read a metric with no interface
+            # suffix, and nothing has ever recorded one — six rules that
+            # could not fire on any device. "The worst port on this box" is
+            # what a device-level rule can usefully mean.
+            worst: dict[str, float] = {}
             for row in interfaces:
                 if_index = row["if_index"]
                 prior = existing.get(if_index)
@@ -1017,30 +1404,57 @@ class NodePoller:
                 # this poll.
                 sample_ts = row.get("_sample_ts") or now
                 in_bps = out_bps = in_err_rate = out_err_rate = None
-                if prior is not None:
+                in_disc_rate = out_disc_rate = None
+                # ifCounterDiscontinuityTime: the agent saying this port's
+                # counters restarted. A rate across that is fiction for
+                # exactly the same reason a rate across a reboot is.
+                discontinuity = row.get("discontinuity_ts")
+                broke = (discontinuity is not None and prior is not None
+                         and prior["discontinuity_ts"] is not None
+                         and discontinuity != prior["discontinuity_ts"])
+                if prior is not None and not rebooted and not broke:
+                    since = prior["last_sample_ts"] or 0
+                    bits = row.get("_octet_bits", 32)
                     in_bps = counter_rate(
-                        prior["last_in_octets"], prior["last_sample_ts"] or 0,
-                        row.get("in_octets"), sample_ts, row.get("_octet_bits", 32),
-                        speed_bps=row.get("speed_bps"))
+                        prior["last_in_octets"], since, row.get("in_octets"),
+                        sample_ts, bits, speed_bps=row.get("speed_bps"))
                     out_bps = counter_rate(
-                        prior["last_out_octets"], prior["last_sample_ts"] or 0,
-                        row.get("out_octets"), sample_ts, row.get("_octet_bits", 32),
-                        speed_bps=row.get("speed_bps"))
-                    # ifInErrors/ifOutErrors are 32-bit counters; the rate
-                    # is errors per second between polls.
+                        prior["last_out_octets"], since, row.get("out_octets"),
+                        sample_ts, bits, speed_bps=row.get("speed_bps"))
+                    # ifInErrors/ifOutErrors and ifInDiscards/ifOutDiscards
+                    # are 32-bit counters; the rate is events per second
+                    # between polls.
                     in_err_rate = counter_rate(
-                        prior["last_in_errors"], prior["last_sample_ts"] or 0,
-                        row.get("in_errors"), sample_ts, 32)
+                        prior["last_in_errors"], since, row.get("in_errors"),
+                        sample_ts, 32)
                     out_err_rate = counter_rate(
-                        prior["last_out_errors"], prior["last_sample_ts"] or 0,
-                        row.get("out_errors"), sample_ts, 32)
-                self.db.update_interface_rate(
-                    device_id, if_index, in_octets=row.get("in_octets"),
-                    out_octets=row.get("out_octets"),
-                    in_errors=row.get("in_errors"), out_errors=row.get("out_errors"),
-                    in_bps=in_bps, out_bps=out_bps,
-                    in_error_rate=in_err_rate, out_error_rate=out_err_rate, ts=sample_ts)
-                interface_id = self.db.interface_id_for(device_id, if_index)
+                        prior["last_out_errors"], since, row.get("out_errors"),
+                        sample_ts, 32)
+                    in_disc_rate = counter_rate(
+                        prior["last_in_discards"], since, row.get("in_discards"),
+                        sample_ts, 32)
+                    out_disc_rate = counter_rate(
+                        prior["last_out_discards"], since, row.get("out_discards"),
+                        sample_ts, 32)
+                speed_bps = row.get("speed_bps")
+                in_util = (100.0 * in_bps * 8 / speed_bps
+                           if in_bps is not None and speed_bps else None)
+                out_util = (100.0 * out_bps * 8 / speed_bps
+                            if out_bps is not None and speed_bps else None)
+                rate_rows.append({
+                    "if_index": if_index, "in_octets": row.get("in_octets"),
+                    "out_octets": row.get("out_octets"),
+                    "in_errors": row.get("in_errors"),
+                    "out_errors": row.get("out_errors"),
+                    "in_discards": row.get("in_discards"),
+                    "out_discards": row.get("out_discards"),
+                    "in_bps": in_bps, "out_bps": out_bps,
+                    "in_error_rate": in_err_rate, "out_error_rate": out_err_rate,
+                    "in_discard_rate": in_disc_rate,
+                    "out_discard_rate": out_disc_rate,
+                    "discontinuity_ts": discontinuity,
+                    "ts": sample_ts})
+                interface_id = interface_ids.get(if_index)
                 if interface_id is not None and prior is not None:
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
                         kind = "link_up" if row.get("oper_status") == "up" else "link_down"
@@ -1050,18 +1464,26 @@ class NodePoller:
                                 f"{row.get('descr') or if_index}: {prior['oper_status']} -> {row.get('oper_status')}")
                 if interface_id is not None:
                     label = row.get("descr") or f"if{if_index}"
-                    for suffix, unit, value in (
-                        ("in_bps", "bps", in_bps), ("out_bps", "bps", out_bps),
-                        ("in_err", "err/s", in_err_rate),
-                        ("out_err", "err/s", out_err_rate),
-                    ):
-                        if value is not None:
-                            self.db.record_metric_sample(
-                                device_id, f"if_{suffix}.{if_index}",
-                                f"{label} {suffix}", unit, "gauge", now, value)
+                    for suffix, unit, value in _INTERFACE_METRICS(
+                            in_bps, out_bps, in_err_rate, out_err_rate,
+                            in_disc_rate, out_disc_rate, in_util, out_util):
+                        if value is None:
+                            continue
+                        samples.append((f"if_{suffix}.{if_index}",
+                                        f"{label} {suffix}", unit, "gauge",
+                                        now, value))
+                        if suffix in _DEVICE_MAX_KEYS:
+                            worst[suffix] = max(worst.get(suffix, value), value)
+            for suffix, value in worst.items():
+                unit, label = _DEVICE_MAX_KEYS[suffix]
+                samples.append((f"if_{suffix}", label, unit, "gauge", now, value))
+            # T3 — every interface's counters and rates.
+            self.db.update_interface_rates(device_id, rate_rows)
 
-        for key, label, unit, kind, value in metrics:
-            self.db.record_metric_sample(device_id, key, label, unit, kind, now, value)
+        samples.extend((key, label, unit, kind, now, value)
+                       for key, label, unit, kind, value in metrics)
+        # T4 — every sample this poll produced, in one transaction.
+        self.db.record_metric_samples(device_id, samples)
 
     def working_config(self, device) -> dict:
         """The config an *on-demand* read should use — effective_config()
@@ -1132,34 +1554,76 @@ class NodePoller:
         try:
             if version in (0, 1):
                 identity, _proto, _pw = credential_for(config)
+                request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GET,
-                                       random.randint(1, 2**16), oids)
-                response = session.request(packet)
+                                       request_id, oids)
+                response = session.request(packet, request_id)
                 self._check_error_status(response)
                 return response
 
-            identity, auth_proto, password = credential_for(config)
-            engine = self._engines.get(device["id"])
-            if engine is None:
-                engine = self._discover_engine(session, device)
-            engine_id, boots, engine_time, _learned_at = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            packet = build_v3_request(
-                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GET, oids,
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet)
-            if response.pdu_tag == PDU_REPORT:
-                # Out of time window, or unknown engine: refresh and fail
-                # this attempt cleanly; the next poll re-discovers.
-                self._engines.invalidate(device["id"])
-                raise _AuthFailure(f"{device['ip']}: engine resync required "
-                                   f"(received a Report-PDU)")
+            response = self._v3_exchange(session, device, config, PDU_GET, oids)
             self._check_error_status(response)
             return response
         finally:
             session.close()
+
+    def _v3_exchange(self, session: _Session, device, config: dict, pdu_tag: int,
+                     oids: list[str], max_repetitions: int = 0) -> Response:
+        """One authenticated v3 round trip, with the engine resync RFC 3414
+        §3.2 actually prescribes.
+
+        Every v3 caller went through its own copy of "build the message,
+        send it, and if a Report comes back give up" — so a device whose
+        engineBoots had incremented (a restart) failed every poll until
+        something else invalidated the cache, and the operator was told
+        only "engine resync required". Here a Report is what it is: the
+        agent telling us its current boots/time. Those are learned, the
+        request is retried once with them, and only a second Report is an
+        error — named after the usmStats counter the agent pointed at, so
+        a wrong password reads differently from a wrong clock. A refused
+        security level is raised as SnmpUnsupported, which the poll path
+        classifies as status 'unsupported' rather than as an auth failure.
+        """
+        identity, auth_proto, password = credential_for(config)
+        last: Response | None = None
+        for attempt in (0, 1):
+            engine = self._engines.current(device["id"])
+            if engine is None:
+                engine = self._discover_engine(session, device)
+            engine_id, boots, engine_time = engine
+            auth_key = localized_key(auth_proto, password, engine_id) \
+                if auth_proto and password else None
+            request_id = session.next_request_id()
+            packet = build_v3_request(
+                session.next_request_id(), request_id, pdu_tag, oids,
+                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+                user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
+                max_repetitions=max_repetitions)
+            response = session.request(packet, request_id)
+            if response.pdu_tag != PDU_REPORT:
+                return response
+            last = response
+            name, explanation = report_reason(response)
+            if name == "unsupportedSecLevels":
+                raise SnmpUnsupported(f"{device['ip']}: {explanation}")
+            if attempt == 0:
+                # The Report carries the agent's own authoritative engine
+                # id, boots and time — which is exactly what the retry
+                # needs. Learn them rather than throwing the answer away
+                # and rediscovering on the next poll.
+                self._engines.invalidate(device["id"])
+                if response.engine_id:
+                    self._engines.set(device["id"], response.engine_id,
+                                      response.engine_boots, response.engine_time)
+                continue
+            self._engines.invalidate(device["id"])
+            raise _AuthFailure(
+                f"{device['ip']}: SNMPv3 request refused"
+                + (f" ({explanation})" if explanation
+                   else " (the device answered with a Report-PDU)")
+                + (f" [usmStats{name[0].upper()}{name[1:]}]" if name else ""))
+        raise _AuthFailure(f"{device['ip']}: SNMPv3 request refused"
+                           + (" (a Report-PDU, twice)" if last else ""))
 
     def _discover_engine(self, session: _Session, device) -> tuple:
         probe = discovery_probe()
@@ -1168,7 +1632,7 @@ class NodePoller:
             raise SnmpError(f"{device['ip']}: no engine id in discovery reply")
         self._engines.set(device["id"], response.engine_id, response.engine_boots,
                           response.engine_time)
-        return self._engines.get(device["id"])
+        return self._engines.current(device["id"])
 
     @staticmethod
     def _check_error_status(response: Response) -> None:
@@ -1192,10 +1656,21 @@ class NodePoller:
         raises the same exception _poll_snmp_scalars alone would if no
         candidate works, so the caller's existing except chain still
         classifies the failure exactly as before this feature existed."""
+        device_id = device["id"]
         candidates = self.db.credential_candidates(device)
-        cached_index = self._credentials.get(device["id"])
+        cached_index = self._credentials.get(device_id)
         order = [cached_index] if cached_index is not None and cached_index < len(candidates) else []
         order += [i for i in range(len(candidates)) if i not in order]
+        # A device that is simply down does not need its whole credential
+        # list re-tried on every poll: four candidates at 3 s and two
+        # retries is 36 s of a worker per poll, per down device. After a
+        # sweep has failed, only the last-known-good candidate (or the
+        # first, if there is none) is tried until the retry window passes —
+        # the same negative caching the on-demand path in working_config
+        # has always had.
+        failed_at = self._credential_probe_failed.get(device_id, 0.0)
+        if len(order) > 1 and time.time() - failed_at < self._PROBE_RETRY_S:
+            order = order[:1]
         last_error: Exception | None = None
         for index in order:
             trial_config = {**config, **candidates[index]}
@@ -1204,8 +1679,11 @@ class NodePoller:
             except SnmpError as exc:
                 last_error = exc
                 continue
-            self._credentials[device["id"]] = index
+            self._credentials[device_id] = index
+            self._credential_probe_failed.pop(device_id, None)
             return trial_config, identity, uptime_ticks, metrics
+        if len(candidates) > 1:
+            self._credential_probe_failed[device_id] = time.time()
         raise last_error or SnmpTimeout(f"no reply from {device['ip']}")
 
     def _identity_extras(self, device, config: dict, oids: list[str]) -> dict:
@@ -1317,7 +1795,169 @@ class NodePoller:
         except SnmpError:
             pass   # best-effort: UCD-SNMP-MIB not present on this device
 
+        metrics.extend(self._poll_vendor_health(device, config, identity,
+                                                already={m[0] for m in metrics}))
         return identity, uptime_ticks, metrics
+
+    # How often a device's ipAddrTable is re-read. Its addresses change when
+    # somebody reconfigures it, not between polls, and the walk exists to
+    # correlate traps and syslog rather than to chart anything — so once an
+    # hour, not on the poll cycle.
+    _ADDRESS_REFRESH_S = 3600.0
+
+    def _health_column(self, device, config: dict, oid: str, how: str):
+        """One vendor table column, reduced to a single number.
+
+        Best-effort throughout: a device that does not implement the column
+        answers nothing and contributes nothing, exactly like the UCD-SNMP
+        read above. Errors are swallowed for the same reason — not
+        answering a vendor object is the normal case, not a poll failure.
+        """
+        try:
+            values = self._walk_column(device, config, oid)
+        except SnmpError:
+            return None
+        numbers = [float(value) for value in values.values()
+                   if isinstance(value, (int, float))]
+        if not numbers:
+            return None
+        if how == "column_max":
+            return max(numbers)
+        if how == "column_avg":
+            return sum(numbers) / len(numbers)
+        return numbers[0]
+
+    def _cisco_memory_pct(self, device, config: dict):
+        """Cisco reports memory as used and free bytes per pool rather than
+        as a percentage. Pools are summed: a router with a processor pool
+        and an I/O pool has one memory figure, not two."""
+        try:
+            used = self._walk_column(device, config, nodeoids.CISCO_MEMORY_USED)
+            free = self._walk_column(device, config, nodeoids.CISCO_MEMORY_FREE)
+        except SnmpError:
+            return None
+        used_total = sum(float(v) for v in used.values()
+                         if isinstance(v, (int, float)))
+        free_total = sum(float(v) for v in free.values()
+                         if isinstance(v, (int, float)))
+        total = used_total + free_total
+        if total <= 0:
+            return None
+        return 100.0 * used_total / total
+
+    def _host_resources_disk_pct(self, device, config: dict):
+        """The busiest fixed disk, as a percentage.
+
+        hrStorageTable also holds RAM and virtual memory rows; reporting
+        those as disk would make a machine using its page cache look full.
+        Only hrStorageFixedDisk rows count, and the fullest of them is what
+        an operator means by "the disk is filling up"."""
+        try:
+            types = self._walk_column(device, config, nodeoids.HR_STORAGE_TYPE)
+            if not types:
+                return None
+            sizes = self._walk_column(device, config, nodeoids.HR_STORAGE_SIZE)
+            used = self._walk_column(device, config, nodeoids.HR_STORAGE_USED)
+        except SnmpError:
+            return None
+        worst = None
+        for index, kind in types.items():
+            if str(kind).strip(".") != nodeoids.HR_STORAGE_FIXED_DISK:
+                continue
+            size = sizes.get(index)
+            taken = used.get(index)
+            if not isinstance(size, (int, float)) or not isinstance(taken, (int, float)):
+                continue
+            if size <= 0:
+                continue
+            pct = 100.0 * float(taken) / float(size)
+            worst = pct if worst is None else max(worst, pct)
+        return worst
+
+    def _refresh_addresses(self, device, config: dict) -> None:
+        """Remember every address this device answers on.
+
+        A switch sends its traps from a loopback and its syslog from a
+        management VRF, and neither address is in the devices table, so the
+        alert engine could not tell whose message it was. ipAddrTable says
+        which addresses are the device's own. Walked at most once an hour
+        per device — see _ADDRESS_REFRESH_S."""
+        device_id = device["id"]
+        now = time.time()
+        if now - self._addresses_read.get(device_id, 0.0) < self._ADDRESS_REFRESH_S:
+            return
+        self._addresses_read[device_id] = now
+        try:
+            rows = self._walk_column(device, config, nodeoids.IP_ADDR_TABLE)
+        except SnmpError:
+            return
+        addresses = [str(value) for value in rows.values() if value]
+        if addresses:
+            self.db.record_device_addresses(device_id, addresses, "ipAddrTable")
+
+    def _poll_vendor_health(self, device, config: dict, identity: dict,
+                            already=()) -> list[tuple]:
+        """CPU, memory, disk, temperature and session count for real network
+        gear, keyed on the vendor arc SNMP identification worked out.
+
+        Everything here is best-effort and additive: the thresholds are
+        unchanged, so a device that starts answering cpu_pct can now open
+        `cpu_high` where it previously reported nothing at all. Only the
+        objects the device's own maker defines are asked for; the
+        HOST-RESOURCES fallback runs only when neither the vendor table nor
+        UCD-SNMP produced a figure, so a net-snmp box costs nothing extra.
+        """
+        arc = identity.get("vendor_arc") if identity else None
+        if arc is None:
+            arc = nodeoids.enterprise_arc(
+                (identity or {}).get("sys_object_id") or "")
+        metrics: list[tuple] = []
+        # `already` is what the UCD-SNMP read produced. A vendor's own
+        # object beats it — a FortiGate that also answers UCD-SNMP is still
+        # better described by fgSysCpuUsage — so the vendor probes below
+        # ignore it and record_metric_samples keeps the last value per key.
+        # Only the generic HOST-RESOURCES fallback respects it, so a
+        # net-snmp box costs no extra requests at all.
+        produced: set = set()
+
+        def add(key, label, unit, value):
+            if value is None or key in produced:
+                return
+            produced.add(key)
+            metrics.append((key, label, unit, "gauge", float(value)))
+
+        probes = nodeoids.VENDOR_HEALTH.get(arc, ())
+        scalars = [probe for probe in probes if probe[4] == "scalar"]
+        if scalars:
+            try:
+                response = self._snmp_get(device, config,
+                                          [probe[3] for probe in scalars])
+                values = {vb["oid"]: vb for vb in response.varbinds}
+            except SnmpError:
+                values = {}
+            for key, label, unit, oid, _how in scalars:
+                vb = values.get(oid)
+                if vb and vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                             "endOfMibView", "null") \
+                        and isinstance(vb["value"], (int, float)):
+                    add(key, label, unit, vb["value"])
+        for key, label, unit, oid, how in probes:
+            if how == "scalar" or key in produced:
+                continue
+            add(key, label, unit, self._health_column(device, config, oid, how))
+        if arc == 9:
+            add("mem_pct", "Memory", "%",
+                self._cisco_memory_pct(device, config))
+        known = produced | set(already)
+        if "cpu_pct" not in known:
+            for key, label, unit, oid, how in nodeoids.GENERIC_HEALTH:
+                add(key, label, unit,
+                    self._health_column(device, config, oid, how))
+        if "disk_pct" not in known:
+            add("disk_pct", "Storage", "%",
+                self._host_resources_disk_pct(device, config))
+        self._refresh_addresses(device, config)
+        return metrics
 
     def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
                           defer_assignment: bool = False) -> None:
@@ -1624,47 +2264,148 @@ class NodePoller:
             pass   # best-effort: this MIB's objects aren't answered by this device
         return metrics
 
-    def _poll_interfaces(self, device, config: dict) -> list[dict]:
-        """Walks the ifIndex column to discover interfaces, then GETs the
-        needed columns for each index in one round trip per interface.
-        The ifIndex walk itself opts into raise_on_timeout: this result
-        feeds directly into the device's own up/down status, so a genuine
-        mid-walk timeout must be reported as the failure it is rather
-        than silently returning however many interfaces were found before
-        the device stopped answering."""
-        indexes = self._walk_indexes(device, config, nodeoids.IF_TABLE["if_index"],
-                                     raise_on_timeout=True)
+    # A device the walk enumerated but whose per-interface GETs stopped
+    # answering used to be read at N x timeout x (retries + 1) — 77 minutes
+    # for a 512-port chassis at the shipped defaults, all of it on one poll
+    # worker. Half the device's own poll interval is the budget, with a
+    # floor so a 3-second focus poll still reads something.
+    _INTERFACE_BUDGET_FRACTION = 0.5
+    _INTERFACE_BUDGET_FLOOR_S = 3.0
+    _INTERFACE_GIVE_UP_TIMEOUTS = 3
+    _MAX_INTERFACES = 512
+
+    def _v1_get_dropping_unknown(self, device, config: dict, oids: list,
+                                 max_drops: int = 3) -> dict:
+        """A GET against an SNMPv1 agent, minus the objects it does not
+        implement.
+
+        v1 has no per-varbind noSuchObject: an agent asked for one object
+        it does not have answers the WHOLE request with error-status 2
+        (noSuchName), error-index naming the offender, and echoes every
+        varbind back as a null. The offending varbind is dropped and the
+        request re-sent, up to `max_drops` times — beyond that the device
+        is answering nothing useful and the interface is skipped, rather
+        than the poll spending one round trip per column.
+        """
+        remaining = list(oids)
+        for _ in range(max_drops + 1):
+            if not remaining:
+                return {}
+            response = self._snmp_get(device, config, remaining)
+            if response.error_status != 2:            # noSuchName
+                return {vb["oid"]: vb for vb in response.varbinds}
+            index = response.error_index
+            if not 1 <= index <= len(remaining):
+                return {}      # the agent will not say which: nothing to drop
+            remaining.pop(index - 1)
+        return {}
+
+    def _interface_varbinds(self, device, config: dict, if_index: int,
+                            is_v1: bool, want_ifx: bool) -> tuple:
+        """(oid -> varbind, whether ifXTable still answers) for one
+        interface.
+
+        On v2c and v3 the IF-MIB and ifXTable columns ride in one GET: an
+        object the agent lacks comes back as a per-varbind noSuchObject and
+        the rest of the reply is unharmed. On v1 they cannot — mixing one
+        ifXTable OID into the request makes a v1 agent answer noSuchName
+        for the whole PDU, and since only authorizationError was ever
+        raised on, every interface on every v1 device came back blank: no
+        counters, no speed, no link events. So on v1 the two tables are two
+        requests, and an ifXTable that answers noSuchName is remembered as
+        "this device has none" for the rest of the poll rather than
+        re-asked once per port.
+        """
+        oids = [f"{oid}.{if_index}" for oid in nodeoids.IF_TABLE.values()]
+        ifx_oids = [f"{oid}.{if_index}" for oid in nodeoids.IFX_TABLE.values()]
+        if not is_v1:
+            response = self._snmp_get(device, config, oids + ifx_oids)
+            return {vb["oid"]: vb for vb in response.varbinds}, want_ifx
+        values = self._v1_get_dropping_unknown(device, config, oids)
+        if not want_ifx:
+            return values, False
+        try:
+            response = self._snmp_get(device, config, ifx_oids)
+        except SnmpTimeout:
+            raise
+        except SnmpError:
+            return values, False
+        if response.error_status == 2:                # no ifXTable at all
+            return values, False
+        values.update({vb["oid"]: vb for vb in response.varbinds})
+        return values, True
+
+    def _poll_interfaces(self, device, config: dict) -> tuple:
+        """(rows, complete) for a device's interfaces.
+
+        Walks the ifIndex column to discover interfaces, then reads the
+        columns for each index. The ifIndex walk opts into
+        raise_on_timeout: its result feeds the device's own up/down
+        status, so a genuine mid-walk timeout must be reported as the
+        failure it is rather than silently returning however many
+        interfaces were found before the device stopped answering.
+
+        `complete` is what lets the caller decide whether an interface the
+        walk did not produce is really gone. A walk cut short by a
+        timeout, the row cap, an agent answering out of order, or a
+        per-interface read this poll abandoned is not evidence of absence,
+        and deleting on it takes the interfaces' link-event history with
+        them.
+        """
+        interval = float(config.get("poll_interval_s") or 120)
+        deadline = time.time() + max(self._INTERFACE_BUDGET_FLOOR_S,
+                                     self._INTERFACE_BUDGET_FRACTION * interval)
+        indexes, complete = self._walk_indexes(
+            device, config, nodeoids.IF_TABLE["if_index"], raise_on_timeout=True)
         if not indexes:
-            return []
+            return [], complete
+        configured_version = config.get("snmp_version")
+        is_v1 = configured_version is not None and int(configured_version) == 0
+        want_ifx = True
+        wanted = indexes[:self._MAX_INTERFACES]
+        if len(indexes) > self._MAX_INTERFACES:
+            complete = False
         rows = []
-        skipped_timeouts = 0
-        for if_index in indexes[:512]:   # a sane ceiling; real devices rarely exceed this
-            oids = [f"{oid}.{if_index}" for oid in nodeoids.IF_TABLE.values()]
-            ifx_oids = [f"{oid}.{if_index}" for oid in nodeoids.IFX_TABLE.values()]
+        skipped = 0
+        consecutive_timeouts = 0
+        abandoned = ""
+        for if_index in wanted:
+            if time.time() > deadline:
+                abandoned = "the poll's interface budget ran out"
+                break
+            if consecutive_timeouts >= self._INTERFACE_GIVE_UP_TIMEOUTS:
+                abandoned = (f"{consecutive_timeouts} interfaces in a row did "
+                             f"not answer")
+                break
             try:
-                response = self._snmp_get(device, config, oids + ifx_oids)
+                values, want_ifx = self._interface_varbinds(
+                    device, config, if_index, is_v1, want_ifx)
             except SnmpTimeout:
-                # Unlike the ifIndex walk above, one interface's own GET
-                # timing out doesn't invalidate the whole poll — the
-                # device answered enough to enumerate its interfaces, so
-                # the rest are still worth collecting. It's tracked and
-                # folded into snmp_error below, though, rather than
-                # disappearing the way it silently used to.
-                skipped_timeouts += 1
+                # One interface's own GET timing out doesn't invalidate the
+                # whole poll — the device answered enough to enumerate its
+                # interfaces, so the rest are still worth collecting. Three
+                # in a row does mean the device has gone quiet.
+                skipped += 1
+                consecutive_timeouts += 1
                 continue
             except SnmpError:
+                skipped += 1
+                consecutive_timeouts = 0
                 continue
+            consecutive_timeouts = 0
             # Stamped right after this interface's own GET returns, not at
             # poll start: at 3 s focus-poll cadence the gap between an
             # earlier poll-start timestamp and when the counter was actually
             # read was up to ±17% of dt. This is the timestamp counter_rate
-            # and update_interface_rate use below for this row.
+            # and update_interface_rates use below for this row.
             sample_ts = time.time()
-            values = {vb["oid"]: vb for vb in response.varbinds}
 
-            def _val(table, key):
-                vb = values.get(f"{table[key]}.{if_index}")
-                return vb["value"] if vb and vb["type"] not in ("noSuchObject", "noSuchInstance") else None
+            def _val(table, key, _values=values, _index=if_index):
+                vb = _values.get(f"{table[key]}.{_index}")
+                if not vb or vb["type"] in ("noSuchObject", "noSuchInstance",
+                                            "endOfMibView", "null"):
+                    return None
+                return vb["value"]
 
             speed = _val(nodeoids.IF_TABLE, "if_speed")
             high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
@@ -1680,6 +2421,9 @@ class NodePoller:
             oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
             in_errors = _val(nodeoids.IF_TABLE, "if_in_errors")
             out_errors = _val(nodeoids.IF_TABLE, "if_out_errors")
+            in_discards = _val(nodeoids.IF_TABLE, "if_in_discards")
+            out_discards = _val(nodeoids.IF_TABLE, "if_out_discards")
+            discontinuity = _val(nodeoids.IFX_TABLE, "if_discontinuity")
             rows.append({
                 "if_index": if_index,
                 "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
@@ -1695,18 +2439,43 @@ class NodePoller:
                 "out_octets": int(out_octets) if isinstance(out_octets, (int, float)) else None,
                 "in_errors": int(in_errors) if isinstance(in_errors, (int, float)) else None,
                 "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
+                "in_discards": int(in_discards) if isinstance(in_discards, (int, float)) else None,
+                "out_discards": int(out_discards) if isinstance(out_discards, (int, float)) else None,
+                "discontinuity_ts": (float(discontinuity)
+                                     if isinstance(discontinuity, (int, float)) else None),
                 "_octet_bits": octet_bits,
                 "_sample_ts": sample_ts,
             })
-        if skipped_timeouts:
-            self.log.add(NODES, f"{skipped_timeouts} of {len(indexes)} interface(s) on "
-                                f"{device['ip']} timed out this poll and were skipped",
+        if skipped or abandoned:
+            complete = False
+            reason = abandoned or f"{skipped} did not answer"
+            self.log.add(NODES, f"Read {len(rows)} of {len(indexes)} interface(s) "
+                                f"on {device['ip']}: {reason}. Interfaces that "
+                                f"were not read keep their stored values.",
                         target=device["ip"])
-        return rows
+        return rows, complete
 
     def _walk_column(self, device, config: dict, base_oid: str,
-                     raise_on_timeout: bool = False) -> dict[str, object]:
-        """One table column, walked to completion: index suffix -> value.
+                     raise_on_timeout: bool = False,
+                     deadline: float | None = None) -> dict[str, object]:
+        """One table column's values. See _walk_column_status, which this
+        wraps for the callers that do not need to know whether the walk
+        finished."""
+        return self._walk_column_status(device, config, base_oid,
+                                        raise_on_timeout=raise_on_timeout,
+                                        deadline=deadline)[0]
+
+    def _walk_column_status(self, device, config: dict, base_oid: str,
+                            raise_on_timeout: bool = False,
+                            deadline: float | None = None) -> tuple:
+        """(index suffix -> value, whether the walk reached the end).
+
+        `complete` is False whenever the walk stopped for a reason that is
+        not "the table ended": a timeout, an SNMP error, the row cap, an
+        agent that answered nothing, one that answered out of order, or
+        the caller's own deadline. Callers that go on to delete rows the
+        walk did not produce need to know the difference — a walk cut
+        short is not evidence that anything is gone.
 
         v2c and v3 walk with GETBULK — one request answers up to
         `settings["snmp_bulk_max_repetitions"]` rows instead of one GETNEXT
@@ -1739,26 +2508,33 @@ class NodePoller:
         as the real failure it is instead of masquerading as "this
         device just doesn't have any more rows."""
         settings = self.db.settings()
-        max_repetitions = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
         max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
         # GETBULK does not exist in v1, so whether to use it is decided on
         # the configured version with 0 (v1) the only value that says no —
         # an absent version means v2c, the same default `_walk_request`,
         # `_snmp_get` and `_snmp_get_next` apply for framing. Framing
         # (build_request vs build_v3_request) is unaffected either way: v1
-        # and v2c share the same community-based wire format.
-        raw_version = config.get("snmp_version")
-        is_v1 = raw_version is not None and int(raw_version) == 0
-        use_bulk = not is_v1 and max_repetitions > 0
+        # and v2c share the same community-based wire format. The
+        # repetition count is the one this device last coped with.
+        use_bulk, max_repetitions = self._bulk_settings(device, config)
 
         values: dict[str, object] = {}
         current = base_oid
         hit_cap = False
+        complete = True
         session = self._session_for(device, config)
         try:
             while True:
                 if len(values) >= max_rows:
                     hit_cap = True
+                    complete = False
+                    break
+                if deadline is not None and time.time() > deadline:
+                    # The caller's own wall-clock budget. Checked inside
+                    # the walk, not only between walks: a Cisco per-VLAN
+                    # sweep that checked only between VLANs could run two
+                    # unbounded walks past the budget it was given.
+                    complete = False
                     break
                 try:
                     pdu_tag = PDU_GETBULK if use_bulk else PDU_GETNEXT
@@ -1768,16 +2544,20 @@ class NodePoller:
                     if raise_on_timeout:
                         raise SnmpTimeout(
                             f"{exc} (table walk cut short after {len(values)} row(s))") from exc
+                    complete = False
                     break
                 except SnmpError:
+                    complete = False
                     break
                 if use_bulk and response.error_status == 1:   # tooBig
                     if max_repetitions <= 1:
                         use_bulk = False
                     else:
                         max_repetitions = max(1, max_repetitions // 2)
+                    self._remember_repetitions(device, max_repetitions)
                     continue
                 if not response.varbinds:
+                    complete = False
                     break
                 stop = False
                 for vb in response.varbinds:
@@ -1789,12 +2569,14 @@ class NodePoller:
                         stop = True
                         break
                     if _oid_key(oid) <= _oid_key(current):
+                        complete = False
                         stop = True
                         break
                     values[oid[len(base_oid) + 1:]] = vb["value"]
                     current = oid
                     if len(values) >= max_rows:
                         hit_cap = True
+                        complete = False
                         stop = True
                         break
                 if stop:
@@ -1805,18 +2587,28 @@ class NodePoller:
             self.log.add(NODES, f"Table walk of {base_oid} on {device['ip']} "
                                 f"stopped at the {max_rows}-row cap",
                          target=device["ip"])
-        return values
+        return values, complete
 
     def _walk_indexes(self, device, config: dict, base_oid: str,
-                      raise_on_timeout: bool = False) -> list[int]:
+                      raise_on_timeout: bool = False) -> tuple:
+        """(the integer indexes the column reported, whether the walk
+        finished).
+
+        A suffix that is not an integer is skipped, not treated as the end
+        of the table: one malformed row used to truncate the list, and
+        because the caller then deleted every interface it had not seen,
+        one bad row took the rest of the device's ports and their link
+        history with it.
+        """
         indexes: list[int] = []
-        for suffix in self._walk_column(device, config, base_oid,
-                                        raise_on_timeout=raise_on_timeout):
+        values, complete = self._walk_column_status(
+            device, config, base_oid, raise_on_timeout=raise_on_timeout)
+        for suffix in values:
             try:
                 indexes.append(int(suffix))
             except ValueError:
-                break
-        return indexes
+                continue
+        return indexes, complete
 
     # ENTITY-MIB (RFC 6933) and ENTITY-SENSOR-MIB (RFC 3433) columns used
     # by read_dom() to find a port's transceiver sensors.
@@ -1987,7 +2779,8 @@ class NodePoller:
             entries.append(entry)
         return entries
 
-    def _bridge_ports_for(self, device, config: dict, if_index: int):
+    def _bridge_ports_for(self, device, config: dict, if_index: int,
+                          deadline: float | None = None):
         """(bridge ports mapping to this ifIndex, whether the device answered).
 
         A switch that does not answer dot1dBasePortIfIndex at all is a
@@ -1995,7 +2788,7 @@ class NodePoller:
         for this interface, and the caller reports them differently.
         """
         base_port_if_index = self._walk_column(
-            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
         if not base_port_if_index:
             return set(), False
         ports = set()
@@ -2041,6 +2834,11 @@ class NodePoller:
                 vlans.append(vlan)
         entries = []
         answered = False
+        # The budget is passed INTO each walk, not only checked between
+        # VLANs: checking between them let the last VLAN start two
+        # unbounded walks (bridge ports, then the forwarding table) after
+        # the budget was already spent, which is how a dialog a human is
+        # waiting on ran for minutes.
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
             if time.time() > deadline:
@@ -2053,11 +2851,12 @@ class NodePoller:
                 # read the caller tried first comes back empty on exactly
                 # the devices this path exists for.
                 ports, port_answered = self._bridge_ports_for(
-                    device, scoped, if_index)
+                    device, scoped, if_index, deadline=deadline)
                 answered = answered or port_answered
                 if not ports:
                     continue
-            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT,
+                                         deadline=deadline)
             entries.extend(self._fdb_entries(fdb_port, ports, vlan, False))
         return entries, answered
 
@@ -2181,10 +2980,11 @@ class NodePoller:
             unique.append(entry)
         return unique
 
-    def _bridge_port_map(self, device, config: dict) -> dict:
+    def _bridge_port_map(self, device, config: dict,
+                         deadline: float | None = None) -> dict:
         """bridge port -> ifIndex, for every port the device reports."""
         base_port_if_index = self._walk_column(
-            device, config, self._DOT1D_BASE_PORT_IF_INDEX)
+            device, config, self._DOT1D_BASE_PORT_IF_INDEX, deadline=deadline)
         mapping = {}
         for suffix, value in base_port_if_index.items():
             try:
@@ -2216,6 +3016,7 @@ class NodePoller:
                 vlans.append(vlan)
         entries = []
         answered = False
+        # See _cisco_vlan_fdb: the budget goes into the walks themselves.
         deadline = time.time() + self._VLAN_WALK_BUDGET_S
         for vlan in sorted(vlans, key=int)[:self._MAX_VLAN_CONTEXTS]:
             if time.time() > deadline:
@@ -2223,11 +3024,12 @@ class NodePoller:
             scoped = {**config, "community": f"{community}@{vlan}"}
             mapping = port_map
             if not mapping:
-                mapping = self._bridge_port_map(device, scoped)
+                mapping = self._bridge_port_map(device, scoped, deadline=deadline)
                 answered = answered or bool(mapping)
                 if not mapping:
                     continue
-            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT)
+            fdb_port = self._walk_column(device, scoped, self._DOT1D_FDB_PORT,
+                                         deadline=deadline)
             entries.extend(self._fdb_entries(
                 fdb_port, set(mapping), vlan, False, mapping))
         return entries, answered
@@ -2302,69 +3104,122 @@ class NodePoller:
         return {"base": base, "rows": rows, "stopped": stopped,
                 "complete": stopped == "end of subtree"}
 
+    def _bulk_settings(self, device, config: dict) -> tuple:
+        """(use GETBULK, repetitions) for a walk of this device.
+
+        The repetition count is remembered per device: an agent that
+        answered "tooBig" once will answer it again, and re-learning the
+        same limit at the start of every walk costs a wasted round trip
+        each time.
+        """
+        settings = self.db.settings()
+        configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+        raw_version = config.get("snmp_version")
+        is_v1 = raw_version is not None and int(raw_version) == 0
+        if is_v1 or configured <= 0:
+            return False, 0
+        learned = self._bulk_repetitions.get(device["id"])
+        return True, min(configured, learned) if learned else configured
+
+    def _remember_repetitions(self, device, repetitions: int) -> None:
+        self._bulk_repetitions[device["id"]] = max(1, int(repetitions))
+
     def _walk_from(self, device, config, base: str, max_rows: int,
                    budget_s: float, cancelled=None,
                    on_row=None) -> tuple[list[dict], str]:
-        """The GETNEXT walk itself: rows collected, and why it stopped.
+        """The subtree walk itself: rows collected, and why it stopped.
 
         Shared by walk_subtree (one subtree, in front of a waiting human)
         and the background whole-device walk, which differ only in their
         bounds and in having a cancel — not in what a walk is. `cancelled`
         is polled between requests; `on_row` sees each row as it arrives so
         a job can report progress without exposing its list.
+
+        GETBULK on v2c and v3, over one shared socket, the same way
+        _walk_column already walks a table column. This was one GETNEXT and
+        one fresh UDP socket per row: the review put a fleet-wide first
+        identification at about 2.8 hours, almost all of it round trips
+        that a single GETBULK could have answered forty at a time.
         """
         deadline = time.time() + budget_s
         rows: list[dict] = []
         stopped = "end of subtree"
         current = base
-        while True:
-            if cancelled is not None and cancelled():
-                stopped = f"cancelled after {len(rows)} row(s)"
-                break
-            if len(rows) >= max_rows:
-                stopped = f"stopped at the {max_rows}-row limit"
-                break
-            if time.time() > deadline:
-                stopped = f"stopped after {budget_s:.0f}s"
-                break
-            try:
-                response = self._snmp_get_next(device, config, current)
-            except SnmpTimeout:
-                # Name what was actually tried. "The device stopped
-                # answering" alone sent an operator hunting the device when
-                # the answer was on this end — which credential we used, and
-                # against which address and port.
-                stopped = (
-                    f"no reply from {device['ip']}:{DEFAULT_SNMP_PORT} "
-                    f"using {_credential_label(config)}"
-                    + (f" — stopped after {len(rows)} row(s)" if rows else ""))
-                break
-            except SnmpError as exc:
-                stopped = f"SNMP error: {exc}"
-                break
-            if not response.varbinds:
-                stopped = "the device returned nothing"
-                break
-            vb = response.varbinds[0]
-            oid = vb["oid"]
-            if not oid or not (oid == base or oid.startswith(base + ".")):
-                break                      # walked out of the subtree: done
-            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
-                break
-            # A GETNEXT answer must lexicographically follow the request; a
-            # broken agent that echoes the request OID (or goes backwards)
-            # would otherwise fill the dialog with the same row until the cap
-            # or the clock stopped it, presented as the device's answer.
-            if _oid_key(oid) <= _oid_key(current):
-                stopped = ("the device answered with a non-increasing OID "
-                           f"({oid}) — its SNMP agent is misbehaving")
-                break
-            row = {"oid": oid, "type": vb["type"],
-                   "value": vb["value"], "text": vb.get("text")}
-            rows.append(row)
-            if on_row is not None:
-                on_row(row)
-            current = oid
+        use_bulk, repetitions = self._bulk_settings(device, config)
+        session = self._session_for(device, config)
+        try:
+            while True:
+                if cancelled is not None and cancelled():
+                    stopped = f"cancelled after {len(rows)} row(s)"
+                    break
+                if len(rows) >= max_rows:
+                    stopped = f"stopped at the {max_rows}-row limit"
+                    break
+                if time.time() > deadline:
+                    stopped = f"stopped after {budget_s:.0f}s"
+                    break
+                try:
+                    response = self._walk_request(
+                        session, device, config, current,
+                        PDU_GETBULK if use_bulk else PDU_GETNEXT, repetitions)
+                except SnmpTimeout:
+                    # Name what was actually tried. "The device stopped
+                    # answering" alone sent an operator hunting the device
+                    # when the answer was on this end — which credential we
+                    # used, and against which address and port.
+                    stopped = (
+                        f"no reply from {device['ip']}:{DEFAULT_SNMP_PORT} "
+                        f"using {_credential_label(config)}"
+                        + (f" — stopped after {len(rows)} row(s)" if rows else ""))
+                    break
+                except SnmpError as exc:
+                    stopped = f"SNMP error: {exc}"
+                    break
+                if use_bulk and response.error_status == 1:      # tooBig
+                    if repetitions <= 1:
+                        use_bulk = False
+                    else:
+                        repetitions = max(1, repetitions // 2)
+                    self._remember_repetitions(device, repetitions)
+                    continue
+                if not response.varbinds:
+                    stopped = "the device returned nothing"
+                    break
+                done = False
+                for vb in response.varbinds:
+                    oid = vb["oid"]
+                    if not oid or not (oid == base or oid.startswith(base + ".")):
+                        done = True          # walked out of the subtree
+                        break
+                    if vb["type"] in ("noSuchObject", "noSuchInstance",
+                                      "endOfMibView"):
+                        done = True
+                        break
+                    # An answer must lexicographically follow the request; a
+                    # broken agent that echoes the request OID (or goes
+                    # backwards) would otherwise fill the dialog with the
+                    # same row until the cap or the clock stopped it,
+                    # presented as the device's answer.
+                    if _oid_key(oid) <= _oid_key(current):
+                        stopped = ("the device answered with a non-increasing "
+                                   f"OID ({oid}) — its SNMP agent is "
+                                   f"misbehaving")
+                        done = True
+                        break
+                    row = {"oid": oid, "type": vb["type"],
+                           "value": vb["value"], "text": vb.get("text")}
+                    rows.append(row)
+                    if on_row is not None:
+                        on_row(row)
+                    current = oid
+                    if len(rows) >= max_rows:
+                        stopped = f"stopped at the {max_rows}-row limit"
+                        done = True
+                        break
+                if done:
+                    break
+        finally:
+            session.close()
         return rows, stopped
 
     # The whole-device walk starts here rather than at .1: 1.3.6.1 is
@@ -2443,21 +3298,11 @@ class NodePoller:
         try:
             if version in (0, 1):
                 identity, _proto, _pw = credential_for(config)
+                request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                       random.randint(1, 2**16), [oid])
-                return session.request(packet)
-            identity, auth_proto, password = credential_for(config)
-            engine = self._engines.get(device["id"])
-            if engine is None:
-                engine = self._discover_engine(session, device)
-            engine_id, boots, engine_time, _learned_at = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            packet = build_v3_request(
-                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GETNEXT, [oid],
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            return session.request(packet)
+                                       request_id, [oid])
+                return session.request(packet, request_id)
+            return self._v3_exchange(session, device, config, PDU_GETNEXT, [oid])
         finally:
             session.close()
 
@@ -2481,23 +3326,13 @@ class NodePoller:
         version = int(config.get("snmp_version", 1))
         if version in (0, 1):
             identity, _proto, _pw = credential_for(config)
+            request_id = session.next_request_id()
             packet = build_request(version, identity or "public", pdu_tag,
-                                   random.randint(1, 2**16), [oid],
+                                   request_id, [oid],
                                    max_repetitions=max_repetitions)
-            return session.request(packet)
-        identity, auth_proto, password = credential_for(config)
-        engine = self._engines.get(device["id"])
-        if engine is None:
-            engine = self._discover_engine(session, device)
-        engine_id, boots, engine_time, _learned_at = engine
-        auth_key = localized_key(auth_proto, password, engine_id) \
-            if auth_proto and password else None
-        packet = build_v3_request(
-            random.randint(1, 2**16), random.randint(1, 2**16), pdu_tag, [oid],
-            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-            user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
-            max_repetitions=max_repetitions)
-        return session.request(packet)
+            return session.request(packet, request_id)
+        return self._v3_exchange(session, device, config, pdu_tag, [oid],
+                                 max_repetitions=max_repetitions)
 
 
 class _AuthFailure(SnmpError):

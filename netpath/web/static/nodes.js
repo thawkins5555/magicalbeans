@@ -3170,6 +3170,14 @@
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
         ${number('np-maxmib', 'Max MIB file size', Math.round((s.max_mib_bytes || 0) / 1024 / 1024), 'min=1')} MB
+        <p class="hint">A chart narrower than three days is drawn from raw
+          samples; anything wider reads hourly rollups (min, average and max
+          per hour), which are summarised once an hour and kept for
+          ${s.rollup_retention_days || 400} days. So raw retention decides how
+          far back you can see every individual poll — not how far back the
+          chart goes. Raw samples are also capped at
+          ${(s.sample_row_cap_per_metric || 5000).toLocaleString()} per metric,
+          which at the default interval is roughly a week.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {

@@ -56,9 +56,12 @@ def subnet_size(cidr: str) -> int:
     enough that being off by one is most visible.
     """
     net = ipaddress.ip_network(str(cidr).strip(), strict=False)
-    if net.version != 4:
-        raise ValueError("only IPv4 subnets are supported")
     count = net.num_addresses
+    if net.version == 6:
+        # No network or broadcast address to subtract in IPv6 — every
+        # address in the prefix is a host address (RFC 4291 §2.6.1's
+        # subnet-router anycast is still a usable address to probe).
+        return count
     return 1 if count <= 2 else count - 2
 
 
@@ -70,14 +73,17 @@ def usable_addresses(cidr: str, max_addresses: int) -> list[str]:
     of it was never actually probed.
     """
     net = ipaddress.ip_network(str(cidr).strip(), strict=False)
-    if net.version != 4:
-        raise ValueError("only IPv4 subnets are supported")
     count = subnet_size(cidr)
     if count > max_addresses:
+        # An IPv6 prefix reaches this long before an IPv4 one does — a /64
+        # is 18 quintillion addresses — and the message is the right
+        # answer for both: name a prefix small enough to actually sweep.
         raise SubnetTooLarge(
             f"{cidr} has {count} usable addresses, over the {max_addresses}"
             f" limit. Narrow the subnet, or raise the limit in IPAM settings"
             f" if you mean to sweep something this size.")
+    if net.version == 6:
+        return [str(ip) for ip in net]
     if net.num_addresses <= 2:
         return [str(net.network_address)]           # /31 or /32
     return [str(ip) for ip in net.hosts()]

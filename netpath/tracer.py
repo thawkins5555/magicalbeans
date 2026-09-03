@@ -378,10 +378,24 @@ def ping(ip: str, timeout_s: float = 1.5) -> PingResult:
 
 
 def resolve(host: str) -> str | None:
+    """The address to show for a target, IPv4 or IPv6.
+
+    gethostbyname is IPv4-only: it raised for every AAAA-only name and for
+    an IPv6 literal typed straight into the box, so a v6 target could not
+    even be traced. getaddrinfo answers for both families and returns the
+    literal unchanged when it is given one. A name with both records
+    prefers its A record, so nothing about an existing IPv4 target
+    changes.
+    """
     try:
-        return socket.gethostbyname(host)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
     except OSError:
         return None
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family and info[4]:
+                return info[4][0]
+    return None
 
 
 def run_trace(
