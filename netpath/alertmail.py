@@ -102,10 +102,17 @@ def render(text: str, context: dict) -> str:
 
 
 def clock_text(ts) -> str:
-    """A timestamp as local wall-clock text, or "" for a missing one."""
+    """A timestamp as local wall-clock text, or "" for a missing one.
+
+    The UTC offset is part of the text, not decoration: every timestamp in
+    an alert email is the *server's* wall clock, and a fleet spanning sites
+    (or an operator reading the mail on a phone in another zone) has no way
+    to tell which clock "02:14" was. An offset makes the same string usable
+    in an incident write-up without asking where the server lives.
+    """
     if not ts:
         return ""
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    return time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(ts))
 
 
 # The name this module used before the engine needed to format a timestamp
@@ -131,9 +138,13 @@ def duration_text(seconds) -> str:
         total = float(seconds)
     except (TypeError, ValueError):
         return ""
+    # Rounded BEFORE the test, not after: on the float, 0.4 s is "positive"
+    # and then rendered as "0 s" -- the exact claim the paragraph above says
+    # this function refuses to make. Seen live in a recovery message
+    # ("responding again at 20:49:30 after 0 s down").
+    total = int(round(total))
     if total <= 0:
         return ""
-    total = int(round(total))
     if total < 60:
         return f"{total} s"
     minutes, secs = divmod(total, 60)
