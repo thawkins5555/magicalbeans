@@ -7,8 +7,9 @@
   const PAD = { left: 46, right: 10, top: 10, bottom: 22 };
 
   const view = {
-    // Newest first, the order the server already returns.
-    trapSort: { key: 'ts', descending: true },
+    // Newest first, the order the server already returns — until the
+    // operator clicks a heading, which is remembered per browser.
+    trapSort: App.recallSort('snmp-traps', { key: 'ts', descending: true }),
     t0: Date.now() / 1000 - 86400,
     t1: Date.now() / 1000,
     follow: true,
@@ -502,6 +503,18 @@
         if (App.state.tab === 'snmp') drawHistogram();
       });
     }
+
+    // Last thing in init(): the severity, trap-kind and range lists above
+    // are filled, so a restored choice has an option to land on. Live is
+    // not restored — a page that came back already frozen would give the
+    // operator no clue why nothing moves.
+    const CONTROLS = ['sn-q', 'sn-severity', 'sn-kind', 'sn-version', 'sn-source',
+      'sn-oid', 'sn-range', 'sn-limit', 'sn-show-hostname'];
+    App.restoreControls('snmp', CONTROLS);
+    App.rememberControls('snmp', CONTROLS);
+    // The box is the setting's only home on a fresh load, but the table
+    // reads view.showHostname, so the two have to start out agreeing.
+    view.showHostname = App.el('sn-show-hostname').checked;
   }
 
   App.pages.snmp = { init, refresh, fastTick: drawStatus };

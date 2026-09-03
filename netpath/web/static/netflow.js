@@ -101,7 +101,11 @@
       dst: App.el('nf-dst').value.trim(),
       port: App.el('nf-port').value.trim(),
       protocol: App.el('nf-protocol').value,
-      exporter: App.el('nf-exporter').value,
+      // The exporter list is filled from the response below, so on the load
+      // after a reload the restored choice is not on the element yet and the
+      // first fetch would ignore it.
+      exporter: App.el('nf-exporter').value ||
+        App.savedControl('netflow', 'nf-exporter') || '',
     };
   }
 
@@ -410,7 +414,7 @@
   /* Which column the table is ordered by. Separate from the selector above it:
      that one decides which records the server sends back, this one decides how
      the returned records are arranged. */
-  let sort = { key: 'bytes', descending: true };
+  let sort = App.recallSort('nf-records', { key: 'bytes', descending: true });
 
   function onSort(key, descending) {
     sort = { key, descending };
@@ -654,6 +658,18 @@
         exporter.appendChild(option);
       }
     }
+    // The one late-filled control on this page: a restored exporter can only
+    // be selected once the option it names exists. An exporter that has
+    // stopped sending never appears, and the filter stays on "All".
+    if (!exporter.value) {
+      exporter.value = App.savedControl('netflow', 'nf-exporter') || '';
+      // Nothing to select it on: drop it, rather than let filters() keep
+      // asking the server for an exporter this page cannot show as chosen.
+      if (exporter.selectedIndex < 0) {
+        exporter.value = '';
+        App.rememberControl('netflow', 'nf-exporter', '');
+      }
+    }
 
     view.fetchedAt = Date.now();
     drawChart();
@@ -735,6 +751,15 @@
         if (App.state.tab === 'netflow') drawChart();
       });
     }
+
+    // Restored before resetWindow(), which reads the range straight off
+    // nf-range to size the first window — after it, the window would be
+    // built from the markup default and only correct itself on the next
+    // change. Follow is deliberately not restored.
+    const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
+      'nf-protocol', 'nf-exporter', 'nf-order'];
+    App.restoreControls('netflow', CONTROLS);
+    App.rememberControls('netflow', CONTROLS);
     resetWindow();
   }
 
