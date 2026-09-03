@@ -55,7 +55,7 @@ class TrapCollector:
         self.counters = {"packets": 0, "traps": 0, "stored": 0, "dropped": 0,
                          "rejected": 0, "bad_community": 0, "undecodable": 0,
                          "filtered": 0, "informs_acked": 0, "errors": 0,
-                         "last_trap": 0.0}
+                         "bad_auth": 0, "unverified": 0, "last_trap": 0.0}
         # A receive thread must never die on packet content; failures are
         # counted here and _crash records a thread that ended anyway so the
         # status strip does not read like a deliberate stop.
@@ -70,6 +70,8 @@ class TrapCollector:
         self._auto_community = True
         self._versions: set[int] = {0, 1, 3}
         self._ack_informs = True
+        self._reject_failed_auth = True
+        self._last_bad_auth_log = 0.0
         self._min_severity = 7
         self._seen: collections.OrderedDict = collections.OrderedDict()
 
@@ -103,6 +105,7 @@ class TrapCollector:
             self._versions.add(3)
 
         self._ack_informs = bool(settings.get("acknowledge_informs", True))
+        self._reject_failed_auth = bool(settings.get("reject_failed_auth", True))
         self._min_severity = int(settings.get("min_severity", 7))
         self.db.store_raw = bool(settings.get("store_raw", False))
         self.decoder.configure(settings)
@@ -314,6 +317,8 @@ class TrapCollector:
         if not self._accepted_community(trap.community, trap.version):
             self.counters["bad_community"] += 1
             return
+        if not self._accepted_auth(trap):
+            return
 
         self.counters["traps"] += 1
         self.counters["last_trap"] = time.time()
@@ -332,6 +337,41 @@ class TrapCollector:
             self._queue.put_nowait(trap)
         except queue.Full:
             self.counters["dropped"] += 1
+
+    def _accepted_auth(self, trap) -> bool:
+        """Enforce the SNMPv3 digest the decoder already computed.
+
+        _accepted_community returns True unconditionally for v3 because v3
+        has no community, and nothing downstream looked at auth_state — so a
+        forged authNoPriv trap with a wrong digest was counted as a failure
+        and then stored and alerted on exactly like a genuine one. "failed"
+        means a configured user's digest did not verify, which is either an
+        attack or a password mismatch; "unverified" means no user is
+        configured for that name, so nothing could be checked. The second is
+        counted and kept, because that is what a site with no v3 users
+        configured has always had.
+        """
+        if trap.auth_state == "failed":
+            self.counters["bad_auth"] += 1
+            if not self._reject_failed_auth:
+                return True
+            now = time.time()
+            if now - self._last_bad_auth_log >= 60:
+                self._last_bad_auth_log = now
+                self.log.add(ERROR,
+                             f"Discarded an SNMPv3 trap from {trap.source} whose "
+                             f"authentication failed (user {trap.community!r})",
+                             target=trap.source,
+                             detail="The digest did not verify against the "
+                                    "configured password for that user. Either "
+                                    "the device's password differs, or the trap "
+                                    "was forged. Turn off \"reject failed "
+                                    "authentication\" in Settings to store them "
+                                    "anyway.")
+            return False
+        if trap.version == 3 and trap.auth_state in ("unverified", "encrypted"):
+            self.counters["unverified"] += 1
+        return True
 
     def _acknowledge(self, trap, address) -> None:
         """An InformRequest is retransmitted until acknowledged. Answering it

@@ -96,6 +96,13 @@ DEFAULTS = {
     # Used only to verify the authentication digest on authNoPriv and authPriv
     # messages; privacy (decryption) is not implemented.
     "v3_users": "",
+    # Whether a v3 trap whose authentication digest does not verify is
+    # discarded. On, because the alternative is what shipped: the digest was
+    # computed, the failure was counted, and the trap was stored and alerted
+    # on anyway, so anyone with network reach to the trap port could
+    # manufacture alerts and page the on-call. Turning it off restores the
+    # old behaviour for a site that needs to see what is arriving.
+    "reject_failed_auth": True,
     # Volume control at the door, before anything is written.
     "min_severity": 7,          # keep this severity and anything worse
     "max_varbinds": 64,

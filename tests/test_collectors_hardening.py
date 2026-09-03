@@ -549,12 +549,131 @@ def test_c5_drain_sources_can_be_caught_up() -> None:
     trap_db.close()
 
 
+# ----------------------------------------------------------------------- C6
+
+def _tlv(tag: int, body: bytes) -> bytes:
+    if len(body) < 0x80:
+        return bytes([tag, len(body)]) + body
+    raw = len(body).to_bytes((len(body).bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(raw)]) + raw + body
+
+
+def _int_tlv(value: int) -> bytes:
+    length = max(1, (value.bit_length() + 8) // 8)
+    return _tlv(0x02, value.to_bytes(length, "big"))
+
+
+def _oid_tlv(oid: str) -> bytes:
+    arcs = [int(part) for part in oid.split(".")]
+    body = bytes([arcs[0] * 40 + arcs[1]])
+    for arc in arcs[2:]:
+        chunk = bytearray([arc & 0x7F])
+        arc >>= 7
+        while arc:
+            chunk.insert(0, (arc & 0x7F) | 0x80)
+            arc >>= 7
+        body += bytes(chunk)
+    return _tlv(0x06, body)
+
+
+def v3_trap(user: str, engine_id: bytes, digest: bytes,
+            trap_oid: str = "1.3.6.1.6.3.1.1.5.3") -> bytes:
+    """An SNMPv3 authNoPriv snmpV2-Trap carrying `digest` as its
+    msgAuthenticationParameters. A digest of the wrong bytes is exactly what a
+    forger sends, and what the review offered 401 of."""
+    header = _tlv(0x30, _int_tlv(1) + _int_tlv(65507)
+                  + _tlv(0x04, b"\x01") + _int_tlv(3))     # msgFlags: auth
+    usm = _tlv(0x30,
+               _tlv(0x04, engine_id) + _int_tlv(1) + _int_tlv(100)
+               + _tlv(0x04, user.encode()) + _tlv(0x04, digest) + _tlv(0x04, b""))
+    varbinds = _tlv(0x30,
+                    _tlv(0x30, _oid_tlv("1.3.6.1.2.1.1.3.0")
+                         + _tlv(0x43, b"\x00\x01\x00\x00"))
+                    + _tlv(0x30, _oid_tlv("1.3.6.1.6.3.1.1.4.1.0")
+                           + _oid_tlv(trap_oid)))
+    pdu = _tlv(0xA7, _int_tlv(1) + _int_tlv(0) + _int_tlv(0) + varbinds)
+    scoped = _tlv(0x30, _tlv(0x04, engine_id) + _tlv(0x04, b"") + pdu)
+    return _tlv(0x30, _int_tlv(3) + header + _tlv(0x04, usm) + scoped)
+
+
+def test_c6_forged_v3_traps_are_dropped() -> None:
+    """_verify_v3 computed the digest correctly and counted the failure, and
+    then _enqueue stored the trap anyway: _accepted_community returns True
+    unconditionally for v3 and nothing else looked at auth_state. The review
+    sent 401 forged authNoPriv traps; all 401 were stored and all 401 became
+    alert occurrences."""
+    print("C6: a v3 trap whose authentication fails is not stored")
+
+    settings = {"bind_address": "127.0.0.1",
+                "v3_users": "noc / SHA / correcthorsebattery"}
+    engine = b"\x80\x00\x1f\x88\x80" + b"engine"
+
+    trap_db = SnmpTrapDatabase(db_path("c6-traps.db"))
+    traps = TrapCollector(trap_db)
+    port = free_udp_port()
+    assert traps.start({**settings, "port": port})
+    try:
+        forged = v3_trap("noc", engine, b"\x00" * 12)
+        for _ in range(401):
+            send_udp(port, forged)
+        check(wait_for(lambda: traps.counters["bad_auth"] >= 401, 15.0),
+              f"401 forged traps are counted as bad_auth "
+              f"({traps.counters['bad_auth']})")
+        time.sleep(1.5)
+        stored = trap_db.max_id()
+        check(stored == 0, f"none of them reach the database (stored={stored})")
+        check(traps.counters["traps"] == 0,
+              "and none of them refresh the 'last trap' figure")
+    finally:
+        traps.stop()
+        trap_db.close()
+
+    # A user nobody configured cannot be checked: counted, and still kept,
+    # because that is what a site with no v3 users has always had.
+    trap_db = SnmpTrapDatabase(db_path("c6-unverified.db"))
+    traps = TrapCollector(trap_db)
+    port = free_udp_port()
+    assert traps.start({**settings, "port": port})
+    try:
+        send_udp(port, v3_trap("someone-else", engine, b"\x00" * 12))
+        check(wait_for(lambda: trap_db.max_id() == 1, 8.0),
+              "a trap from an unconfigured v3 user is still stored")
+        check(traps.counters["unverified"] == 1 and traps.counters["bad_auth"] == 0,
+              "and counted as unverified, separately from bad_auth")
+        row = trap_db.traps_since(0)[0]
+        check(row["auth_state"] == "unverified",
+              "with auth_state 'unverified' on the row")
+    finally:
+        traps.stop()
+        trap_db.close()
+
+    # The setting can be turned off for a site that needs to see them.
+    trap_db = SnmpTrapDatabase(db_path("c6-permissive.db"))
+    traps = TrapCollector(trap_db)
+    port = free_udp_port()
+    assert traps.start({**settings, "port": port, "reject_failed_auth": False})
+    try:
+        send_udp(port, v3_trap("noc", engine, b"\x00" * 12))
+        check(wait_for(lambda: trap_db.max_id() == 1, 8.0),
+              "reject_failed_auth=False stores the forged trap as before")
+        check(traps.counters["bad_auth"] == 1,
+              "and still counts it in bad_auth")
+    finally:
+        traps.stop()
+        trap_db.close()
+
+    from netpath import snmptrapdb as snmptrapdb_mod
+    check(snmptrapdb_mod.DEFAULTS.get("reject_failed_auth") is True,
+          "the setting ships on by default")
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
     test_c3_kernel_drops_are_visible,
     test_c4_prune_does_not_rebuild_the_index,
     test_c5_drain_sources_can_be_caught_up,
+    test_c6_forged_v3_traps_are_dropped,
 ]
 
 
