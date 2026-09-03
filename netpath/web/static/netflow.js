@@ -1,9 +1,33 @@
 /* The NetFlow page: collector status, stacked traffic chart, top-N bars and
    the flow record table. */
 (() => {
-  const SERIES = ['#7AA2F7', '#7DCFB6', '#E5A3C4', '#F2B880', '#A9A0F0',
-                  '#69B3D6', '#C3D06A', '#E0868A', '#8FB8A0', '#C9A227'];
-  const OTHER = '#4C5561';
+  /* The categorical palette for stacked bands, top-N bars and their legend.
+
+     The set this replaces was ten colours picked by eye. Two of them were
+     the accent and the muted grey — the colours that mean "interactive"
+     and "no data" everywhere else in the application — and the rest were
+     never checked against the one thing a stacked chart has to survive:
+     telling a band from the band it touches.
+
+     Measured, simulating protanopia and comparing in Lab: the old set's
+     closest ADJACENT pair was 11.3 apart and its lightness spread 15
+     points, so bands blurred into each other and the brighter series read
+     as more important. This one is 32.8 apart at its closest adjacent pair
+     with a 7-point lightness band, and every entry clears 3:1 against the
+     panel it is drawn on (lowest 4.7).
+
+     Honest limit: with eight categories, two NON-adjacent entries still
+     come within 5.5 of each other under simulation — closer than the pair
+     they replace. Bands that touch are what the eye compares in a stack,
+     and the legend and the hover tooltip both carry a swatch beside the
+     name for the rest. Eight rather than ten because eight is near the
+     limit of what anyone matches against a legend, and the server already
+     folds the ninth series onwards into "Other". */
+  const SERIES = ['#5B8DEB', '#CF7638', '#2FA886', '#B0881A',
+                  '#D1609A', '#4F9A3A', '#8F76E8', '#DC5A5A'];
+  // "Other", and anything past the eighth series: deliberately the neutral
+  // that means "nothing of its own" in the donuts too, not a ninth hue.
+  const OTHER = 'var(--data-neutral)';
 
   /* One place decides a series' colour. The stacked bands, the legend and
      the tooltip all read it from here, so a swatch always names the band
@@ -480,12 +504,13 @@
       tr.addEventListener('mouseleave', App.hideTooltip);
     });
     table.appendChild(body);
+    App.wireRowKeyboard(body);
   }
 
   /* ---------------------------------------------------------- settings */
 
   function settingsDialog() {
-    const s = App.state.flowSettings;
+    const s = App.state.flowSettings || {};
     const check = (id, label, on) =>
       `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
     const number = (id, label, value, attrs = '') =>
@@ -550,7 +575,7 @@
             box.querySelector('#cols-netflow'), COLUMNS),
         } });
         await App.loadState();
-        App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
+        App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
         App.closeModal();
         App.refreshNow('netflow');
       } },
@@ -724,9 +749,12 @@
     App.rememberControls('netflow', CONTROLS);
     App.fillRanges(App.el('nf-range'), 'Last hour');
     const dimension = App.el('nf-dimension');
-    // /api/state sends the dimension list only to an account with NetFlow
-    // read; init() runs for every page regardless, so an account without it
-    // must not throw here and take the rest of the boot down with it.
+    // `dimensions` — like every other block in /api/state — is omitted
+    // entirely for an account that cannot read this module (see
+    // _STATE_MODULE_KEYS in api.py), and init() runs for every module
+    // whatever the account may read. Defaulting rather than assuming is the
+    // rule for anything that comes out of state: the tab is hidden anyway,
+    // so an empty list here is exactly right.
     for (const name of App.state.dimensions || []) {
       const option = document.createElement('option');
       option.value = name;

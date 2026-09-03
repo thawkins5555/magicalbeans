@@ -7,6 +7,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 - [4.39.0 — unreleased](#4390-unreleased)
 - [4.37.1 — Review of 4.37.0](#4371--review-of-4370)
 - [4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves](#4370--views-that-survive-a-reload-mute-where-it-belongs-bulk-resolve-that-resolves)
+- [4.36.2 — UI/UX review: the defects it found](#4362-uiux-review-the-defects-it-found)
 - [4.36.1 — Review of the SSH terminal](#4361-review-of-the-ssh-terminal)
 - [4.36.0 — SSH from the device pane, with host keys that are remembered](#4360-ssh-from-the-device-pane-with-host-keys-that-are-remembered)
 - [4.35.0 — A question mark beside the setting](#4350-a-question-mark-beside-the-setting)
@@ -694,6 +695,109 @@ Nine changes are not, and an operator should read them before updating.
   sign-in.** The NetFlow page's set-up iterated a dimension list the server
   only sends to accounts that may read NetFlow; it now tolerates its
   absence.
+
+### 4.36.2 — UI/UX review: the defects it found
+
+The first of four passes over the interface, following the review recorded
+in `UI-UX-REVIEW.md`. This one is only the defects — nothing is redesigned,
+nine things are made to work.
+
+- **One module can no longer take down the whole application.** Every
+  module is started inside its own guard. It used to be one loop with no
+  isolation, so the first exception meant the tab was never selected and
+  the refresh timer never started: the page painted whatever had been
+  stored and then sat there, frozen, with nothing on screen to say why.
+  An account without NetFlow access hit exactly that — `/api/state`
+  correctly omits a module's block for someone who cannot read it, and the
+  NetFlow module read it without checking — so the accounts an
+  administrator creates first, the read-only ones, got a dead page. A
+  module that fails now hides its own tab and the rest of the app starts.
+- **A device must be given an address.** `999.999.1.oops` was accepted and
+  stored, and the row that resulted looked exactly like a device that was
+  merely down, forever. Addresses are now checked on the server, and the
+  Add device dialog reports a blank or refused address instead of appearing
+  to do nothing.
+- **"You must change your password" is now a rule rather than a request.**
+  It was a dialog the browser raised, which Escape closed, which re-asked
+  only on the next reload, and which nothing enforced: the account was
+  fully usable throughout. The server now refuses everything except the
+  change itself, signing out, and the polling that keeps the prompt on
+  screen; the dialog cannot be dismissed, and offers Sign out instead of a
+  Cancel that would have been a lie.
+- **The storage meters on Settings show how full each database is.** All
+  eight rendered as empty grey pills whatever the number behind them,
+  because the meter shared a class name with the toolbar and inherited its
+  padding — which, under `border-box`, left the bar exactly zero pixels of
+  height to fill.
+- **Wireless and ConfigRX no longer reload into a blank page.** The rule
+  that paints the first frame, before any script has run, was a
+  hand-written list of ten tabs; the product has had twelve since those two
+  shipped. It is now generated from the tab being restored, so it cannot
+  fall behind the tab strip again.
+- **Small things that were wrong.** The nine Maintenance buttons wrap onto
+  a second row instead of folding every label onto two lines; a DHCP
+  server's error reads along the bar instead of down a sixty-pixel column,
+  having borrowed the syslog severity chip's fixed width for its colour;
+  the Debug event log names all eleven of its categories rather than six,
+  with the other five showing their raw keys; and a session about to hit
+  its twelve-hour ceiling now says so a minute beforehand, where it used to
+  arrive as a sudden return to the sign-in page.
+- **The keyboard reaches the tables.** Selecting a row to fill a detail
+  pane is the central gesture of most of this application and it answered
+  only a pointer: no row anywhere carried a tab stop, a role or a key
+  handler. Rows now take focus, answer Enter and Space with the behaviour
+  they already had, and move under the arrow keys. One row per table is in
+  the tab order at a time, so a three-hundred-row Syslog table does not put
+  three hundred stops in front of whatever follows it.
+- **Focus is visible, and survives a refresh.** The stylesheet said
+  `outline: none` on inputs and left everything else to the browser's own
+  ring, which measures 1.01:1 against this background — tabbing through the
+  application showed nothing moving. There is now one ring, drawn for the
+  keyboard and not for the mouse. Separately, every table is rebuilt on its
+  poll tick, which used to throw the focused row away and drop the keyboard
+  back at the top of the page every few seconds; the row at that position
+  now takes it back.
+- **Dialogs behave like dialogs.** The one every module uses had no role and
+  no name, and Tab walked straight out of it into the page behind the
+  scrim — where a screen reader would read a form nobody could see. It is
+  now announced as a dialog, named by its own heading, holds the keyboard
+  until it is answered, switches the page behind it off rather than merely
+  covering it, and hands focus back to whatever opened it. The help panel
+  had all of this already; this is the same treatment for the rest.
+- **Controls say what they are.** Fifty-nine row checkboxes were announced
+  as "checkbox" with nothing to tell them apart, so choosing a row meant
+  counting; each is now named after the device or alert it selects. The ten
+  zoom and pan buttons that read as "−", "+", "‹" and "›" have names, as do
+  nine time-window and row-limit menus that had none. Anything that changes
+  a status line is also announced once, through a live region the next pass
+  will build its notifications on.
+- **State is no longer carried by colour alone.** A green dot and a red dot
+  are the same dot to a colour-blind operator, and the same grey in the
+  screenshot somebody pastes into a ticket. Every status now has a shape as
+  well as a colour and a word — `● up`, `■ down`, `▲ auth
+  failed`, `○ unknown` — from one renderer shared by Nodes, Wireless
+  and ConfigRX, which had each inlined their own dot. ConfigRX's "changed"
+  stops being green, which meant "healthy" on every other page: a config
+  that differs from the last copy is information, not a fault.
+- **Alerts names the severity.** The column showed a bare `2`, while Syslog
+  and SNMP Trap both showed the word, so the one page an operator triages
+  from was the one that required them to remember the scale.
+- **The tab badge says how bad, not just how many.** It was amber whatever
+  was behind it; it now takes the tone of the worst open alert, so the tab
+  strip answers "does this need me now?" without opening the tab.
+- **The empty part of an IPAM donut is visible.** "Never seen" and
+  "available" were drawn in a border colour at 1.35:1 against the panel, so
+  a subnet with three addresses left looked identical to one that was full.
+- **NetFlow's series palette was rebuilt.** Two of the ten were the accent
+  and the muted grey — the colours that mean "interactive" and "no data"
+  everywhere else — and the closest pair of touching bands was 11.3 apart
+  under simulated protanopia. The new set of eight is 32.8 apart at its
+  closest touching pair, holds a seven-point lightness band so no series
+  reads as more important than another, and clears 3:1 against the panel.
+- **Tests.** `tests/test_web_gates.py` covers the three halves a browser
+  must not be trusted with: the must-change gate, device address
+  validation, and the shape of `/api/state` for each permission set — the
+  last being the defect that produced the dead page above.
 
 ### 4.36.1 — Review of the SSH terminal
 
