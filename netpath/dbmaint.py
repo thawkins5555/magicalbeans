@@ -39,14 +39,17 @@ def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "") -> bool
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
         if mode != INCREMENTAL:
-            # The pragma only takes effect on a database with no pages at
-            # all. A WAL-mode file already has its first page by the time
-            # the caller gets here, so a VACUUM (cheap on a new file, a
-            # one-time cost on an old one) is what actually converts it.
+            # The pragma alone only takes on a database with no pages at all,
+            # and opening one in WAL mode already writes page 1 — so even a
+            # brand-new file needs the VACUUM for the setting to stick. It is
+            # instant when there is nothing in the file; only a database with
+            # real content in it is worth mentioning in the log.
+            pages = conn.execute("PRAGMA page_count").fetchone()[0]
             started = time.monotonic()
             conn.execute("VACUUM")
-            log.info("%s: converted to incremental auto-vacuum in %.1f s",
-                     label or "database", time.monotonic() - started)
+            if pages > 1:
+                log.info("%s: converted to incremental auto-vacuum in %.1f s",
+                         label or "database", time.monotonic() - started)
             mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         log.warning("%s: could not enable incremental vacuum: %s", label or "database", exc)
@@ -76,6 +79,11 @@ def reclaim(conn: sqlite3.Connection, lock: threading.Lock | threading.RLock,
         freed += max(0, before - after)
         if after <= 0 or after == before or time.monotonic() >= deadline:
             break
+        # Release the GIL before reacquiring the lock. A Python lock is not
+        # fair: without this the loop reacquires it before a waiting writer
+        # is ever scheduled, so "the lock is released between steps" bought
+        # the writer nothing.
+        time.sleep(0)
     with lock:
         try:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

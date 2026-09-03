@@ -9,15 +9,22 @@ no retransmission.
 
 from __future__ import annotations
 
-import os
+import collections
 import queue
 import socket
 import threading
 import time
+import traceback
 
+from . import udpsock
 from .eventlog import ERROR, NETFLOW, NullLog
 from .flowdb import FlowDatabase
 from .nfdecode import IPFIX, V5, V9, Decoder
+
+
+# Cap on the "first packet from exporter ..." memory: the key is a spoofable
+# source address, so it is an LRU rather than an unbounded set.
+MAX_SEEN_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -38,7 +45,7 @@ class Collector:
         self.db = db
         self.on_batch = on_batch
         self.log = log or NullLog()
-        self._seen_exporters: set[str] = set()
+        self._seen_exporters: collections.OrderedDict = collections.OrderedDict()
         self._stop = threading.Event()
         self._rx_thread: threading.Thread | None = None
         self._wr_thread: threading.Thread | None = None
@@ -47,10 +54,21 @@ class Collector:
         self.decoder = Decoder()
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
         self.rcvbuf = 0
         self.started_at = 0.0
         self.counters = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
-                         "errors": 0, "last_packet": 0.0, "last_template": 0.0}
+                         "errors": 0, "resampled": 0, "last_packet": 0.0,
+                         "last_template": 0.0}
+        # A receive thread must never be able to die on packet content, so its
+        # per-datagram work is guarded and the failures counted here; _crash
+        # records a thread that ended anyway, so the status strip can say
+        # "stopped unexpectedly" instead of looking like an operator stop.
+        self._loop_errors = 0
+        self._last_error_log = 0.0
+        self._crash: str | None = None
+        self._drops: udpsock.KernelDrops | None = None
+        self._drops_logged = False
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
@@ -65,6 +83,8 @@ class Collector:
         self.stop()
         self._settings = dict(settings)
         self.error = None
+        self._crash = None
+        self._loop_errors = 0
         self._stop.clear()
 
         self._versions = set()
@@ -86,30 +106,14 @@ class Collector:
 
         address = settings.get("bind_address", "0.0.0.0")
         port = int(settings.get("port", 2055))
+        wanted = int(settings.get("socket_buffer_kb", 4096)) * 1024
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            if os.name == "nt":
-                # SO_REUSEADDR on Windows lets a second process bind the same
-                # UDP port and quietly take delivery of the datagrams, so a
-                # leftover instance silently steals every packet while this one
-                # looks healthy. SO_EXCLUSIVEADDRUSE makes the second bind fail
-                # loudly instead, which is the error we want to show.
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET,
-                                    socket.SO_EXCLUSIVEADDRUSE, 1)
-                except (AttributeError, OSError):
-                    pass
-            else:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            wanted = int(settings.get("socket_buffer_kb", 4096)) * 1024
+            sock, self.family = udpsock.bind(socket.SOCK_DGRAM, address, port,
+                                             wanted)
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, wanted)
                 self.rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
             except OSError:
                 self.rcvbuf = 0
-            sock.bind((address, port))
-            sock.settimeout(0.5)
         except OSError as exc:
             hint = ""
             if getattr(exc, "errno", None) in (48, 98, 10048):
@@ -120,12 +124,30 @@ class Collector:
             self.log.add(ERROR, self.error)
             return False
 
+        if self.rcvbuf and self.rcvbuf < wanted:
+            # Linux reports back twice what it granted, so a readback below
+            # the request means net.core.rmem_max clamped it — the single
+            # commonest reason for kernel drops under load.
+            self.log.add(ERROR,
+                         f"The receive buffer was clamped to {self.rcvbuf} bytes "
+                         f"(asked for {wanted})",
+                         detail="Raise net.core.rmem_max on this host, or lower "
+                                "the buffer size in Settings so the two agree.")
+        self._drops = udpsock.KernelDrops(port) if udpsock.supported() else None
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
         self._sock = sock
         self.bound = (address, port)
-        self._rx_thread = threading.Thread(target=self._receive, name="netflow-rx",
-                                           daemon=True)
-        self._wr_thread = threading.Thread(target=self._write, name="netflow-wr",
-                                           daemon=True)
+        self._rx_thread = threading.Thread(
+            target=lambda: self._guard(self._receive, "netflow-rx"),
+            name="netflow-rx", daemon=True)
+        self._wr_thread = threading.Thread(
+            target=lambda: self._guard(self._write, "netflow-wr"),
+            name="netflow-wr", daemon=True)
         self.started_at = time.time()
         self._seen_exporters.clear()
         self._rx_thread.start()
@@ -155,6 +177,77 @@ class Collector:
 
     # ---------------------------------------------------------------- threads
 
+    def _guard(self, target, name: str) -> None:
+        """Run a collector thread and remember how it ended.
+
+        Without this an exception simply printed itself to stderr and the
+        listener was gone with `status_text` still reading "Collector
+        stopped", which is what an operator sees after a deliberate stop.
+        """
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set():
+                self._crash = f"{name} ended unexpectedly"
+
+    def _first_from(self, exporter: str) -> bool:
+        """True the first time an exporter is seen since the last start.
+
+        The set is keyed on the datagram's source address, which anyone with
+        network reach can vary, so it is bounded and least-recently-used
+        rather than growing for the life of the process.
+        """
+        if exporter in self._seen_exporters:
+            self._seen_exporters.move_to_end(exporter)
+            return False
+        self._seen_exporters[exporter] = None
+        while len(self._seen_exporters) > MAX_SEEN_SOURCES:
+            self._seen_exporters.popitem(last=False)
+        return True
+
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible. The key is
+        absent on platforms that do not publish the figure.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on NetFlow port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a datagram the receive path could not process, and log at
+        most one traceback a minute so a flood cannot fill the event log."""
+        self._loop_errors += 1
+        self.counters["errors"] = self.decoder.stats["errors"] + self._loop_errors
+        now = time.time()
+        if now - self._last_error_log >= 60:
+            self._last_error_log = now
+            self.log.add(ERROR, f"Receive error: {exc}",
+                         detail=traceback.format_exc())
+
     def _receive(self) -> None:
         sock = self._sock
         while not self._stop.is_set() and sock is not None:
@@ -164,52 +257,57 @@ class Collector:
                 continue
             except OSError:
                 break
-
-            exporter = address[0]
-            if self._allowed and exporter not in self._allowed:
-                self.counters["rejected"] += 1
-                continue
-            if not self._settings.get("auto_accept_exporters", True) and not self._allowed:
-                self.counters["rejected"] += 1
-                continue
-            if len(data) >= 2:
-                version = int.from_bytes(data[:2], "big")
-                if version not in self._versions:
-                    self.counters["rejected"] += 1
-                    continue
-
-            self.counters["packets"] += 1
-            self.counters["last_packet"] = time.time()
-            templates_before = self.decoder.stats["templates"]
-            errors_before = self.decoder.stats["errors"]
-            flows = self.decoder.decode(data, exporter)
-
-            if exporter not in self._seen_exporters:
-                self._seen_exporters.add(exporter)
-                self.log.add(NETFLOW, f"First packet from exporter {exporter}",
-                             target=exporter,
-                             detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
-                                    f"bytes    {len(data)}\n"
-                                    f"sampling {self.decoder.sampling_for(exporter)}")
-            gained = self.decoder.stats["templates"] - templates_before
-            if gained:
-                self.counters["last_template"] = time.time()
-                self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
-                             target=exporter)
-            if self.decoder.stats["errors"] > errors_before:
-                self.log.add(ERROR, f"Undecodable packet from {exporter}",
-                             target=exporter,
-                             detail=f"{len(data)} bytes, first 32: {data[:32].hex(' ')}")
-            self.counters["errors"] = self.decoder.stats["errors"]
-            if not flows:
-                continue
             try:
-                self._queue.put_nowait((exporter, flows))
-            except queue.Full:
-                self.counters["dropped"] += len(flows)
+                self._handle(data, address)
+            except Exception as exc:
+                self._note_error(exc)
+
+    def _handle(self, data: bytes, address) -> None:
+        exporter = udpsock.normalise_source(address[0])
+        if self._allowed and exporter not in self._allowed:
+            self.counters["rejected"] += 1
+            return
+        if not self._settings.get("auto_accept_exporters", True) and not self._allowed:
+            self.counters["rejected"] += 1
+            return
+        if len(data) >= 2:
+            version = int.from_bytes(data[:2], "big")
+            if version not in self._versions:
+                self.counters["rejected"] += 1
+                return
+
+        self.counters["packets"] += 1
+        self.counters["last_packet"] = time.time()
+        templates_before = self.decoder.stats["templates"]
+        errors_before = self.decoder.stats["errors"]
+        flows = self.decoder.decode(data, exporter)
+
+        if self._first_from(exporter):
+            self.log.add(NETFLOW, f"First packet from exporter {exporter}",
+                         target=exporter,
+                         detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
+                                f"bytes    {len(data)}\n"
+                                f"sampling {self.decoder.sampling_for(exporter)}")
+        gained = self.decoder.stats["templates"] - templates_before
+        if gained:
+            self.counters["last_template"] = time.time()
+            self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
+                         target=exporter)
+        if self.decoder.stats["errors"] > errors_before:
+            self.log.add(ERROR, f"Undecodable packet from {exporter}",
+                         target=exporter,
+                         detail=f"{len(data)} bytes, first 32: {data[:32].hex(' ')}")
+        self.counters["errors"] = self.decoder.stats["errors"] + self._loop_errors
+        if not flows:
+            return
+        try:
+            self._queue.put_nowait((exporter, flows))
+        except queue.Full:
+            self.counters["dropped"] += len(flows)
 
     def _write(self) -> None:
         pending: list = []
+        # exporter -> [packets, flows, sampling, version]
         per_exporter: dict[str, list[int]] = {}
         last_flush = time.time()
 
@@ -217,28 +315,51 @@ class Collector:
             try:
                 exporter, flows = self._queue.get(timeout=0.4)
                 pending.extend(flows)
-                entry = per_exporter.setdefault(exporter, [0, 0, 1])
+                entry = per_exporter.setdefault(exporter, [0, 0, 1, 0])
                 entry[0] += 1
                 entry[1] += len(flows)
                 entry[2] = flows[0].sampling
+                # Each exporter's own version, not whichever flow happened to
+                # be first in the whole batch: with v5 and v9 exporters in one
+                # flush window the Exporters table told the operator the wrong
+                # protocol for every one of them, which is the first thing
+                # anyone checks when an exporter's records stop decoding.
+                entry[3] = flows[0].version
             except queue.Empty:
                 pass
 
+            self._poll_kernel_drops()
             due = time.time() - last_flush >= 1.0
             if pending and (due or len(pending) >= 500):
                 written = self.db.insert_flows(pending)
                 self.counters["flows"] += written
-                for exporter, (packets, flows_n, sampling) in per_exporter.items():
-                    version = pending[0].version if pending else 0
-                    self.db.touch_exporter(exporter, version, packets, flows_n, sampling)
+                self.db.touch_exporters(
+                    [(exporter, entry[3], entry[0], entry[1], entry[2])
+                     for exporter, entry in per_exporter.items()])
                 pending.clear()
                 per_exporter.clear()
                 last_flush = time.time()
+                self._apply_learned_rates()
                 if self.on_batch:
                     self.on_batch()
 
         if pending:
             self.db.insert_flows(pending)
+        self._apply_learned_rates()
+
+    def _apply_learned_rates(self) -> None:
+        """Store any sampling rate announced since the last flush, and correct
+        the flows that arrived before the announcement."""
+        rates, self.decoder.learned_rates = self.decoder.learned_rates, []
+        if not rates:
+            return
+        try:
+            corrected = self.db.record_sampling_rates(rates, self.started_at)
+        except Exception as exc:
+            self._note_error(exc)
+            return
+        if corrected:
+            self.counters["resampled"] += corrected
 
     # ----------------------------------------------------------------- status
 
@@ -246,6 +367,8 @@ class Collector:
         if self.error:
             return self.error
         if not self.running:
+            if self._crash:
+                return f"Collector stopped unexpectedly: {self._crash}"
             return "Collector stopped"
         address, port = self.bound or ("?", 0)
         base = f"Listening on {address}:{port} (UDP)"
@@ -259,6 +382,9 @@ class Collector:
             # last one came is worth as much as the packet time.
             parts.append(f"last template {_ago(template)}" if template
                          else "no template yet")
+            lost = self.counters.get("kernel_dropped", 0)
+            if lost:
+                parts.append(f"{lost} dropped by the kernel")
             return " \u00b7 ".join(parts)
         waiting = time.time() - self.started_at if self.started_at else 0
         if waiting > 60:

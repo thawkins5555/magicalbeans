@@ -225,6 +225,17 @@ def until_connected(client, timeout: float = 30.0) -> list:
     raise AssertionError(f"never reached 'connected': {seen}")
 
 
+def wait_idle(timeout: float = 10.0) -> None:
+    """Wait for the registry to be empty again. A client's close() returns
+    as soon as its own frame is on the wire; the server thread lets its
+    session go a moment later, and a cap counted before that is a cap
+    already spent."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and service.ssh_sessions.count:
+        time.sleep(0.05)
+    assert service.ssh_sessions.count == 0, service.ssh_sessions.count
+
+
 # -------------------------------------------------------------- the service
 
 service = Service(
@@ -399,6 +410,7 @@ try:
     status, payload = call("GET", f"/api/ssh/devices/{device}", token=token)
     assert payload["host_key"], payload
     assert payload["host_key"]["fingerprint"] == first_fingerprint, payload
+    seen_before = service.configrx_db.host_key("127.0.0.1", stub.port)["last_seen_ts"]
     ws = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
     ws.send_json({"type": "open", "cols": 80, "rows": 24})
     seen = until_connected(ws)
@@ -406,6 +418,14 @@ try:
     print("PASS: a second connection to a known host key reports no hostkey "
           "event, and the page's GET shows the stored fingerprint")
     ws.close()
+
+    # And the sighting is recorded: last_seen_ts is the only thing that says
+    # a remembered key is still in use rather than left over from a device
+    # that has gone. A terminal is a sighting exactly as a backup is.
+    seen_after = service.configrx_db.host_key("127.0.0.1", stub.port)["last_seen_ts"]
+    assert seen_after > seen_before, (seen_before, seen_after)
+    print("PASS: connecting again advances the host key's last-seen time, so a "
+          "device that is only ever SSHed to does not look unconfirmed")
 
     # -------------------------------------------------- a changed host key
 
@@ -517,6 +537,52 @@ try:
         print("PASS: a session with no keystrokes is closed with 4408 once the "
               "idle timeout passes")
         idle.close()
+        wait_idle()
+
+        # Frames are not presence; keystrokes are. A page on a second
+        # monitor that a window manager nudges sends `resize` and nothing
+        # else, and that must not keep a root shell on a core switch alive.
+        nudged = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        nudged.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(nudged)
+        stop_nudging = threading.Event()
+
+        def nudge():
+            while not stop_nudging.wait(0.4):
+                try:
+                    nudged.send_json({"type": "resize", "cols": 100, "rows": 30})
+                except OSError:
+                    return
+
+        threading.Thread(target=nudge, daemon=True).start()
+        assert nudged.wait_closed(20) == 4408, nudged.close_code
+        stop_nudging.set()
+        nudged.close()
+        wait_idle()
+        print("PASS: a stream of resize frames does not hold the session open "
+              "— only keystrokes refresh the idle timer")
+
+        # And the other way round: somebody typing is never idle.
+        typed = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        typed.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(typed)
+        stop_typing = threading.Event()
+
+        def keep_typing():
+            while not stop_typing.wait(0.4):
+                try:
+                    typed.send_binary(b" ")     # a keystroke the stub buffers
+                except OSError:
+                    return
+
+        threading.Thread(target=keep_typing, daemon=True).start()
+        time.sleep(sshterm.IDLE_TIMEOUT_S * 2)
+        assert service.ssh_sessions.count == 1, service.ssh_sessions.count
+        stop_typing.set()
+        assert typed.wait_closed(20) == 4408, typed.close_code
+        typed.close()
+        print("PASS: keystrokes hold it open past twice the idle timeout, and "
+              "it closes once they stop")
     finally:
         sshterm.IDLE_TIMEOUT_S = original_idle
 
@@ -533,12 +599,6 @@ try:
             if found or time.time() > deadline:
                 return found
             time.sleep(0.05)
-
-    def wait_idle(timeout: float = 10.0) -> None:
-        deadline = time.time() + timeout
-        while time.time() < deadline and service.ssh_sessions.count:
-            time.sleep(0.05)
-        assert service.ssh_sessions.count == 0, service.ssh_sessions.count
 
     wait_idle()
     import stubs.stub_ssh_device as stub_module
@@ -585,6 +645,112 @@ try:
         ws.close()
     finally:
         stub_module._Server.check_auth_password = accept_password
+    wait_idle()
+
+    # --------------------------- and the cap follows the account, not the socket
+
+    # A socket is free to open, so a per-socket counter is no counter at
+    # all: close the window, open another, and the guessing carries on. The
+    # cap is per account and device, across sockets, with a cooling-off —
+    # and the socket that runs into it never reaches the device.
+    stub4 = StubDevice(mode="slow", pause_s=0.05, host="127.0.0.4")
+    guessed = service.nodes_db.add_device("127.0.0.4", name="guess-target",
+                                          group_id=group_id)
+    service.configrx_db.update_device_config(guessed, ssh_port=stub4.port)
+    tried = []
+    stub_module._Server.check_auth_password = (
+        lambda self, username, password: (tried.append(username),
+                                          paramiko.AUTH_FAILED)[1])
+    try:
+        def guess(client, times: int) -> None:
+            """Answer `need-credentials` `times` over. Each answer is sent
+            only once the ask for it has arrived, so the failures are in
+            order rather than raced."""
+            for _ in range(times):
+                assert client.next_control("need-credentials", timeout=30)
+                client.send_json({"type": "auth", "username": "wrong",
+                                  "password": "guess"})
+
+        def error_saying(client, needle: str, timeout: float = 30.0) -> dict:
+            """The next error frame that says `needle` — a refused login
+            sends its own error first, and it is not the one being asserted."""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                message = client.next_control(timeout=timeout)
+                assert message is not None, f"the socket closed before {needle!r}"
+                if message["type"] == "error" and needle in message["message"]:
+                    return message
+            raise AssertionError(f"no error saying {needle!r}")
+
+        first = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        first.send_json({"type": "open", "cols": 80, "rows": 24})
+        guess(first, 3)
+        assert first.next_control("need-credentials", timeout=30)
+        first.close()
+        wait_idle()
+        assert len(tried) == 3, tried
+
+        # A brand-new socket: the counter does not start again with it.
+        second = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        second.send_json({"type": "open", "cols": 80, "rows": 24})
+        guess(second, 2)
+        error_saying(second, "Too many failed logins")
+        assert second.wait_closed(10) == 1000, second.close_code
+        second.close()
+        wait_idle()
+        assert len(tried) == sshterm.MAX_AUTH_ATTEMPTS, tried
+        print("PASS: five refusals spread over two sockets spend the cap — "
+              "reconnecting does not reset it")
+
+        numbered = [e["detail"] for e in service.nodes_db.device_events(
+            guessed, kinds=["ssh"]) if "refused (attempt" in e["detail"]]
+        assert len(numbered) == sshterm.MAX_AUTH_ATTEMPTS, numbered
+        assert any("attempt 4 of 5" in d for d in numbered), numbered
+        assert any("attempt 5 of 5" in d for d in numbered), numbered
+        print("PASS: the device events count 1..5 across both sockets, so the "
+              "pattern is visible instead of reading as two fresh starts")
+
+        # The sixth attempt: refused here, and the device never hears it.
+        third = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+        third.send_json({"type": "open", "cols": 80, "rows": 24})
+        message = error_saying(third, "Too many failed logins for this device")
+        assert "minute" in message["message"], message
+        assert third.wait_closed(10) == 4429, third.close_code
+        third.close()
+        wait_idle()
+        assert len(tried) == sshterm.MAX_AUTH_ATTEMPTS, tried
+        print("PASS: the sixth attempt is refused with 4429 and a cooling-off "
+              "period, without the device being contacted at all")
+
+        refusals = [e["detail"] for e in service.nodes_db.device_events(
+            guessed, kinds=["ssh"]) if "refused before it was attempted" in
+            e["detail"]]
+        assert len(refusals) == 1 and DEFAULT_USER in refusals[0], refusals
+        print("PASS: the refusal to start is audited once, not once per socket")
+
+        # A cooling-off that has passed lets the account try again, and a
+        # login the device accepts clears what is standing against the pair.
+        original_window = sshterm.AUTH_FAILURE_WINDOW_S
+        sshterm.AUTH_FAILURE_WINDOW_S = 0.5
+        try:
+            time.sleep(0.6)
+            stub_module._Server.check_auth_password = accept_password
+            again = WsClient(web_port, f"/api/ssh/devices/{guessed}/socket", token)
+            again.send_json({"type": "open", "cols": 80, "rows": 24})
+            assert again.next_control("need-credentials", timeout=30)
+            again.send_json({"type": "auth", "username": "operator",
+                             "password": PASSWORD})
+            until_connected(again)
+            again.close()
+            wait_idle()
+        finally:
+            sshterm.AUTH_FAILURE_WINDOW_S = original_window
+        assert service.ssh_sessions.auth_cooldown(DEFAULT_USER, guessed) == (0.0, False)
+        print("PASS: the count decays with its window, and a login the device "
+              "accepts clears it")
+    finally:
+        stub_module._Server.check_auth_password = accept_password
+        stub4.close()
     wait_idle()
 
     # ------------------------------------- a shell is only as live as its session
@@ -645,6 +811,141 @@ try:
         sshterm.MAX_SESSIONS_PER_USER = original_per_user
         for one in mine:
             one.close()
+    wait_idle()
+
+    # ------------------------------------------- the watchdog survives a fault
+
+    # Every limit on a live shell — the idle timeout, the sign-out check,
+    # the permission check — is that one loop in that one daemon thread. An
+    # exception used to end the thread, silently, and the shell then ran on
+    # with none of them. Here the session store raises for three ticks and
+    # the watchdog has to still be enforcing afterwards.
+    status, payload = call("POST", "/api/users",
+                           {"username": "flakyuser", "password": "Corr3ct-Horse-B6t",
+                            "grants": {"ssh": "write"}}, token=token)
+    assert status == 200, (status, payload)
+    flaky_token = login("flakyuser", "Corr3ct-Horse-B6t")
+    flaky = WsClient(web_port, f"/api/ssh/devices/{device}/socket", flaky_token)
+    flaky.send_json({"type": "open", "cols": 80, "rows": 24})
+    until_connected(flaky)
+
+    real_get = service.sessions.get
+    raised = []
+
+    def flaky_get(looked_up):
+        """Raise for this one session's token, and only three times: every
+        other caller — including the request that signs it out — sees the
+        real store."""
+        if looked_up == flaky_token and len(raised) < 3:
+            raised.append(looked_up)
+            raise RuntimeError("the session store is busy")
+        return real_get(looked_up)
+
+    service.sessions.get = flaky_get
+    try:
+        deadline = time.time() + 15
+        while len(raised) < 3 and time.time() < deadline:
+            time.sleep(0.1)
+        assert len(raised) == 3, raised
+    finally:
+        service.sessions.get = real_get
+    status, payload = call("POST", "/api/logout", {}, token=flaky_token)
+    assert status == 200, (status, payload)
+    assert flaky.wait_closed(15) == 4401, flaky.close_code
+    flaky.close()
+    print("PASS: a watchdog tick that raises is reported once — the traceback "
+          "above is that report, for three raised ticks — and the next tick "
+          "is still taken, so the shell's limits go on being enforced")
+    wait_idle()
+
+    # ------------------------------------ shutting down stops sessions at once
+
+    # `stop()` takes the socket's I/O lock, which a write into a browser
+    # that stopped reading holds for SEND_TIMEOUT_S. Serially that is
+    # sixteen of those, one after another, ahead of a three-second budget.
+    class StallingSession:
+        """A session whose stop() is parked exactly where a real one is:
+        waiting for a write that only a socket shutdown will release."""
+
+        def __init__(self, registry):
+            self.registry = registry
+            self.device_id = 0
+            self.released = threading.Event()
+            self.stopped = threading.Event()
+
+        def unblock(self):
+            self.released.set()
+
+        def stop(self, message=""):
+            self.released.wait(30)          # wsock.SEND_TIMEOUT_S, or longer
+            self.stopped.set()
+            with self.registry._lock:
+                self.registry._sessions.discard(self)
+
+    registry = sshterm.SshSessionRegistry(service)
+    stalled = [StallingSession(registry) for _ in range(sshterm.MAX_SESSIONS)]
+    registry._sessions.update(stalled)
+    started = time.time()
+    registry.shutdown()
+    elapsed = time.time() - started
+    assert elapsed < sshterm.SHUTDOWN_BUDGET_S + 2, elapsed
+    assert registry.count == 0, registry.count
+    assert all(one.stopped.is_set() for one in stalled)
+    print(f"PASS: {len(stalled)} stalled sessions are stopped together in "
+          f"{elapsed:.1f}s, inside one budget, instead of one timeout each")
+
+    # ------------------------------------ a socket that never sends `open`
+
+    # The slot is taken at the 101, not at `connected`: a laptop that slept
+    # with the terminal open, or a client that never intended to send
+    # `open`, holds it against both caps. Everything that bounds a
+    # terminal's life has to cover that window too.
+    original_handshake = sshterm.HANDSHAKE_TIMEOUT_S
+    original_per_user = sshterm.MAX_SESSIONS_PER_USER
+    sshterm.HANDSHAKE_TIMEOUT_S = 2
+    sshterm.MAX_SESSIONS_PER_USER = 1
+    try:
+        silent = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        assert silent.upgraded, (silent.status, silent.headers)
+        # It really is holding the slot: this account's one session is spent.
+        blocked = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        blocked.send_json({"type": "open", "cols": 80, "rows": 24})
+        message = blocked.next_control("error")
+        assert "You already have 1 SSH sessions" in message["message"], message
+        blocked.close()
+        assert silent.wait_closed(20) == 4408, silent.close_code
+        silent.close()
+        wait_idle()
+        print("PASS: a socket that upgrades and sends no 'open' loses its slot "
+              "with 4408 instead of holding it forever")
+
+        # And the cap it was spending is free again.
+        after = WsClient(web_port, f"/api/ssh/devices/{device}/socket", token)
+        after.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(after)
+        after.close()
+        print("PASS: the per-account cap that socket was spending is released")
+    finally:
+        sshterm.HANDSHAKE_TIMEOUT_S = original_handshake
+        sshterm.MAX_SESSIONS_PER_USER = original_per_user
+    wait_idle()
+
+    # The other half: the watchdog's sign-out check covers that window too,
+    # so a socket parked before `open` does not outlive the sign-in behind
+    # it while it waits.
+    status, payload = call("POST", "/api/users",
+                           {"username": "silentuser", "password": "Corr3ct-Horse-B5t",
+                            "grants": {"ssh": "write"}}, token=token)
+    assert status == 200, (status, payload)
+    silent_token = login("silentuser", "Corr3ct-Horse-B5t")
+    waiting = WsClient(web_port, f"/api/ssh/devices/{device}/socket", silent_token)
+    assert waiting.upgraded, (waiting.status, waiting.headers)
+    status, payload = call("POST", "/api/logout", {}, token=silent_token)
+    assert status == 200, (status, payload)
+    assert waiting.wait_closed(15) == 4401, waiting.close_code
+    waiting.close()
+    print("PASS: signing out closes a socket that is still waiting for its "
+          "'open' message, with 4401")
     wait_idle()
 
     # ------------------------------------------------- the same thing over TLS

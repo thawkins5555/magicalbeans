@@ -19,7 +19,9 @@ The shape:
   request that opened it by hours, so being authorised at the upgrade is not
   enough — signing out, a session expiring, an account deleted or the `ssh`
   permission taken away all close the shell (4401), and every failed login
-  is counted and audited so the page cannot be used as a password oracle.
+  is counted — against the account and the device, not against the socket,
+  which is free to open again — and audited, so the page cannot be used as
+  a password oracle.
 * The credential is ConfigRX's stored one for that device when there is one
   — decrypted at connect time and dropped immediately, exactly as the backup
   path does — and otherwise typed into the page and sent once over the
@@ -38,11 +40,14 @@ in both directions.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
 from . import configrx, hostkeys, permissions
 from .eventlog import NODES
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- the limits
 #
@@ -50,6 +55,14 @@ from .eventlog import NODES
 # answered the TCP/banner/auth exchange in ten seconds is not reachable, and
 # an operator staring at a blank terminal wants to be told so.
 CONNECT_TIMEOUT_S = 10
+# How long a socket may sit between the 101 and its `open` message. The
+# page sends `open` from its `onopen` handler, so this is measured in
+# round trips; what it bounds is the other case — a laptop that slept with
+# the terminal open, a proxy that dropped the TCP connection without a FIN,
+# or a client that never intended to send one. Without it such a socket
+# holds its slot against both caps for the life of the process, and four of
+# them lock an account out of its own terminals.
+HANDSHAKE_TIMEOUT_S = 15
 # Idle timeout: no *keystrokes* for this long ends the session, mirroring
 # the web session's own "presence, not the tab being open" rule (auth.py's
 # SessionStore.touch). A shell left open on a switch overnight is a real
@@ -64,11 +77,21 @@ MAX_SESSIONS = 16
 # otherwise lock every other operator out. Four terminals is more than anyone
 # watches at once.
 MAX_SESSIONS_PER_USER = 4
-# Failed logins allowed on one socket. Without a cap the page is an
-# unthrottled password oracle against every device this app can reach; five
-# is the room a mistyped password needs and no more. Every failure is
-# audited, and the cap ends the session.
+# Failed logins allowed per signed-in account and device. Not per socket:
+# a socket is free to open, so a per-socket cap is no cap at all — close
+# the window, open another, and the counter starts again. Without a real
+# one the page is an unthrottled password oracle against every device this
+# app can reach; five is the room a mistyped password needs and no more.
+# Every failure is audited, and the cap ends the session.
 MAX_AUTH_ATTEMPTS = 5
+# How long a refused login is remembered against that pair. Once the cap is
+# spent the account cannot try this device again until the newest failure
+# has aged out, and a new socket is refused before the device is contacted
+# at all. Five minutes is a cooling-off an operator who mistyped notices
+# and a guessing loop cannot outrun. A successful login clears the count:
+# the pair has proved itself, and the operator who fumbled four passwords
+# should not be locked out an hour later.
+AUTH_FAILURE_WINDOW_S = 300
 # How often keystrokes refresh the *web* session. A shell being typed into is
 # presence by the same rule server.py applies to a POST, but a touch per
 # keystroke would be a write per character; twice a minute is plenty.
@@ -77,6 +100,17 @@ TOUCH_INTERVAL_S = 30
 # web session every tick, which is one dictionary lookup; the permission is a
 # database read). Five seconds from revoked to closed.
 PERMISSION_EVERY_TICKS = 5
+# How long `SshSessionRegistry.shutdown()` may take in total — for every
+# session, not for each one. Sessions are stopped concurrently inside it:
+# stopping one takes its socket's I/O lock, which its own output pump can
+# be holding for up to wsock.SEND_TIMEOUT_S against a browser that stopped
+# reading, and sixteen of those in a row is four minutes of an operator's
+# Ctrl+C apparently doing nothing while the poller and the databases wait.
+SHUTDOWN_BUDGET_S = 3.0
+# The grace after the budget in which sockets that were shut down by force
+# — which takes no lock, and is what fails a parked write at once — are
+# given to finish and let go of their slots.
+SHUTDOWN_GRACE_S = 0.5
 # The largest terminal output frame. Channel reads are capped at this, so a
 # device dumping a 4 MB `show tech-support` arrives as a stream of frames a
 # browser can render as it goes rather than one it must buffer whole.
@@ -96,6 +130,12 @@ _MAX_ROWS = 300
 # here would close the circle at start-up.
 _OP_TEXT = 0x1
 _OP_BINARY = 0x2
+
+# The control messages a person has to produce, and so the only ones that
+# count as presence. `resize` is not one of them: a window manager nudging
+# a page nobody is watching sends it, and IDLE_TIMEOUT_S is about
+# keystrokes — see its comment.
+_INPUT_TYPES = ("open", "auth", "trust")
 
 
 def _int_in(value, low: int, high: int, default: int) -> int:
@@ -126,6 +166,15 @@ class SshSessionRegistry:
         self._lock = threading.Lock()
         self._sessions: set = set()
         self._stopping = False
+        # Refused logins, keyed by (app user, device id) rather than by
+        # socket — see MAX_AUTH_ATTEMPTS. Each entry is the timestamps still
+        # inside the window (at most the cap's worth is kept) and whether the
+        # refusal that follows has already been audited, so a client that
+        # reconnects in a loop leaves one line rather than one per socket.
+        # Entries whose failures have all aged out are dropped, so this does
+        # not grow with the devices an account has ever mistyped a password
+        # for.
+        self._auth_failures: dict = {}
 
     @property
     def count(self) -> int:
@@ -160,6 +209,58 @@ class SshSessionRegistry:
             with self._lock:
                 self._sessions.discard(session)
 
+    # ------------------------------------------------------ refused logins
+
+    def _fresh_failures(self, key) -> list:
+        """The failure times still inside the window for one (account,
+        device) pair, dropping every entry — this one included — that has
+        aged out entirely. Called under the lock."""
+        now = time.time()
+        spent = []
+        for other, entry in self._auth_failures.items():
+            entry["times"] = [when for when in entry["times"]
+                              if now - when < AUTH_FAILURE_WINDOW_S]
+            if not entry["times"]:
+                spent.append(other)
+        for other in spent:
+            del self._auth_failures[other]
+        entry = self._auth_failures.get(key)
+        return entry["times"] if entry else []
+
+    def record_auth_failure(self, app_user: str, device_id: int) -> int:
+        """Count one refused login against this account and device, and
+        return how many now stand within the window. That number is what
+        the audit line says, so a pattern spread over several sockets reads
+        as one run of attempts rather than as five ones."""
+        key = (app_user or "", int(device_id))
+        with self._lock:
+            times = self._fresh_failures(key)
+            times.append(time.time())
+            del times[:-MAX_AUTH_ATTEMPTS]      # only the cap's worth matters
+            self._auth_failures[key] = {"times": times, "announced": False}
+            return len(times)
+
+    def clear_auth_failures(self, app_user: str, device_id: int) -> None:
+        """A login this device accepted: the pair has proved itself."""
+        with self._lock:
+            self._auth_failures.pop((app_user or "", int(device_id)), None)
+
+    def auth_cooldown(self, app_user: str, device_id: int) -> tuple[float, bool]:
+        """How long this account must wait before trying this device again,
+        and whether this refusal is the first to be audited — a client
+        reconnecting in a loop should leave one line, not one per socket.
+        (0.0, False) when there is nothing to wait for."""
+        key = (app_user or "", int(device_id))
+        with self._lock:
+            times = self._fresh_failures(key)
+            if len(times) < MAX_AUTH_ATTEMPTS:
+                return 0.0, False
+            left = max(0.0, AUTH_FAILURE_WINDOW_S - (time.time() - times[-1]))
+            entry = self._auth_failures[key]
+            first = not entry["announced"]
+            entry["announced"] = True
+            return left, first
+
     @staticmethod
     def _refuse(ws, message: str) -> None:
         """Say why, then close with the code the page's table calls "too
@@ -169,13 +270,36 @@ class SshSessionRegistry:
 
     def shutdown(self) -> None:
         """End every session. Called before the databases close, because a
-        session that is still running will write a closing device event."""
+        session that is still running will write a closing device event.
+
+        Concurrently, under one budget for all of them: `stop()` sends a
+        closing status and a close frame, both of which take the socket's
+        I/O lock, and a pump thread writing into a browser that stopped
+        reading can hold that lock for `wsock.SEND_TIMEOUT_S`. Serially
+        that is sixteen timeouts one after another — minutes — before the
+        drain loop was even reached. Anything still live when the budget
+        runs out has its socket shut down by force, which takes no lock and
+        is what makes a parked write fail at once.
+        """
         with self._lock:
             self._stopping = True
             live = list(self._sessions)
+        if not live:
+            return
+        deadline = time.time() + SHUTDOWN_BUDGET_S
+        stoppers = []
         for session in live:
-            session.stop("The server is shutting down")
-        deadline = time.time() + 3.0
+            thread = threading.Thread(
+                target=session.stop, args=("The server is shutting down",),
+                name=f"ssh-stop-{session.device_id}", daemon=True)
+            thread.start()
+            stoppers.append(thread)
+        for thread in stoppers:
+            thread.join(timeout=max(0.0, deadline - time.time()))
+        if self.count:
+            for session in live:
+                session.unblock()
+            deadline += SHUTDOWN_GRACE_S
         while time.time() < deadline and self.count:
             time.sleep(0.05)
 
@@ -201,6 +325,17 @@ class SshSession:
         self.channel = None
         self._stopped = threading.Event()
         self._stop_lock = threading.Lock()
+        # When the slot was taken (the 101 has already been answered), and
+        # whether the `open` message that turns it into a session has
+        # arrived. The handshake deadline is measured from the first and
+        # closed by the second — from the upgrade, not from the last frame,
+        # so a client that sends anything else forever still gives the slot
+        # back.
+        self._started_at = time.time()
+        self._open_seen = False
+        # Whether the watchdog has already reported a failed tick; one line
+        # per session, not one a second.
+        self._watch_failed = False
         self._last_input = time.time()
         self._last_touch = 0.0
         self._auth_failures = 0
@@ -240,13 +375,29 @@ class SshSession:
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(decoded, dict):
-                self._last_input = time.time()
+                # Only a message somebody had to type refreshes the idle
+                # timer; a `resize` arriving on its own is traffic, not
+                # presence.
+                if decoded.get("type") in _INPUT_TYPES:
+                    self._last_input = time.time()
                 return decoded
         return None
 
     # ----------------------------------------------------------------- run
 
     def run(self) -> None:
+        # The watchdog starts here, not once a shell exists: from this line
+        # on the session is counted against both caps, and everything that
+        # bounds a terminal's life — the handshake deadline, the sign-out
+        # check and the permission check — has to cover the window before
+        # `open` as well. A shell can be waiting in that window across a
+        # sign-out, and a socket that never sends `open` used to hold its
+        # slot, its thread and its authorisation for the life of the
+        # process.
+        watchdog = threading.Thread(target=self._idle_watch,
+                                    name=f"ssh-idle-{self.device_id}",
+                                    daemon=True)
+        watchdog.start()
         try:
             self._run()
         except Exception as exc:                     # never leak a traceback
@@ -278,6 +429,7 @@ class SshSession:
                 self.cols = _int_in(opening.get("cols"), 20, _MAX_COLS, self.cols)
                 self.rows = _int_in(opening.get("rows"), 5, _MAX_ROWS, self.rows)
             if kind == "open":
+                self._open_seen = True       # the handshake deadline is met
                 break
 
         if not configrx.paramiko_available():
@@ -289,11 +441,15 @@ class SshSession:
         self.port = _int_in(config["ssh_port"] if config else 22, 1, 65535, 22)
         reason = self._load_stored_credential(config)
 
-        idler = threading.Thread(target=self._idle_watch,
-                                 name=f"ssh-idle-{self.device_id}", daemon=True)
-        idler.start()
-
         while not self._stopped.is_set():
+            # Checked before the credentials are even asked for, so a socket
+            # opened after the cap was spent — this one or any other — is
+            # refused without the device hearing about it.
+            cooling, first = self.registry.auth_cooldown(self.app_user,
+                                                         self.device_id)
+            if cooling > 0:
+                self._refuse_after_failures(cooling, first)
+                return
             if self._password is None:
                 if not self._ask_for_credentials(reason):
                     return
@@ -314,6 +470,24 @@ class SshSession:
                     return
                 continue
             return                                    # reported already
+
+    def _refuse_after_failures(self, seconds: float, announce: bool) -> None:
+        """This account has spent its refused logins against this device —
+        on this socket or on one it has since closed. Say how long the wait
+        is, close 4429 (the code the page's table already means "too many"),
+        and audit the refusal *itself* once per cooling-off period: a
+        reconnecting client should read as one line, not as five hundred
+        refused logins."""
+        minutes = max(1, -(-int(seconds) // 60))
+        self._error(f"Too many failed logins for this device. Try again in "
+                    f"about {minutes} minute(s).")
+        if announce:
+            self._audit(
+                f"SSH login refused before it was attempted: "
+                f"{MAX_AUTH_ATTEMPTS} recent failures for {self.app_user} "
+                f"on this device (from {self.client_ip})",
+                f"No connection was made; about {minutes} minute(s) to wait.")
+        self.ws.close(CLOSE_TOO_MANY, "Too many failed logins")
 
     def _ask_for_credentials(self, reason: str) -> bool:
         """Ask the page for a username and password and wait for them.
@@ -414,6 +588,18 @@ class SshSession:
 
         self._password = None
         self.client = client
+        # "This same key was presented again just now" — the store's own
+        # usage contract, which ConfigRX's backup path already follows. The
+        # policy touches the row only on the path where `prepare` could not
+        # rebuild the stored key; on the ordinary one paramiko checks the
+        # key itself and the policy is never reached, so without this a
+        # device that is SSHed to daily but never backed up shows a
+        # last_seen_ts frozen at its first connection — which the ConfigRX
+        # dialog reads as a key nobody has confirmed since it was pinned.
+        try:
+            store.record_seen(self.host, self.port)
+        except Exception:
+            pass                     # a sighting lost is not a failed connect
         # The policy is the only thing that knows whether this was a first
         # sighting: it is what stored the key, and it kept the fingerprint.
         if policy.stored_new:
@@ -429,6 +615,11 @@ class SshSession:
             self.client = None
             return "failed", None
         self.channel.settimeout(None)
+        # The device accepted this account's credential, so the refused
+        # logins standing against the pair are spent: an operator who
+        # fumbled four passwords and then got in must not be locked out an
+        # hour later by the count they left behind.
+        self.registry.clear_auth_failures(self.app_user, self.device_id)
         self._status("connected", f"Connected to {self.host}:{self.port}")
         self._audit_open()
         return "connected", None
@@ -480,8 +671,13 @@ class SshSession:
             if message is None:
                 break
             opcode, payload = message
-            self._last_input = time.time()
             if opcode == _OP_BINARY:                 # keystrokes
+                # The idle timer is refreshed here and nowhere else in this
+                # loop: a shell is ended by nobody *typing* at it, and a
+                # `resize` from a window a monitor nudged is not somebody
+                # typing. Otherwise a root shell on a core switch stays open
+                # for as long as any client keeps sending anything at all.
+                self._last_input = time.time()
                 self._touch_web_session()
                 try:
                     self.channel.sendall(payload)
@@ -539,34 +735,65 @@ class SshSession:
 
     def _idle_watch(self) -> None:
         """The session's own heartbeat, once a second: is the person who
-        opened this still signed in, do they still hold `ssh` write, and has
-        anyone typed lately. Authorisation is not settled once at the
-        upgrade — a shell can outlive the sign-in that opened it by hours,
-        and signing out, expiring, being deleted or having the permission
-        taken away must all end it."""
+        opened this still signed in, do they still hold `ssh` write, has the
+        socket got as far as its `open` message, and has anyone typed
+        lately. Authorisation is not settled once at the upgrade — a shell
+        can outlive the sign-in that opened it by hours, and signing out,
+        expiring, being deleted or having the permission taken away must all
+        end it. It runs from the moment the slot is taken rather than from
+        the moment a shell exists, because a socket waiting for its `open`
+        message is already holding that slot."""
         ticks = 0
         while not self._stopped.wait(1.0):
             ticks += 1
-            if self.token and self.service.sessions.get(self.token) is None:
-                self._end_unauthorized(
-                    "You were signed out",
-                    f"SSH session closed: {self.app_user} is no longer signed in")
-                return
-            if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_ssh_write():
-                self._end_unauthorized(
-                    "SSH access was revoked",
-                    f"SSH session closed: {self.app_user} no longer holds "
-                    f"SSH write access")
-                return
-            # Read the module global each time: the tests shorten it, and an
-            # operator-facing constant is worth being able to change.
-            if time.time() - self._last_input < IDLE_TIMEOUT_S:
-                continue
-            minutes = int(IDLE_TIMEOUT_S // 60) or 1
-            self._status("closed", f"Closed after {minutes} minute(s) idle")
-            self.ws.close(CLOSE_IDLE, "Idle timeout")
+            try:
+                if self._watch_tick(ticks):
+                    return
+            except Exception:
+                # This loop is the only thing enforcing the idle timeout,
+                # the sign-out check and the permission check, and it is one
+                # daemon thread: an exception from the session store, the
+                # socket or the audit path used to end it silently and leave
+                # the shell running with none of them. A tick that fails is
+                # a tick lost, not a control switched off — so it is
+                # reported once and the next one is taken.
+                if not self._watch_failed:
+                    self._watch_failed = True
+                    log.exception("The SSH session watchdog for device %s "
+                                  "failed a tick; it keeps running",
+                                  self.device_id)
+
+    def _watch_tick(self, ticks: int) -> bool:
+        """One beat of the watchdog. True when the session is over and the
+        loop should end."""
+        if self.token and self.service.sessions.get(self.token) is None:
+            self._end_unauthorized(
+                "You were signed out",
+                f"SSH session closed: {self.app_user} is no longer signed in")
+            return True
+        if ticks % PERMISSION_EVERY_TICKS == 0 and not self._has_ssh_write():
+            self._end_unauthorized(
+                "SSH access was revoked",
+                f"SSH session closed: {self.app_user} no longer holds "
+                f"SSH write access")
+            return True
+        # Read the module globals each time: the tests shorten them, and
+        # operator-facing constants are worth being able to change.
+        if not self._open_seen:
+            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
+                return False
+            self._status("closed", f"No terminal was opened within "
+                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
+            self.ws.close(CLOSE_IDLE, "Handshake timeout")
             self.stop()
-            return
+            return True
+        if time.time() - self._last_input < IDLE_TIMEOUT_S:
+            return False
+        minutes = int(IDLE_TIMEOUT_S // 60) or 1
+        self._status("closed", f"Closed after {minutes} minute(s) idle")
+        self.ws.close(CLOSE_IDLE, "Idle timeout")
+        self.stop()
+        return True
 
     def _has_ssh_write(self) -> bool:
         try:
@@ -585,6 +812,16 @@ class SshSession:
         self.stop()
 
     # --------------------------------------------------------------- close
+
+    def unblock(self) -> None:
+        """Shut the socket down without taking its I/O lock, so a thread
+        parked in a send or a read fails at once. The last resort of
+        `SshSessionRegistry.shutdown()`: it costs the operator the closing
+        notice on the page, which is why it is not the first."""
+        try:
+            self.ws.unblock()
+        except Exception:
+            pass
 
     def stop(self, message: str = "") -> None:
         with self._stop_lock:
@@ -624,8 +861,11 @@ class SshSession:
     def _audit_auth_failure(self) -> None:
         """A refused login, counted and recorded. The SSH username is named
         (it is what was tried), the password never is — and the count is
-        what turns a stream of these into something an operator can see."""
-        self._auth_failures += 1
+        what turns a stream of these into something an operator can see.
+        The count comes from the registry, keyed by account and device, so
+        it does not start again with every new socket."""
+        self._auth_failures = self.registry.record_auth_failure(
+            self.app_user, self.device_id)
         self._audit(
             f"SSH login as {self._username or '(no user)'} refused "
             f"(attempt {self._auth_failures} of {MAX_AUTH_ATTEMPTS}; requested "

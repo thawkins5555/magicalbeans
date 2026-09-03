@@ -219,28 +219,66 @@ class Decision:
 
 
 def arc_name(arc: int | None) -> str:
-    """The vendor key for an enterprise arc: the sysObjectID table first
-    (its keys are what every behavioural reader compares against), then
-    the enterprise-number list."""
+    """The canonical vendor key for an enterprise arc: the sysObjectID table
+    first (its keys are what every behavioural reader compares against),
+    then the enterprise-number list.
+
+    Canonicalised here because this is the one place both tables meet: a
+    manufacturer with several arcs — HPE has five, Dell three — would
+    otherwise put the same fleet under several different vendor keys
+    depending on which arc each box answered."""
     if arc is None:
         return ""
     key = vendor_for(f"{ENTERPRISES}.{arc}")
     if key:
-        return key
+        return enterprises.canonical_key(key)
     hit = enterprises.lookup(arc)
     return hit[0] if hit else ""
 
 
 def _arc_confidence(arc: int) -> str:
     """How much to trust a name that came from the arc number alone: high
-    when the arc was read out of MIB text (trapoids.WELL_KNOWN or
-    enterprises.VERIFIED), medium for a curated-from-memory entry. Checked
-    against the tables directly — vendor_for() now falls back to the
-    curated list too, so it can no longer tell the two apart."""
+    when the arc has been cross-checked against a real device's sysObjectID
+    or a bundled MIB (trapoids.WELL_KNOWN or enterprises.VERIFIED), medium
+    for an entry that has not. Checked against the tables directly —
+    vendor_for() now falls back to the curated list too, so it can no longer
+    tell the two apart."""
     from .trapoids import WELL_KNOWN
     if f"{ENTERPRISES}.{arc}" in WELL_KNOWN or enterprises.is_verified(arc):
         return "high"
     return "medium"
+
+
+# Rebadged hardware: an arc, the sysDescr substrings that say the box is
+# somebody else's design, and whose. A Stratix or ArmorStratix switch is a
+# Rockwell Automation product built by Cisco: it answers a 1.3.6.1.4.1.9
+# sysObjectID and a sysDescr beginning "Cisco IOS Software", so decide()
+# takes the arc branch, never reaches the sysDescr rule that knows about
+# Rockwell, and every Stratix on the plant floor is labelled plain Cisco.
+#
+# The vendor key stays the arc's — the box runs IOS, so the Cisco MIB
+# bundle, the Cisco poll profile and the Cisco ConfigRX profile are all the
+# right ones, and changing the key would break each of them. What the
+# rebadge adds is the name on the support contract, in the evidence line the
+# device pane shows.
+OEM_REBADGES: tuple[tuple[int, tuple[str, ...], str], ...] = (
+    (9, ("armorstratix", "stratix", "allen-bradley", "allen bradley"),
+     "rockwellAutomation"),
+)
+
+
+def rebadged_by(arc: int | None, sys_descr: str) -> str:
+    """The vendor key of whoever badges a device on `arc` whose sysDescr
+    names them, or "". Presentation only — see OEM_REBADGES."""
+    if arc is None or not sys_descr:
+        return ""
+    lowered = sys_descr.lower()
+    for rebadge_arc, needles, key in OEM_REBADGES:
+        if rebadge_arc != arc:
+            continue
+        if any(needle in lowered for needle in needles):
+            return key
+    return ""
 
 
 def decide(sys_object_id: str, sys_descr: str, arcs, candidates, *,
@@ -269,9 +307,19 @@ def decide(sys_object_id: str, sys_descr: str, arcs, candidates, *,
     elif real_sys_arc:
         name = arc_name(sys_arc)
         if name:
+            # An aliased arc's own label is a model hint worth showing beside
+            # the vendor ("aruba, Aruba CX (HPE)"); an unaliased one just
+            # repeats the vendor, so it is left out.
+            label = enterprises.arc_label(sys_arc)
+            detail = (f" ({name})" if label in ("", enterprises.display_name(name))
+                      else f" ({name}, {label})")
+            rebadge = rebadged_by(sys_arc, sys_descr)
+            if rebadge:
+                detail += (f"; sysDescr names it a "
+                           f"{enterprises.display_name(rebadge)} rebadge")
             decision = Decision(name, "sysObjectID", _arc_confidence(sys_arc), sys_arc,
                                 reason=f"sysObjectID {sys_object_id} is under enterprise "
-                                       f"arc {sys_arc} ({name})")
+                                       f"arc {sys_arc}{detail}")
         else:
             descr = vendor_from_descr(sys_descr)
             if descr:

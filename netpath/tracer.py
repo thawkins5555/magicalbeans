@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,21 @@ from .procs import hidden
 from statistics import mean
 
 IS_WINDOWS = os.name == "nt"
+IS_LINUX = os.name != "nt" and os.uname().sysname == "Linux"
+
+# Butskoy's traceroute, the Linux one, sends up to this many probes at once
+# (its own -N default). Windows tracert is strictly serial, and the BSD
+# traceroute macOS ships has no -N at all, so both stay at 1.
+PROBE_PARALLELISM = 16 if IS_LINUX else 1
+
+# Set to False once a traceroute has rejected -N, so a build without it (an
+# embedded busybox, say) costs one failed run rather than every run.
+_SUPPORTS_PARALLEL: bool = IS_LINUX
+
+# The header line names the address the traceroute binary itself resolved,
+# which is the one the probes actually went to.
+_UNIX_HEADER = re.compile(r"^traceroute to \S+ \(([0-9A-Fa-f:.]+)\)", re.M)
+_WIN_HEADER = re.compile(r"^\s*Tracing route to \S+ \[([0-9A-Fa-f:.]+)\]", re.M | re.I)
 
 _HOP_LINE = re.compile(r"^\s*(\d+)\s+(.*)$")
 _UNIX_TIME = re.compile(r"^\d+(?:\.\d+)?$")
@@ -32,6 +48,7 @@ _BRACKETED = re.compile(r"\[([0-9A-Fa-f:.]+)\]")
 # actively refusing the packet and saying so, which is a different fault from
 # silence: the path to that router works, and something past it said no.
 UNREACHABLE_CODES = {
+    "!": "unreachable, reason not stated",
     "!H": "host unreachable",
     "!N": "network unreachable",
     "!P": "protocol unreachable",
@@ -209,19 +226,25 @@ def _binary() -> str:
     return path
 
 
-def _build_command(host: str, max_hops: int, probes: int, timeout_s: float) -> list[str]:
+def _build_command(host: str, max_hops: int, probes: int, timeout_s: float,
+                   parallel: bool = True) -> list[str]:
     exe = _binary()
     if IS_WINDOWS:
         # tracert always sends 3 probes per hop and has no -q equivalent.
         return [exe, "-d", "-h", str(max_hops), "-w", str(int(timeout_s * 1000)), host]
-    return [
+    command = [
         exe,
         "-n",
         "-q", str(probes),
         "-m", str(max_hops),
         "-w", str(int(max(1, timeout_s))),
-        host,
     ]
+    if parallel and _SUPPORTS_PARALLEL:
+        # Ask for the parallelism explicitly rather than inheriting whatever
+        # the build defaults to, so expected_budget below is arithmetic about
+        # this run rather than a guess.
+        command += ["-N", str(PROBE_PARALLELISM)]
+    return command + [host]
 
 
 def _parse_unix(output: str) -> list[Hop]:
@@ -291,8 +314,9 @@ def _parse_windows(output: str) -> list[Hop]:
                 continue
             break
         tail = " ".join(tokens[i:])
-        if not times and not _windows_unreachable_code(tail):
-            # No timings and nothing reported: not a hop line we understand.
+        refusal = _windows_unreachable_code(tail)
+        if not times and not refusal and not _first_address(tail):
+            # No timings, no phrase we know and no address: not a hop line.
             continue
         ip = None
         bracket = _BRACKETED.search(tail)
@@ -316,20 +340,80 @@ def _parse_windows(output: str) -> list[Hop]:
         if ip is not None:
             hop.addrs.setdefault(ip, [])
 
-        code = _windows_unreachable_code(tail)
-        if code:
-            hop.annotations[ip or "?"] = code
+        if not refusal and not times and ip is not None:
+            # Match on the structure, not on English: a numbered line naming a
+            # router with no "ms" columns is that router refusing the packet.
+            # On a German tracert ("meldet: Zielhost nicht erreichbar") the
+            # phrase table finds nothing and the whole hop used to be dropped
+            # from the result, so a refusal degraded to silence and the
+            # timeline said "fail" where it should say "blocked".
+            refusal = "!"
+        if refusal:
+            hop.annotations[ip or "?"] = refusal
         hops.append(hop)
     return hops
 
 
-def expected_budget(max_hops: int, probes: int, timeout_s: float = 2.0) -> float:
+def _first_address(text: str) -> str | None:
+    """The first address-looking token in a line, brackets stripped."""
+    bracket = _BRACKETED.search(text or "")
+    if bracket:
+        return bracket.group(1)
+    for token in (text or "").split():
+        candidate = token.strip("[]")
+        if _is_ip(candidate):
+            return candidate
+    return None
+
+
+def expected_budget(max_hops: int, probes: int, timeout_s: float = 2.0,
+                    parallel: int | None = None) -> float:
     """Worst-case run time for a trace, used to kill it and to flag a slow one.
 
     Shared so the watchdog in run_trace and the debug page's "overdue" marker
     can never disagree about what too long means.
+
+    The old formula assumed strictly serial probes, which is true of Windows
+    tracert and of nothing else: Linux traceroute sends 16 at a time, so a
+    fully black-holed 30-hop path finishes in about 12 s rather than the 195 s
+    the arithmetic claimed. Being 16x too generous is not harmless — a
+    genuinely hung binary held a worker for the whole of it — and it made the
+    documented remedy, lowering the hop count, buy far less than stated.
     """
-    return max_hops * probes * timeout_s + 15
+    if parallel is None:
+        parallel = PROBE_PARALLELISM if _SUPPORTS_PARALLEL else 1
+    rounds = math.ceil(max_hops / max(1, parallel))
+    return rounds * probes * timeout_s + 15
+
+
+def _run(command: list[str], budget: float):
+    """One traceroute run. The C locale keeps the binary's own wording in
+    English so the unreachable phrases stay recognisable on a host with a
+    localised environment."""
+    env = dict(os.environ)
+    if not IS_WINDOWS:
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=budget,
+        env=env,
+        # Otherwise every trace flashes a console window when the parent
+        # has none of its own, which is the case under pythonw.exe.
+        **hidden(),
+    )
+
+
+def _rejected_parallel(completed, output: str) -> bool:
+    """True when the run failed because the binary does not know -N."""
+    if IS_WINDOWS or not _SUPPORTS_PARALLEL or completed.returncode == 0:
+        return False
+    lowered = (output or "").lower()
+    return any(phrase in lowered for phrase in
+               ("invalid option", "unrecognized option", "unknown option",
+                "usage:", "illegal option"))
 
 
 _UNIX_PING_TIME = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
@@ -428,19 +512,17 @@ def run_trace(
     except TracerouteUnavailable as exc:
         return TraceResult(host, dest_ip, [], False, started, 0.0, error=str(exc))
 
-
     budget = expected_budget(max_hops, probes, timeout_s)
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=budget,
-            # Otherwise every trace flashes a console window when the parent
-            # has none of its own, which is the case under pythonw.exe.
-            **hidden(),
-        )
+        completed = _run(command, budget)
         output = completed.stdout + "\n" + completed.stderr
+        if _rejected_parallel(completed, output):
+            # This build has no -N. Remember that, and run it again without.
+            globals()["_SUPPORTS_PARALLEL"] = False
+            command = _build_command(host, max_hops, probes, timeout_s)
+            budget = expected_budget(max_hops, probes, timeout_s)
+            completed = _run(command, budget)
+            output = completed.stdout + "\n" + completed.stderr
     except subprocess.TimeoutExpired:
         return TraceResult(
             host, dest_ip, [], False, started, time.time() - started,
@@ -452,6 +534,12 @@ def run_trace(
                            error=str(exc), command=command)
 
     hops = _parse_windows(output) if IS_WINDOWS else _parse_unix(output)
+    # The binary prints the address it resolved in its header line. For a
+    # round-robin, GSLB or anycast name that is routinely not the address this
+    # process resolved a moment earlier, and comparing the final hop against
+    # our answer recorded a perfectly successful trace as reached=0 for ever.
+    header = (_WIN_HEADER if IS_WINDOWS else _UNIX_HEADER).search(output)
+    header_ip = header.group(1) if header else None
 
     # tracert can print the refusal on a line of its own, with no hop number,
     # after the numbered hops. Attribute it to the last router that answered.
@@ -464,7 +552,8 @@ def run_trace(
                     hop.annotations[address] = code
                     break
 
-    reached = any(dest_ip in hop.addrs for hop in hops)
+    wanted = {ip for ip in (dest_ip, header_ip) if ip}
+    reached = any(address in hop.addrs for hop in hops for address in wanted)
 
     error = None
     if not hops:

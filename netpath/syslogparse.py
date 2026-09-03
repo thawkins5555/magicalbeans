@@ -29,6 +29,16 @@ MONTHS = {name: index for index, name in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
 
+# The largest PRI a valid message can carry: facility 23, severity 7.
+MAX_PRI = 191
+# How far a device's own clock may differ from ours before its timestamp is
+# discarded in favour of the arrival time. A BSD timestamp carries no year and
+# no timezone, so a device in another zone, or with a wrong clock, files rows
+# hours or months away from when they happened. Those sort to the top of every
+# newest-first search for ever and, when they land in the future, prune's
+# `ts < cutoff` can never remove them.
+CLOCK_SKEW_S = 3600.0
+
 
 def facility_name(number) -> str:
     try:
@@ -103,10 +113,17 @@ def _parse_3164_time(month: str, day: str, clock: str, now: float) -> float:
     elif month_number == 1 and local.tm_mon == 12:
         year += 1
     try:
-        return time.mktime((year, month_number, int(day), hour, minute, second,
-                            0, 0, -1))
+        stamp = time.mktime((year, month_number, int(day), hour, minute, second,
+                             0, 0, -1))
     except (ValueError, OverflowError):
         return now
+    # mktime read the device's clock as this server's local time, which is
+    # wrong for any device in another timezone and for any device with a wrong
+    # clock. Rather than filing the row hours or months away from when it
+    # happened, fall back to the arrival time, which is at least true.
+    if abs(stamp - now) > CLOCK_SKEW_S:
+        return now
+    return stamp
 
 
 def parse(data: bytes, source: str, now: float | None = None) -> LogEntry:
@@ -123,13 +140,21 @@ def parse(data: bytes, source: str, now: float | None = None) -> LogEntry:
     body = text
     if priority:
         value = int(priority.group(1))
-        entry.facility = value >> 3
-        entry.severity = value & 0x07
-        body = text[priority.end():]
+        if value <= MAX_PRI:
+            entry.facility = value >> 3
+            entry.severity = value & 0x07
+            body = text[priority.end():]
+        # Above 191 the angle brackets are not a PRI at all — <999> yielded
+        # facility 124, which no filter dropdown offers — so the whole line
+        # stays message text at the default facility and severity.
 
     # RFC 5424 announces itself with a version number of 1.
     if body[:2] == "1 ":
         parts = body[2:].split(" ", 5)
+        # A heartbeat with no MSG at all is valid and common, and splits into
+        # five parts; requiring six stored the whole header as the message.
+        if len(parts) == 5:
+            parts = parts + [""]
         if len(parts) >= 6:
             stamp, host, app, procid, msgid, rest = parts
             when = _parse_5424_time(stamp)
@@ -166,11 +191,28 @@ def parse(data: bytes, source: str, now: float | None = None) -> LogEntry:
 
 
 def _strip_structured_data(rest: str) -> str:
-    """Drop the RFC 5424 structured-data block, keeping the readable message."""
+    """Drop the RFC 5424 structured-data block, keeping the readable message.
+
+    A message carries any number of SD-ELEMENTs, and relayed rsyslog lines
+    routinely carry two —
+    `[timeQuality tzKnown="1"][origin ip="10.1.1.1" software="rsyslogd"]`.
+    Returning after the first one left the rest of the metadata blob in the
+    message column and in the trigram index, so searches matched SD noise.
+    """
     rest = rest.lstrip()
     if not rest.startswith("["):
         return rest[2:] if rest.startswith("- ") else (
             "" if rest == "-" else rest)
+    while rest.startswith("["):
+        end = _end_of_element(rest)
+        if end is None:
+            return rest              # unterminated: keep it rather than guess
+        rest = rest[end:].lstrip()
+    return rest
+
+
+def _end_of_element(rest: str) -> int | None:
+    """Index just past the first balanced `[...]`, or None if unterminated."""
     depth = 0
     escaped = False
     for index, char in enumerate(rest):
@@ -184,5 +226,5 @@ def _strip_structured_data(rest: str) -> str:
         elif char == "]":
             depth -= 1
             if depth == 0:
-                return rest[index + 1:].lstrip()
-    return rest
+                return index + 1
+    return None

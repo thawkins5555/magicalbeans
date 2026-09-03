@@ -20,15 +20,32 @@ framing:
     etc.) beyond pulling SYNTAX's textual type name, an INTEGER enum
     table when present, and DESCRIPTION's quoted text — everything else
     in an OBJECT-TYPE clause is ignored.
-  - TEXTUAL-CONVENTION clauses are recognized only in that they still
-    match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE regex when they
-    themselves define an object; a bare `Foo ::= TEXTUAL-CONVENTION ...`
-    type alias (no trailing `{ parent number }`) is not modeled at all.
+  - A bare `Foo ::= TEXTUAL-CONVENTION ...` type alias is counted
+    (ParseResult.textual_conventions) but not modeled: it names a type,
+    not an OID, so there is nothing in it to resolve or poll. The count
+    is there so a module that is nothing else — SNMPv2-TC is exactly
+    that, 16 conventions and no objects — reports what it is rather than
+    "nothing was recognized in this file", which reads as a failed
+    import. TEXTUAL-CONVENTION clauses that do define an object still
+    match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE scan as before.
+
+Why every scan below is written as "find the next landmark, then look
+forward a bounded distance" rather than as one regex per clause: a lazy
+`(.*?)` between a macro keyword and its `::=` re-reads the rest of the
+file from every candidate start, so a truncated MIB — all the headers,
+none of the closing clauses, which is exactly how a half-downloaded file
+looks — costs O(n^2). CPython's `re` does not release the GIL while it
+matches, so that is not a slow request but a frozen appliance: no web UI,
+no poller timers, no trap or syslog drain, for as long as it runs. Every
+pass here is linear in the file, and `parse()` carries a wall-clock
+budget on top so no single upload can hold the interpreter for long even
+if some input shape defeats the analysis.
 """
 
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 # Seeds IMPORTS resolution — every real-world MIB transitively imports one
@@ -41,6 +58,33 @@ WELL_KNOWN_ROOTS = {
     "enterprises": "1.3.6.1.4.1", "security": "1.3.6.1.5",
     "snmpV2": "1.3.6.1.6", "snmpModules": "1.3.6.1.6.3",
 }
+
+# How long one file may spend inside parse(). Every shipped MIB parses in
+# under 0.05 s and the largest module anyone has ever published is a few
+# hundred KB, so this is three orders of magnitude of headroom for real
+# input and still a hard ceiling on how long a hostile upload can hold the
+# GIL. Checked between phases and every few hundred clauses within one.
+PARSE_BUDGET_S = 5.0
+
+# A macro clause ("NAME OBJECT-TYPE ... ::= { parent 3 }") is a few hundred
+# bytes in every real MIB; the largest in the shipped bundle is under 2 KB.
+# Bounding how far past a macro keyword the `::=` may sit is what stops a
+# file of bare headers from making each failed clause cost the whole file.
+MACRO_CLAUSE_LIMIT = 20_000
+
+
+class MibTooLarge(ValueError):
+    """The input is larger than the caller's byte cap.
+
+    A distinct type so `resolve_all()` can tell "this file is bigger than
+    the cap that is in force today" — which is a stored file to leave
+    exactly as it is — from "this file could not be parsed", which is
+    something the operator has to be told about.
+    """
+
+
+class MibParseTimeout(ValueError):
+    """Parsing spent longer than `budget_s` and was abandoned."""
 
 
 @dataclass
@@ -61,6 +105,16 @@ class ParseResult:
     objects: list[ParsedObject]
     imports: dict[str, str] = field(default_factory=dict)   # symbol -> FROM module
     notes: list[str] = field(default_factory=list)
+    # `Foo ::= TEXTUAL-CONVENTION ...` type aliases. Counted, never turned
+    # into objects: a textual convention names a *type*, not an OID, so there
+    # is nothing here to resolve or poll. The count exists so a module that is
+    # nothing but textual conventions — SNMPv2-TC is exactly that — can say so
+    # instead of reporting that nothing was recognized in it.
+    textual_conventions: int = 0
+
+
+# The only two spans that get blanked: a quoted string and an ASN.1 comment.
+_MASK_OPEN_RE = re.compile(r'"|--')
 
 
 def _strip_comments_and_strings(text: str) -> str:
@@ -73,43 +127,64 @@ def _strip_comments_and_strings(text: str) -> str:
 
     This is what lets the structural regexes below treat `--` or `::=`
     appearing inside a comment or a quoted description as inert text
-    instead of real syntax."""
-    out = list(text)
+    instead of real syntax.
+
+    Written as "copy the span up to the next `"` or `--`, then blank that
+    one span" rather than as a per-character walk: `list(text)` cost nine
+    bytes of memory per input byte and 3.6 s on an 8 MB file before any
+    regex had run, for a pass that only ever blanks two kinds of span."""
+    parts: list[str] = []
     i, n = 0, len(text)
     while i < n:
-        ch = text[i]
-        if ch == '"':
-            j = text.find('"', i + 1)
-            end = (j + 1) if j != -1 else n
-            for k in range(i, end):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = end
-            continue
-        if text[i:i + 2] == "--":
-            j = i + 2
-            while j < n and text[j] != "\n" and text[j:j + 2] != "--":
-                j += 1
-            end = (j + 2) if text[j:j + 2] == "--" else j
-            for k in range(i, min(end, n)):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = end
-            continue
-        i += 1
-    return "".join(out)
+        opener = _MASK_OPEN_RE.search(text, i)
+        if opener is None:
+            parts.append(text[i:])
+            break
+        start = opener.start()
+        if start > i:
+            parts.append(text[i:start])
+        if opener.group(0) == '"':
+            closer = text.find('"', start + 1)
+            end = (closer + 1) if closer != -1 else n
+        else:
+            # ASN.1: a comment runs to the next `--` or to end of line,
+            # whichever comes first. The newline itself is not part of it.
+            newline = text.find("\n", start + 2)
+            dashes = text.find("--", start + 2)
+            if dashes != -1 and (newline == -1 or dashes < newline):
+                end = dashes + 2
+            else:
+                end = newline if newline != -1 else n
+        span = text[start:end]
+        parts.append(" " * len(span) if "\n" not in span
+                     else "".join("\n" if ch == "\n" else " " for ch in span))
+        i = end
+    return "".join(parts)
 
 
 _MODULE_RE = re.compile(r"([A-Za-z][\w-]*)\s+DEFINITIONS\b")
-_IMPORTS_BLOCK_RE = re.compile(r"\bIMPORTS\b(.*?);", re.DOTALL)
-_IMPORT_GROUP_RE = re.compile(r"([\w,\s-]+?)\s+FROM\s+([A-Za-z][\w-]*)")
+_IMPORTS_KW_RE = re.compile(r"\bIMPORTS\b")
+# The symbol list of one IMPORTS group is everything between the previous
+# `FROM <module>` and the next `FROM`; the lookbehind keeps `FROM` a word of
+# its own rather than the tail of a symbol name.
+_IMPORT_FROM_RE = re.compile(r"(?<=\s)FROM\s+([A-Za-z][\w-]*)")
+_IMPORT_SYMBOL_RE = re.compile(r"[\w-]+")
 
-_OBJECT_TYPE_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+OBJECT-TYPE\b(.*?)::=\s*\{([^{}]*)\}", re.DOTALL)
+# Each macro is found by its header alone; the `::= { ... }` that closes the
+# clause is then looked for in a bounded window that stops at the next
+# header of the same macro (see _iter_macro_clauses).
+# `(?!\s+MACRO\b)` skips the ASN.1 macro *definitions* themselves, which
+# SNMPv2-SMI carries in full ("NOTIFICATION-TYPE MACRO ::= BEGIN ... END").
+# Without it the word before the macro keyword — `END`, from the previous
+# macro definition — was read as an object name and given the OID of the
+# next real clause in the file.
+_MACRO_DEFN_TAIL = r"(?!\s+MACRO\b)"
+_OBJECT_TYPE_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+OBJECT-TYPE\b" + _MACRO_DEFN_TAIL)
 _OBJECT_ID_RE = re.compile(
     r"\b([a-zA-Z][\w-]*)\s+OBJECT\s+IDENTIFIER\s*::=\s*\{([^{}]*)\}")
-_NOTIFICATION_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+NOTIFICATION-TYPE\b(.*?)::=\s*\{([^{}]*)\}", re.DOTALL)
+_NOTIFICATION_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+NOTIFICATION-TYPE\b" + _MACRO_DEFN_TAIL)
 # The two other macros that define a real branch node rather than describing
 # one. Nearly every RFC MIB names its own root with MODULE-IDENTITY
 # (`dot1dBridge MODULE-IDENTITY ... ::= { mib-2 17 }`) and hangs the whole
@@ -118,13 +193,25 @@ _NOTIFICATION_RE = re.compile(
 # macros (OBJECT-GROUP, NOTIFICATION-GROUP, MODULE-COMPLIANCE) are
 # deliberately still ignored: they are agent-capability paperwork, never
 # polled, and nothing hangs off them.
-_MODULE_IDENTITY_RE = re.compile(
-    r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b(.*?)"
-    r"::=\s*\{([^{}]*)\}", re.DOTALL)
+_MODULE_IDENTITY_HEAD_RE = re.compile(
+    r"\b([a-zA-Z][\w-]*)\s+(?:MODULE-IDENTITY|OBJECT-IDENTITY)\b"
+    + _MACRO_DEFN_TAIL)
+_OID_ASSIGN_RE = re.compile(r"::=\s*\{([^{}]*)\}")
+# `DisplayString ::= TEXTUAL-CONVENTION`. The MACRO definition SNMPv2-TC
+# opens with reads the other way round ("TEXTUAL-CONVENTION MACRO ::=") and
+# is correctly not counted.
+_TEXTUAL_CONVENTION_RE = re.compile(r"\b[A-Za-z][\w-]*\s*::=\s*TEXTUAL-CONVENTION\b")
 
 _SYNTAX_RE = re.compile(r"\bSYNTAX\s+([A-Za-z][\w-]*)")
 _SYNTAX_ENUM_RE = re.compile(r"\bSYNTAX\s+INTEGER\s*\{([^{}]*)\}")
-_ENUM_PAIR_RE = re.compile(r"([A-Za-z][\w-]*)\s*\((-?\d+)\)")
+# `\d{1,100}` rather than `\d+`: since 3.11 `int()` refuses a decimal string
+# longer than sys.get_int_max_str_digits() (4,300 by default, and settable as
+# low as 640), and an unbounded capture made that ValueError escape parse() —
+# so an operator uploading a MIB with a silly enum value got a message about
+# Python's integer limits, and resolve_all() then skipped the file silently
+# on every later re-resolve. No SMI enum is anywhere near 100 digits; one that
+# is simply is not recorded.
+_ENUM_PAIR_RE = re.compile(r"([A-Za-z][\w-]*)\s*\((-?\d{1,100})\)")
 _DESCRIPTION_RE = re.compile(r'\bDESCRIPTION\s+"([^"]*)"', re.DOTALL)
 
 
@@ -164,39 +251,125 @@ def _parse_oid_tail(braces_text: str):
     return parent_name, ".".join(arcs), None
 
 
-def _parse_imports(masked_text: str) -> dict[str, str]:
+def _imports_span(masked_text: str) -> tuple[int, int, int] | None:
+    """(block_start, body_start, block_end) of the `IMPORTS ... ;` block,
+    or None. Two `str` searches rather than `\\bIMPORTS\\b(.*?);`, which
+    re-reads the file once per `IMPORTS` keyword when the `;` is missing."""
+    keyword = _IMPORTS_KW_RE.search(masked_text)
+    if keyword is None:
+        return None
+    semicolon = masked_text.find(";", keyword.end())
+    if semicolon == -1:
+        return None
+    return keyword.start(), keyword.end(), semicolon + 1
+
+
+def _parse_imports(masked_text: str, body_start: int, body_end: int) -> dict[str, str]:
+    """symbol -> module, read by walking the block once.
+
+    The block reads `sym, sym, sym FROM Module sym FROM Module ...`, so
+    every `FROM` closes the run of symbols since the previous one. Written
+    as a scan because the regex this replaces (`([\\w,\\s-]+?)\\s+FROM\\s+...`)
+    re-expanded its lazy symbol run from every start position whenever a
+    stretch of the block held no `FROM` at all — a truncated import list
+    cost 66 s at 64 KB.
+    """
     imports: dict[str, str] = {}
-    block = _IMPORTS_BLOCK_RE.search(masked_text)
-    if not block:
-        return imports
-    for group in _IMPORT_GROUP_RE.finditer(block.group(1)):
-        module_name = group.group(2)
-        for symbol in group.group(1).split(","):
+    position = body_start
+    for group in _IMPORT_FROM_RE.finditer(masked_text, body_start, body_end):
+        module_name = group.group(1)
+        for symbol in masked_text[position:group.start()].split(","):
             symbol = symbol.strip()
-            if symbol:
+            if symbol and _IMPORT_SYMBOL_RE.fullmatch(symbol):
                 imports[symbol] = module_name
+        position = group.end()
     return imports
+
+
+def _blank_span(text: str, start: int, end: int) -> str:
+    """`text` with [start:end) replaced by spaces, newlines kept, so every
+    later match's offset still indexes into the original text."""
+    span = text[start:end]
+    blanked = "".join("\n" if ch == "\n" else " " for ch in span)
+    return text[:start] + blanked + text[end:]
+
+
+def _iter_macro_clauses(masked_text: str, head_re: re.Pattern,
+                        limit: int = MACRO_CLAUSE_LIMIT):
+    """Yield (name, body_start, body_end, brace_text) for every
+    `NAME <macro> ...body... ::= { ... }` clause, in one left-to-right pass.
+
+    The window in which the closing `::= { ... }` is looked for stops at
+    whichever comes first: `limit` bytes, or the next header of the same
+    macro. Both bounds matter. The second is what makes the pass linear —
+    the sum of all windows is at most the length of the file — and it is
+    also the more faithful reading: one macro's clause has never legally
+    contained another's header, so a header with no clause of its own
+    should be skipped rather than allowed to swallow the definition that
+    follows it.
+    """
+    text_len = len(masked_text)
+    heads = head_re.finditer(masked_text)
+    head = next(heads, None)
+    while head is not None:
+        following = next(heads, None)
+        body_start = head.end()
+        stop = min(text_len, body_start + limit)
+        if following is not None:
+            stop = min(stop, following.start())
+        assignment = _OID_ASSIGN_RE.search(masked_text, body_start, stop)
+        if assignment is not None:
+            yield (head.group(1), body_start, assignment.start(),
+                   assignment.group(1))
+        head = following
 
 
 def _extract_enums(body_original: str) -> dict[int, str] | None:
     match = _SYNTAX_ENUM_RE.search(body_original)
     if not match:
         return None
-    enums = {int(v): n for n, v in _ENUM_PAIR_RE.findall(match.group(1))}
+    enums: dict[int, str] = {}
+    for name, value in _ENUM_PAIR_RE.findall(match.group(1)):
+        try:
+            enums[int(value)] = name
+        except ValueError:      # belt and braces behind the digit bound
+            continue
     return enums or None
 
 
-def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
+def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
+          budget_s: float | None = None) -> ParseResult:
     """Best-effort. Never raises for malformed input — a file with zero
     recognizable definitions comes back as a ParseResult with an empty
-    object list and a note explaining why, not an exception; the only
-    exception this raises is the size guard, checked before any regex
-    work so a pasted multi-megabyte file is refused cheaply."""
+    object list and a note explaining why, not an exception.
+
+    Two guards do raise, both subclasses of ValueError so the upload
+    endpoint keeps turning them into a 400 with their own message:
+    `MibTooLarge` for the byte cap, checked before any scanning so a
+    pasted multi-megabyte file is refused cheaply, and `MibParseTimeout`
+    for the wall-clock budget, checked between phases and periodically
+    within one. Nothing else escapes: an enum value too long for
+    `int()`, a truncated clause, an unterminated string are all just
+    definitions that do not get recorded."""
     if len(text.encode("utf-8", "replace")) > max_bytes:
-        raise ValueError(f"File exceeds the {max_bytes:,} byte limit")
+        raise MibTooLarge(f"File exceeds the {max_bytes:,} byte limit")
+
+    # Read from the module constant, not from a default argument bound at
+    # import time, so an operator's build or a test can change the ceiling.
+    if budget_s is None:
+        budget_s = PARSE_BUDGET_S
+    deadline = (time.monotonic() + budget_s) if budget_s and budget_s > 0 else None
+
+    def check_budget() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise MibParseTimeout(
+                f"This file took longer than {budget_s:g}s to parse and was "
+                "abandoned; it is far larger or far more unusual than any "
+                "real MIB module.")
 
     notes: list[str] = []
     masked = _strip_comments_and_strings(text)
+    check_budget()
 
     module_match = _MODULE_RE.search(masked)
     module = module_match.group(1) if module_match else ""
@@ -204,19 +377,25 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
         notes.append("No 'NAME DEFINITIONS ::= BEGIN' header was found; "
                      "the module name is left blank.")
 
-    imports = _parse_imports(masked)
     # An IMPORTS list names macros as bare symbols ("IMPORTS MODULE-IDENTITY,
     # OBJECT-TYPE ... FROM SNMPv2-SMI"), which reads to a regex exactly like a
     # definition whose name is IMPORTS. Blank the block out — keeping its
     # length and newlines so offsets into the original text still line up —
     # once its symbols have been recorded.
-    masked = _IMPORTS_BLOCK_RE.sub(
-        lambda m: "".join("\n" if c == "\n" else " " for c in m.group(0)),
-        masked, count=1)
+    span = _imports_span(masked)
+    if span is None:
+        imports: dict[str, str] = {}
+    else:
+        block_start, body_start, block_end = span
+        imports = _parse_imports(masked, body_start, block_end - 1)
+        masked = _blank_span(masked, block_start, block_end)
+    check_budget()
 
     objects: dict[str, ParsedObject] = {}
 
-    for match in _OBJECT_ID_RE.finditer(masked):
+    for index, match in enumerate(_OBJECT_ID_RE.finditer(masked)):
+        if not index % 256:
+            check_budget()
         name, braces = match.group(1), match.group(2)
         if name in objects:
             continue
@@ -224,12 +403,14 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
         objects[name] = ParsedObject(name=name, parent=parent, last_arc=last_arc,
                                      oid=literal)
 
-    for match in _OBJECT_TYPE_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _OBJECT_TYPE_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         syntax_match = _SYNTAX_RE.search(body_original)
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
@@ -238,65 +419,117 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024) -> ParseResult:
             syntax=(syntax_match.group(1) if syntax_match else ""),
             enums=_extract_enums(body_original))
 
-    for match in _MODULE_IDENTITY_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _MODULE_IDENTITY_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
             name=name, parent=parent, last_arc=last_arc, oid=literal,
             description=(desc_match.group(1).strip() if desc_match else ""))
 
-    for match in _NOTIFICATION_RE.finditer(masked):
-        name, braces = match.group(1), match.group(3)
+    clauses = _iter_macro_clauses(masked, _NOTIFICATION_HEAD_RE)
+    for index, (name, body_start, body_end, braces) in enumerate(clauses):
+        if not index % 256:
+            check_budget()
         if name in objects:
             continue
         parent, last_arc, literal = _parse_oid_tail(braces)
-        body_original = text[match.start(2):match.end(2)]
+        body_original = text[body_start:body_end]
         desc_match = _DESCRIPTION_RE.search(body_original)
         objects[name] = ParsedObject(
             name=name, parent=parent, last_arc=last_arc, oid=literal,
             description=(desc_match.group(1).strip() if desc_match else ""),
             is_notification=True)
 
+    textual_conventions = len(_TEXTUAL_CONVENTION_RE.findall(masked))
     if not objects:
-        notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, MODULE-IDENTITY, "
-                     "or NOTIFICATION-TYPE definitions were recognized in "
-                     "this file.")
+        if textual_conventions:
+            # SNMPv2-TC and its vendor equivalents are nothing but type
+            # definitions. Saying "nothing was recognized" about a file that
+            # imported perfectly reads as a failed import, and the obvious
+            # response is to delete it and try again.
+            notes.append(f"{textual_conventions} textual convention(s) and no "
+                         "objects, which is what this module is: it defines "
+                         "SNMP types, not OIDs, so there is nothing here to "
+                         "resolve or poll. The import succeeded.")
+        else:
+            notes.append("No OBJECT-TYPE, OBJECT IDENTIFIER, MODULE-IDENTITY, "
+                         "or NOTIFICATION-TYPE definitions were recognized in "
+                         "this file.")
 
     return ParseResult(module=module, objects=list(objects.values()),
-                       imports=imports, notes=notes)
+                       imports=imports, notes=notes,
+                       textual_conventions=textual_conventions)
 
 
 def resolve(objects: list[ParsedObject], known: dict[str, str]) -> tuple[int, list[str]]:
-    """Repeatedly resolves any object whose parent is now known — either
-    already in `known` (pre-seeded by the caller with WELL_KNOWN_ROOTS
-    plus every OID this app already has a name for) or itself just
-    resolved this pass — until a fixed point. Mutates each ParsedObject's
-    `.oid` in place. Returns (resolved_count, sorted unresolved parent
-    names) — the latter is exactly the diagnostic that makes upload order
-    visible: uploading a dependent MIB before the one that defines its
-    parent branch leaves it with unresolved=["thatParentName"], and
-    calling resolve() again after the dependency is uploaded (or after
-    the caller adds its objects into `known` via all_known_oids())
-    finishes the job without re-parsing anything."""
+    """Resolves every object whose parent is known — either already in
+    `known` (pre-seeded by the caller with WELL_KNOWN_ROOTS plus every OID
+    this app already has a name for) or itself resolvable from one of
+    those. Mutates each ParsedObject's `.oid` in place. Returns
+    (resolved_count, sorted unresolved parent names) — the latter is
+    exactly the diagnostic that makes upload order visible: uploading a
+    dependent MIB before the one that defines its parent branch leaves it
+    with unresolved=["thatParentName"], and calling resolve() again after
+    the dependency is uploaded (or after the caller adds its objects into
+    `known` via all_known_oids()) finishes the job without re-parsing
+    anything.
+
+    Resolution follows the dependency chain instead of repeating passes
+    over the whole list. A MIB is free to list an object before the parent
+    it hangs off — legal, and usual in generated MIBs — and the old
+    "keep sweeping until a sweep gains nothing" loop then needed one sweep
+    per link, i.e. O(n^2): a 20,000-object file took 26 s. Here each
+    object is walked up to the first ancestor with a known OID and the
+    chain is filled in from the top down, so every object is visited once
+    whether it resolves or not; the same 20,000-object file takes under
+    0.1 s. `visiting` guards the walk against a MIB whose parents form a
+    cycle, and `dead` remembers a chain that ended nowhere so a second
+    object hanging off it does not walk it again."""
     known = dict(known)
+    # Only unresolved objects are worth indexing: an object that already
+    # carries a literal numeric OID has never been fed back into `known` by
+    # this function (resolve_all does that between files), so a walk must
+    # stop at it rather than continue through it.
+    by_name: dict[str, ParsedObject] = {}
+    for obj in objects:
+        if obj.oid is None and obj.parent is not None:
+            by_name.setdefault(obj.name, obj)
+
     resolved = 0
-    changed = True
-    while changed:
-        changed = False
-        for obj in objects:
-            if obj.oid is not None or obj.parent is None:
-                continue
-            parent_oid = known.get(obj.parent)
-            if parent_oid is None:
-                continue
-            obj.oid = f"{parent_oid}.{obj.last_arc}"
-            known[obj.name] = obj.oid
+    dead: set[str] = set()
+    for start in objects:
+        if start.oid is not None or start.parent is None:
+            continue
+        chain: list[ParsedObject] = []
+        visiting: set[str] = set()
+        obj = start
+        while True:
+            if obj.name in dead or obj.name in visiting:
+                dead.update(visiting)
+                dead.add(obj.name)
+                chain = []
+                break
+            visiting.add(obj.name)
+            chain.append(obj)
+            if obj.parent in known:
+                break
+            parent = by_name.get(obj.parent)
+            if parent is None:
+                dead.update(visiting)
+                chain = []
+                break
+            obj = parent
+        for node in reversed(chain):
+            node.oid = f"{known[node.parent]}.{node.last_arc}"
+            known[node.name] = node.oid
             resolved += 1
-            changed = True
+
     unresolved = sorted({obj.parent for obj in objects
                         if obj.oid is None and obj.parent})
     return resolved, unresolved
@@ -318,13 +551,17 @@ def known_oids_for(nodes_db) -> dict[str, str]:
 def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
     """Re-resolve every stored MIB against every other, to a fixpoint.
 
-    `resolve()` already loops within one file; what it cannot do is see a
-    parent that lives in a file parsed later. That is the whole reason MIB
-    upload order used to matter: CISCO-PROCESS-MIB uploaded before CISCO-SMI
-    resolved nothing, and only a manual Resolve on each file afterwards
-    finished the chain. This walks every file repeatedly, feeding each pass's
-    newly-resolved names into the next, until a pass gains nothing — after
-    which order is irrelevant and a bundle can be installed as a heap.
+    `resolve()` already follows a chain within one file; what it cannot do
+    on its own is see a parent that lives in a *different* file. That is
+    the whole reason MIB upload order used to matter: CISCO-PROCESS-MIB
+    uploaded before CISCO-SMI resolved nothing, and only a manual Resolve
+    on each file afterwards finished the chain. Every file's objects are
+    therefore resolved as one list, so a chain that crosses files is
+    followed exactly like one that does not, in a single walk — where the
+    previous code re-swept all files up to `max_passes` (8) times, one
+    sweep per link of cross-file depth, at up to 400 files per bundle.
+    `max_passes` is accepted and ignored, so an existing caller keeps
+    working.
 
     Only files whose object set actually changed are written back, so calling
     this when everything is already resolved is a read-only no-op rather than
@@ -332,25 +569,33 @@ def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
     """
     rows = [row for row in nodes_db.mib_files() if row["content"]]
     parsed: dict[int, ParseResult] = {}
+    failed = 0
     for row in rows:
         try:
             parsed[row["id"]] = parse(row["content"], max_bytes=max_bytes)
-        except ValueError:
+        except MibTooLarge:
             continue          # oversized now that the cap is lower: leave as-is
+        except ValueError as exc:
+            # Anything else — the parse budget, or a guard added later — is a
+            # file that will be skipped on every re-resolve from here on. Say
+            # so on the file itself: silently skipping it forever is how a MIB
+            # ends up shown as "0 objects" with nothing to explain it.
+            failed += 1
+            nodes_db.update_mib_file(row["id"],
+                                     parse_notes=f"Could not be parsed: {exc}")
 
     known = dict(WELL_KNOWN_ROOTS)
     known.update(nodes_db.all_known_oids())
-    passes = 0
-    for passes in range(1, max_passes + 1):
-        gained = 0
-        for result in parsed.values():
-            count, _ = resolve(result.objects, known)
-            for obj in result.objects:
-                if obj.oid:
-                    known.setdefault(obj.name, obj.oid)
-            gained += count
-        if not gained:
-            break
+    every_object: list[ParsedObject] = []
+    for result in parsed.values():
+        every_object.extend(result.objects)
+    # A literal numeric OID (`::= { 1 3 6 1 4 1 9999 }`) is a name other
+    # files hang off, so it has to be visible before the walk starts.
+    for obj in every_object:
+        if obj.oid:
+            known.setdefault(obj.name, obj.oid)
+    resolve(every_object, known)
+    passes = 1
 
     changed = 0
     resolved_total = 0
@@ -377,6 +622,7 @@ def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
             for obj in result.objects])
         changed += 1
     return {"files": len(parsed), "files_changed": changed, "passes": passes,
+            "files_failed": failed,
             "object_count": object_total, "resolved_count": resolved_total}
 
 

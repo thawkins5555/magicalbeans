@@ -26,12 +26,38 @@ def device_name(device) -> str:
     return device["sys_name"] or manual or ""
 
 
+def device_for_ip(nodes_db, ip: str):
+    """The Nodes device at `ip`, by its polling address or by any address it
+    is known to own.
+
+    Matching on `devices.ip` alone means a switch polled at its management
+    VLAN address but built with `logging source-interface Loopback0` — the
+    standard build wherever there is a management VRF — correlates with
+    nothing: no name in the Syslog Host column, no name on the alert, no way
+    to filter its messages by device. The alias table is looked up through
+    getattr because a database from before it exists simply does not have it.
+    """
+    if nodes_db is None:
+        return None
+    device = nodes_db.device_by_ip(ip)
+    if device is not None:
+        return device
+    lookup = getattr(nodes_db, "device_id_for_address", None)
+    if lookup is None:
+        return None
+    try:
+        device_id = lookup(ip)
+    except Exception:
+        return None
+    return nodes_db.device(device_id) if device_id else None
+
+
 def resolve_name(nodes_db, app_db, ip: str, device=None) -> str | None:
     """The Nodes module's device name first (see device_name), then the DNS
     reverse-lookup cache. None if nothing is known. Pass `device` when the
     caller already has the row, to skip a redundant lookup."""
-    if device is None and nodes_db is not None:
-        device = nodes_db.device_by_ip(ip)
+    if device is None:
+        device = device_for_ip(nodes_db, ip)
     name = device_name(device)
     if name:
         return name
@@ -60,7 +86,7 @@ def fill_from_nodes(nodes_db, names: dict, ips) -> dict:
     for ip in ips:
         if names.get(ip):
             continue
-        device = nodes_db.device_by_ip(ip)
+        device = device_for_ip(nodes_db, ip)
         name = device_name(device)
         if name:
             names[ip] = name
