@@ -109,6 +109,37 @@ Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`)
 - `netpath/dbopen.py`: one `connect()` helper that opens a database and narrows the file and its WAL/SHM companions to owner-only (0600) on POSIX hosts. Modules adopt it as they are touched.
 - `netpath/dbmaint.py`: `enable_incremental_vacuum()` converts a database to incremental auto-vacuum once, and `reclaim()` frees pages in short locked steps followed by a WAL truncate, replacing the whole-file `VACUUM` that stalled every writer during prunes and size trims.
 
+#### Alerts
+
+- *(pending — filled from workstream A)*
+
+#### Poller and storage
+
+- *(pending — filled from workstream B)*
+
+#### Collectors
+
+- *(pending — filled from workstream C)*
+
+#### Security
+
+- *(pending — filled from workstream D)*
+
+#### Web UI
+
+- *(pending — filled from workstream E)*
+
+#### Documentation
+
+- **`REVIEW-NETWORK-ENGINEER.md` corrected in place.** The review that motivates this release was itself re-reviewed before any of it was implemented. Finding identifiers are prefixed by section (`P-` poller, `C-` collectors, `A-` alerts, `S-` security, `X-` performance, `U-` UX and documentation), because `B1`, `S1`, `N1` and `F1` each meant three different things and the report's own cross-references were ambiguous; all 34 cross-references follow, and two of them pointed at the wrong finding. Every row is now tagged CONFIRMED or PLAUSIBLE, which the preamble had promised and 99 of 149 rows did not carry, and the preamble says exactly what the two words mean. Twenty rows the reviewers wrote and the first draft dropped are restored. Nine numbers that contradicted each other are reconciled in place with the measurement and the reason — the surviving samples per metric at 2,000 devices is 0.29, not 1.29; batching is 69× faster, not 62×; there are eleven scripted special devices, not thirteen. Five effort estimates were understated and say so. §3 gains a "what the numbers do not mean" paragraph and the table of six settings the campaign overrode; §1 states that the software moved to 4.36.1 mid-review and marks what that release already closed; Appendix C records what was withdrawn, corrected and added; §9 records what is implemented as it lands.
+- **Sixteen documentation claims the code contradicts are corrected**, each verified by grep rather than by memory. The two `deploy\` PowerShell scripts `README.md` told you to run never existed, and there is no `deploy/` directory — the shortcut and remote-update sections now describe what to actually do, and "Running as a service" gains a real NSSM recipe beside the systemd unit. "Data > Export window to CSV" does not exist, in any tab. `FEATURES.md` claimed CPU and memory came from "UCD-SNMP-MIB **or HOST-RESOURCES-MIB**" when `HOST_RESOURCES` was defined and never referenced, and still said there was "no SNMP polling yet" and "no alerting engine yet" three years after both shipped. `INTERNALS.md` said SNMPv3 engine parameters "only need refreshing if the target reboots", which is true of the engine id and false of the engine time — the reason every v3 device failed about every third poll. `NETWORK-AND-STORAGE-REQUIREMENTS.md` estimated 150 bytes per syslog message against 455 measured, and promised an hourly rollup that had no caller. `PERFORMANCE_REVIEW.md` twice claimed work was "verified with a Playwright test" that was not in the repository. `CREDENTIAL-SECURITY.md` said the application performs "no update check" while the Update button calls GitHub on every press.
+- **Three new documents**, from the seven the review found missing. `QUICKSTART.md` takes a new installation from unpacked to first device polled, first path watched and first alert emailed — including the point at which a Linux host stops being able to store a credential. `BACKUP-RESTORE.md` covers the ten WAL databases: why copying a `.db` on its own gives a torn backup, `sqlite3 .backup` for a live instance, the restore order, and what DPAPI means for a restore onto different hardware. `RUNBOOK.md` is twelve symptoms an operator can see on a screen and what to do about each — poller stopped, collector stopped unexpectedly, kernel drops, alert backlog, empty charts, disk full, mail stopped, a changed SSH host key, a saturated poll pool, an alert flood, nobody can sign in, a corrupt database.
+- **A table of contents** in `README.md`, `FEATURES.md`, `INTERNALS.md` and this file. `INTERNALS.md` is 245 KB and had no way in.
+- **`CREDENTIAL-SECURITY.md` gains three sections.** §6a says what is inside a stored ConfigRX backup — a device's own communities, enable secrets, TACACS and RADIUS keys and IPsec pre-shared keys, which were never SappiWhere's credentials and so never went through DPAPI — and what the new redaction pass does and does not cover. §8a describes the audit log. §10 sets out, for the first time in one place, exactly what a non-Windows host cannot do, and why a portable secret store was designed and deliberately deferred rather than shipped weakly. The credential inventory at the top of the file gains the backups row it was missing.
+- **A CI workflow** (`.github/workflows/tests.yml`). `tests/run_all.py` on ubuntu-latest and windows-latest against Python 3.11 and 3.12, with `iputils-ping` installed on Linux deliberately — the suite that used to fail wherever `ping` existed now has to keep passing with it there — and a second job that stands up the demo fleet and runs the browser checks in `tests/ui/`. There was no CI, no Makefile and no build file of any kind before this.
+- **`demo/seed.py --defaults`** seeds a fleet without tuning anything the application ships: 120-second poll interval, 3.0 s timeout, 2 retries, MAC walks off, 16 poll workers, 300 seconds of new-device grace, 60 emails an hour, and the built-in `cpu_high` and `response_time_high` thresholds untouched. The verification campaign runs once with it, so the report carries a like-for-like column beside the tuned run rather than only numbers taken under six overrides. `demo/README.md` tabulates the difference.
+- `tests/README.md` gains a row for each new suite, a section on the browser checks, and a correction: "no `ping` binary" described the machine the suites were written on, not a property of the suites.
+
 ### 4.36.1 — Review of the SSH terminal
 
 A security-focused review of 4.36.0 before it reached main. Nothing about
