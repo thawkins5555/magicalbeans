@@ -35,6 +35,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
+from . import configrx_redact
 from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
 from .hostkeys import HostKeyChanged, HostKeyStore
@@ -85,6 +86,15 @@ PARAMIKO_MISSING = ("paramiko is not installed on this server — ConfigRX needs
 
 _paramiko_ok: bool | None = None
 _paramiko_identity: str | None = None
+# One lock over both cached probes. They are read from the web request
+# threads (status_text sits on the frontend's /api/state poll), from the
+# terminal's socket threads and from the backup workers, and written by
+# whichever of them gets there first — and the write is not one store but
+# an import followed by a store. Without this, a worker restarting with
+# recheck=True could publish `False` for the instant its import took while
+# a request thread read it, and two threads could pay for the paramiko +
+# cryptography import at once.
+_paramiko_lock = threading.Lock()
 
 
 def paramiko_identity() -> str:
@@ -99,15 +109,16 @@ def paramiko_identity() -> str:
     just installed 3.4 with no way to see that 5.0 was still what was running.
     """
     global _paramiko_identity
-    if _paramiko_identity is None:
-        try:
-            import paramiko
-            version = getattr(paramiko, "__version__", "unknown version")
-            path = getattr(paramiko, "__file__", None)
-            _paramiko_identity = f"{version} ({path})" if path else str(version)
-        except ImportError:
-            _paramiko_identity = "not installed"
-    return _paramiko_identity
+    with _paramiko_lock:
+        if _paramiko_identity is None:
+            try:
+                import paramiko
+                version = getattr(paramiko, "__version__", "unknown version")
+                path = getattr(paramiko, "__file__", None)
+                _paramiko_identity = f"{version} ({path})" if path else str(version)
+            except ImportError:
+                _paramiko_identity = "not installed"
+        return _paramiko_identity
 
 
 def paramiko_available(recheck: bool = False) -> bool:
@@ -119,13 +130,14 @@ def paramiko_available(recheck: bool = False) -> bool:
     passes recheck=True, so 'install it, then restart the worker' still
     picks the new install up without an app restart."""
     global _paramiko_ok
-    if _paramiko_ok is None or recheck:
-        try:
-            import paramiko  # noqa: F401
-            _paramiko_ok = True
-        except ImportError:
-            _paramiko_ok = False
-    return _paramiko_ok
+    with _paramiko_lock:
+        if _paramiko_ok is None or recheck:
+            try:
+                import paramiko  # noqa: F401
+                _paramiko_ok = True
+            except ImportError:
+                _paramiko_ok = False
+        return _paramiko_ok
 
 
 # Key exchanges and host-key types that modern paramiko no longer prefers,
@@ -500,7 +512,7 @@ class ConfigRxWorker:
         if paramiko_available():
             import paramiko
             _apply_legacy_algorithms(
-                paramiko, bool(self.settings.get("allow_legacy_ssh", True)))
+                paramiko, bool(self.settings.get("allow_legacy_ssh", False)))
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
         self._thread.start()
@@ -723,7 +735,19 @@ class ConfigRxWorker:
                                 f"read ended on '{ended}'.")
             return
 
-        backup_id, _digest = self.db.add_backup(device_id, cleaned)
+        # Redaction happens here, before anything is stored: what reaches
+        # configrx.db is what an operator will be able to download, so the
+        # secrets have to be gone by this line and not merely hidden by the
+        # endpoint that serves it. Per-device opt-out, off by default.
+        store_secrets = bool(config["store_secrets"]
+                             if "store_secrets" in config.keys() else False)
+        if store_secrets:
+            redacted_count = 0
+        else:
+            cleaned, redacted_count = configrx_redact.redact(cleaned)
+
+        backup_id, _digest = self.db.add_backup(
+            device_id, cleaned, redacted=not store_secrets)
         # Only when a key was actually stored, and said once: the note used to
         # be appended to every backup, because the accepted key was thrown
         # away with the connection and every device was unknown again next
@@ -732,7 +756,12 @@ class ConfigRxWorker:
         if backup_id is not None:
             self.counters["changed"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
-            self.log.add(CONFIGRX, f"Stored a changed config backup for {device['ip']}")
+            self.log.add(
+                CONFIGRX, f"Stored a changed config backup for {device['ip']}",
+                detail=(f"{redacted_count} secret-bearing line(s) redacted "
+                        f"before storage" if not store_secrets else
+                        "Stored verbatim: this device has \"keep secrets in "
+                        "backups\" switched on"))
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

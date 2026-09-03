@@ -25,6 +25,7 @@ the ordinary MIB upload (which accepts a zip).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import time
 import urllib.error
@@ -623,15 +624,33 @@ class DownloadError(RuntimeError):
     """A fetch failed for a reason worth showing an operator verbatim."""
 
 
-def fetch_file(url: str, timeout_s: float, max_bytes: int) -> str:
-    """One MIB over HTTPS, capped and decoded.
+def fetch_file(url: str, timeout_s: float, max_bytes: int,
+               sha256: str = "") -> str:
+    """One MIB over HTTPS, capped, checked and decoded.
 
     Reads one byte past the cap so an oversized file is refused rather than
     silently truncated into a MIB that parses to nonsense.
+
+    The TLS context is selfupdate's, which trusts the system store *and*
+    the CA bundle vendored beside it. This path deliberately did not, even
+    though that bundle exists precisely because a locked-down Windows
+    server's own certificate store can be missing the root GitHub's
+    certificate chains to — so MIB installs failed on exactly the machines
+    the bundle was added for.
+
+    `sha256`, when the catalog entry carries one, is checked against the
+    bytes received and a mismatch refuses the file. Entries without one are
+    fetched as before: the sources are two third-party branch HEADs, whose
+    content legitimately changes, so a digest can only be pinned for an
+    entry someone has actually pinned. Passing one is how a site that needs
+    the guarantee gets it.
     """
+    from . import selfupdate
+
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s,
+                                    context=selfupdate._ssl_context()) as response:
             raw = response.read(max_bytes + 1)
     except urllib.error.HTTPError as error:
         raise DownloadError(f"{url} returned HTTP {error.code}") from error
@@ -647,6 +666,12 @@ def fetch_file(url: str, timeout_s: float, max_bytes: int) -> str:
         raise DownloadError(f"{url} exceeds the {max_bytes:,} byte per-file limit")
     if not raw.strip():
         raise DownloadError(f"{url} returned an empty file")
+    if sha256:
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual.lower() != sha256.strip().lower():
+            raise DownloadError(
+                f"{url} does not match its pinned SHA-256 ({actual[:12]}… "
+                f"against {sha256.strip()[:12]}…) — refusing to install it")
     return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
 
 

@@ -11,6 +11,8 @@ import ipaddress
 import sqlite3
 import json
 import math
+import secrets
+import threading
 import time
 
 from ..analysis import availability, build_timeline, build_topology
@@ -33,8 +35,24 @@ from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
 from .. import permissions as _permissions
+from .. import appdb as _appdb
 
 MIN_BLOCK_PX = 3
+
+
+def _audit(service, params, action: str, target: str = "",
+           detail: str = "") -> None:
+    """One line in the on-disk audit trail (appdb.audit).
+
+    Written alongside the event-log line most of these actions already
+    produce, not instead of it: the ring is for watching the application
+    work and is gone on the next restart, this is the record that answers
+    "who changed that" a month later. Only authentication, authorization,
+    credential and destructive-administration actions come here — this is
+    not a second copy of the event log.
+    """
+    service.app_db.audit(params.get("_username", ""), params.get("_client", ""),
+                         action, target, detail)
 
 
 def _num(params, key, default=None, cast=float):
@@ -74,10 +92,31 @@ _STATE_MODULE_KEYS = {
     "settings": ("storage",),
 }
 
+# Global settings only a Settings reader may see. "settings" itself stays in
+# every response — every module's own refresh cadence lives in it and every
+# tab needs those — but these keys are server internals with no reason to
+# reach an account without Settings access: where the listener binds and
+# which TLS material it loads, how long a sign-in lasts, and which resolver
+# the nslookup subprocesses are pointed at.
+SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
+                      "session_idle_minutes", "session_max_hours",
+                      "dns_server", "asn_server")
+
+
+def _visible_settings(settings: dict, granted: dict) -> dict:
+    """`settings` as this caller may see it. One rule, used by both the
+    endpoint that reads the settings and the one that writes them — they
+    disagreed before, and post_settings echoing the unfiltered dict was
+    half of the escalation the review found."""
+    if _permissions.allows(granted.get("settings"), _permissions.READ):
+        return settings
+    return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
+
 
 def get_state(service, params, body) -> dict:
     from .. import __version__
-    from ..selfupdate import INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY
+    from ..selfupdate import (INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY,
+                              INSTALLED_TAG_KEY, updates_enabled)
 
     names = service.hostname_stats()
     session = service.sessions.get(params.get("_token", ""))
@@ -89,7 +128,11 @@ def get_state(service, params, body) -> dict:
         "permissions": granted,
         "update": {
             "installed_commit": service.app_db.meta(INSTALLED_COMMIT_KEY),
+            "installed_tag": service.app_db.meta(INSTALLED_TAG_KEY),
             "installed_at": service.app_db.meta(INSTALLED_AT_KEY),
+            # So the Settings page can say why the button does nothing,
+            # rather than showing one that always fails.
+            "enabled": updates_enabled(service.app_db),
         },
         "session": {
             "username": session["username"] if session else "",
@@ -204,18 +247,11 @@ def get_state(service, params, body) -> dict:
         if not _permissions.allows(granted.get(module), _permissions.READ):
             for key in keys:
                 result.pop(key, None)
-    if not _permissions.allows(granted.get("settings"), _permissions.READ):
-        # "settings" itself stays present even without Settings access —
-        # every module's own refresh cadence (nodes_refresh_s and so on)
-        # and cross-cutting config (DNS/ASN) live in it, and every tab
-        # needs to read those regardless of its own module's grant. Only
-        # the web-listener detail (bind address, port, and — in
-        # particular — the TLS cert/key file paths) is Settings-specific
-        # server internals with no reason to reach a user without
-        # Settings access, so it alone is stripped out here rather than
-        # the whole key.
-        result["settings"] = {k: v for k, v in result["settings"].items()
-                              if k not in ("web_host", "web_port", "web_cert", "web_key")}
+    # "settings" itself stays present even without Settings access — every
+    # module's own refresh cadence (nodes_refresh_s and so on) lives in it,
+    # and every tab needs to read those regardless of its own module's
+    # grant. Only the keys in SETTINGS_ONLY_KEYS are stripped.
+    result["settings"] = _visible_settings(result["settings"], granted)
     return result
 
 
@@ -730,6 +766,29 @@ ws_ssh_device.hijack = True
 # -------------------------------------------------------------------- debug
 
 
+# Which module's grant an event category belongs to. eventlog.CATEGORIES is
+# a display taxonomy, not an authorization one, so the mapping is written
+# out here rather than assumed. The three that name no module of their own
+# go to `settings`: `system` carries sign-in history and account changes,
+# `error` carries every module's failure detail (including ConfigRX's), and
+# `dns` names the addresses the resolver is working through. Holding
+# `debug` alone still shows the worker tables, counters and schedules,
+# which is what the Debug page is for.
+_EVENT_CATEGORY_MODULE = {
+    "trace": "netpath",
+    "dns": "settings",
+    "netflow": "netflow",
+    "snmp": "snmp",
+    "nodes": "nodes",
+    "alerts": "alerts",
+    "ipam": "ipam",
+    "wireless": "wireless",
+    "configrx": "configrx",
+    "system": "settings",
+    "error": "settings",
+}
+
+
 def get_debug(service, params, body) -> dict:
     since = int(_num(params, "since", 0, int) or 0)
     state = service.monitor.worker_state()
@@ -769,10 +828,19 @@ def get_debug(service, params, body) -> dict:
                 entry["elapsed"] = now - (work.get("queued") or now)
         workers.append(entry)
 
+    # The event log is one stream carrying every module's events, and
+    # `debug: read` was enough to read all of them — device names and
+    # addresses, DHCP server labels, ConfigRX failure detail, sign-in
+    # history — with no grant on any of those modules. Each category is
+    # filtered by the module it belongs to, so the Debug page shows a
+    # caller their own modules' events and nothing else.
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
+               if _permissions.allows(granted.get(module), _permissions.READ)}
     events = [
         {"seq": e.seq, "ts": e.ts, "clock": e.clock, "category": e.category,
          "target": e.target, "message": e.message, "detail": e.detail}
-        for e in service.log.since(since)
+        for e in service.log.since(since) if e.category in visible
     ]
 
     # One row per address currently out for a reverse lookup.
@@ -884,76 +952,175 @@ def post_debug_clear(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- settings
 
+# Which module owns each settings scope, and what POST /api/settings does
+# with it: {scope: (Service method name, response key)}. The route table
+# derives the permission from THIS table (server._settings_requirement)
+# rather than from permissions.MODULES — a module in MODULES with no entry
+# here (`debug` was one) used to be authorized against itself and then fall
+# through to the global writer, which is how a debug:write account rewrote
+# the listener's bind address, TLS paths and the DNS server. Anything not
+# named here is the Settings module's, by construction.
+SETTINGS_SCOPES = {
+    "netpath": ("apply_netpath_settings", "settings"),
+    "netflow": ("apply_netflow_settings", "flow_settings"),
+    "syslog": ("apply_syslog_settings", "syslog_settings"),
+    "snmp": ("apply_snmp_settings", "snmp_settings"),
+    "ipam": ("apply_ipam_settings", "ipam_settings"),
+    "nodes": ("apply_nodes_settings", "nodes_settings"),
+    "alerts": ("apply_alerts_settings", "alerts_settings"),
+    "wireless": ("apply_wireless_settings", "wireless_settings"),
+    "configrx": ("apply_configrx_settings", "configrx_settings"),
+}
+
+
+# Global settings that are not an operator's to change even with Settings
+# write: turning this host's self-update on decides whether it will replace
+# its own code from the internet.
+ADMIN_ONLY_SETTINGS = ("updates_enabled",)
+
+
+def _is_admin(service, params) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get("admin"), _permissions.WRITE)
+
+
+def _may_change_admin_settings(service, params) -> bool:
+    """Whether this caller may change ADMIN_ONLY_SETTINGS. Its own function
+    so there is exactly one place the answer is decided."""
+    return _is_admin(service, params)
+
+
 def post_settings(service, params, body) -> dict:
     scope = str(body.get("scope", "global"))
     values = body.get("values") or {}
-    if scope == "netpath":
-        return {"settings": service.apply_netpath_settings(values)}
-    if scope == "netflow":
-        return {"flow_settings": service.apply_netflow_settings(values)}
-    if scope == "syslog":
-        return {"syslog_settings": service.apply_syslog_settings(values)}
-    if scope == "snmp":
-        return {"snmp_settings": service.apply_snmp_settings(values)}
-    if scope == "ipam":
-        return {"ipam_settings": service.apply_ipam_settings(values)}
-    if scope == "nodes":
-        return {"nodes_settings": service.apply_nodes_settings(values)}
-    if scope == "alerts":
-        return {"alerts_settings": service.apply_alerts_settings(values)}
-    if scope == "wireless":
-        return {"wireless_settings": service.apply_wireless_settings(values)}
-    if scope == "configrx":
-        return {"configrx_settings": service.apply_configrx_settings(values)}
-    return {"settings": service.apply_global_settings(values)}
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    touched = [key for key in ADMIN_ONLY_SETTINGS if key in values]
+    if touched and not _may_change_admin_settings(service, params):
+        raise PermissionError(
+            f"Changing {', '.join(touched)} needs administrator access")
+    # The keys, never the values: a settings value can be a credential-
+    # adjacent path or a hostname, and an audit trail is a record of what
+    # was touched, not a second copy of the configuration.
+    _audit(service, params, "settings.change", target=scope,
+           detail=", ".join(sorted(str(k) for k in values)) or "nothing")
+    entry = SETTINGS_SCOPES.get(scope)
+    if entry is None:
+        applied = service.apply_global_settings(values)
+        return {"settings": _visible_settings(applied, granted)}
+    method, key = entry
+    applied = getattr(service, method)(values)
+    # NetPath's apply returns the merged settings dict, which carries the
+    # global keys too; every other scope returns only its own module's.
+    return {key: _visible_settings(applied, granted) if key == "settings" else applied}
 
 
 def post_update(service, params, body) -> dict:
     from .. import selfupdate
 
+    # Refused here as well as inside apply(): this is the one that produces
+    # a 403 rather than a JSON error, so an operator sees a refusal rather
+    # than a failed update, and nothing reaches the network at all.
+    if not selfupdate.updates_enabled(service.app_db):
+        raise PermissionError(selfupdate.UPDATES_DISABLED_MESSAGE)
+    _audit(service, params, "update.requested")
     result = selfupdate.apply(service.app_db)
     if result.get("ok") and not result.get("up_to_date"):
         service.log.add(SYSTEM_CATEGORY,
-                        f"Updated to commit {result['commit']}: "
-                        f"{result['message']}; restarting")
+                        f"Updated to {result.get('tag') or result['commit']}; "
+                        f"restarting")
+        # Written before the restart, and to disk, which is the whole point:
+        # the process is about to be replaced.
+        _audit(service, params, "update.installed",
+               target=str(result.get("tag") or result.get("commit") or ""))
+    elif not result.get("ok"):
+        _audit(service, params, "update.refused",
+               detail=str(result.get("error", "")))
     return result
+
+
+# Maintenance actions that delete everything rather than applying a
+# retention policy: `prune(0, 0)` means "every row". On a regulated network
+# prune_syslog erases the evidence trail and prune_configrx erases every
+# stored config. Each needs `confirm: true` in the body, and each is
+# audited with the number of rows it destroyed.
+_DESTRUCTIVE_MAINTENANCE = {
+    "prune_traces", "prune_flows", "prune_syslog", "prune_snmp", "prune_ipam",
+    "prune_nodes", "prune_alerts", "prune_configrx",
+}
 
 
 def post_maintenance(service, params, body) -> dict:
     action = str(body.get("action", ""))
+    if action in _DESTRUCTIVE_MAINTENANCE and body.get("confirm") is not True:
+        raise ValueError(
+            f"{action} deletes stored history outright — it is not the "
+            f"retention policy. Send \"confirm\": true to go ahead.")
+
+    def done(message: str, counted: int) -> dict:
+        _audit(service, params, f"maintenance.{action}",
+               target=action, detail=f"{counted} row(s): {message}")
+        service.log.add(SYSTEM_CATEGORY, f"Maintenance {action}: {message}")
+        return {"message": message, "removed": counted}
+
     if action == "redns":
         removed = service.app_db.clear_hostnames()
-        return {"message": f"Cleared {removed} cached names; "
-                           f"lookups restart within 15s"}
+        return done(f"Cleared {removed} cached names; "
+                    f"lookups restart within 15s", removed)
     if action == "prune_traces":
         days = float(service.settings.get("trace_retention_days", 90))
         removed = service.db.prune(days)
-        return {"message": f"Deleted {removed} traces older than {days:.0f} days"}
+        return done(f"Deleted {removed} traces older than {days:.0f} days",
+                    removed)
     if action == "prune_flows":
         removed = service.flow_db.prune(0, 0)
-        return {"message": f"Deleted {removed} flow records"}
+        return done(f"Deleted {removed} flow records", removed)
     if action == "prune_syslog":
         removed = service.syslog_db.prune(0, 0)
-        return {"message": f"Deleted {removed} syslog messages"}
+        return done(f"Deleted {removed} syslog messages", removed)
     if action == "prune_snmp":
         removed = service.snmp_db.prune(0, 0)
-        return {"message": f"Deleted {removed} stored traps"}
+        return done(f"Deleted {removed} stored traps", removed)
     if action == "prune_ipam":
         hosts = service.ipam_db.prune_hosts(0)
         conflicts = service.ipam_db.prune_conflicts(0)
         scans = service.ipam_db.prune_scans(0)
-        return {"message": f"Deleted {hosts} host record(s), {conflicts} "
-                           f"resolved conflict(s), {scans} scan record(s)"}
+        return done(f"Deleted {hosts} host record(s), {conflicts} "
+                    f"resolved conflict(s), {scans} scan record(s)",
+                    hosts + conflicts + scans)
     if action == "prune_nodes":
         removed = service.nodes_db.prune(sample_days=0, event_days=0, discovery_days=0)
-        return {"message": f"Deleted {removed} stored sample(s)/event(s)"}
+        return done(f"Deleted {removed} stored sample(s)/event(s)", removed)
     if action == "prune_alerts":
         removed = service.alerts_db.prune(0)
-        return {"message": f"Deleted {removed} resolved alert(s)"}
+        return done(f"Deleted {removed} resolved alert(s)", removed)
     if action == "prune_configrx":
         removed = service.configrx_db.prune(0, 0)
-        return {"message": f"Deleted {removed} stored config backup(s)"}
-    return {"message": "Unknown action"}
+        return done(f"Deleted {removed} stored config backup(s)", removed)
+    # A 200 saying "Unknown action" made a typo in an automation script look
+    # like a successful prune.
+    raise ValueError(f"Unknown maintenance action {action!r}")
+
+
+def get_audit(service, params, body) -> dict:
+    """The on-disk audit trail. Administrator-only, and read-only: there is
+    no endpoint anywhere that deletes from this table.
+
+    `since` is the last id already seen (the same cursor shape the Debug
+    page's event feed uses), `limit` how many rows to return at most,
+    capped server-side.
+    """
+    since = int(_num(params, "since", 0, int) or 0)
+    limit = int(_num(params, "limit", 500, int) or 500)
+    rows = service.app_db.audit_events(since, limit)
+    return {
+        "events": [{"id": row["id"], "ts": row["ts"],
+                    "username": row["username"], "client": row["client"],
+                    "action": row["action"], "target": row["target"],
+                    "detail": row["detail"]} for row in rows],
+        "last_id": rows[-1]["id"] if rows else since,
+        "max_id": service.app_db.audit_last_id(),
+        "limit": min(max(1, limit), _appdb.AUDIT_MAX_LIMIT),
+    }
 
 
 # ------------------------------------------------------------------- syslog
@@ -1399,8 +1566,25 @@ def post_ipam_dhcp_server(service, params, body) -> dict:
 
 
 def put_ipam_dhcp_server(service, params, body, server_id) -> dict:
+    existing = service.ipam_db.dhcp_server(server_id)
+    if not existing:
+        raise ValueError("No such DHCP server")
     fields = {k: v for k, v in body.items() if k in ("address", "label", "enabled")}
+    # A stored credential belongs to the machine it was stored for. Pointing
+    # the row at a different address and then pressing Test or Poll would
+    # otherwise hand that account's password to whatever answers there —
+    # the same retargeting the SMTP test allowed. Moving the row forgets the
+    # credential; storing one again is a deliberate act naming the new host.
+    moved = ("address" in fields
+             and str(fields["address"]).strip() != str(existing["address"] or ""))
     service.ipam_db.update_dhcp_server(server_id, **fields)
+    if moved and existing["password_enc"]:
+        service.ipam_db.clear_dhcp_credential(server_id)
+        service.log.add(IPAM_CATEGORY,
+                        f"Cleared the stored credential for DHCP server "
+                        f"{existing['label']}: its address changed from "
+                        f"{existing['address']} to {fields['address']}")
+        return {"ok": True, "credential_cleared": True}
     return {"ok": True}
 
 
@@ -1468,6 +1652,8 @@ def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
     service.ipam_db.set_dhcp_credential(server_id, username, encrypted)
     service.log.add(IPAM_CATEGORY,
                     f"Stored a credential for DHCP server {server['label']}")
+    _audit(service, params, "credential.store",
+           target=f"dhcp:{server['address']}", detail=f"username {username}")
     return {"ok": True}
 
 
@@ -1478,6 +1664,8 @@ def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict
     service.ipam_db.clear_dhcp_credential(server_id)
     service.log.add(IPAM_CATEGORY, f"Cleared the stored credential for DHCP "
                                    f"server {server['label']}")
+    _audit(service, params, "credential.clear",
+           target=f"dhcp:{server['address']}")
     return {"ok": True}
 
 
@@ -1568,17 +1756,37 @@ def _tri(value):
     return None if value is None else bool(value)
 
 
-def _device_json(row) -> dict:
+# The community string travels in the clear in every packet the protocol
+# defines, so it is not a secret in the sense a password is — and it is
+# still the only access control on many industrial devices, where the v2c
+# community is what a PLC or RTU checks before answering, and sometimes
+# before accepting a write. Handing every community in the estate to every
+# read-only Nodes account is a lateral-movement gift regardless of what the
+# wire already leaks. The value is shown to callers who could change it
+# anyway (module WRITE); everyone else gets `has_community`, the same
+# reduction `v3_auth_pass_enc` already gets.
+def _community_fields(row, reveal: bool) -> dict:
+    community = row["community"]
+    fields = {"has_community": bool(community)}
+    if reveal:
+        fields["community"] = community
+    return fields
+
+
+def _may_read_secrets(service, params, module: str) -> bool:
+    granted = service.app_db.permissions_for(params.get("_username", ""))
+    return _permissions.allows(granted.get(module), _permissions.WRITE)
+
+
+def _device_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
         "group_id": row["group_id"], "device_group_id": row["device_group_id"],
         "display_name_source": row["display_name_source"],
         "enabled": bool(row["enabled"]),
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
-        # The community string is not a secret — it travels in the clear in
-        # every packet the protocol defines — so it is shown as typed. Only
-        # the v3 auth password is ever redacted down to has_credential.
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "poll_interval_s": row["poll_interval_s"],
         "snmp_timeout_s": row["snmp_timeout_s"],
@@ -1621,10 +1829,11 @@ def _device_json(row) -> dict:
     }
 
 
-def _group_json(service, row) -> dict:
+def _group_json(service, row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "name": row["name"], "snmp_version": row["snmp_version"],
-        "community": row["community"], "v3_user": row["v3_user"],
+        **_community_fields(row, reveal),
+        "v3_user": row["v3_user"],
         "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "poll_interval_s": row["poll_interval_s"],
@@ -1642,15 +1851,16 @@ def _group_json(service, row) -> dict:
         # "primary" credential — always present, always tried first. This
         # is every ADDITIONAL credential the poller falls back to in
         # order when the primary doesn't work for a given device.
-        "credentials": [_group_credential_json(r)
+        "credentials": [_group_credential_json(r, reveal)
                         for r in service.nodes_db.group_credentials(row["id"])],
     }
 
 
-def _group_credential_json(row) -> dict:
+def _group_credential_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "group_id": row["group_id"], "label": row["label"],
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
         "created_ts": row["created_ts"],
@@ -1770,9 +1980,10 @@ def get_nodes_devices(service, params, body) -> dict:
     # operator who silenced a device an hour ago and then wonders why it
     # is quiet should be able to see why without opening Alerts.
     muted = service.alerts_db.muted_entity_ids("device")
+    reveal = _may_read_secrets(service, params, "nodes")
     devices = []
     for row in rows:
-        device = _device_json(row)
+        device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
         devices.append(device)
@@ -1853,10 +2064,13 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     row = service.nodes_db.device(device_id)
     if not row:
         raise ValueError("No such device")
-    device = _device_json(row)
+    reveal = _may_read_secrets(service, params, "nodes")
+    device = _device_json(row, reveal)
+    # effective_config resolves the profile's own community into the
+    # device's, so it carries one too and follows the same rule.
     device["effective_config"] = {
         k: v for k, v in service.nodes_db.effective_config(row).items()
-        if k != "v3_auth_pass_enc"}
+        if k != "v3_auth_pass_enc" and (reveal or k != "community")}
     device["group_name"] = None
     if row["group_id"]:
         group = service.nodes_db.group(row["group_id"])
@@ -2429,6 +2643,8 @@ def post_nodes_device_credential(service, params, body, device_id) -> dict:
         password = None
     service.nodes_db.set_device_credential(device_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY, f"Stored an SNMPv3 credential for {row['ip']}")
+    _audit(service, params, "credential.store", target=f"device:{row['ip']}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2437,6 +2653,7 @@ def delete_nodes_device_credential(service, params, body, device_id) -> dict:
     if not row:
         raise ValueError("No such device")
     service.nodes_db.clear_device_credential(device_id)
+    _audit(service, params, "credential.clear", target=f"device:{row['ip']}")
     service.log.add(NODES_CATEGORY,
                     f"Cleared the stored SNMPv3 credential for {row['ip']}")
     return {"ok": True}
@@ -2479,7 +2696,9 @@ def delete_nodes_device_group(service, params, body, device_group_id) -> dict:
 
 
 def get_nodes_groups(service, params, body) -> dict:
-    return {"groups": [_group_json(service, r) for r in service.nodes_db.groups()]}
+    reveal = _may_read_secrets(service, params, "nodes")
+    return {"groups": [_group_json(service, r, reveal)
+                       for r in service.nodes_db.groups()]}
 
 
 def post_nodes_group(service, params, body) -> dict:
@@ -2547,6 +2766,8 @@ def post_nodes_group_credential(service, params, body, group_id) -> dict:
     service.nodes_db.set_group_credential(group_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY,
                     f"Stored an SNMPv3 credential for profile {row['name']}")
+    _audit(service, params, "credential.store", target=f"profile:{row['name']}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2625,6 +2846,9 @@ def post_nodes_group_credential_secret(service, params, body, group_id, credenti
     service.nodes_db.set_group_credential_password(credential_id, user, auth_proto, encrypted)
     service.log.add(NODES_CATEGORY, "Stored an SNMPv3 credential for an additional "
                                     f"credential on profile {cred['label'] or credential_id}")
+    _audit(service, params, "credential.store",
+           target=f"profile-credential:{cred['label'] or credential_id}",
+           detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -2633,6 +2857,8 @@ def delete_nodes_group_credential_secret(service, params, body, group_id, creden
     if not cred or cred["group_id"] != int(group_id):
         raise ValueError("No such credential")
     service.nodes_db.clear_group_credential_password(credential_id)
+    _audit(service, params, "credential.clear",
+           target=f"profile-credential:{cred['label'] or credential_id}")
     return {"ok": True}
 
 
@@ -2689,7 +2915,15 @@ def post_nodes_discovery(service, params, body) -> dict:
         raise ValueError(
             "This profile has no v1/v2c communities for discovery to try. "
             "Pick a profile with one, or allow ping-only devices.")
-    overrides = {"discovery_communities": communities}
+    # The never-scan list and the probe rate are global settings the
+    # discovery job cannot see on its own (its settings dict is Nodes'),
+    # so they are carried in with the per-job overrides. They are NOT
+    # settable from the request body — a scan does not get to choose how
+    # gentle it is with a plant segment.
+    overrides = {
+        "discovery_communities": communities,
+        "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
+    }
     # Per-scan timing overrides from the Start-discovery dialog — they
     # live only in this job's settings, never in stored settings.
     for body_key, override_key, cast in (
@@ -3084,6 +3318,7 @@ def post_alert_ack(service, params, body, alert_id) -> dict:
         raise ValueError("No such alert")
     service.alerts_db.acknowledge(alert_id, params.get("_username", ""),
                                   str(body.get("note", "")))
+    _audit(service, params, "alert.ack", target=str(alert_id))
     return {"ok": True}
 
 
@@ -3091,6 +3326,7 @@ def post_alert_resolve(service, params, body, alert_id) -> dict:
     if not service.alerts_db.alert(alert_id):
         raise ValueError("No such alert")
     service.alerts_db.resolve(alert_id, params.get("_username", ""))
+    _audit(service, params, "alert.resolve", target=str(alert_id))
     return {"ok": True}
 
 
@@ -3136,16 +3372,21 @@ def post_alerts_mute(service, params, body) -> dict:
     row = service.alerts_db.mute(kind, entity_id, hours,
                                  by=params.get("_username", ""),
                                  reason=str(body.get("reason", "")))
+    _audit(service, params, "alert.mute", target=f"{kind}:{entity_id}",
+           detail=f"{hours:g}h: {str(body.get('reason', ''))}")
     return {"mute": _mute_json(row)}
 
 
 def delete_alerts_mute(service, params, body) -> dict:
     kind, entity_id = _mute_entity(body)
-    return {"lifted": service.alerts_db.unmute(kind, entity_id)}
+    lifted = service.alerts_db.unmute(kind, entity_id)
+    _audit(service, params, "alert.unmute", target=f"{kind}:{entity_id}")
+    return {"lifted": lifted}
 
 
 def post_alerts_ack_all(service, params, body) -> dict:
     n = service.alerts_db.acknowledge_all(params.get("_username", ""))
+    _audit(service, params, "alert.ack_all", detail=f"{n} alert(s)")
     return {"acknowledged": n}
 
 
@@ -3159,12 +3400,14 @@ def _bulk_alert_ids(body) -> list[int]:
 def post_alerts_bulk_ack(service, params, body) -> dict:
     alert_ids = _bulk_alert_ids(body)
     n = service.alerts_db.acknowledge_many(alert_ids, params.get("_username", ""))
+    _audit(service, params, "alert.ack_bulk", detail=f"{n} of {len(alert_ids)}")
     return {"acknowledged": n}
 
 
 def post_alerts_bulk_resolve(service, params, body) -> dict:
     alert_ids = _bulk_alert_ids(body)
     n = service.alerts_db.resolve_many(alert_ids, params.get("_username", ""))
+    _audit(service, params, "alert.resolve_bulk", detail=f"{n} of {len(alert_ids)}")
     return {"resolved": n}
 
 
@@ -3328,31 +3571,63 @@ def post_alerts_smtp_credential(service, params, body) -> dict:
         password = None
     service.alerts_db.set_smtp_credential(encrypted)
     service.log.add(ALERTS_CATEGORY, "Stored the SMTP credential")
+    _audit(service, params, "credential.store", target="smtp")
     return {"ok": True}
 
 
 def delete_alerts_smtp_credential(service, params, body) -> dict:
     service.alerts_db.clear_smtp_credential()
     service.log.add(ALERTS_CATEGORY, "Cleared the stored SMTP credential")
+    _audit(service, params, "credential.clear", target="smtp")
     return {"ok": True}
+
+
+# The body fields that decide WHERE the test email goes and how the
+# connection to it is protected. Overriding any of them and letting the
+# stored password be used is how a stored SMTP credential was made to walk
+# out to any host and port on the network (`AUTH PLAIN` in the clear, to a
+# listener of the caller's choosing). Testing an unsaved host is still
+# allowed — with the password for that host typed in beside it.
+_SMTP_DESTINATION_KEYS = ("smtp_host", "smtp_port", "smtp_security",
+                          "smtp_verify_cert")
+
+# Transports that actually protect a password on the wire. Anything else
+# ("none", "plain", a typo) sends AUTH over cleartext TCP.
+_SMTP_SECURE = ("ssl", "starttls")
 
 
 def post_alerts_smtp_test(service, params, body) -> dict:
     """Sends a real test email, using in-progress-edit SMTP settings from
     the body when present, else the saved ones — the same "test what's
     typed before saving" idiom as IPAM's DHCP test and the SNMP Trap/
-    Syslog "send test" buttons."""
+    Syslog "send test" buttons.
+
+    The stored password is only ever sent to the stored destination. That
+    is the whole of CREDENTIAL-SECURITY.md's promise that a stored
+    credential can only be used or replaced, and this endpoint used to
+    break it: every destination field was taken from the request body while
+    the password came from the database.
+    """
     from .. import alertmail, dpapi
 
     to_addr = str(body.get("to", "")).strip()
     if not to_addr:
         raise ValueError("A recipient address is required")
     settings = dict(service.alerts_settings)
+    overridden = [key for key in _SMTP_DESTINATION_KEYS
+                  if key in body
+                  and str(body[key]) != str(settings.get(key, ""))]
     for key in ("smtp_host", "smtp_port", "smtp_security", "smtp_verify_cert",
                "smtp_username", "smtp_from", "smtp_from_name", "smtp_timeout_s"):
         if key in body:
             settings[key] = body[key]
     password = body.get("password")
+    if password is None and overridden:
+        raise ValueError(
+            "This test changes " + ", ".join(overridden) + ", so it cannot use "
+            "the saved password: type the password for that server into the "
+            "test instead. The saved one is only ever sent to the saved "
+            "server.")
     if password is None:
         blob = service.alerts_db.smtp_password_enc()
         if blob:
@@ -3360,6 +3635,19 @@ def post_alerts_smtp_test(service, params, body) -> dict:
                 password = dpapi.unprotect(blob).decode("utf-8")
             except Exception:
                 password = None
+    if password and str(settings.get("smtp_security", "")).lower() not in _SMTP_SECURE:
+        if not service.settings.get("smtp_allow_plain_auth", False):
+            raise ValueError(
+                f"Sending a password over "
+                f"'{settings.get('smtp_security') or 'none'}' would put it on "
+                f"the wire in the clear. Use ssl or starttls, or leave the "
+                f"password blank, or turn on \"Allow SMTP AUTH without "
+                f"transport security\" in Settings.")
+    if password and settings.get("smtp_verify_cert") is False:
+        raise ValueError(
+            "Sending a password to a server whose certificate is not "
+            "verified defeats the point of the encryption. Turn certificate "
+            "verification back on, or leave the password blank.")
     subject = "SappiWhere test email"
     body_text = "This is a test email from SappiWhere's Alerts module."
     try:
@@ -3389,11 +3677,12 @@ def post_alerts_engine(service, params, body) -> dict:
 
 # ---------------------------------------------------------------- wireless
 
-def _controller_json(row) -> dict:
+def _controller_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "name": row["name"], "ip": row["ip"],
         "enabled": bool(row["enabled"]),
-        "snmp_version": row["snmp_version"], "community": row["community"],
+        "snmp_version": row["snmp_version"],
+        **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         # Same has_credential convention as Nodes' device v3 password —
         # the encrypted blob itself is never sent to the browser.
@@ -3499,7 +3788,9 @@ def _ap_json(service, row) -> dict:
 
 def get_wireless_overview(service, params, body) -> dict:
     return {
-        "controllers": [_controller_json(r) for r in service.wireless_db.controllers()],
+        "controllers": [_controller_json(r, _may_read_secrets(
+            service, params, "wireless"))
+            for r in service.wireless_db.controllers()],
         "ap_counts": service.wireless_db.ap_counts(),
         "poller": {
             "running": service.wireless.running,
@@ -3510,7 +3801,9 @@ def get_wireless_overview(service, params, body) -> dict:
 
 
 def get_wireless_controllers(service, params, body) -> dict:
-    return {"controllers": [_controller_json(r) for r in service.wireless_db.controllers()]}
+    reveal = _may_read_secrets(service, params, "wireless")
+    return {"controllers": [_controller_json(r, reveal)
+                            for r in service.wireless_db.controllers()]}
 
 
 _CONTROLLER_EDITABLE_BODY = ("name", "ip", "enabled", "snmp_version",
@@ -3530,10 +3823,23 @@ def post_wireless_controller(service, params, body) -> dict:
 
 
 def put_wireless_controller(service, params, body, controller_id) -> dict:
-    if not service.wireless_db.controller(controller_id):
+    existing = service.wireless_db.controller(controller_id)
+    if not existing:
         raise ValueError("No such controller")
     fields = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY}
+    # Same rule as the DHCP server above: the stored SNMPv3 password was
+    # stored for one controller at one address, so moving the row to a
+    # different address forgets it rather than offering it to whatever
+    # answers at the new one on the next poll.
+    moved = ("ip" in fields and str(fields["ip"]).strip() != str(existing["ip"] or ""))
     service.wireless_db.update_controller(controller_id, **fields)
+    if moved and existing["v3_auth_pass_enc"]:
+        service.wireless_db.set_credential(controller_id, None)
+        service.log.add(WIRELESS_CATEGORY,
+                        f"Cleared the stored credential for controller "
+                        f"{existing['name']}: its address changed from "
+                        f"{existing['ip']} to {fields['ip']}")
+        return {"ok": True, "credential_cleared": True}
     return {"ok": True}
 
 
@@ -3571,6 +3877,8 @@ def post_wireless_controller_credential(service, params, body, controller_id) ->
     service.wireless_db.update_controller(controller_id, v3_user=user, v3_auth_proto=auth_proto)
     service.wireless_db.set_credential(controller_id, encrypted)
     service.log.add(WIRELESS_CATEGORY, f"Stored an SNMPv3 credential for {row['name']}")
+    _audit(service, params, "credential.store",
+           target=f"controller:{row['ip']}", detail=f"SNMPv3 user {user}")
     return {"ok": True}
 
 
@@ -3580,6 +3888,7 @@ def delete_wireless_controller_credential(service, params, body, controller_id) 
         raise ValueError("No such controller")
     service.wireless_db.set_credential(controller_id, None)
     service.log.add(WIRELESS_CATEGORY, f"Cleared the stored SNMPv3 credential for {row['name']}")
+    _audit(service, params, "credential.clear", target=f"controller:{row['ip']}")
     return {"ok": True}
 
 
@@ -3686,6 +3995,10 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
         "effective_vendor": override or nodesdb.detected_vendor(device_row) or "",
         "vendor_is_override": bool(override),
         "backup_enabled": bool(config["backup_enabled"]) if config else False,
+        # Whether this device's captures are stored verbatim rather than
+        # redacted (configrx_redact.py). Off unless somebody turned it on.
+        "store_secrets": bool(config["store_secrets"]) if (
+            config and "store_secrets" in config.keys()) else False,
         "ssh_port": config["ssh_port"] if config else 22,
         "ssh_username": (config["ssh_username"] if config else "") or "",
         # Same has_credential convention as every other stored password in
@@ -3701,8 +4014,13 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
 
 
 def _configrx_backup_json(row) -> dict:
+    keys = row.keys()
     return {"id": row["id"], "device_id": row["device_id"], "ts": row["ts"],
-            "sha256": row["sha256"], "size_bytes": row["size_bytes"]}
+            "sha256": row["sha256"], "size_bytes": row["size_bytes"],
+            # So the UI can say whether what it is about to show has had
+            # its secrets taken out. Keyed defensively for a row handed in
+            # from an older-shaped source, as the device rows are.
+            "redacted": bool(row["redacted"]) if "redacted" in keys else False}
 
 
 def delete_configrx_backup(service, params, body, backup_id) -> dict:
@@ -3774,7 +4092,14 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
     fields = {k: v for k, v in body.items()
-             if k in ("backup_enabled", "ssh_port", "ssh_username", "vendor_override")}
+             if k in ("backup_enabled", "ssh_port", "ssh_username",
+                      "vendor_override", "store_secrets")}
+    if "store_secrets" in fields:
+        fields["store_secrets"] = 1 if fields["store_secrets"] else 0
+        _audit(service, params,
+               "configrx.store_secrets", target=str(device_id),
+               detail="on — captures will be stored verbatim"
+                      if fields["store_secrets"] else "off")
     service.configrx_db.update_device_config(device_id, **fields)
     return {"ok": True}
 
@@ -3869,6 +4194,8 @@ def post_configrx_devices_bulk_credential(service, params, body) -> dict:
             service.configrx_db.set_credential(device_id, username, encrypted)
             updated += 1
     service.log.add(CONFIGRX_CATEGORY, f"Bulk-stored an SSH credential for {updated} device(s)")
+    _audit(service, params, "credential.store", target="configrx:bulk",
+           detail=f"{updated} device(s), username {username}")
     return {"ok": True, "updated": updated}
 
 
@@ -3895,6 +4222,8 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
         password = None
     service.configrx_db.set_credential(device_id, username, encrypted)
     service.log.add(CONFIGRX_CATEGORY, f"Stored an SSH credential for {row['ip']}")
+    _audit(service, params, "credential.store", target=f"configrx:{row['ip']}",
+           detail=f"username {username}")
     return {"ok": True}
 
 
@@ -3904,6 +4233,7 @@ def delete_configrx_device_credential(service, params, body, device_id) -> dict:
         raise ValueError("No such device")
     service.configrx_db.clear_credential(device_id)
     service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored SSH credential for {row['ip']}")
+    _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}")
     return {"ok": True}
 
 
@@ -4008,37 +4338,100 @@ def _client(params) -> str:
     return params.get("_client", "")
 
 
+# At most this many password verifications at once. Each one is a scrypt
+# at N=2^17 — about 128 MiB and half a second — on an endpoint that needs
+# no session, so unbounded concurrency was both a memory DoS (30 parallel
+# attempts is ~4 GB) and the reason the throttle's sleep did not bite: the
+# server is threaded, so twelve simultaneous guesses each slept five
+# seconds in parallel and the effective rate was one attempt per 0.9 s
+# rather than one per five.
+_LOGIN_SLOTS = threading.Semaphore(4)
+
+_dummy_hash_value: str | None = None
+_dummy_hash_lock = threading.Lock()
+
+
+def _dummy_hash() -> str:
+    """A real hash of a random string, built with the parameters in force
+    now.
+
+    The point of hashing when the account does not exist is that the time
+    taken says nothing about whether it does. The hardcoded string this
+    replaces named N=2^14 while stored hashes use 2^17, so a missing
+    account answered about nine times faster — measured 0.055 s against
+    0.48 s — and the endpoint was a username oracle. Derived from
+    hash_password so it cannot drift from the real cost again, including
+    onto the PBKDF2 fallback where scrypt is unavailable.
+    """
+    global _dummy_hash_value
+    with _dummy_hash_lock:
+        if _dummy_hash_value is None:
+            from ..auth import hash_password
+            _dummy_hash_value = hash_password(secrets.token_urlsafe(32))
+        return _dummy_hash_value
+
+
 def post_login(service, params, body) -> dict:
     """Verify a password. Deliberately slow to fail, and vague about why."""
-    from ..auth import needs_rehash, hash_password, verify_password
+    from ..auth import (AuthError, LockedOut, check_username, needs_rehash,
+                        hash_password, verify_password)
 
-    username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
     client = _client(params)
 
-    delay = service.throttle.delay_for(username, client)
-    if delay:
-        time.sleep(min(delay, 5))
+    # Validated before it is used as a throttle key or written anywhere.
+    # An unvalidated name reached both: a 200 KB username produced a 200 KB
+    # event, which is a cheap way to push every other event out of the
+    # 3,000-entry ring. Every name that is not a username shares one key
+    # and one log line, so trying millions of them costs one entry.
+    try:
+        username = check_username(str(body.get("username", "")))
+    except AuthError:
+        username = ""
+    label = username or "(not a username)"
 
-    row = service.app_db.user(username) if username else None
-    stored = row["password"] if row else None
-
-    # Hash something even when the account does not exist, so the time taken
-    # cannot be used to discover which usernames are real.
-    if stored is None:
-        verify_password(password, "scrypt$16384$8$1$" + "A" * 24 + "$" + "A" * 44)
-        service.throttle.record_failure(username or "?", client)
-        service.log.add(ERROR_CATEGORY, f"Failed sign-in for "
-                                        f"{username or '(blank)'} from {client}")
-        raise PermissionError("Wrong username or password")
-
-    if not verify_password(password, stored):
-        service.throttle.record_failure(username, client)
+    # Checked before the semaphore and before any hashing: a locked-out
+    # caller must not be able to hold a verification slot or spend a
+    # half-second of scrypt.
+    remaining = service.throttle.lockout_remaining(username, client)
+    if remaining > 0:
         service.log.add(ERROR_CATEGORY,
-                        f"Failed sign-in for {row['username']} from {client}")
-        raise PermissionError("Wrong username or password")
+                        f"Refused sign-in for {label} from {client}: too many "
+                        f"failures, locked for another {remaining / 60:.0f} min")
+        _audit(service, dict(params, _username=label), "signin.locked_out",
+               target=label, detail=f"locked for another {remaining:.0f}s")
+        raise LockedOut(f"Too many failed sign-ins. Try again in "
+                        f"{max(1, round(remaining / 60))} minute(s).")
 
-    service.throttle.clear(username, client)
+    with _LOGIN_SLOTS:
+        delay = service.throttle.delay_for(username, client)
+        if delay:
+            time.sleep(min(delay, 5))
+
+        row = service.app_db.user(username) if username else None
+        stored = row["password"] if row else None
+
+        # Hash something even when the account does not exist, so the time
+        # taken cannot be used to discover which usernames are real.
+        if stored is None:
+            verify_password(password, _dummy_hash())
+            service.throttle.record_failure(username, client)
+            service.log.add(ERROR_CATEGORY,
+                            f"Failed sign-in for {label} from {client}")
+            _audit(service, dict(params, _username=label), "signin.failed",
+                   target=label, detail="no such account")
+            raise PermissionError("Wrong username or password")
+
+        if not verify_password(password, stored):
+            service.throttle.record_failure(username, client)
+            service.log.add(ERROR_CATEGORY,
+                            f"Failed sign-in for {row['username']} from {client}")
+            _audit(service, dict(params, _username=row["username"]),
+                   "signin.failed", target=row["username"],
+                   detail="wrong password")
+            raise PermissionError("Wrong username or password")
+
+    service.throttle.clear(username)
     service.app_db.touch_login(row["username"])
 
     # Upgrade the stored hash quietly, now that we hold the password.
@@ -4046,9 +4439,14 @@ def post_login(service, params, body) -> dict:
         service.app_db.set_password(row["username"], hash_password(password),
                                 must_change=bool(row["must_change"]))
 
+    # The real User-Agent header, not a body field. The session list claims
+    # to show what signed in; it used to show whatever the caller put in a
+    # body key called "_agent", markup and all.
     token = service.sessions.create(row["username"], client,
-                                    str(body.get("_agent", "")))
+                                    str(params.get("_agent", "")))
     service.log.add(SYSTEM_CATEGORY, f"{row['username']} signed in from {client}")
+    _audit(service, dict(params, _username=row["username"]), "signin.ok",
+           target=row["username"], detail=str(params.get("_agent", ""))[:120])
     return {"token": token, "username": row["username"],
             "must_change": bool(row["must_change"])}
 
@@ -4058,6 +4456,8 @@ def post_logout(service, params, body) -> dict:
     session = service.sessions.get(token)
     if session:
         service.log.add(SYSTEM_CATEGORY, f"{session['username']} signed out")
+        _audit(service, dict(params, _username=session["username"]),
+               "signout", target=session["username"])
     service.sessions.destroy(token)
     return {"ok": True}
 
@@ -4118,7 +4518,30 @@ def post_user(service, params, body) -> dict:
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {username} created by "
                     f"{params.get('_username', 'someone')}")
+    _audit(service, params, "user.create", target=username,
+           detail=", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
+                  or "no grants")
     return {"username": username}
+
+
+def _last_admin_guard(service, target: str, keeps_admin: bool) -> None:
+    """Refuse a change that would leave the install with no administrator.
+
+    Deleting the last *account* was already refused; losing the last
+    administrator is the same trap by a different route — an install with
+    no admin has no way back into its own user management short of editing
+    app.db by hand.
+    """
+    if keeps_admin:
+        return
+    admins = service.app_db.usernames_with("admin", _permissions.WRITE)
+    if [name for name in admins if name.lower() != target.lower()]:
+        return
+    if any(name.lower() == target.lower() for name in admins):
+        raise ValueError(
+            f"{target} is the only account with administrator access. Give "
+            f"another account administrator access first, or there would be "
+            f"no way to manage accounts at all.")
 
 
 def post_user_permissions(service, params, body) -> dict:
@@ -4127,11 +4550,25 @@ def post_user_permissions(service, params, body) -> dict:
         raise ValueError("Which account?")
     if not service.app_db.user(username):
         raise ValueError(f"No account called {username}")
+    me = params.get("_username", "")
+    # Nobody edits their own grants. An administrator who wants a different
+    # set asks another administrator for it, which is what makes the grid a
+    # record of a decision rather than of a self-service action — and it
+    # closes the "grant yourself every module" step the review found.
+    if username.lower() == me.lower():
+        raise ValueError(
+            "You cannot change your own permissions. Ask another "
+            "administrator to make the change.")
     grants = body.get("grants") or {}
+    _last_admin_guard(service, username,
+                      grants.get("admin") == _permissions.WRITE)
     service.app_db.set_permissions(username, grants)
     service.log.add(SYSTEM_CATEGORY,
                     f"Permissions for {username} changed by "
                     f"{params.get('_username', 'someone')}")
+    _audit(service, params, "user.permissions", target=username,
+           detail=", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
+                  or "no grants")
     return {"username": username, "permissions": service.app_db.permissions_for(username)}
 
 
@@ -4150,11 +4587,14 @@ def delete_user(service, params, body, username: str = "") -> dict:
         raise ValueError(f"No account called {target}")
     if service.app_db.user_count() <= 1:
         raise ValueError("That is the only account; there would be no way back in")
+    _last_admin_guard(service, target, keeps_admin=False)
 
     service.app_db.remove_user(target)
     ended = service.sessions.destroy_user(target)
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {target} removed by {me}; {ended} session(s) ended")
+    _audit(service, params, "user.delete", target=target,
+           detail=f"{ended} session(s) ended")
     return {"removed": target}
 
 
@@ -4191,4 +4631,6 @@ def post_password(service, params, body) -> dict:
     service.log.add(SYSTEM_CATEGORY,
                     f"Password for {target} changed by {me}; "
                     f"{ended} session(s) ended")
+    _audit(service, params, "password.reset" if resetting else "password.change",
+           target=target, detail=f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}

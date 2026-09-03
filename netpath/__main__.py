@@ -18,12 +18,29 @@ import time
 
 
 def default_db_path() -> str:
+    """The data folder, created owner-only.
+
+    Everything this application stores lives in one folder: the scrypt
+    password hashes, the SNMP communities, the DPAPI blobs, every captured
+    device config and the syslog history. It was being created 0755 with
+    0644 files inside it, so any local account could read all of it. The
+    mode is applied to a folder that already exists as well as to a new
+    one — the whole point is the upgrade case, where the folder was made
+    before this line existed. Windows has no meaningful POSIX mode and
+    inherits its ACL from the profile directory, so it is left alone.
+    """
     if os.name == "nt":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     else:
         base = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
     folder = os.path.join(base, "netpath-monitor")
-    os.makedirs(folder, exist_ok=True)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        try:
+            if os.stat(folder).st_mode & 0o077:
+                os.chmod(folder, 0o700)
+        except OSError:
+            pass          # a folder someone deliberately shared; not ours to fight
     return os.path.join(folder, "netpath.db")
 
 
@@ -174,7 +191,16 @@ def run_headless(args) -> int:
     if not cert:
         print("  No certificate given, so this is plain HTTP. Pass --cert and "
               "--key to serve TLS.")
-    print("  There is no authentication yet: bind somewhere you trust.")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            # Said plainly because it is true of every credential typed into
+            # the UI and of the session cookie itself, and because the line
+            # this replaces claimed the opposite — that there was no
+            # authentication at all, which stopped being true in 4.22.
+            print(f"  WARNING: serving on {host} without TLS. Sign-ins, "
+                  f"session cookies and every credential typed into the "
+                  f"interface cross the network in the clear.")
+    print("  Sign in with an account; the seeded admin must change its "
+          "password before it can do anything else.")
     print("  Ctrl+C to stop.")
 
     try:

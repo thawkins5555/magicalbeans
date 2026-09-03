@@ -101,7 +101,10 @@ def main():
     # phase as all-alive so the SNMP phase (against the now-dark stub
     # agent, so every attempt times out) actually takes long enough to
     # cancel mid-flight, exercising the real code under test either way.
-    nodediscover_mod.sweep = lambda addresses, timeout_ms=800, workers=64: {
+    # **kwargs: the real sweep() also takes probes_per_second and
+    # never_scan, and this stand-in must not care which of them the caller
+    # passes.
+    nodediscover_mod.sweep = lambda addresses, timeout_ms=800, workers=64, **kw: {
         ip: True for ip in addresses}
     agent.alive = False  # every SNMP attempt now times out
     job_id4 = poller.start_discovery("subnet", "127.0.0.0/28",

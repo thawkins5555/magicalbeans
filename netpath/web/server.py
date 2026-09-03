@@ -5,9 +5,11 @@ certificate is configured. That keeps the deployment to "install PySide6 or
 don't" rather than pulling a web framework and its dependency tree onto a
 machine whose job is watching the network.
 
-There is no authentication yet. Bind to an interface you trust, or to
-127.0.0.1 and reach it through something that does authenticate, until the
-TACACS work lands.
+Every route carries a (module, level) permission and needs a signed-in
+session; see `permissions.py` and the ROUTES table below. Without `--cert`
+this is plain HTTP, so the session cookie and every credential typed into
+the interface cross the network in the clear — bind to 127.0.0.1, or give
+it a certificate.
 """
 
 from __future__ import annotations
@@ -23,10 +25,11 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from collections import deque
+from collections import OrderedDict, deque
 
 from . import api
 from . import wsock
+from .. import auth
 from .. import permissions
 from .service import Service
 
@@ -37,22 +40,35 @@ R, W = permissions.READ, permissions.WRITE
 
 def _password_requirement(params, body):
     """Changing your own password is always allowed (per-route None); only
-    resetting a *different* account's needs the same Settings-write gate
+    resetting a *different* account's needs the same administrator gate
     user management itself sits behind — mirrors post_password's own
     `resetting = target.lower() != me.lower()` check, since the route
-    table can't see into the request body on its own."""
+    table can't see into the request body on its own.
+
+    Administrator rather than Settings write since 4.37: resetting someone
+    else's password is taking their account, and that belongs with creating
+    and deleting accounts, not with changing a refresh interval."""
     me = params.get("_username", "")
     target = str(body.get("username", "") or me)
-    return ("settings", W) if target.lower() != me.lower() else None
+    return ("admin", W) if target.lower() != me.lower() else None
 
 
 def _settings_requirement(params, body):
     """post_settings is one generic dispatcher for every module's own
-    settings (body['scope']); the module that gates it is whichever one
-    the scope names, not a fixed tag — 'global' (or anything unrecognized)
-    falls to the Settings module itself."""
+    settings (body['scope']); the module that gates it is whichever one the
+    scope names, not a fixed tag — 'global' (or anything unrecognized)
+    falls to the Settings module itself.
+
+    Derived from post_settings' own dispatch table, not from
+    permissions.MODULES: a module listed there with no branch in
+    post_settings was authorized against itself and then fell through to
+    the global writer. `debug` was exactly that, so a debug:write account
+    could rewrite the listener's bind address, port, TLS certificate and
+    key paths, the DNS server the nslookup subprocesses use, and the
+    session lifetimes. Reading the requirement from the table that decides
+    what actually happens keeps the two from drifting apart again."""
     scope = str(body.get("scope", "global"))
-    module = scope if scope in permissions.MODULES else "settings"
+    module = scope if scope in api.SETTINGS_SCOPES else "settings"
     return (module, W)
 
 
@@ -66,10 +82,14 @@ ROUTES = [
     ("POST", r"^/api/logout$", api.post_logout, None),
     ("POST", r"^/api/heartbeat$", api.post_heartbeat, None),
     ("GET", r"^/api/session$", api.get_session, None),
-    ("GET", r"^/api/users$", api.get_users, ("settings", W)),
-    ("POST", r"^/api/users$", api.post_user, ("settings", W)),
-    ("DELETE", r"^/api/users$", api.delete_user, ("settings", W)),
-    ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("settings", W)),
+    # Accounts and their grants are the `admin` capability's, not
+    # Settings'. Settings write used to be all of this as well: an account
+    # granted it to change a retention cap could grant itself every module,
+    # reset anyone's password and trigger the self-update.
+    ("GET", r"^/api/users$", api.get_users, ("admin", W)),
+    ("POST", r"^/api/users$", api.post_user, ("admin", W)),
+    ("DELETE", r"^/api/users$", api.delete_user, ("admin", W)),
+    ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
     ("GET", r"^/api/state$", api.get_state, None),
     ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
@@ -124,7 +144,11 @@ ROUTES = [
     ("POST", r"^/api/nodes/devices/bulk-poll$", api.post_nodes_devices_bulk_poll, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/bulk-identify$", api.post_nodes_devices_bulk_identify, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
-    ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", R)),
+    # Focus sets a three-second poll interval on a device. That is traffic
+    # this application decides to send, at twenty times the normal rate, at
+    # a box that may be a PLC — a write, not a read, whatever the browser
+    # happens to call it while a row is selected.
+    ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/mac-table$", api.get_nodes_device_mac_table, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/oids$", api.get_nodes_device_oids, ("nodes", R)),
@@ -227,7 +251,13 @@ ROUTES = [
     ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
-    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
+    # The backup's CONTENT, not its metadata: even after the redaction pass
+    # a captured config is a map of the device — interfaces, ACLs, VPN
+    # peers, management addresses — so downloading one is a ConfigRX write's
+    # privilege. The listing (dates, sizes, hashes, whether it was redacted)
+    # stays a read, which is what a read-only operator needs to answer "has
+    # this switch changed".
+    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
@@ -246,11 +276,16 @@ ROUTES = [
     # the socket is the one hijacking route in the table (see _route).
     ("GET", r"^/api/ssh/devices/(\d+)$", api.get_ssh_device, ("ssh", W)),
     ("GET", r"^/api/ssh/devices/(\d+)/socket$", api.ws_ssh_device, ("ssh", W)),
+    # The on-disk audit trail. Administrator-only, and there is deliberately
+    # no route that writes to or deletes from it.
+    ("GET", r"^/api/audit$", api.get_audit, ("admin", R)),
     ("GET", r"^/api/debug$", api.get_debug, ("debug", R)),
     ("POST", r"^/api/debug/clear$", api.post_debug_clear, ("debug", W)),
     ("POST", r"^/api/settings$", api.post_settings, _settings_requirement),
-    ("POST", r"^/api/maintenance$", api.post_maintenance, ("settings", W)),
-    ("POST", r"^/api/update$", api.post_update, ("settings", W)),
+    # Maintenance deletes retention data outright and self-update replaces
+    # this host's own code: both are administrator acts, not settings.
+    ("POST", r"^/api/maintenance$", api.post_maintenance, ("admin", W)),
+    ("POST", r"^/api/update$", api.post_update, ("admin", W)),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)
@@ -260,21 +295,54 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
 PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css", "/favicon.ico"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
+# What an account whose password must still be changed may reach. Everything
+# else under /api/ is refused until it has been: the seeded admin/admin
+# account is a way in, not an account, and the flag saying so was enforced
+# only by the bundled UI (app.js) — anything talking to the API directly was
+# exempt, so a fresh install was owned by whoever reached the port first.
+# Static files are untouched: the browser has to be able to load the app in
+# order to show the change-password dialog at all.
+MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state",
+                   "/api/heartbeat", "/api/password"}
+
 SESSION_COOKIE = "sw_session"
+
+
+class LengthRequired(ValueError):
+    """A body this server will not read: chunked rather than measured. Its
+    own type so _route can answer 411 instead of the 400 every other bad
+    body gets."""
+
+
+# How many source addresses the access log remembers at once. `recent` has
+# always been a bounded deque; `clients` was a plain dict with nothing
+# removing entries, so every address that ever made a request stayed for
+# the life of the process along with its user-agent string — every
+# port-scanner source, every health-check probe, every DHCP-reassigned
+# laptop. A thousand is far more than any real operator population and
+# still a bounded amount of memory and of work for the console, which
+# re-sorts this dict once a second.
+MAX_TRACKED_CLIENTS = 1000
 
 
 class AccessLog:
     """Recent requests and per-client totals, for the service console.
 
-    Bounded: this is a live view, not an audit trail. Static files are counted
-    but kept out of the recent list, which would otherwise be nothing but the
-    five scripts every page load fetches.
+    Bounded in both directions: this is a live view, not an audit trail —
+    that is what appdb's `audit` table is for, and unlike this it is never
+    trimmed. Static files are counted but kept out of the recent list,
+    which would otherwise be nothing but the five scripts every page load
+    fetches.
     """
 
-    def __init__(self, capacity: int = 400):
+    def __init__(self, capacity: int = 400,
+                 max_clients: int = MAX_TRACKED_CLIENTS):
         self._lock = threading.Lock()
         self.recent: deque = deque(maxlen=capacity)
-        self.clients: dict[str, dict] = {}
+        # Ordered by least-recently-seen, so eviction drops the address
+        # that has been quiet longest rather than an arbitrary one.
+        self.clients: "OrderedDict[str, dict]" = OrderedDict()
+        self.max_clients = max_clients
         self.total = 0
         self.errors = 0
         self.active = 0
@@ -303,6 +371,9 @@ class AccessLog:
                 info["agent"] = agent
             if status >= 400:
                 info["errors"] += 1
+            self.clients.move_to_end(client)
+            while len(self.clients) > self.max_clients:
+                self.clients.popitem(last=False)
 
     def opened(self) -> None:
         with self._lock:
@@ -335,10 +406,30 @@ class Handler(BaseHTTPRequestHandler):
     service: Service = None      # set on the server instance
     access: AccessLog = None
 
+    # socketserver only calls settimeout() when this is not None, so without
+    # it a half-open connection sat in readline() forever holding its
+    # thread — one slow-loris socket per thread, with no cap on either.
+    # Thirty seconds is far longer than any legitimate client needs to
+    # finish sending a request. The terminal's WebSocket replaces this with
+    # its own timeout the moment it takes the socket over (wsock.WebSocket),
+    # so a quiet shell is not affected.
+    timeout = 30
+
     # ------------------------------------------------------------ plumbing
 
     def log_message(self, fmt, *args):
         return  # the event log is the log; stderr noise helps nobody
+
+    def send_response(self, code, message=None):
+        """The base class's, without the `Server` header.
+
+        "SappiWhere" on every response tells an unauthenticated scanner
+        which product — and so which version-specific weaknesses — to try,
+        and buys nothing: no client here reads it.
+        """
+        self.log_request(code)
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
 
     def setup(self):
         super().setup()
@@ -365,13 +456,23 @@ class Handler(BaseHTTPRequestHandler):
         # this used to carry matched *any* host, which would let every page
         # in the product open a socket anywhere. `frame-ancestors 'none'`
         # keeps the terminal — Trust button and all — out of anyone's
-        # iframe. Inline styles stay allowed for the terminal emulator,
+        # iframe. `form-action 'self'` is what stops injected markup from
+        # posting an operator's typing off-site, and `base-uri 'none'`
+        # stops an injected <base> from repointing every relative URL on
+        # the page. Inline styles stay allowed for the terminal emulator,
         # which injects its own <style>.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline';"
-                         " connect-src 'self'; frame-ancestors 'none'")
+                         " connect-src 'self'; frame-ancestors 'none';"
+                         " base-uri 'none'; form-action 'self'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # Only under TLS: sent over plain HTTP it is ignored by browsers,
+        # and sending it from a host that is later served without a
+        # certificate would lock the interface out of every browser that
+        # remembered it.
+        if getattr(self.server, "is_tls", False):
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -384,26 +485,63 @@ class Handler(BaseHTTPRequestHandler):
         headers.update(extra_headers or {})
         self._send(code, body, "application/json; charset=utf-8", headers)
 
-    # Every request body this app takes is JSON, and the largest legitimate
-    # one by far is a base64-encoded MIB zip (max_mib_bundle_bytes, 64 MB by
-    # default, ~85 MB once encoded). Anything past this is refused before a
-    # byte is read, rather than being pulled into memory first — otherwise a
-    # single mistyped Content-Length is an out-of-memory kill.
-    MAX_BODY_BYTES = 128 * 1024 * 1024
+    # Every request body this app takes is JSON, and every one of them is
+    # small — a device, a rule, a settings block. Anything past this is
+    # refused before a byte is read, rather than being pulled into memory
+    # first: a single mistyped Content-Length used to be a 128 MiB
+    # allocation, and that was the general limit for every route.
+    MAX_BODY_BYTES = 16 * 1024 * 1024
 
-    def _body(self) -> dict:
+    # The exception, and the only one: a MIB upload carries a base64-encoded
+    # archive, whose ceiling is the operator's own max_mib_bundle_bytes
+    # setting (64 MB by default, ~85 MB once encoded). Raising the limit for
+    # exactly these paths keeps the general cap tight without breaking a
+    # documented setting.
+    LARGE_BODY_PATHS = ("/api/nodes/mibs",)
+
+    def _body_limit(self, path: str) -> int:
+        if not path.startswith(self.LARGE_BODY_PATHS):
+            return self.MAX_BODY_BYTES
+        try:
+            budget = int(self.service.nodes_settings.get(
+                "max_mib_bundle_bytes", 0))
+        except (AttributeError, TypeError, ValueError):
+            budget = 0
+        # base64 is four bytes per three, plus the JSON envelope around it.
+        return max(self.MAX_BODY_BYTES, (budget * 4) // 3 + 65536)
+
+    def _body(self, limit: int | None = None) -> dict:
+        # Chunked bodies were read as Content-Length 0, i.e. as an empty
+        # body, and the request then ran with default arguments — POST
+        # /api/settings with no body resolves to apply_global_settings({}).
+        # Harmless as deployed (HTTP/1.0, no keep-alive) and a hole the
+        # moment a reverse proxy forwards a chunked request, so it is
+        # refused outright rather than silently reinterpreted.
+        if (self.headers.get("Transfer-Encoding") or "").strip():
+            raise LengthRequired(
+                "This server reads Content-Length only; send the body with a "
+                "length rather than chunked")
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
-        if length > self.MAX_BODY_BYTES:
+        cap = self.MAX_BODY_BYTES if limit is None else limit
+        if length > cap:
             raise ValueError(
                 f"Request body of {length:,} bytes exceeds the "
-                f"{self.MAX_BODY_BYTES:,} byte limit")
+                f"{cap:,} byte limit")
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return {}
+        if not isinstance(body, dict):
+            return {}
+        # Underscore-prefixed keys are this layer's, not the caller's — the
+        # same rule the query string has always had. Only the body was
+        # exempt, and post_login read `_agent` out of it, so the session
+        # list showed whatever the client claimed instead of its real
+        # User-Agent (arbitrary markup included).
+        return {k: v for k, v in body.items() if not str(k).startswith("_")}
 
     # -------------------------------------------------------------- routing
 
@@ -456,6 +594,55 @@ class Handler(BaseHTTPRequestHandler):
                     (time.perf_counter() - started) * 1000,
                     self.headers.get("User-Agent", "")[:120])
 
+    def _origin_matches(self, origin: str) -> bool:
+        """Whether `origin` is this server's own origin — scheme, host and
+        port, all three.
+
+        Comparing the netloc alone accepted `https://host:8443` against a
+        plain-HTTP listener on that host and port, and vice versa. The hole
+        is narrow (a page at `http://host:8443` cannot exist while
+        `https://host:8443` is what is listening) but an origin is defined
+        as the triple and there is no reason to compare two thirds of it.
+        The scheme comes from whether a certificate is configured, which is
+        the same thing the cookie's `Secure` flag is decided by.
+        """
+        parsed = urlparse(origin)
+        expected_scheme = "https" if getattr(self.server, "is_tls", False) else "http"
+        host = (self.headers.get("Host") or "").strip().lower()
+        return (parsed.scheme.lower() == expected_scheme
+                and parsed.netloc.lower() == host)
+
+    def _same_origin(self, require_origin: bool = False) -> bool:
+        """Whether a request came from this server's own pages.
+
+        One rule, used by both the state-changing methods and the
+        terminal's WebSocket upgrade, with `require_origin` the single
+        difference between them. A browser always sends `Origin` on an
+        upgrade, so the socket refuses a missing one. It does NOT always
+        send it on a same-origin fetch, and nothing outside a browser sends
+        it at all — the demo harness and every script that drives this API
+        through http.client included — so for POST/PUT/DELETE an absent
+        `Origin` is allowed. That is not a hole: the attack this closes is a
+        page on another origin using the operator's cookie, and a browser
+        doing that always labels it. `Sec-Fetch-Site` is checked the same
+        way: honoured when the browser sends it, absent otherwise.
+
+        `SameSite=Strict` on the cookie is not enough on its own, because
+        "site" is registrable-domain-scoped: another port on this host or a
+        sibling subdomain is the same site, and over plain HTTP a network
+        attacker can put a page on one.
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            if require_origin:
+                return False
+        elif not self._origin_matches(origin):
+            return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site and site not in ("same-origin", "none"):
+            return False
+        return True
+
     def _route(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -487,6 +674,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(302, b"", "text/plain", {"Location": "/login"})
             return
 
+        # The flag on the account, not on the session: a reset takes effect
+        # for a session that is already open, and the check costs one indexed
+        # lookup on a table with one row per operator.
+        if session and path.startswith("/api/") and path not in MUST_CHANGE_API:
+            row = self.service.app_db.user(session["username"])
+            if row is not None and row["must_change"]:
+                self._json({"error": "password change required"}, 403)
+                return
+
         # A cross-site form can send a POST but cannot set this content type
         # without a preflight the browser will refuse. With SameSite=Strict on
         # the cookie that is belt and braces, but both are cheap.
@@ -494,6 +690,9 @@ class Handler(BaseHTTPRequestHandler):
             content_type = (self.headers.get("Content-Type") or "").split(";")[0]
             if content_type.strip() != "application/json":
                 self._json({"error": "Requests must be application/json"}, 415)
+                return
+            if not self._same_origin():
+                self._json({"error": "Cross-origin request refused"}, 403)
                 return
 
         for route_method, pattern, handler, requirement in COMPILED:
@@ -503,7 +702,8 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 continue
             try:
-                body = self._body() if method in ("POST", "PUT", "DELETE") else {}
+                body = (self._body(self._body_limit(path))
+                        if method in ("POST", "PUT", "DELETE") else {})
                 need = requirement(params, body) if callable(requirement) else requirement
                 if need is not None:
                     module, level = need
@@ -540,12 +740,13 @@ class Handler(BaseHTTPRequestHandler):
                     # sibling subdomain is "same site" and its page could
                     # otherwise open this socket with the operator's cookie
                     # and drive a shell. A browser always sends Origin on an
-                    # upgrade, so a missing one is refused too; it is a check
-                    # about who is asking, which is this layer's business,
-                    # not the framing's.
-                    origin = (self.headers.get("Origin") or "").strip()
-                    host = (self.headers.get("Host") or "").strip().lower()
-                    if not origin or urlparse(origin).netloc.lower() != host:
+                    # upgrade, so a missing one is refused too (hence
+                    # require_origin); it is a check about who is asking,
+                    # which is this layer's business, not the framing's.
+                    # Same helper as the POST/PUT/DELETE rule above, so the
+                    # two cannot drift — and it compares the scheme as well
+                    # as the netloc, which this check used not to.
+                    if not self._same_origin(require_origin=True):
                         self._json({"error": "Cross-origin WebSocket refused"}, 403)
                         return
                     try:
@@ -572,6 +773,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/logout":
                     headers = self._set_session_cookie("", clear=True)
                 self._json(result, extra_headers=headers)
+            except LengthRequired as exc:
+                self._json({"error": str(exc)}, 411)
+            except auth.LockedOut as exc:
+                # Before the ValueError arm below: LockedOut is an AuthError,
+                # not a ValueError, but keeping it here says plainly that
+                # "stop" and "wrong password" are different answers.
+                self._json({"error": str(exc)}, 429)
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
             except ValueError as exc:

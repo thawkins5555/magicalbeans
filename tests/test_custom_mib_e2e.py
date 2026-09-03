@@ -51,6 +51,12 @@ def call(method, path, body=None, token=None):
 
 
 def login(username, password):
+    # 4.37 refuses every API route for an account whose password must still
+    # be changed, so clear the flag rather than re-password every account
+    # this suite uses. The stored hash goes back unchanged.
+    row = service.app_db.user(username)
+    if row is not None and row["must_change"]:
+        service.app_db.set_password(username, row["password"], must_change=False)
     status, payload, headers = call("POST", "/api/login", {"username": username, "password": password})
     assert status == 200, (status, payload)
     return headers.get("Set-Cookie", "").split("sw_session=")[1].split(";")[0]

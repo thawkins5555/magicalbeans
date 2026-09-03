@@ -228,21 +228,101 @@ def _parse_bsd_arp(output: str) -> dict[str, str]:
     return table
 
 
-def sweep(addresses: list[str], timeout_ms: int = 800,
-          workers: int = 64) -> dict[str, bool]:
-    """Ping every address concurrently. Returns {ip: answered}."""
+# Probes per second a sweep may put on the wire. 64 workers each launching
+# a `ping` as fast as it finishes was, on a /24, a burst of hundreds of ICMP
+# echo requests in well under a second — the traffic pattern that has
+# knocked over legacy PLC and RTU stacks. 200/s still finishes a /24 in
+# about a second and a quarter; the point is that it is a rate rather than
+# "as fast as this machine can fork".
+DEFAULT_PROBES_PER_SECOND = 200
+
+
+def parse_never_scan(text) -> list:
+    """The "never scan these" list, as networks. Accepts a comma- or
+    whitespace-separated string (what a settings field holds) or a list.
+    Anything unparseable is dropped rather than raised on: a typo in a
+    safety list must not stop the application starting, and an entry that
+    does not parse simply protects nothing."""
+    if not text:
+        return []
+    parts = text if isinstance(text, (list, tuple)) else re.split(r"[,\s]+", str(text))
+    networks = []
+    for part in parts:
+        part = str(part).strip()
+        if not part:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def is_never_scanned(ip: str, networks) -> bool:
+    if not networks:
+        return False
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)
+
+
+def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
+          probes_per_second: float = DEFAULT_PROBES_PER_SECOND,
+          never_scan=()) -> dict[str, bool]:
+    """Ping every address, at most `probes_per_second` of them. Returns
+    {ip: answered}.
+
+    Addresses inside `never_scan` are never probed at all and come back
+    False — "did not answer" is exactly what they are to every caller, and
+    the alternative (omitting them) would make a bounded sweep silently
+    report fewer addresses than it was asked about.
+
+    Pacing is applied where the probe is *submitted*, not where it
+    completes, so the rate is a rate on the wire rather than on the
+    results. The pool still runs `workers` probes concurrently: a probe
+    takes up to `timeout_ms`, so a single-threaded 200/s is not reachable
+    at all with a 800 ms timeout.
+    """
     results: dict[str, bool] = {}
     if not addresses:
         return results
+    blocked = parse_never_scan(never_scan)
+    interval = 1.0 / probes_per_second if probes_per_second and probes_per_second > 0 else 0.0
+
+    to_probe = []
+    for ip in addresses:
+        if is_never_scanned(ip, blocked):
+            results[ip] = False
+        else:
+            to_probe.append(ip)
+    if not to_probe:
+        return results
+
+    def paced(index_ip):
+        index, ip = index_ip
+        if interval:
+            # Absolute rather than a sleep per probe: a sleep between
+            # submissions would add the probe's own latency to the gap and
+            # halve the effective rate.
+            due = started + index * interval
+            delay = due - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+        return ping_once(ip, timeout_ms)
+
+    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        for ip, alive in zip(addresses, pool.map(
-                lambda ip: ping_once(ip, timeout_ms), addresses)):
+        for ip, alive in zip(to_probe, pool.map(paced, enumerate(to_probe))):
             results[ip] = alive
     return results
 
 
 def scan_subnet(cidr: str, max_addresses: int, timeout_ms: int = 800,
-                workers: int = 64) -> tuple[dict[str, bool], dict[str, str]]:
+                workers: int = 64,
+                probes_per_second: float = DEFAULT_PROBES_PER_SECOND,
+                never_scan=()) -> tuple[dict[str, bool], dict[str, str]]:
     """One full pass: ping every address, then read the ARP table once.
 
     Returns (alive, arp) — alive is every address probed, arp is whatever the
@@ -250,7 +330,8 @@ def scan_subnet(cidr: str, max_addresses: int, timeout_ms: int = 800,
     just answered is fine; the caller only looks up addresses it asked about).
     """
     addresses = usable_addresses(cidr, max_addresses)
-    alive = sweep(addresses, timeout_ms=timeout_ms, workers=workers)
+    alive = sweep(addresses, timeout_ms=timeout_ms, workers=workers,
+                  probes_per_second=probes_per_second, never_scan=never_scan)
     arp = read_arp_table()
     net = ipaddress.ip_network(str(cidr).strip(), strict=False)
     in_subnet = {ip: mac for ip, mac in arp.items()
