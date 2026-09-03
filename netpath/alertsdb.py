@@ -1167,6 +1167,20 @@ class AlertsDatabase:
                 (cutoff_ts,)).fetchall()
         return {row["dedup_key"]: row["ts"] for row in rows}
 
+    def open_dedup_keys(self) -> set:
+        """Every dedup_key with an open or acknowledged alert.
+
+        One query for the whole set rather than open_by_dedup per candidate:
+        the threshold evaluator asks "does this already have an alert" for
+        every breaching device on every tick, and during a site outage that
+        is hundreds of lookups a tick for an answer that is almost always
+        yes.
+        """
+        with self._lock:
+            return {row["dedup_key"] for row in self._conn.execute(
+                "SELECT dedup_key FROM alerts WHERE state IN ('open','acked')"
+            ).fetchall()}
+
     def open_by_dedup(self, dedup_key: str) -> sqlite3.Row | None:
         """The open (or acknowledged) alert for this dedup key, if any.
 

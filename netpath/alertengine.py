@@ -993,6 +993,9 @@ class AlertEngine:
         # with add/remove churn leaked an entry per deleted device. Only the
         # devices this tick actually saw are carried forward.
         live_streaks: dict[tuple, tuple] = {}
+        # Loaded on first use and only when a breach has no new sample behind
+        # it, so a tick with nothing breaching costs nothing extra.
+        open_keys: set | None = None
         for device_id in device_ids:
             device = devices.get(device_id)
             if device is None:
@@ -1040,7 +1043,8 @@ class AlertEngine:
                         device_name=device["name"] or "", device_ip=device["ip"],
                         extra={"metric_label": metric["label"] if metric else rule["source_kind"],
                               "value": str(value), "threshold": str(rule["threshold"])})
-                    resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
+                    key = dedup_key(rule, occurrence)
+                    resolved_ts = self._operator_resolves.get(key)
                     if (resolved_ts is not None and first_breach_ts is not None
                             and first_breach_ts <= resolved_ts):
                         # An operator resolved this exact breach run by hand;
@@ -1048,6 +1052,25 @@ class AlertEngine:
                         # resets first_breach_ts above) is followed by a new
                         # breach — see AlertsDatabase.operator_resolved_since.
                         continue
+                    if sample_ts is not None and sample_ts == previous_ts:
+                        # Nothing has been polled since the last tick, so
+                        # there is no new occurrence to report — only the
+                        # same one, still true. Raising it anyway bumped
+                        # `count` every five seconds, so a CPU alert open
+                        # overnight told the operator it had "occurred 8640
+                        # time(s)" when the metric had been sampled 480
+                        # times: the number meant engine ticks.
+                        #
+                        # Still raised when nothing is open for this key,
+                        # because that is how a threshold re-derives itself —
+                        # after a rollup parent clears, or after an alert is
+                        # resolved while the breach continues, the next tick
+                        # has to be able to open it again without waiting for
+                        # a fresh sample.
+                        if open_keys is None:
+                            open_keys = self.db.open_dedup_keys()
+                        if key in open_keys:
+                            continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     dedup = dedup_key(rule, Occurrence(

@@ -727,3 +727,39 @@ assert engine._breach_streaks == {}, engine._breach_streaks
 ok("streak state for a deleted device is dropped rather than leaked")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# =================================================================== A10
+print("\nA10 — count means occurrences, not engine ticks")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+did = add_device(nodes, "10.10.0.1", "core-sw-a")
+base = time.time()
+# Twenty-one breaching polls a minute apart, with four idle ticks between
+# each: cpu_high needs for_polls=2, so it opens on the second and is
+# incremented by the nineteen after it.
+for i in range(21):
+    nodes.record_metric_sample(did, "cpu_pct", "CPU", "%", "gauge",
+                               base + i * 60, 97.0)
+    engine._tick()
+    for _ in range(4):
+        engine._tick()
+live = open_rows(alerts, "cpu_high", did)
+assert len(live) == 1, [dict(a) for a in live]
+assert live[0]["count"] == 20, live[0]["count"]
+ok(f"20 minutes at 60 s samples with 105 ticks gives count "
+   f"{live[0]['count']}, not 105")
+
+# The re-derivation that count-suppression must not break: resolve the alert
+# while the breach continues and no new sample arrives — the very next tick
+# has to open it again.
+alerts.resolve(live[0]["id"], by="")
+engine._tick()
+again = open_rows(alerts, "cpu_high", did)
+assert len(again) == 1 and again[0]["id"] != live[0]["id"], \
+    [dict(a) for a in again]
+ok("a still-breaching threshold with no open alert re-opens on the next "
+   "tick, with no new sample")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
