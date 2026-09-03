@@ -1008,6 +1008,62 @@ check("the default cap is small enough to matter",
       str(ipam_worker.DEFAULT_MAX_CONCURRENT_SCANS))
 
 
+# ------------------------------------------- H11: the curated port-name table
+
+print("H11 the port table has no duplicate keys and no editorial labels")
+
+from netpath import services                         # noqa: E402
+
+# Eleven keys were written twice in the same dict literal. The values agreed,
+# so nothing behaved wrongly — but a reader has to check that by hand, and the
+# next edit to one of a pair is silently discarded.
+SERVICES_PATH = os.path.join(REPO_ROOT, "netpath", "services.py")
+with open(SERVICES_PATH, encoding="utf-8") as handle:
+    services_tree = ast.parse(handle.read())
+literal_keys: list = []
+for node in ast.walk(services_tree):
+    if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "PORTS":
+        literal_keys = [key.value for key in node.value.keys]
+repeated = sorted({k for k in literal_keys if literal_keys.count(k) > 1})
+check("no port is listed twice in the PORTS literal", repeated == [],
+      str(repeated))
+check("...and the table still has everything it had",
+      len(literal_keys) == len(services.PORTS) == 185, str(len(literal_keys)))
+
+# The labels that were opinions rather than registrations, on a chart an
+# operator may take to a security meeting.
+check("4444 is no longer labelled with an attack tool", 4444 not in services.PORTS)
+check("3391 is no longer labelled with an invented name", 3391 not in services.PORTS)
+check("5555 is no longer labelled as a game", 5555 not in services.PORTS)
+for port in (4444, 3391, 5555):
+    shown = services.port_name(port)
+    check(f"...and {port} now shows the registration or the number, nothing else",
+          shown == str(port) or shown.endswith(f"({port})"), shown)
+
+# The entries that matter for this product must be exactly as they were: the
+# industrial protocols, and every key that was one half of a duplicate pair.
+industrial = {502: "Modbus", 2222: "EtherNet/IP", 44818: "EtherNet/IP",
+              20000: "DNP3", 2404: "IEC-104", 34962: "PROFINET-RT",
+              34963: "PROFINET-RTM", 34964: "PROFINET-CM", 47808: "BACnet",
+              4840: "OPC-UA", 1883: "MQTT", 8883: "MQTT-TLS"}
+wrong = {k: (v, services.PORTS.get(k)) for k, v in industrial.items()
+         if services.PORTS.get(k) != v}
+check("every industrial protocol name is untouched", wrong == {}, str(wrong))
+
+deduped = {1194: "OpenVPN", 1521: "Oracle", 1701: "L2TP", 1723: "PPTP",
+           1812: "RADIUS", 2049: "NFS", 3128: "Squid", 4500: "IPsec-NAT",
+           5061: "SIPS", 5432: "PostgreSQL", 5671: "AMQPS", 5672: "AMQP"}
+wrong = {k: (v, services.PORTS.get(k)) for k, v in deduped.items()
+         if services.PORTS.get(k) != v}
+check("every de-duplicated port kept the name both copies agreed on",
+      wrong == {}, str(wrong))
+check("port_name still reads as a name and a number",
+      services.port_name(502) == "Modbus (502)"
+      and services.port_name(443) == "HTTPS (443)"
+      and services.port_name(0, resolve=False) == "0",
+      services.port_name(502))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)

@@ -3,6 +3,16 @@
 Three sources, in order: names the site has declared, a small curated table for
 the ones worth presenting nicely, and the operating system's own services file
 for everything else registered with IANA.
+
+The curated table names registrations and the industrial protocols this
+product exists for. It does not name what software the traffic might be,
+because these labels are read off a chart and taken to a meeting: "Metasploit
+(4444)" is an accusation the flow record cannot support, and a port with a
+registration that ordinary software also uses is better shown under that
+registration -- or under nothing, which lets the OS services file answer --
+than under a guess. A port whose meaning is site-specific belongs in the
+NetFlow settings' custom port list, where a person takes responsibility for
+it.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ PORTS = {
     1521: "Oracle", 1645: "RADIUS", 1646: "RADIUS", 1701: "L2TP", 1723: "PPTP",
     1812: "RADIUS", 1813: "RADIUS", 1883: "MQTT", 2049: "NFS", 2055: "NetFlow",
     2222: "EtherNet/IP", 3128: "Squid", 3268: "LDAP-GC", 3306: "MySQL",
-    3389: "RDP", 4444: "Metasploit", 4500: "IPsec-NAT", 5060: "SIP",
+    3389: "RDP", 4500: "IPsec-NAT", 5060: "SIP",
     5061: "SIPS", 5432: "PostgreSQL", 5900: "VNC", 5985: "WinRM",
     5986: "WinRM-S", 6379: "Redis", 8000: "HTTP-alt", 8080: "HTTP-proxy",
     8443: "HTTPS-alt", 9100: "JetDirect", 9200: "Elasticsearch",
@@ -40,18 +50,18 @@ PORTS = {
     646: "LDP", 830: "NETCONF", 831: "NETCONF-ssh", 873: "rsync",
     902: "VMware", 989: "FTPS-data", 990: "FTPS", 992: "Telnets",
     1080: "SOCKS", 1099: "Java-RMI", 1352: "Lotus", 1414: "MQ-Series",
-    1521: "Oracle", 1547: "Laplink", 1604: "Citrix-ICA", 1701: "L2TP",
-    1720: "H.323", 1755: "MMS", 1812: "RADIUS", 1985: "HSRP",
-    2000: "SCCP", 2002: "Cisco-globe", 2049: "NFS", 2082: "cPanel",
+    1547: "Laplink", 1604: "Citrix-ICA",
+    1720: "H.323", 1755: "MMS", 1985: "HSRP",
+    2000: "SCCP", 2002: "Cisco-globe", 2082: "cPanel",
     2083: "cPanel-SSL", 2181: "ZooKeeper", 2375: "Docker", 2376: "Docker-TLS",
-    2404: "IEC-104", 2598: "Citrix-CGP", 3128: "Squid", 3260: "iSCSI",
+    2404: "IEC-104", 2598: "Citrix-CGP", 3260: "iSCSI",
     3269: "LDAPS-GC", 3299: "SAP-router", 3478: "STUN", 3479: "STUN",
     3690: "Subversion", 3784: "BFD", 3785: "BFD-echo", 4369: "EPMD",
-    4500: "IPsec-NAT", 4505: "Salt", 4506: "Salt", 4840: "OPC-UA",
+    4505: "Salt", 4506: "Salt", 4840: "OPC-UA",
     4949: "Munin", 5000: "UPnP", 5001: "commplex-link", 5007: "WSM-Server-SSL",
     5222: "XMPP", 5269: "XMPP-server", 5353: "mDNS", 5355: "LLMNR",
-    5357: "WSDAPI", 5432: "PostgreSQL", 5555: "Freeciv", 5601: "Kibana",
-    5672: "AMQP", 5671: "AMQPS", 5666: "NRPE", 5671: "AMQPS",
+    5357: "WSDAPI", 5601: "Kibana",
+    5666: "NRPE", 5671: "AMQPS", 5672: "AMQP",
     5701: "Hazelcast", 5800: "VNC-http", 5901: "VNC-1", 5902: "VNC-2",
     5903: "VNC-3", 5938: "TeamViewer", 5984: "CouchDB", 6000: "X11",
     6001: "X11-1", 6081: "Geneve", 6443: "Kubernetes", 6514: "Syslog-TLS",
@@ -65,7 +75,6 @@ PORTS = {
     25565: "Minecraft", 26000: "Quake", 32768: "filenet-tms",
     34962: "PROFINET-RT", 34963: "PROFINET-RTM", 34964: "PROFINET-CM",
     47808: "BACnet", 51820: "WireGuard", 4789: "VXLAN", 1935: "RTMP",
-    1194: "OpenVPN", 1723: "PPTP", 3391: "RDP-censor", 5061: "SIPS",
 }
 
 
