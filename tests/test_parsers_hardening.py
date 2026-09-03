@@ -182,6 +182,103 @@ check("...and 'END' is no longer recorded as an object",
       "END" not in by_name)
 
 
+# --------------------------------------------- H2: resolve() follows the chain
+
+print("H2  resolve() is linear in the number of objects")
+
+
+def chain_mib(depth: int, terminate: bool = True) -> str:
+    """A MIB that lists every object before the parent it hangs off — legal,
+    and what a generated MIB usually looks like. One sweep per link was one
+    sweep too many."""
+    lines = ["CHAIN DEFINITIONS ::= BEGIN"]
+    lines += [f"o{i} OBJECT IDENTIFIER ::= {{ o{i + 1} 1 }}" for i in range(depth)]
+    if terminate:
+        lines.append(f"o{depth} OBJECT IDENTIFIER ::= {{ enterprises 1 }}")
+    lines.append("END")
+    return "\n".join(lines)
+
+
+parsed = mibparse.parse(chain_mib(10000), max_bytes=8 * 1024 * 1024)
+(count, unresolved), elapsed = timed(
+    mibparse.resolve, parsed.objects, dict(mibparse.WELL_KNOWN_ROOTS))
+check("a 10,000-deep reversed dependency chain resolves in under 2 s",
+      elapsed < 2.0, f"{elapsed:.3f}s (5.89 s before)")
+check("...and every object in it resolved",
+      count == 10001 and not unresolved, f"{count} resolved, {unresolved[:3]}")
+by_name = {o.name: o for o in parsed.objects}
+check("...to the right OIDs", by_name["o10000"].oid == "1.3.6.1.4.1.1"
+      and by_name["o9998"].oid == "1.3.6.1.4.1.1.1.1", by_name["o9998"].oid)
+
+# The same chain with nothing at the bottom: every object is unresolvable,
+# and finding that out must not cost a walk per object either.
+parsed = mibparse.parse(chain_mib(20000, terminate=False), max_bytes=8 * 1024 * 1024)
+(count, unresolved), elapsed = timed(
+    mibparse.resolve, parsed.objects, dict(mibparse.WELL_KNOWN_ROOTS))
+check("a 20,000-deep chain that resolves to nothing is rejected in under 1 s",
+      elapsed < 1.0, f"{elapsed:.3f}s")
+check("...having resolved nothing, and reporting every parent it wanted",
+      count == 0 and len(unresolved) == 20000 and "o20000" in unresolved,
+      f"{count} resolved, {len(unresolved)} unresolved parents")
+
+# A MIB whose parents form a cycle must terminate, not spin.
+cycle = mibparse.parse("C DEFINITIONS ::= BEGIN\n"
+                       "a OBJECT IDENTIFIER ::= { b 1 }\n"
+                       "b OBJECT IDENTIFIER ::= { a 1 }\nEND", max_bytes=MB)
+count, unresolved = mibparse.resolve(cycle.objects, dict(mibparse.WELL_KNOWN_ROOTS))
+check("a cycle in the parent chain resolves nothing and terminates",
+      count == 0 and unresolved == ["a", "b"], f"{count}, {unresolved}")
+
+
+# --------------------------------- H2: resolve_all() resolves once, not 8 times
+
+class FakeMibStore:
+    """The five nodes_db methods resolve_all() uses, in memory."""
+
+    def __init__(self, files: dict[str, str]):
+        self.rows = [{"id": i, "filename": n, "content": c}
+                     for i, (n, c) in enumerate(sorted(files.items()))]
+        self.objects: dict[int, list[dict]] = {r["id"]: [] for r in self.rows}
+        self.updates: dict[int, dict] = {}
+        self.parses = 0
+
+    def mib_files(self):
+        self.parses += 1
+        return list(self.rows)
+
+    def all_known_oids(self):
+        return {}
+
+    def mib_objects(self, mib_file_id):
+        return self.objects[mib_file_id]
+
+    def update_mib_file(self, mib_file_id, **fields):
+        self.updates.setdefault(mib_file_id, {}).update(fields)
+
+    def replace_mib_objects(self, mib_file_id, objects):
+        self.objects[mib_file_id] = objects
+
+
+# Five files, each hanging off the one uploaded after it: the shape that made
+# upload order matter, and the one the pass loop paid 8 sweeps for.
+files = {"e-05.mib": "M5 DEFINITIONS ::= BEGIN\n"
+                     "lvl5 OBJECT IDENTIFIER ::= { enterprises 42 }\nEND"}
+for level in range(4, 0, -1):
+    files[f"e-{level:02d}.mib"] = (
+        f"M{level} DEFINITIONS ::= BEGIN\n"
+        f"lvl{level} OBJECT IDENTIFIER ::= {{ lvl{level + 1} {level} }}\nEND")
+store = FakeMibStore(files)
+summary = mibparse.resolve_all(store, max_bytes=MB)
+oids = {o["name"]: o["oid"] for rows in store.objects.values() for o in rows}
+check("a five-file chain resolves in one pass whatever order the files are in",
+      summary["passes"] == 1 and summary["resolved_count"] == 5,
+      str(summary))
+check("...to the right OIDs across every file",
+      oids == {"lvl5": "1.3.6.1.4.1.42", "lvl4": "1.3.6.1.4.1.42.4",
+               "lvl3": "1.3.6.1.4.1.42.4.3", "lvl2": "1.3.6.1.4.1.42.4.3.2",
+               "lvl1": "1.3.6.1.4.1.42.4.3.2.1"}, str(oids))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)
