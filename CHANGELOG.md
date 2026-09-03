@@ -6,6 +6,14 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.36.0 — unreleased
+
+Work in progress from the network-engineer review (`REVIEW-NETWORK-ENGINEER.md`). Entries are grouped by area and added as each change lands; the package version stays 4.35.0 until release.
+
+#### Foundation
+
+- `netpath/dbopen.py`: one `connect()` helper that opens a database and narrows the file and its WAL/SHM companions to owner-only (0600) on POSIX hosts. Modules adopt it as they are touched.
+
 ### 4.35.0 — A question mark beside the setting
 
 - **Settings can now explain themselves.** A small **?** beside a control
