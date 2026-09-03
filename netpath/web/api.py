@@ -1451,8 +1451,25 @@ def post_ipam_dhcp_server(service, params, body) -> dict:
 
 
 def put_ipam_dhcp_server(service, params, body, server_id) -> dict:
+    existing = service.ipam_db.dhcp_server(server_id)
+    if not existing:
+        raise ValueError("No such DHCP server")
     fields = {k: v for k, v in body.items() if k in ("address", "label", "enabled")}
+    # A stored credential belongs to the machine it was stored for. Pointing
+    # the row at a different address and then pressing Test or Poll would
+    # otherwise hand that account's password to whatever answers there —
+    # the same retargeting the SMTP test allowed. Moving the row forgets the
+    # credential; storing one again is a deliberate act naming the new host.
+    moved = ("address" in fields
+             and str(fields["address"]).strip() != str(existing["address"] or ""))
     service.ipam_db.update_dhcp_server(server_id, **fields)
+    if moved and existing["password_enc"]:
+        service.ipam_db.clear_dhcp_credential(server_id)
+        service.log.add(IPAM_CATEGORY,
+                        f"Cleared the stored credential for DHCP server "
+                        f"{existing['label']}: its address changed from "
+                        f"{existing['address']} to {fields['address']}")
+        return {"ok": True, "credential_cleared": True}
     return {"ok": True}
 
 
@@ -3360,22 +3377,52 @@ def delete_alerts_smtp_credential(service, params, body) -> dict:
     return {"ok": True}
 
 
+# The body fields that decide WHERE the test email goes and how the
+# connection to it is protected. Overriding any of them and letting the
+# stored password be used is how a stored SMTP credential was made to walk
+# out to any host and port on the network (`AUTH PLAIN` in the clear, to a
+# listener of the caller's choosing). Testing an unsaved host is still
+# allowed — with the password for that host typed in beside it.
+_SMTP_DESTINATION_KEYS = ("smtp_host", "smtp_port", "smtp_security",
+                          "smtp_verify_cert")
+
+# Transports that actually protect a password on the wire. Anything else
+# ("none", "plain", a typo) sends AUTH over cleartext TCP.
+_SMTP_SECURE = ("ssl", "starttls")
+
+
 def post_alerts_smtp_test(service, params, body) -> dict:
     """Sends a real test email, using in-progress-edit SMTP settings from
     the body when present, else the saved ones — the same "test what's
     typed before saving" idiom as IPAM's DHCP test and the SNMP Trap/
-    Syslog "send test" buttons."""
+    Syslog "send test" buttons.
+
+    The stored password is only ever sent to the stored destination. That
+    is the whole of CREDENTIAL-SECURITY.md's promise that a stored
+    credential can only be used or replaced, and this endpoint used to
+    break it: every destination field was taken from the request body while
+    the password came from the database.
+    """
     from .. import alertmail, dpapi
 
     to_addr = str(body.get("to", "")).strip()
     if not to_addr:
         raise ValueError("A recipient address is required")
     settings = dict(service.alerts_settings)
+    overridden = [key for key in _SMTP_DESTINATION_KEYS
+                  if key in body
+                  and str(body[key]) != str(settings.get(key, ""))]
     for key in ("smtp_host", "smtp_port", "smtp_security", "smtp_verify_cert",
                "smtp_username", "smtp_from", "smtp_from_name", "smtp_timeout_s"):
         if key in body:
             settings[key] = body[key]
     password = body.get("password")
+    if password is None and overridden:
+        raise ValueError(
+            "This test changes " + ", ".join(overridden) + ", so it cannot use "
+            "the saved password: type the password for that server into the "
+            "test instead. The saved one is only ever sent to the saved "
+            "server.")
     if password is None:
         blob = service.alerts_db.smtp_password_enc()
         if blob:
@@ -3383,6 +3430,19 @@ def post_alerts_smtp_test(service, params, body) -> dict:
                 password = dpapi.unprotect(blob).decode("utf-8")
             except Exception:
                 password = None
+    if password and str(settings.get("smtp_security", "")).lower() not in _SMTP_SECURE:
+        if not service.settings.get("smtp_allow_plain_auth", False):
+            raise ValueError(
+                f"Sending a password over "
+                f"'{settings.get('smtp_security') or 'none'}' would put it on "
+                f"the wire in the clear. Use ssl or starttls, or leave the "
+                f"password blank, or turn on \"Allow SMTP AUTH without "
+                f"transport security\" in Settings.")
+    if password and settings.get("smtp_verify_cert") is False:
+        raise ValueError(
+            "Sending a password to a server whose certificate is not "
+            "verified defeats the point of the encryption. Turn certificate "
+            "verification back on, or leave the password blank.")
     subject = "SappiWhere test email"
     body_text = "This is a test email from SappiWhere's Alerts module."
     try:
@@ -3553,10 +3613,23 @@ def post_wireless_controller(service, params, body) -> dict:
 
 
 def put_wireless_controller(service, params, body, controller_id) -> dict:
-    if not service.wireless_db.controller(controller_id):
+    existing = service.wireless_db.controller(controller_id)
+    if not existing:
         raise ValueError("No such controller")
     fields = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY}
+    # Same rule as the DHCP server above: the stored SNMPv3 password was
+    # stored for one controller at one address, so moving the row to a
+    # different address forgets it rather than offering it to whatever
+    # answers at the new one on the next poll.
+    moved = ("ip" in fields and str(fields["ip"]).strip() != str(existing["ip"] or ""))
     service.wireless_db.update_controller(controller_id, **fields)
+    if moved and existing["v3_auth_pass_enc"]:
+        service.wireless_db.set_credential(controller_id, None)
+        service.log.add(WIRELESS_CATEGORY,
+                        f"Cleared the stored credential for controller "
+                        f"{existing['name']}: its address changed from "
+                        f"{existing['ip']} to {fields['ip']}")
+        return {"ok": True, "credential_cleared": True}
     return {"ok": True}
 
 

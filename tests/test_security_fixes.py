@@ -341,6 +341,135 @@ def main() -> int:
         selfupdate.set_before_restart_hook(real_hook)
         SERVICE.app_db.save_settings({"updates_enabled": False})
 
+    # -------------------------------------------- D4 credential retargeting
+    # The listener the review used: anything that reaches it is recorded, so
+    # "no AUTH was seen" is a fact about the wire, not about the code.
+    seen = []
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    smtp_port = listener.getsockname()[1]
+    listener.listen(8)
+    listener.settimeout(0.5)
+    stop_listener = threading.Event()
+
+    def spy():
+        while not stop_listener.is_set():
+            try:
+                sock, _addr = listener.accept()
+            except (socket.timeout, OSError):
+                continue
+            try:
+                sock.settimeout(2)
+                sock.sendall(b"220 spy ESMTP\r\n")
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    seen.append(data)
+                    if data.upper().startswith(b"EHLO") or data.upper().startswith(b"HELO"):
+                        sock.sendall(b"250-spy\r\n250 AUTH PLAIN LOGIN\r\n")
+                    else:
+                        sock.sendall(b"250 ok\r\n")
+            except OSError:
+                pass
+            finally:
+                sock.close()
+
+    spy_thread = threading.Thread(target=spy, daemon=True)
+    spy_thread.start()
+    try:
+        SERVICE.alerts_db.set_smtp_credential(
+            dpapi_mod.protect(b"S3cretStoredPassword"))
+        SERVICE.alerts_db.save_settings({
+            "smtp_host": "mail.example.invalid", "smtp_port": 25,
+            "smtp_security": "starttls", "smtp_username": "svc-monitor",
+            "smtp_from": "sappiwhere@example.invalid"})
+        SERVICE.alerts_settings = SERVICE.alerts_db.settings()
+
+        status, _h, payload = req(
+            "POST", "/api/alerts/smtp/test",
+            {"to": "a@b.c", "smtp_host": "127.0.0.1", "smtp_port": smtp_port,
+             "smtp_security": "none", "smtp_username": "svc-monitor"},
+            cookie=admin_cookie)
+        check("D4 the stored SMTP password is refused for a body-supplied host",
+              status == 400 and "saved password" in str(payload.get("error", "")),
+              f"{status} {payload}")
+        check("D4 …and the listener saw nothing at all", not seen, str(seen[:2]))
+
+        # With a password typed in, the destination is allowed — but not
+        # over a transport that puts it on the wire in the clear.
+        status, _h, payload = req(
+            "POST", "/api/alerts/smtp/test",
+            {"to": "a@b.c", "smtp_host": "127.0.0.1", "smtp_port": smtp_port,
+             "smtp_security": "none", "smtp_username": "svc-monitor",
+             "password": "typed-in"}, cookie=admin_cookie)
+        check("D4 a password over an unprotected transport is refused",
+              status == 400 and "in the clear" in str(payload.get("error", "")),
+              f"{status} {payload}")
+        check("D4 …and still nothing reached the listener", not seen, str(seen[:2]))
+
+        # No password at all: the connection is allowed to happen (this is
+        # the "does the port answer" test), and no AUTH is sent.
+        status, _h, payload = req(
+            "POST", "/api/alerts/smtp/test",
+            {"to": "a@b.c", "smtp_host": "127.0.0.1", "smtp_port": smtp_port,
+             "smtp_security": "none", "smtp_username": "", "password": ""},
+            cookie=admin_cookie)
+        # The spy answers 250 to everything, so the send itself reports a
+        # protocol error; what matters here is that the connection was made
+        # at all — a passwordless test of an unsaved host is still allowed.
+        check("D4 a passwordless test still reaches the host",
+              status == 200 and any(b"HLO" in d.upper() for d in seen),
+              f"{status} {payload} {seen[:2]}")
+        check("D4 …with no AUTH on the wire",
+              not any(b"AUTH" in d.upper() for d in seen),
+              str([d[:40] for d in seen]))
+
+        # The opt-out exists, and turning it on lets the plain-auth test run.
+        SERVICE.settings["smtp_allow_plain_auth"] = True
+        seen.clear()
+        status, _h, payload = req(
+            "POST", "/api/alerts/smtp/test",
+            {"to": "a@b.c", "smtp_host": "127.0.0.1", "smtp_port": smtp_port,
+             "smtp_security": "none", "smtp_username": "svc-monitor",
+             "password": "typed-in"}, cookie=admin_cookie)
+        check("D4 the documented opt-out re-enables plain AUTH",
+              status == 200 and any(b"AUTH" in d.upper() for d in seen),
+              f"{status} {payload}")
+        SERVICE.settings["smtp_allow_plain_auth"] = False
+    finally:
+        stop_listener.set()
+        spy_thread.join(timeout=3)
+        listener.close()
+
+    # A stored credential does not follow the row to a new address.
+    status, _h, payload = req("POST", "/api/ipam/dhcp/servers",
+                              {"address": "10.0.0.5", "label": "dhcp-a"},
+                              cookie=admin_cookie)
+    server_id = payload["id"]
+    SERVICE.ipam_db.set_dhcp_credential(server_id, "svc",
+                                        dpapi_mod.protect(b"dhcp-secret"))
+    status, _h, payload = req("PUT", f"/api/ipam/dhcp/servers/{server_id}",
+                              {"address": "10.9.9.9"}, cookie=admin_cookie)
+    check("D4 moving a DHCP server clears its stored credential",
+          status == 200 and payload.get("credential_cleared")
+          and not SERVICE.ipam_db.dhcp_server(server_id)["password_enc"],
+          f"{status} {payload}")
+
+    status, _h, payload = req("POST", "/api/wireless/controllers",
+                              {"name": "wlc-a", "ip": "10.0.0.6"},
+                              cookie=admin_cookie)
+    controller_id = payload["id"]
+    SERVICE.wireless_db.set_credential(controller_id,
+                                       dpapi_mod.protect(b"wlc-secret"))
+    status, _h, payload = req("PUT", f"/api/wireless/controllers/{controller_id}",
+                              {"ip": "10.9.9.9"}, cookie=admin_cookie)
+    check("D4 moving a wireless controller clears its stored credential",
+          status == 200 and payload.get("credential_cleared")
+          and not SERVICE.wireless_db.controller(controller_id)["v3_auth_pass_enc"],
+          f"{status} {payload}")
+
     return 0
 
 
