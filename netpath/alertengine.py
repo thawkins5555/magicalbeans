@@ -13,6 +13,7 @@ cadence rather than Monitor's per-target scheduling.
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -22,7 +23,8 @@ from dataclasses import asdict
 from . import alertmail
 from . import hostresolve
 from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
-    Occurrence, dedup_key, evaluate_flapping, evaluate_threshold, match_device
+    UNMANAGED_ONLY_RULES, Occurrence, dedup_key, evaluate_flapping, \
+    evaluate_threshold, match_device, syslog_signature
 from .eventlog import ALERTS, ERROR, NullLog
 
 TICK_S = 5.0
@@ -34,6 +36,27 @@ TICK_S = 5.0
 # observation ends suppression well before this ever matters in practice —
 # this is a backstop, not the mechanism.
 OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
+
+# How much of a source backlog one tick will work through. A collector that
+# has been storing while the engine was stopped (or a syslog burst) can leave
+# hundreds of thousands of rows behind the cursor; draining all of them in one
+# tick would hold the tick thread for minutes and starve every other source.
+# The drains therefore page forward until one of these two budgets is spent,
+# and whatever is left is reported as counters["backlog"] so an operator can
+# see the engine is behind rather than guessing from a quiet Alerts page. The
+# cursor still only advances over rows that were actually applied, so nothing
+# is skipped — the next tick simply carries on from where this one stopped.
+DRAIN_ROW_BUDGET = 5000
+DRAIN_TIME_BUDGET_S = 2.0
+
+# _rollup_parent's third answer, beside "this open alert already says it" and
+# "nothing does". It means "an outage implies this, but there is no open row
+# to hang a note on" — the parent was resolved by hand while the device is
+# still down, or the outage is an upstream device's whose own alert an
+# operator has already worked. Suppressing without a note is right there: an
+# operator who resolved the outage has said they know about it, and handing
+# them the six alerts it implies is the opposite of what they asked for.
+SUPPRESSED = object()
 
 
 def _ago(ts: float) -> str:
@@ -89,9 +112,36 @@ class AlertEngine:
         self._operator_resolves: dict[str, float] = {}
         self._sent_this_hour: list[float] = []
         self._suppression_logged_hour: int | None = None
+        # source -> the id this tick's drain reached. Written to `meta` by
+        # _flush_cursors AFTER every occurrence has been applied, never
+        # before: a cursor that commits at drain time is a promise the batch
+        # was handled, and an exception in the apply loop used to break that
+        # promise silently and permanently. See _advance_cursor.
+        self._cursor_advances: dict[str, int] = {}
+        # Per-tick drain budget bookkeeping, reset at the top of _tick.
+        self._drain_rows = 0
+        self._drain_deadline = 0.0
+        # Whether a reader accepts a `limit` keyword, keyed by qualified
+        # name. Every shipped source does; the fallback exists so an engine
+        # built against an older database module still drains (unlimited
+        # fetch, sliced here) rather than raising on every tick.
+        self._limit_support: dict[str, bool] = {}
+        # Delivery runs on its own thread: sending inline on the tick meant a
+        # dead relay froze evaluation for as long as the outage lasted, which
+        # is exactly when evaluation matters most. See alertmail.MailQueue.
+        self._mail = alertmail.MailQueue(on_result=self._mail_result,
+                                         on_breaker=self._mail_breaker)
+        # Occurrences raised by the application about itself (the mail path,
+        # the poll pool) rather than read from a source. Appended from any
+        # thread — the mail worker raises the SMTP one — and drained on the
+        # tick thread like every other source. See system_occurrence.
+        self._system_lock = threading.Lock()
+        self._system_occurrences: list[Occurrence] = []
+        self._system_clears: list[tuple[str, str]] = []
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
-                         "rolled_up": 0, "muted": 0}
+                         "rolled_up": 0, "muted": 0, "apply_errors": 0,
+                         "backlog": 0}
         self.error: str | None = None
         self._last_tick_ts: float = 0.0
 
@@ -102,6 +152,7 @@ class AlertEngine:
     def start(self) -> None:
         self.stop()
         self._stop.clear()
+        self._mail.start()
         self._thread = threading.Thread(target=self._loop, name="alert-engine", daemon=True)
         self._thread.start()
 
@@ -117,6 +168,7 @@ class AlertEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
+        self._mail.stop()
 
     def shutdown(self) -> None:
         self.stop()
@@ -153,6 +205,10 @@ class AlertEngine:
         # already resolved by hand.
         self._operator_resolves = self.db.operator_resolved_since(
             time.time() - OPERATOR_RESOLVE_WINDOW_S)
+        self._cursor_advances.clear()
+        self._drain_rows = 0
+        self._drain_deadline = time.monotonic() + DRAIN_TIME_BUDGET_S
+        self.counters["backlog"] = 0
         occurrences = []
         occurrences += self._drain_device_events(settings)
         occurrences += self._drain_interface_events(settings)
@@ -160,6 +216,7 @@ class AlertEngine:
         occurrences += self._drain_syslog(settings)
         occurrences += self._drain_ipam_conflicts(settings)
         occurrences += self._drain_ap_events(settings)
+        occurrences += self._drain_system_occurrences()
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
         occurrences += self._evaluate_netpath_thresholds(settings)
@@ -170,11 +227,213 @@ class AlertEngine:
         muted = self.db.muted_entity_ids("device")
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
-            if self._hold_for_new_device(occurrence, settings):
+            # Per occurrence, not per tick. The apply path is not
+            # exception-free — template lookup, context building, rendering
+            # and the rollup queries all run against SQLite, and an
+            # OperationalError (locked, disk full) can surface from any of
+            # them. One raised here used to abort the whole batch, and
+            # because the cursors had already committed, the rest of that
+            # batch was gone for good. A poisoned occurrence is now counted,
+            # logged with its traceback, and skipped; its source's cursor
+            # still advances past it, so the engine makes progress rather
+            # than re-reading the same bad row every five seconds forever.
+            try:
+                if self._hold_for_new_device(occurrence, settings):
+                    continue
+                if muted and self._muted(occurrence, muted):
+                    continue
+                self._apply(rules, occurrence, settings)
+            except Exception:
+                self.counters["apply_errors"] += 1
+                self.log.add(ERROR,
+                             f"Alert occurrence for {occurrence.entity_label} "
+                             f"could not be applied",
+                             detail=traceback.format_exc())
+        # Only now, once every occurrence above has been applied (or
+        # deliberately skipped), does any source's cursor move.
+        self._flush_cursors()
+        self._sweep_expired()
+        self._sweep_renotify(settings)
+
+    # -------------------------------------------------- system occurrences
+
+    def system_occurrence(self, rule_key: str, entity_id: str, label: str,
+                          severity: int | None = None, extra: dict | None = None,
+                          message: str = "") -> None:
+        """Raise an occurrence about the application itself.
+
+        Callable from any thread — the mail worker raises the SMTP one and
+        the poller raises pool saturation — because the condition is noticed
+        wherever it happens, not on the tick. The occurrence is queued and
+        applied by the next _tick like any other, so rules, dedup, mute and
+        rollup all behave exactly as they do for a device event.
+
+        `rule_key` doubles as the occurrence's source_kind, which is what
+        makes one system rule match one system condition rather than every
+        system rule opening on every one.
+        """
+        occurrence = Occurrence(
+            kind="system", source_kind=rule_key, entity_kind="system",
+            entity_id=str(entity_id), entity_label=label, ts=time.time(),
+            message=message or label, severity=severity,
+            extra=dict(extra or {}))
+        with self._system_lock:
+            self._system_occurrences.append(occurrence)
+
+    def clear_system_occurrence(self, rule_key: str, entity_id: str) -> None:
+        """The other half: the condition has ended, so resolve its alert on
+        the next tick. Resolved with resolved_by '' like every other engine
+        auto-resolve, so it is never mistaken for a hand resolve."""
+        with self._system_lock:
+            self._system_clears.append((rule_key, str(entity_id)))
+
+    def _drain_system_occurrences(self) -> list[Occurrence]:
+        with self._system_lock:
+            pending = self._system_occurrences
+            clears = self._system_clears
+            self._system_occurrences = []
+            self._system_clears = []
+        for rule_key, entity_id in clears:
+            rule = self.db.rule_by_key(rule_key)
+            if rule is None:
                 continue
-            if muted and self._muted(occurrence, muted):
-                continue
-            self._apply(rules, occurrence, settings)
+            if self.db.resolve_by_dedup(f"{rule['key']}:system:{entity_id}", by=""):
+                self.counters["resolved"] += 1
+        return pending
+
+    def _mail_result(self, job, ok: bool, error: str) -> None:
+        """One delivery finished, on the mail worker's thread. AlertsDatabase
+        has its own RLock, so the notification row is safe to write here."""
+        if ok:
+            self.counters["emails_sent"] += 1
+        else:
+            self.counters["send_errors"] += 1
+        self.db.record_notification(job.alert_id, job.kind,
+                                    ", ".join(job.to_addrs), job.subject,
+                                    ok, error)
+
+    def _mail_breaker(self, is_open: bool, error: str) -> None:
+        """The mail path itself became (un)usable. Raised as an ordinary
+        alert so the failure that silences every other alert is the one
+        thing that cannot be silenced by it — no email is sent for a
+        kind='system' rule, see _notify."""
+        if is_open:
+            self.system_occurrence(
+                "smtp_failing", "smtp", "Alert email", severity=2,
+                extra={"error": error},
+                message=f"Alert email is failing and delivery is paused: {error}")
+        else:
+            self.clear_system_occurrence("smtp_failing", "smtp")
+
+    # ------------------------------------------------------- drain plumbing
+
+    def _advance_cursor(self, source: str, value: int) -> None:
+        """Remember how far `source` was drained, without writing it yet.
+
+        Deferred rather than committed inside the drain because a cursor is
+        the engine's statement that everything up to that id has been turned
+        into alerts. Writing it before the apply loop made that statement
+        early, and an exception mid-loop then discarded the rest of the
+        batch permanently — the drain would never hand those rows back.
+        _flush_cursors writes these at the end of the tick instead.
+        """
+        if value > self._cursor_advances.get(source, 0):
+            self._cursor_advances[source] = value
+
+    def _flush_cursors(self) -> None:
+        for source, value in self._cursor_advances.items():
+            if value > self.db.cursor(source):
+                self.db.set_cursor(source, value)
+        self._cursor_advances.clear()
+
+    def _accepts_limit(self, fetch) -> bool:
+        """Whether a `*_since` reader takes a `limit` keyword.
+
+        Every shipped one does. Asked rather than assumed so that an engine
+        running against a database module that predates the keyword falls
+        back to an unlimited fetch and a Python slice instead of raising on
+        every tick — the drain budget is a nicety, draining at all is not.
+        """
+        name = getattr(fetch, "__qualname__", repr(fetch))
+        known = self._limit_support.get(name)
+        if known is None:
+            try:
+                known = "limit" in inspect.signature(fetch).parameters
+            except (TypeError, ValueError):
+                known = False
+            self._limit_support[name] = known
+        return known
+
+    def _read_forward(self, source: str, fetch, cursor: int, max_id_fn=None):
+        """Yield rows newer than `cursor`, oldest first, in id order.
+
+        Pages rather than issuing one fixed-size read: a source that fell
+        behind (the engine was stopped, or a syslog burst outran the tick)
+        used to catch up at one batch per tick, which at 500 rows a batch and
+        12 ticks a minute is slower than the burst that caused it. This keeps
+        asking for the next batch until the source is caught up or the
+        per-tick budget is spent, and reports whatever is left as `backlog`
+        so being behind is visible instead of merely quiet.
+        """
+        paged = self._accepts_limit(fetch)
+        batch = 2000 if paged else DRAIN_ROW_BUDGET
+        at = cursor
+        caught_up = False
+        while True:
+            if paged:
+                rows = fetch(at, limit=batch)
+            else:
+                rows = list(fetch(at))[:batch]
+            if not rows:
+                caught_up = True
+                break
+            for row in rows:
+                yield row
+                if row["id"] > at:
+                    at = row["id"]
+            self._drain_rows += len(rows)
+            if len(rows) < batch:
+                caught_up = True
+                break
+            if (self._drain_rows >= DRAIN_ROW_BUDGET
+                    or time.monotonic() >= self._drain_deadline):
+                break
+        if not caught_up and max_id_fn is not None:
+            try:
+                self.counters["backlog"] += max(0, int(max_id_fn()) - int(at))
+            except Exception:
+                pass
+
+    def _device_for_source(self, cache: dict, source: str):
+        """The managed device that sent this trap or syslog message, or None.
+
+        A per-drain dict rather than a query per row: a burst of traps is
+        overwhelmingly from a handful of sources, and a mass syslog event is
+        the same host many times. None is a real answer, cached as such —
+        "this address is not a device we poll" is exactly what
+        trap_link_down_unmanaged needs, and re-asking for it every row would
+        be the most expensive lookup of the drain.
+        """
+        if not source:
+            return None
+        if source in cache:
+            return cache[source]
+        lookup = getattr(self.nodes_db, "device_by_ip", None)
+        device = lookup(source) if lookup is not None else None
+        cache[source] = device
+        return device
+
+    def _source_name(self, device, source: str) -> str:
+        """A display name for a trap/syslog sender, given a cached device row.
+
+        nodes_db is withheld from resolve_name when the cache already
+        answered "not a device we poll", because resolve_name's own
+        device_by_ip fallback would repeat exactly the lookup that produced
+        that answer, once per row. The DNS-cache half still runs.
+        """
+        return hostresolve.resolve_name(
+            self.nodes_db if device is not None else None, self.app_db,
+            source, device=device) or source
 
     def _muted(self, occurrence: Occurrence, muted: dict) -> bool:
         """True when this occurrence is about a device an operator silenced.
@@ -381,9 +640,10 @@ class AlertEngine:
             return []
         cursor = self.db.cursor("device_events")
         occurrences = []
-        rows = self.nodes_db.device_events_since(cursor)
         max_id = cursor
-        for row in rows:
+        for row in self._read_forward("device_events",
+                                      self.nodes_db.device_events_since, cursor,
+                                      self.nodes_db.max_device_event_id):
             max_id = max(max_id, row["id"])
             device = self.nodes_db.device(row["device_id"])
             if device is None:
@@ -412,23 +672,62 @@ class AlertEngine:
                 device_name=device["name"] or "", device_ip=device["ip"],
                 extra=extra)
             occurrences.append(occurrence)
+            if row["kind"] == "up":
+                occurrences.extend(self._replay_downstream_outages(device))
             if resolved:
                 self.counters["resolved"] += 1
                 self._notify_clear(resolved, cleared_rule, settings, extra=extra)
         if max_id > cursor:
-            self.db.set_cursor("device_events", max_id)
+            self._advance_cursor("device_events", max_id)
         return occurrences
+
+    def _replay_downstream_outages(self, device) -> list[Occurrence]:
+        """`down` occurrences for devices behind an upstream that just
+        recovered and are still down themselves.
+
+        The other end of the topology rollup, and the reason it is safe. A
+        device whose outage was suppressed (or absorbed) under its upstream
+        has no open alert and will never produce a second `down` event, so
+        without this it would go quiet the moment the upstream recovered —
+        the network's remaining fault would be the one thing nobody was told
+        about. Asked of the device's CURRENT status rather than of what was
+        suppressed earlier, so a site that came back cleanly replays nothing.
+
+        Marked replayed so the new-device hold does not park them again.
+        """
+        ids_of = getattr(self.nodes_db, "downstream_ids", None)
+        if ids_of is None:
+            return []
+        child_ids = ids_of(device["id"])
+        if not child_ids:
+            return []
+        out = []
+        for child in self.nodes_db.devices_by_ids(child_ids):
+            if not child["enabled"] or child["status"] != "down":
+                continue
+            label = hostresolve.resolve_name(
+                self.nodes_db, self.app_db, child["ip"], device=child) or child["ip"]
+            occurrence = Occurrence(
+                kind="device_event", source_kind="down", entity_kind="device",
+                entity_id=str(child["id"]), entity_label=label, ts=time.time(),
+                message=f"{label}: still not responding now that the upstream "
+                        f"outage has cleared",
+                device_name=child["name"] or "", device_ip=child["ip"])
+            occurrence.replayed = True
+            out.append(occurrence)
+        return out
 
     def _drain_interface_events(self, settings) -> list[Occurrence]:
         if not self.db.has_cursor("interface_events"):
             self.db.set_cursor("interface_events", self.nodes_db.max_interface_event_id())
             return []
         cursor = self.db.cursor("interface_events")
-        rows = self.nodes_db.interface_events_since(cursor)
         occurrences = []
         max_id = cursor
         touched_interfaces: set[int] = set()
-        for row in rows:
+        for row in self._read_forward("interface_events",
+                                      self.nodes_db.interface_events_since, cursor,
+                                      self.nodes_db.max_interface_event_id):
             max_id = max(max_id, row["id"])
             touched_interfaces.add(row["interface_id"])
             interface = self.nodes_db.interface_by_id(row["interface_id"])
@@ -488,7 +787,7 @@ class AlertEngine:
                 ts=time.time(), message=f"{label} is flapping",
                 device_name=device["name"] or "", device_ip=device["ip"]))
         if max_id > cursor:
-            self.db.set_cursor("interface_events", max_id)
+            self._advance_cursor("interface_events", max_id)
         return occurrences
 
     def _drain_traps(self, settings) -> list[Occurrence]:
@@ -496,19 +795,41 @@ class AlertEngine:
             self.db.set_cursor("traps", self.snmp_db.max_id())
             return []
         cursor = self.db.cursor("traps")
-        rows = self.snmp_db.traps_since(cursor)
         occurrences = []
         max_id = cursor
-        for row in rows:
+        devices: dict = {}
+        for row in self._read_forward("traps", self.snmp_db.traps_since,
+                                      cursor, self.snmp_db.max_id):
             max_id = max(max_id, row["id"])
+            # A trap alert used to name only the trap ("linkDown"), because
+            # nothing on the occurrence said which box sent it: device_name
+            # was empty, so a rule's device_filter could not match a trap at
+            # all, and the label an operator read named a fault with no
+            # subject. The sending address is in hand on every row; the
+            # managed device behind it usually is too.
+            device = self._device_for_source(devices, row["source"])
+            source_label = self._source_name(device, row["source"])
+            trap_label = row["trap_name"] or row["trap_oid"] or "trap"
             occurrences.append(Occurrence(
                 kind="trap", source_kind=row["trap_kind"] or "", entity_kind="trap",
-                entity_id=row["trap_oid"] or "", entity_label=row["trap_name"] or row["trap_oid"] or row["source"],
-                ts=row["ts"], message=row["varbind_text"] or "", device_ip=row["source"],
+                # Source AND oid. Keyed on the OID alone, 200 linkDown traps
+                # from 200 switches collapsed into one alert row naming no
+                # device, and open_or_increment overwrote its message with
+                # each one, so 250 faults on 250 devices read as three rows.
+                entity_id=f'{row["source"]}:{row["trap_oid"] or ""}',
+                entity_label=f"{source_label}: {trap_label}",
+                ts=row["ts"], message=row["varbind_text"] or "",
+                device_name=(device["name"] if device else "") or "",
+                device_ip=row["source"],
+                # traps.severity has been stored since the receiver shipped
+                # and the occurrence simply never carried it, so every trap
+                # of any severity satisfied a rule's severity floor.
+                severity=row["severity"],
+                managed=device is not None,
                 extra={"trap_name": row["trap_name"] or "", "trap_oid": row["trap_oid"] or "",
                       "varbinds": row["varbind_text"] or ""}))
         if max_id > cursor:
-            self.db.set_cursor("traps", max_id)
+            self._advance_cursor("traps", max_id)
         return occurrences
 
     def _drain_syslog(self, settings) -> list[Occurrence]:
@@ -517,28 +838,40 @@ class AlertEngine:
             return []
         cursor = self.db.cursor("syslog")
         min_severity = int(settings.get("min_severity", 7))
-        rows = self.syslog_db.rows_since(cursor)
         occurrences = []
         max_id = cursor
-        for row in rows:
+        devices: dict = {}
+        for row in self._read_forward("syslog", self.syslog_db.rows_since,
+                                      cursor, self.syslog_db.max_id):
             max_id = max(max_id, row["id"])
             if row["severity"] > min_severity:
                 continue
+            device = self._device_for_source(devices, row["source"])
             # Same "don't override a real self-reported host" rule as the
             # Syslog page's own Host column, so an alert opened from a
             # message shows the same name the Syslog page shows for it.
             if row["host"] and row["host"] != row["source"]:
                 label = row["host"]
             else:
-                label = hostresolve.resolve_name(
-                    self.nodes_db, self.app_db, row["source"]) or row["source"]
+                label = self._source_name(device, row["source"])
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
-                entity_id=row["source"], entity_label=label,
-                ts=row["ts"], message=row["message"] or "", device_ip=row["source"],
-                severity=row["severity"]))
+                # Source AND message signature: keyed on the host alone, a
+                # %SYS-2-MALLOCFAIL and an %OSPF-4-ERRRCV on the same switch
+                # were one row whose message was whichever arrived last.
+                entity_id=f'{row["source"]}:{syslog_signature(row["message"] or "")}',
+                entity_label=label,
+                ts=row["ts"], message=row["message"] or "",
+                # The device's own name where the sender is one we poll, so a
+                # rule's device_filter matches syslog the same way it matches
+                # a poll event; the self-reported host otherwise, which is
+                # the only name an unmanaged sender has.
+                device_name=(device["name"] if device else "") or row["host"] or "",
+                device_ip=row["source"],
+                severity=row["severity"],
+                managed=device is not None))
         if max_id > cursor:
-            self.db.set_cursor("syslog", max_id)
+            self._advance_cursor("syslog", max_id)
         return occurrences
 
     def _drain_ipam_conflicts(self, settings) -> list[Occurrence]:
@@ -563,8 +896,41 @@ class AlertEngine:
                         f"{row['mac_a']} and {row['mac_b']}",
                 device_ip=row["ip"]))
         if max_id > cursor:
-            self.db.set_cursor("ipam_conflicts", max_id)
+            self._advance_cursor("ipam_conflicts", max_id)
+        self._pair_ipam_resolutions(all_conflicts, settings)
         return occurrences
+
+    def _pair_ipam_resolutions(self, all_conflicts, settings) -> None:
+        """Resolve the alert for an IPAM conflict a person has marked
+        resolved in the IPAM module.
+
+        The alert and the conflict row were tracked entirely separately, so
+        clearing the conflict left its alert open forever — the same pairing
+        mib_present already has with mib_missing, which this restores for the
+        one module that had the two halves and never joined them.
+
+        One query for the module's open alerts and a set intersection, rather
+        than a resolve_by_dedup per resolved conflict: the conflicts list
+        includes every conflict ever recorded, and almost all of them are
+        both resolved and long since alerted about.
+        """
+        rule = self.db.rule_by_key("ipam_new_conflict")
+        if rule is None:
+            return
+        resolved_ids = {str(row["id"]) for row in all_conflicts
+                        if row["resolved_ts"]}
+        if not resolved_ids:
+            return
+        for alert_row in self.db.alerts(state="unresolved", rule_id=rule["id"],
+                                        limit=2000):
+            if alert_row["entity_kind"] != "ipam":
+                continue
+            if alert_row["entity_id"] not in resolved_ids:
+                continue
+            resolved = self.db.resolve_by_dedup(alert_row["dedup_key"], by="")
+            if resolved:
+                self.counters["resolved"] += 1
+                self._notify_clear(resolved, rule, settings)
 
     def _drain_ap_events(self, settings) -> list[Occurrence]:
         """Wireless AP lifecycle events — today just ap_removed, raised by
@@ -578,7 +944,9 @@ class AlertEngine:
             self.db.set_cursor("ap_events", self.wireless_db.max_ap_event_id())
             return []
         cursor = self.db.cursor("ap_events")
-        rows = self.wireless_db.ap_events_since(cursor)
+        rows = list(self._read_forward("ap_events",
+                                       self.wireless_db.ap_events_since, cursor,
+                                       self.wireless_db.max_ap_event_id))
         occurrences = []
         max_id = cursor
         # One controllers query per drain, not one per event row: a burst
@@ -609,7 +977,7 @@ class AlertEngine:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, cleared_rule, settings)
         if max_id > cursor:
-            self.db.set_cursor("ap_events", max_id)
+            self._advance_cursor("ap_events", max_id)
         return occurrences
 
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
@@ -647,15 +1015,47 @@ class AlertEngine:
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
             return occurrences
-        for device in self.nodes_db.devices():
-            if not device["enabled"]:
+        # One query for the keys the enabled rules actually name, instead of
+        # a full `SELECT *` per device: at 2,000 devices with ~90 metrics
+        # each that was 400,000 rows every five seconds to evaluate four live
+        # rules, ~88% of it rows no rule reads, all of it through the
+        # connection and lock the poller writes with.
+        wanted = sorted({r["source_kind"] for r in rules if r["source_kind"]})
+        metric_rows = self.nodes_db.metrics_for_keys(wanted)
+        metrics_by_device_key = {(m["device_id"], m["key"]): m for m in metric_rows}
+        device_ids = sorted({m["device_id"] for m in metric_rows})
+        devices = {d["id"]: d for d in self.nodes_db.devices_by_ids(device_ids)}
+        # A sample this old is treated as absent. evaluate_threshold has no
+        # notion of sample age, so once a streak was satisfied every later
+        # tick re-raised the occurrence from last_value even if the device
+        # had stopped answering weeks ago — an alert opened from a 45-day-old
+        # sample, refreshed to last_ts = now on every tick, sorting itself to
+        # the top of a list ordered by last_ts. Absent means the streak
+        # resets; it does NOT resolve the alert, because a device that went
+        # quiet is a fault for device_down or the rollup to report, not
+        # something to quietly declare recovered.
+        stale_after = float(settings.get("threshold_stale_s", 900) or 0)
+        now = time.time()
+        # Streak state is per (rule, device) and lived forever, so a fleet
+        # with add/remove churn leaked an entry per deleted device. Only the
+        # devices this tick actually saw are carried forward.
+        live_streaks: dict[tuple, tuple] = {}
+        # Loaded on first use and only when a breach has no new sample behind
+        # it, so a tick with nothing breaching costs nothing extra.
+        open_keys: set | None = None
+        for device_id in device_ids:
+            device = devices.get(device_id)
+            if device is None:
                 continue
-            metrics_by_key = {m["key"]: m for m in self.nodes_db.metrics(device["id"])}
+            label = None
             for rule in rules:
-                metric = metrics_by_key.get(rule["source_kind"])
+                metric = metrics_by_device_key.get((device_id, rule["source_kind"]))
                 value = metric["last_value"] if metric else None
                 sample_ts = metric["last_ts"] if metric else None
-                streak_key = (rule["id"], device["id"])
+                if (stale_after > 0 and sample_ts is not None
+                        and now - sample_ts > stale_after):
+                    value, sample_ts = None, None
+                streak_key = (rule["id"], device_id)
                 previous_ts, streak, first_breach_ts = self._breach_streaks.get(
                     streak_key, (None, 0, None))
                 threshold = rule["threshold"]
@@ -667,14 +1067,20 @@ class AlertEngine:
                     streak += 1
                     if first_breach_ts is None:
                         first_breach_ts = sample_ts
-                self._breach_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
+                live_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
                 # Sample time, not wall-clock: a device that stopped being
                 # polled must not accumulate breach seconds while silent.
                 breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
                                   else max(0.0, sample_ts - first_breach_ts))
                 result = evaluate_threshold(rule, value, streak, breach_seconds)
-                label = hostresolve.resolve_name(
-                    self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
+                if result == "":
+                    continue
+                if label is None:
+                    # Resolved at most once per device per tick, and only for
+                    # a device that has something to report.
+                    label = hostresolve.resolve_name(
+                        self.nodes_db, self.app_db, device["ip"],
+                        device=device) or device["ip"]
                 if result == "breach":
                     occurrence = Occurrence(
                         kind="threshold", source_kind=rule["source_kind"],
@@ -684,7 +1090,8 @@ class AlertEngine:
                         device_name=device["name"] or "", device_ip=device["ip"],
                         extra={"metric_label": metric["label"] if metric else rule["source_kind"],
                               "value": str(value), "threshold": str(rule["threshold"])})
-                    resolved_ts = self._operator_resolves.get(dedup_key(rule, occurrence))
+                    key = dedup_key(rule, occurrence)
+                    resolved_ts = self._operator_resolves.get(key)
                     if (resolved_ts is not None and first_breach_ts is not None
                             and first_breach_ts <= resolved_ts):
                         # An operator resolved this exact breach run by hand;
@@ -692,6 +1099,25 @@ class AlertEngine:
                         # resets first_breach_ts above) is followed by a new
                         # breach — see AlertsDatabase.operator_resolved_since.
                         continue
+                    if sample_ts is not None and sample_ts == previous_ts:
+                        # Nothing has been polled since the last tick, so
+                        # there is no new occurrence to report — only the
+                        # same one, still true. Raising it anyway bumped
+                        # `count` every five seconds, so a CPU alert open
+                        # overnight told the operator it had "occurred 8640
+                        # time(s)" when the metric had been sampled 480
+                        # times: the number meant engine ticks.
+                        #
+                        # Still raised when nothing is open for this key,
+                        # because that is how a threshold re-derives itself —
+                        # after a rollup parent clears, or after an alert is
+                        # resolved while the breach continues, the next tick
+                        # has to be able to open it again without waiting for
+                        # a fresh sample.
+                        if open_keys is None:
+                            open_keys = self.db.open_dedup_keys()
+                        if key in open_keys:
+                            continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     dedup = dedup_key(rule, Occurrence(
@@ -702,6 +1128,7 @@ class AlertEngine:
                     if resolved:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, rule, settings)
+        self._breach_streaks = live_streaks
         return occurrences
 
     def _evaluate_dhcp_thresholds(self, settings) -> list[Occurrence]:
@@ -1040,15 +1467,70 @@ class AlertEngine:
     # ------------------------------------------------------------- rollup
 
     def _rollup_parent(self, rule, occurrence: Occurrence):
-        """The open alert that already says what `rule` is about to say, or
-        None. See alertrules.ROLLED_UP_BY for which rules have a parent."""
+        """The open alert that already says what `rule` is about to say,
+        SUPPRESSED, or None.
+
+        Three answers, in order:
+
+        1. The same device's own parent alert is open — the original rollup,
+           see alertrules.ROLLED_UP_BY for which rules have one.
+        2. The parent is `device_down`, it is NOT open, and the device is
+           still down. That is the case an operator creates by triaging: the
+           natural action on an outage is to resolve it, and the moment they
+           did, every child re-derived on the next tick. The review measured
+           three fresh alerts and three fresh emails within five seconds for
+           a device that was still down — and device_down could not come back
+           to re-suppress them, because it is event-driven and no second
+           `down` event is ever recorded. Triaging an outage was punished
+           with more noise than it removed.
+        3. `device_down` itself, for a device whose upstream is down. This is
+           the topology half: without it a core switch failure arrives as one
+           alert per access switch behind it, each true and none of them the
+           one worth reading.
+        """
+        if occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
+            return None
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
-        if not parent_key or occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
+        if parent_key:
+            parent_rule = self.db.rule_by_key(parent_key)
+            if parent_rule is None or not parent_rule["enabled"]:
+                return None
+            parent = self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
+            if parent is not None:
+                return parent
+            if parent_key == "device_down":
+                device = self._occurrence_device(occurrence)
+                if device is not None and device["status"] == "down":
+                    return SUPPRESSED
             return None
-        parent_rule = self.db.rule_by_key(parent_key)
-        if parent_rule is None or not parent_rule["enabled"]:
+        if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
+            return self._upstream_outage(rule, occurrence)
+        return None
+
+    def _upstream_outage(self, rule, occurrence: Occurrence):
+        """The open `device_down` of the nearest ancestor that is also down.
+
+        Walks upwards rather than checking only the immediate upstream: in a
+        site outage the whole chain goes at once, and whichever device the
+        engine happened to see first is the one holding the open alert. The
+        walk is cycle-safe and depth-capped in nodesdb.upstream_chain.
+
+        getattr rather than a direct call so an engine running against a
+        database module without the topology columns behaves exactly as it
+        did before them.
+        """
+        chain_of = getattr(self.nodes_db, "upstream_chain", None)
+        if chain_of is None:
             return None
-        return self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
+        try:
+            device_id = int(occurrence.entity_id)
+        except (TypeError, ValueError):
+            return None
+        for ancestor_id in chain_of(device_id):
+            parent = self.db.open_by_dedup(f"{rule['key']}:device:{ancestor_id}")
+            if parent is not None:
+                return parent
+        return None
 
     def _absorb_subordinates(self, parent_rule, occurrence: Occurrence,
                              parent_row) -> None:
@@ -1092,6 +1574,41 @@ class AlertEngine:
                 self.db.add_rollup_note(
                     parent_row["id"],
                     f"Resolved “{child_rule['name']}” — implied by this outage")
+        if (parent_rule["key"] or "") == "device_down" \
+                and occurrence.entity_kind == "device":
+            self._absorb_downstream(parent_rule, occurrence, parent_row)
+
+    def _absorb_downstream(self, rule, occurrence: Occurrence, parent_row) -> None:
+        """Resolve the outages of everything behind a device that just went
+        down, when their alerts opened before this one did.
+
+        _rollup_parent covers the other order — a downstream outage noticed
+        after the upstream one is suppressed before it opens. Both orders
+        happen: a power event takes the whole site at once and which device
+        the poller reaches first is arbitrary.
+
+        Silent, like every other absorption: no clear email for an alert that
+        was never a separate problem. If the upstream comes back and a
+        downstream device is still down, _replay_downstream_outages re-raises
+        it — a device the engine has stopped alerting about must not stay
+        silent once the excuse for the silence is gone.
+        """
+        ids_of = getattr(self.nodes_db, "downstream_ids", None)
+        if ids_of is None:
+            return
+        try:
+            device_id = int(occurrence.entity_id)
+        except (TypeError, ValueError):
+            return
+        for child_id in ids_of(device_id):
+            resolved = self.db.resolve_by_dedup(
+                f"{rule['key']}:device:{child_id}", by="")
+            if resolved:
+                self.counters["resolved"] += 1
+                self.db.add_rollup_note(
+                    parent_row["id"],
+                    f"Resolved “{resolved['entity_label']}” — implied by the "
+                    f"upstream outage of {occurrence.entity_label}")
 
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
@@ -1110,21 +1627,44 @@ class AlertEngine:
             # stop matching any custom rule that has one set.
             if rule["kind"] in ("device_event", "interface_event", "trap",
                                 "wireless_event", "threshold", "dhcp_threshold",
-                                "netpath_threshold"):
+                                "netpath_threshold", "system"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
-            if rule["kind"] == "syslog" and occurrence.severity is not None:
+            if (rule["kind"] in ("syslog", "trap")
+                    and not (rule["source_kind"] or "")
+                    and occurrence.severity is not None):
                 # Lower number = more severe (RFC 5424): the rule's own
                 # severity is the threshold it fires at — "this severity
                 # and worse" — not just a label stamped on the resulting
-                # alert.
+                # alert. Traps were exempt, so "Critical SNMP trap received"
+                # opened at severity 2 for fifty informational config-save
+                # traps.
+                #
+                # Only for a rule with NO source_kind, i.e. one that is about
+                # every trap or every message. A rule naming one trap already
+                # says exactly which fact it is about, and the shipped
+                # coldStart rule (severity 4) would otherwise never fire: a
+                # trap with no severity mapping decodes as 5, which is worse
+                # than 4 on this scale.
                 if occurrence.severity > rule["severity"]:
                     continue
+            if (rule["key"] or "") in UNMANAGED_ONLY_RULES and occurrence.managed:
+                # "Link-down trap from an unmanaged device" has advertised
+                # this check since it shipped and never performed it, so a
+                # managed switch's port flap raised three alerts: this one,
+                # trap_critical, and interface_down from polling.
+                continue
             if not match_device(rule, occurrence):
                 continue
             key = dedup_key(rule, occurrence)
             if rollup:
                 parent = self._rollup_parent(rule, occurrence)
+                if parent is SUPPRESSED:
+                    # Implied by an outage with no open row to annotate: the
+                    # parent was hand-resolved while the device is still
+                    # down, or the upstream's own alert has been worked.
+                    self.counters["rolled_up"] += 1
+                    continue
                 if parent is not None:
                     # Not opened at all, so no email and no row to work. The
                     # parent says where it went, so the latency alert an
@@ -1138,24 +1678,97 @@ class AlertEngine:
             row, is_new = self.db.open_or_increment(
                 rule["id"], key, occurrence.entity_kind, occurrence.entity_id,
                 occurrence.entity_label, rule["severity"], occurrence.message,
-                occurrence.detail, occurrence.ts)
+                occurrence.detail, occurrence.ts, extra=occurrence.extra)
             if is_new:
                 self.counters["opened"] += 1
                 if rollup and (rule["key"] or "") in ROLLS_UP:
                     self._absorb_subordinates(rule, occurrence, row)
-            renotify_minutes = float(settings.get("renotify_minutes", 0))
-            should_notify = is_new
-            if not is_new and renotify_minutes > 0 and row["state"] == "open":
-                if time.time() - row["last_ts"] >= renotify_minutes * 60 - TICK_S:
-                    should_notify = True
-            if should_notify:
-                self._notify(row, rule, occurrence, settings, renotify=not is_new)
+                self._notify(row, rule, occurrence, settings)
+            # Renotify is NOT decided here any more. It used to compare
+            # against row["last_ts"], which open_or_increment had just set to
+            # this occurrence's timestamp a statement earlier, so the
+            # difference was always about zero and the condition could not be
+            # satisfied for any renotify_minutes above five seconds. Worse,
+            # this path is only reached when a NEW occurrence arrives, and an
+            # event-driven rule (a device that stays down, a trap) produces
+            # exactly one. _sweep_renotify sweeps open alerts instead.
+
+    # ------------------------------------------------------------- expiry
+
+    def _sweep_expired(self) -> None:
+        """Close alerts whose rule gives them a lifetime that has run out.
+
+        No clear email: a rule with an auto-resolve interval reports
+        something that already finished happening, and "resolved: device
+        rebooted" a day later tells an operator nothing they can act on. The
+        alert leaves the open list, which is the whole point — an open count
+        that includes yesterday's recoveries is a count nobody trusts.
+
+        resolved_by is '' like every other engine auto-resolve, so an expired
+        alert never suppresses a genuine new breach run later.
+        """
+        for row in self.db.expired_alerts(time.time()):
+            self.db.resolve(row["id"], by="")
+            self.counters["resolved"] += 1
+
+    # ------------------------------------------------------------ renotify
+
+    def _sweep_renotify(self, settings) -> None:
+        """Tell the operator again about alerts still open and unacknowledged.
+
+        A sweep over open alerts rather than a branch on the occurrence path,
+        because most alerts worth re-notifying about produce no further
+        occurrences at all: a device that stays down records one `down`
+        event, a trap arrives once, an IPAM conflict is detected once. An
+        admin who sets "re-notify every 30 minutes" for an unattended
+        overnight shift means "keep telling me until somebody deals with it",
+        and the occurrence path could only ever have honoured that for
+        threshold rules.
+
+        The occurrence handed to _notify is rebuilt from the alert row, with
+        its stored extras, so a threshold renotify still renders {{value}}
+        and a trap renotify still renders {{trap_name}}.
+        """
+        minutes = float(settings.get("renotify_minutes", 0) or 0)
+        if minutes <= 0:
+            return
+        # Minus one tick, so an alert due at exactly N minutes is not
+        # deferred to the following tick every single time.
+        cutoff = time.time() - (minutes * 60 - TICK_S)
+        for row in self.db.alerts_due_renotify(cutoff):
+            rule = self.db.rule(row["rule_id"])
+            if rule is None or not rule["enabled"]:
+                continue
+            try:
+                extra = json.loads(row["extra_json"] or "{}")
+            except (TypeError, ValueError):
+                extra = {}
+            occurrence = Occurrence(
+                kind=rule["kind"], source_kind=rule["source_kind"] or "",
+                entity_kind=row["entity_kind"], entity_id=row["entity_id"],
+                entity_label=row["entity_label"], ts=row["last_ts"],
+                message=row["message"], detail=row["detail"] or "",
+                extra=extra if isinstance(extra, dict) else {})
+            self._notify(row, rule, occurrence, settings, renotify=True)
 
     # -------------------------------------------------------------- notify
 
     def _notify(self, alert_row, rule_row, occurrence: Occurrence, settings,
                renotify: bool = False, notify_kind: str | None = None,
                template_override=None) -> None:
+        # A system rule is about the application's own health, and today the
+        # only one is "email is not being delivered". Mailing about that
+        # would be either impossible or a loop, so system alerts live on the
+        # Alerts page and nowhere else.
+        if rule_row["kind"] == "system":
+            return
+        # A rule can be worth recording and not worth mailing about. The
+        # alert still opens, is still listed, is still counted — only the
+        # inbox is spared. Guarded on the column's presence so an engine
+        # against a database that predates it keeps notifying, which is the
+        # behaviour every rule had before.
+        if "notify" in rule_row.keys() and not rule_row["notify"]:
+            return
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
@@ -1163,6 +1776,18 @@ class AlertEngine:
         current_hour = int(now // 3600)
         if max_per_hour and len(self._sent_this_hour) >= max_per_hour:
             self.counters["suppressed"] += 1
+            # A row per suppressed send, not just a global counter. In the
+            # review's 500-device outage, 60 alerts were emailed and 440 were
+            # dropped with no record on the alert at all: the only trace was
+            # this counter and one ERROR line an hour in a 3,000-entry
+            # in-memory ring that the poller overwrites in about ninety
+            # seconds. An operator asking "were we told about site 14" could
+            # not be answered. Now the alert's own detail pane says nobody
+            # was told, and why.
+            self.db.record_notification(
+                alert_row["id"], notify_kind or ("renotify" if renotify else "alert"),
+                "", "", False,
+                f"not sent: over the {max_per_hour}/hour email limit")
             if self._suppression_logged_hour != current_hour:
                 self._suppression_logged_hour = current_hour
                 self.log.add(ERROR, f"Alert email volume over {max_per_hour}/hour — "
@@ -1215,19 +1840,28 @@ class AlertEngine:
                     password = None
 
         kind = notify_kind or ("renotify" if renotify else "alert")
-        try:
-            alertmail.send(settings, password, to_addrs, subject, body,
-                           bool(template["is_html"]))
-            self._sent_this_hour.append(now)
-            self.counters["emails_sent"] += 1
-            self.db.record_notification(alert_row["id"], kind, ", ".join(to_addrs),
-                                        subject, True)
-        except Exception as exc:
+        job = alertmail.MailJob(
+            settings=dict(settings), password=password, to_addrs=list(to_addrs),
+            subject=subject, body=body, is_html=bool(template["is_html"]),
+            alert_id=alert_row["id"], kind=kind)
+        password = None
+        # The quota counts ATTEMPTS, not successes. Appending only on success
+        # meant a dead relay consumed no quota at all: 500 alerts produced 500
+        # attempts, none of which the hourly cap stopped, and each paid the
+        # full SMTP timeout. An attempt is what costs time, so an attempt is
+        # what is rationed.
+        self._sent_this_hour.append(now)
+        # Stamped on submit even when the queue refuses below: the renotify
+        # clock measures "how long since we last tried to tell anyone", and
+        # re-trying a full queue every tick would only fill it faster.
+        self.db.mark_notified(alert_row["id"], now)
+        if not self._mail.submit(job):
+            # Bounded on purpose; a refusal is recorded against the alert so
+            # the drop shows in its own detail pane rather than only in a
+            # global counter.
             self.counters["send_errors"] += 1
             self.db.record_notification(alert_row["id"], kind, ", ".join(to_addrs),
-                                        subject, False, str(exc))
-        finally:
-            password = None
+                                        subject, False, "send queue full")
 
     def _device_ip_for(self, alert_row) -> str:
         """Best-effort recovery of the real device address for the
