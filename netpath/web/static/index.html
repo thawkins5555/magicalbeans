@@ -951,8 +951,21 @@
         <code>main</code> and, if there is anything new, downloads it, swaps it
         in and restarts the service — which signs everyone out, this session
         included, so it lands you back on the sign-in page.</p>
+      <div class="row" data-requires-write="admin">
+        <label class="check"><input type="checkbox" id="set-updates-enabled">
+          Allow updates from GitHub</label>
+      </div>
+      <p class="hint" data-requires-write="admin">Off unless you turn it on, and
+        saved the moment you tick it. What it installs is <strong>whatever is at
+        the tip of <code>main</code> right now</strong> — there is no signature,
+        no tag and no checksum in that path, so anyone who can push to that
+        repository chooses the code this host runs at the next press of the
+        button, on a machine holding your SNMP communities and SSH credentials.
+        This is a known, temporary state, recorded as S-B1 in
+        <code>REVIEW-NETWORK-ENGINEER.md</code>. If that is not acceptable here,
+        leave this off and replace the <code>netpath</code> folder by hand.</p>
       <div class="row">
-        <button id="update-now" class="primary half" data-requires-write="settings">Check for update &amp; restart</button>
+        <button id="update-now" class="primary half" data-requires-write="admin">Check for update &amp; restart</button>
       </div>
       <p class="hint" id="update-status"></p>
     </fieldset>

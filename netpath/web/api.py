@@ -1037,15 +1037,21 @@ def post_update(service, params, body) -> dict:
     if not selfupdate.updates_enabled(service.app_db):
         raise _permissions.Forbidden(selfupdate.UPDATES_DISABLED_MESSAGE)
     _audit(service, params, "update.requested")
+    db_path = getattr(service.app_db, "path", "")
     result = selfupdate.apply(service.app_db)
     if result.get("ok") and not result.get("up_to_date"):
         service.log.add(SYSTEM_CATEGORY,
                         f"Updated to {result.get('tag') or result['commit']}; "
                         f"restarting")
-        # Written before the restart, and to disk, which is the whole point:
-        # the process is about to be replaced.
-        _audit(service, params, "update.installed",
-               target=str(result.get("tag") or result.get("commit") or ""))
+        # Through a connection of its own, not the service's: a successful
+        # apply() has already stopped everything and closed app.db, so the
+        # ordinary audit path could only fail here — which is what it did,
+        # losing the record of who replaced this host's code and writing a
+        # traceback to the log on every successful update.
+        from ..appdb import write_audit
+        write_audit(db_path, str(params.get("_username", "")),
+                    str(params.get("_client", "")), "update.installed",
+                    target=str(result.get("tag") or result.get("commit") or ""))
     elif not result.get("ok"):
         _audit(service, params, "update.refused",
                detail=str(result.get("error", "")))

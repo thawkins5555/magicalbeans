@@ -136,6 +136,29 @@ release is what makes the button work, and one bug found while proving it.
   every install already carries it. An installation that cannot accept the
   exposure meanwhile should leave `updates_enabled` off and replace the
   `netpath` directory by hand.
+- **There is now a control that turns self-update on.** `updates_enabled`
+  shipped with a default, an administrator-only guard, enforcement in
+  `apply()` and a refusal naming a checkbox — "Allow updates from GitHub" —
+  that had never been added to any page. The setting could only ever hold
+  its default, so the button could not work on any install, however it was
+  configured. Settings now carries that checkbox, in the Software update
+  card, saved on the spot rather than through **Apply** (it is
+  administrator-only, and `post_settings` refuses a whole request carrying a
+  key like that without the grant, which would have broken Apply for anyone
+  holding Settings write without Admin). A test now fails if any
+  administrator-only setting has no control that can set it.
+- **The update button is offered to the grant that can actually use it.** It
+  was shown to anyone with Settings write while `/api/update` requires Admin
+  write, so a Settings-only operator got a button whose press could only be
+  refused.
+- **A completed update is recorded in the audit log again.** `apply()`
+  closes every database before it swaps the package, so the audit write for
+  a successful install ran against a closed connection: it failed, was
+  swallowed, and wrote a traceback to the service log on every successful
+  update. "This host replaced its own code, at the request of this account"
+  is the entry that matters most in that log and it was the one entry never
+  kept. It now goes through a short-lived connection of its own, the same
+  way the installed-commit marker already did.
 - **A refusal no longer looks like being signed out.** "Updating from GitHub
   is switched off" and "changing this needs administrator access" were
   answered 401, which the browser reads as an expired session: it replaced

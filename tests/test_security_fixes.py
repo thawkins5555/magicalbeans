@@ -22,10 +22,12 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import ssl
 import stat
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error as urllib_error
@@ -214,7 +216,32 @@ def main() -> int:
           and "session_idle_minutes" in payload.get("settings", {}))
 
     # ------------------------------------------------------- D3 self-update
+    from netpath import appdb as appdb_module
     from netpath import selfupdate
+
+    # A setting the API guards but no page can set is a setting that can only
+    # ever hold its default. updates_enabled shipped exactly like that: the
+    # default, the admin-only guard, the enforcement in apply() and a refusal
+    # naming a control ("Allow updates from GitHub in Settings") that did not
+    # exist anywhere in the UI, so the update button could never work on any
+    # install. Every administrator-only setting has to be reachable.
+    from netpath.web import api as _api
+    static_dir = os.path.join(_paths.REPO_ROOT, "netpath", "web", "static")
+    with open(os.path.join(static_dir, "settings.js"), encoding="utf-8") as fh:
+        settings_js = fh.read()
+    with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as fh:
+        index_html = fh.read()
+    unreachable = [key for key in _api.ADMIN_ONLY_SETTINGS
+                   if key not in settings_js]
+    check("D3 every administrator-only setting has a control that sets it",
+          not unreachable, str(unreachable))
+    # And that control is gated on the grant the API actually demands, so it
+    # is not offered to someone whose press can only ever be refused.
+    check("D3 …the update controls are gated on admin, not settings",
+          index_html.count('data-requires-write="admin"') >= 3
+          and 'id="update-now" class="primary half" '
+              'data-requires-write="settings"' not in index_html,
+          str(index_html.count('data-requires-write="admin"')))
 
     status, _h, payload = req("POST", "/api/update", {}, cookie=admin_cookie)
     # 403 specifically, not "401 or 403": accepting either is what let a 401
@@ -391,6 +418,24 @@ def main() -> int:
         check("D3 switching the setting off stops it reaching the network",
               not result.get("ok") and result.get("disabled") and not state["calls"],
               f"{result} {state['calls']}")
+
+        # "This host replaced its own code" is the audit entry that matters
+        # most, and it was the one the log never kept: apply() closes app.db
+        # before it swaps the package, so the service's own handle is gone
+        # by the time there is an outcome to record, and audit() swallowed
+        # the resulting ProgrammingError after logging a traceback. A
+        # connection of the write's own is the same idiom write_meta uses.
+        audit_probe = os.path.join(tempfile.mkdtemp(), "app.db")
+        probe_db = appdb_module.AppDatabase(audit_probe)
+        probe_db.audit("someone", "10.0.0.9", "update.requested")
+        probe_db.close()                    # exactly what apply() leaves
+        appdb_module.write_audit(audit_probe, "someone", "10.0.0.9",
+                                 "update.installed", target="abc1234567")
+        with sqlite3.connect(audit_probe) as probe:
+            actions = [r[0] for r in
+                       probe.execute("SELECT action FROM audit ORDER BY ts")]
+        check("D3 a completed update is audited even though app.db is closed",
+              actions == ["update.requested", "update.installed"], str(actions))
 
         # The verified path apply() no longer uses, still covered so that
         # restoring it stays a change to apply() rather than a rewrite.

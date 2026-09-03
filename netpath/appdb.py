@@ -729,6 +729,41 @@ def write_meta(path: str, key: str, value: str) -> None:
         conn.close()
 
 
+def write_audit(path: str, username: str, client: str, action: str,
+                target: str = "", detail: str = "") -> None:
+    """Record one audit row through a connection of this call's own.
+
+    Same reason as write_meta, for the entry that matters most: a completed
+    self-update. `apply()` closes every database before it replaces the
+    package, so the handle the service was using is gone by the time there
+    is an outcome to record — and `AppDatabase.audit()` swallowed the
+    resulting ProgrammingError, which meant "this host replaced its own
+    code" was the one action the audit log never kept, and every successful
+    update wrote a traceback to the service log instead.
+
+    Never raises, for the same reason `audit()` does not: the update has
+    already happened, and losing the row must not turn it into a 500.
+    """
+    if not path:
+        return
+    try:
+        conn = dbopen.connect(path)
+        try:
+            conn.execute(
+                "INSERT INTO audit(ts, username, client, action, target,"
+                " detail) VALUES (?,?,?,?,?,?)",
+                (time.time(), username[:AUDIT_LIMITS["username"]],
+                 client[:AUDIT_LIMITS["client"]],
+                 action[:AUDIT_LIMITS["action"]],
+                 target[:AUDIT_LIMITS["target"]],
+                 detail[:AUDIT_LIMITS["detail"]]))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        log_module.exception("could not write an audit row for %r", action)
+
+
 # ----------------------------------------------------------------- migration
 
 def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:

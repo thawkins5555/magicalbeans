@@ -51,6 +51,33 @@
     App.el('update-version').textContent = server.version ? `v${server.version}` : '';
     const commit = (server.update || {}).installed_commit;
     App.el('update-commit').textContent = commit ? commit.slice(0, 10) : 'unknown';
+    App.el('set-updates-enabled').checked = !!(server.update || {}).enabled;
+  }
+
+  /* Saved on the spot rather than joining the Apply button's payload.
+     updates_enabled is administrator-only, and post_settings refuses the
+     whole request when a key like that is present without the grant — so
+     folding it into `apply()` would have made Apply fail outright for
+     anyone holding Settings write without Admin, for a setting they were
+     not even trying to change. */
+  async function setUpdatesEnabled() {
+    const box = App.el('set-updates-enabled');
+    const wanted = box.checked;
+    try {
+      await App.post('/api/settings',
+                     { scope: 'global', values: { updates_enabled: wanted } });
+      await App.loadState();
+      updateStatus(wanted
+        ? 'Updates from GitHub are allowed — this host will install the tip '
+          + 'of main when the button below is pressed.'
+        : 'Updates from GitHub are switched off; the button below will refuse.',
+        wanted ? 'var(--warn)' : 'var(--ok)');
+    } catch (error) {
+      // Put the box back where it was: the setting did not change, and a
+      // tick that stays ticked would say it did.
+      box.checked = !wanted;
+      updateStatus(error.message, 'var(--fail)');
+    }
   }
 
   function updateStatus(message, colour) {
@@ -450,6 +477,7 @@
     App.el('set-apply').onclick = apply;
     App.el('set-revert').onclick = load;
     App.el('update-now').onclick = checkForUpdate;
+    App.el('set-updates-enabled').onchange = setUpdatesEnabled;
     for (const button of document.querySelectorAll('[data-maint]')) {
       button.onclick = () => confirmMaintenance(button.dataset.maint);
     }
