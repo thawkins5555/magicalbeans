@@ -556,6 +556,29 @@ What the re-run establishes:
   new columns and tables added in place, `admin` granted to the account that
   held `settings: write`, and every file re-created 0600 (they were 0644).
 
+**The outage rollup, demonstrated rather than asserted.** `upstream_id` is
+what lets one site failure read as one alert, and nothing in the demo set it,
+so the feature was covered only by unit tests. `demo/seed.py --topology` now
+points every Site-A device at the core switch (183 of them at the 250-device
+size) and leaves Site-B and Site-C alone, so one run shows both behaviours.
+Two otherwise identical 250-device runs, same fleet, same nine incidents:
+
+| Over the whole run | Without `upstream_id` | With it |
+|---|---|---|
+| `device_down` alerts | 144 | **17** |
+| Emails for those alerts | 288 | **26** |
+| Emails of every kind | 1,752 | 1,400 |
+| Alerts of every kind | 1,686 | 1,344 |
+
+The suppressed devices are not silently dropped: each rolled-up alert carries
+a note naming what it absorbed ("Resolved 'Packet loss to device high' —
+implied by this outage"), and recovery re-opens the alerts of anything still
+down once its parent comes back. Seventeen rather than one is the honest
+figure and the reason is ordering: a device polled before the core's own
+`device_down` alert exists has no parent to be absorbed into yet, so it opens
+its own. Ordering `device_down` occurrences upstream-first within a tick would
+close that gap and is recorded in §6 as a follow-on.
+
 ---
 
 ## 4. Findings by area
