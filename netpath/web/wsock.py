@@ -48,12 +48,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import select
+import selectors
 import socket
 import ssl
 import struct
 import threading
+import time
+
+log = logging.getLogger(__name__)
 
 # The RFC's magic constant, appended to the client's key before the digest.
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -89,6 +94,16 @@ SEND_TIMEOUT_S = 15
 # One `recv` from the socket. Independent of the message cap: this is the
 # stream, not a frame.
 _RECV_BYTES = 65536
+
+# `poll()` where the platform has it (Linux, the BSDs), `selectors` — which
+# is epoll/kqueue there and `select` on Windows — everywhere else. NOT
+# `select.select`: it cannot express a descriptor at or above FD_SETSIZE
+# (1024) and raises ValueError for one, and this application reaches that
+# number on an ordinary busy appliance (ten databases with their WAL and
+# SHM companions, three UDP listeners, the poller's worker sockets, one
+# descriptor per open HTTP connection). Windows' select has no such ceiling
+# on the descriptor's *value*, which is why the fallback is safe there.
+_HAS_POLL = hasattr(select, "poll")
 
 # Close codes this module sends on its own behalf. The application's own
 # codes (4401/4408/4429) are passed to close() by the caller.
@@ -207,6 +222,9 @@ class WebSocket:
         # Filled in when the peer closes: the code and reason it gave.
         self.close_code: int | None = None
         self.close_reason: str = ""
+        # Whether the readability wait has already been reported as broken;
+        # one line per socket, not one per slice.
+        self._wait_broken = False
         self._set_timeout(READ_SLICE_S)
 
     def _set_timeout(self, seconds: float) -> None:
@@ -349,15 +367,50 @@ class WebSocket:
         the slice to expire, which is what makes `closed` noticed promptly.
         Its answer is not trusted: the read that follows happens either way,
         because under TLS a whole record can already be decoded and waiting
-        inside the SSL object with nothing left for `select` to see — which
+        inside the SSL object with nothing left for the wait to see — which
         is also why a TLS socket that reports pending bytes is not made to
-        wait out the slice first."""
+        wait out the slice first.
+
+        What must never happen is *no* wait: the read behind this one is
+        non-blocking, so a wait that returns immediately turns the reader
+        into a loop that takes and releases the I/O lock millions of times
+        a second, pinning a core and starving the pump thread on the same
+        socket. That is why the wait uses `poll`/`epoll` rather than
+        `select` (see `_HAS_POLL`), and why a wait that cannot be performed
+        at all is slept out rather than skipped.
+        """
         try:
             if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending():
                 return
-            select.select([self.sock], [], [], READ_SLICE_S)
         except (OSError, ValueError):
             pass                          # closed underneath us; the read says so
+        try:
+            self._poll_readable(READ_SLICE_S)
+        except (OSError, ValueError) as exc:
+            # Not evidence that the socket is gone — the read that follows
+            # decides that — but the slice still has to pass, or this is a
+            # spin. Said once per socket, because it is the kind of fault
+            # that otherwise only shows up as an unexplained busy CPU.
+            if not self._wait_broken:
+                self._wait_broken = True
+                log.warning("WebSocket reader cannot wait on its socket "
+                            "(%s: %s); falling back to a timed sleep",
+                            type(exc).__name__, exc)
+            time.sleep(READ_SLICE_S)
+
+    def _poll_readable(self, timeout: float) -> None:
+        """One readability wait on this socket, with no ceiling on the
+        descriptor's value. Both objects are per-call: `select.poll()` costs
+        no descriptor at all, and a selector is only built on the platforms
+        that have no `poll`."""
+        if _HAS_POLL:
+            poller = select.poll()
+            poller.register(self.sock.fileno(), select.POLLIN | select.POLLPRI)
+            poller.poll(timeout * 1000.0)
+            return
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.sock, selectors.EVENT_READ)
+            selector.select(timeout)
 
     # ------------------------------------------------------------- writing
 

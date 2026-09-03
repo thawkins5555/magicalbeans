@@ -6,6 +6,7 @@ bug rather than as a terminal that mysteriously stops echoing. The other
 side of the same contract (a real upgrade over the real server, and a
 session on top of it) is tests/test_ssh_terminal.py."""
 import email
+import os
 import socket
 import struct
 import threading
@@ -329,6 +330,64 @@ try:
     sock.close()
 finally:
     wsock.SEND_TIMEOUT_S = original_send_timeout
+
+# ------------------------------------------- a socket above FD_SETSIZE
+#
+# `select()` cannot express a descriptor at or above FD_SETSIZE (1024): it
+# raises ValueError, and a swallowed one left the reader with no wait
+# anywhere in its cycle — a non-blocking read that says "nothing yet" and
+# straight back round, at 100% of a core for the life of an idle terminal,
+# taking and releasing the I/O lock in front of the pump thread the whole
+# time. Descriptors that high are ordinary on an appliance with ten
+# databases, three listeners and a poller, so the wait has to be a real
+# wait on one.
+HIGH_FD = 1100
+
+
+def high_fd_pair():
+    """(client socket, WebSocket) whose server end is numbered above
+    FD_SETSIZE. Built without a handshake: this is about the descriptor."""
+    server_sock, client_sock = socket.socketpair()
+    os.dup2(server_sock.fileno(), HIGH_FD)
+    high = socket.socket(server_sock.family, server_sock.type, fileno=HIGH_FD)
+    server_sock.close()
+    client_sock.settimeout(5)
+    return client_sock, wsock.WebSocket(high)
+
+
+try:
+    sock, ws = high_fd_pair()
+except OSError as exc:
+    print(f"SKIP: no descriptor available at {HIGH_FD} here ({exc})")
+else:
+    assert ws.sock.fileno() >= 1024, ws.sock.fileno()
+    started = time.time()
+    ws._wait_readable()
+    waited = time.time() - started
+    assert waited >= wsock.READ_SLICE_S * 0.5, \
+        f"the wait on fd {ws.sock.fileno()} returned in {waited:.4f}s"
+    print(f"PASS: a wait on descriptor {ws.sock.fileno()} (above FD_SETSIZE) "
+          f"waits its slice ({waited:.2f}s), rather than raising and being "
+          f"swallowed")
+
+    parked = []
+    reader = threading.Thread(target=lambda: parked.append(ws.recv()), daemon=True)
+    cpu_before, wall_before = time.process_time(), time.time()
+    reader.start()
+    time.sleep(1.5)
+    cpu, wall = time.process_time() - cpu_before, time.time() - wall_before
+    assert cpu < wall * 0.25, \
+        f"an idle reader burnt {cpu:.2f}s of CPU in {wall:.2f}s of wall clock"
+    print(f"PASS: an idle session on that descriptor costs {cpu:.3f}s of CPU "
+          f"in {wall:.1f}s, not a whole core")
+
+    # And it is still a socket: the frame the reader was waiting for arrives.
+    sock.sendall(wsock.client_frame(wsock.OP_TEXT, b'{"type":"open"}'))
+    reader.join(timeout=5)
+    assert parked == [(wsock.OP_TEXT, b'{"type":"open"}')], parked
+    print("PASS: a frame on that descriptor is still read and delivered")
+    ws.close()
+    sock.close()
 
 # A peer that simply vanishes ends recv() without an exception.
 sock, ws = pair()
