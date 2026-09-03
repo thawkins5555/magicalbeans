@@ -135,6 +135,8 @@ ASN_TTL_S = 30 * 86400
 
 # Global: read by more than one module, so it belongs to none of them.
 GLOBAL_DEFAULTS = {
+    # How often the Dashboard re-reads its tiles.
+    "dashboard_refresh_s": 5,
     "dns_enabled": True,
     "dns_workers": 8,
     "dns_timeout_s": 3.0,

@@ -1797,6 +1797,7 @@ def _device_json(row, reveal: bool = False) -> dict:
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
+        "upstream_id": (row["upstream_id"] if "upstream_id" in row.keys() else None),
         # Vendor identification (4.32): keyed defensively for a row handed
         # in from an older-shaped source.
         "vendor_confidence": (row["vendor_confidence"] or ""
@@ -3246,6 +3247,10 @@ def _rule_json(row) -> dict:
         # Keyed defensively for the same reason as rollup_note above.
         "for_seconds": (row["for_seconds"] if "for_seconds" in row.keys() else None),
         "template_id": row["template_id"], "created_ts": row["created_ts"],
+        # Set by the rule editor since 4.37; keyed defensively like the rest.
+        "auto_resolve_after_s": (row["auto_resolve_after_s"]
+                                 if "auto_resolve_after_s" in row.keys() else None),
+        "notify": (bool(row["notify"]) if "notify" in row.keys() else True),
     }
 
 

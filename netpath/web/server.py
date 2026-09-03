@@ -312,7 +312,8 @@ COMPILED = [(method, re.compile(pattern), handler, requirement)
             for method, pattern, handler, requirement in ROUTES]
 
 # Reachable without a session: the sign-in page and what it needs to render.
-PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css", "/favicon.ico"}
+PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/app.css",
+                "/favicon.ico", "/favicon.svg"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
 # What an account whose password must still be changed may reach. Everything

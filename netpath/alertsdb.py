@@ -928,10 +928,14 @@ class AlertsDatabase:
 
     # ---------------------------------------------------------------- alerts
 
-    def alerts(self, state: str | None = None, severity: int | None = None,
-              rule_id: int | None = None, device_text: str | None = None,
-              text: str | None = None, t0: float | None = None,
-              t1: float | None = None, limit: int = 300) -> list[sqlite3.Row]:
+    def _alert_filter(self, state, severity, rule_id, device_text, text,
+                      t0, t1) -> tuple[str, list]:
+        """The WHERE clause shared by `alerts()` and `count_alerts()`.
+
+        One list showing "300 of 532" needs the same question answered twice,
+        and a filter that drifts between the two makes the second number a
+        lie about the first.
+        """
         clauses, params = [], []
         if state == "unresolved":
             clauses.append("state IN ('open', 'acked')")
@@ -956,7 +960,26 @@ class AlertsDatabase:
         if t1 is not None:
             clauses.append("opened_ts <= ?")
             params.append(t1)
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return (f" WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+    def count_alerts(self, state: str | None = None, severity: int | None = None,
+                     rule_id: int | None = None, device_text: str | None = None,
+                     text: str | None = None, t0: float | None = None,
+                     t1: float | None = None) -> int:
+        """How many alerts match, ignoring the list's limit — so the UI can
+        say how many it is not showing rather than implying there are none."""
+        where, params = self._alert_filter(state, severity, rule_id,
+                                           device_text, text, t0, t1)
+        with self._lock:
+            return int(self._conn.execute(
+                f"SELECT COUNT(*) FROM alerts{where}", params).fetchone()[0])
+
+    def alerts(self, state: str | None = None, severity: int | None = None,
+              rule_id: int | None = None, device_text: str | None = None,
+              text: str | None = None, t0: float | None = None,
+              t1: float | None = None, limit: int = 300) -> list[sqlite3.Row]:
+        where, params = self._alert_filter(state, severity, rule_id,
+                                           device_text, text, t0, t1)
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM alerts{where} ORDER BY last_ts DESC LIMIT ?",
