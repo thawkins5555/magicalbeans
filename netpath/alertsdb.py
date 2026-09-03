@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
-    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'
+    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
     source_kind     TEXT,                   -- meaning depends on kind, see nodesdb/alertrules
     severity        INTEGER NOT NULL DEFAULT 4,   -- syslog 0-7 scale, shared across every module
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -203,9 +203,9 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "flap_window_s", "flap_min_transitions")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 32 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
+# 33 built-in rules: 7 device_event + 3 interface_event + 11 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold. Each `template` name is a
+# 3 netpath_threshold + 1 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 5 ship; an admin can point any rule at any template.
@@ -288,6 +288,14 @@ _BUILTIN_RULES = [
     ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 100.0, 3),
     ("netpath_path_unstable", "NetPath path repeatedly failing", "netpath_threshold", "trace_unreached_pct", 4, "threshold_breach", 50.0, 20.0, 1),
     ("netpath_latency_high", "NetPath latency far above normal", "netpath_threshold", "trace_rtt_warn_pct", 4, "threshold_breach", 300.0, 150.0, 3),
+    # kind='system' is the application reporting on itself. Its occurrences
+    # come from AlertEngine.system_occurrence rather than from a source
+    # cursor, and source_kind is the rule key so one system condition matches
+    # one system rule. No email is ever sent for a system rule (see
+    # AlertEngine._notify): this one exists precisely because email is not
+    # working, and the others would be reporting a fault in the machinery
+    # they would have to use.
+    ("smtp_failing", "Alert email is not being delivered", "system", "smtp_failing", 2, "trap_forwarded", None, None, 1),
 ]
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening

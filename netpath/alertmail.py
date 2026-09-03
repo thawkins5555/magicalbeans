@@ -7,10 +7,14 @@ rest of this app follows for BER/ASN.1, MIB parsing, and everything else.
 
 from __future__ import annotations
 
+import queue
 import re
 import smtplib
 import ssl
+import threading
 import time
+import traceback
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr
 
@@ -287,3 +291,226 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
             smtp.quit()
         except Exception:
             pass
+
+
+# ------------------------------------------------------------ sender queue
+
+# How many messages may wait to be sent. A mass outage produces one job per
+# alert; beyond this the queue refuses rather than growing without bound, and
+# the refusal is recorded against the alert (ok=0, "send queue full") so a
+# dropped notification is visible in the alert's own detail pane instead of
+# only in a counter.
+QUEUE_SIZE = 500
+
+# Consecutive failures that open the breaker, and how long it stays open.
+# Five is enough to distinguish "one message bounced" from "the relay is
+# gone"; fifteen minutes is short enough that a relay coming back is noticed
+# within one maintenance window and long enough that a dead relay is not
+# retried once per alert for an hour.
+BREAKER_FAILURES = 5
+BREAKER_COOLDOWN_S = 900.0
+
+BREAKER_ERROR = "not attempted: alert email is failing (delivery paused)"
+
+
+@dataclass
+class MailJob:
+    """One message to deliver, with everything `send` needs already
+    resolved. Built on the engine's tick thread and handed to the queue, so
+    nothing about it may need a database read later: the settings snapshot,
+    the recipients and the rendered text all travel with the job."""
+    settings: dict
+    password: str | None
+    to_addrs: list = field(default_factory=list)
+    subject: str = ""
+    body: str = ""
+    is_html: bool = False
+    alert_id: int | None = None
+    kind: str = "alert"
+
+
+class MailQueue:
+    """A bounded queue of MailJobs drained by one worker thread.
+
+    Sending used to happen inline on the alert engine's tick. At the shipped
+    smtp_timeout_s of 15 s, a site-wide outage with a dead relay meant 500
+    alerts × 15 s of blocked tick — around two hours during which the engine
+    evaluated nothing, noticed no recoveries and re-derived no thresholds.
+    Even a healthy relay at a 0.2 s round trip took 12.3 s for that outage,
+    against a 5 s tick. Delivery therefore happens here, off the tick, and
+    the engine's only cost is an enqueue.
+
+    The breaker is the second half of the same problem: without one, every
+    alert keeps paying the relay's full timeout for as long as it is down.
+    After BREAKER_FAILURES consecutive failures the queue stops attempting
+    and completes jobs as failed immediately; after the cooldown the next
+    job is let through as a half-open probe, and its result either closes
+    the breaker or starts another cooldown.
+
+    `on_result(job, ok, error)` and `on_breaker(is_open, error)` are called
+    on the worker thread, so a caller that writes to a database from them
+    needs that database to have its own lock — AlertsDatabase does.
+    """
+
+    def __init__(self, *, maxsize: int = QUEUE_SIZE, on_result=None,
+                 on_breaker=None, failures_to_open: int = BREAKER_FAILURES,
+                 cooldown_s: float = BREAKER_COOLDOWN_S):
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._on_result = on_result
+        self._on_breaker = on_breaker
+        self.failures_to_open = max(1, int(failures_to_open))
+        self.cooldown_s = float(cooldown_s)
+        self._lock = threading.Lock()
+        self._stopping = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._busy = False
+        self._failures = 0
+        self._open_since: float | None = None
+
+    # ------------------------------------------------------------ lifecycle
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stopping.clear()
+        self._thread = threading.Thread(target=self._run, name="alert-mail",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Ask the worker to finish and wait up to two seconds for it.
+
+        Two seconds and not longer because the worker may be inside a
+        blocking smtplib call with a 15 s timeout, and a shutdown that waits
+        for a dead relay is a shutdown that appears to hang. The thread is a
+        daemon, so an abandoned send cannot keep the process alive.
+        """
+        thread = self._thread
+        self._thread = None
+        self._stopping.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    # -------------------------------------------------------------- submit
+
+    def submit(self, job: MailJob) -> bool:
+        """Queue a message. False when the queue is full — the caller records
+        that against the alert rather than blocking the tick thread."""
+        if not self.running:
+            self.start()
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            return False
+        return True
+
+    def depth(self) -> int:
+        return self._queue.qsize()
+
+    def breaker_open(self) -> bool:
+        with self._lock:
+            return self._open_since is not None
+
+    def wait_idle(self, timeout: float = 5.0) -> bool:
+        """True once nothing is queued and nothing is in flight. For callers
+        that need the queue settled before reading its effects — tests, and
+        the maintenance pass before a database is closed."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                if self._queue.empty() and not self._busy:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    # -------------------------------------------------------------- worker
+
+    def _run(self) -> None:
+        # A short get() timeout rather than a shutdown sentinel at the back
+        # of the queue: stop() must not have to wait for a backlog of jobs
+        # aimed at a relay that is not answering.
+        while not self._stopping.is_set():
+            try:
+                job = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            with self._lock:
+                self._busy = True
+            try:
+                self._deliver(job)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                with self._lock:
+                    self._busy = False
+                self._queue.task_done()
+
+    def _deliver(self, job: MailJob) -> None:
+        blocked = self._breaker_verdict()
+        if blocked:
+            self._finish(job, False, blocked)
+            return
+        try:
+            # Resolved from the module namespace at call time, not captured
+            # at construction, so a deployment (or a test) that replaces
+            # alertmail.send is honoured by jobs already queued.
+            send(job.settings, job.password, list(job.to_addrs), job.subject,
+                 job.body, job.is_html)
+        except Exception as exc:
+            self._record_failure(str(exc) or exc.__class__.__name__)
+            self._finish(job, False, str(exc) or exc.__class__.__name__)
+        else:
+            self._record_success()
+            self._finish(job, True, "")
+
+    def _breaker_verdict(self) -> str:
+        """"" when this job may be attempted, otherwise why it was not."""
+        with self._lock:
+            if self._open_since is None:
+                return ""
+            if time.monotonic() - self._open_since >= self.cooldown_s:
+                # Half open: this one job goes out. Its result decides
+                # whether the breaker closes or the cooldown restarts.
+                return ""
+            return BREAKER_ERROR
+
+    def _record_failure(self, error: str) -> None:
+        with self._lock:
+            self._failures += 1
+            newly_open = (self._open_since is None
+                          and self._failures >= self.failures_to_open)
+            if newly_open or self._open_since is not None:
+                # A failed half-open probe restarts the cooldown rather than
+                # letting the next job through immediately.
+                self._open_since = time.monotonic()
+        if newly_open:
+            self._fire_breaker(True, error)
+
+    def _record_success(self) -> None:
+        with self._lock:
+            was_open = self._open_since is not None
+            self._failures = 0
+            self._open_since = None
+        if was_open:
+            self._fire_breaker(False, "")
+
+    def _fire_breaker(self, is_open: bool, error: str) -> None:
+        if self._on_breaker is None:
+            return
+        try:
+            self._on_breaker(is_open, error)
+        except Exception:
+            traceback.print_exc()
+
+    def _finish(self, job: MailJob, ok: bool, error: str) -> None:
+        if self._on_result is None:
+            return
+        try:
+            self._on_result(job, ok, error)
+        except Exception:
+            traceback.print_exc()

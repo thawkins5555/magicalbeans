@@ -116,6 +116,18 @@ class AlertEngine:
         # built against an older database module still drains (unlimited
         # fetch, sliced here) rather than raising on every tick.
         self._limit_support: dict[str, bool] = {}
+        # Delivery runs on its own thread: sending inline on the tick meant a
+        # dead relay froze evaluation for as long as the outage lasted, which
+        # is exactly when evaluation matters most. See alertmail.MailQueue.
+        self._mail = alertmail.MailQueue(on_result=self._mail_result,
+                                         on_breaker=self._mail_breaker)
+        # Occurrences raised by the application about itself (the mail path,
+        # the poll pool) rather than read from a source. Appended from any
+        # thread — the mail worker raises the SMTP one — and drained on the
+        # tick thread like every other source. See system_occurrence.
+        self._system_lock = threading.Lock()
+        self._system_occurrences: list[Occurrence] = []
+        self._system_clears: list[tuple[str, str]] = []
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
                          "rolled_up": 0, "muted": 0, "apply_errors": 0,
@@ -130,6 +142,7 @@ class AlertEngine:
     def start(self) -> None:
         self.stop()
         self._stop.clear()
+        self._mail.start()
         self._thread = threading.Thread(target=self._loop, name="alert-engine", daemon=True)
         self._thread.start()
 
@@ -145,6 +158,7 @@ class AlertEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
+        self._mail.stop()
 
     def shutdown(self) -> None:
         self.stop()
@@ -192,6 +206,7 @@ class AlertEngine:
         occurrences += self._drain_syslog(settings)
         occurrences += self._drain_ipam_conflicts(settings)
         occurrences += self._drain_ap_events(settings)
+        occurrences += self._drain_system_occurrences()
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
         occurrences += self._evaluate_netpath_thresholds(settings)
@@ -227,6 +242,76 @@ class AlertEngine:
         # Only now, once every occurrence above has been applied (or
         # deliberately skipped), does any source's cursor move.
         self._flush_cursors()
+
+    # -------------------------------------------------- system occurrences
+
+    def system_occurrence(self, rule_key: str, entity_id: str, label: str,
+                          severity: int | None = None, extra: dict | None = None,
+                          message: str = "") -> None:
+        """Raise an occurrence about the application itself.
+
+        Callable from any thread — the mail worker raises the SMTP one and
+        the poller raises pool saturation — because the condition is noticed
+        wherever it happens, not on the tick. The occurrence is queued and
+        applied by the next _tick like any other, so rules, dedup, mute and
+        rollup all behave exactly as they do for a device event.
+
+        `rule_key` doubles as the occurrence's source_kind, which is what
+        makes one system rule match one system condition rather than every
+        system rule opening on every one.
+        """
+        occurrence = Occurrence(
+            kind="system", source_kind=rule_key, entity_kind="system",
+            entity_id=str(entity_id), entity_label=label, ts=time.time(),
+            message=message or label, severity=severity,
+            extra=dict(extra or {}))
+        with self._system_lock:
+            self._system_occurrences.append(occurrence)
+
+    def clear_system_occurrence(self, rule_key: str, entity_id: str) -> None:
+        """The other half: the condition has ended, so resolve its alert on
+        the next tick. Resolved with resolved_by '' like every other engine
+        auto-resolve, so it is never mistaken for a hand resolve."""
+        with self._system_lock:
+            self._system_clears.append((rule_key, str(entity_id)))
+
+    def _drain_system_occurrences(self) -> list[Occurrence]:
+        with self._system_lock:
+            pending = self._system_occurrences
+            clears = self._system_clears
+            self._system_occurrences = []
+            self._system_clears = []
+        for rule_key, entity_id in clears:
+            rule = self.db.rule_by_key(rule_key)
+            if rule is None:
+                continue
+            if self.db.resolve_by_dedup(f"{rule['key']}:system:{entity_id}", by=""):
+                self.counters["resolved"] += 1
+        return pending
+
+    def _mail_result(self, job, ok: bool, error: str) -> None:
+        """One delivery finished, on the mail worker's thread. AlertsDatabase
+        has its own RLock, so the notification row is safe to write here."""
+        if ok:
+            self.counters["emails_sent"] += 1
+        else:
+            self.counters["send_errors"] += 1
+        self.db.record_notification(job.alert_id, job.kind,
+                                    ", ".join(job.to_addrs), job.subject,
+                                    ok, error)
+
+    def _mail_breaker(self, is_open: bool, error: str) -> None:
+        """The mail path itself became (un)usable. Raised as an ordinary
+        alert so the failure that silences every other alert is the one
+        thing that cannot be silenced by it — no email is sent for a
+        kind='system' rule, see _notify."""
+        if is_open:
+            self.system_occurrence(
+                "smtp_failing", "smtp", "Alert email", severity=2,
+                extra={"error": error},
+                message=f"Alert email is failing and delivery is paused: {error}")
+        else:
+            self.clear_system_occurrence("smtp_failing", "smtp")
 
     # ------------------------------------------------------- drain plumbing
 
@@ -1245,7 +1330,7 @@ class AlertEngine:
             # stop matching any custom rule that has one set.
             if rule["kind"] in ("device_event", "interface_event", "trap",
                                 "wireless_event", "threshold", "dhcp_threshold",
-                                "netpath_threshold"):
+                                "netpath_threshold", "system"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "syslog" and occurrence.severity is not None:
@@ -1291,6 +1376,12 @@ class AlertEngine:
     def _notify(self, alert_row, rule_row, occurrence: Occurrence, settings,
                renotify: bool = False, notify_kind: str | None = None,
                template_override=None) -> None:
+        # A system rule is about the application's own health, and today the
+        # only one is "email is not being delivered". Mailing about that
+        # would be either impossible or a loop, so system alerts live on the
+        # Alerts page and nowhere else.
+        if rule_row["kind"] == "system":
+            return
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
@@ -1350,19 +1441,24 @@ class AlertEngine:
                     password = None
 
         kind = notify_kind or ("renotify" if renotify else "alert")
-        try:
-            alertmail.send(settings, password, to_addrs, subject, body,
-                           bool(template["is_html"]))
-            self._sent_this_hour.append(now)
-            self.counters["emails_sent"] += 1
-            self.db.record_notification(alert_row["id"], kind, ", ".join(to_addrs),
-                                        subject, True)
-        except Exception as exc:
+        job = alertmail.MailJob(
+            settings=dict(settings), password=password, to_addrs=list(to_addrs),
+            subject=subject, body=body, is_html=bool(template["is_html"]),
+            alert_id=alert_row["id"], kind=kind)
+        password = None
+        # The quota counts ATTEMPTS, not successes. Appending only on success
+        # meant a dead relay consumed no quota at all: 500 alerts produced 500
+        # attempts, none of which the hourly cap stopped, and each paid the
+        # full SMTP timeout. An attempt is what costs time, so an attempt is
+        # what is rationed.
+        self._sent_this_hour.append(now)
+        if not self._mail.submit(job):
+            # Bounded on purpose; a refusal is recorded against the alert so
+            # the drop shows in its own detail pane rather than only in a
+            # global counter.
             self.counters["send_errors"] += 1
             self.db.record_notification(alert_row["id"], kind, ", ".join(to_addrs),
-                                        subject, False, str(exc))
-        finally:
-            password = None
+                                        subject, False, "send queue full")
 
     def _device_ip_for(self, alert_row) -> str:
         """Best-effort recovery of the real device address for the

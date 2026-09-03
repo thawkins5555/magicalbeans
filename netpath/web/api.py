@@ -3154,7 +3154,7 @@ def post_alerts_rule(service, params, body) -> dict:
         raise ValueError("key, name and kind are all required")
     if kind not in ("device_event", "interface_event", "threshold",
                     "dhcp_threshold", "netpath_threshold", "trap", "syslog",
-                    "ipam", "wireless_event"):
+                    "ipam", "wireless_event", "system"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")

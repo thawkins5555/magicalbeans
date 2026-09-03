@@ -183,3 +183,115 @@ assert engine.counters["backlog"] == 0, engine.counters
 ok("2,500 rows behind the cursor are drained in one tick, backlog 0")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== A2
+print("\nA2 — SMTP off the tick, with a breaker")
+
+
+class FakeMail:
+    """Stands in for alertmail.send. Counts attempts, fails on demand, and
+    can block so a shutdown with a wedged relay can be timed."""
+
+    def __init__(self):
+        self.attempts = []
+        self.fail = False
+        self.block = threading.Event()
+
+    def __call__(self, settings, password, to_addrs, subject, body, is_html):
+        self.attempts.append(subject)
+        if self.block.is_set():
+            time.sleep(30)
+        if self.fail:
+            raise OSError("relay refused the connection")
+
+
+MAIL_SETTINGS = {"email_enabled": True, "smtp_host": "relay.invalid",
+                 "smtp_to_default": ["noc@example.invalid"]}
+
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+fake = FakeMail()
+fake.fail = True
+real_send = alertmail.send
+alertmail.send = fake
+try:
+    engine._mail.cooldown_s = 900.0
+    engine._tick()
+    did = add_device(nodes, "10.3.0.1", "core-sw-a")
+    # Six separate outages, one per device: each opens its own alert and so
+    # submits its own message.
+    ids = [did] + [add_device(nodes, f"10.3.0.{i}", f"acc-sw-{i}")
+                   for i in range(2, 8)]
+    for device_id in ids:
+        nodes.record_device_event(device_id, "down", "stopped responding")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0), "mail queue never went idle"
+
+    assert len(fake.attempts) == 5, len(fake.attempts)
+    ok("the breaker stops attempting after 5 consecutive failures "
+       f"({len(ids)} alerts, {len(fake.attempts)} attempts)")
+
+    failed = [n for aid in [a["id"] for a in alerts.alerts(state="unresolved")]
+              for n in alerts.notifications_for(aid) if not n["ok"]]
+    assert len(failed) == len(ids), [dict(f) for f in failed]
+    assert sum(1 for f in failed if "not attempted" in (f["error"] or "")) == 2, \
+        [f["error"] for f in failed]
+    ok("every alert carries its own failed-notification row, "
+       "including the ones never attempted")
+
+    assert len(engine._sent_this_hour) == len(ids), engine._sent_this_hour
+    ok("the hourly quota counts attempts, so a dead relay is rationed")
+
+    engine._tick()          # raises the queued smtp_failing occurrence
+    smtp_rows = open_rows(alerts, "smtp_failing")
+    assert len(smtp_rows) == 1, [dict(r) for r in smtp_rows]
+    assert smtp_rows[0]["severity"] == 2, dict(smtp_rows[0])
+    assert alerts.notifications_for(smtp_rows[0]["id"]) == [], \
+        "a system alert must never try to email about email"
+    ok("the mail path raises its own alert, and that alert sends no email")
+
+    # The cooldown elapses and the relay comes back: the next job is the
+    # half-open probe, and its success closes the breaker.
+    fake.fail = False
+    engine._mail.cooldown_s = 0.0
+    nodes.record_device_event(ids[0], "up", "responding again")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    engine._tick()          # drains the queued clear
+    assert alerts.rule_by_key("smtp_failing") is not None
+    resolved = [a for a in alerts.alerts(state="resolved")
+                if a["entity_kind"] == "system"]
+    assert len(resolved) == 1, [dict(r) for r in resolved]
+    assert resolved[0]["resolved_by"] == "", dict(resolved[0])
+    assert open_rows(alerts, "smtp_failing") == []
+    ok("a successful half-open probe closes the breaker and resolves the "
+       "alert with resolved_by ''")
+finally:
+    alertmail.send = real_send
+engine.stop()
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# A wedged relay must not make shutdown look like a hang.
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+blocker = FakeMail()
+blocker.block.set()
+alertmail.send = blocker
+try:
+    engine._tick()
+    blocked_device = add_device(nodes, "10.3.9.9", "wedged-sw")
+    nodes.record_device_event(blocked_device, "down", "stopped responding")
+    engine._tick()
+    for _ in range(200):                      # let the worker pick the job up
+        if blocker.attempts:
+            break
+        time.sleep(0.01)
+    assert blocker.attempts, "the worker never started the blocked send"
+    started = time.monotonic()
+    engine.stop()
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.5, elapsed
+    ok(f"stop() returns in {elapsed:.2f}s with a send blocked on a dead relay")
+finally:
+    alertmail.send = real_send
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
