@@ -354,11 +354,28 @@ store = FakeMibStore({
 })
 slow_id = [r["id"] for r in store.rows if r["filename"] == "slow.mib"][0]
 budget_was = mibparse.PARSE_BUDGET_S
+real_monotonic = time.monotonic
+# A budget of a fraction of a microsecond raced real wall-clock time against
+# however long this machine takes to mask and scan 5000 statements — on a
+# fast enough box, or one whose clock reads in coarser steps than the race
+# needs, parse() can finish an entire check_budget() interval before the
+# clock visibly advances, so the budget is never seen as exceeded. Faking
+# the clock removes the race: each call reports strictly further ahead than
+# the last, so whichever call inside parse() sets the deadline, every later
+# call inside check_budget() is unconditionally past it.
+fake_now = [0.0]
+
+def fake_monotonic():
+    fake_now[0] += 1000.0
+    return fake_now[0]
+
+time.monotonic = fake_monotonic
 try:
     mibparse.PARSE_BUDGET_S = 0.0000001
     summary = mibparse.resolve_all(store, max_bytes=MB)
 finally:
     mibparse.PARSE_BUDGET_S = budget_was
+    time.monotonic = real_monotonic
 note = store.updates.get(slow_id, {}).get("parse_notes", "")
 check("a file that cannot be parsed gets a note saying so",
       summary["files_failed"] == 1 and note.startswith("Could not be parsed"),

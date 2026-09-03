@@ -601,7 +601,12 @@ print(f"the cover takes effect and says so once in the Nodes log: "
 # not answering.
 import netpath.alertengine as alertengine_module
 alertengine_module.OPERATOR_RESOLVE_WINDOW_S = 0.0
-assert alerts10.operator_resolved_since(time.time()) == {}, \
+# +1s margin: the resolve above and this call are both real time.time()
+# reads a handful of statements apart, and on a coarser wall clock (seen on
+# Windows CI) they can land on the same tick, making resolved_ts >= cutoff
+# true instead of false. A cutoff a full second ahead is unambiguously past
+# any real resolve time recorded moments ago, regardless of clock grain.
+assert alerts10.operator_resolved_since(time.time() + 1) == {}, \
     "the resolve really has aged out of the engine's window"
 for i in range(3):
     down_poll(nodes10, did10, base10 + 210 + i * 70)
