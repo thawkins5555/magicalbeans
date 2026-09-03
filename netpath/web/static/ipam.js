@@ -1043,6 +1043,12 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       control's change writes the store before whatever those handlers redraw
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end; it assigns from script, which fires no event. */
+    const CONTROLS = ['ipam-alive-only', 'ipam-show-resolved', 'ipam-scope-sort'];
+    App.rememberControls('ipam', CONTROLS);
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => {
         App.rememberSub('ipam', btn.dataset.subtab);
@@ -1076,9 +1082,7 @@
     // Last thing in init(): nothing has been drawn yet, so the first draw
     // of each sub-view already has these. The scope order lives on `view`
     // as well as on the control, so the two have to start out agreeing.
-    const CONTROLS = ['ipam-alive-only', 'ipam-show-resolved', 'ipam-scope-sort'];
     App.restoreControls('ipam', CONTROLS);
-    App.rememberControls('ipam', CONTROLS);
     view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
     selectSub(App.recallSub('ipam', view.sub));
   }

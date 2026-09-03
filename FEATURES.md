@@ -28,13 +28,21 @@ panel sizes and column widths, per browser rather than per account. **It
 also keeps the view itself**: the column a table was sorted on and which
 way, whatever was typed into a search box, every dropdown filter, and the
 sub-tab a page was on (Devices or Discovery, Subnets or DHCP) all come back
-as they were. What is deliberately *not* remembered is the Live / follow
-switch on the streaming pages: a page that came back with its updates
-quietly switched off would read as broken, so those start on every load.
-**Reset panel sizes** on the Settings tab resets panel sizes and nothing
-else. **Signing in always opens on Dashboard**, though: a fresh login is a
-new visit, not a reload, so it starts from the same place every time rather
-than wherever a previous session happened to leave off.
+as they were. That covers the nine pages that have filters and sortable
+tables — Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless,
+ConfigRX and Debug. Dashboard and Settings have nothing of the kind to
+keep, and NetPath keeps its own time window per destination instead, since
+there the window belongs to the destination rather than to the page. What
+is deliberately *not* remembered is the Live / follow switch on the
+streaming pages: a page that came back with its updates quietly switched
+off would read as broken, so those start on every load. It is also *per
+person*, not just per browser: signing out clears it, and a different
+account signing in on the same browser starts with clean filters rather
+than inheriting the last operator's searches. **Reset panel sizes** on the
+Settings tab resets panel sizes and nothing else. **Signing in always opens
+on Dashboard**, though: a fresh login is a new visit, not a reload, so it
+starts from the same place every time rather than wherever a previous
+session happened to leave off.
 
 ## How it runs
 

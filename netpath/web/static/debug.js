@@ -355,14 +355,25 @@
           select.appendChild(option);
         }
       }
-      // Late-filled: destinations are discovered from the event stream, so a
-      // restored choice can only be applied once its option turns up. One
-      // that never does leaves the filter on "All destinations".
+      /* Late-filled: destinations are discovered from the event stream, so a
+         restored choice may name one this batch simply has not mentioned yet
+         — the list only ever grows, and a quiet destination can be several
+         batches away. So the choice is OFFERED rather than forgotten: it goes
+         in as an option of its own and is selected, and the batch that does
+         name it finds it already in view.targets and adds nothing. Forgetting
+         it instead is what dropped a restored destination on the first tick
+         after a reload. */
       if (!select.value) {
-        select.value = App.savedControl('debug', 'dbg-target') || '';
-        if (select.selectedIndex < 0) {
-          select.value = '';
-          App.rememberControl('debug', 'dbg-target', '');
+        const saved = App.savedControl('debug', 'dbg-target') || '';
+        if (saved) {
+          if (!view.targets.has(saved)) {
+            view.targets.add(saved);
+            const option = document.createElement('option');
+            option.value = saved;
+            option.textContent = saved;
+            select.appendChild(option);
+          }
+          select.value = saved;
         }
       }
       drawEvents();
@@ -380,9 +391,17 @@
       label.innerHTML =
         `<input type="checkbox" id="dbg-cat-${category}" value="${category}" checked>` +
         ` ${CATEGORY_LABEL[category] || category}`;
-      label.querySelector('input').onchange = drawEvents;
       cats.appendChild(label);
     }
+    /* The category boxes have to exist before the store can listen to them,
+       so this is as early as it goes — but still before every handler of this
+       module's own, so a change writes the store before anything reacting to
+       it reads back. restoreControls stays at the end of init(); it assigns
+       from script, which fires no event. */
+    const CONTROLS = ['dbg-target', 'dbg-search'].concat(
+      App.state.categories.map((category) => `dbg-cat-${category}`));
+    App.rememberControls('debug', CONTROLS);
+    for (const input of cats.querySelectorAll('input')) input.onchange = drawEvents;
     App.el('dbg-target').innerHTML = '<option value="">All destinations</option>';
     App.el('dbg-target').onchange = drawEvents;
     App.el('dbg-search').oninput = drawEvents;
@@ -391,10 +410,16 @@
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
     };
     /* Ticking every category back on one at a time is the reason "None" on
-       its own would be a trap, so both directions are offered. Nothing is
-       stored: categoriesOn() reads the boxes live on every draw. */
+       its own would be a trap, so both directions are offered. categoriesOn()
+       reads the boxes live on every draw, so nothing here has to be kept in
+       step with them — but the store does, since setting .checked from script
+       is silent (see below). */
     const setAllCategories = (on) => {
       for (const input of cats.querySelectorAll('input')) input.checked = on;
+      // Setting .checked from script fires no event, so without this the
+      // store would keep the boxes as they were: None followed by a reload
+      // used to come back with every category ticked again.
+      App.syncControls('debug', App.state.categories.map((c) => `dbg-cat-${c}`));
       drawEvents();
     };
     App.el('dbg-cats-all').onclick = () => setAllCategories(true);
@@ -419,10 +444,7 @@
     // Last thing in init(): the category boxes above exist, and nothing has
     // been drawn — the first drawEvents reads all of these live. Follow is
     // deliberately not restored.
-    const CONTROLS = ['dbg-target', 'dbg-search'].concat(
-      App.state.categories.map((category) => `dbg-cat-${category}`));
     App.restoreControls('debug', CONTROLS);
-    App.rememberControls('debug', CONTROLS);
   }
 
   App.pages.debug = { init, refresh, fastTick };

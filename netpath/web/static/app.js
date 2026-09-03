@@ -697,28 +697,82 @@ const App = (() => {
      `Reset panel sizes` deliberately leaves this key alone: it means "put
      the furniture back", not "throw away what I was looking at".
 
+     Per browser, but not shared between the people using it: the store
+     records the username it was written for, a different one signing in
+     discards the whole store before any page restores from it, and signing
+     out removes the key outright. One operator's search terms are their own
+     work and must not pre-fill the next shift's filter bars on the NOC
+     workstation they share.
+
      Deliberately NOT stored: the Live/Follow checkboxes on Syslog, Traps,
      NetFlow and Debug. Persisting "Live off" would hand somebody a page
      that has silently stopped moving, with nothing on screen to say why —
      the one setting where remembering the last state is the wrong answer.
 
-     Shape: {sort: {gridName: {key, descending}},
+     Shape: {user: username,
+             sort: {gridName: {key, descending}},
              pages: {page: {controls: {elementId: value}, sub: name}}}. */
 
   const VIEW_KEY = 'sappiwhere.view';
 
+  /* The parsed store, kept in memory. Every fetch path with a late-filled
+     select reads it — Nodes twice a tick, Alerts and ConfigRX once — and
+     typing in a filter box writes it on every keystroke, so parsing and
+     re-serialising a JSON blob each time was real work for nothing. The one
+     thing a cache can get wrong is a SECOND TAB writing the same key, so the
+     browser's own `storage` event drops it: that event fires in every other
+     tab but not the one that wrote, which is exactly the rule this needs. */
+  let viewCache = null;
+
   function loadView() {
+    if (viewCache) return viewCache;
     try {
-      return JSON.parse(localStorage.getItem(VIEW_KEY) || '{}') || {};
+      viewCache = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}') || {};
     } catch (error) {
-      return {};
+      viewCache = {};
     }
+    return viewCache;
   }
 
   function saveView(store) {
+    viewCache = store || {};
     try {
-      localStorage.setItem(VIEW_KEY, JSON.stringify(store));
+      localStorage.setItem(VIEW_KEY, JSON.stringify(viewCache));
     } catch (error) { /* private browsing, or storage full: not worth failing */ }
+  }
+
+  // `key === null` is a whole-storage clear from another tab.
+  window.addEventListener('storage', (event) => {
+    if (event.key === VIEW_KEY || event.key === null) viewCache = null;
+  });
+
+  /* Whose view state this is. Two operators sharing one browser — a NOC
+     workstation, a shift handover — used to inherit each other's filter
+     bars: the previous operator's device names and search text pre-filled
+     the next one's page, and that is their work, not a shared setting. So
+     the store carries the username it was written for, and a different one
+     throws the whole thing away before any page restores from it rather
+     than merging two people's idea of what they were looking at.
+
+     Called from loadState(), which start() awaits before any module's
+     init() runs, so the discard always beats the first restoreControls. */
+  function claimView(username) {
+    if (!username) return;
+    const store = loadView();
+    if (store.user === username) return;
+    saveView(store.user ? { user: username }
+                        : Object.assign({}, store, { user: username }));
+  }
+
+  /* Sign-out empties it: leaving one operator's filters on a shared machine
+     for whoever logs in next is the same privacy question, and that next
+     operator may never sign in through this browser for claimView to catch
+     it. */
+  function forgetView() {
+    viewCache = null;
+    try {
+      localStorage.removeItem(VIEW_KEY);
+    } catch (error) { /* private browsing: nothing was stored anyway */ }
   }
 
   /* The OID browser's table is a modal built fresh each time it opens, over
@@ -759,6 +813,25 @@ const App = (() => {
   function savedControl(page, id) {
     const controls = pageControls(page);
     return Object.prototype.hasOwnProperty.call(controls, id) ? controls[id] : null;
+  }
+
+  /* What a fetch on the late-filled path should send. The element wins once
+     its option list has actually been built — for a <select> that means more
+     than the one "any" placeholder — and only before that does the store
+     stand in for it.
+
+     Reading `select.value || savedControl(...)` instead made the filter send
+     the PREVIOUS choice for one cycle every time somebody picked "any": the
+     empty value is falsy, so the fallback took over and re-sent the id that
+     had just been cleared. Anything that is not a <select> has no late fill
+     to wait for and always answers for itself. */
+  function controlOrSaved(page, id) {
+    const element = document.getElementById(id);
+    if (element && (element.tagName !== 'SELECT' || element.options.length > 1)) {
+      return controlValue(element);
+    }
+    const stored = savedControl(page, id);
+    return stored === null || stored === undefined ? '' : stored;
   }
 
   /* Set the named controls from the store, and report what was applied.
@@ -808,6 +881,25 @@ const App = (() => {
     saveView(store);
   }
 
+  /* Write the named controls' CURRENT values to the store. A Clear button
+     sets `.value = ''` on half a filter bar from script, and a programmatic
+     assignment fires no `change` or `input` event — so the listeners below
+     never hear it and the store keeps what the operator has just cleared.
+     NetFlow showed that worst: the exporter fallback went on naming an
+     exporter Clear had already taken off the control. */
+  function syncControls(page, ids) {
+    const store = loadView();
+    store.pages = store.pages || {};
+    store.pages[page] = store.pages[page] || {};
+    const controls = store.pages[page].controls = store.pages[page].controls || {};
+    for (const id of ids) {
+      const element = document.getElementById(id);
+      if (!element) continue;
+      controls[id] = controlValue(element);
+    }
+    saveView(store);
+  }
+
   function rememberControls(page, ids) {
     for (const id of ids) {
       const element = document.getElementById(id);
@@ -827,11 +919,20 @@ const App = (() => {
      has not kept anything, so these travel with the controls. A stored name
      is only honoured while a button for it is still on its page — a build
      that drops a sub-view must not leave every sub-view hidden. */
-  function recallSub(page, fallback) {
+  function recallSub(page, fallback, scope) {
     const sub = ((loadView().pages || {})[page] || {}).sub;
     if (!sub || typeof sub !== 'string' || !/^[a-z0-9_-]+$/i.test(sub)) return fallback;
-    const section = document.getElementById(`page-${String(page).split('.')[0]}`);
-    if (!section || !section.querySelector(`.subtab[data-subtab="${sub}"]`)) return fallback;
+    // Validated against the ONE nav the value belongs to, not the whole
+    // page: Nodes carries a second `.subtabs` inside the device pane, so a
+    // page-level name checked against `#page-nodes` could match a button in
+    // that pane instead and selectSub would then leave the page with no
+    // sub-page active at all. `scope` is the other nav's own container;
+    // without it the rule is "the section's first .subtabs", which is the
+    // page's own nav in every module.
+    const root = scope || document.getElementById(`page-${String(page).split('.')[0]}`);
+    if (!root) return fallback;
+    const nav = root.querySelector('.subtabs') || root;
+    if (!nav.querySelector(`.subtab[data-subtab="${sub}"]`)) return fallback;
     return sub;
   }
 
@@ -1180,6 +1281,10 @@ const App = (() => {
     }
     if (payload.session) {
       state.session = payload.session;
+      state.username = payload.session.username || '';
+      // Before anything restores from the store: start() awaits this call and
+      // only then runs the modules' init().
+      claimView(state.username);
       applySessionIdle(payload.session);
       const who = document.getElementById('whoami');
       if (who) who.textContent = payload.session.username;
@@ -1267,6 +1372,9 @@ const App = (() => {
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {
+        // Dropped before the redirect, not after: whoever signs in next on
+        // this browser must not find this operator's filters waiting.
+        forgetView();
         try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
         window.location.href = '/login';
       };
@@ -1337,7 +1445,7 @@ const App = (() => {
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     recallSort, rememberSort, restoreControls, rememberControls,
-    rememberControl, savedControl,
+    rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub,
     grid, sortRows, canRead, canWrite, accountModal,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,

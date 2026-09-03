@@ -9,14 +9,17 @@ Listed newest first. Version numbers are build order, not dates.
 ### 4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves
 
 - **Reloading a page keeps what you had on screen.** Column sorts, search
-  boxes, dropdown filters and sub-tabs on every module now come back the way
-  they were — the same way the tab, panel sizes and column widths already
-  did — instead of snapping to their defaults. The browser remembers them,
-  per browser rather than per account, under one key beside the others.
-  Deliberately not remembered: the Live / follow switches, because coming
-  back to a page that had quietly stopped updating is worse than coming back
-  to one that starts fresh. **Reset panel sizes** still means panel sizes
-  and leaves these alone.
+  boxes, dropdown filters and sub-tabs on the nine pages that have them —
+  Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless, ConfigRX and
+  Debug — now come back the way they were, the same way the tab, panel sizes
+  and column widths already did, instead of snapping to their defaults. The
+  browser remembers them, per browser rather than per account, under one key
+  beside the others. NetPath is not among them: it keeps its own time window
+  per destination, which is not a page-wide filter. Deliberately not
+  remembered: the Live / follow switches, because coming back to a page that
+  had quietly stopped updating is worse than coming back to one that starts
+  fresh. **Reset panel sizes** still means panel sizes and leaves these
+  alone.
 - **Mute device is offered on every alert that is about a device, and says
   why when it cannot be.** The button had never left the alert detail — it
   was hidden whenever the selected alert was not a *device* alert, which

@@ -32,6 +32,10 @@
     discResults: [],
     discChecked: new Set(),
     discCheckedJob: null,   // which job discChecked's defaults were seeded for
+    // Result ids this job has already offered, so a sweep that is still
+    // running can pre-approve what it finds NEXT without undoing a manual
+    // untick of what it found before. Reset with discCheckedJob.
+    discSeen: new Set(),
     discSort: App.recallSort('nodes-discovery', { key: 'ip', descending: false }),
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
     mibFiles: [],
@@ -2580,7 +2584,7 @@
             if (view.discSelected === job.id && !running) {
               view.discSelected = null;
               view.discResults = [];
-              drawDiscResultsTable();
+              drawDiscResultsTable(true);
             }
             App.refreshNow('nodes');
           });
@@ -2595,6 +2599,10 @@
           return;
         }
         view.discSelected = job.id;
+        // The selected row's highlight moves here rather than inside
+        // loadDiscResults, which every live tick calls: redrawing the jobs
+        // table twice a tick was work for a table nothing had changed.
+        drawDiscJobsTable();
         loadDiscResults();
       };
       body.appendChild(tr);
@@ -2603,19 +2611,36 @@
   }
 
   async function loadDiscResults() {
-    if (!view.discSelected) { view.discResults = []; drawDiscResultsTable(); return; }
-    const r = await App.get(`/api/nodes/discovery/${view.discSelected}`);
-    view.discResults = r.results;
-    if (view.discCheckedJob !== view.discSelected) {
-      // First look at this job's results: pre-approve what the policy
-      // says — SNMP-identified devices only; a manual uncheck afterwards
-      // sticks because this only reseeds when the selected job changes.
-      view.discChecked = new Set(
-        view.discResults.filter((x) => x.snmp_ok && !x.promoted_device_id)
-          .map((x) => x.id));
-      view.discCheckedJob = view.discSelected;
+    if (!view.discSelected) {
+      view.discResults = [];
+      drawDiscResultsTable(true);
+      return;
     }
-    drawDiscJobsTable();
+    // The job this fetch is FOR. A live tick's fetch and a click on another
+    // job race each other: without this, job A's rows painted under job B's
+    // selection and re-seeded B's ticks from A's results, so Promote would
+    // have posted A's result ids against job B.
+    const jobId = view.discSelected;
+    const r = await App.get(`/api/nodes/discovery/${jobId}`);
+    if (view.discSelected !== jobId) return;
+    view.discResults = r.results;
+    if (view.discCheckedJob !== jobId) {
+      // First look at this job's results: pre-approve what the policy says —
+      // SNMP-identified devices only.
+      view.discChecked = new Set();
+      view.discSeen = new Set();
+      view.discCheckedJob = jobId;
+    }
+    // Everything this job has not offered before gets the same treatment as
+    // the first batch did, so a job clicked at 10 % ends up with every
+    // SNMP-identified device ticked rather than only the tenth that existed
+    // at the click. Only UNSEEN ids are touched, so a manual untick sticks.
+    for (const x of view.discResults) {
+      if (!view.discSeen.has(x.id)) {
+        view.discSeen.add(x.id);
+        if (x.snmp_ok && !x.promoted_device_id) view.discChecked.add(x.id);
+      }
+    }
     drawDiscResultsTable();
   }
 
@@ -2658,15 +2683,16 @@
   }
 
   /* Vendor with its confidence marker, the "install these MIBs" hint and
-     the "(added)" tag. The arc title hangs on a <span> inside the cell
-     rather than on the cell itself: App.drawRows owns the <td>. */
+     the "(added)" tag. The arcs tooltip is NOT part of this: hung on a
+     <span> around the text it only covered the words, so hovering the rest
+     of a wide Vendor column said nothing. It goes on the <td> instead — in
+     the grid through App.drawRows' onRow callback, in the approval dialog
+     on the cell this string is written into. */
   function discVendorCell(r) {
-    const body = `${escape(r.vendor || '\u2014')}${vendorMarker(r)}` +
+    return `${escape(r.vendor || '\u2014')}${vendorMarker(r)}` +
       (r.suggest_bundle && !r.suggest_bundle_installed
         ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : '') +
       (r.promoted_device_id ? ' <span class="hint">(added)</span>' : '');
-    const title = discArcsTitle(r);
-    return title ? `<span title="${escape(title)}">${body}</span>` : body;
   }
 
   const DISC_COLUMNS = [
@@ -2693,13 +2719,16 @@
      swapped through view.discChecked, which used to leave the pane's
      selection standing in a global for the length of one string build. */
   function discResultRowsHtml(results, job, cls, checkedSet) {
-    return results.map((r) =>
-      `<tr><td>${discCheckCell(r, job, checkedSet, cls)}</td>` +
-      `<td>${escape(r.ip)}</td>` +
-      `<td>${r.ping_ok ? 'yes' : 'no'}</td>` +
-      `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
-      `<td>${escape(r.sys_name || '\u2014')}</td>` +
-      `<td>${discVendorCell(r)}</td></tr>`).join('');
+    return results.map((r) => {
+      const arcs = discArcsTitle(r);
+      return `<tr><td>${discCheckCell(r, job, checkedSet, cls)}</td>` +
+        `<td>${escape(r.ip)}</td>` +
+        `<td>${r.ping_ok ? 'yes' : 'no'}</td>` +
+        `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
+        `<td>${escape(r.sys_name || '\u2014')}</td>` +
+        `<td${arcs ? ` title="${escape(arcs)}"` : ''}>` +
+        `${discVendorCell(r)}</td></tr>`;
+    }).join('');
   }
 
   function discArcsTitle(r) {
@@ -2742,15 +2771,37 @@
 
   function onDiscSort(key, descending) {
     view.discSort = { key, descending };
-    drawDiscResultsTable();
+    drawDiscResultsTable(true);
   }
 
-  function drawDiscResultsTable() {
+  // What the table on screen was last built from. A running sweep re-fetches
+  // every couple of seconds and most of those answers are identical; rebuilding
+  // every row's innerHTML for them cost a redraw a tick for nothing.
+  let discDrawnSignature = null;
+
+  /* `force` for the callers that change something the signature cannot see —
+     the ticks, which live in a Set beside the rows rather than on them. */
+  function drawDiscResultsTable(force) {
     const table = App.el('disc-results-table');
     const job = discSelectedJob();
     const selectable = view.discResults.filter((r) => discSelectable(r, job));
     const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
     const chosen = ticked();
+    // promoted_device_id and snmp_ok are the only fields the server ever
+    // changes on a result that already exists; everything else about a row is
+    // fixed when the scanner writes it. So an unchanged list under an
+    // unchanged sort renders identically, and the only thing that still has
+    // to be corrected is the header's select-all box.
+    const signature = [
+      view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
+      view.discResults.map((r) =>
+        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.promoted_device_id || ''}`).join(','),
+    ].join('|');
+    if (!force && signature === discDrawnSignature) {
+      App.refreshSelectAll(table, selectable.length, ticked());
+      return;
+    }
+    discDrawnSignature = signature;
     // A redraw under a running sweep must not throw the pane back to the top
     // while someone is reading further down it.
     const wrap = table.parentElement;
@@ -2758,23 +2809,33 @@
     App.grid(table, {
       name: 'nodes-discovery', columns: DISC_COLUMNS,
       sort: view.discSort, onSort: onDiscSort,
-      selectAll: {
+      // A scan that found nothing anyone may add — every address dead, or
+      // every device already promoted — has no boxes to govern, and a
+      // select-all above an empty column is a control that does nothing.
+      selectAll: selectable.length > 0 ? {
         key: 'check',
-        checked: selectable.length > 0 && chosen === selectable.length,
+        checked: chosen === selectable.length,
         some: chosen > 0 && chosen < selectable.length,
         onToggle: (on) => {
           for (const r of selectable) {
             if (on) view.discChecked.add(r.id); else view.discChecked.delete(r.id);
           }
-          drawDiscResultsTable();
+          drawDiscResultsTable(true);
         },
-      } });
+      } : null });
     const body = document.createElement('tbody');
     // Sorted into a copy, never in place: view.discResults is what the next
     // tick's fetch replaces and what the approval dialog reads.
     const rows = App.sortRows(view.discResults, view.discSort.key,
                               view.discSort.descending, DISC_COLUMNS);
+    const vendorIndex = DISC_COLUMNS.findIndex((c) => c.key === 'vendor');
     App.drawRows(body, rows, DISC_COLUMNS, (tr, row) => {
+      // The whole Vendor cell carries the enterprise-arc explanation, not
+      // just the vendor word inside it.
+      const arcs = discArcsTitle(row);
+      if (arcs && vendorIndex >= 0 && tr.children[vendorIndex]) {
+        tr.children[vendorIndex].title = arcs;
+      }
       const box = tr.querySelector('.disc-check');
       if (!box) return;
       box.onchange = () => {
@@ -2797,9 +2858,22 @@
     return !!pane && pane.classList.contains('active');
   }
 
-  // The selected job's `id:state` on the previous Nodes tick, so a sweep
-  // that has just stopped gets one final fetch and then goes quiet.
+  /* The selected job's `id:state:probed:responded:identified` as of the last
+     tick the Discovery pane was actually on screen. The jobs list carries all
+     five, so "has this sweep moved?" is answered by the list fetch that
+     happens anyway and the full result set — one row per probed address, dead
+     ones included, up to max_scan_addresses — is only asked for when it has.
+
+     Advanced only while the pane is visible: a sweep that finished behind the
+     Devices sub-tab used to consume its own running -> done edge unseen, and
+     the results pane then showed whatever the job had found at the moment it
+     was hidden, for good. */
   let discPrevState = null;
+
+  function discJobSignature(job) {
+    return job ? `${job.id}:${job.state}:${job.probed}:${job.responded}:` +
+                 `${job.identified}` : null;
+  }
 
   function startDiscovery() {
     const target = App.el('disc-target').value.trim();
@@ -2842,6 +2916,7 @@
         discStatus('');
         view.discSelected = result.id;
         view.discChecked = new Set();
+        view.discSeen = new Set();
         view.discCheckedJob = result.id;
         App.refreshNow('nodes');
       } },
@@ -2894,7 +2969,7 @@
           if (view.discSelected === job.id) {
             view.discSelected = null;
             view.discResults = [];
-            drawDiscResultsTable();
+            drawDiscResultsTable(true);
           }
           App.refreshNow('nodes');
         }, () => {
@@ -3328,13 +3403,12 @@
     if (App.state.tab !== 'nodes') return;
     drawStatus();
     const q = App.el('nd-q').value.trim();
-    // Same fallback as fillGroupFilter: on the load right after a reload
-    // the options do not exist yet, and the first fetch has to honour the
-    // restored choice or the list would contradict the filter for a tick.
-    const group_id = App.el('nd-filter-group').value ||
-      App.savedControl('nodes', 'nd-filter-group') || '';
-    const device_group_id = App.el('nd-filter-devgroup').value ||
-      App.savedControl('nodes', 'nd-filter-devgroup') || '';
+    // Same fallback as fillGroupFilter: until the options exist the first
+    // fetch has to honour the restored choice, or the list would contradict
+    // the filter for a tick. Once they do, the control answers for itself —
+    // including when it answers "any".
+    const group_id = App.controlOrSaved('nodes', 'nd-filter-group');
+    const device_group_id = App.controlOrSaved('nodes', 'nd-filter-devgroup');
     const status = App.el('nd-filter-status').value;
     // Omitted entirely when unchecked, not sent as "false": App.get only
     // drops params equal to '', so the API reads presence, not value.
@@ -3487,11 +3561,19 @@
     view.discJobs = jobs.jobs;
     drawDiscJobsTable();
     const job = discSelectedJob();
-    const previous = discPrevState;
-    discPrevState = job ? `${job.id}:${job.state}` : null;
-    if (job && discoveryVisible()
-        && (job.state === 'running' || previous === `${job.id}:running`)) {
-      await loadDiscResults().catch(() => {});
+    if (discoveryVisible()) {
+      const previous = discPrevState;
+      const signature = discJobSignature(job);
+      discPrevState = signature;
+      // Fetch when the counters or the state have actually moved, and once
+      // more on the edge out of `running` so the pane ends on the sweep's
+      // final rows rather than its second-to-last tick.
+      const wasRunning = !!(job && previous
+        && previous.startsWith(`${job.id}:running:`));
+      if (job && signature !== previous
+          && (job.state === 'running' || wasRunning)) {
+        await loadDiscResults().catch(() => {});
+      }
     }
     maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
   }
@@ -3530,6 +3612,16 @@
   }
 
   function init() {
+    /* Registered before any of this module's own handlers, so that when a
+       filter changes the store is written BEFORE the refresh those handlers
+       kick off reads it back. Listeners run in registration order, and the
+       other way round the fetch fallback still saw the previous choice.
+       restoreControls stays at the end of init(), where the option lists it
+       needs have been built; it assigns values from script, which fires no
+       event, so these listeners do not fight it. */
+    const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
+      'nd-filter-status', 'nd-filter-offline', 'disc-target', 'disc-pingonly'];
+    App.rememberControls('nodes', CONTROLS);
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => {
         App.rememberSub('nodes', btn.dataset.subtab);
@@ -3680,12 +3772,13 @@
     // of the DOM exactly as it reads the markup defaults. A restored Find
     // box does not search for a MAC on its own — that stays a keypress,
     // because the lookup can open a dialog.
-    const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
-      'nd-filter-status', 'nd-filter-offline', 'disc-target', 'disc-pingonly'];
     App.restoreControls('nodes', CONTROLS);
-    App.rememberControls('nodes', CONTROLS);
     selectSub(App.recallSub('nodes', 'devices'));
-    selectDetailSub(App.recallSub('nodes.detail', 'interfaces'));
+    // Scoped to the device pane: this page has two navs, and validating a
+    // detail-pane name against the whole of #page-nodes (or the page's own
+    // name against the detail nav) matches a button in the wrong one.
+    selectDetailSub(App.recallSub('nodes.detail', 'interfaces',
+                                  App.el('nd-detail')));
   }
 
   function selectSub(name) {
@@ -3694,6 +3787,13 @@
     }
     for (const page of document.querySelectorAll('#page-nodes > .subpage')) {
       page.classList.toggle('active', page.id === `nodes-sub-${name}`);
+    }
+    // Coming back to Discovery: the live re-fetch was off while this pane was
+    // hidden, so whatever the selected sweep found in the meantime is not on
+    // screen yet. One fetch now rather than waiting for the next tick — and
+    // for a job that has since finished, there may be no next tick.
+    if (name === 'discovery' && view.discSelected) {
+      loadDiscResults().catch(() => {});
     }
   }
 

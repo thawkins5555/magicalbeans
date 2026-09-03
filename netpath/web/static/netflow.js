@@ -103,9 +103,10 @@
       protocol: App.el('nf-protocol').value,
       // The exporter list is filled from the response below, so on the load
       // after a reload the restored choice is not on the element yet and the
-      // first fetch would ignore it.
-      exporter: App.el('nf-exporter').value ||
-        App.savedControl('netflow', 'nf-exporter') || '',
+      // first fetch would ignore it. Once the list exists the control answers
+      // for itself, "All exporters" included — the old `value || saved` form
+      // read an empty choice as "no answer" and re-sent the previous one.
+      exporter: App.controlOrSaved('netflow', 'nf-exporter'),
     };
   }
 
@@ -679,6 +680,15 @@
   }
 
   function init() {
+    /* Registered before this module's own onchange handlers below, so a
+       filter change writes the store before the refresh those handlers start
+       reads it back — listeners run in registration order. restoreControls
+       stays at the end, after the dimension, protocol and range lists exist;
+       it assigns from script, which fires no event. Follow is deliberately
+       not restored. */
+    const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
+      'nf-protocol', 'nf-exporter', 'nf-order'];
+    App.rememberControls('netflow', CONTROLS);
     App.fillRanges(App.el('nf-range'), 'Last hour');
     const dimension = App.el('nf-dimension');
     // /api/state sends the dimension list only to an account with NetFlow
@@ -719,11 +729,13 @@
     }
     App.el('nf-apply').onclick = () => App.refreshNow('netflow');
     App.el('nf-clear').onclick = () => {
-      App.el('nf-src').value = '';
-      App.el('nf-dst').value = '';
-      App.el('nf-port').value = '';
-      App.el('nf-protocol').value = '';
-      App.el('nf-exporter').value = '';
+      const cleared = ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'];
+      for (const id of cleared) App.el(id).value = '';
+      // Assigning .value from script fires no event, so the store would keep
+      // every value Clear has just removed — and the exporter fallback in
+      // filters() would go on asking the server for one this bar no longer
+      // shows, which is what made Clear unable to clear the exporter at all.
+      App.syncControls('netflow', cleared);
       App.refreshNow('netflow');
     };
     for (const id of ['nf-src', 'nf-dst', 'nf-port']) {
@@ -760,11 +772,8 @@
     // Restored before resetWindow(), which reads the range straight off
     // nf-range to size the first window — after it, the window would be
     // built from the markup default and only correct itself on the next
-    // change. Follow is deliberately not restored.
-    const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
-      'nf-protocol', 'nf-exporter', 'nf-order'];
+    // change.
     App.restoreControls('netflow', CONTROLS);
-    App.rememberControls('netflow', CONTROLS);
     resetWindow();
   }
 
