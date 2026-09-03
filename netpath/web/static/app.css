@@ -109,7 +109,19 @@ body {
   border-bottom: 1px solid var(--hairline);
   padding: 0 12px;
   flex: none;
+  /* `body { overflow: hidden }` clips rather than scrolls, so below about
+     1,400 px the right-hand tabs — Debug, Settings — and the sign-out button
+     were simply unreachable: cut off with nothing to scroll. This is the
+     one-line half of the narrow-layout problem (a real narrow layout is a
+     separate piece of work): the bar scrolls sideways instead of losing its
+     tail, and nothing in it is allowed to shrink into unreadability. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
 }
+#tabs > * { flex: none; }
+#tabs > .grow { flex: 1 0 auto; }
 .tab {
   background: none;
   border: none;
