@@ -11,12 +11,34 @@ from __future__ import annotations
 import ipaddress
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .eventlog import ERROR, IPAM, NullLog, SYSTEM
 from .ipam_dhcp import DhcpUnavailable
 from .ipam_dhcp import poll as dhcp_poll
 from .ipam_scan import SubnetTooLarge, normalize_mac, read_arp_table, sweep, usable_addresses
 from .ipamdb import IpamDatabase, scope_size
+
+# How many subnet scans may run at once. Each one calls sweep(), which builds
+# its own ThreadPoolExecutor of `ping_workers` (64) threads and runs one
+# `ping` subprocess per address, so the number that matters is this times
+# ping_workers: 4 x 64 = 256 concurrent pings, on a box that is also polling
+# a fleet. Before, every enabled subnet got its own bare thread with nothing
+# limiting how many ran together -- 50 subnets meant 50 scan threads, 3,200
+# pool threads and up to 3,200 concurrent ping processes.
+#
+# Overridable per install through the IPAM settings key of the same name;
+# `settings.get` keeps working on a database that has no such key.
+DEFAULT_MAX_CONCURRENT_SCANS = 4
+
+# The window the first scan of each subnet is spread across, in seconds.
+# `_next_scan` starts empty, so on the first tick after start-up every
+# enabled subnet was due at once -- and because they then all share one
+# scan_interval_minutes they stayed in lockstep for the life of the process.
+# Five minutes is short enough that an operator watching a fresh install
+# sees every subnet scanned promptly, and long enough that fifty of them do
+# not arrive together.
+FIRST_SCAN_SPREAD_S = 300.0
 
 
 def credential_for_server(server) -> tuple[str | None, str | None]:
@@ -49,6 +71,15 @@ class IpamWorker:
         self._next_dhcp_poll: dict[int, float] = {}
         self._scanning: set[int] = set()
         self._polling: set[int] = set()
+        # Subnets handed to the scan pool but not yet started. Without this,
+        # a scan waiting for a pool slot is in neither _scanning nor the
+        # queue's view, so the next tick would hand it in again.
+        self._queued: set[int] = set()
+        self._scan_pool: ThreadPoolExecutor | None = None
+        self._scan_pool_size = 0
+        # False until the first tick has spread the subnets' first scans
+        # across FIRST_SCAN_SPREAD_S.
+        self._staggered = False
         # When each currently-running scan or poll began, for the Debug page.
         # Only holds entries for ids presently in _scanning/_polling — an id
         # leaving one of those sets removes its entry here in the same
@@ -72,6 +103,13 @@ class IpamWorker:
         if self.running:
             self.log.add(SYSTEM, "IPAM worker stopped")
         self._stop.set()
+        with self._lock:
+            pool, self._scan_pool = self._scan_pool, None
+            self._scan_pool_size = 0
+        if pool is not None:
+            # Not waited on: a sweep in flight can take minutes, and stop()
+            # is called from the UI thread and from shutdown.
+            pool.shutdown(wait=False)
 
     def shutdown(self) -> None:
         self.stop()
@@ -99,10 +137,11 @@ class IpamWorker:
             return
         now = time.time()
 
-        for subnet in self.db.subnets():
-            if not subnet["enabled"]:
-                continue
-            if now >= self._next_scan.get(subnet["id"], 0) and subnet["id"] not in self._scanning:
+        subnets = [s for s in self.db.subnets() if s["enabled"]]
+        if not self._staggered:
+            self._stagger_first_scans(subnets, settings, now)
+        for subnet in subnets:
+            if now >= self._next_scan.get(subnet["id"], 0):
                 self._schedule_scan(subnet["id"], settings)
 
         for server in self.db.dhcp_servers():
@@ -111,6 +150,40 @@ class IpamWorker:
             if now >= self._next_dhcp_poll.get(server["id"], 0) and server["id"] not in self._polling:
                 self._schedule_dhcp_poll(server["id"], settings)
 
+    def _stagger_first_scans(self, subnets: list, settings: dict,
+                             now: float) -> None:
+        """Give each subnet its own first due time, spread evenly across
+        FIRST_SCAN_SPREAD_S (or the scan interval, whichever is shorter).
+
+        Runs once. A subnet added later has no entry and so is still due
+        immediately, which is what an operator who just added one expects.
+        """
+        self._staggered = True
+        interval_s = float(settings.get("scan_interval_minutes", 60)) * 60
+        spread = min(FIRST_SCAN_SPREAD_S, max(interval_s, 0.0))
+        count = len(subnets)
+        if count < 2 or spread <= 0:
+            return
+        for position, subnet in enumerate(subnets):
+            self._next_scan.setdefault(subnet["id"],
+                                       now + spread * position / count)
+
+    def _pool(self, settings: dict) -> ThreadPoolExecutor:
+        """The shared scan pool, rebuilt if its configured size changed.
+        Caller must not hold the lock."""
+        size = max(1, int(settings.get("max_concurrent_scans",
+                                       DEFAULT_MAX_CONCURRENT_SCANS)))
+        with self._lock:
+            if self._scan_pool is not None and self._scan_pool_size == size:
+                return self._scan_pool
+            old_pool, self._scan_pool = self._scan_pool, ThreadPoolExecutor(
+                max_workers=size, thread_name_prefix="ipam-scan")
+            self._scan_pool_size = size
+            pool = self._scan_pool
+        if old_pool is not None:
+            old_pool.shutdown(wait=False)
+        return pool
+
     def scan_now(self, subnet_id: int) -> None:
         self._schedule_scan(subnet_id, self.db.settings())
 
@@ -118,10 +191,22 @@ class IpamWorker:
         self._schedule_dhcp_poll(server_id, self.db.settings())
 
     def _schedule_scan(self, subnet_id: int, settings: dict) -> None:
+        """Hand one subnet to the shared scan pool, at most once at a time.
+
+        A bulk "scan all subnets" from the API arrives here too, so the cap
+        applies to it as well: the scans queue instead of fanning out.
+        """
+        with self._lock:
+            if subnet_id in self._scanning or subnet_id in self._queued:
+                return
+            self._queued.add(subnet_id)
         self._next_scan[subnet_id] = time.time() + \
             float(settings.get("scan_interval_minutes", 60)) * 60
-        threading.Thread(target=self._run_scan, args=(subnet_id, settings),
-                         name=f"ipam-scan-{subnet_id}", daemon=True).start()
+        try:
+            self._pool(settings).submit(self._run_scan, subnet_id, settings)
+        except RuntimeError:        # the pool was shut down under us
+            with self._lock:
+                self._queued.discard(subnet_id)
 
     def _schedule_dhcp_poll(self, server_id: int, settings: dict) -> None:
         self._next_dhcp_poll[server_id] = time.time() + \
@@ -133,6 +218,7 @@ class IpamWorker:
 
     def _run_scan(self, subnet_id: int, settings: dict) -> None:
         with self._lock:
+            self._queued.discard(subnet_id)
             if subnet_id in self._scanning:
                 return
             self._scanning.add(subnet_id)

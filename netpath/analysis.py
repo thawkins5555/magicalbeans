@@ -19,6 +19,50 @@ STATUS_ORDER = {"none": 0, "ok": 1, "warn": 2, "fail": 3, "blocked": 4,
                 "overrun": 5, "error": 6}
 
 
+# The timeline's own ceilings, applied inside build_timeline() so that no
+# caller can ask for an unbounded allocation.
+#
+# `t0`, `t1` and the pixel width they are derived from all arrive as query
+# parameters on a GET that only needs the read-only role, and nothing between
+# the query string and here bounded any of them. `n_buckets` works out to
+# roughly min(span / interval, width / MIN_BLOCK_PX), so `t1=1e9&width=1e6`
+# allocated 326,798 Bucket objects -- each with a Counter, plus two
+# list-of-lists entries and a dict in the JSON response -- and `width=3e7`
+# would have reached about ten million, some 4 GB, from one request.
+#
+# 2,000 blocks is already finer than any screen can draw: the UI's own
+# smallest block is a few pixels, so a 4K display asks for at most ~1,000.
+# Beyond the cap the window is kept and the buckets are widened to fit,
+# which is what a caller asking for a decade of history actually wants.
+MAX_BUCKETS = 2000
+# Seconds since the epoch that a window may name: 1970-01-01 to 2100-01-01,
+# and at most ten years wide.
+MAX_TIMESTAMP = 4102444800.0
+MAX_SPAN_S = 10 * 366 * 24 * 3600.0
+
+
+def clamp_window(t0, t1) -> tuple[float, float]:
+    """A finite, ordered, epoch-plausible (t0, t1) of at most MAX_SPAN_S.
+
+    Public because the API layer wants the same rule at the boundary; applied
+    inside build_timeline() regardless, so a caller that forgets is still
+    safe."""
+    try:
+        t0, t1 = float(t0), float(t1)
+    except (TypeError, ValueError):
+        return 0.0, 60.0
+    if not (math.isfinite(t0) and math.isfinite(t1)):
+        return 0.0, 60.0
+    t0 = min(max(t0, 0.0), MAX_TIMESTAMP)
+    t1 = min(max(t1, 0.0), MAX_TIMESTAMP)
+    if t1 <= t0:
+        t1 = min(t0 + 60.0, MAX_TIMESTAMP)
+        t0 = min(t0, t1 - 1.0)
+    if t1 - t0 > MAX_SPAN_S:
+        t0 = t1 - MAX_SPAN_S
+    return t0, t1
+
+
 def worst(statuses) -> str:
     best = "none"
     for status in statuses:
@@ -274,10 +318,32 @@ def build_timeline(traces, t0: float, t1: float, bucket_s: float) -> list[Bucket
     or the user pans. With bucket_s equal to the polling interval, one block is
     one scheduled poll, and a block with no trace in it is a poll that was
     missed rather than an artefact of where the window happens to start.
+
+    The window and the block count are clamped here rather than trusted from
+    the caller: `t0`, `t1` and the width `bucket_s` is derived from all come
+    off a query string, and none of them was bounded anywhere. Past
+    MAX_BUCKETS the window is kept and the blocks are widened to fit, so a
+    request for a decade gets a decade at ten-hour resolution instead of an
+    allocation that outlives the process.
     """
-    bucket_s = max(float(bucket_s), 1e-3)
+    t0, t1 = clamp_window(t0, t1)
+    try:
+        bucket_s = float(bucket_s)
+    except (TypeError, ValueError):
+        bucket_s = 60.0
+    if not math.isfinite(bucket_s):
+        bucket_s = 60.0
+    bucket_s = max(bucket_s, 1e-3)
     start = math.floor(t0 / bucket_s) * bucket_s
     n_buckets = max(1, int(math.ceil((t1 - start) / bucket_s)))
+    if n_buckets > MAX_BUCKETS:
+        # Widen against MAX_BUCKETS - 1 so that the grid snap below, which
+        # can push `start` up to one bucket earlier than t0, still lands
+        # inside the cap without dropping the newest block.
+        bucket_s = max((t1 - t0) / (MAX_BUCKETS - 1), 1e-3)
+        start = math.floor(t0 / bucket_s) * bucket_s
+        n_buckets = max(1, min(MAX_BUCKETS,
+                               int(math.ceil((t1 - start) / bucket_s))))
     buckets = [Bucket(start + i * bucket_s, start + (i + 1) * bucket_s)
                for i in range(n_buckets)]
     rtts: list[list[float]] = [[] for _ in range(n_buckets)]

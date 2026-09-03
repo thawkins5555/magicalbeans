@@ -26,11 +26,11 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import random
 import re
 import socket
 import struct
 import subprocess
+import time
 
 from .procs import hidden
 
@@ -46,6 +46,36 @@ IN = 1
 # lookups, which go through socket.gethostbyaddr and so use it implicitly),
 # so a public resolver is the default here unless one is configured.
 DEFAULT_ASN_SERVER = "8.8.8.8"
+
+
+# One DNS label: 1-63 of letter/digit/hyphen, not starting or ending with a
+# hyphen. Used to decide whether a configured resolver is a name this code is
+# willing to hand to a subprocess -- see nslookup().
+_LABEL = r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
+_HOSTNAME_RE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*\.?\Z")
+
+
+def is_ip_literal(text: str) -> bool:
+    try:
+        ipaddress.ip_address((text or "").strip())
+    except ValueError:
+        return False
+    return True
+
+
+def is_resolver_address(text: str) -> bool:
+    """True for an address or hostname a resolver may be nominated by.
+
+    Everything else -- an empty string, a shell metacharacter, and above all
+    anything starting with `-` -- is refused. `nslookup` reads a leading-`-`
+    argument as an option (`-port=`, `-type=`, `-debug`, `-timeout=`) and has
+    no `--` separator to stop it, so refusing the shape is the only defence
+    there is.
+    """
+    text = (text or "").strip()
+    if not text or len(text) > 255:
+        return False
+    return is_ip_literal(text) or bool(_HOSTNAME_RE.fullmatch(text))
 
 
 def ptr_name(ip: str) -> str:
@@ -96,31 +126,84 @@ def _read_name(message: bytes, offset: int) -> tuple[str, int]:
     return ".".join(labels), end
 
 
-def query_ptr(ip: str, server: str, timeout_s: float = 3.0,
-              port: int = 53) -> str | None:
-    """Ask one server directly for the PTR record. None if it has no answer."""
+def _question_echoes(reply: bytes, question: bytes) -> bool:
+    """True when the reply carries back exactly the question that was asked.
+
+    A resolver echoes the question section verbatim, so an answer that does
+    not is not an answer to this query. Compared case-insensitively because
+    only the letters of a label can legally differ, and every other byte in
+    the encoded question (label lengths, which are at most 63, the qtype and
+    the qclass) is below 'A' and so unaffected by .lower()."""
+    if len(reply) < 12 + len(question):
+        return False
+    questions = struct.unpack("!H", reply[4:6])[0]
+    return questions == 1 and reply[12:12 + len(question)].lower() == question.lower()
+
+
+def _exchange(name: str, rtype: int, server: str, timeout_s: float,
+              port: int) -> bytes | None:
+    """One UDP query, and the verified reply to it -- or None.
+
+    Three things this does that sending with `sendto` and matching on the
+    16-bit ID alone did not:
+
+    * `connect()` before sending, so the kernel drops any datagram that did
+      not come from the server this query went to. Without it the only check
+      on an injected PTR or TXT answer was guessing 16 bits, and the name
+      that came back was stored and shown as the identity of a device or a
+      traceroute hop.
+    * The query ID comes from `os.urandom`, not from the Mersenne Twister,
+      which is seeded once per process and whose next outputs can be
+      predicted from a few observed ones.
+    * `timeout_s` bounds the whole exchange rather than each `recv`. A peer
+      that sent one junk datagram every two seconds used to restart the
+      clock every time and could hold a resolver worker indefinitely; eight
+      such streams took out all eight workers and reverse DNS stopped.
+    """
     try:
-        question = _encode(ptr_name(ip)) + struct.pack("!HH", PTR, IN)
-    except ValueError:
+        question = _encode(name) + struct.pack("!HH", rtype, IN)
+    except (ValueError, UnicodeError):
         return None
 
-    request_id = random.randint(0, 0xFFFF)
-    header = struct.pack("!HHHHHH", request_id, 0x0100, 1, 0, 0, 0)
-    packet = header + question
+    request_id = int.from_bytes(os.urandom(2), "big")
+    packet = struct.pack("!HHHHHH", request_id, 0x0100, 1, 0, 0, 0) + question
 
     family = socket.AF_INET6 if ":" in server else socket.AF_INET
+    deadline = time.monotonic() + timeout_s
     sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(timeout_s)
     try:
-        sock.sendto(packet, (server, port))
+        sock.settimeout(timeout_s)
+        sock.connect((server, port))
+        sock.send(packet)
         while True:
-            reply, _ = sock.recvfrom(4096)
-            if len(reply) >= 12 and struct.unpack("!H", reply[:2])[0] == request_id:
-                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
+            reply = sock.recv(4096)
+            if len(reply) < 12:
+                continue
+            if struct.unpack("!H", reply[:2])[0] != request_id:
+                continue
+            if not _question_echoes(reply, question):
+                continue
+            return reply
     except OSError:
         return None
     finally:
         sock.close()
+
+
+def query_ptr(ip: str, server: str, timeout_s: float = 3.0,
+              port: int = 53) -> str | None:
+    """Ask one server directly for the PTR record. None if it has no answer."""
+    try:
+        name = ptr_name(ip)
+    except ValueError:
+        return None
+    reply = _exchange(name, PTR, server, timeout_s, port)
+    if reply is None:
+        return None
 
     _, flags, questions, answers, _, _ = struct.unpack("!HHHHHH", reply[:12])
     if flags & 0x000F or not answers:            # RCODE set, or nothing to say
@@ -147,24 +230,9 @@ def query_txt(name: str, server: str, timeout_s: float = 3.0,
               port: int = 53) -> str | None:
     """One TXT record's text for `name`, via the same raw-UDP path
     query_ptr() uses. None if there is no answer."""
-    question = _encode(name) + struct.pack("!HH", TXT, IN)
-    request_id = random.randint(0, 0xFFFF)
-    header = struct.pack("!HHHHHH", request_id, 0x0100, 1, 0, 0, 0)
-    packet = header + question
-
-    family = socket.AF_INET6 if ":" in server else socket.AF_INET
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(timeout_s)
-    try:
-        sock.sendto(packet, (server, port))
-        while True:
-            reply, _ = sock.recvfrom(4096)
-            if len(reply) >= 12 and struct.unpack("!H", reply[:2])[0] == request_id:
-                break
-    except OSError:
+    reply = _exchange(name, TXT, server, timeout_s, port)
+    if reply is None:
         return None
-    finally:
-        sock.close()
 
     _, flags, questions, answers, _, _ = struct.unpack("!HHHHHH", reply[:12])
     if flags & 0x000F or not answers:
@@ -259,10 +327,21 @@ _NSLOOKUP_NAME = re.compile(r"name\s*=\s*([^\s]+)", re.IGNORECASE)
 
 def nslookup(ip: str, server: str | None = None,
              timeout_s: float = 5.0) -> str | None:
-    """Shell out to nslookup, so that whatever it finds, this finds too."""
-    command = ["nslookup", ip]
+    """Shell out to nslookup, so that whatever it finds, this finds too.
+
+    Both arguments are validated here rather than trusted from the caller.
+    No shell is involved, so there was never a shell-injection path; what
+    there was is that `nslookup` reads a leading-`-` argument as an option
+    and offers no `--` to stop it, and that the safety of the two live
+    callers rested on a property of those callers rather than on anything
+    this public helper checked."""
+    if not is_ip_literal(ip):
+        return None
+    command = ["nslookup", ip.strip()]
     if server:
-        command.append(server)
+        if not is_resolver_address(server):
+            return None
+        command.append(server.strip())
     try:
         completed = subprocess.run(
             command, capture_output=True, text=True, timeout=timeout_s,
@@ -279,19 +358,33 @@ def nslookup(ip: str, server: str | None = None,
 
 def reverse(ip: str, timeout_s: float = 3.0, server: str | None = None,
             use_nslookup: bool = True) -> tuple[str | None, str]:
-    """Best available name for an address, and which method produced it."""
-    previous = socket.getdefaulttimeout()
+    """Best available name for an address, and which method produced it.
+
+    `timeout_s` bounds attempts 2 and 3. It does not bound
+    `socket.gethostbyaddr`, and never did: that call goes through the C
+    library resolver and honours resolv.conf, not any Python setting. The
+    code that used to bracket it in
+    `socket.setdefaulttimeout(timeout_s)` / `setdefaulttimeout(previous)`
+    therefore bought nothing and cost two things. `setdefaulttimeout` is
+    process-wide, not thread-local, and it is applied to every socket
+    created anywhere in the process while it is set -- the poller's UDP
+    sockets, IPAM's sweep, an SSH transport, an alert mail, every
+    connection the web server accepts -- and, with eight resolver workers
+    running by default, the save/restore pairs interleaved and left the
+    global permanently set to the resolver's timeout. Concurrency here is
+    bounded by the caller's own thread pool instead.
+    """
+    if not is_ip_literal(ip):
+        return None, "none"
+    ip = ip.strip()
     try:
-        socket.setdefaulttimeout(timeout_s)
         name = socket.gethostbyaddr(ip)[0]
         if name:
             return name, "system"
     except (OSError, IndexError):
         pass
-    finally:
-        socket.setdefaulttimeout(previous)
 
-    if server:
+    if server and is_resolver_address(server):
         name = query_ptr(ip, server, timeout_s)
         if name:
             return name, f"ptr@{server}"

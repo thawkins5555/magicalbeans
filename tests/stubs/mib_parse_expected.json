@@ -1,0 +1,240 @@
+{
+ "BRIDGE-MIB.mib": {
+  "digest": "0b156b3c2c3d1abc32513791464b6e1e6c7eb247be6dd77c510ebe78017d54b9",
+  "import_count": 13,
+  "module": "BRIDGE-MIB",
+  "object_count": 69,
+  "resolved_count": 69,
+  "unresolved": []
+ },
+ "ENTITY-MIB.mib": {
+  "digest": "d4987c31c07e48447b56688eb693b7af07de03046613c88d9079d8e019d73cc2",
+  "import_count": 19,
+  "module": "ENTITY-MIB",
+  "object_count": 54,
+  "resolved_count": 54,
+  "unresolved": []
+ },
+ "ENTITY-SENSOR-MIB.mib": {
+  "digest": "5ade04ba91ddd59c89b6ecf80905c2978b92b52a23897b82acbbb211be8ea827",
+  "import_count": 12,
+  "module": "ENTITY-SENSOR-MIB",
+  "object_count": 15,
+  "resolved_count": 15,
+  "unresolved": []
+ },
+ "HOST-RESOURCES-MIB.mib": {
+  "digest": "40b55c1e248f3dbe452d2f46462fd98b79851ba6fb4bdc236f2f354689818db7",
+  "import_count": 15,
+  "module": "HOST-RESOURCES-MIB",
+  "object_count": 97,
+  "resolved_count": 97,
+  "unresolved": []
+ },
+ "IANAifType-MIB.mib": {
+  "digest": "9c797f37bd98ab3a746e0a321160c0a24bb44c272ef10308854f94f0351d9213",
+  "import_count": 3,
+  "module": "IANAifType-MIB",
+  "object_count": 1,
+  "resolved_count": 1,
+  "unresolved": []
+ },
+ "IF-MIB.mib": {
+  "digest": "0355db9ecc371df80809c1c7d8838d43fcfb2fc53d3c1ef86f9ec58bf934d7bb",
+  "import_count": 22,
+  "module": "IF-MIB",
+  "object_count": 74,
+  "resolved_count": 72,
+  "unresolved": [
+   "snmpTraps"
+  ]
+ },
+ "INET-ADDRESS-MIB.mib": {
+  "digest": "367804641ab535144c9996f328c1b7f94f33b649607cae8abfb496ff830dffeb",
+  "import_count": 4,
+  "module": "INET-ADDRESS-MIB",
+  "object_count": 1,
+  "resolved_count": 1,
+  "unresolved": []
+ },
+ "IP-MIB.mib": {
+  "digest": "7d7bd524231b96702756ed813636a55f3224a1ad6297c9197cb664a3011421da",
+  "import_count": 25,
+  "module": "IP-MIB",
+  "object_count": 267,
+  "resolved_count": 267,
+  "unresolved": []
+ },
+ "LLDP-MIB.mib": {
+  "digest": "5045dd79f8b4bfd1e3929956fc19307b1bb65d4634abc6070844591481bf8988",
+  "import_count": 15,
+  "module": "LLDP-MIB",
+  "object_count": 96,
+  "resolved_count": 96,
+  "unresolved": []
+ },
+ "P-BRIDGE-MIB.mib": {
+  "digest": "111457306dc9635e55f597c48ffcf48f24f26bb1e987be47ff184cea764fb4a8",
+  "import_count": 16,
+  "module": "P-BRIDGE-MIB",
+  "object_count": 51,
+  "resolved_count": 0,
+  "unresolved": [
+   "dot1dBridge",
+   "dot1dExtBase",
+   "dot1dGarp",
+   "dot1dGmrp",
+   "dot1dPortCapabilitiesEntry",
+   "dot1dPortCapabilitiesTable",
+   "dot1dPortGarpEntry",
+   "dot1dPortGarpTable",
+   "dot1dPortGmrpEntry",
+   "dot1dPortGmrpTable",
+   "dot1dPortOutboundAccessPriorityEntry",
+   "dot1dPortOutboundAccessPriorityTable",
+   "dot1dPortPriorityEntry",
+   "dot1dPortPriorityTable",
+   "dot1dPriority",
+   "dot1dTp",
+   "dot1dTpHCPortEntry",
+   "dot1dTpHCPortTable",
+   "dot1dTpPortOverflowEntry",
+   "dot1dTpPortOverflowTable",
+   "dot1dTrafficClassEntry",
+   "dot1dTrafficClassTable",
+   "dot1dUserPriorityRegenEntry",
+   "dot1dUserPriorityRegenTable",
+   "pBridgeConformance",
+   "pBridgeMIB",
+   "pBridgeMIBObjects"
+  ]
+ },
+ "POWER-ETHERNET-MIB.mib": {
+  "digest": "c753a12db0ff5922a6eeeb59d111fe00083b7a410b34def78cc536711435ca71",
+  "import_count": 12,
+  "module": "POWER-ETHERNET-MIB",
+  "object_count": 38,
+  "resolved_count": 38,
+  "unresolved": []
+ },
+ "Q-BRIDGE-MIB.mib": {
+  "digest": "b69b75959cf337f5cca0615b2aeea4af722e171502bf14c22c85982753bc0226",
+  "import_count": 19,
+  "module": "Q-BRIDGE-MIB",
+  "object_count": 111,
+  "resolved_count": 0,
+  "unresolved": [
+   "dot1dBridge",
+   "dot1qBase",
+   "dot1qFdbEntry",
+   "dot1qFdbTable",
+   "dot1qForwardAllEntry",
+   "dot1qForwardAllTable",
+   "dot1qForwardUnregisteredEntry",
+   "dot1qForwardUnregisteredTable",
+   "dot1qLearningConstraintsEntry",
+   "dot1qLearningConstraintsTable",
+   "dot1qPortVlanEntry",
+   "dot1qPortVlanHCStatisticsEntry",
+   "dot1qPortVlanHCStatisticsTable",
+   "dot1qPortVlanStatisticsEntry",
+   "dot1qPortVlanStatisticsTable",
+   "dot1qPortVlanTable",
+   "dot1qStatic",
+   "dot1qStaticMulticastEntry",
+   "dot1qStaticMulticastTable",
+   "dot1qStaticUnicastEntry",
+   "dot1qStaticUnicastTable",
+   "dot1qTp",
+   "dot1qTpFdbEntry",
+   "dot1qTpFdbTable",
+   "dot1qTpGroupEntry",
+   "dot1qTpGroupTable",
+   "dot1qVlan",
+   "dot1qVlanCurrentEntry",
+   "dot1qVlanCurrentTable",
+   "dot1qVlanStaticEntry",
+   "dot1qVlanStaticTable",
+   "dot1vProtocol",
+   "dot1vProtocolGroupEntry",
+   "dot1vProtocolGroupTable",
+   "dot1vProtocolPortEntry",
+   "dot1vProtocolPortTable",
+   "qBridgeConformance",
+   "qBridgeMIB",
+   "qBridgeMIBObjects"
+  ]
+ },
+ "SNMPv2-MIB.mib": {
+  "digest": "82b4391473fc69955557b74b978ca2ebc52b01782f13291d6492c02c07c96721",
+  "import_count": 13,
+  "module": "SNMPv2-MIB",
+  "object_count": 60,
+  "resolved_count": 60,
+  "unresolved": []
+ },
+ "SNMPv2-SMI.mib": {
+  "digest": "fc17f0455f007ee364078bb49f8c9dae072d1fd5b160166dcba9ca6ad733fd3c",
+  "import_count": 0,
+  "module": "SNMPv2-SMI",
+  "object_count": 16,
+  "resolved_count": 15,
+  "unresolved": []
+ },
+ "SNMPv2-TC.mib": {
+  "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "import_count": 1,
+  "module": "SNMPv2-TC",
+  "object_count": 0,
+  "resolved_count": 0,
+  "unresolved": []
+ },
+ "TCP-MIB.mib": {
+  "digest": "04d5fd3fce9500d6a96430927d2a548f8d52f39480dd2d89a6c6c1dcfd75f881",
+  "import_count": 14,
+  "module": "TCP-MIB",
+  "object_count": 44,
+  "resolved_count": 44,
+  "unresolved": []
+ },
+ "UCD-SNMP-MIB.mib": {
+  "digest": "8a943e56a94f23bb242f05e2430a6938037727ea3d001263c561d03512f05389",
+  "import_count": 12,
+  "module": "UCD-SNMP-MIB",
+  "object_count": 181,
+  "resolved_count": 181,
+  "unresolved": []
+ },
+ "UDP-MIB.mib": {
+  "digest": "4d2e85df2a32b8df1815a64da9526d1343e2b9373abf97549657757d6e5e517b",
+  "import_count": 13,
+  "module": "UDP-MIB",
+  "object_count": 25,
+  "resolved_count": 25,
+  "unresolved": []
+ },
+ "enterprise-roots-2.mib": {
+  "digest": "1313422f14b09c917c60b270e082c8b3c9fb51bf0d380d52d811e05baf835ac4",
+  "import_count": 0,
+  "module": "SAPPIWHERE-ENTERPRISE-ROOTS-2",
+  "object_count": 1,
+  "resolved_count": 1,
+  "unresolved": []
+ },
+ "enterprise-roots.mib": {
+  "digest": "b872c1d22121d76ed508288783129e88c412d7283b2cf1b6eb6ab09b7ca68dfb",
+  "import_count": 0,
+  "module": "SAPPIWHERE-ENTERPRISE-ROOTS",
+  "object_count": 20,
+  "resolved_count": 20,
+  "unresolved": []
+ },
+ "if-mib-core.mib": {
+  "digest": "b56eb73a53d9c9e208eacfdaa19543faeb2cc308a97140849c80d393466973de",
+  "import_count": 0,
+  "module": "IF-MIB-CORE",
+  "object_count": 24,
+  "resolved_count": 24,
+  "unresolved": []
+ }
+}
