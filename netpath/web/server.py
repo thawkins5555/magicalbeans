@@ -5,9 +5,11 @@ certificate is configured. That keeps the deployment to "install PySide6 or
 don't" rather than pulling a web framework and its dependency tree onto a
 machine whose job is watching the network.
 
-There is no authentication yet. Bind to an interface you trust, or to
-127.0.0.1 and reach it through something that does authenticate, until the
-TACACS work lands.
+Every route carries a (module, level) permission and needs a signed-in
+session; see `permissions.py` and the ROUTES table below. Without `--cert`
+this is plain HTTP, so the session cookie and every credential typed into
+the interface cross the network in the clear — bind to 127.0.0.1, or give
+it a certificate.
 """
 
 from __future__ import annotations

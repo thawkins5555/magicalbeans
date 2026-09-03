@@ -162,7 +162,10 @@ class AppDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # dbopen.connect rather than sqlite3.connect: this file holds the
+        # scrypt password hashes and the permission grants, and was being
+        # created 0644 for any local account to read.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -590,7 +593,7 @@ def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:
     # Every step below is INSERT OR REPLACE, so running it again is safe and is
     # the only way a half-finished migration ever completes.
 
-    source = sqlite3.connect(legacy_path)
+    source = dbopen.connect(legacy_path)
     source.row_factory = sqlite3.Row
     try:
         present = {row["name"] for row in source.execute(

@@ -35,6 +35,8 @@ import threading
 import time
 import zlib
 
+from . import dbopen
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS device_config (
     device_id           INTEGER PRIMARY KEY,
@@ -101,12 +103,15 @@ DEFAULTS = {
     # short is how a partial config gets captured.
     "capture_timeout_s": 180,
     # Offer SHA-1 key exchange and ssh-rsa host keys as a last resort, for
-    # the older switches and firewalls that offer nothing newer. On by
-    # default because backing those up is the job; turn it off where policy
-    # forbids SHA-1 and every device is known to speak something modern.
+    # the older switches and firewalls that offer nothing newer. OFF by
+    # default: it weakens the handshake for every device, not only the ones
+    # that need it, and a default that quietly does so is the wrong way
+    # round — a site with gear that offers nothing newer turns it on, once,
+    # deliberately. A device that needs it says so plainly in its backup
+    # error (LEGACY_KEX_DISABLED), naming this setting.
     # Only effective when the installed paramiko still implements them —
     # paramiko 5 removed the code (see configrx._apply_legacy_algorithms).
-    "allow_legacy_ssh": True,
+    "allow_legacy_ssh": False,
     # Comma-joined column keys the ConfigRX device table shows; "" means the
     # frontend's defaults. Lives here rather than in the browser's
     # localStorage so it sits beside the rest of the module's settings
@@ -128,7 +133,11 @@ class ConfigRxDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        # dbopen.connect rather than sqlite3.connect: this file holds every
+        # captured device config (communities, TACACS/RADIUS keys, IPsec
+        # pre-shared keys, enable secrets) and the DPAPI-wrapped SSH
+        # passwords, and was being created 0644.
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")

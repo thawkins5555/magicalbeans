@@ -470,6 +470,60 @@ def main() -> int:
           and not SERVICE.wireless_db.controller(controller_id)["v3_auth_pass_enc"],
           f"{status} {payload}")
 
+    # ---------------------------------------------------------- D5 file modes
+    if os.name == "nt":
+        check("D5 file modes (skipped: Windows has no POSIX mode)", True)
+    else:
+        def loose_modes(names):
+            bad = []
+            for name in names:
+                for suffix in ("", "-wal", "-shm"):
+                    path = os.path.join(DATA_DIR, name + ".db" + suffix)
+                    if not os.path.exists(path):
+                        continue
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                    if mode & 0o077:
+                        bad.append(f"{os.path.basename(path)}={oct(mode)}")
+            return bad
+
+        # The three this workstream owns. dbopen.connect is adopted by each
+        # database module as its workstream touches it; the remaining seven
+        # are listed rather than failed so this suite reports progress
+        # instead of blocking on another agent's file.
+        check("D5 app.db, wireless.db and configrx.db are owner-only",
+              not loose_modes(("app", "wireless", "configrx")),
+              ", ".join(loose_modes(("app", "wireless", "configrx"))))
+        remaining = loose_modes(("netpath", "flows", "syslog", "ipam",
+                                 "snmptraps", "nodes", "alerts"))
+        if remaining:
+            print("      note: still to adopt dbopen.connect — "
+                  + ", ".join(sorted({r.split("=")[0] for r in remaining})))
+
+        from netpath import __main__ as entry
+        home = os.path.join(TMPDIR, "fakehome")
+        os.makedirs(home, exist_ok=True)
+        old_xdg = os.environ.get("XDG_DATA_HOME")
+        os.environ["XDG_DATA_HOME"] = home
+        try:
+            folder = os.path.dirname(entry.default_db_path())
+            check("D5 a new data folder is created owner-only",
+                  stat.S_IMODE(os.stat(folder).st_mode) == 0o700,
+                  oct(stat.S_IMODE(os.stat(folder).st_mode)))
+            os.chmod(folder, 0o755)          # an install that predates this
+            entry.default_db_path()
+            check("D5 an existing world-readable data folder is tightened",
+                  stat.S_IMODE(os.stat(folder).st_mode) == 0o700,
+                  oct(stat.S_IMODE(os.stat(folder).st_mode)))
+        finally:
+            if old_xdg is None:
+                os.environ.pop("XDG_DATA_HOME", None)
+            else:
+                os.environ["XDG_DATA_HOME"] = old_xdg
+
+    from netpath.configrxdb import DEFAULTS as CONFIGRX_DEFAULTS
+    check("D5 allow_legacy_ssh is off by default",
+          CONFIGRX_DEFAULTS["allow_legacy_ssh"] is False)
+
     return 0
 
 
