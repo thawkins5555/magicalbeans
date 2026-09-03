@@ -8,6 +8,7 @@ so the receive path does nothing but read, parse and enqueue.
 
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import socket
@@ -21,6 +22,9 @@ from .syslogparse import parse
 
 BATCH = 500
 FLUSH_S = 1.0
+# Cap on the "first message from ..." memory: the key is a spoofable source
+# address, so it is an LRU rather than an unbounded set.
+MAX_SEEN_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -62,7 +66,7 @@ class SyslogCollector:
         self._use_receive_time = False
         self._min_severity = 7
         self._max_chars = 2048
-        self._seen: set[str] = set()
+        self._seen: collections.OrderedDict = collections.OrderedDict()
 
     @property
     def running(self) -> bool:
@@ -198,6 +202,22 @@ class SyslogCollector:
 
     # ----------------------------------------------------------------- threads
 
+
+    def _first_from(self, source: str) -> bool:
+        """True the first time a source is seen since the last start.
+
+        The set is keyed on the datagram's source address, which anyone with
+        network reach can vary, so it is bounded and least-recently-used
+        rather than growing for the life of the process.
+        """
+        if source in self._seen:
+            self._seen.move_to_end(source)
+            return False
+        self._seen[source] = None
+        while len(self._seen) > MAX_SEEN_SOURCES:
+            self._seen.popitem(last=False)
+        return True
+
     def _accepted(self, source: str) -> bool:
         if self._allowed:
             return source in self._allowed
@@ -209,8 +229,7 @@ class SyslogCollector:
         if not self._accepted(source):
             self.counters["rejected"] += 1
             return
-        if source not in self._seen:
-            self._seen.add(source)
+        if self._first_from(source):
             self.log.add(SYSTEM, f"First syslog message from {source}",
                          target=source)
         try:

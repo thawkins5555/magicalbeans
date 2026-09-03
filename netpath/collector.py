@@ -9,6 +9,7 @@ no retransmission.
 
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import socket
@@ -19,6 +20,11 @@ import traceback
 from .eventlog import ERROR, NETFLOW, NullLog
 from .flowdb import FlowDatabase
 from .nfdecode import IPFIX, V5, V9, Decoder
+
+
+# Cap on the "first packet from exporter ..." memory: the key is a spoofable
+# source address, so it is an LRU rather than an unbounded set.
+MAX_SEEN_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -39,7 +45,7 @@ class Collector:
         self.db = db
         self.on_batch = on_batch
         self.log = log or NullLog()
-        self._seen_exporters: set[str] = set()
+        self._seen_exporters: collections.OrderedDict = collections.OrderedDict()
         self._stop = threading.Event()
         self._rx_thread: threading.Thread | None = None
         self._wr_thread: threading.Thread | None = None
@@ -184,6 +190,21 @@ class Collector:
             if not self._stop.is_set():
                 self._crash = f"{name} ended unexpectedly"
 
+    def _first_from(self, exporter: str) -> bool:
+        """True the first time an exporter is seen since the last start.
+
+        The set is keyed on the datagram's source address, which anyone with
+        network reach can vary, so it is bounded and least-recently-used
+        rather than growing for the life of the process.
+        """
+        if exporter in self._seen_exporters:
+            self._seen_exporters.move_to_end(exporter)
+            return False
+        self._seen_exporters[exporter] = None
+        while len(self._seen_exporters) > MAX_SEEN_SOURCES:
+            self._seen_exporters.popitem(last=False)
+        return True
+
     def _note_error(self, exc: Exception) -> None:
         """Count a datagram the receive path could not process, and log at
         most one traceback a minute so a flood cannot fill the event log."""
@@ -229,8 +250,7 @@ class Collector:
         errors_before = self.decoder.stats["errors"]
         flows = self.decoder.decode(data, exporter)
 
-        if exporter not in self._seen_exporters:
-            self._seen_exporters.add(exporter)
+        if self._first_from(exporter):
             self.log.add(NETFLOW, f"First packet from exporter {exporter}",
                          target=exporter,
                          detail=f"version  {int.from_bytes(data[:2], 'big')}\n"

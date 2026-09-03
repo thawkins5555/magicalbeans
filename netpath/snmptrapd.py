@@ -7,6 +7,7 @@ in practice.
 
 from __future__ import annotations
 
+import collections
 import os
 import queue
 import socket
@@ -20,6 +21,9 @@ from .trapdecode import Decoder, VERSION_NAMES, build_inform_response
 
 BATCH = 200
 FLUSH_S = 1.0
+# Cap on the "first trap from ..." memory: the key is a spoofable source
+# address, so it is an LRU rather than an unbounded set.
+MAX_SEEN_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -64,7 +68,7 @@ class TrapCollector:
         self._versions: set[int] = {0, 1, 3}
         self._ack_informs = True
         self._min_severity = 7
-        self._seen: set[str] = set()
+        self._seen: collections.OrderedDict = collections.OrderedDict()
 
     @property
     def running(self) -> bool:
@@ -196,6 +200,22 @@ class TrapCollector:
 
     # ----------------------------------------------------------------- access
 
+
+    def _first_from(self, source: str) -> bool:
+        """True the first time a source is seen since the last start.
+
+        The set is keyed on the datagram's source address, which anyone with
+        network reach can vary, so it is bounded and least-recently-used
+        rather than growing for the life of the process.
+        """
+        if source in self._seen:
+            self._seen.move_to_end(source)
+            return False
+        self._seen[source] = None
+        while len(self._seen) > MAX_SEEN_SOURCES:
+            self._seen.popitem(last=False)
+        return True
+
     def _accepted_source(self, source: str) -> bool:
         if self._allowed:
             return source in self._allowed
@@ -248,8 +268,7 @@ class TrapCollector:
 
         self.counters["traps"] += 1
         self.counters["last_trap"] = time.time()
-        if source not in self._seen:
-            self._seen.add(source)
+        if self._first_from(source):
             self.log.add(SNMP, f"First SNMP trap from {source} "
                                f"({VERSION_NAMES.get(trap.version, '?')}, "
                                f"{trap.trap_name or trap.trap_oid})", target=source)

@@ -12,10 +12,18 @@ Nothing here touches the database or the network; feed it bytes, get Flows.
 
 from __future__ import annotations
 
+import collections
 import socket
 import struct
 import time
 from dataclasses import dataclass, field
+
+# Template ids, observation domains and exporter addresses all come off the
+# wire, so both caches are keyed on data an attacker (or a rebooting exporter
+# that never reuses a domain) chooses. Bounded, least-recently-used, and
+# generous enough for a few thousand exporters' worth of real templates.
+MAX_TEMPLATES = 4096
+MAX_SAMPLING = 4096
 
 V5 = 5
 V9 = 9
@@ -78,19 +86,50 @@ class Flow:
     sampling: int = 1
 
 
+class _Lru(collections.OrderedDict):
+    """A dict with a hard entry limit, dropping the least recently used key.
+
+    Both of the decoder's caches are keyed on values the exporter chooses, so
+    an unbounded dict is a memory leak that any sender can drive.
+    """
+
+    def __init__(self, limit: int):
+        super().__init__()
+        self.limit = limit
+        self.evictions = 0
+
+    def __setitem__(self, key, value) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.limit:
+            self.popitem(last=False)
+            self.evictions += 1
+
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+
 @dataclass
 class Template:
     template_id: int
     fields: list[tuple[int, int, int]] = field(default_factory=list)  # (id, len, enterprise)
     is_options: bool = False
     scope_count: int = 0
+    # 0xFFFF means "variable length" in IPFIX only. In v9 it is a legitimate
+    # fixed 65535-byte field, and reading it as a variable-length one silently
+    # decoded the following field's bytes as a counter.
+    ipfix: bool = False
 
     @property
     def length(self) -> int | None:
         """Fixed record length, or None when the template has a variable field."""
         total = 0
         for _, size, _ in self.fields:
-            if size == 0xFFFF:
+            if self.ipfix and size == 0xFFFF:
                 return None
             total += size
         return total
@@ -115,16 +154,30 @@ def _int(raw: bytes) -> int:
     return int.from_bytes(raw, "big") if raw else 0
 
 
+def _pick(*candidates: bytes | None) -> bytes:
+    """First address field with real content.
+
+    Several platforms carry both the v4 and the v6 address pair in one
+    template and zero-fill the unused pair. `b"\x00\x00\x00\x00"` is truthy,
+    so an `or` chain rendered every IPv6 flow on such an exporter as
+    0.0.0.0 -> 0.0.0.0, which then dominated every top-N chart.
+    """
+    for candidate in candidates:
+        if candidate and any(candidate):
+            return candidate
+    return b""
+
+
 class Decoder:
     """Stateful across packets: holds the template cache and per-exporter sampling."""
 
     def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True):
-        self.templates: dict[tuple[str, int, int], Template] = {}
-        self.sampling: dict[str, int] = {}
+        self.templates: _Lru = _Lru(MAX_TEMPLATES)
+        self.sampling: _Lru = _Lru(MAX_SAMPLING)
         self.default_sampling = max(1, int(default_sampling))
         self.trust_exporter_sampling = trust_exporter_sampling
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
-                      "no_template": 0}
+                      "no_template": 0, "bad_template": 0}
 
     def sampling_for(self, exporter: str) -> int:
         if self.trust_exporter_sampling:
@@ -251,7 +304,9 @@ class Decoder:
         while offset + 4 <= len(body):
             template_id, count = struct.unpack_from("!HH", body, offset)
             offset += 4
-            template = Template(template_id=template_id, is_options=options)
+            template = Template(template_id=template_id, is_options=options,
+                                ipfix=ipfix)
+            broken = count == 0
             for _ in range(count):
                 if offset + 4 > len(body):
                     return
@@ -264,7 +319,19 @@ class Decoder:
                         return
                     enterprise = struct.unpack_from("!I", body, offset)[0]
                     offset += 4
+                if size <= 0:
+                    broken = True
                 template.fields.append((field_id, size, enterprise))
+            if broken:
+                # A template with no fields, or with a zero-length field, has a
+                # record length of zero: caching it made _read_data loop
+                # forever at 100% CPU on the receive thread with `running`
+                # still true. Refuse it, and forget any earlier template with
+                # the same id so stale layouts cannot be decoded either.
+                self.stats["bad_template"] += 1
+                self.stats["errors"] += 1
+                self.templates.pop((exporter, domain, template_id), None)
+                continue
             self.templates[(exporter, domain, template_id)] = template
             self.stats["templates"] += 1
 
@@ -287,7 +354,8 @@ class Decoder:
             field_count = scope_count + option_len // 4
 
         template = Template(template_id=template_id, is_options=True,
-                            scope_count=scope_count)
+                            scope_count=scope_count, ipfix=ipfix)
+        broken = field_count == 0
         for _ in range(field_count):
             if offset + 4 > len(body):
                 break
@@ -300,7 +368,14 @@ class Decoder:
                     break
                 enterprise = struct.unpack_from("!I", body, offset)[0]
                 offset += 4
+            if size <= 0:
+                broken = True
             template.fields.append((field_id, size, enterprise))
+        if broken:
+            self.stats["bad_template"] += 1
+            self.stats["errors"] += 1
+            self.templates.pop((exporter, domain, template_id), None)
+            return
         self.templates[(exporter, domain, template_id)] = template
         self.stats["templates"] += 1
 
@@ -316,6 +391,14 @@ class Decoder:
         flows: list[Flow] = []
         offset = 0
         fixed = template.length
+        if fixed is not None and fixed <= 0:
+            # Belt and braces beside the guard in _read_templates: a cached
+            # template from before this check, or one whose fields sum to
+            # zero, would never advance `offset`.
+            self.stats["bad_template"] += 1
+            self.stats["errors"] += 1
+            self.templates.pop((exporter, domain, template_id), None)
+            return []
 
         while offset < len(body):
             if fixed is not None:
@@ -410,9 +493,9 @@ class Decoder:
             end = now
             start = min(start, end) if start else end
 
-        src = values.get(SRC_IPV4) or values.get(SRC_IPV6) or b""
-        dst = values.get(DST_IPV4) or values.get(DST_IPV6) or b""
-        hop = values.get(NEXT_HOP_V4) or values.get(NEXT_HOP_V6) or b""
+        src = _pick(values.get(SRC_IPV4), values.get(SRC_IPV6))
+        dst = _pick(values.get(DST_IPV4), values.get(DST_IPV6))
+        hop = _pick(values.get(NEXT_HOP_V4), values.get(NEXT_HOP_V6))
 
         return Flow(
             exporter=exporter, version=version,
