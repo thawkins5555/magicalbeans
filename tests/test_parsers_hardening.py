@@ -394,6 +394,90 @@ check("a module with both conventions and objects is unchanged",
       and mixed.notes == [], str(mixed.notes))
 
 
+# ------------------------------- H5: one key per vendor, and an honest claim
+
+print("H5  enterprise arcs: one key per manufacturer, Rockwell reachable")
+
+from netpath import enterprises, vendorid            # noqa: E402
+
+# G-16. Each of these arcs used to key its own vendor row, so one HPE or
+# Dell fleet was spread over several rows of the Nodes vendor filter.
+for arc, want in ((47196, "aruba"), (14823, "aruba"), (8744, "hp"),
+                  (40310, "hp"), (11, "hp"), (6027, "dell"), (10297, "dell"),
+                  (674, "dell"), (12276, "f5"), (3375, "f5"),
+                  (1588, "brocade"), (1991, "brocade")):
+    got = vendorid.arc_name(arc)
+    check(f"arc {arc} keys the vendor as {want!r}", got == want, got)
+
+check("an alias still displays as its manufacturer, not as its arc",
+      enterprises.display_name("arubaCx") == "Aruba"
+      and enterprises.display_name("silverPeak") == "HP / HPE"
+      and enterprises.display_name("dellPowerConnect") == "Dell",
+      enterprises.display_name("arubaCx"))
+check("...while the arc's own label survives as a model hint",
+      enterprises.arc_label(47196) == "Aruba CX (HPE)"
+      and enterprises.arc_label(40310) == "Silver Peak / HPE",
+      enterprises.arc_label(47196))
+decision = vendorid.decide("1.3.6.1.4.1.47196.1.2", "ArubaOS-CX", [], [])
+check("...and the evidence line carries both",
+      decision.vendor == "aruba" and "Aruba CX (HPE)" in decision.reason,
+      decision.reason)
+check("hpCompaq is deliberately left alone (HP's server arc, not its switches)",
+      vendorid.arc_name(232) == "hpCompaq", vendorid.arc_name(232))
+check("a vendor with one arc is untouched",
+      vendorid.arc_name(9) == "cisco" and vendorid.arc_name(2636) == "juniper")
+
+# G-17. Rockwell/Allen-Bradley holds PEN 95; without it a controller
+# answering its own arc read as "unknown enterprise arc 95".
+check("PEN 95 names Rockwell Automation / Allen-Bradley",
+      enterprises.lookup(95) == ("rockwellAutomation",
+                                 "Rockwell Automation / Allen-Bradley"),
+      str(enterprises.lookup(95)))
+logix = vendorid.decide("1.3.6.1.4.1.95.1.2", "Allen-Bradley ControlLogix", [], [])
+check("a controller on arc 95 is named, at curated confidence",
+      logix.vendor == "rockwellAutomation" and logix.confidence == "medium",
+      f"{logix.vendor} {logix.confidence}")
+check("...and it is not claimed as cross-checked", not enterprises.is_verified(95))
+
+# A Stratix switch is Rockwell's product built by Cisco: a 1.3.6.1.4.1.9
+# sysObjectID and an IOS sysDescr, so the arc branch wins and the sysDescr
+# rule that knows about Rockwell is never reached. The vendor key stays
+# cisco — the box runs IOS, so the Cisco MIB, poll and ConfigRX profiles are
+# the right ones — but the evidence now says whose box it is.
+stratix = vendorid.decide(
+    "1.3.6.1.4.1.9.1.2694",
+    "Cisco IOS Software, Stratix 5700 Software (STRATIX-5700-UNIVERSALK9-M)",
+    [], [])
+check("a Stratix switch still polls as Cisco", stratix.vendor == "cisco")
+check("...but the evidence names the Rockwell rebadge",
+      "Rockwell Automation / Allen-Bradley rebadge" in stratix.reason,
+      stratix.reason)
+plain = vendorid.decide("1.3.6.1.4.1.9.1.1", "Cisco IOS Software, C2960", [], [])
+check("...and an ordinary Cisco switch says nothing of the sort",
+      plain.vendor == "cisco" and "rebadge" not in plain.reason, plain.reason)
+check("ArmorStratix and a bare Allen-Bradley string match too",
+      vendorid.rebadged_by(9, "cisco ios, ArmorStratix 5700") == "rockwellAutomation"
+      and vendorid.rebadged_by(9, "Allen-Bradley 1783-BMS") == "rockwellAutomation"
+      and vendorid.rebadged_by(2636, "Stratix") == ""
+      and vendorid.rebadged_by(None, "Stratix") == "")
+
+# G-15. The docstring claimed a provenance the tree contradicts.
+check("the module no longer claims the arcs were read from vendor MIB text",
+      "read out of the vendor's own MIB text" not in (enterprises.__doc__ or ""))
+check("...and says what VERIFIED and CURATED actually mean",
+      "cross-checked against a real device's sysObjectID or a bundled\n  MIB"
+      in (enterprises.__doc__ or ""), (enterprises.__doc__ or "")[:0])
+
+# Every alias target must itself be a real key, or a fleet lands on nothing.
+targets = {v for v in enterprises.VENDOR_ALIASES.values()}
+keys = {key for key, _ in enterprises.ENTERPRISES.values()}
+check("every alias points at an arc that exists", targets <= keys,
+      str(targets - keys))
+check("no alias points at another alias",
+      not (targets & set(enterprises.VENDOR_ALIASES)),
+      str(targets & set(enterprises.VENDOR_ALIASES)))
+
+
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")
     raise SystemExit(1)

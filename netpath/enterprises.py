@@ -1,21 +1,32 @@
 """IANA enterprise numbers -> vendor, for arcs no uploaded MIB describes.
 
-Two tables, deliberately kept apart:
+Every arc in both tables below is hand-authored from the IANA Private
+Enterprise Number registry (www.iana.org/assignments/enterprise-numbers),
+which is not reachable from the build environment. What separates the two
+tables is corroboration, not origin:
 
-- VERIFIED: every arc was read out of the vendor's own MIB text (the
-  ``::= { enterprises N }`` line) — the same rule trapoids.WELL_KNOWN's 4.28
-  block set. These decide a vendor at high confidence.
-- CURATED: hand-authored from memory of the IANA registry. The registry
-  itself (www.iana.org/assignments/enterprise-numbers) is not reachable from
-  the build environment, so nothing here was checked against it in this
-  build. These decide at *medium* confidence, and the arc number is always
-  written into the device's evidence, so a wrong entry is auditable and
-  scoped to devices nothing else can name. Keep this list conservative: a
-  vendor mislabelled is worse than a vendor left as a number.
+- VERIFIED: cross-checked against a real device's sysObjectID or a bundled
+  MIB — the arc has been seen in the field or read out of MIB text in this
+  tree. These decide a vendor at high confidence.
+- CURATED: not cross-checked in this build. These decide at *medium*
+  confidence, and the arc number is always written into the device's
+  evidence, so a wrong entry is auditable and scoped to devices nothing
+  else can name. Keep this list conservative: a vendor mislabelled is
+  worse than a vendor left as a number.
 
-Keys match trapoids.WELL_KNOWN and nodeoids.SYSDESCR_VENDORS wherever both
-name the same vendor, so the walk, the sysObjectID table and the sysDescr
-guess all agree on one spelling ("phoenixContact", not three variants).
+Neither table was transcribed from vendor MIB modules, which is what this
+docstring claimed until 4.37.0: the tree holds vendor MIB text for exactly
+one of the 53 VERIFIED arcs (Moxa's 8691), and the file that ships those
+arcs — mibs/enterprise-roots.mib — says as much in terms.
+
+One vendor, one key. A manufacturer that holds several arcs (HPE holds
+five) is keyed under one canonical name through VENDOR_ALIASES, so the
+Nodes vendor filter shows one row per manufacturer rather than one per
+arc; the arc's own label stays available as a model hint through
+arc_label(). Keys match trapoids.WELL_KNOWN and nodeoids.SYSDESCR_VENDORS
+wherever both name the same vendor, so the walk, the sysObjectID table and
+the sysDescr guess all agree on one spelling ("phoenixContact", not three
+variants).
 """
 
 from __future__ import annotations
@@ -157,18 +168,74 @@ CURATED: dict[int, tuple[str, str]] = {
     46366: ("mimosa", "Mimosa Networks"),
     48690: ("teltonika", "Teltonika"),
     50588: ("zebra", "Zebra"),
+    # Allen-Bradley Company, Inc. -- the brand Rockwell Automation sells its
+    # factory-automation line under, and the holder of PEN 95
+    # (1.3.6.1.4.1.95). IANA itself is blocked by this build's egress proxy;
+    # the number was taken from Wikidata's Allen-Bradley entry (Q2648305),
+    # which carries the IANA PEN property, and is CURATED rather than
+    # VERIFIED because no Rockwell MIB and no Rockwell device was reachable
+    # here to cross-check it against. Without it a ControlLogix or
+    # CompactLogix controller answering its own arc reads as "unknown
+    # enterprise arc 95".
+    95: ("rockwellAutomation", "Rockwell Automation / Allen-Bradley"),
 }
 
 # Verified always wins over a curated guess for the same arc.
 ENTERPRISES: dict[int, tuple[str, str]] = {**CURATED, **VERIFIED}
 
+# A narrow, arc-specific key -> the one key that names the manufacturer.
+#
+# A manufacturer often holds several PENs -- HPE answers on five of them,
+# Dell on three -- and keying a device by whichever arc it happened to
+# answer split one fleet across several rows of the Nodes vendor filter:
+# "Aruba" and "Aruba CX (HPE)" read as two unrelated vendors, and 112 Aruba
+# APs became four rows an operator had to add up by hand. The arc-specific
+# label is still worth showing, but as a *model* hint (arc_label()), never
+# as the vendor.
+#
+# hpCompaq (232) is deliberately NOT folded into hp: that arc is HP's server
+# and iLO line, and per-vendor behaviour keyed on "hp" is written for HP
+# switches.
+VENDOR_ALIASES: dict[str, str] = {
+    "arubaCx": "aruba",              # 47196, ArubaOS-CX
+    "colubris": "hp",                # 8744, HP's wireless line
+    "silverPeak": "hp",              # 40310, HPE Aruba EdgeConnect
+    "dellNetworking": "dell",        # 6027, the Force10 line
+    "dellPowerConnect": "dell",      # 10297
+    "f5Networks": "f5",              # 12276, F5's other arc
+    "brocadeFabric": "brocade",      # 1588, Fabric OS
+}
+
+
+def canonical_key(key: str) -> str:
+    """The one key that names this vendor. Every reader of a vendor key
+    should go through here, so a device keyed by a narrow arc and a device
+    keyed by the manufacturer's main arc land in the same row."""
+    return VENDOR_ALIASES.get(key or "", key or "")
+
 
 def lookup(arc) -> tuple[str, str] | None:
-    """(vendor key, display name) for an enterprise number, or None."""
+    """(canonical vendor key, the arc's own display name) for an enterprise
+    number, or None. The key is canonical; the name is the arc's, which for
+    an aliased arc is a model rather than a vendor ("Aruba CX (HPE)") --
+    display_name(key) is the vendor's own name."""
     try:
-        return ENTERPRISES.get(int(arc))
+        hit = ENTERPRISES.get(int(arc))
     except (TypeError, ValueError):
         return None
+    if hit is None:
+        return None
+    return canonical_key(hit[0]), hit[1]
+
+
+def arc_label(arc) -> str:
+    """The arc's own label, aliased or not -- "Aruba CX (HPE)" for 47196.
+    A model hint for the evidence line, never the vendor."""
+    try:
+        hit = ENTERPRISES.get(int(arc))
+    except (TypeError, ValueError):
+        return ""
+    return hit[1] if hit else ""
 
 
 def is_verified(arc) -> bool:
@@ -179,24 +246,29 @@ def is_verified(arc) -> bool:
 
 
 # Vendors identified by sysDescr alone, which therefore have no arc to be
-# keyed by here. Rockwell Automation is one: no Rockwell MIB was reachable to
-# read a verified arc out of, and a guessed arc silently mislabels every
-# device beneath it, so it is named by sysDescr only -- and still deserves to
-# read as its own name rather than as a camelCase token.
-ARCLESS_DISPLAY: dict[str, str] = {
-    "rockwellAutomation": "Rockwell Automation",
-}
+# keyed by here, and still deserve to read as their own name rather than as
+# a camelCase token. Empty since 4.37.0: Rockwell Automation was the only
+# entry and now has arc 95 above, so it is reachable from a sysObjectID as
+# well as from a sysDescr substring.
+ARCLESS_DISPLAY: dict[str, str] = {}
 
+# An aliased arc's label names a model, not a manufacturer, so it must not
+# become the display name of the key it aliases to: without the skip,
+# whichever of HPE's five arcs came first would have decided what "hp"
+# reads as.
 _DISPLAY: dict[str, str] = {}
 for _arc, (_key, _name) in ENTERPRISES.items():
-    _DISPLAY.setdefault(_key, _name)
-del _arc, _key, _name
+    if _key not in VENDOR_ALIASES:
+        _DISPLAY.setdefault(_key, _name)
 for _key, _name in ARCLESS_DISPLAY.items():
     _DISPLAY.setdefault(_key, _name)
-del _key, _name
+del _arc, _key, _name
 
 
 def display_name(key: str) -> str:
     """A human label for a vendor key, falling back to the key itself so a
-    vendor named only by sysDescr still reads as something."""
+    vendor named only by sysDescr still reads as something. Aliased through
+    canonical_key() first, so a device stored under a narrow key by an
+    earlier release still displays as its manufacturer."""
+    key = canonical_key(key)
     return _DISPLAY.get(key or "", key or "")
