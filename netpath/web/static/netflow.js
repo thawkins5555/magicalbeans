@@ -731,7 +731,9 @@
         if (event.key === 'Enter') App.refreshNow('netflow');
       };
     }
-    App.el('nf-resolve').checked = !!App.state.flowSettings.resolve_addresses;
+    // Same rule as the dimension list above: flow settings are only in the
+    // state of an account that may read NetFlow.
+    App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
     App.el('nf-resolve').onchange = async (event) => {
       await App.post('/api/settings', {
         scope: 'netflow', values: { resolve_addresses: event.target.checked },
