@@ -120,10 +120,11 @@ reported zero dropped.
    ```
    and restart the service so the sockets pick it up. Make it permanent in
    `/etc/sysctl.d/`.
-4. **Turn on per-source rate limiting.** The syslog collector has
-   `syslog_per_source_rate`, 200 messages per second per source by default;
-   traffic above it is counted as `throttled` rather than dropped by the
-   kernel, so you keep everyone else's messages and know whose you shed.
+4. **Turn on per-source rate limiting.** The syslog collector's
+   `per_source_rate`, in Syslog settings, is 200 messages a second per source
+   by default; traffic above it is counted as `throttled` rather than dropped
+   by the kernel, so you keep everyone else's messages and know whose you
+   shed. Setting it to 0 disables the limit.
 5. **Check the writer is not the bottleneck.** If `queue` in the Debug counters
    is also high, the receive thread is fine and the database write path is
    behind — see the disk section.
@@ -334,8 +335,9 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    and auto-resolves; on earlier builds every one of them arrived titled
    "<device> is not responding", which it was not.
 3. **A device in a trap or syslog loop.** One device, one message repeated.
-   Mute the device, fix it, unmute. `syslog_per_source_rate` limits the damage
-   at ingest.
+   Mute the device, fix it, unmute. Syslog settings' `per_source_rate` limits
+   the damage at ingest, and a line a device repeats is collapsed into one row
+   with a repeat count rather than filling the table.
 4. **A rule that is too broad.** `trap_critical` matched every trap of any
    severity before 4.37.0, so a config-save trap opened a severity-2 "Critical
    SNMP trap". If you are on an older build, either disable that rule or raise

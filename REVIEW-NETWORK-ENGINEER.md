@@ -1115,15 +1115,18 @@ a new subsystem was ruled out at the start rather than attempted badly.
   recipients, escalation, on-call), A-F18 and U-F7 (maintenance windows, muting
   anything that is not a device), A-F19 (un-acknowledge), A-F25 (top-N,
   MTTR/SLA reporting, ticket and runbook links). Each is a feature, and the
-  dependency map A-F24 needed had to land first.
+  dependency map they wanted (A-F24, which did land) had to come first.
 - **Pattern-matched event rules** — A-F13 (sub-poll-interval flap detection),
   C-N9 (trap varbind conditions, syslog regex, "N in M minutes"). Out of scope:
   a rule language is its own design, and A4's per-signature syslog keying takes
   the immediate pain out of C-N9's second half.
-- **Paging and virtualisation** — X-F7, X-F18, U-F3, X-F20 (`localeCompare` per
-  comparison), X-F21 (`series()` returning every raw point). Approved as
-  "defer; ship only the tab-bar scroll fix"; the Dashboard (E10) is the answer
-  to "what do I look at first" that paging was being asked for.
+- **Paging, virtualisation and layout** — X-F7, X-F18, U-F3, X-F20
+  (`localeCompare` per comparison), X-F21 (`series()` returning every raw
+  point), U-F27's other half (zero media queries; at 390 px six of twelve tabs
+  are unreachable), and U-F24's other half (still no spinners and no
+  `aria-busy`; only the request timeout was in scope). Approved as "defer; ship
+  only the tab-bar scroll fix"; the Dashboard (E10) is the answer to "what do I
+  look at first" that paging was being asked for.
 - **Import and export** — U-F5 (CSV/clipboard/print), U-F6 (bulk import),
   P-N4 (bulk device import and the 1,024-address discovery cap). The
   documentation claiming an export that never existed is corrected (D7); the

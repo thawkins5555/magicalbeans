@@ -486,9 +486,14 @@ known secret-bearing directives listed above, replacing the secret with
 `<redacted>` and leaving the rest of the line intact so the configuration is
 still readable and still diffable. It runs after capture and before
 `add_backup`, so the unredacted text never reaches the database at all — this
-is not a display filter. Redaction is per-device and can be turned off for a
-device where the whole point of the backup is the key material, deliberately,
-with the setting visible on the device's ConfigRX dialog.
+is not a display filter. Every stored backup records whether it was redacted,
+so a row captured before the upgrade is not mistaken for a redacted one.
+Redaction is on for every device, and can be turned off for a device where the
+whole point of the backup is the key material: `store_secrets` on that device's
+ConfigRX configuration, per device rather than global, set through the ConfigRX
+API. There is deliberately no button for it — turning it on is a decision about
+one switch, taken by somebody who knows what that switch's configuration
+contains.
 
 **Be clear about what redaction is and is not.** It is a pattern list. It
 covers the directives above across the vendors ConfigRX supports, and it will
@@ -624,8 +629,8 @@ the device.
 
   **A correction, because an earlier edition of this sentence also said "no
   update check" and that was not true.** Pressing **Update** on the Settings
-  tab calls `selfupdate.latest_commit()`, which makes an HTTPS request to
-  `api.github.com` to ask what the newest published release is. It is
+  tab calls `selfupdate.latest_tag()`, which makes an HTTPS request to
+  `api.github.com` to ask what the newest published release tag is. It is
   operator-initiated, never scheduled and never automatic; it sends no
   identifier, no fleet data and no credential — a plain GET with a
   `User-Agent` — and the reply is a version string. But it *is* an outbound
@@ -652,7 +657,7 @@ action:
 
 | Action | Recorded |
 | --- | --- |
-| Sign-in, success and failure | timestamp, username as supplied, client address |
+| Sign-in: success, failure, and a lockout | timestamp, username as supplied, client address |
 | Sign-out | timestamp, username, client |
 | User created, deleted, permissions changed, password reset | actor, target account, what changed |
 | Own password changed | actor |

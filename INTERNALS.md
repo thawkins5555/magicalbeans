@@ -3837,13 +3837,19 @@ session has two threads on it and under TLS (`WebServer(certfile=…)` wraps
 the listening socket) concurrent `SSL_read`/`SSL_write` on one `SSLSocket`
 is not something OpenSSL supports: a TLS 1.3 post-handshake message arriving
 during a `show tech-support` can end the connection with a record error. The
-reader waits for readability with `select` **outside** the lock
-(`READ_SLICE_S = 0.25`) and then takes it only for a non-blocking read, so
-the thread that is idle almost all the time cannot starve the one with
-output to send; `select`'s answer is not trusted, since a whole record can
-already be decoded and waiting inside the SSL object (an `SSLSocket` whose
-`pending()` says so skips the wait altogether, so a decoded keystroke is
-not held for a slice). Writes take the lock
+reader waits for readability **outside** the lock (`READ_SLICE_S = 0.25`)
+and then takes it only for a non-blocking read, so the thread that is idle
+almost all the time cannot starve the one with output to send. That wait is
+`poll()` where the platform has it and a `selectors` object (epoll or kqueue
+there, `select` on Windows) where it does not — deliberately *not*
+`select.select`, which cannot express a descriptor at or above `FD_SETSIZE`
+and, given this process holds ten databases with their WAL companions, three
+UDP listeners, every poll worker's socket and one descriptor per open HTTP
+connection, was reached routinely: past 1,024 the call raised on every pass
+and the reader spun, burning a core for an idle terminal. The wait's answer
+is not trusted either, since a whole record can already be decoded and
+waiting inside the SSL object (an `SSLSocket` whose `pending()` says so skips
+the wait altogether, so a decoded keystroke is not held for a slice). Writes take the lock
 with `SEND_TIMEOUT_S = 15` on the socket: a browser that stops reading fails
 the send, marks the socket closed and releases everything waiting on it, so
 `stop()`, the idle watchdog and `SshSessionRegistry.shutdown()` are bounded
@@ -3870,11 +3876,17 @@ then `status connected`. `resize` is tolerated *before* `open` — the page
 measures its terminal as it opens the socket and a notice appearing between
 the two changes that measurement, so the size can legitimately arrive first;
 the session applies it and goes on waiting for `open`. Close codes: 1000
-normal (including "too many failed logins"), 4401 not authorised — a `trust`
-from an account that no longer holds `ssh` write, and also the liveness
-watchdog below: signed out, session expired or deleted, permission revoked —
-4408 idle, 4429 too many sessions (either cap). An unpermitted or
-cross-origin upgrade never gets a socket at all; it is an HTTP 403.
+normal, 4401 not authorised — a `trust` from an account that no longer holds
+`ssh` write, and also the liveness watchdog below: signed out, session
+expired or deleted, permission revoked — 4408 idle, which also covers a
+socket that completed the handshake and then never sent its `open`
+(`HANDSHAKE_TIMEOUT_S`), and 4429 too many, which means either session cap or
+a request refused because this account has too many recent failed logins
+against this device. An unpermitted or cross-origin upgrade never gets a
+socket at all; it is an HTTP 403. A frame carrying a reserved opcode, or with
+a reserved bit set, fails the connection rather than being reassembled as
+terminal data: `wsock._DEFINED_OPS` is the closed set, and anything outside
+it raises.
 
 **The session registry and its limits.** `SshSessionRegistry` is built in
 `Service.__init__` after the session store and ConfigRX's database, and
@@ -3885,15 +3897,27 @@ handler's own thread reads the socket and writes keystrokes into the
 channel, a pump thread reads channel output and sends it back, and a small
 timer thread is the session's heartbeat. The constants in `sshterm.py` are
 the whole policy: `CONNECT_TIMEOUT_S = 10` (ConfigRX's, for the same
-reason), `IDLE_TIMEOUT_S = 900` measured on *keystrokes* — presence, not the
+reason), `HANDSHAKE_TIMEOUT_S = 15` — how long a socket that has completed
+the WebSocket handshake may hold its slot, its thread and its authorisation
+without sending `open`, after which it is closed 4408, because a slept laptop
+used to keep all four of an account's slots indefinitely —
+`IDLE_TIMEOUT_S = 900` measured on *keystrokes* — presence, not the
 window being open, the rule `SessionStore.touch` applies to the web session
 — `MAX_SESSIONS = 16` across the application and `MAX_SESSIONS_PER_USER = 4`
 for one account (past either the socket closes 4429, with a message naming
 the cap that was reached; the per-user one is what stops sixteen sockets
 from one account locking every other operator out), `MAX_AUTH_ATTEMPTS = 5`
-failed logins per socket, `TOUCH_INTERVAL_S = 30`, `PERMISSION_EVERY_TICKS =
-5`, and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel read so a
-device dumping a huge `show tech-support` streams rather than being
+failed logins **per (account, device) pair** with `AUTH_FAILURE_WINDOW_S =
+300` — see below — `TOUCH_INTERVAL_S = 30`, `PERMISSION_EVERY_TICKS = 5`,
+`SHUTDOWN_BUDGET_S = 3.0` and `SHUTDOWN_GRACE_S = 0.5` — the total, not
+per-session, that `SshSessionRegistry.shutdown()` may take, because stopping
+a session takes its socket's I/O lock, which its own output pump can be
+holding for up to `wsock.SEND_TIMEOUT_S` against a browser that stopped
+reading, and sixteen of those in sequence is four minutes of an operator's
+Ctrl+C apparently doing nothing while the poller and the databases wait; the
+grace is for sockets shut down by force, which takes no lock, to let go of
+their slots — and `MAX_OUTPUT_BYTES = 64 * 1024`, the size of one channel
+read so a device dumping a huge `show tech-support` streams rather than being
 buffered whole. The credential — ConfigRX's, decrypted at connect, or one
 typed into the page — lives in a local for the length of the connect and is
 dropped in its `finally`; the one case where it is held longer is between a
@@ -3919,8 +3943,14 @@ the web session's idle timeout is measured in hours. And every
 `AuthenticationException` is counted and audited (`SSH login as <ssh user>
 refused (attempt n of 5; requested by <app user> from <ip>)`, never the
 password); at `MAX_AUTH_ATTEMPTS` the session says "Too many failed logins"
-and closes, so the page cannot be used as an unthrottled password oracle
-against every device the app can reach.
+and closes 4429. **The count is kept per (account, device) pair, not per
+socket** — which is the whole point of it. Per socket, five guesses were
+followed by closing the window, opening it again and five more, so the page
+was still an unthrottled password oracle against every device the
+application can reach. Once the cap is spent, a new socket for that pair is
+refused *before the device is contacted at all*, until the newest failure has
+aged out of `AUTH_FAILURE_WINDOW_S`; a successful login clears the count, so
+an operator who fumbled four passwords is not locked out an hour later.
 
 **The `ssh` permission and its backfill.** `permissions.MODULES` gained
 `"ssh"`, the only entry with no tab of its own: both terminal routes require
@@ -4004,6 +4034,16 @@ the address, a second device row at that address may rely on it, and a
 `nodes` write must not be able to reset a trust anchor that `configrx`
 write guards. `configrxdb.forget_device` therefore takes only the device
 id.
+
+**What the terminal does with it.** The same `prepare` / `policy` /
+`connect` sequence, and — from 4.37.0 — the `record_seen(host, port)` that
+closes it. A terminal connection that paramiko accepted against the stored
+key now touches that row's `last_seen_ts`, so the fingerprint line in
+ConfigRX's device dialog reports when the device last presented the key
+rather than when it was first stored. Before this the terminal was the one
+caller that checked a key and never said it had: an install whose operators
+worked entirely from the terminal showed every key as last seen on the day
+it was pinned.
 
 **The scoped boundary.** "Only `pager_off` + `show_config` are ever sent"
 remains true and is still the point of `configrx_vendors.py`, but it is now
