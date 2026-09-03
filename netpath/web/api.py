@@ -4234,3 +4234,42 @@ def get_alerts_total(service, params, body) -> dict:
     capped = total > ALERT_TOTAL_CAP
     return {"total": ALERT_TOTAL_CAP if capped else total,
             "capped": capped, "cap": ALERT_TOTAL_CAP}
+
+
+# Six features across four tabs store a secret, and every one of them goes
+# through Windows DPAPI: on Linux the credential fields render in full, the
+# operator types a password, and the save comes back 400. IPAM's DHCP form is
+# the worst of it — it renders completely, with Windows-only help text, on a
+# host where `ipam_dhcp.IS_WINDOWS` is False and nothing can ever work.
+#
+# This says so once, up front, so the front end can gate a form instead of
+# letting somebody fill it in and be refused. It is deliberately a route of
+# its own rather than another key on /api/state: the answer cannot change
+# while the process is running, so it is fetched once at start-up and never
+# polled. Nothing here is a secret — it is which of this host's features can
+# work at all — so read on any module is enough.
+def get_platform(service, params, body) -> dict:
+    """What this host can and cannot do, for the forms that depend on it."""
+    from .. import dpapi
+    from .. import ipam_dhcp
+
+    powershell = False
+    if ipam_dhcp.IS_WINDOWS:
+        try:
+            ipam_dhcp._powershell_binary()
+            powershell = True
+        except Exception:                                     # noqa: BLE001
+            powershell = False
+
+    return {
+        "platform": {
+            "is_windows": bool(dpapi.IS_WINDOWS),
+            "powershell": powershell,
+            # A platform-neutral secret store was considered and deferred
+            # (see the release notes); this stays False until one exists, and
+            # the front end words its refusals from it rather than hard-coding
+            # "Windows only" in nine places.
+            "secret_store": False,
+            "credential_store": "Windows DPAPI" if dpapi.IS_WINDOWS else None,
+        },
+    }

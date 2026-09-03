@@ -238,8 +238,10 @@
           <option value="MD5" ${c && c.v3_auth_proto === 'MD5' ? 'selected' : ''}>MD5</option>
           <option value="SHA" ${c && c.v3_auth_proto === 'SHA' ? 'selected' : ''}>SHA</option>
         </select></label>
-        <label>Auth password <input id="wc-v3pass" type="password"
-          placeholder="${c && c.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Auth password <input id="wc-v3pass" type="password"
+              placeholder="${c && c.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SNMPv3 auth password')}
         <p class="hint">authPriv is not supported — only noAuthNoPriv or authNoPriv will
           reach the controller.</p>
       </fieldset>`;
@@ -274,7 +276,7 @@
         }
         const v3user = m.querySelector('#wc-v3user').value.trim();
         const v3proto = m.querySelector('#wc-v3proto').value;
-        const v3pass = m.querySelector('#wc-v3pass').value;
+        const v3pass = (m.querySelector('#wc-v3pass') || {}).value || '';
         if (v3user && v3proto && v3pass) {
           await App.post(`/api/wireless/controllers/${id}/credential`, {
             v3_user: v3user, v3_auth_proto: v3proto, v3_auth_pass: v3pass,

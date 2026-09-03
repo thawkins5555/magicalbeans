@@ -1813,8 +1813,10 @@
           ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((p) =>
             `<option value="${p}" ${d.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select></label>
-        <label>v3 auth password <input id="nd-f-authpass" type="password"
-          placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>v3 auth password <input id="nd-f-authpass" type="password"
+              placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>`
+          : App.credentialUnavailableHtml('An SNMPv3 auth password')}
         <label>Poll interval <input id="nd-f-interval" type="number" min="10" value="${d.poll_interval_s || ''}"> s</label>
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${App.helpLink('nodes.profile.ping')}
@@ -1967,7 +1969,7 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = box.querySelector('#nd-f-authpass').value;
+        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         const result = await App.post('/api/nodes/devices',
@@ -2011,7 +2013,7 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = box.querySelector('#nd-f-authpass').value;
+        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         await App.put(`/api/nodes/devices/${d.id}`,
@@ -2100,7 +2102,7 @@
     const result = box.querySelector('#nd-f-test-result');
     result.textContent = 'Testing…';
     const overrides = deviceOverrides(box);
-    const authPass = box.querySelector('#nd-f-authpass').value;
+    const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
     const body = { ...overrides };
     if (authPass) body.v3_auth_pass = authPass;
     try {
@@ -2225,7 +2227,9 @@
         ${['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'].map((x) =>
           `<option value="${x}">${x}</option>`).join('')}
       </select></label>
-      <label>v3 auth password <input id="nd-pc-authpass" type="password"></label>
+      ${App.canStoreSecrets()
+        ? '<label>v3 auth password <input id="nd-pc-authpass" type="password"></label>'
+        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
       <button type="button" id="nd-pc-add">Add credential</button>
       <p class="hint" id="nd-pc-status"></p>`;
   }
@@ -2280,7 +2284,7 @@
         v3_user: box.querySelector('#nd-pc-v3user').value.trim(),
         v3_auth_proto: box.querySelector('#nd-pc-authproto').value,
       };
-      const authPass = box.querySelector('#nd-pc-authpass').value;
+      const authPass = (box.querySelector('#nd-pc-authpass') || {}).value || '';
       status.innerHTML = '';
       addBtn.disabled = true;
       try {
@@ -2300,8 +2304,10 @@
           }
         }
         await refreshCredentialsList(box, groupId);
+        // 'nd-pc-authpass' is absent on a host that cannot store secrets.
         for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user', 'nd-pc-authpass']) {
-          box.querySelector(`#${id}`).value = '';
+          const field = box.querySelector(`#${id}`);
+          if (field) field.value = '';
         }
       } catch (error) {
         status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
@@ -2327,8 +2333,10 @@
         ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((x) =>
           `<option value="${x}" ${p.v3_auth_proto === x ? 'selected' : ''}>${x}</option>`).join('')}
       </select></label>
-      <label>v3 auth password <input id="nd-p-authpass" type="password"
-        placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+      ${App.canStoreSecrets()
+        ? `<label>v3 auth password <input id="nd-p-authpass" type="password"
+            placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+        : App.credentialUnavailableHtml('An SNMPv3 auth password')}
       <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
@@ -2397,7 +2405,7 @@
       { label: 'Add', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
         if (!fields.name) return;
-        const authPass = box.querySelector('#nd-p-authpass').value;
+        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
         const result = await App.post('/api/nodes/groups', fields);
         if (authPass && fields.v3_user && fields.v3_auth_proto) {
           await App.post(`/api/nodes/groups/${result.id}/credential`,
@@ -2521,7 +2529,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
-        const authPass = box.querySelector('#nd-p-authpass').value;
+        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
         await App.put(`/api/nodes/groups/${g.id}`, fields);
         if (authPass && fields.v3_user && fields.v3_auth_proto) {
           await App.post(`/api/nodes/groups/${g.id}/credential`,

@@ -403,6 +403,36 @@
 
   /* ---------------------------------------------------------------- dhcp */
 
+  /* Reading a Windows DHCP server runs PowerShell with the DhcpServer module
+     on the machine running SappiWhere (ipam_dhcp.py), so on any other host
+     the whole subtab is a form that cannot be made to work — and it used to
+     render completely, with Windows-only help text and no hint of that.
+     `/api/platform` says which host this is; the form is replaced by a
+     notice that names what is missing rather than being silently broken. */
+  function applyDhcpAvailability() {
+    const platform = App.state.platform || {};
+    const usable = Boolean(platform.is_windows && platform.powershell);
+    const body = App.el('ipam-dhcp-body');
+    const notice = App.el('ipam-dhcp-unavailable');
+    if (!body || !notice) return usable;
+    body.hidden = !usable;
+    notice.hidden = usable;
+    if (!usable) {
+      App.el('ipam-dhcp-unavailable-why').textContent = platform.is_windows
+        ? 'This host is Windows but no PowerShell was found on it. Reading a '
+          + 'DHCP server needs PowerShell with the DhcpServer module (part of '
+          + 'RSAT: DHCP Server Tools), installed on the machine running '
+          + 'SappiWhere — not necessarily on the DHCP server itself.'
+        : 'Scopes and leases are read by running PowerShell with the '
+          + 'DhcpServer module on the machine running SappiWhere, so this '
+          + 'subtab only works when SappiWhere itself runs on Windows. '
+          + 'Everything else in IPAM — subnets, scans, hosts and conflicts — '
+          + 'works here. Subnet scanning finds the same addresses; it just '
+          + 'cannot read the server\u2019s own lease records.';
+    }
+    return usable;
+  }
+
   /* One DHCP server is picked at a time via a dropdown rather than a full
      sidebar table -- that sidebar space belongs to SCOPES now, mirroring
      Subnets & Hosts, and most installs have only a couple of servers
@@ -988,7 +1018,11 @@
   /* --------------------------------------------------------------- lifecycle */
 
   async function refresh() {
-    await Promise.all([loadSubnets(), loadConflicts(), loadDhcpServers()]);
+    // Nothing to poll for on a host where the DHCP subtab cannot work, and
+    // a server list that always comes back empty is noise on the wire.
+    const dhcp = applyDhcpAvailability();
+    await Promise.all([loadSubnets(), loadConflicts(),
+                       ...(dhcp ? [loadDhcpServers()] : [])]);
     drawStatus();
   }
 
@@ -1046,6 +1080,8 @@
   }
 
   function init() {
+    // /api/platform has already answered by the time any module inits.
+    applyDhcpAvailability();
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => selectSub(btn.dataset.subtab);
     }

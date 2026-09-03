@@ -731,8 +731,10 @@
         </select></label>
         ${check('as-verify', 'Verify server certificate', s.smtp_verify_cert !== false)}
         <label>Username <input id="as-user" value="${escape(s.smtp_username || '')}"></label>
-        <label>Password <input id="as-pass" type="password"
-          placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="as-pass" type="password"
+          placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SMTP password')}
         <p class="hint" id="as-cred-status"></p>
       </fieldset>
       <fieldset><legend>IDENTITY &amp; RECIPIENTS</legend>
@@ -800,7 +802,7 @@
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
-        const password = box.querySelector('#as-pass').value;
+        const password = (box.querySelector('#as-pass') || {}).value || '';
         if (password) {
           try {
             await App.post('/api/alerts/smtp/credential', { password });

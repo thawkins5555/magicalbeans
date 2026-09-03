@@ -97,6 +97,46 @@ const App = (() => {
 
   const pages = {};
 
+  /* ---------------------------------------------------- host capabilities
+
+     Six features across four tabs store a secret and every one goes through
+     Windows DPAPI, so on Linux the credential fields rendered in full, the
+     operator typed a password and the save came back 400; IPAM's DHCP form
+     rendered completely, with Windows-only help text, on a host where it
+     could never work. `/api/platform` answers once at start-up (the answer
+     cannot change while the process runs) and these two helpers are what
+     the forms ask.
+
+     Defaults assume the host CAN do it: if the fetch fails, the operator
+     gets today's behaviour — a form and a server-side refusal — rather than
+     a wrongly disabled feature. */
+  state.platform = { is_windows: true, powershell: true, secret_store: false,
+                     credential_store: null };
+
+  function canStoreSecrets() {
+    const p = state.platform || {};
+    return Boolean(p.is_windows || p.secret_store);
+  }
+
+  /* One sentence, in one place, for every credential field that cannot work
+     on this host. Rendered where the field would have been, so nobody types
+     a password into something that will refuse it. */
+  function credentialUnavailableHtml(what) {
+    return `<p class="hint warn-text">${escapeHtml(what || 'A password')} cannot be` +
+      ' stored on this host: credentials are encrypted with Windows DPAPI, and' +
+      ' there is no equivalent here yet. Configure this on a Windows host, or' +
+      ' use an option that needs no stored secret.</p>';
+  }
+
+  async function loadPlatform() {
+    try {
+      const payload = await get('/api/platform');
+      if (payload && payload.platform) state.platform = payload.platform;
+    } catch (error) {
+      // Left at the permissive default above on purpose.
+    }
+  }
+
   /* ------------------------------------------------------------ server */
 
   /* A request that never answers used to leave the UI frozen and looking
@@ -1662,6 +1702,8 @@ const App = (() => {
     } catch (error) {
       connected(false, String(error.message || error));
     }
+    // Before any module's init() builds a form that depends on it.
+    await loadPlatform();
 
     applyDensity();
     window.addEventListener('resize', applyDensity);
@@ -1700,6 +1742,7 @@ const App = (() => {
     clock, stamp, span, duration, bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, closeModal, confirmDestructive, el, svgNode, tooltip, hideTooltip,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
+    canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, a11yTable, sortRows, canRead, canWrite, accountModal,

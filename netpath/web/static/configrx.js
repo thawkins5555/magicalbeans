@@ -222,8 +222,10 @@
           placeholder="leave blank to leave unchanged"></label>
         <label>Username <input id="cx-bulk-username"
           placeholder="leave blank to leave unchanged"></label>
-        <label>Password <input id="cx-bulk-password" type="password"
-          placeholder="leave blank to keep each device's own"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="cx-bulk-password" type="password"
+              placeholder="leave blank to keep each device's own"></label>`
+          : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">A password is stored only when a username is given with
           it — the pair is what gets encrypted, and half of one would lock the
           batch out. Stored encrypted and never shown again.</p>
@@ -231,7 +233,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
         const username = m.querySelector('#cx-bulk-username').value.trim();
-        const password = m.querySelector('#cx-bulk-password').value;
+        const password = (m.querySelector('#cx-bulk-password') || {}).value || '';
         const enabled = m.querySelector('#cx-bulk-enabled').value;
         const vendor = m.querySelector('#cx-bulk-vendor').value.trim();
         const port = m.querySelector('#cx-bulk-port').value.trim();
@@ -536,8 +538,10 @@
         <label>Port <input id="cx-port" type="number" min="1" max="65535"
           value="${device.ssh_port}"></label>
         <label>Username <input id="cx-username" value="${escape(device.ssh_username)}"></label>
-        <label>Password <input id="cx-password" type="password"
-          placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+        ${App.canStoreSecrets()
+          ? `<label>Password <input id="cx-password" type="password"
+              placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
           is no way to run any other command from here.</p>
@@ -553,7 +557,7 @@
           ssh_username: m.querySelector('#cx-username').value.trim(),
           vendor_override: m.querySelector('#cx-vendor').value.trim(),
         });
-        const password = m.querySelector('#cx-password').value;
+        const password = (m.querySelector('#cx-password') || {}).value || '';
         const username = m.querySelector('#cx-username').value.trim();
         if (password && username) {
           await App.post(`/api/configrx/devices/${device.id}/credential`, {

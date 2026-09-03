@@ -255,6 +255,9 @@ ROUTES = [
     # a hunk with the module routes above. `/api/alerts/total` cannot
     # collide with `/api/alerts/(\d+)`, which only matches digits.
     ("GET", r"^/api/alerts/total$", api.get_alerts_total, ("alerts", R)),
+    # Which of this host's features can work at all. No gate beyond a
+    # session: it is a property of the machine, not of any module.
+    ("GET", r"^/api/platform$", api.get_platform, None),
 ]
 
 COMPILED = [(method, re.compile(pattern), handler, requirement)

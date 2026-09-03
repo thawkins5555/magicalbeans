@@ -608,6 +608,15 @@
   </div>
 
   <div id="ipam-sub-dhcp" class="subpage active">
+    <!-- Shown instead of the form on a host with no PowerShell: reading a
+         Windows DHCP server needs it, and the whole subtab rendered in full
+         on Linux with Windows-only help text and no hint it could not work.
+         ipam.js unhides one of these two on start-up from /api/platform. -->
+    <div id="ipam-dhcp-unavailable" class="pad-x pad-b" hidden style="padding-top:14px">
+      <h2>DHCP is a Windows feature</h2>
+      <p class="hint" id="ipam-dhcp-unavailable-why"></p>
+    </div>
+    <div id="ipam-dhcp-body">
     <div class="bar">
       <span class="section">DHCP SERVER</span>
       <select id="ipam-dhcp-server-select"></select>
@@ -644,6 +653,7 @@
       <div class="table-wrap"><table id="ipam-dhcp-lease-table"></table></div>
     </div>
    </div>
+    </div>
   </div>
 </section>
 
