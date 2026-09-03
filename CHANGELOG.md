@@ -4,7 +4,8 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
-- [4.39.0 — unreleased](#4390-unreleased)
+- [4.40.0 — The update button works again](#4400--the-update-button-works-again)
+- [4.39.0](#4390)
 - [4.37.1 — Review of 4.37.0](#4371--review-of-4370)
 - [4.37.0 — Views that survive a reload, Mute where it belongs, bulk Resolve that resolves](#4370--views-that-survive-a-reload-mute-where-it-belongs-bulk-resolve-that-resolves)
 - [4.36.2 — UI/UX review: the defects it found](#4362-uiux-review-the-defects-it-found)
@@ -103,7 +104,50 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 4.39.0 — unreleased
+### 4.40.0 — The update button works again
+
+4.39.0 was published as a tag with a digest, exactly as its own `RELEASE.md`
+described, and then could not be installed by anything already running. This
+release is what makes the button work, and one bug found while proving it.
+
+- **Self-update follows the tip of `main` again, knowingly and temporarily.**
+  4.39.0 installed only a published tag whose tarball matched a SHA-256
+  published as a release asset. That path is gated behind `updates_enabled`,
+  a setting that exists only from 4.39.0 — so every install in the field ran
+  an updater that predated it and could not reach 4.39.0 through the button
+  at all. The update mechanism had locked itself out of the release that
+  introduced it. `apply()` now reads the tip of `main`, downloads that
+  commit's tarball and installs it, recording `update_installed_commit` and
+  claiming no tag.
+
+  What that costs, plainly: with the setting on, anyone who can push to this
+  repository chooses the code the install runs at the next press of the
+  button, on a host holding your SNMP communities and SSH credentials. There
+  is no tag, no digest and no signature in the path. What remains: the
+  setting is still off by default and administrator-only, and the archive is
+  still size-capped, still stripped of its own mode bits and still checked
+  for shape before anything is swapped in.
+
+  It is recorded as reopened against S-B1 in `REVIEW-NETWORK-ENGINEER.md`,
+  with the route back — `latest_tag()` and `published_digest()` are still in
+  `netpath/selfupdate.py` and still tested, so restoring the verified path is
+  a change to `apply()` once the fleet is on a version that has the setting.
+  The migration trap that forced this cannot recur, because from then on
+  every install already carries it. An installation that cannot accept the
+  exposure meanwhile should leave `updates_enabled` off and replace the
+  `netpath` directory by hand.
+- **A refusal no longer looks like being signed out.** "Updating from GitHub
+  is switched off" and "changing this needs administrator access" were
+  answered 401, which the browser reads as an expired session: it replaced
+  the page with the sign-in form, which — for a session that was perfectly
+  valid — bounced straight back, having thrown the explanation away. Pressing
+  **Check for updates** on a default install therefore looked like a login
+  glitch rather than a setting that was off. Both are 403 now, and the
+  sentence saying what to do reaches the person who pressed the button. The
+  test that should have caught it accepted "401 or 403" for one case and
+  asserted the 401 for the other; both now require the 403.
+
+### 4.39.0
 
 Two reviews, implemented. The first is the network-engineer review in
 `REVIEW-NETWORK-ENGINEER.md` — a fortnight of a very large mixed fleet held
@@ -143,40 +187,10 @@ Nine changes are not, and an operator should read them before updating.
   before, not less: the old whole-table cap of 50,000 rows meant a large fleet
   held minutes.
 - **Self-update is off until an administrator turns it on.** `updates_enabled`
-  ships off and is administrator-only. When it is on, the button installs the
-  tip of `main` — see the next entry, which is the one to read before turning
-  it on.
-- **The update button installs an unverified branch tip, knowingly.** This
-  release first shipped the hardened version — newest published tag, checked
-  against a SHA-256 published as a release asset — and it has been withdrawn
-  before release. It could not work: the hardened path is gated behind
-  `updates_enabled`, a setting that only exists in this release, so every
-  install already in the field ran an updater that predated it and could not
-  reach this release through the button at all. The update mechanism had
-  locked itself out of the release that introduced it.
-
-  What that costs, plainly: with the setting on, anyone who can push to the
-  repository chooses the code the install runs at the next press of the
-  button, on a host holding your SNMP communities and SSH credentials. There
-  is no tag, no digest and no signature in the path. The archive is still
-  size-capped, still stripped of its own mode bits, and still checked for
-  shape before anything is swapped in, and the setting is still off by
-  default and administrator-only — those are the mitigations that remain.
-
-  It is recorded as reopened against S-B1 in `REVIEW-NETWORK-ENGINEER.md`,
-  with the route back: `latest_tag()` and `published_digest()` are still in
-  `netpath/selfupdate.py` and still tested, so restoring the verified path is
-  a change to `apply()` once the fleet is on a version that has the setting.
-  An install that cannot accept the exposure in the meantime should leave
-  `updates_enabled` off and replace the directory by hand.
-- **A refusal no longer looks like being signed out.** "Updating from GitHub
-  is switched off" and "changing this needs administrator access" were
-  answered 401, which the browser reads as an expired session: it replaced
-  the page with the sign-in form, which — for a session that was perfectly
-  valid — bounced straight back, having thrown the explanation away. Pressing
-  **Check for updates** on a default install therefore looked like a login
-  glitch rather than a setting that was off. Both are 403 now, and the
-  sentence saying what to do reaches the person who pressed the button.
+  ships off, is administrator-only, and the update path installs a published
+  release tag verified against a published SHA-256 rather than the tip of a
+  branch. (4.40.0 withdrew the tag-and-digest half of this; the setting
+  itself stands.)
 - **Administering the application is its own capability.** A new `admin` grant
   covers user accounts, permission changes, password resets, maintenance,
   self-update and the audit log. Accounts holding **Settings: write** receive it
