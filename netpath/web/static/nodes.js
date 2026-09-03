@@ -121,8 +121,8 @@
   function mutedTag(row) {
     if (!row.muted_until) return '';
     const until = new Date(row.muted_until * 1000).toLocaleString();
-    return ` · <span class="warn-text" title="New alerts for this device are ` +
-      `suppressed until ${escape(until)}">alerts muted</span>`;
+    return ` · <span class="warn-text muted-tag" title="New alerts for this ` +
+      `device are suppressed until ${escape(until)}">alerts muted</span>`;
   }
 
   const COLUMNS = [
@@ -140,7 +140,7 @@
       // The mute lives in Alerts but is shown here on purpose: an operator
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
-      cell: (r) => `${escape(displayName(r))}<div class="hint">${escape(r.ip)}` +
+      cell: (r) => `${escape(displayName(r))}<div class="ip-line">${escape(r.ip)}` +
         `${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
@@ -808,6 +808,7 @@
     if (!el) return;
     const svg = App.el('nd-status-timeline-svg');
     svg.innerHTML = '';
+    App.statusPatternDefs(svg);
     const data = view.timeline;
     const width = el.clientWidth || 400;
     const height = el.clientHeight || 24;
@@ -824,16 +825,36 @@
     for (const seg of segments) {
       const x0 = x(seg.ts_start);
       const w = Math.max(x(seg.ts_end) - x0, 1);
-      const rect = App.svgNode('rect', {
-        x: x0, y: 0, width: w, height, fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+      const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
+      // The segment is a <g> rather than a bare rect so the colour, the
+      // texture over it and the keyboard focus are one thing the operator
+      // can Tab to and read, instead of a colour with a mouse-only tooltip.
+      const group = App.svgNode('g', {
+        tabindex: 0, role: 'img', 'aria-label': label,
+        class: 'timeline-seg',
       });
-      rect.addEventListener('mousemove', (event) => {
-        const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}`;
-        App.tooltip(label, event);
+      group.appendChild(App.svgNode('title', {}, label));
+      group.appendChild(App.svgNode('rect', {
+        x: x0, y: 0, width: w, height,
+        fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+      }));
+      // Colour is never the only signal: every non-`up` state carries its
+      // own texture (see App.statusPatternDefs).
+      const pattern = App.statusPatternUrl(seg.status);
+      if (pattern) {
+        group.appendChild(App.svgNode('rect', {
+          x: x0, y: 0, width: w, height, fill: pattern,
+        }));
+      }
+      group.addEventListener('mousemove', (event) => App.tooltip(label, event));
+      group.addEventListener('mouseleave', App.hideTooltip);
+      group.addEventListener('focus', () => {
+        const box = group.getBoundingClientRect();
+        App.tooltip(label, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
-      rect.addEventListener('mouseleave', App.hideTooltip);
-      svg.appendChild(rect);
+      group.addEventListener('blur', App.hideTooltip);
+      svg.appendChild(group);
     }
   }
 

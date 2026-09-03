@@ -91,6 +91,15 @@ body {
 }
 .skip-link:focus { left: 8px; top: 8px; }
 
+/* Status-timeline segments are keyboard reachable (each one announces its
+   state and window), so focus has to be visible on them. */
+.timeline-seg { outline: none; }
+.timeline-seg:focus-visible rect:first-of-type,
+.timeline-seg:focus rect:first-of-type {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
 /* ------------------------------------------------------------------ tabs */
 #tabs {
   display: flex;
@@ -293,7 +302,15 @@ input[type=checkbox] { accent-color: var(--accent); }
   font: 600 11px/1 var(--ui);
   letter-spacing: 1.4px;
 }
-.hint { color: var(--faint); font-size: 11px; }
+/* --faint is 2.50:1 on --bg at 11px, roughly half of what AA asks for, and
+   .hint is not decorative: it carries every device's IP address, the mute
+   tag, alert counts and every empty state. --muted is 5.18:1. */
+.hint { color: var(--muted); font-size: 11px; }
+/* The IP under a device name is the network engineer's primary key and the
+   first thing to disappear on a NOC wall screen: its own class, a size up
+   from a hint, so it is not carried along by whatever .hint becomes next. */
+.ip-line { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.ip-line .muted-tag { font-family: var(--ui); }
 .hint.pad { padding: 2px 12px 6px; margin: 0; }
 .terms { font-family: var(--mono); padding: 0 12px 6px; }
 .terms b { color: var(--muted); font-weight: 600; }
@@ -605,7 +622,7 @@ th .grip:hover { background: var(--accent, var(--muted)); opacity: 0.35; }
 .sev-4 { color: var(--warn); }
 .sev-5 { color: var(--text); }
 .sev-6 { color: var(--muted); }
-.sev-7 { color: var(--faint); }
+.sev-7 { color: var(--muted); }        /* --faint was 2.50:1 — below AA */
 #syslog-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #snmp-table td.msg { white-space: pre-wrap; word-break: break-word; }
 #nodes-table td.msg, #alerts-table td.msg { white-space: pre-wrap; word-break: break-word; }

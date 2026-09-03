@@ -614,6 +614,79 @@ const App = (() => {
 
   function el(id) { return document.getElementById(id); }
 
+  /* ------------------------------------------------- status patterns
+
+     Under a deuteranopia transform --ok #3FB950, --fail #F85149 and
+     --blocked #FF8A65 become three khakis 1.34:1 apart, and --fail and
+     --error have identical relative luminance, so a status timeline drawn
+     in colour alone says nothing to about one operator in twelve. NetPath
+     already hatched "refused" and striped "skipped"; this extends that
+     vocabulary to every state and shares one set of definitions between
+     the NetPath canvas and the device status timeline, so the two read the
+     same way.
+
+     `none`/`up`/`ok` are deliberately plain: the baseline needs to be the
+     one without texture, or everything is texture and nothing reads. */
+  const STATUS_PATTERN = {
+    warn: 'sw-pat-dots',       // degraded — sparse dots
+    unsupported: 'sw-pat-dots',
+    auth: 'sw-pat-dots',
+    fail: 'sw-pat-fail',       // no reply — diagonal, leaning the other way
+    down: 'sw-pat-fail',
+    blocked: 'sw-pat-hatch',   // refused — the 45 degree hatch NetPath used
+    overrun: 'sw-pat-bars',    // skipped — vertical bars, as before
+    error: 'sw-pat-rows',      // probe failed — horizontal bars
+    unknown: 'sw-pat-rows',
+  };
+
+  function statusPatternUrl(status) {
+    const id = STATUS_PATTERN[status];
+    return id ? `url(#${id})` : null;
+  }
+
+  /* Appends the pattern definitions to `svg` once. Ink is white at low
+     alpha so one definition works over every status colour and in both
+     themes, exactly as NetPath's original hatch did. */
+  function statusPatternDefs(svg) {
+    if (!svg || svg.querySelector('#sw-pat-defs')) return;
+    const defs = svgNode('defs', { id: 'sw-pat-defs' });
+    const stroke = 'rgba(255,255,255,0.45)';
+
+    const hatch = svgNode('pattern', { id: 'sw-pat-hatch', width: 6, height: 6,
+      patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
+    hatch.appendChild(svgNode('line',
+      { x1: 0, y1: 0, x2: 0, y2: 6, stroke, 'stroke-width': 2 }));
+    defs.appendChild(hatch);
+
+    const fail = svgNode('pattern', { id: 'sw-pat-fail', width: 5, height: 5,
+      patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(-45)' });
+    fail.appendChild(svgNode('line',
+      { x1: 0, y1: 0, x2: 0, y2: 5, stroke, 'stroke-width': 2.2 }));
+    defs.appendChild(fail);
+
+    const bars = svgNode('pattern', { id: 'sw-pat-bars', width: 4, height: 4,
+      patternUnits: 'userSpaceOnUse' });
+    bars.appendChild(svgNode('line',
+      { x1: 1, y1: 0, x2: 1, y2: 4, stroke: 'rgba(255,255,255,0.5)',
+        'stroke-width': 1.4 }));
+    defs.appendChild(bars);
+
+    const rows = svgNode('pattern', { id: 'sw-pat-rows', width: 4, height: 4,
+      patternUnits: 'userSpaceOnUse' });
+    rows.appendChild(svgNode('line',
+      { x1: 0, y1: 1, x2: 4, y2: 1, stroke: 'rgba(255,255,255,0.5)',
+        'stroke-width': 1.4 }));
+    defs.appendChild(rows);
+
+    const dots = svgNode('pattern', { id: 'sw-pat-dots', width: 5, height: 5,
+      patternUnits: 'userSpaceOnUse' });
+    dots.appendChild(svgNode('circle',
+      { cx: 1.6, cy: 1.6, r: 1.1, fill: 'rgba(255,255,255,0.55)' }));
+    defs.appendChild(dots);
+
+    svg.insertBefore(defs, svg.firstChild);
+  }
+
   function svgNode(name, attrs = {}, text) {
     const node = document.createElementNS('http://www.w3.org/2000/svg', name);
     for (const [key, value] of Object.entries(attrs)) {
@@ -1342,6 +1415,7 @@ const App = (() => {
     registerHelp, helpLink, showHelp, closeHelp,
     resetLayout,
     grid, a11yTable, sortRows, canRead, canWrite, accountModal,
+    statusPatternDefs, statusPatternUrl,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };
