@@ -35,6 +35,7 @@ CATEGORIES = [TRACE, DNS, NETFLOW, SNMP, NODES, ALERTS, IPAM, WIRELESS,
              CONFIGRX, SYSTEM, ERROR]
 
 DETAIL_LIMIT = 6000
+MESSAGE_LIMIT = 512
 
 # How many distinct targets the filter drop-down remembers. The events
 # themselves are capped at `capacity` (3,000), but the set of targets seen
@@ -79,6 +80,11 @@ class EventLog:
 
     def add(self, category: str, message: str, target: str = "",
             detail: str = "") -> None:
+        if message and len(message) > MESSAGE_LIMIT:
+            # A message is a headline: the debug page renders it in a table
+            # cell and one row of it is not worth a screenful. Anything that
+            # long belongs in `detail`, which has its own, larger cap.
+            message = message[:MESSAGE_LIMIT] + "…"
         if detail and len(detail) > DETAIL_LIMIT:
             detail = detail[:DETAIL_LIMIT] + "\n… truncated …"
         with self._lock:

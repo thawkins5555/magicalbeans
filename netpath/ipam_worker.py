@@ -61,9 +61,15 @@ def credential_for_server(server) -> tuple[str | None, str | None]:
 
 
 class IpamWorker:
-    def __init__(self, db: IpamDatabase, log=None):
+    def __init__(self, db: IpamDatabase, log=None, global_settings=None):
         self.db = db
         self.log = log or NullLog()
+        # Called for the application-wide settings: never_scan_cidrs lives
+        # there rather than in the IPAM module's own table, because which
+        # networks nothing here may probe is a fact about the plant, and
+        # Nodes discovery honours the same list. A worker built without it
+        # simply has no deny list.
+        self._global_settings = global_settings
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -216,6 +222,23 @@ class IpamWorker:
 
     # ------------------------------------------------------------ subnet scan
 
+    def _never_scan(self) -> tuple:
+        """The networks no scan from here may probe, from the global settings.
+
+        Failing to read them is not a reason to skip a scan, but it is a
+        reason to say so: an empty list means every address is probed, which
+        is what the setting exists to prevent.
+        """
+        if self._global_settings is None:
+            return ()
+        try:
+            raw = self._global_settings().get("never_scan_cidrs", "")
+        except Exception as exc:
+            self.log.add(ERROR, f"IPAM could not read never_scan_cidrs: {exc}")
+            return ()
+        return tuple(part.strip() for part in
+                     str(raw or "").replace(",", " ").split() if part.strip())
+
     def _run_scan(self, subnet_id: int, settings: dict) -> None:
         with self._lock:
             self._queued.discard(subnet_id)
@@ -249,7 +272,8 @@ class IpamWorker:
         alive_count, new_conflicts, error = 0, 0, None
         try:
             alive_map = sweep(addresses, timeout_ms=int(settings.get("ping_timeout_ms", 800)),
-                              workers=int(settings.get("ping_workers", 64)))
+                              workers=int(settings.get("ping_workers", 64)),
+                              never_scan=self._never_scan())
             net = ipaddress.ip_network(subnet["cidr"], strict=False)
             arp = {ip: mac for ip, mac in read_arp_table().items()
                   if ipaddress.ip_address(ip) in net}
