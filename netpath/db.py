@@ -8,12 +8,30 @@ moved to appdb.py, which is what every module reads them from.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
+
 from statistics import mean
 
+from . import dbmaint, dbopen
 from .tracer import TraceResult
+
+log = logging.getLogger(__name__)
+
+# Trimming a database back under its size cap: rows are deleted in fixed
+# batches, each in its own short transaction, so the write lock is never held
+# for more than one batch. The old shape deleted 15% of the table and then
+# VACUUMed the whole file with the lock held, up to six times per maintenance
+# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
+# still finished above the cap and reported success.
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -103,11 +121,12 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            dbmaint.enable_incremental_vacuum(self._conn, "netpath.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -450,28 +469,59 @@ class Database:
         """Upsert running probe counters for one hop. Never stores per-probe
         rows — probes/lost/rtt_sum/rtt_min/rtt_max are cumulative counters, so
         a target probed every few seconds for days does not bloat the table."""
+        self.record_hop_probes([(target_id, ip, result)])
+
+    def record_hop_probes(self, probes) -> int:
+        """Fold a whole round of hop probes into hop_stats in one transaction.
+
+        One SELECT + UPSERT + commit per probe meant ten opted-in targets with
+        fifteen hops each committing 150 times every four seconds, on the same
+        database and the same lock the trace scheduler writes traces to. A
+        round is a batch: one read of the rows it touches, one executemany,
+        one commit.
+        """
+        wanted = {(target_id, ip) for target_id, ip, _ in probes}
+        if not wanted:
+            return 0
         with self._lock:
-            row = self._conn.execute(
-                "SELECT probes, lost, rtt_sum, rtt_min, rtt_max FROM hop_stats"
-                " WHERE target_id=? AND ip=?", (target_id, ip)).fetchone()
-            probes = (row["probes"] if row else 0) + result.sent
-            lost = (row["lost"] if row else 0) + result.lost
-            rtt_sum = (row["rtt_sum"] if row else 0.0) + (result.rtt_ms or 0.0)
-            prev_min = row["rtt_min"] if row else None
-            prev_max = row["rtt_max"] if row else None
-            rtt_min = result.rtt_ms if result.rtt_ms is not None and (
-                prev_min is None or result.rtt_ms < prev_min) else prev_min
-            rtt_max = result.rtt_ms if result.rtt_ms is not None and (
-                prev_max is None or result.rtt_ms > prev_max) else prev_max
-            self._conn.execute(
+            existing = {}
+            for target_id, ip in wanted:
+                row = self._conn.execute(
+                    "SELECT probes, lost, rtt_sum, rtt_min, rtt_max FROM hop_stats"
+                    " WHERE target_id=? AND ip=?", (target_id, ip)).fetchone()
+                if row is not None:
+                    existing[(target_id, ip)] = (row["probes"], row["lost"],
+                                                 row["rtt_sum"], row["rtt_min"],
+                                                 row["rtt_max"])
+            now = time.time()
+            merged: dict[tuple[int, str], list] = {}
+            for target_id, ip, result in probes:
+                key = (target_id, ip)
+                current = merged.get(key)
+                if current is None:
+                    base = existing.get(key, (0, 0, 0.0, None, None))
+                    current = [base[0], base[1], base[2], base[3], base[4]]
+                    merged[key] = current
+                current[0] += result.sent
+                current[1] += result.lost
+                current[2] += result.rtt_ms or 0.0
+                if result.rtt_ms is not None:
+                    current[3] = (result.rtt_ms if current[3] is None
+                                  else min(current[3], result.rtt_ms))
+                    current[4] = (result.rtt_ms if current[4] is None
+                                  else max(current[4], result.rtt_ms))
+            self._conn.executemany(
                 "INSERT INTO hop_stats(target_id, ip, probes, lost, rtt_sum,"
                 " rtt_min, rtt_max, updated_ts) VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(target_id, ip) DO UPDATE SET probes=excluded.probes,"
                 " lost=excluded.lost, rtt_sum=excluded.rtt_sum,"
                 " rtt_min=excluded.rtt_min, rtt_max=excluded.rtt_max,"
                 " updated_ts=excluded.updated_ts",
-                (target_id, ip, probes, lost, rtt_sum, rtt_min, rtt_max, time.time()))
+                [(target_id, ip, values[0], values[1], values[2], values[3],
+                  values[4], now)
+                 for (target_id, ip), values in merged.items()])
             self._conn.commit()
+        return len(merged)
 
     def hop_stats_for_target(self, target_id: int) -> dict[str, sqlite3.Row]:
         with self._lock:
@@ -553,40 +603,69 @@ class Database:
         return total
 
     def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest traces until the file fits under the cap.
-
-        Deletes in chunks and vacuums between them, because SQLite does not
-        return space to the filesystem until it is vacuumed — without that the
-        loop would never see the size fall and would empty the table.
-        """
+        """Delete the oldest traces, and their hops, until the file fits
+        under the cap."""
         if max_bytes <= 0:
             return 0
         removed = 0
-        for _ in range(6):
-            if self.size_bytes() <= max_bytes:
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        for _ in range(TRIM_PASSES):
+            size = self.size_bytes()
+            if size <= max_bytes:
                 break
             with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM traces").fetchone()["n"]
-                if total <= 200:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traces").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - 200)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                cut = low + want
+                chunk = TRIM_CHUNK
+                while low < cut and time.monotonic() < deadline:
+                    upper = min(low + chunk, cut)
+                    started = time.monotonic()
+                    with self._lock:
+                        self._conn.execute(
+                            "DELETE FROM hops"
+                            " WHERE trace_id >= ? AND trace_id < ?",
+                            (low, upper))
+                        cursor = self._conn.execute(
+                            "DELETE FROM traces"
+                            " WHERE id >= ? AND id < ?", (low, upper))
+                        removed += cursor.rowcount or 0
+                        self._conn.commit()
+                    held = time.monotonic() - started
+                    low = upper
+                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
+                    # however large the rows turn out to be — a trap with its
+                    # raw frame stored costs an order of magnitude more than a
+                    # syslog line, and one fixed batch size cannot suit both.
+                    if held > TRIM_LOCK_TARGET_S:
+                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+                    elif held < TRIM_LOCK_TARGET_S / 4:
+                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+            # Hand the freed pages back, in short slices outside the lock
+            # block. reclaim takes the lock itself and reacquires it in a
+            # tight loop, and a Python lock is not fair, so it is asked for a
+            # little at a time rather than for one long run.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="netpath.db"):
                     break
-                chunk = max(int(total * 0.15), 200)
-                ids = [row["id"] for row in self._conn.execute(
-                    "SELECT id FROM traces ORDER BY started_ts LIMIT ?", (chunk,))]
-                marks = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"DELETE FROM hops WHERE trace_id IN ({marks})", ids)
-                cur = self._conn.execute(
-                    f"DELETE FROM traces WHERE id IN ({marks})", ids)
-                removed += cur.rowcount or 0
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                # VACUUM alone does not shrink the files in WAL mode: the freed
-                # pages sit in the write-ahead log until it is checkpointed and
-                # truncated, so the loop would never see the size fall.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self.size_bytes() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        "netpath.db", self.size_bytes(), removed, max_bytes)
         return removed
-
     def prune(self, older_than_days: float) -> int:
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
@@ -597,6 +676,10 @@ class Database:
             cur = self._conn.execute("DELETE FROM traces WHERE started_ts < ?", (cutoff,))
             self._conn.commit()
             removed = cur.rowcount
-        with self._lock:
-            self._conn.execute("VACUUM")
+        if removed:
+            # Nothing deleted means nothing to give back. The old code rewrote
+            # the whole file with VACUUM on every call regardless, which on a
+            # netpath.db holding months of per-hop rows froze the trace
+            # scheduler and the UI for seconds at a time.
+            dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
         return removed

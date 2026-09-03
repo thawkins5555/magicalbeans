@@ -19,11 +19,38 @@ trigram cannot index. The app says which one is in use.
 
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
+
+from . import dbmaint, dbopen
+
+log = logging.getLogger(__name__)
+
+# Trimming a database back under its size cap: rows are deleted in fixed
+# batches, each in its own short transaction, so the write lock is never held
+# for more than one batch. The old shape deleted 15% of the table and then
+# VACUUMed the whole file with the lock held, up to six times per maintenance
+# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
+# still finished above the cap and reported success.
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
+
+# RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
+# possible: an external-content FTS5 table cannot work out what a deleted row
+# contained, so without the old column values the only way to keep the index
+# honest was to rebuild the whole thing.
+HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
+# How often the pre-3.35 fallback is allowed to rebuild the index.
+REBUILD_INTERVAL_S = 3600.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS logs (
@@ -83,6 +110,12 @@ DEFAULTS = {
     # and survives Reset layout, which clears per-browser column widths
     # but must not eat a settings choice.
     "table_columns": "",
+    # Volume controls for one noisy source, so a single device in a debug loop
+    # cannot evict every other device's messages from the queue.
+    "per_source_rate": 200,       # messages a second, 0 disables the limit
+    "collapse_repeats_s": 5.0,    # merge identical consecutive lines within
+                                  # this many seconds into one row, 0 disables
+    "max_tcp_clients": 64,
 }
 
 
@@ -92,9 +125,14 @@ class SyslogDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         self.fts = False
+        self._last_rebuild: float | None = None
+        # Last row stored per source, for consecutive-duplicate collapsing.
+        # Keyed on a spoofable source address, so bounded and LRU.
+        self._last_row: collections.OrderedDict = collections.OrderedDict()
+        self.collapse_repeats_s = 0.0
         # Set when an index from an older build had to be dropped; the refill
         # runs on a thread so opening the database stays instant.
         self._backfill_wanted = False
@@ -103,9 +141,24 @@ class SyslogDatabase:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            dbmaint.enable_incremental_vacuum(self._conn, "syslog.db")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._enable_fts()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an
+        install from before repeat collapsing needs the column added
+        explicitly or the next insert fails.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(logs)").fetchall()}
+        if "repeat_count" not in columns:
+            self._conn.execute("ALTER TABLE logs ADD COLUMN repeat_count"
+                               " INTEGER NOT NULL DEFAULT 1")
 
     def _enable_fts(self) -> None:
         """Create the search index, rebuilding it if its shape has changed.
@@ -234,10 +287,45 @@ class SyslogDatabase:
 
     # ------------------------------------------------------------------ write
 
+    def _collapse(self, entries) -> tuple[list, list[int]]:
+        """Split a batch into rows to insert and rows to fold into a repeat.
+
+        A device in a debug loop sends the same line thousands of times; one
+        row per line buries every other message and inflates the index for no
+        information. A consecutive identical line from the same source within
+        the window bumps the previous row's repeat_count instead. Both halves
+        are O(1) per message: the previous row per source is remembered in a
+        bounded LRU rather than looked up.
+        """
+        window = self.collapse_repeats_s
+        if window <= 0:
+            return list(entries), []
+        fresh, bumps = [], []
+        for entry in entries:
+            key = entry.source
+            previous = self._last_row.get(key)
+            if (previous is not None and previous[1] == entry.message
+                    and entry.ts - previous[2] <= window):
+                bumps.append(previous[0])
+                # The run's row keeps the first occurrence's timestamp — when
+                # it started is the useful figure — but the window walks
+                # forward so a steady repeat stays one row.
+                self._last_row[key] = (previous[0], previous[1], entry.ts)
+                self._last_row.move_to_end(key)
+                continue
+            fresh.append(entry)
+        return fresh, bumps
+
+    def _remember(self, first_id: int, entries) -> None:
+        for index, entry in enumerate(entries):
+            self._last_row[entry.source] = (first_id + index, entry.message,
+                                            entry.ts)
+            self._last_row.move_to_end(entry.source)
+        while len(self._last_row) > 4096:
+            self._last_row.popitem(last=False)
+
     def insert(self, entries) -> int:
-        rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
-                 e.procid, e.msgid, e.message, e.raw) for e in entries]
-        if not rows:
+        if not entries:
             return 0
         counts: dict[tuple[int, int], int] = {}
         for entry in entries:
@@ -245,6 +333,24 @@ class SyslogDatabase:
             counts[key] = counts.get(key, 0) + 1
 
         with self._lock:
+            # Collapsing is decided under the lock so two writers cannot bump
+            # the same row concurrently.
+            entries, bumps = self._collapse(entries)
+            rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
+                     e.procid, e.msgid, e.message, e.raw) for e in entries]
+            if bumps:
+                self._conn.executemany(
+                    "UPDATE logs SET repeat_count = repeat_count + 1"
+                    " WHERE id = ?", [(row_id,) for row_id in bumps])
+            if not rows:
+                # The hourly timeline still counts every message that arrived:
+                # a storm that collapses to one row is still a storm.
+                self._conn.executemany(
+                    "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
+                    " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
+                    [(hour, severity, n) for (hour, severity), n in counts.items()])
+                self._conn.commit()
+                return 0
             self._conn.executemany(
                 "INSERT INTO logs(ts, source, host, facility, severity, app,"
                 " procid, msgid, message, raw) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -261,6 +367,11 @@ class SyslogDatabase:
                     [(first_id + index, entry.message, entry.app, entry.host,
                       entry.source)
                      for index, entry in enumerate(entries)])
+            else:
+                last_id = self._conn.execute(
+                    "SELECT last_insert_rowid()").fetchone()[0]
+                first_id = last_id - len(rows) + 1
+            self._remember(first_id, entries)
             self._conn.executemany(
                 "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
                 " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
@@ -418,15 +529,26 @@ class SyslogDatabase:
                 by[key] = by.get(key, 0) + row["n"]
         return buckets
 
-    def rows_since(self, last_id: int, limit: int = 500) -> list[sqlite3.Row]:
+    def rows_since(self, last_id: int, limit: int | None = 500) -> list[sqlite3.Row]:
         """Rows newer than last_id, oldest first — same cursor-read contract
-        as SnmpTrapDatabase.traps_since, used by the alert engine."""
+        as SnmpTrapDatabase.traps_since, used by the alert engine.
+
+        `limit` is the caller's per-tick budget; None means "everything
+        newer", which only a caller that has already sized the backlog with
+        max_id() should ask for.
+        """
         with self._lock:
+            if limit is None:
+                return self._conn.execute(
+                    "SELECT * FROM logs WHERE id > ? ORDER BY id ASC",
+                    (int(last_id),)).fetchall()
             return self._conn.execute(
                 "SELECT * FROM logs WHERE id > ? ORDER BY id ASC LIMIT ?",
                 (int(last_id), int(limit))).fetchall()
 
     def max_id(self) -> int:
+        """Highest stored log id, so a reader can size its own backlog
+        (max_id() - cursor) and say how far behind it is."""
         with self._lock:
             row = self._conn.execute("SELECT MAX(id) AS m FROM logs").fetchone()
         return int(row["m"] or 0)
@@ -465,46 +587,128 @@ class SyslogDatabase:
                 pass
         return total
 
+    def _delete_logs(self, where: str, params) -> int:
+        """Delete matching log rows and their index entries, without a rebuild.
+
+        `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` costs a full
+        re-index of the whole table however few rows were removed — measured
+        at 18.6 s to delete a single row from a million, with the write lock
+        held the whole time, every fifteen minutes once retention bites.
+        RETURNING hands back exactly the column values FTS5 needs to retire
+        each row's entries, so the cost becomes proportional to what was
+        actually deleted. Must be called with the lock held.
+        """
+        if self.fts and HAS_RETURNING:
+            rows = self._conn.execute(
+                f"DELETE FROM logs WHERE {where}"
+                " RETURNING id, message, app, host, source", params).fetchall()
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO logs_fts(logs_fts, rowid, message, app, host,"
+                    " source) VALUES ('delete', ?, ?, ?, ?, ?)",
+                    [(row["id"], row["message"], row["app"], row["host"],
+                      row["source"]) for row in rows])
+            return len(rows)
+
+        cursor = self._conn.execute(f"DELETE FROM logs WHERE {where}", params)
+        removed = cursor.rowcount or 0
+        if removed and self.fts:
+            self._rebuild_index()
+        return removed
+
+    def _rebuild_index(self) -> None:
+        """Pre-3.35 fallback: a full rebuild, at most once an hour.
+
+        Orphaned index rows are harmless — search joins `logs` on the rowid
+        and drops what no longer exists — so the rebuild is housekeeping, not
+        correctness, and running it on every prune was the whole problem.
+        """
+        now = time.monotonic()
+        if self._last_rebuild is not None and now - self._last_rebuild < REBUILD_INTERVAL_S:
+            return
+        self._last_rebuild = now
+        self._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+
     def prune(self, retention_days: float, max_rows: int) -> int:
         removed = 0
-        cutoff = time.time() - retention_days * 86400
+        now = time.time()
+        cutoff = now - retention_days * 86400
         with self._lock:
-            cursor = self._conn.execute("DELETE FROM logs WHERE ts < ?", (cutoff,))
-            removed += cursor.rowcount or 0
+            removed += self._delete_logs("ts < ?", (cutoff,))
+            # A device whose clock is set years ahead files rows that sort to
+            # the top of every newest-first search and that `ts < cutoff` can
+            # never reach. Arrival-time clamping stops new ones; this removes
+            # the ones already stored.
+            removed += self._delete_logs("ts > ?", (now + 86400,))
             self._conn.execute("DELETE FROM log_counts WHERE hour < ?", (cutoff,))
             total = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
             if max_rows and total > max_rows:
-                cursor = self._conn.execute(
-                    "DELETE FROM logs WHERE id IN (SELECT id FROM logs"
-                    " ORDER BY ts ASC LIMIT ?)", (total - max_rows,))
-                removed += cursor.rowcount or 0
-            if removed and self.fts:
-                self._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
+                removed += self._delete_logs(
+                    "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
+                    (total - max_rows,))
             self._conn.commit()
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest messages until the file fits under the cap.
+
+        Batched and reclaimed rather than deleted-and-VACUUMed: the write
+        lock is the one the syslog writer thread needs, and holding it
+        across a whole-file rewrite stalled ingest for seconds at a time.
+        """
         if max_bytes <= 0:
             return 0
         removed = 0
-        for _ in range(6):
-            if self.size_bytes() <= max_bytes:
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        for _ in range(TRIM_PASSES):
+            size = self.size_bytes()
+            if size <= max_bytes:
                 break
             with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
-                if total <= 5000:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM logs").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - 5000)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                cut = low + want
+                chunk = TRIM_CHUNK
+                while low < cut and time.monotonic() < deadline:
+                    upper = min(low + chunk, cut)
+                    started = time.monotonic()
+                    with self._lock:
+                        removed += self._delete_logs(
+                            "id >= ? AND id < ?", (low, upper))
+                        self._conn.commit()
+                    held = time.monotonic() - started
+                    low = upper
+                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
+                    # however large the rows turn out to be — a trap with its
+                    # raw frame stored costs an order of magnitude more than a
+                    # syslog line, and one fixed batch size cannot suit both.
+                    if held > TRIM_LOCK_TARGET_S:
+                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+                    elif held < TRIM_LOCK_TARGET_S / 4:
+                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+            # Hand the freed pages back, in short slices outside the lock
+            # block. reclaim takes the lock itself and reacquires it in a
+            # tight loop, and a Python lock is not fair, so it is asked for a
+            # little at a time rather than for one long run.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="syslog.db"):
                     break
-                chunk = max(int(total * 0.15), 5000)
-                cursor = self._conn.execute(
-                    "DELETE FROM logs WHERE id IN (SELECT id FROM logs"
-                    " ORDER BY ts ASC LIMIT ?)", (chunk,))
-                removed += cursor.rowcount or 0
-                if self.fts:
-                    self._conn.execute(
-                        "INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self.size_bytes() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        "syslog.db", self.size_bytes(), removed, max_bytes)
         return removed

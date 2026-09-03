@@ -8,6 +8,7 @@ None. Feed it bytes, get a Trap.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import hmac
 import socket
@@ -317,7 +318,11 @@ AUTH_PROTOCOLS = {                     # name -> (hashlib ctor, digest bytes)
     "SHA512": (hashlib.sha512, 48),    # RFC 7860 usmHMAC384SHA512
 }
 
-_KEY_CACHE: dict[tuple, bytes] = {}
+# The engine id in the key comes straight off the wire, so a stream of forged
+# v3 traps with a fresh engine id each time grew this dict without bound (and
+# paid a 1 MiB hash per entry). Bounded, least-recently-used.
+_KEY_CACHE_MAX = 256
+_KEY_CACHE: collections.OrderedDict = collections.OrderedDict()
 
 
 def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
@@ -336,12 +341,15 @@ def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
     key = (proto, password, engine_id)
     cached = _KEY_CACHE.get(key)
     if cached is not None:
+        _KEY_CACHE.move_to_end(key)
         return cached
     raw = password.encode("utf-8")
     repeated = raw * (1048576 // len(raw) + 1)
     ku = ctor(repeated[:1048576]).digest()
     localized = ctor(ku + engine_id + ku).digest()
     _KEY_CACHE[key] = localized
+    while len(_KEY_CACHE) > _KEY_CACHE_MAX:
+        _KEY_CACHE.popitem(last=False)
     return localized
 
 

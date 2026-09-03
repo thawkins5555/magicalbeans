@@ -9,9 +9,27 @@ flow batch contend with the trace scheduler.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
+
+from . import dbmaint, dbopen
+
+log = logging.getLogger(__name__)
+
+# Trimming a database back under its size cap: rows are deleted in fixed
+# batches, each in its own short transaction, so the write lock is never held
+# for more than one batch. The old shape deleted 15% of the table and then
+# VACUUMed the whole file with the lock held, up to six times per maintenance
+# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
+# still finished above the cap and reported success.
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flows (
@@ -34,7 +52,11 @@ CREATE TABLE IF NOT EXISTS flows (
     next_hop  TEXT,
     packets   INTEGER,
     bytes     INTEGER,
-    sampling  INTEGER DEFAULT 1
+    sampling  INTEGER DEFAULT 1,
+    -- Which sampler produced the flow, so a rate announced after it arrived
+    -- can still be applied to it.
+    domain    INTEGER DEFAULT 0,
+    sampler_id INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_flows_ts ON flows(ts_end);
 CREATE INDEX IF NOT EXISTS ix_flows_exporter ON flows(exporter, ts_end);
@@ -60,6 +82,19 @@ CREATE TABLE IF NOT EXISTS interfaces (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Sampling rates as the exporter announced them, one row per sampler rather
+-- than one per exporter: a router with per-interface rates sends several
+-- options records and keeping only the last one applied the wrong factor to
+-- everything else.
+CREATE TABLE IF NOT EXISTS samplers (
+    exporter   TEXT    NOT NULL,
+    domain     INTEGER NOT NULL DEFAULT 0,
+    sampler_id INTEGER NOT NULL DEFAULT 0,
+    rate       INTEGER NOT NULL DEFAULT 1,
+    updated_ts REAL,
+    PRIMARY KEY (exporter, domain, sampler_id)
 );
 """
 
@@ -113,13 +148,30 @@ class FlowDatabase:
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            dbmaint.enable_incremental_vacuum(self._conn, "netflow.db")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an
+        install from before per-sampler rates needs them added explicitly or
+        the next insert fails. Existing rows keep the factor that was baked
+        into them at decode time.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(flows)").fetchall()}
+        for column in ("domain", "sampler_id"):
+            if column not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE flows ADD COLUMN {column} INTEGER DEFAULT 0")
 
     def close(self) -> None:
         with self._lock:
@@ -158,7 +210,7 @@ class FlowDatabase:
             (f.exporter, f.version, f.ts_start, f.ts_end, f.src_ip, f.dst_ip,
              f.src_port, f.dst_port, f.protocol, f.tos, f.tcp_flags,
              f.in_if, f.out_if, f.src_as, f.dst_as, f.next_hop,
-             f.packets, f.bytes, f.sampling)
+             f.packets, f.bytes, f.sampling, f.domain, f.sampler_id)
             for f in flows
         ]
         if not rows:
@@ -167,8 +219,9 @@ class FlowDatabase:
             self._conn.executemany(
                 "INSERT INTO flows(exporter, version, ts_start, ts_end, src_ip,"
                 " dst_ip, src_port, dst_port, protocol, tos, tcp_flags, in_if,"
-                " out_if, src_as, dst_as, next_hop, packets, bytes, sampling)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " out_if, src_as, dst_as, next_hop, packets, bytes, sampling,"
+                " domain, sampler_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
             self._conn.commit()
@@ -176,18 +229,72 @@ class FlowDatabase:
 
     def touch_exporter(self, address: str, version: int, packets: int,
                        flows: int, sampling: int) -> None:
+        """One exporter's counters. A one-row wrapper around touch_exporters."""
+        self.touch_exporters([(address, version, packets, flows, sampling)])
+
+    def touch_exporters(self, entries) -> int:
+        """Fold a flush's worth of exporter counters in with one commit.
+
+        A fleet of 500 exporters used to produce 500 commits per flush
+        interval, each one taking the write lock the flow writer needs.
+        """
+        rows = list(entries)
+        if not rows:
+            return 0
         now = time.time()
         with self._lock:
-            self._conn.execute(
+            self._conn.executemany(
                 "INSERT INTO exporters(address, version, first_seen, last_seen,"
                 " packets, flows, sampling) VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(address) DO UPDATE SET last_seen=excluded.last_seen,"
                 " version=excluded.version, sampling=excluded.sampling,"
                 " packets=exporters.packets+excluded.packets,"
                 " flows=exporters.flows+excluded.flows",
-                (address, version, now, now, packets, flows, sampling),
-            )
+                [(address, version, now, now, packets, flows, sampling)
+                 for address, version, packets, flows, sampling in rows])
             self._conn.commit()
+        return len(rows)
+
+    def record_sampling_rates(self, rates, since_ts: float = 0.0) -> int:
+        """Store announced sampling rates, and correct the flows that arrived
+        before the announcement.
+
+        Options templates are sent on a slower cycle than data, so the flows
+        decoded before the first one were stored with sampling=1 for ever and
+        every byte figure for that window was understated by the sampling
+        factor, with no way to put it right — the multiplication is applied at
+        query time against the value baked into the row. The correction is
+        bounded to flows this collector run stored, which is exactly the
+        window that can be wrong.
+        """
+        rows = list(rates)
+        if not rows:
+            return 0
+        now = time.time()
+        corrected = 0
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO samplers(exporter, domain, sampler_id, rate,"
+                " updated_ts) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(exporter, domain, sampler_id) DO UPDATE SET"
+                " rate=excluded.rate, updated_ts=excluded.updated_ts",
+                [(exporter, domain, sampler_id, rate, now)
+                 for exporter, domain, sampler_id, rate in rows])
+            for exporter, domain, sampler_id, rate in rows:
+                cursor = self._conn.execute(
+                    "UPDATE flows SET sampling = ? WHERE exporter = ?"
+                    " AND domain = ? AND sampler_id = ? AND sampling <> ?"
+                    " AND ts_end >= ?",
+                    (rate, exporter, domain, sampler_id, rate, since_ts))
+                corrected += cursor.rowcount or 0
+            self._conn.commit()
+        return corrected
+
+    def samplers(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM samplers ORDER BY exporter, domain, sampler_id"
+            ).fetchall()
 
     def exporters(self) -> list[sqlite3.Row]:
         with self._lock:
@@ -241,27 +348,60 @@ class FlowDatabase:
         if max_bytes <= 0:
             return 0
         removed = 0
-        for _ in range(6):
-            if self.size_bytes() <= max_bytes:
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        for _ in range(TRIM_PASSES):
+            size = self.size_bytes()
+            if size <= max_bytes:
                 break
             with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM flows").fetchone()["n"]
-                if total <= 1000:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - 1000)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                cut = low + want
+                chunk = TRIM_CHUNK
+                while low < cut and time.monotonic() < deadline:
+                    upper = min(low + chunk, cut)
+                    started = time.monotonic()
+                    with self._lock:
+                        cursor = self._conn.execute(
+                            "DELETE FROM flows"
+                            " WHERE id >= ? AND id < ?", (low, upper))
+                        removed += cursor.rowcount or 0
+                        self._conn.commit()
+                    held = time.monotonic() - started
+                    low = upper
+                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
+                    # however large the rows turn out to be — a trap with its
+                    # raw frame stored costs an order of magnitude more than a
+                    # syslog line, and one fixed batch size cannot suit both.
+                    if held > TRIM_LOCK_TARGET_S:
+                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+                    elif held < TRIM_LOCK_TARGET_S / 4:
+                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+            # Hand the freed pages back, in short slices outside the lock
+            # block. reclaim takes the lock itself and reacquires it in a
+            # tight loop, and a Python lock is not fair, so it is asked for a
+            # little at a time rather than for one long run.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="netflow.db"):
                     break
-                chunk = max(int(total * 0.15), 1000)
-                cur = self._conn.execute(
-                    "DELETE FROM flows WHERE id IN (SELECT id FROM flows"
-                    " ORDER BY ts_end ASC LIMIT ?)", (chunk,))
-                removed += cur.rowcount or 0
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                # VACUUM alone does not shrink the files in WAL mode: the freed
-                # pages sit in the write-ahead log until it is checkpointed and
-                # truncated, so the loop would never see the size fall.
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self.size_bytes() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        "netflow.db", self.size_bytes(), removed, max_bytes)
         return removed
-
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
         """Busiest source and destination addresses seen recently.
 

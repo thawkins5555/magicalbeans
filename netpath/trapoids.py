@@ -48,7 +48,12 @@ WELL_KNOWN = {
     # ---------------------------------------------------------- BGP4-MIB
     "1.3.6.1.2.1.15.7.1":      "bgpEstablished",
     "1.3.6.1.2.1.15.7.2":      "bgpBackwardTransition",
-    "1.3.6.1.2.1.15.3.1.7":    "bgpPeerState",
+    # bgpPeerRemoteAddr is .1.7 and bgpPeerState is .1.2, not the other way
+    # round: a real bgpBackwardTransition rendered as
+    # "bgpPeerState.198.51.100.75=198.51.100.75", which reads as a peer stuck
+    # in a state that does not exist and hides the state that does.
+    "1.3.6.1.2.1.15.3.1.2":    "bgpPeerState",
+    "1.3.6.1.2.1.15.3.1.7":    "bgpPeerRemoteAddr",
     "1.3.6.1.2.1.15.3.1.14":   "bgpPeerLastError",
     # ----------------------------------------------------------- UPS-MIB
     "1.3.6.1.2.1.33.2.1":      "upsTrapOnBattery",
@@ -165,24 +170,45 @@ DEFAULT_SEVERITY_RULES = [
     ("1.3.6.1.2.1.33.2.1",  2),   # upsTrapOnBattery     -> critical
 ]
 
+# The shortest OID that can be a table column here (1.3.6.1.2.1.x.y.1.z is
+# seven arcs), so walking back through a varbind's instance index can never
+# reach so far up the tree that it matches an unrelated table.
+MIN_COLUMN_ARCS = 7
+
 # Enum-valued objects worth showing by name rather than as a bare number.
 ENUMS = {
     "1.3.6.1.2.1.2.2.1.7": {1: "up", 2: "down", 3: "testing"},          # ifAdminStatus
     "1.3.6.1.2.1.2.2.1.8": {1: "up", 2: "down", 3: "testing",
                             4: "unknown", 5: "dormant", 6: "notPresent",
                             7: "lowerLayerDown"},                        # ifOperStatus
-    "1.3.6.1.2.1.15.3.1.7": {1: "idle", 2: "connect", 3: "active",
+    "1.3.6.1.2.1.15.3.1.2": {1: "idle", 2: "connect", 3: "active",
                              4: "opensent", 5: "openconfirm",
                              6: "established"},                          # bgpPeerState
 }
 
 
 def enum_text(oid: str, kind: str, value, fallback: str) -> str:
-    """Name a numeric enum where one is known: 'down (2)' rather than '2'."""
+    """Name a numeric enum where one is known: 'down (2)' rather than '2'.
+
+    A varbind names a column plus its instance index, and the index is not
+    always one arc: ifOperStatus.7 has one, but bgpPeerState is indexed by the
+    peer's IP address, so the instance is four. Stripping a single arc found
+    the column for the first and never for the second, which is why the BGP
+    state was rendered as a bare number even once its OID was right. Walk the
+    prefixes instead, shortest index first, stopping well before the arcs that
+    make up the column itself.
+    """
     if kind != "INTEGER":
         return fallback
-    parts = oid.rsplit(".", 1)
-    table = ENUMS.get(oid) or (ENUMS.get(parts[0]) if len(parts) == 2 else None)
+    table = ENUMS.get(oid)
+    arcs = oid.split(".")
+    # An instance index of more than eight arcs is not something any of these
+    # tables uses, and MIN_COLUMN_ARCS keeps the walk from reaching up into
+    # the OID tree far enough to hit an unrelated table.
+    for depth in range(1, 9):
+        if table or len(arcs) - depth < MIN_COLUMN_ARCS:
+            break
+        table = ENUMS.get(".".join(arcs[:len(arcs) - depth]))
     if not table:
         return fallback
     try:

@@ -8,18 +8,25 @@ so the receive path does nothing but read, parse and enqueue.
 
 from __future__ import annotations
 
-import os
+import collections
 import queue
 import socket
 import threading
 import time
+import traceback
 
+from . import udpsock
 from .eventlog import ERROR, NullLog, SYSTEM
 from .syslogdb import SyslogDatabase
 from .syslogparse import parse
 
 BATCH = 500
 FLUSH_S = 1.0
+# Cap on the "first message from ..." memory and on the per-source rate
+# buckets: both are keyed on a spoofable source address, so both are LRUs
+# rather than unbounded dicts.
+MAX_SEEN_SOURCES = 4096
+MAX_RATE_SOURCES = 4096
 
 
 def _ago(ts: float) -> str:
@@ -47,15 +54,33 @@ class SyslogCollector:
         self._queue: queue.Queue = queue.Queue(maxsize=100_000)
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
         self.counters = {"messages": 0, "stored": 0, "dropped": 0,
-                         "rejected": 0, "filtered": 0, "last_message": 0.0}
+                         "rejected": 0, "filtered": 0, "errors": 0,
+                         "throttled": 0, "tcp_refused": 0, "tcp_clients": 0,
+                         "last_message": 0.0}
+        # A receive thread must never die on message content; failures are
+        # counted here and _crash records a thread that ended anyway so the
+        # status strip does not read like a deliberate stop.
+        self._last_error_log = 0.0
+        self._crash: str | None = None
+        self._drops: udpsock.KernelDrops | None = None
+        self._drops_logged = False
         self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
         self._use_receive_time = False
         self._min_severity = 7
         self._max_chars = 2048
-        self._seen: set[str] = set()
+        self._seen: collections.OrderedDict = collections.OrderedDict()
+        # source -> [tokens, last refill]. One float pair per source, refilled
+        # lazily on arrival, so throttling costs O(1) per message and cannot
+        # grow past MAX_RATE_SOURCES entries however many addresses appear.
+        self._buckets: collections.OrderedDict = collections.OrderedDict()
+        self._rate = 0.0
+        self._last_throttle_log = 0.0
+        self._max_tcp_clients = 64
+        self._clients: list[threading.Thread] = []
 
     @property
     def running(self) -> bool:
@@ -66,6 +91,7 @@ class SyslogCollector:
     def start(self, settings: dict) -> bool:
         self.stop()
         self.error = None
+        self._crash = None
         self._stop.clear()
         self._seen.clear()
 
@@ -76,6 +102,11 @@ class SyslogCollector:
         self._use_receive_time = bool(settings.get("use_receive_time", False))
         self._min_severity = int(settings.get("min_severity", 7))
         self._max_chars = max(int(settings.get("max_message_chars", 2048)), 80)
+        self._rate = max(0.0, float(settings.get("per_source_rate", 200) or 0))
+        self._max_tcp_clients = max(1, int(settings.get("max_tcp_clients", 64)))
+        self._buckets.clear()
+        self.db.collapse_repeats_s = max(
+            0.0, float(settings.get("collapse_repeats_s", 5.0) or 0))
 
         address = settings.get("bind_address", "0.0.0.0")
         port = int(settings.get("port", 514))
@@ -115,6 +146,14 @@ class SyslogCollector:
             self.error = "Neither UDP nor TCP is enabled"
             return False
 
+        self._drops = (udpsock.KernelDrops(port)
+                       if self._udp is not None and udpsock.supported() else None)
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
         self.bound = (address, port)
         if self._udp is not None:
             self._spawn(self._receive_udp, "syslog-udp")
@@ -127,27 +166,79 @@ class SyslogCollector:
         return True
 
     def _bind(self, kind, address: str, port: int, buffer_bytes: int):
-        sock = socket.socket(socket.AF_INET, kind)
-        if os.name == "nt":
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            except (AttributeError, OSError):
-                pass
-        else:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock, self.family = udpsock.bind(kind, address, port, buffer_bytes)
         try:
-            option = socket.SO_RCVBUF
-            sock.setsockopt(socket.SOL_SOCKET, option, buffer_bytes)
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            if kind == socket.SOCK_DGRAM and granted < buffer_bytes:
+                # Linux reports back twice what it granted, so a readback
+                # below the request means net.core.rmem_max clamped it — the
+                # commonest reason for kernel drops under load.
+                self.log.add(ERROR,
+                             f"The receive buffer was clamped to {granted} bytes "
+                             f"(asked for {buffer_bytes})",
+                             detail="Raise net.core.rmem_max on this host, or "
+                                    "lower the buffer size in Settings so the "
+                                    "two agree.")
         except OSError:
             pass
-        sock.bind((address, port))
-        sock.settimeout(0.5)
         return sock
 
     def _spawn(self, target, name: str) -> None:
-        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread = threading.Thread(target=lambda: self._guard(target, name),
+                                  name=name, daemon=True)
         thread.start()
         self._threads.append(thread)
+
+    def _guard(self, target, name: str) -> None:
+        """Run a collector thread and remember how it ended, so a crash reads
+        as "stopped unexpectedly" rather than as an operator stop."""
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set() and name != "syslog-tcp-client":
+                self._crash = f"{name} ended unexpectedly"
+
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible. The key is
+        absent on platforms that do not publish the figure.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on syslog port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a message the receive path could not process; log at most one
+        traceback a minute so a flood cannot fill the event log."""
+        self.counters["errors"] += 1
+        now = time.time()
+        if now - self._last_error_log >= 60:
+            self._last_error_log = now
+            self.log.add(ERROR, f"Receive error: {exc}",
+                         detail=traceback.format_exc())
 
     def stop(self) -> None:
         self._stop.set()
@@ -158,27 +249,87 @@ class SyslogCollector:
                 except OSError:
                     pass
         self._udp = self._tcp = None
-        for thread in self._threads:
+        for thread in self._threads + self._clients:
             if thread.is_alive():
                 thread.join(timeout=2)
         self._threads = []
+        self._clients = []
+        self.counters["tcp_clients"] = 0
         self.bound = None
 
     # ----------------------------------------------------------------- threads
+
+
+    def _first_from(self, source: str) -> bool:
+        """True the first time a source is seen since the last start.
+
+        The set is keyed on the datagram's source address, which anyone with
+        network reach can vary, so it is bounded and least-recently-used
+        rather than growing for the life of the process.
+        """
+        if source in self._seen:
+            self._seen.move_to_end(source)
+            return False
+        self._seen[source] = None
+        while len(self._seen) > MAX_SEEN_SOURCES:
+            self._seen.popitem(last=False)
+        return True
 
     def _accepted(self, source: str) -> bool:
         if self._allowed:
             return source in self._allowed
         return self._auto_accept
 
+    def _within_rate(self, source: str, now: float) -> bool:
+        """A token bucket per source, refilled lazily.
+
+        The only volume controls were a global severity floor and a global
+        queue, so one device in a debug loop consumed the whole queue and
+        evicted every other device's messages — and `dropped` could not say
+        whose. O(1) per message and bounded in memory.
+        """
+        if self._rate <= 0:
+            return True
+        bucket = self._buckets.get(source)
+        if bucket is None:
+            bucket = [self._rate, now]
+            self._buckets[source] = bucket
+            while len(self._buckets) > MAX_RATE_SOURCES:
+                self._buckets.popitem(last=False)
+        else:
+            self._buckets.move_to_end(source)
+            bucket[0] = min(self._rate, bucket[0] + (now - bucket[1]) * self._rate)
+            bucket[1] = now
+        if bucket[0] < 1.0:
+            return False
+        bucket[0] -= 1.0
+        return True
+
     def _enqueue(self, data: bytes, source: str) -> None:
-        self.counters["messages"] += 1
-        self.counters["last_message"] = time.time()
+        # Counted after the access check, not before: a rejected source used
+        # to refresh "last message just now", so the status strip read healthy
+        # while every packet was being thrown away.
         if not self._accepted(source):
             self.counters["rejected"] += 1
             return
-        if source not in self._seen:
-            self._seen.add(source)
+        now = time.time()
+        if not self._within_rate(source, now):
+            self.counters["throttled"] += 1
+            if now - self._last_throttle_log >= 60:
+                self._last_throttle_log = now
+                self.log.add(ERROR,
+                             f"Throttling syslog from {source}: more than "
+                             f"{self._rate:.0f} messages a second",
+                             target=source,
+                             detail="Messages above the per-source rate are "
+                                    "discarded so one noisy device cannot "
+                                    "evict everyone else's. Raise or clear "
+                                    "the per-source rate in Settings to keep "
+                                    "them all.")
+            return
+        self.counters["messages"] += 1
+        self.counters["last_message"] = now
+        if self._first_from(source):
             self.log.add(SYSTEM, f"First syslog message from {source}",
                          target=source)
         try:
@@ -205,7 +356,10 @@ class SyslogCollector:
                 continue
             except OSError:
                 break
-            self._enqueue(data, address[0])
+            try:
+                self._enqueue(data, udpsock.normalise_source(address[0]))
+            except Exception as exc:
+                self._note_error(exc)
 
     def _receive_tcp(self) -> None:
         sock = self._tcp
@@ -216,8 +370,26 @@ class SyslogCollector:
                 continue
             except OSError:
                 break
-            self._spawn(lambda c=client, a=address[0]: self._read_stream(c, a),
-                        "syslog-tcp-client")
+            # One thread per connection with no cap and a list that only ever
+            # grew: a device that reconnects per message, or a scanner,
+            # exhausted threads and then memory. Dead ones are reaped on every
+            # accept and the live ones are capped.
+            address = (udpsock.normalise_source(address[0]),) + tuple(address[1:])
+            self._clients = [t for t in self._clients if t.is_alive()]
+            self.counters["tcp_clients"] = len(self._clients)
+            if len(self._clients) >= self._max_tcp_clients:
+                self.counters["tcp_refused"] += 1
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
+            thread = threading.Thread(
+                target=lambda c=client, a=address[0]: self._read_stream(c, a),
+                name="syslog-tcp-client", daemon=True)
+            self._clients.append(thread)
+            self.counters["tcp_clients"] = len(self._clients)
+            thread.start()
 
     def _read_stream(self, client: socket.socket, source: str) -> None:
         """A TCP stream is a byte stream, so messages must be reassembled.
@@ -235,7 +407,13 @@ class SyslogCollector:
                 buffer += chunk
                 while buffer:
                     space = buffer.find(b" ")
-                    if 0 < space <= 10 and buffer[:space].isdigit():
+                    # RFC 6587 octet counting: "<count> <message>", and the
+                    # message always starts with a PRI. Without the "<" test a
+                    # newline-framed line that merely starts with a number
+                    # ("123 packets dropped") was read as a length prefix and
+                    # the connection desynchronised from there on.
+                    if (0 < space <= 10 and buffer[:space].isdigit()
+                            and buffer[space + 1:space + 2] == b"<"):
                         length = int(buffer[:space])
                         if len(buffer) < space + 1 + length:
                             break
@@ -251,6 +429,9 @@ class SyslogCollector:
                     buffer = buffer[newline + 1:]
         except (OSError, ValueError):
             pass
+        except Exception as exc:
+            # One malformed stream must not take the whole receiver down.
+            self._note_error(exc)
         finally:
             try:
                 client.close()
@@ -265,6 +446,7 @@ class SyslogCollector:
                 pending.append(self._queue.get(timeout=0.3))
             except queue.Empty:
                 pass
+            self._poll_kernel_drops()
             due = time.time() - last_flush >= FLUSH_S
             if pending and (due or len(pending) >= BATCH):
                 try:
@@ -288,10 +470,21 @@ class SyslogCollector:
         if self.error:
             return self.error
         if not self.running:
+            if self._crash:
+                return f"Collector stopped unexpectedly: {self._crash}"
             return "Collector stopped"
         address, _ = self.bound or ("?", 0)
         where = ", ".join(f"{name} {value}" for name, value in self.ports.items())
         base = f"Listening on {address} ({where})"
         last = self.counters["last_message"]
-        return f"{base} \u00b7 last message {_ago(last)}" if last else \
-            f"{base} \u00b7 waiting for messages"
+        text = (f"{base} \u00b7 last message {_ago(last)}" if last
+                else f"{base} \u00b7 waiting for messages")
+        parts = [text]
+        lost = self.counters.get("kernel_dropped", 0)
+        if lost:
+            parts.append(f"{lost} dropped by the kernel")
+        if self.counters["throttled"]:
+            parts.append(f"{self.counters['throttled']} throttled")
+        if self.counters["tcp_clients"]:
+            parts.append(f"{self.counters['tcp_clients']} TCP clients")
+        return " \u00b7 ".join(parts)
