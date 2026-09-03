@@ -681,7 +681,10 @@
   function init() {
     App.fillRanges(App.el('nf-range'), 'Last hour');
     const dimension = App.el('nf-dimension');
-    for (const name of App.state.dimensions) {
+    // /api/state sends the dimension list only to an account with NetFlow
+    // read; init() runs for every page regardless, so an account without it
+    // must not throw here and take the rest of the boot down with it.
+    for (const name of App.state.dimensions || []) {
       const option = document.createElement('option');
       option.value = name;
       option.textContent = name;

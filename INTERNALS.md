@@ -545,9 +545,10 @@ unticking everything would leave a table of nothing but checkboxes, the one
 state with no way out. Storage is a `table_columns` key in the owning
 module's own settings scope (`/api/settings`, nine scopes), never
 `localStorage`, for the reason `wirelessdb.py:95` gives: Reset layout clears
-per-browser *widths* and must not eat a settings choice. Sort state is the
-opposite — a per-session `view.*Sort` object, deliberately not persisted,
-because mixing the two storage models is how that bug happens.
+per-browser *widths* and must not eat a settings choice. Sort state lives on
+a `view.*Sort` object per table and, since 4.37.0, is seeded from the
+per-browser view store (`App.recallSort`, below) — still a different key
+from the layout, so Reset layout cannot eat it either.
 
 `App.grid` gained a `selectAll: {key, checked, some, onToggle}` option that
 renders the checkbox into the named column's header cell, with
@@ -3675,6 +3676,56 @@ Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+### The view store (`app.js` `sappiwhere.view`)
+
+What the operator has a page *set to* — the column each table is sorted by,
+what is typed in the filter bars, which sub-view is open — is the third
+kind of per-browser state, beside the layout (splitters, widths) and the
+tab. Until 4.37.0 none of it survived a reload: every filter's "current
+value" was the DOM element itself, read at fetch time, and every sort a
+`view.*Sort` literal, so a reload gave the markup defaults. One key now
+holds it, shape `{sort: {gridName: {key, descending}}, pages: {page:
+{controls: {elementId: value}, sub: name}}}`, with the same private-browsing
+try/catch every other `localStorage` write carries. Per browser, never sent
+to the server; written on change only, read once at init. `Reset panel
+sizes` leaves it alone: it means "put the furniture back".
+
+Four helpers, and the whole write path for sort is one line: `App.grid`'s
+header-click handler calls `rememberSort(name, sort)` before `onSort`, so
+every grid records its sort under the name it already passes for widths,
+and a module opts in by seeding its state field with
+`App.recallSort(gridName, fallback)` — twelve grids do, including
+`nodes-discovery`. `UNSAVED_SORTS` exempts the OID-browser modal, whose
+table is rebuilt over a different device each time it opens. Filters use
+`App.restoreControls(page, ids)` at the **end** of each module's `init()`
+(the ranges and severity lists are filled by then and nothing has been
+fetched, so the first fetch reads the restored values out of the DOM
+exactly as it reads the markup defaults) and `App.rememberControls(page,
+ids)` beside the handler wiring — `input` for text boxes, because `change`
+only fires on blur and a reload with the cursor still in the field is the
+case this exists for. Sub-views go through `App.recallSub`/`rememberSub`,
+honoured only while a button for the stored name is still on the page.
+
+**The late-filled selects.** Seven dropdowns are populated after `init()`
+from fetched data (the Nodes profile and device-group filters, the Alerts
+rule filter, the ConfigRX vendor filter, the Wireless controller list, the
+NetFlow exporter list, the Debug target list). Assigning a stored value to
+an empty `<select>` selects nothing, so each fill function falls back to
+`App.savedControl(page, id)` when nothing is chosen yet, and — because the
+first fetch happens *before* the fill — the fetch path does the same, so a
+restored dropdown filters the very first request rather than showing the
+right label over an unfiltered list for a tick. A stored choice the list
+can no longer offer (a deleted rule, a vendor with no devices left) is
+dropped from the store by `App.rememberControl` rather than applied, so the
+table recovers on the next refresh instead of staying empty behind an
+invisible filter.
+
+**Deliberately not stored:** the Live/Follow checkboxes on Syslog, Traps,
+NetFlow and Debug — "Live off" remembered across a reload is a page that
+has silently stopped moving with nothing on screen to say why; which
+columns a table shows (an account setting, above); and the widths and
+splitters (their own keys).
 
 Because a stored splitter width beats the shipped `data-grow` on every
 load, changing a shipped default is invisible to anyone who ever dragged

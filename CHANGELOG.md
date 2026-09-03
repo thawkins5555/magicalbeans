@@ -52,6 +52,10 @@ Listed newest first. Version numbers are build order, not dates.
   that is still running now fills its results in as it goes rather than
   sitting frozen until the job is clicked again, keeping the sort and the
   ticks, and stops fetching when the sweep ends or you leave the view.
+- **Fixed: an account without NetFlow access hit a script error on every
+  sign-in.** The NetFlow page's set-up iterated a dimension list the server
+  only sends to accounts that may read NetFlow; it now tolerates its
+  absence.
 
 ### 4.36.1 — Review of the SSH terminal
 

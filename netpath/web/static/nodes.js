@@ -32,8 +32,7 @@
     discResults: [],
     discChecked: new Set(),
     discCheckedJob: null,   // which job discChecked's defaults were seeded for
-    // 4.37.0: seeded from App.recallSort('nodes-discovery', …) once the view store lands
-    discSort: { key: 'ip', descending: false },
+    discSort: App.recallSort('nodes-discovery', { key: 'ip', descending: false }),
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
     mibFiles: [],
     mibSelected: null,
