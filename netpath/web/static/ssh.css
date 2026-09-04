@@ -36,6 +36,15 @@ body.ssh-page {
 .ssh-status.is-closed { color: var(--muted); }
 .ssh-status.is-error { color: var(--fail); }
 
+/* A key is set in the monospace face at the surrounding size, not left to the
+   user agent — an unstyled <kbd> brings a third font family in at its own
+   default size, which is the same debt <code> already carries elsewhere. */
+.ssh-kbd-hint kbd {
+  font: inherit;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
 /* Published once, plainly, rather than left implicit: the terminal below is
    the one control on this page a keyboard cannot Tab out of on its own. */
 .ssh-kbd-hint {

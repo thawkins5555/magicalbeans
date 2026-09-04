@@ -208,14 +208,17 @@
       termEl.dataset.focusWired = '1';
       termEl.addEventListener('focus', () => { if (term) term.focus(); });
     }
-    /* Escape is a real keystroke inside plenty of shell programs (vi among
-       them), so it is not simply swallowed — attachCustomKeyEventHandler
-       runs before xterm decides what to do with a key, and returning false
-       here is what stops this one short of the pty. Documented in the hint
-       line under the header, since a trap with no escape is a WCAG failure
-       whichever key gets you out. */
+    /* A terminal that keeps Tab has to publish some other way out, or it is
+       a keyboard trap. The way out is Ctrl+F6, not Escape: Escape is a real
+       keystroke to the device — vi, less, a menu-driven switch console all
+       need it, and this window exists to reach exactly those — so spending
+       it on focus management would cost an operator the key they use most
+       and hand back one they use once. Ctrl+F6 is the platform convention
+       for leaving a widget that captures the tab key, and nothing on a
+       switch's shell reads it. Documented in the hint line under the
+       header, which is what the guideline actually asks for. */
     term.attachCustomKeyEventHandler((event) => {
-      if (event.type === 'keydown' && event.key === 'Escape') {
+      if (event.type === 'keydown' && event.key === 'F6' && event.ctrlKey) {
         reconnectBtn.focus();
         return false;
       }
