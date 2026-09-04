@@ -23,8 +23,12 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import select
 import shutil
+import socket
+import struct
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -120,7 +124,226 @@ def _ping_command(ip: str, timeout_ms: int) -> list[str]:
     return ["ping", "-c", "1", "-W", str(max(1, round(timeout_ms / 1000))), ip]
 
 
+# ---------------------------------------------------------- socket ICMP
+#
+# ping_once/ping_many used to be one `subprocess.run(["ping", ...])` per
+# probe. At three probes per device per poll that is 3,000 fork/execs a
+# poll cycle across 1,000 devices — measured at 88-134 process creations a
+# second and a load average of 15 on four cores, almost none of it actual
+# network work. A raw or unprivileged-datagram ICMP socket does the same
+# probe without spawning anything: build the echo request by hand (the
+# checksum is the one part the kernel will not do for you), send it, and
+# wait for the matching reply with select() against a deadline — the same
+# shape as the subprocess path had, minus the process.
+#
+# NETPATH_PING_MODE picks the implementation:
+#   unset / "auto"  — use a socket if one can be opened here, else the old
+#                     subprocess path. Detected once per process, not once
+#                     per probe (see _icmp_socket_kind).
+#   "socket"        — demand the fast path; raise instead of silently
+#                     falling back, so a deployment can confirm it landed.
+#   "subprocess"    — always fork/exec `ping`, exactly as before. This is
+#                     the demo harness's override: demo/bin/ping is a
+#                     scripted stand-in on PATH that makes a simulated
+#                     device (a plain loopback address — 127.0.0.x) look
+#                     "down" by refusing to answer, per its own docstring.
+#                     A real ICMP socket does not go through PATH at all;
+#                     it would reach that loopback address directly, and
+#                     the kernel always answers a loopback echo whether or
+#                     not the fleet has taken the simulated device down,
+#                     silently defeating the demo's failure scenarios.
+#                     demo/ is off limits to this change, so this is the
+#                     one place that can say it: demo/scenario.py's
+#                     start_app() needs one more line —
+#                     env["NETPATH_PING_MODE"] = "subprocess" — beside
+#                     where it already sets PATH to demo/bin, to keep that
+#                     guarantee on every host the demo runs on.
+_PING_MODE_ENV = "NETPATH_PING_MODE"
+
+_ICMP_ECHO_REQUEST = 8
+_ICMP_ECHO_REPLY = 0
+
+_icmp_kind_lock = threading.Lock()
+_icmp_kind_cache = "unchecked"          # -> "dgram", "raw", or None
+
+
+def _icmp_checksum(data: bytes) -> int:
+    """The RFC 1071 Internet checksum — the same algorithm ping(8) itself
+    computes over the ICMP header and payload. Nothing on this host
+    validates an outgoing packet's checksum, so a wrong one here would not
+    raise; it would just make every probe fail as 100% loss on the wire,
+    the same as talking to a dead host."""
+    if len(data) % 2:
+        data = data + b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _build_echo_request(identifier: int, sequence: int, token: bytes) -> bytes:
+    """One ICMP echo request, header checksum included. `token` rides
+    along in the payload and is expected back verbatim in the reply — a
+    second, cheap check alongside id/sequence that a reply actually
+    answers this probe rather than being a stale or unrelated packet (a
+    raw socket sees every ICMP packet the host receives, not just replies
+    to its own probes)."""
+    header = struct.pack("!BBHHH", _ICMP_ECHO_REQUEST, 0, 0, identifier, sequence)
+    checksum = _icmp_checksum(header + token)
+    header = struct.pack("!BBHHH", _ICMP_ECHO_REQUEST, 0, checksum, identifier, sequence)
+    return header + token
+
+
+def _parse_icmp_reply(packet: bytes, has_ip_header: bool):
+    """(type, code, identifier, sequence, payload) off the wire, or None
+    if `packet` is too short to be a real one. A SOCK_RAW socket hands
+    back the IP header along with the ICMP payload; SOCK_DGRAM's
+    unprivileged ping socket has already stripped it, the same as any
+    other UDP-shaped read."""
+    if has_ip_header:
+        if len(packet) < 20:
+            return None
+        packet = packet[(packet[0] & 0x0F) * 4:]
+    if len(packet) < 8:
+        return None
+    icmp_type, code, _checksum, identifier, sequence = struct.unpack("!BBHHH", packet[:8])
+    return icmp_type, code, identifier, sequence, packet[8:]
+
+
+def _is_ipv4(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).version == 4
+    except ValueError:
+        return False
+
+
+def _detect_icmp_socket_kind() -> str | None:
+    """"dgram", "raw", or None — probed once, not once per call.
+
+    SOCK_DGRAM + IPPROTO_ICMP is Linux's unprivileged "ping socket": the
+    kernel only opens it for a uid inside
+    /proc/sys/net/ipv4/ping_group_range, which nothing sets by default, so
+    it only exists where an administrator deliberately granted it. It is
+    tried first because a deliberate grant like that is exactly the signal
+    that sending real ICMP from this process is wanted here.
+
+    SOCK_RAW works unconditionally for a process with CAP_NET_RAW — root,
+    ordinarily — which is a much weaker signal (plenty of things run as
+    root without anyone having decided this process in particular should
+    be pinging the network), but it is still the documented fallback:
+    a locked-down host with neither gets None and the subprocess path,
+    unchanged.
+    """
+    if IS_WINDOWS:
+        return None
+    for sock_type, name in ((socket.SOCK_DGRAM, "dgram"), (socket.SOCK_RAW, "raw")):
+        try:
+            probe = socket.socket(socket.AF_INET, sock_type, socket.IPPROTO_ICMP)
+        except OSError:
+            continue
+        probe.close()
+        return name
+    return None
+
+
+def _icmp_socket_kind() -> str | None:
+    """The cached capability, honouring NETPATH_PING_MODE. See the module
+    comment above for what each mode does and why the override exists."""
+    global _icmp_kind_cache
+    mode = os.environ.get(_PING_MODE_ENV, "").strip().lower()
+    if mode == "subprocess":
+        return None
+    with _icmp_kind_lock:
+        if _icmp_kind_cache == "unchecked":
+            _icmp_kind_cache = _detect_icmp_socket_kind()
+        kind = _icmp_kind_cache
+    if kind is None and mode == "socket":
+        raise OSError(
+            "NETPATH_PING_MODE=socket but no ICMP socket could be opened here "
+            "(see /proc/sys/net/ipv4/ping_group_range, or run with CAP_NET_RAW)")
+    return kind
+
+
+def _ping_many_socket(ip: str, count: int, timeout_ms: int,
+                      kind: str) -> tuple[int, int, float | None]:
+    """(sent, received, average RTT in ms) for `count` echo probes to `ip`,
+    all sent over one socket rather than one subprocess per probe.
+
+    A fresh socket per call rather than one shared across every in-flight
+    probe: Linux's unprivileged ping socket (SOCK_DGRAM) demultiplexes
+    replies straight to the socket that sent the matching request, by a
+    local id the kernel assigns it, and a raw socket (SOCK_RAW) gets its
+    own fan-out copy of every ICMP packet the host sees regardless of who
+    else is listening. Either way a call's own socket only ever needs to
+    care about its own replies, so concurrent polls of other devices —
+    each on its own thread, each opening its own socket here — cannot
+    steal each other's packets or block on one another. Socket setup costs
+    nothing like a fork/exec, so one per call is not the bottleneck the
+    subprocess it replaces was.
+
+    Raises OSError only if the socket itself cannot be opened (capability
+    looked fine at process start but is not right now); a probe that sends
+    but gets no reply — including a genuine "network unreachable" on
+    send — is just counted as not received, the same as it was for a
+    failed subprocess ping.
+    """
+    sock_type = socket.SOCK_DGRAM if kind == "dgram" else socket.SOCK_RAW
+    sock = socket.socket(socket.AF_INET, sock_type, socket.IPPROTO_ICMP)
+    identifier = os.getpid() & 0xFFFF
+    sent = 0
+    received = 0
+    rtts: list[float] = []
+    try:
+        for sequence in range(1, count + 1):
+            token = os.urandom(8)
+            try:
+                sock.sendto(_build_echo_request(identifier, sequence, token), (ip, 0))
+            except OSError:
+                sent += 1
+                continue
+            sent += 1
+            sent_at = time.monotonic()
+            deadline = sent_at + timeout_ms / 1000
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _w, _x = select.select([sock], [], [], remaining)
+                if not readable:
+                    break
+                try:
+                    packet, _addr = sock.recvfrom(1024)
+                except OSError:
+                    break
+                parsed = _parse_icmp_reply(packet, has_ip_header=(sock_type == socket.SOCK_RAW))
+                if not parsed:
+                    continue
+                reply_type, _code, reply_id, reply_seq, reply_payload = parsed
+                if reply_type != _ICMP_ECHO_REPLY or reply_seq != sequence:
+                    continue                       # not this probe's reply
+                if sock_type == socket.SOCK_RAW and reply_id != identifier:
+                    continue                       # someone else's raw-socket traffic
+                if reply_payload[:len(token)] != token:
+                    continue
+                received += 1
+                rtts.append((time.monotonic() - sent_at) * 1000)
+                break
+    finally:
+        sock.close()
+    return sent, received, (sum(rtts) / len(rtts)) if rtts else None
+
+
 def ping_once(ip: str, timeout_ms: int = 800) -> bool:
+    if _is_ipv4(ip):
+        kind = _icmp_socket_kind()
+        if kind is not None:
+            try:
+                _sent, received, _rtt = _ping_many_socket(ip, 1, timeout_ms, kind)
+                return received > 0
+            except OSError:
+                pass                    # socket path unavailable; fall through below
     try:
         completed = subprocess.run(
             _ping_command(ip, timeout_ms), capture_output=True, text=True,
@@ -134,22 +357,37 @@ def ping_many(ip: str, count: int = 3,
               timeout_ms: int = 1000) -> tuple[int, int, float | None]:
     """(sent, received, average RTT in ms) for `count` echo probes.
 
-    Sent one at a time rather than as a single `ping -c N`: Windows and the
-    BSDs disagree on how to ask for a burst and on how they summarise it,
-    and one probe per subprocess is the only form already known to work
-    everywhere here. It costs a process per probe, which at a default of
-    three probes per poll interval is not worth trading correctness for.
+    Prefers one ICMP socket over `count` subprocess spawns wherever the
+    platform permits it (see _icmp_socket_kind) — that used to cost a
+    process per probe, three per device per poll, which is what turned
+    into hundreds of fork/execs a second across a real-sized fleet. The
+    RTT there is real wall-clock time around each send/receive, which is
+    finally trustworthy: the old subprocess path measured `ping`'s own
+    "time=" figure instead of timing the subprocess itself, specifically
+    because process spawn overhead of a few milliseconds would otherwise
+    have been reported as network latency. A socket has no such overhead
+    to hide.
 
-    The RTT comes from the ping output's own "time=" figure, parsed with
-    tracer.py's existing regexes, not from wall-clock timing around the
-    subprocess — that measured process spawn as latency and reported a
-    sub-millisecond LAN device at 20 ms or worse. Returns None for the RTT
-    when nothing came back.
+    Falls back to one `ping -c 1` subprocess per probe — Windows, IPv6 (not
+    handled by the ICMPv4 socket path above), or any host where neither an
+    unprivileged nor a raw ICMP socket could be opened. Sent one at a time
+    rather than as a single `ping -c N` there too: Windows and the BSDs
+    disagree on how to ask for a burst and on how they summarise it, and
+    one probe per subprocess is the only form already known to work
+    everywhere here.
     """
+    count = max(1, int(count))
+    if _is_ipv4(ip):
+        kind = _icmp_socket_kind()
+        if kind is not None:
+            try:
+                return _ping_many_socket(ip, count, timeout_ms, kind)
+            except OSError:
+                pass                    # socket path unavailable; fall through below
+
     from .tracer import _UNIX_PING_TIME, _WIN_PING_TIME
 
     pattern = _WIN_PING_TIME if IS_WINDOWS else _UNIX_PING_TIME
-    count = max(1, int(count))
     received = 0
     rtts: list[float] = []
     for _ in range(count):

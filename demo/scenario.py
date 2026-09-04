@@ -340,6 +340,12 @@ class Scenario:
         os.makedirs(self.data_dir, exist_ok=True)
         env = dict(os.environ)
         env["PATH"] = os.path.join(HERE, "bin") + os.pathsep + env.get("PATH", "")
+        # The scripted ping shim on that PATH is the whole point: it answers
+        # from the fleet's device state. Socket ICMP would bypass PATH and
+        # reach the loopback addresses directly, where the kernel always
+        # answers, so a "down" device would look up. Force the subprocess
+        # path so the shim keeps deciding.
+        env["NETPATH_PING_MODE"] = "subprocess"
         env.setdefault("PYTHONUNBUFFERED", "1")
         process = self.spawn(
             "app", [sys.executable, "-u", "-m", "netpath", "--headless",
