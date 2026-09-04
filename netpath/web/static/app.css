@@ -105,9 +105,12 @@ body {
   color: var(--text);
   border-bottom: 2px solid transparent;
 }
+/* No `outline: none` here any more: it left a keyboard user only the
+   underline below to say a figure had focus at all, on a page where every
+   other control gets the app-wide :focus-visible ring. Leaving outline
+   unset lets that rule apply, same as everywhere else. */
 a.figure:hover, a.figure:focus-visible {
   border-bottom-color: var(--accent);
-  outline: none;
 }
 a.figure:focus-visible .figure-value { text-decoration: underline; }
 .figure-value { font: 600 var(--fs-2xl)/1 var(--mono); }
@@ -416,8 +419,15 @@ button.primary:disabled:hover { background: var(--grid); }
    can see the feature exists and what it would need. */
 /* No opacity here, deliberately: dimming a control that is already drawn in
    the disabled tone would take that tone back below the contrast floor, and
-   the reason for disabling it is a sentence, not a shade. */
-.write-denied-why { margin: 4px 0 0; }
+   the reason for disabling it is a sentence, not a shade. Now one per page
+   (App.explainDeniedGroups) rather than one per container, appended to the
+   page's own root — which carries no padding of its own, unlike the bars
+   and fieldsets that used to sit beside it — so it gets the same 12px
+   gutter a .bar has. Settings' notes land inside .scroll instead, which
+   already insets everything else there 16px; matching that padding on top
+   would double the indent, so they get none of their own. */
+.write-denied-why { margin: 6px 0 0; padding: 0 12px; }
+#page-settings .scroll > .write-denied-why { padding: 0; }
 button.icon { width: 32px; padding: 5px 0; text-align: center; }
 /* A module's Settings button is an ordinary secondary button. It used to
    be an accent outline that inverted to a solid accent fill on hover — the

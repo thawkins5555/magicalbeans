@@ -246,19 +246,24 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
   await check('the shell announces itself: h1, skip link, tablist, tabpanels',
     async () => {
+      // Scoped to the top-level strip (#tabs and its twelve .page panels)
+      // rather than the whole document: the .subtabs groups inside Nodes,
+      // Alerts and IPAM are genuine nested tablists with their own
+      // role="tablist"/"tab"/"tabpanel" now (see the check below), so a
+      // document-wide count of either role is no longer twelve or one.
       const shell = await page.evaluate(() => ({
         h1: document.querySelectorAll('h1').length,
         skip: Boolean(document.querySelector('.skip-link')),
-        tablist: document.querySelectorAll('[role="tablist"]').length,
+        tablist: document.querySelectorAll('#tabs[role="tablist"]').length,
         tabs: document.querySelectorAll('.tab[role="tab"]').length,
         selected: document.querySelectorAll('.tab[aria-selected="true"]').length,
-        panels: document.querySelectorAll('[role="tabpanel"]').length,
+        panels: document.querySelectorAll('.page[role="tabpanel"]').length,
         connLive: (document.getElementById('conn') || {}).getAttribute
           ? document.getElementById('conn').getAttribute('role') : null,
       }));
       assert(shell.h1 >= 1, 'no <h1> in the document');
       assert(shell.skip, 'no skip link');
-      assert(shell.tablist === 1, `expected one tablist, found ${shell.tablist}`);
+      assert(shell.tablist === 1, `expected one #tabs tablist, found ${shell.tablist}`);
       assert(shell.tabs === TABS.length,
              `expected ${TABS.length} role="tab", found ${shell.tabs}`);
       assert(shell.selected === 1,
@@ -268,6 +273,66 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(shell.connLive === 'status',
              `#conn should be role="status", is ${shell.connLive}`);
       return `h1 ${shell.h1}, tabs ${shell.tabs}, panels ${shell.panels}`;
+    });
+
+  await check('the .subtabs groups are their own nested tablists, keyboard and all',
+    async () => {
+      // Nodes' top-level nav, its nested device-detail pane (present in the
+      // DOM whether or not a device is selected — only its ancestor is
+      // [hidden]), Alerts and IPAM: each .subtabs is a tablist in its own
+      // right, wired by App.wireSubtabGroups rather than by the module.
+      await selectTab(page, 'nodes');
+      await settle(page, 700);
+      const audit = await page.evaluate(() => {
+        const groups = [...document.querySelectorAll('.subtabs')];
+        return groups.map((nav) => {
+          const tabs = [...nav.querySelectorAll(':scope > .subtab')];
+          return {
+            tablist: nav.getAttribute('role') === 'tablist',
+            tabCount: tabs.length,
+            tabRole: tabs.every((t) => t.getAttribute('role') === 'tab'),
+            selected: tabs.filter((t) => t.getAttribute('aria-selected') === 'true').length,
+            panelled: tabs.every((t) => t.getAttribute('aria-controls')
+              && document.getElementById(t.getAttribute('aria-controls'))
+              && document.getElementById(t.getAttribute('aria-controls'))
+                .getAttribute('role') === 'tabpanel'),
+          };
+        });
+      });
+      assert(audit.length >= 3, `expected at least 3 .subtabs groups, found ${audit.length}`);
+      for (const [index, group] of audit.entries()) {
+        assert(group.tablist, `.subtabs #${index} has no role="tablist"`);
+        assert(group.tabRole, `.subtabs #${index} has a .subtab without role="tab"`);
+        assert(group.selected === 1,
+               `.subtabs #${index} has ${group.selected} aria-selected="true" subtabs, want 1`);
+        assert(group.panelled, `.subtabs #${index} has a subtab whose aria-controls ` +
+               'does not name a role="tabpanel"');
+      }
+      // ArrowRight from the first subtab of the top-level Nodes group moves
+      // focus AND selection to the second, the same contract #tabs has.
+      const before = await page.evaluate(() =>
+        document.querySelector('#page-nodes > .subtabs > .subtab[aria-selected="true"]')
+          .dataset.subtab);
+      await page.focus('#page-nodes > .subtabs > .subtab:first-child');
+      await page.keyboard.press('ArrowRight');
+      await settle(page, 300);
+      const after = await page.evaluate(() => ({
+        selected: document.querySelector(
+          '#page-nodes > .subtabs > .subtab[aria-selected="true"]').dataset.subtab,
+        focused: document.activeElement
+          && document.activeElement.classList.contains('subtab')
+          && document.activeElement.getAttribute('aria-selected') === 'true',
+      }));
+      assert(after.selected !== before, `ArrowRight did not change the selected subtab ` +
+             `(stayed on ${before})`);
+      assert(after.focused, 'ArrowRight moved the selection but not the keyboard focus');
+      // Leave Nodes as every other check here found it.
+      await page.evaluate(() => {
+        const first = document.querySelector('#page-nodes > .subtabs > .subtab:first-child');
+        if (first) first.click();
+      });
+      await settle(page, 300);
+      return `${audit.length} subtab tablist(s), arrow keys move focus and selection`;
     });
 
   await check('every rendered table has a caption and scope="col" headers',
@@ -361,12 +426,16 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         const svg = document.getElementById('nd-status-timeline-svg');
         const segs = svg ? [...svg.querySelectorAll('.timeline-seg')] : [];
         return {
-          patterns: svg ? svg.querySelectorAll('#sw-pat-defs pattern').length : 0,
+          // Each host svg now carries its own suffixed <defs> (App.
+          // statusPatternDefs), rather than every chart sharing the one
+          // #sw-pat-defs id — the very collision this fixed — so this
+          // svg's own <pattern> children are what to count.
+          patterns: svg ? svg.querySelectorAll('pattern').length : 0,
           segments: segs.length,
           focusable: segs.filter((g) => g.getAttribute('tabindex') === '0').length,
           labelled: segs.filter((g) => (g.getAttribute('aria-label') || '').length > 3).length,
-          patternForDown: App.statusPatternUrl('down'),
-          patternForUp: App.statusPatternUrl('up'),
+          patternForDown: App.statusPatternUrl('down', svg),
+          patternForUp: App.statusPatternUrl('up', svg),
         };
       });
       assert(audit.patterns >= 5,

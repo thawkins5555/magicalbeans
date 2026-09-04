@@ -132,37 +132,53 @@ const App = (() => {
     el.classList.toggle('write-denied', !allowed);
   }
 
-  /* One sentence per bar, not per button. Nine dead buttons in a row want
-     one line saying why, and the line goes at the end of the container they
-     are in so it reads as a note about that group. */
+  /* One sentence per page, not per container. Grouping by the nearest
+     .bar/.strip/.row/fieldset used to repeat the same sentence once for
+     every one of nine dead buttons scattered across a page, each copy
+     inserted afterend with no gutter of its own — on Settings that put a
+     copy after the fixed .bar.footer, past the edge of the scrolling area,
+     where it could never be read. Grouped by page and by module instead:
+     at most a handful of sentences, each said once, each inside the page's
+     own scroll container so it is never clipped by a sibling that does not
+     scroll with it. */
   let deniedSignature = null;
+
+  // A page whose content scrolls inside its own wrapper (Settings' .scroll,
+  // so the note lands above the fixed footer rather than after it) uses
+  // that; every other page uses its own root, which is itself the thing
+  // that lays out and, so far, the thing that scrolls.
+  function writeDeniedHost(pageEl) {
+    return pageEl.querySelector(':scope > .scroll') || pageEl;
+  }
 
   function explainDeniedGroups(denied) {
     // applyPermissions runs on every loadState, twice a minute at the
     // slowest and every two seconds at the fastest. Rebuilding these notes
     // each time would churn the DOM for nothing, so they are rebuilt only
     // when the set of denied controls actually changes.
-    const signature = denied.map((el) => el.id || el.dataset.requiresWrite).join('|');
+    const byPage = new Map();     // pageEl -> Set(module)
+    for (const el of denied) {
+      const pageEl = el.closest('.page');
+      if (!pageEl) continue;
+      if (!byPage.has(pageEl)) byPage.set(pageEl, new Set());
+      byPage.get(pageEl).add(el.dataset.requiresWrite);
+    }
+    const signature = [...byPage.entries()]
+      .map(([pageEl, modules]) => `${pageEl.id}:${[...modules].sort().join(',')}`)
+      .sort().join('|');
     if (signature === deniedSignature) return;
     deniedSignature = signature;
     for (const stale of document.querySelectorAll('.write-denied-why')) {
       stale.remove();
     }
-    const groups = new Map();
-    for (const el of denied) {
-      const host = el.closest('.bar, .strip, .row, fieldset') || el.parentElement;
-      if (!host) continue;
-      if (!groups.has(host)) groups.set(host, el.dataset.requiresWrite);
-    }
-    for (const [host, module] of groups) {
-      const note = document.createElement('p');
-      note.className = 'hint write-denied-why';
-      note.textContent = writeDeniedReason(module);
-      // A bar is a flex row: the sentence goes UNDER it rather than
-      // becoming another item squeezed into it. A fieldset is a box, so
-      // the sentence belongs inside, with the fields it is about.
-      if (host.tagName === 'FIELDSET') host.appendChild(note);
-      else host.insertAdjacentElement('afterend', note);
+    for (const [pageEl, modules] of byPage) {
+      const host = writeDeniedHost(pageEl);
+      for (const module of [...modules].sort()) {
+        const note = document.createElement('p');
+        note.className = 'hint write-denied-why';
+        note.textContent = writeDeniedReason(module);
+        host.appendChild(note);
+      }
     }
   }
 
@@ -647,11 +663,14 @@ const App = (() => {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
-      // Assertive: being signed out in a minute is worth interrupting
-      // whatever is being read.
-      idleBanner.setAttribute('role', 'alert');
+      // The visible countdown changes every second and lives in a plain,
+      // non-live span — it used to be role="alert" itself, so a screen
+      // reader re-announced "Signing out in NNs" once a second for the
+      // entire warning window. #idle-banner-announce is the only live part
+      // now, and its text only changes at the checkpoints below.
       idleBanner.innerHTML =
         '<span id="idle-banner-text"></span>' +
+        '<span id="idle-banner-announce" class="sr-only" role="alert"></span>' +
         '<button id="idle-banner-stay">Stay signed in</button>';
       document.body.appendChild(idleBanner);
       document.getElementById('idle-banner-stay').onclick = () => {
@@ -663,10 +682,23 @@ const App = (() => {
     return document.getElementById('idle-banner-text');
   }
 
+  // Checkpoints an announcement fires at, rather than every one of the
+  // sixty-odd seconds the visible countdown ticks through.
+  const IDLE_CHECKPOINTS = new Set([60, 30, 10, 5, 4, 3, 2, 1]);
+  let announcedIdleSecond = null;
+
+  function announceIdleCheckpoint(message, secondsLeft) {
+    if (!IDLE_CHECKPOINTS.has(secondsLeft) || announcedIdleSecond === secondsLeft) return;
+    announcedIdleSecond = secondsLeft;
+    const node = document.getElementById('idle-banner-announce');
+    if (node) node.textContent = message;
+  }
+
   function showIdleWarning(secondsLeft) {
     const text = ensureIdleBanner();
     document.getElementById('idle-banner-stay').hidden = false;
     text.textContent = `Signing out in ${secondsLeft}s from inactivity`;
+    announceIdleCheckpoint(`Signing out in ${secondsLeft} seconds from inactivity`, secondsLeft);
   }
 
   /* The absolute ceiling, reached whether or not anyone is at the keyboard.
@@ -679,10 +711,13 @@ const App = (() => {
     text.textContent =
       `Signing out in ${secondsLeft}s — this session has reached its maximum ` +
       'length. Sign in again to carry on.';
+    announceIdleCheckpoint(`Signing out in ${secondsLeft} seconds — this session has ` +
+      'reached its maximum length', secondsLeft);
   }
 
   function hideIdleWarning() {
     if (idleBanner) idleBanner.hidden = true;
+    announcedIdleSecond = null;
   }
 
   /* ------------------------------------------- out-of-app notification
@@ -1442,11 +1477,19 @@ const App = (() => {
       '<button type="button" class="primary discard-keep">Keep editing</button>' +
       '</div>';
     box.appendChild(prompt);
+    // The prompt is a sibling of the form, not inside it, so the 13 fields
+    // behind it were still in the tab order and in trapTab's own
+    // focusableIn(box) walk — Tab could leave "Keep editing" for the very
+    // form the prompt is asking about. inert removes the form from both
+    // until Keep editing answers the question and puts it back.
+    const form = box.querySelector('form.modal-form');
+    if (form) form.inert = true;
     prompt.querySelector('.discard-go').onclick = () => {
       modalDirty = false;
       closeModal();
     };
     prompt.querySelector('.discard-keep').onclick = () => {
+      if (form) form.inert = false;
       prompt.remove();
       const first = box.querySelector('.modal-form input, .modal-form select,'
         + ' .modal-form textarea');
@@ -1605,11 +1648,12 @@ const App = (() => {
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
+    const names = state.severities || [];
+    histogramTable(host, buckets, opts, names);
     if (!buckets.length) {
       emptyText(svg, width, height, opts.empty || 'Nothing in this window');
       return;
     }
-    const names = state.severities || [];
     const present = new Set();
     for (const bucket of buckets) {
       for (const sev of Object.keys(bucket.by_severity || {})) {
@@ -1676,9 +1720,28 @@ const App = (() => {
         rows.push({ text: `${names[sev] || sev}: ${bucket.by_severity[String(sev)]}`,
                     color: SEV_COLOR[sev] || 'var(--muted)' });
       }
+      // A bar a mouse can hover has to be a bar a keyboard can reach: the
+      // hit target takes focus and shows the same tooltip a hover would,
+      // and its aria-label says in one sentence what the tooltip shows in
+      // several lines, for whichever comes first.
+      hit.setAttribute('tabindex', '0');
+      hit.setAttribute('role', 'img');
+      hit.setAttribute('aria-label', rows.map((r) => r.text).join(', '));
       hit.addEventListener('mousemove', (event) => tooltip(rows, event));
       hit.addEventListener('mouseleave', hideTooltip);
-      if (opts.onBucket) hit.addEventListener('click', () => opts.onBucket(bucket));
+      hit.addEventListener('focus', () => {
+        const rect = hit.getBoundingClientRect();
+        tooltip(rows, { clientX: rect.left + rect.width / 2, clientY: rect.top });
+      });
+      hit.addEventListener('blur', hideTooltip);
+      if (opts.onBucket) {
+        hit.addEventListener('click', () => opts.onBucket(bucket));
+        hit.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          opts.onBucket(bucket);
+        });
+      }
       svg.appendChild(hit);
     });
     const every = Math.max(1, Math.floor(buckets.length / 8));
@@ -1690,6 +1753,38 @@ const App = (() => {
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, stamp(bucket.t0, opts.span)));
     });
+  }
+
+  /* The chart's tabular alternative: everything the bars draw, in one pass
+     over the same `buckets` array, since a screen-reader user gets no
+     equivalent of glancing at the shape of a histogram. Visually hidden
+     (.sr-only) rather than a second visible table, which would just be the
+     chart's data said twice on screen. Lives beside the svg in `host`
+     rather than inside it — a <table> is not valid SVG content. */
+  function histogramTable(host, buckets, opts, names) {
+    let table = host.querySelector(':scope > table.sr-only');
+    if (!buckets.length) {
+      if (table) table.remove();
+      return;
+    }
+    if (!table) {
+      table = document.createElement('table');
+      table.className = 'sr-only';
+      host.appendChild(table);
+    }
+    const unit = opts.unit || 'items';
+    const caption = `${unit.charAt(0).toUpperCase()}${unit.slice(1)} by time`;
+    const rows = buckets.map((bucket) => {
+      const severities = Object.keys(bucket.by_severity || {})
+        .map(Number).sort((a, b) => b - a)
+        .map((sev) => `${names[sev] || sev}: ${bucket.by_severity[String(sev)]}`)
+        .join(', ');
+      return `<tr><td>${escapeHtml(when(bucket.t0))}</td>` +
+        `<td>${bucket.total || 0}</td><td>${escapeHtml(severities || '—')}</td></tr>`;
+    }).join('');
+    table.innerHTML = `<caption>${escapeHtml(caption)}</caption>` +
+      `<thead><tr><th scope="col">Time</th><th scope="col">Total</th>` +
+      `<th scope="col">By severity</th></tr></thead><tbody>${rows}</tbody>`;
   }
 
   /* -------------------------------------------- the filter bar, wired once
@@ -1825,52 +1920,84 @@ const App = (() => {
     unknown: 'sw-pat-rows',
   };
 
-  function statusPatternUrl(status) {
-    const id = STATUS_PATTERN[status];
-    return id ? `url(#${id})` : null;
+  /* `url(#sw-pat-hatch)` is a document-wide id lookup, so six identical ids
+     defined on every chart's own <defs> meant every SVG resolved the SAME
+     definitions — whichever chart's <defs> happened to land in the DOM
+     first — rather than its own. The colour-blind texture mechanism rested
+     on that collision. Each host svg now gets its own suffix, derived from
+     the svg's own element id (stable and already unique per chart) or a
+     generated one for a chart built without a static id; `statusPatternIds`
+     is the map a caller threads from `statusPatternDefs` through to
+     `statusPatternUrl` so the fill it builds points at THIS svg's defs.
+
+     `svg` is optional on statusPatternUrl only for a caller that has not
+     been updated to pass it yet — every one shares the fixed 'shared'
+     suffix then, which is the old collision-prone behaviour and no worse
+     than before, rather than losing its texture outright in the meantime. */
+  let patternSeq = 0;
+  const PATTERN_NAMES = ['sw-pat-hatch', 'sw-pat-fail', 'sw-pat-bars', 'sw-pat-rows', 'sw-pat-dots'];
+
+  function statusPatternIds(svg) {
+    const suffix = svg
+      ? (svg.dataset.swPatSuffix = svg.dataset.swPatSuffix || svg.id || `chart${++patternSeq}`)
+      : 'shared';
+    const ids = {};
+    for (const name of PATTERN_NAMES) ids[name] = `${name}-${suffix}`;
+    return ids;
+  }
+
+  function statusPatternUrl(status, svg) {
+    const name = STATUS_PATTERN[status];
+    if (!name) return null;
+    return `url(#${statusPatternIds(svg)[name]})`;
   }
 
   /* Appends the pattern definitions to `svg` once. Ink is white at low
      alpha so one definition works over every status colour and in both
-     themes, exactly as NetPath's original hatch did. */
+     themes, exactly as NetPath's original hatch did. Returns the id map,
+     for a caller that wants it without a second call to statusPatternUrl. */
   function statusPatternDefs(svg) {
-    if (!svg || svg.querySelector('#sw-pat-defs')) return;
-    const defs = svgNode('defs', { id: 'sw-pat-defs' });
+    if (!svg) return null;
+    const ids = statusPatternIds(svg);
+    const defsId = `sw-pat-defs-${svg.dataset.swPatSuffix}`;
+    if (svg.querySelector(`#${defsId}`)) return ids;
+    const defs = svgNode('defs', { id: defsId });
     const stroke = 'rgba(255,255,255,0.45)';
 
-    const hatch = svgNode('pattern', { id: 'sw-pat-hatch', width: 6, height: 6,
+    const hatch = svgNode('pattern', { id: ids['sw-pat-hatch'], width: 6, height: 6,
       patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
     hatch.appendChild(svgNode('line',
       { x1: 0, y1: 0, x2: 0, y2: 6, stroke, 'stroke-width': 2 }));
     defs.appendChild(hatch);
 
-    const fail = svgNode('pattern', { id: 'sw-pat-fail', width: 5, height: 5,
+    const fail = svgNode('pattern', { id: ids['sw-pat-fail'], width: 5, height: 5,
       patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(-45)' });
     fail.appendChild(svgNode('line',
       { x1: 0, y1: 0, x2: 0, y2: 5, stroke, 'stroke-width': 2.2 }));
     defs.appendChild(fail);
 
-    const bars = svgNode('pattern', { id: 'sw-pat-bars', width: 4, height: 4,
+    const bars = svgNode('pattern', { id: ids['sw-pat-bars'], width: 4, height: 4,
       patternUnits: 'userSpaceOnUse' });
     bars.appendChild(svgNode('line',
       { x1: 1, y1: 0, x2: 1, y2: 4, stroke: 'rgba(255,255,255,0.5)',
         'stroke-width': 1.4 }));
     defs.appendChild(bars);
 
-    const rows = svgNode('pattern', { id: 'sw-pat-rows', width: 4, height: 4,
+    const rows = svgNode('pattern', { id: ids['sw-pat-rows'], width: 4, height: 4,
       patternUnits: 'userSpaceOnUse' });
     rows.appendChild(svgNode('line',
       { x1: 0, y1: 1, x2: 4, y2: 1, stroke: 'rgba(255,255,255,0.5)',
         'stroke-width': 1.4 }));
     defs.appendChild(rows);
 
-    const dots = svgNode('pattern', { id: 'sw-pat-dots', width: 5, height: 5,
+    const dots = svgNode('pattern', { id: ids['sw-pat-dots'], width: 5, height: 5,
       patternUnits: 'userSpaceOnUse' });
     dots.appendChild(svgNode('circle',
       { cx: 1.6, cy: 1.6, r: 1.1, fill: 'rgba(255,255,255,0.55)' }));
     defs.appendChild(dots);
 
     svg.insertBefore(defs, svg.firstChild);
+    return ids;
   }
 
   function svgNode(name, attrs = {}, text) {
@@ -2387,6 +2514,73 @@ const App = (() => {
     saveView(store);
   }
 
+  /* Roving-tabindex arrow-key contract for a tablist-shaped group: shared
+     by the twelve-tab strip and the .subtabs groups below rather than
+     written twice. ArrowRight/Left wrap through the tabs `tabsFn` returns,
+     Home/End jump to the ends; `activate` both moves focus and performs
+     the selection (selectTab for the main strip, a real click for a
+     subtab group, whose module already owns an onclick for it). */
+  function wireRovingTabs(list, tabsFn, activate) {
+    list.addEventListener('keydown', (event) => {
+      if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
+      const tabs = tabsFn();
+      const current = tabs.indexOf(document.activeElement);
+      if (current === -1) return;
+      let next;
+      if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+      else if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+      else if (event.key === 'Home') next = 0;
+      else next = tabs.length - 1;
+      event.preventDefault();
+      tabs[next].focus();
+      activate(tabs[next]);
+    });
+  }
+
+  /* The .subtabs groups (Nodes' top-level nav, its nested device-detail
+     pane, Alerts, IPAM) are genuinely nested tablists — a second level of
+     tabs inside a page the top strip already switched to — and get the
+     full tablist/tab/tabpanel semantics and the same keyboard contract as
+     the twelve-tab strip, wired once here rather than by each module: a
+     module's own selectSub only ever toggles the `active` class, so a
+     MutationObserver on that class is what keeps aria-selected/tabindex
+     and the paired subpage in step however the selection happened — a
+     click, an arrow key, or the recallSub() a module runs on its own
+     init(). tests/ui/walk.mjs's tablist/tab/tabpanel counts are scoped to
+     the top-level strip alone and asserts these groups' own roles
+     separately, so a nested tablist here does not collide with either. */
+  function wireSubtabGroups() {
+    for (const nav of document.querySelectorAll('.subtabs')) {
+      nav.setAttribute('role', 'tablist');
+      const tabs = [...nav.querySelectorAll(':scope > .subtab')];
+      const panels = nav.parentElement
+        ? [...nav.parentElement.querySelectorAll(':scope > .subpage')] : [];
+      if (!tabs.length) continue;
+      tabs.forEach((tab, index) => {
+        tab.setAttribute('role', 'tab');
+        const panel = panels[index];
+        if (!panel) return;
+        tab.id = tab.id || `subtab-for-${panel.id}`;
+        tab.setAttribute('aria-controls', panel.id);
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+      });
+      const sync = () => {
+        for (const tab of tabs) {
+          const active = tab.classList.contains('active');
+          tab.setAttribute('aria-selected', active ? 'true' : 'false');
+          tab.tabIndex = active ? 0 : -1;
+        }
+      };
+      sync();
+      const observer = new MutationObserver(sync);
+      for (const tab of tabs) {
+        observer.observe(tab, { attributes: true, attributeFilter: ['class'] });
+      }
+      wireRovingTabs(nav, () => tabs.filter((t) => !t.hidden), (tab) => tab.click());
+    }
+  }
+
   /* Build a table head that can be dragged wider and clicked to sort.
      
      Widths live in a <colgroup> rather than on each <th>, so a redraw of the
@@ -2641,14 +2835,25 @@ const App = (() => {
     // moment later, so a keyboard user keeps their place across a refresh
     // instead of being returned to the top of the page every poll.
     const focused = document.activeElement;
-    pendingRowFocus = (focused && focused.tagName === 'TR' && table.contains(focused))
+    const focusedInTable = Boolean(focused && table.contains(focused));
+    pendingRowFocus = (focusedInTable && focused.tagName === 'TR')
       ? [...focused.parentElement.rows].indexOf(focused)
+      : -1;
+    // headKey folds in the sort state, so sorting from the keyboard rebuilds
+    // the head and destroys the very <th> Enter or Space was just pressed
+    // on. The column position survives the rebuild the same way
+    // pendingRowFocus carries a row position across a body rebuild.
+    const focusedHeadIndex = (focusedInTable && focused.tagName === 'TH')
+      ? [...focused.parentElement.cells].indexOf(focused)
       : -1;
 
     table.innerHTML = '';
     table.appendChild(caption);
     table.appendChild(colgroup);
     table.appendChild(head);
+    if (focusedHeadIndex >= 0 && row.cells[focusedHeadIndex]) {
+      row.cells[focusedHeadIndex].focus();
+    }
     return table;
   }
 
@@ -2811,9 +3016,20 @@ const App = (() => {
       if (tr.dataset.keyboardWired) continue;
       tr.dataset.keyboardWired = '1';
       tr.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
+        if (event.key === 'Enter') {
           event.preventDefault();     // Space would scroll the pane instead
           tr.click();
+          return;
+        }
+        if (event.key === ' ') {
+          event.preventDefault();
+          // A row with its own selection checkbox reads Space the way a
+          // checkbox does — tick it — rather than as a second way to
+          // trigger the row's own click (already Enter's job); a row with
+          // none falls back to that click, so a table without bulk
+          // selection loses nothing.
+          const box = tr.querySelector('input[type="checkbox"]');
+          if (box) box.click(); else tr.click();
           return;
         }
         const step = event.key === 'ArrowDown' ? 1
@@ -3148,6 +3364,11 @@ const App = (() => {
       const current = tab.dataset.tab === name;
       tab.classList.toggle('active', current);
       tab.setAttribute('aria-selected', current ? 'true' : 'false');
+      // Roving tabindex: only the active tab sits in the page's Tab order,
+      // so Tab moves past the strip in one stop instead of twelve. Arrow
+      // keys (wired once in start(), below) move both the tabindex and
+      // focus among the rest.
+      tab.tabIndex = current ? 0 : -1;
     }
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
@@ -3219,6 +3440,10 @@ const App = (() => {
     if (alertsBadge) {
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
+      // The badge's digits are folded into the tab's own aria-label below,
+      // so a screen reader is not also handed the bare number as a second,
+      // separate piece of the button's text content ("ALERTS" + "76").
+      alertsBadge.setAttribute('aria-hidden', 'true');
       // Syslog severities: 0-2 are emergency/alert/critical, 3-4 error and
       // warning, the rest informational. The badge takes the tone of the
       // worst one open rather than being permanently amber.
@@ -3229,6 +3454,13 @@ const App = (() => {
       if (!alertsBadge.hidden) {
         alertsBadge.title = `${openCount} open alert(s)`;
       }
+    }
+    // Without this the tab's accessible name was its raw text content —
+    // "ALERTS" run straight into the badge's digits with nothing between
+    // them ("ALERTS76") the moment any alert was open.
+    const alertsTab = document.querySelector('.tab[data-tab="alerts"]');
+    if (alertsTab) {
+      alertsTab.setAttribute('aria-label', openCount > 0 ? `Alerts, ${openCount} open` : 'Alerts');
     }
     // Deliberately not awaited: the title is set synchronously inside, and
     // the (rare) alert fetch behind it must not hold up the poll.
@@ -3393,6 +3625,14 @@ const App = (() => {
         panel.setAttribute('aria-labelledby', tab.id);
       }
     }
+    // ArrowRight/Left/Home/End move focus and switch tabs, the contract
+    // role="tablist" promises and the strip had not implemented at all.
+    if (tabBar) {
+      wireRovingTabs(tabBar,
+        () => [...document.querySelectorAll('.tab')].filter((t) => !t.hidden),
+        (tab) => selectTab(tab.dataset.tab));
+    }
+    wireSubtabGroups();
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {
