@@ -1136,9 +1136,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             self._json({"error": "No such endpoint"}, 404)
             return
-        self._static(path)
+        # `?v=` is a cache-buster, not a route parameter: it selects nothing
+        # about which file is served, only how long the response may be
+        # kept, so a bare presence check is enough.
+        self._static(path, versioned="v" in params)
 
-    def _static(self, path: str) -> None:
+    def _static(self, path: str, versioned: bool = False) -> None:
         if path in ("/", ""):
             path = "/index.html"
         if path == "/login":
@@ -1164,8 +1167,17 @@ class Handler(BaseHTTPRequestHandler):
         # `immutable`): the URLs are fixed names, so the browser must ask;
         # what changed is that asking is now answered from memory with a
         # content hash, and the answer carries the same headers as a 200.
+        #
+        # `?v=` is the one exception: index.html spells it out with the
+        # running __version__, so the URL itself changes on every release and
+        # a year-long cache never serves a byte the release after it wrote.
+        # A warm reload used to mean sixteen conditional requests answered
+        # 304 — cheap on a LAN, sixteen round trips over a NOC's VPN.
         if candidate.endswith(".html"):
             cache = {"Cache-Control": "no-store"}
+        elif versioned:
+            cache = {"Cache-Control": "public, max-age=31536000, immutable",
+                     "ETag": entry["etag"]}
         else:
             cache = {"Cache-Control": "no-cache", "ETag": entry["etag"]}
             if self._etag_matches(entry["etag"]):
