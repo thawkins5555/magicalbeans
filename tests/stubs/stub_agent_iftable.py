@@ -44,9 +44,13 @@ Modes:
                    usmStatsNotInTimeWindows, exactly as an agent does to a
                    poller whose cached engineTime has stopped advancing.
                    --bump-boots-at SECONDS restarts the engine (boots + 1,
-                   engineTime back to 0) that many seconds after the stub
-                   started, so a test can put the restart between two
-                   polls without counting requests.
+                   engineTime back to 0) on the first request that arrives
+                   after an idle gap of at least that many seconds, so a
+                   test can put the restart between two polls without
+                   counting requests. It used to count from process start,
+                   and a slow runner (Windows in CI) reached the deadline
+                   while the FIRST poll was still in flight, restarting the
+                   engine under the poll the test expected to succeed.
 
 Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
 AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
@@ -106,7 +110,7 @@ class Agent:
         self.gets = 0
         self.bump_boots_at = bump_boots_at
         self.bumped = False
-        self.started_at = time.monotonic()
+        self.last_request_at = None   # the idle gap --bump-boots-at measures
         self.stats_path = stats_path
         self.engine_boots = 3
         self.engine_epoch = time.monotonic()
@@ -160,10 +164,17 @@ class Agent:
 
     def _v3_handle(self, req, msg_id: int) -> list:
         self.counts["requests"] += 1
+        now = time.monotonic()
+        # The requests of one poll arrive within milliseconds of each other;
+        # the test's deliberate sleep between polls is the only gap that
+        # reaches the deadline, so the restart lands exactly where the test
+        # says it does whatever the runner's speed.
         if self.bump_boots_at and not self.bumped and \
-                time.monotonic() - self.started_at >= self.bump_boots_at:
+                self.last_request_at is not None and \
+                now - self.last_request_at >= self.bump_boots_at:
             self.bumped = True
             self._bump_boots()
+        self.last_request_at = now
         if not req.engine_id:
             # Engine discovery: an unauthenticated, empty, reportable GET.
             self.counts["discoveries"] += 1
@@ -197,7 +208,20 @@ class Agent:
         temporary = self.stats_path + ".tmp"
         with open(temporary, "w") as handle:
             json.dump(dict(self.counts, engine_boots=self.engine_boots), handle)
-        os.replace(temporary, self.stats_path)
+        # On Windows the replace fails with EACCES while the test has the
+        # destination open for its own read. Retry briefly; and never let a
+        # stats hiccup escape, because this is called from serve() and a
+        # dead stub turns every later poll into "connection forcibly closed".
+        for attempt in range(20):
+            try:
+                os.replace(temporary, self.stats_path)
+                return
+            except PermissionError:
+                time.sleep(0.01)
+        try:
+            os.replace(temporary, self.stats_path)
+        except OSError as exc:
+            print(f"stub stats not written: {exc}", flush=True)
 
     # ---------------------------------------------------------------- values
 

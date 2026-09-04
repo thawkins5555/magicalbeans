@@ -63,6 +63,24 @@ class CommitCounter:
             self.commits += 1
 
 
+def read_stats(path):
+    """The stub rewrites its stats file (atomically, temp + replace) after
+    every datagram it serves, and the test reads it the moment a poll
+    returns. On Windows that races: the reader's open() can land during the
+    replace and raise PermissionError, or read the file between the stub's
+    last reply and its rewrite. Retry for a moment rather than let one race
+    take the whole suite down with a traceback."""
+    deadline = time.monotonic() + 3.0
+    while True:
+        try:
+            with open(path) as handle:
+                return json.load(handle)
+        except (PermissionError, FileNotFoundError, json.JSONDecodeError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
 def v3_engine_time():
     """SNMPv3 engineTime was learned at discovery and sent back unchanged
     for the life of the process, so an agent enforcing RFC 3414 §3.2's
@@ -93,8 +111,7 @@ def v3_engine_time():
         check(device["status"] == "up",
               f"a v3 device polls (status={device['status']!r}, "
               f"error={device['snmp_error']!r})")
-        with open(stats) as handle:
-            after_first = json.load(handle)
+        after_first = read_stats(stats)
         check(after_first["discoveries"] == 1,
               "the first poll discovers the engine exactly once")
 
@@ -103,8 +120,7 @@ def v3_engine_time():
         time.sleep(2.5)
         counted = after_first["reports"]
         device = poll()
-        with open(stats) as handle:
-            after_second = json.load(handle)
+        after_second = read_stats(stats)
         check(device["status"] == "up",
               f"…and the poll 2.5 s later still succeeds "
               f"(status={device['status']!r}, error={device['snmp_error']!r})")
@@ -137,14 +153,12 @@ def v3_engine_time():
         poller = NodePoller(db)
         device = db.device(device_id)
         poller._poll_device(device, db.effective_config(device))   # discovery
-        with open(stats) as handle:
-            before = json.load(handle)
+        before = read_stats(stats)
         time.sleep(1.2)                        # the agent restarts in here
         device = db.device(device_id)
         poller._poll_device(device, db.effective_config(device))   # boots bump
         device = db.device(device_id)
-        with open(stats) as handle:
-            after = json.load(handle)
+        after = read_stats(stats)
         check(after["engine_boots"] == before["engine_boots"] + 1,
               "the stub agent restarted between the two polls")
         check(after["reports"] - before["reports"] == 1,

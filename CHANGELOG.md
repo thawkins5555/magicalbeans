@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.46.3 — One SNMPv3 test, two ways to fail on Windows](#4463--one-snmpv3-test-two-ways-to-fail-on-windows)
 - [4.46.2 — The browser walk was red the whole time](#4462--the-browser-walk-was-red-the-whole-time)
 - [4.46.1 — Review of 4.41.0–4.46.0](#4461--review-of-44104460)
 - [4.46.0 — Any screen, any hand, any wall](#4460--any-screen-any-hand-any-wall)
@@ -111,6 +112,40 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.46.3 — One SNMPv3 test, two ways to fail on Windows
+
+With the browser walk green, the first two runs after it each lost one
+Windows suite job — different Python versions, same test
+(`test_poll_write_path.py`, the SNMPv3 engine-time section), different
+symptoms. Nothing in the branch touches polling; this is the test harness
+racing itself on a slow runner, and it is fixed in the harness.
+
+- **The engine restart landed under the wrong poll.** The stub agent's
+  `--bump-boots-at 1` counted one second from *process start*. Between the
+  stub's "listening" line and the first poll's requests the test opens a
+  database, adds a device and builds a poller, which a Windows runner can
+  take a second over — so the restart fired during the discovery poll
+  instead of during the deliberate sleep after it, the test saw
+  `engine_boots` already bumped and zero Reports, and the poller met a
+  `WinError 10054` from an agent that had just changed identity under it.
+  The stub now restarts on the first request that arrives after an **idle
+  gap** of that length: the requests within one poll are milliseconds
+  apart, the test's sleep is the only gap that qualifies, so the restart
+  lands where the test says it does whatever the runner's speed.
+- **`PermissionError` reading the stats file.** The stub rewrites its JSON
+  counters — atomically, temp file plus `os.replace` — after every
+  datagram, and the test reads the file the instant a poll returns. On
+  Windows the two collide: the reader's `open()` can land during the
+  replace and fail with `EACCES`, which took the whole suite down with a
+  traceback. Worse, the stub's `os.replace` can fail the same way while the
+  test holds the file open, and `write_stats()` was called *outside* the
+  serve loop's `try` — so one lost race killed the stub, and every poll
+  after it saw a connection "forcibly closed by the remote host". The test
+  reads through `read_stats()`, which retries for up to three seconds; the
+  stub retries the replace and never lets a stats hiccup escape `serve()`.
+
+Nothing in the application changed.
 
 ### 4.46.2 — The browser walk was red the whole time
 
