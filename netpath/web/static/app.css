@@ -898,6 +898,18 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
   padding: 12px 14px;
 }
 
+/* ------------------------------------------------------- ConfigRX diff
+   Line-by-line colouring for the unified diff two backups render into
+   (configrx.js's showDiff). Text colour only, no tinted background: the
+   surrounding <pre> already carries .detail's monospace/pre-wrap, and
+   --ok/--fail already mean "added"/"removed" everywhere else added/removed
+   state is shown (the timeline lanes, the port oper-status cell) — this is
+   the same vocabulary, not a new one. */
+.cx-diff-add { color: var(--ok); }
+.cx-diff-rem { color: var(--fail); }
+.cx-diff-hunk { color: var(--accent); }
+.cx-diff-file { color: var(--muted); }
+
 /* -------------------------------------------------------------- loading
 
    The page in view says when a refresh is in flight (app.js sets aria-busy

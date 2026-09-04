@@ -28,6 +28,7 @@ exactly one fixed SSH credential.
 
 from __future__ import annotations
 
+import difflib
 import re
 import socket
 import threading
@@ -467,6 +468,31 @@ def _capture_problem(cleaned: str, ended: str) -> str:
                 f"short to be a config — the command may not be right for this "
                 f"vendor, or the account may lack the privilege to run it")
     return ""
+
+
+def diff_texts(old_text: str, new_text: str, old_label: str, new_label: str
+              ) -> tuple[str, int, int]:
+    """A unified diff between two backups' text (Tier 2: comparing two
+    stored captures) — difflib.unified_diff is the whole mechanism; this
+    only supplies the change-control-readable fromfile/tofile labels
+    (a backup's own timestamp, not "old"/"new") and tallies the +/- lines
+    so the API does not have to re-scan the text for them.
+
+    Callers redact BOTH texts before they ever reach this function — see
+    the diff API route's own docstring for why that happens unconditionally,
+    even for a backup stored verbatim under store_secrets. This function
+    itself has no opinion about secrets; it diffs whatever text it is
+    given, which is what makes it safe to unit-test on its own.
+    """
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    hunks = list(difflib.unified_diff(old_lines, new_lines,
+                                      fromfile=old_label, tofile=new_label))
+    additions = sum(1 for line in hunks
+                    if line.startswith("+") and not line.startswith("+++"))
+    removals = sum(1 for line in hunks
+                  if line.startswith("-") and not line.startswith("---"))
+    return "".join(hunks), additions, removals
 
 
 class ConfigRxWorker:

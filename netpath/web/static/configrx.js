@@ -15,6 +15,9 @@
     backupSort: App.recallSort('configrx-backups', { key: 'ts', descending: true }),
     selectedBackupId: null,
     backupContent: '',
+    // The last /api/configrx/diff response, or null while the plain
+    // single-backup viewer is showing instead — see showDiff/closeDiff.
+    diff: null,
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -324,6 +327,7 @@
     view.selectedDeviceId = deviceId;
     view.selectedBackupId = null;
     view.backupContent = '';
+    closeDiff();
     App.setRoute(deviceId != null ? ['device', deviceId] : []);
     drawDevices();
     drawViewer();
@@ -361,6 +365,14 @@
       ? `BACKUPS \u2014 ${device.name}` : 'BACKUPS';
     App.el('cx-backup-now').hidden = !device || !device.backup_enabled;
     App.el('cx-device-settings').hidden = !device;
+    // "Diff with previous" only makes sense once a backup is selected AND
+    // an older one exists to diff it against — the oldest stored backup
+    // for a device has nothing before it. view.backups is always in the
+    // server's newest-first order (drawBackups' own on-screen sort is a
+    // display concern, applied only to the rendered rows below), so the
+    // next array entry after the selected one IS the adjacent older backup.
+    App.el('cx-backup-diff-prev').hidden =
+      view.selectedBackupId == null || !adjacentOlderBackup(view.selectedBackupId);
     const empty = App.el('cx-backup-empty');
     const wrap = App.el('cx-backup-wrap');
     if (!view.backups.length) {
@@ -417,6 +429,19 @@
     const n = view.backupsChecked.size;
     App.el('cx-backup-bulk').hidden = n === 0;
     if (n) App.el('cx-backup-bulk-count').textContent = `${n} selected`;
+    // Diffing needs exactly two backups picked — one is "diff with
+    // previous" above, and more than two has no obvious pairing to draw.
+    App.el('cx-backup-diff-selected').hidden = n !== 2;
+  }
+
+  /* The adjacent OLDER backup to `id` in the server's own newest-first
+     order — null when `id` is not stored, or is already the oldest one.
+     "Diff with previous" and the button's own visibility (drawBackups)
+     both read this rather than each re-deriving it. */
+  function adjacentOlderBackup(id) {
+    const index = view.backups.findIndex((b) => b.id === id);
+    if (index === -1 || index + 1 >= view.backups.length) return null;
+    return view.backups[index + 1];
   }
 
   /* Deleting the NEWEST stored backup is not the same act as deleting an
@@ -459,6 +484,10 @@
 
   async function selectBackup(backupId) {
     view.selectedBackupId = backupId;
+    // Picking a single backup always means "show me its plain content" —
+    // any diff left open from a previous pair is no longer about what's on
+    // screen now.
+    closeDiff();
     // #/configrx/device/4/backup/91 — a specific stored configuration, which
     // is what a change-control conversation is actually about.
     if (view.selectedDeviceId != null) {
@@ -475,6 +504,66 @@
       || (view.selectedDeviceId
         ? 'Select a backup on the left to view its stored config.'
         : 'Select a device to see its stored backups.');
+  }
+
+  /* --------------------------------------------------------------- diff
+
+     A unified diff between two stored backups (Tier 2: the hashes that
+     detect the change are already stored — this is the view that reads
+     them). `fromId` is the OLDER backup, `toId` the newer one; the server
+     redacts both a second time regardless of how they were originally
+     stored (see api.get_configrx_diff's own docstring for why), so nothing
+     rendered here can ever be an unredacted secret. */
+  function diffLineClass(line) {
+    if (line.startsWith('+++') || line.startsWith('---')) return 'cx-diff-file';
+    if (line.startsWith('@@')) return 'cx-diff-hunk';
+    if (line.startsWith('+')) return 'cx-diff-add';
+    if (line.startsWith('-')) return 'cx-diff-rem';
+    return '';
+  }
+
+  /* Coloured with spans rather than a diff library: difflib's own unified
+     format is three prefix characters ('+', '-', '@@ ', or a leading
+     space for context) and nothing here needs more than that to colour a
+     line — see app.css's .cx-diff-* for the palette these classes read. */
+  function renderDiffHtml(text) {
+    if (!text) return '';
+    const lines = text.replace(/\n$/, '').split('\n');
+    return lines.map((line) => {
+      const cls = diffLineClass(line);
+      return `<span${cls ? ` class="${cls}"` : ''}>${escape(line)}</span>`;
+    }).join('\n');
+  }
+
+  async function showDiff(fromId, toId) {
+    if (view.selectedDeviceId == null) return;
+    let result;
+    try {
+      result = await App.get('/api/configrx/diff',
+        { device: view.selectedDeviceId, from: fromId, to: toId });
+    } catch (error) {
+      App.toast(`Could not diff these backups: ${error.message}`, 'fail');
+      return;
+    }
+    view.diff = result;
+    App.el('cx-viewer').hidden = true;
+    App.el('cx-diff-wrap').hidden = false;
+    App.el('cx-diff-close').hidden = false;
+    App.el('cx-diff-meta').textContent =
+      `${App.stamp(result.from.ts)} → ${App.stamp(result.to.ts)}` +
+      ` — +${result.additions} / −${result.removals}` +
+      (result.identical ? ' — no differences' : '');
+    App.el('cx-diff').innerHTML = result.diff
+      ? renderDiffHtml(result.diff)
+      : '<span class="hint">No differences between these two backups.</span>';
+  }
+
+  function closeDiff() {
+    if (!view.diff) return;
+    view.diff = null;
+    App.el('cx-diff-wrap').hidden = true;
+    App.el('cx-diff-close').hidden = true;
+    App.el('cx-viewer').hidden = false;
   }
 
   /* --------------------------------------------------------- device config */
@@ -753,6 +842,20 @@
       view.backupsChecked.clear();
       drawBackups();
     };
+    App.el('cx-backup-diff-prev').onclick = () => {
+      const older = adjacentOlderBackup(view.selectedBackupId);
+      if (older) showDiff(older.id, view.selectedBackupId);
+    };
+    App.el('cx-backup-diff-selected').onclick = () => {
+      const ids = [...view.backupsChecked];
+      if (ids.length !== 2) return;
+      const [older, newer] = ids
+        .map((id) => view.backups.find((b) => b.id === id))
+        .filter(Boolean)
+        .sort((a, b) => a.ts - b.ts);
+      if (older && newer) showDiff(older.id, newer.id);
+    };
+    App.el('cx-diff-close').onclick = closeDiff;
     App.el('cx-bulk-settings').onclick = bulkSettings;
     App.el('cx-bulk-backup').onclick = bulkBackupNow;
     App.el('cx-settings').onclick = settingsDialog;

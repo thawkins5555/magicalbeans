@@ -261,6 +261,12 @@ ROUTES = [
     ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history, ("ipam", R)),
     ("GET", r"^/api/nodes/overview$", api.get_nodes_overview, ("nodes", R)),
     ("GET", r"^/api/nodes/mac-search$", api.get_nodes_mac_search, ("nodes", R)),
+    # The L2 topology view (Tier 1 #5's UI half): the fleet-wide link graph,
+    # and its own CSV export — matched before the "export.csv" suffix could
+    # ever be confused with a device id, the same ordering rule the devices
+    # export above already follows.
+    ("GET", r"^/api/nodes/topology$", api.get_nodes_topology, ("nodes", R)),
+    ("GET", r"^/api/nodes/topology/export\.csv$", api.get_nodes_topology_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices$", api.get_nodes_devices, ("nodes", R)),
     # Same filters as the list above, exported as CSV: matched before the
     # `(\d+)$` device route below on purpose, though \d+ would never match
@@ -298,6 +304,11 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/export\.csv$",
      api.get_nodes_device_interfaces_export, ("nodes", R)),
+    # The device detail pane's Neighbours section (Tier 1 #5's UI half):
+    # one device's own LLDP/CDP rows, present and stale alike.
+    ("GET", r"^/api/nodes/devices/(\d+)/neighbors$", api.get_nodes_device_neighbors, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/neighbors/export\.csv$",
+     api.get_nodes_device_neighbors_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
@@ -403,6 +414,12 @@ ROUTES = [
     # stays a read, which is what a read-only operator needs to answer "has
     # this switch changed".
     ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", W)),
+    # A diff hands over the device's own configuration lines exactly as
+    # reading one backup's content does (see get_configrx_backup's own
+    # comment above), so it is gated the same way — matched before the
+    # "(\d+)" backup route above could ever apply, though "diff" would
+    # never match \d+ anyway.
+    ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),

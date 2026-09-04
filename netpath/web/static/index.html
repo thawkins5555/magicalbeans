@@ -102,6 +102,7 @@
 
   <nav class="subtabs">
     <button class="subtab active" data-subtab="devices">DEVICES</button>
+    <button class="subtab" data-subtab="topology">TOPOLOGY</button>
     <button class="subtab" data-subtab="discovery">DISCOVERY</button>
     <button class="subtab" data-subtab="profiles">PROFILES &amp; MIBS</button>
   </nav>
@@ -199,6 +200,8 @@
           <div id="nd-d-subs">
             <nav class="subtabs nested">
               <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
+              <button class="subtab" data-subtab="neighbours">NEIGHBOURS</button>
+              <button class="subtab" data-subtab="capabilities">BRIDGE &amp; RF</button>
               <button class="subtab" data-subtab="events">EVENTS</button>
             </nav>
             <div id="nd-d-sub-interfaces" class="subpage active">
@@ -206,12 +209,56 @@
                 <button id="nd-if-export-csv">Export CSV</button></div>
               <div class="table-wrap"><table id="nd-if-table"></table></div>
             </div>
+            <!-- LLDP/CDP rows this device's own ports reported (Tier 1 #5's
+                 UI half). A stale row (present=0) stays listed with its last
+                 seen_ts rather than vanishing — see nodesdb's ageing scheme —
+                 so the "(stale)" hint on that row is real information, not
+                 a bug. -->
+            <div id="nd-d-sub-neighbours" class="subpage">
+              <div class="bar"><span class="grow"></span>
+                <button id="nd-nb-export-csv">Export CSV</button></div>
+              <div class="table-wrap"><table id="nd-nb-table"></table></div>
+            </div>
+            <!-- STP bridge state, the PSE power budget/consumption pair, and
+                 PtP radio RF (RSSI/SNR/capacity and Cambium's own scalars) —
+                 all three are per-device capabilities most devices simply
+                 don't have, so each section says so plainly when absent
+                 rather than showing an empty table. -->
+            <div id="nd-d-sub-capabilities" class="subpage">
+              <div id="nd-cap-stp" class="hint"></div>
+              <div id="nd-cap-poe" class="hint"></div>
+              <div id="nd-cap-rf"></div>
+            </div>
             <div id="nd-d-sub-events" class="subpage">
               <div class="table-wrap"><table id="nd-ev-table"></table></div>
             </div>
           </div>
         </div>
       </aside>
+    </div>
+  </div>
+
+  <div id="nodes-sub-topology" class="subpage">
+    <div class="bar wrap">
+      <span class="section">L2 TOPOLOGY</span>
+      <span id="nd-topo-count" class="hint"></span>
+      <span class="grow"></span>
+      <span class="hint">Scroll to zoom, drag to pan, click a device to open it</span>
+      <button id="nd-topo-zoom-out" aria-label="Zoom out">−</button>
+      <button id="nd-topo-zoom-in" aria-label="Zoom in">+</button>
+      <button id="nd-topo-reset">Reset view</button>
+      <button id="nd-topo-export-csv">Export CSV</button>
+    </div>
+    <!-- Solid border for a known device, dashed for one LLDP/CDP reported
+         but nothing in Nodes could confirm — see the legend text below. -->
+    <div class="bar wrap">
+      <span class="hint"><svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--ok)"></circle></svg> up
+        &nbsp;<svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--fail)"></circle></svg> down
+        &nbsp;<svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--line)"></circle></svg> unknown/unidentified
+        &nbsp;&mdash; a dashed box is a neighbour nothing in Nodes could be matched to.</span>
+    </div>
+    <div id="nd-topo-canvas" class="canvas chart" style="height:65vh">
+      <svg id="nd-topo-svg"></svg>
     </div>
   </div>
 
@@ -837,14 +884,23 @@
     <header class="bar">
       <span id="cx-backup-header" class="section">BACKUPS</span>
       <span class="grow"></span>
+      <!-- Diffs the selected row against the next-OLDER one in this list —
+           the one-click "what changed last time" case; ConfigRX diff (Tier
+           2) picking two specific backups instead is the checkbox pair
+           below. Hidden until a backup with an older neighbour is selected
+           — see selectBackup/drawBackups. -->
+      <button id="cx-backup-diff-prev" data-requires-write="configrx" hidden>Diff with previous</button>
       <button id="cx-backup-now" data-requires-write="configrx" hidden>Back up now</button>
       <button id="cx-device-settings" data-requires-write="configrx" hidden>Device settings</button>
     </header>
-    <!-- data-requires-write sits on the Delete button, not on the bar: the
-         bar is shown by the selection, and applyPermissions() is hide-only,
-         so a hidden bar that later reappears would bring the button back. -->
+    <!-- data-requires-write sits on the Delete/Diff buttons, not the bar:
+         the bar is shown by the selection, and applyPermissions() is
+         hide-only, so a hidden bar that later reappears would bring the
+         buttons back. Diff selected only ever appears once exactly two
+         rows are ticked — see drawBackupBulkBar. -->
     <div class="bar wrap" id="cx-backup-bulk" hidden>
       <span id="cx-backup-bulk-count" class="hint"></span>
+      <button id="cx-backup-diff-selected" data-requires-write="configrx" hidden>Diff selected</button>
       <button id="cx-backup-delete" data-requires-write="configrx">Delete</button>
       <span class="grow"></span>
       <button id="cx-backup-clear">Clear</button>
@@ -854,8 +910,19 @@
    </div>
    <div class="divider"></div>
    <div class="pane pad-x pad-b" data-grow="2">
-    <header class="bar"><span class="section">CONFIG</span></header>
+    <header class="bar"><span id="cx-config-header" class="section">CONFIG</span>
+      <span class="grow"></span>
+      <button id="cx-diff-close" hidden>Close diff</button>
+    </header>
     <pre id="cx-viewer" class="detail" data-empty="Select a device to see its stored backups."></pre>
+    <!-- Replaces the plain viewer above while a diff is open (see
+         showDiff/closeDiff): a unified diff, coloured line-by-line with the
+         same tokens the rest of the product uses for "added"/"removed" —
+         see app.css's .cx-diff-add/.cx-diff-rem. -->
+    <div id="cx-diff-wrap" hidden>
+      <p id="cx-diff-meta" class="hint"></p>
+      <pre id="cx-diff" class="detail"></pre>
+    </div>
    </div>
   </div>
 </section>

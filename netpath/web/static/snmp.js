@@ -258,8 +258,14 @@
       <fieldset><legend>STORAGE</legend>
         ${number('sp-retention', 'Keep traps for (days)', s.retention_days, 'min=1')}
         ${number('sp-maxrows', 'Row cap', s.max_rows, 'min=1000 step=10000')}
-        <p class="hint">The database size cap lives on the Settings tab with the
-          others, since all the databases share one disk.</p>
+        <p class="hint">The database size cap (1024 MB by default, raised from
+          256 MB — a real trap storm reaches 256 MB in minutes) lives on the
+          Settings tab with the others, since all the databases share one disk.
+          Whichever limit is hit first wins: when the size cap is reached before
+          "Keep traps for" would have expired anything, the oldest stored traps
+          are deleted to make room regardless of the day count above — the
+          retention setting is a target, not a guarantee, once the cap is the
+          one actually binding.</p>
       </fieldset>
       ${App.columnPickerFieldset('TRAP LIST COLUMNS', 'snmp', COLUMNS,
                                  s.table_columns)}`, [

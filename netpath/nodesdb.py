@@ -1961,10 +1961,19 @@ class NodesDatabase:
     # reported instead of a bridge's), so this is offered as a suggestion
     # for the future topology-assembly wave to weigh alongside an operator's
     # own manual upstream_id, never as the sole source of truth.
+    # matched_if_index rides along only for the MAC-matched half (a sysName
+    # match has no interface to point at, and stays NULL): it is the
+    # matched device's OWN port — the one whose phys_addr answered — which
+    # is what lets a topology assembly pair this row against that device's
+    # reciprocal one (its own neighbour row back at the observer, if it
+    # also walked LLDP/CDP) by comparing (device_id, if_index) endpoint
+    # pairs, instead of guessing from device ids alone and drawing a link
+    # twice or collapsing two different physical links into one.
     _NEIGHBOR_MATCH_SQL = (
         "SELECT n.*,"
         " COALESCE(byname.id, bymac.id) AS matched_device_id,"
-        " COALESCE(byname.name, bymac.name) AS matched_device_name"
+        " COALESCE(byname.name, bymac.name) AS matched_device_name,"
+        " iface.if_index AS matched_if_index"
         " FROM neighbors n"
         " LEFT JOIN devices byname"
         "   ON byname.enabled = 1 AND n.sys_name != ''"

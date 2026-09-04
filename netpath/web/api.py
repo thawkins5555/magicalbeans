@@ -35,6 +35,7 @@ from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
 from .. import nodeoids
 from .. import configrx
+from .. import configrx_redact
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
@@ -2046,6 +2047,31 @@ def _device_json(row, reveal: bool = False) -> dict:
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
+        # LLDP/CDP, PoE and STP polling (Tier 1 #5/#7): the same
+        # inherit-via-NULL override columns mac_table_interval_s already
+        # models, exposed the same defensive way for a row from before the
+        # migration that added them.
+        "lldp_interval_s": (row["lldp_interval_s"] if "lldp_interval_s" in row.keys() else None),
+        "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in row.keys() else None),
+        "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
+        # The capability probe's verdict — True/False once probed, None
+        # until the first poll gets to it — and, once stp_capable is true,
+        # the bridge-wide state a topology/device pane reads. Per-port PoE
+        # power and STP state live on the interfaces rows instead (see
+        # get_nodes_device_interfaces); the topology-change COUNT is a
+        # metric with history (see get_nodes_device_metrics), not a column
+        # here — this is the device's current bridge identity, not a series.
+        "poe_capable": (bool(row["poe_capable"]) if "poe_capable" in row.keys()
+                        and row["poe_capable"] is not None else None),
+        "stp_capable": (bool(row["stp_capable"]) if "stp_capable" in row.keys()
+                        and row["stp_capable"] is not None else None),
+        "stp_protocol_spec": (row["stp_protocol_spec"] if "stp_protocol_spec" in row.keys() else None),
+        "stp_priority": (row["stp_priority"] if "stp_priority" in row.keys() else None),
+        "stp_root_id": (row["stp_root_id"] if "stp_root_id" in row.keys() else None),
+        "stp_root_cost": (row["stp_root_cost"] if "stp_root_cost" in row.keys() else None),
+        "stp_root_port": (row["stp_root_port"] if "stp_root_port" in row.keys() else None),
+        "stp_time_since_change_s": (row["stp_time_since_change_s"]
+                                    if "stp_time_since_change_s" in row.keys() else None),
         "upstream_id": (row["upstream_id"] if "upstream_id" in row.keys() else None),
         # Vendor identification (4.32): keyed defensively for a row handed
         # in from an older-shaped source.
@@ -2359,6 +2385,193 @@ def get_nodes_mac_search(service, params, body) -> dict:
             "enabled_devices": service.nodes_db.mac_walk_enabled_count(),
             "retention_days": float(
                 service.nodes_settings.get("mac_table_retention_days", 7))}
+
+
+def _neighbor_local_port_labeler(service):
+    """A (device_id, if_index) -> label closure for LLDP/CDP rows, backed by
+    one interfaces() read per device it is actually asked about rather than
+    the whole fleet's — a topology draw only ever touches the handful of
+    devices that reported a neighbour, not the thousands that did not.
+    Falls back to "if <N>" for a port whose interface row has not been
+    polled yet (or was deleted since), which is still a legible label."""
+    cache: dict[int, dict[int, str]] = {}
+
+    def label(device_id, if_index):
+        if if_index is None:
+            return ""
+        ports = cache.get(device_id)
+        if ports is None:
+            ports = {i["if_index"]: (i["descr"] or i["alias"] or "")
+                     for i in service.nodes_db.interfaces(device_id)}
+            cache[device_id] = ports
+        return ports.get(if_index) or f"if {if_index}"
+    return label
+
+
+def _neighbor_json(row, local_port: str = "") -> dict:
+    keys = row.keys()
+    return {
+        "device_id": row["device_id"], "if_index": row["if_index"],
+        "local_port": local_port,
+        "protocol": row["protocol"], "chassis_id": row["chassis_id"],
+        "chassis_id_subtype": row["chassis_id_subtype"],
+        "port_id": row["port_id"], "port_descr": row["port_descr"],
+        "sys_name": row["sys_name"], "sys_descr": row["sys_descr"],
+        "platform": row["platform"], "remote_address": row["remote_address"],
+        "seen_ts": row["seen_ts"], "first_seen_ts": row["first_seen_ts"],
+        "present": bool(row["present"]),
+        "matched_device_id": row["matched_device_id"] if "matched_device_id" in keys else None,
+        "matched_device_name": row["matched_device_name"] if "matched_device_name" in keys else None,
+    }
+
+
+def get_nodes_device_neighbors(service, params, body, device_id) -> dict:
+    """The LLDP/CDP neighbours seen on one device's own ports — protocol,
+    local/remote port, the remote sysName, and the best-effort device match
+    nodesdb.neighbours_of already computes — for the detail pane's
+    Neighbours section. Present and stale rows both come back (see
+    replace_neighbors' ageing scheme); the client marks a stale one rather
+    than this route filtering it out, the same choice get_nodes_device_
+    events makes for interface events."""
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    rows = service.nodes_db.neighbours_of(device_id)
+    label = _neighbor_local_port_labeler(service)
+    return {"neighbors": [_neighbor_json(r, label(device_id, r["if_index"])) for r in rows]}
+
+
+def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
+    """One device's own Neighbours table, exported — bounded by its own
+    port count like the interfaces export beside it, so there is no export
+    ceiling to lift here either."""
+    neighbors = get_nodes_device_neighbors(service, params, body, device_id)["neighbors"]
+    header = ["if_index", "local_port", "protocol", "chassis_id", "sys_name",
+             "port_id", "platform", "remote_address", "matched_device_id",
+             "matched_device_name", "present", "seen_ts", "first_seen_ts"]
+    csv_rows = [[n.get(key) for key in header] for n in neighbors]
+    return _csv_response("neighbours", header, csv_rows)
+
+
+# Item 5's fleet-wide view: an L2 link graph, shaped for the client to draw
+# directly rather than handing over the raw neighbour rows and making every
+# caller re-derive the same graph. Two facts make the shaping worth doing
+# here instead of in the browser: only nodesdb knows which chassis-id/
+# sysName matches resolved to a real device (the join _NEIGHBOR_MATCH_SQL
+# already computes), and only the server can afford an interfaces() read per
+# reporting device to label a local port — the client would otherwise need
+# a second request per device just to draw port labels on hover.
+def _topology_dedup_key(device_id, if_index, matched_id, matched_if_index):
+    """The undirected identity of one physical link. LLDP/CDP is normally
+    walked from BOTH ends — the switch that owns this port and the device
+    across the cable, if it walks its own table too — so the same cable
+    arrives as two rows: (A, ifA) matched to (B, ifB), and separately
+    (B, ifB) matched to (A, ifA). matched_if_index (nodesdb's join of the
+    remote chassis MAC to the remote device's OWN interface) is what makes
+    those two rows produce the identical frozenset key below, so the second
+    row folds onto the first instead of drawing the same cable twice. A
+    sysName-only match (no MAC, so no matched_if_index) cannot be paired
+    this way — it gets its own key per row, which is a real second line on
+    screen rather than a wrong guess at which port to pair it against."""
+    if matched_if_index is not None:
+        return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
+    return ("name-match", device_id, if_index)
+
+
+def _topology_unknown_identity(row) -> str:
+    """What makes two unmatched neighbour rows the SAME unknown neighbour —
+    an AP or phone with no SNMP of its own, seen from two switches, ought to
+    draw as one node with two edges, not two disconnected "unknown" boxes.
+    Falls back to a row-unique key when neither a chassis id nor a sysName
+    was reported at all, which is the honest answer for "nothing here
+    identifies this neighbour beyond the port it was seen on"."""
+    return (row["chassis_id"] or row["sys_name"]
+            or f"row:{row['device_id']}:{row['if_index']}:{row['protocol']}:{row['rem_index']}")
+
+
+def get_nodes_topology(service, params, body) -> dict:
+    """The fleet-wide L2 graph a topology view draws: every Nodes device as
+    a node (id/name/status/ip), plus one edge per distinct LLDP/CDP link —
+    deduplicated per _topology_dedup_key so the ordinary case (both ends of
+    a cable walk their own table) draws one line, not two. A neighbour with
+    no device join (nothing in Nodes answers that chassis id or sysName)
+    still draws, as its own synthetic node — dropping it would make an
+    unmanaged AP or phone invisible instead of clearly unidentified, which
+    is the wrong failure mode for a topology view."""
+    devices = service.nodes_db.devices()
+    device_by_id = {row["id"]: row for row in devices}
+    nodes = [{"id": row["id"], "name": hostresolve.device_name(row) or row["ip"],
+              "status": row["status"], "ip": row["ip"], "unknown": False}
+             for row in devices]
+
+    label = _neighbor_local_port_labeler(service)
+    edges_by_key: dict = {}
+    unknown_nodes: dict = {}
+    for row in service.nodes_db.all_neighbours():
+        if not row["present"]:
+            continue    # the live graph, not the history — a vanished link should stop drawing
+        device_id, if_index = row["device_id"], row["if_index"]
+        matched_id = row["matched_device_id"]
+        matched_if_index = row["matched_if_index"] if "matched_if_index" in row.keys() else None
+        local_label = label(device_id, if_index)
+        remote_port = row["port_id"] or row["port_descr"] or ""
+
+        is_unknown = matched_id is None or matched_id not in device_by_id
+        if not is_unknown:
+            b_id, b_port = matched_id, (remote_port or label(matched_id, matched_if_index))
+            key = _topology_dedup_key(device_id, if_index, matched_id, matched_if_index)
+        else:
+            identity = _topology_unknown_identity(row)
+            unk = unknown_nodes.get(identity)
+            if unk is None:
+                unk = {"id": f"unknown:{identity}",
+                       "name": row["sys_name"] or row["platform"] or row["chassis_id"]
+                               or "Unidentified neighbour",
+                       "status": "unknown", "ip": row["remote_address"] or "", "unknown": True}
+                unknown_nodes[identity] = unk
+            b_id, b_port = unk["id"], remote_port
+            key = ("unknown", identity, device_id, if_index)
+
+        edge = edges_by_key.get(key)
+        if edge is None:
+            edge = {"id": f"e{len(edges_by_key)}", "a_device_id": device_id,
+                    "a_port": local_label, "b_device_id": b_id, "b_port": b_port,
+                    "protocols": [], "unknown": is_unknown, "seen_ts": row["seen_ts"]}
+            edges_by_key[key] = edge
+        if row["protocol"] not in edge["protocols"]:
+            edge["protocols"].append(row["protocol"])
+        edge["seen_ts"] = max(edge["seen_ts"], row["seen_ts"])
+
+    return {"nodes": nodes + list(unknown_nodes.values()), "edges": list(edges_by_key.values())}
+
+
+def _topology_export_rows(service) -> list:
+    device_by_id = {row["id"]: row for row in service.nodes_db.devices()}
+    label = _neighbor_local_port_labeler(service)
+    rows = []
+    for row in service.nodes_db.all_neighbours():
+        device = device_by_id.get(row["device_id"])
+        matched_id = row["matched_device_id"]
+        matched_name = row["matched_device_name"] if "matched_device_name" in row.keys() else None
+        rows.append([
+            row["device_id"], hostresolve.device_name(device) if device else "",
+            row["if_index"], label(row["device_id"], row["if_index"]),
+            row["protocol"], row["chassis_id"], row["sys_name"],
+            row["port_id"] or row["port_descr"], row["platform"], row["remote_address"],
+            matched_id, matched_name, bool(row["present"]), row["seen_ts"], row["first_seen_ts"],
+        ])
+    return rows
+
+
+def get_nodes_topology_export(service, params, body) -> dict:
+    """The neighbours/topology table as CSV: every stored LLDP/CDP row,
+    present and stale alike (an export exists to leave with the whole
+    picture, not only the live graph the on-screen view draws), fleet-wide
+    like get_nodes_devices_export rather than filtered to one device."""
+    header = ["device_id", "device_name", "if_index", "local_port", "protocol",
+             "remote_chassis_id", "remote_sys_name", "remote_port", "platform",
+             "remote_address", "matched_device_id", "matched_device_name",
+             "present", "seen_ts", "first_seen_ts"]
+    return _csv_response("topology", header, _topology_export_rows(service))
 
 
 def post_nodes_device(service, params, body) -> dict:
@@ -3126,6 +3339,11 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
     rows = service.nodes_db.interfaces(device_id)
+    keys = rows[0].keys() if rows else ()
+    # poe_admin/poe_detect_status/poe_power_mw/stp_state (Tier 1 #7): read
+    # defensively like every other column a migration added, since a row
+    # fetched before this wave's ALTER TABLE ran on this database simply
+    # will not have them yet on the very first call after an upgrade.
     return {"interfaces": [
         {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
          "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
@@ -3134,7 +3352,11 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "in_error_rate": r["in_error_rate"], "out_error_rate": r["out_error_rate"],
          "last_in_errors": r["last_in_errors"], "last_out_errors": r["last_out_errors"],
          "last_in_octets": r["last_in_octets"], "last_out_octets": r["last_out_octets"],
-         "last_seen_ts": r["last_seen_ts"]}
+         "last_seen_ts": r["last_seen_ts"],
+         "poe_admin": (r["poe_admin"] if "poe_admin" in keys else None),
+         "poe_detect_status": (r["poe_detect_status"] if "poe_detect_status" in keys else None),
+         "poe_power_mw": (r["poe_power_mw"] if "poe_power_mw" in keys else None),
+         "stp_state": (r["stp_state"] if "stp_state" in keys else None)}
         for r in rows]}
 
 
@@ -3147,7 +3369,7 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
     header = ["if_index", "descr", "alias", "phys_addr", "speed_bps",
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
-             "last_seen_ts"]
+             "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw", "stp_state"]
     csv_rows = [[i.get(key) for key in header] for i in interfaces]
     return _csv_response("interfaces", header, csv_rows)
 
@@ -5143,6 +5365,80 @@ def get_configrx_backup(service, params, body, backup_id) -> dict:
         raise ValueError("No such backup")
     content = service.configrx_db.backup_content(backup_id)
     return {"backup": _configrx_backup_json(row), "content": content}
+
+
+def _configrx_backup_label(row) -> str:
+    return f"backup #{row['id']} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['ts']))})"
+
+
+def get_configrx_diff(service, params, body) -> dict:
+    """A unified diff between two of one device's stored backups — Tier 2:
+    the hashes that would detect the change are already stored, this is
+    the view that reads them. Gated exactly like get_configrx_backup
+    (the single-backup CONTENT route) rather than the metadata list: a
+    diff hands over the device's own configuration lines just as reading
+    one backup does, so it costs the same permission.
+
+    `from`/`to` name backup ids explicitly; omit both for the adjacent
+    pair — the two most recent stored backups, ordered newest as `to` —
+    which is the one-click "what changed last time" case the frontend's
+    Diff button uses by default.
+
+    Redaction is applied a SECOND time here, unconditionally, regardless
+    of what each row's own `redacted` flag already says. A backup captured
+    with "keep secrets in backups" (store_secrets) switched on is stored
+    verbatim on purpose — that setting exists so the row can serve as an
+    actual restore file — but a diff is a comparison view, not a download
+    of that file, and nothing here may hand an unredacted secret to a diff
+    reader even when the device's own setting would let the single-backup
+    view do exactly that. Because configrx_redact.redact() maps every
+    secret it recognises onto the identical literal "<redacted>" token, a
+    secret that merely changed value reads as no line at all in the
+    hunks — the directive is present on both sides and nothing about its
+    own text differs — which is the honest answer for "did the password
+    change": this diff can say a secret-bearing line is still there, not
+    what it became. See configrx_redact's module docstring for the pattern
+    list's own scope and limits.
+    """
+    device_id = _num(params, "device", None, int)
+    if not device_id or not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    backups = service.configrx_db.backups_for(device_id)
+    if len(backups) < 2:
+        raise ValueError("At least two stored backups are needed to diff")
+    from_param = _num(params, "from", None, int)
+    to_param = _num(params, "to", None, int)
+    if from_param is None and to_param is None:
+        # backups_for is already newest-first: the adjacent pair is simply
+        # its first two rows, older explaining what changed into newer.
+        to_row, from_row = backups[0], backups[1]
+    else:
+        by_id = {b["id"]: b for b in backups}
+        from_row = by_id.get(int(from_param)) if from_param is not None else None
+        to_row = by_id.get(int(to_param)) if to_param is not None else None
+        if not from_row or not to_row:
+            raise ValueError("Both backups must belong to this device")
+
+    from_json, to_json = _configrx_backup_json(from_row), _configrx_backup_json(to_row)
+    # Fast path (TESTS: "same-hash pair returns empty diff fast-path"): two
+    # rows with the same content hash cannot diff to anything, whether that
+    # is one backup picked for both ends or two distinct rows that happen
+    # to match (a config reverted to something backed up before). Skipping
+    # redact()+unified_diff here is not just an optimisation — it also means
+    # picking the same backup twice never runs a diff over its own secrets.
+    if from_row["id"] == to_row["id"] or from_row["sha256"] == to_row["sha256"]:
+        return {"diff": "", "additions": 0, "removals": 0,
+                "from": from_json, "to": to_json, "identical": True}
+
+    from_content = service.configrx_db.backup_content(from_row["id"]) or ""
+    to_content = service.configrx_db.backup_content(to_row["id"]) or ""
+    from_redacted, _ = configrx_redact.redact(from_content)
+    to_redacted, _ = configrx_redact.redact(to_content)
+    text, additions, removals = configrx.diff_texts(
+        from_redacted, to_redacted,
+        _configrx_backup_label(from_row), _configrx_backup_label(to_row))
+    return {"diff": text, "additions": additions, "removals": removals,
+            "from": from_json, "to": to_json, "identical": not text}
 
 
 def post_configrx_device_backup(service, params, body, device_id) -> dict:

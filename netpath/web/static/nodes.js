@@ -27,6 +27,12 @@
     ifaces: [],
     ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
+    // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
+    // UI half) and the fleet-wide L2 graph the Topology subtab draws from —
+    // two different shapes of the same underlying table, fetched by
+    // different routes (see loadDetail / loadTopology).
+    neighbors: [],
+    topology: null,
     discJobs: [],
     discSelected: null,
     discResults: [],
@@ -67,6 +73,14 @@
      row, and only the row can carry a shape. */
   const STATUS_TONE = { up: 'ok', down: 'fail', unsupported: 'warn',
     auth: 'warn', unknown: 'none' };
+
+  // dot1dStp per-port state (Tier 1 #7): forwarding is the healthy steady
+  // state, blocking is normal and expected on a redundant link (not a
+  // fault — STP put it there on purpose), and the three transitional
+  // states are worth a second look if they don't clear.
+  const STP_STATE_COLOR = { forwarding: 'var(--ok)', blocking: 'var(--line)',
+    listening: 'var(--warn)', learning: 'var(--warn)', broken: 'var(--fail)',
+    disabled: 'var(--muted)' };
 
   /* The one place display-name precedence lives: 'auto' prefers the SNMP
      hostname (sysName) and falls back to the manually entered name, then
@@ -594,21 +608,25 @@
     if (App.canWrite('nodes')) {
       App.post(`/api/nodes/devices/${view.selected}/focus`, {}).catch(() => {});
     }
-    const [detail, metrics, ifaces, events] = await Promise.all([
+    const [detail, metrics, ifaces, events, neighbors] = await Promise.all([
       App.get(`/api/nodes/devices/${view.selected}`),
       App.get(`/api/nodes/devices/${view.selected}/metrics`),
       App.get(`/api/nodes/devices/${view.selected}/interfaces`),
       App.get(`/api/nodes/devices/${view.selected}/events`),
+      App.get(`/api/nodes/devices/${view.selected}/neighbors`),
     ]);
     view.detail = detail.device;
     view.metrics = metrics.metrics;
     view.ifaces = ifaces.interfaces;
     view.events = events;
+    view.neighbors = neighbors.neighbors;
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
     await loadStatusTimeline();
     drawIfaceTable();
+    drawNeighborsTable();
+    drawCapabilitiesTab();
     drawEventTable();
   }
 
@@ -1000,6 +1018,18 @@
       cell: (r) => (r.in_error_rate != null ? r.in_error_rate.toFixed(2) : '\u2014') },
     { key: 'out_error_rate', label: 'Out err/s', width: 95, numeric: true,
       cell: (r) => (r.out_error_rate != null ? r.out_error_rate.toFixed(2) : '\u2014') },
+    // PoE and STP (Tier 1 #7): only a device the capability probe found
+    // capable ever has anything in these columns \u2014 a switch with neither
+    // table shows the dash every other unpolled cell already shows.
+    { key: 'poe_power_mw', label: 'PoE', width: 100, numeric: true,
+      value: (r) => r.poe_power_mw,
+      cell: (r) => (r.poe_power_mw != null ? `${(r.poe_power_mw / 1000).toFixed(1)} W`
+        : escape(r.poe_admin ? (r.poe_detect_status || r.poe_admin) : '\u2014')) },
+    { key: 'stp_state', label: 'STP', width: 90,
+      cell: (r) => (r.stp_state
+        ? `<span style="color:${STP_STATE_COLOR[r.stp_state] || 'var(--muted)'}">` +
+          `${escape(r.stp_state)}</span>`
+        : '\u2014') },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
       cell: (r) => App.agoCell(r.last_seen_ts) },
   ];
@@ -1901,6 +1931,138 @@
     }
     table.appendChild(body);
     App.wireRowKeyboard(body);
+  }
+
+  /* ---------------------------------------------------------- neighbours
+
+     The device detail pane's Neighbours section (Tier 1 #5's UI half): one
+     device's own LLDP/CDP rows, from /api/nodes/devices/<id>/neighbors.
+     Present and stale rows both come back — a stale one (a cable pulled or
+     the neighbour rebooted mid-cycle) is marked rather than dropped, same
+     as the events table above never drops old events. */
+  function drawNeighborsTable() {
+    const table = App.el('nd-nb-table');
+    if (!table) return;
+    const rows = view.neighbors || [];
+    table.innerHTML = '<caption class="sr-only">LLDP/CDP neighbours</caption>' +
+      '<thead><tr><th scope="col">Local port</th><th scope="col">Protocol</th>' +
+      '<th scope="col">Remote device</th><th scope="col">Remote port</th>' +
+      '<th scope="col">Platform</th>' +
+      `<th scope="col" title="${App.timeZoneTitle()}">Last seen</th></tr></thead>`;
+    const body = document.createElement('tbody');
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      // A matched device is a link into the pane itself — the whole point
+      // of the match is "this cable goes to a device you already monitor",
+      // so seeing that device's own detail should be one click, not a
+      // separate search. An unmatched neighbour names whatever it reported
+      // about itself and says plainly that Nodes could not place it.
+      const remote = r.matched_device_id != null
+        ? `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +
+          `${escape(r.matched_device_name || r.sys_name || 'device')}</button>`
+        : `${escape(r.sys_name || r.chassis_id || 'unidentified')}` +
+          '<span class="hint"> (not in Nodes)</span>';
+      tr.innerHTML = `<td>${escape(r.local_port || `if ${r.if_index}`)}</td>` +
+        `<td>${escape((r.protocol || '').toUpperCase())}</td>` +
+        `<td>${remote}</td>` +
+        `<td>${escape(r.port_id || r.port_descr || '—')}</td>` +
+        `<td>${escape(r.platform || '—')}</td>` +
+        `<td>${App.agoCell(r.seen_ts)}${r.present ? '' : ' <span class="hint">(stale)</span>'}</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+    for (const button of table.querySelectorAll('.nd-nb-link')) {
+      button.onclick = () => selectDevice(Number(button.dataset.device));
+    }
+    if (App.el('nd-nb-export-csv')) {
+      App.el('nd-nb-export-csv').onclick = () => {
+        if (view.selected != null) {
+          App.exportCsv(`/api/nodes/devices/${view.selected}/neighbors/export.csv`, {});
+        }
+      };
+    }
+  }
+
+  /* ------------------------------------------------------- bridge & RF
+
+     STP bridge state, the PSE power budget/consumption pair, and PtP radio
+     RF (Tier 1 #7/#8's UI half) — three capabilities most devices simply
+     don't have, each said plainly when this device doesn't have it rather
+     than an empty table with nothing to explain why. PoE/STP capability
+     and the STP root/topology fields live on the device row itself
+     (view.detail); the PSE watts, the topology-change COUNT and every RF
+     scalar are ordinary metrics with history, read from view.metrics —
+     which is what lets the RF chart below reuse drawSeriesChart exactly as
+     the packet-loss and port-bandwidth charts already do. */
+  function drawCapabilitiesTab() {
+    const stpEl = App.el('nd-cap-stp');
+    const poeEl = App.el('nd-cap-poe');
+    const rfEl = App.el('nd-cap-rf');
+    if (!stpEl || !poeEl || !rfEl) return;
+    const d = view.detail || {};
+    const metricByKey = Object.fromEntries((view.metrics || []).map((m) => [m.key, m]));
+
+    if (d.stp_capable) {
+      const topo = metricByKey.stp_topology_changes;
+      stpEl.innerHTML = '<span class="section">STP</span> ' +
+        `root <b>${escape(d.stp_root_id || '—')}</b>` +
+        (d.stp_root_cost != null ? `, cost ${escape(String(d.stp_root_cost))}` : '') +
+        (d.stp_root_port != null ? `, root port ${escape(String(d.stp_root_port))}` : '') +
+        (d.stp_priority != null ? `, priority ${escape(String(d.stp_priority))}` : '') +
+        (d.stp_protocol_spec ? `, ${escape(d.stp_protocol_spec)}` : '') +
+        (d.stp_time_since_change_s != null
+          ? ` — last topology change ${App.duration(d.stp_time_since_change_s)} ago` : '') +
+        (topo ? ` (${topo.last_value} recorded since this device was added)` : '');
+    } else {
+      stpEl.innerHTML = '<span class="section">STP</span> ' +
+        '<span class="hint">Not answering BRIDGE-MIB, or not polled yet.</span>';
+    }
+
+    if (d.poe_capable) {
+      const budget = metricByKey.poe_budget_w, used = metricByKey.poe_consumption_w;
+      poeEl.innerHTML = '<span class="section">POE</span> ' +
+        (used ? `${used.last_value.toFixed(1)} W in use` : 'usage not yet polled') +
+        (budget ? ` of ${budget.last_value.toFixed(1)} W budget` : '');
+    } else {
+      poeEl.innerHTML = '<span class="section">POE</span> ' +
+        '<span class="hint">Not answering POWER-ETHERNET-MIB, or not polled yet.</span>';
+    }
+
+    const rf = (view.metrics || []).filter((m) => m.key.startsWith('rf_'));
+    if (!rf.length) {
+      rfEl.innerHTML = '<p class="hint">No PtP RF metrics for this device — airFiber/' +
+        'airMAX and Cambium radios only.</p>';
+      return;
+    }
+    rfEl.innerHTML = rf.map((m) => `
+      <div class="bar"><span class="section">${escape(m.label)}</span>
+        <span class="nd-v">${escape(formatMetricValue(m.unit, m.last_value))}</span></div>
+      <div class="canvas chart" style="height:110px" data-rf-metric="${m.id}"><svg></svg></div>
+    `).join('');
+    for (const wrap of rfEl.querySelectorAll('[data-rf-metric]')) {
+      loadRfChart(wrap, Number(wrap.dataset.rfMetric)).catch(() => {});
+    }
+  }
+
+  /* One RF metric's last hour, in its own small chart — the same
+     drawSeriesChart the packet-loss and per-port bandwidth charts use, so
+     wheel-zoom and the rest of that machinery come for free. A ticket
+     guards against a slow fetch landing after the pane has moved to
+     another device, the same discipline deviceDialog's loss chart uses. */
+  async function loadRfChart(wrap, metricId) {
+    const svg = wrap.querySelector('svg');
+    const deviceId = view.selected;
+    const metric = (view.metrics || []).find((m) => m.id === metricId);
+    if (!svg || !metric || deviceId == null) return;
+    const requestId = (wrap.dataset.requestId = String(Date.now()));
+    const t1 = Date.now() / 1000, t0 = t1 - 3600;
+    const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
+      { metric_id: metricId, t0, t1 });
+    if (!wrap.isConnected || wrap.dataset.requestId !== requestId
+        || view.selected !== deviceId) return;
+    drawSeriesChart(svg, wrap, { t0: result.t0, t1: result.t1, unit: metric.unit,
+      series: [{ label: metric.label, color: 'var(--accent)', points: result.points || [] }] });
   }
 
   /* -------------------------------------------------------------- CRUD */
@@ -3306,6 +3468,311 @@
     return !!pane && pane.classList.contains('active');
   }
 
+  /* -------------------------------------------------------- topology
+
+     The L2 link graph (Tier 1 #5's UI half): every Nodes device as a box,
+     one line per distinct LLDP/CDP link (already deduplicated server-side
+     — see api.get_nodes_topology), drawn with plain SVG and the same
+     pan/zoom technique netpath.js's traceroute hop graph uses (own
+     view/frame state, a wheel handler that zooms on the point under the
+     cursor, pointer-capture drag to pan) rather than a charting library.
+     discoveryVisible()'s own pattern: fetched only while this subtab is
+     actually on screen, not on every refresh tick regardless. */
+  function topologyVisible() {
+    const pane = document.getElementById('nodes-sub-topology');
+    return !!pane && pane.classList.contains('active');
+  }
+
+  async function loadTopology() {
+    view.topology = await App.get('/api/nodes/topology');
+    drawTopology();
+  }
+
+  const TOPO_NODE_W = 160, TOPO_NODE_H = 40, TOPO_COL_GAP = 70,
+        TOPO_ROW_GAP = 14, TOPO_COMP_GAP = 36;
+  // Zoom/pan is view state, not data — kept out of `view` (which recallSort
+  // and friends treat as the module's persisted shape) the same way
+  // netpath.js keeps its own route-canvas transform in its own object.
+  const topoState = { zoom: 1, pan: { x: 0, y: 0 }, frame: null,
+    userZoom: false, panDrag: null, dragMoved: false };
+
+  /* device/synthetic-node id -> {x, y}. Connected LLDP/CDP components are
+     laid out as a layered tree from their own highest-degree node (BFS
+     depth = column, siblings stacked in a row) — legible for the star and
+     chain shapes real switch fabrics actually form, and tolerant of a
+     non-tree edge (a redundant link) since layout only follows the BFS
+     spanning tree while EVERY edge still gets drawn afterwards. A device
+     with no reported neighbour at all is not given a lone tall block of
+     its own — it goes into a compact grid appended below the connected
+     components, which is what keeps a fleet of mostly-unpolled devices
+     from turning into a very long, mostly-empty column of single boxes. */
+  function topoLayout(nodes, edges) {
+    const adjacency = new Map();
+    for (const node of nodes) adjacency.set(String(node.id), new Set());
+    for (const edge of edges) {
+      const a = String(edge.a_device_id), b = String(edge.b_device_id);
+      if (!adjacency.has(a) || !adjacency.has(b)) continue;
+      adjacency.get(a).add(b);
+      adjacency.get(b).add(a);
+    }
+    const visited = new Set();
+    const components = [];
+    for (const node of nodes) {
+      const id = String(node.id);
+      if (visited.has(id)) continue;
+      const members = [];
+      const queue = [id];
+      visited.add(id);
+      while (queue.length) {
+        const current = queue.shift();
+        members.push(current);
+        for (const neighbour of adjacency.get(current)) {
+          if (!visited.has(neighbour)) { visited.add(neighbour); queue.push(neighbour); }
+        }
+      }
+      components.push(members);
+    }
+    const isolated = components.filter((c) => c.length === 1).map((c) => c[0]);
+    const connected = components.filter((c) => c.length > 1)
+      .sort((a, b) => b.length - a.length);
+
+    const positions = new Map();
+    let yCursor = 0;
+    for (const members of connected) {
+      const root = members.reduce((best, id) =>
+        (adjacency.get(id).size > adjacency.get(best).size ? id : best), members[0]);
+      const depth = new Map([[root, 0]]);
+      const queue = [root];
+      while (queue.length) {
+        const current = queue.shift();
+        for (const neighbour of adjacency.get(current)) {
+          if (!depth.has(neighbour)) {
+            depth.set(neighbour, depth.get(current) + 1);
+            queue.push(neighbour);
+          }
+        }
+      }
+      const layers = new Map();
+      for (const id of members) {
+        const d = depth.has(id) ? depth.get(id) : 0;
+        if (!layers.has(d)) layers.set(d, []);
+        layers.get(d).push(id);
+      }
+      const maxLen = Math.max(...[...layers.values()].map((l) => l.length));
+      const compHeight = maxLen * (TOPO_NODE_H + TOPO_ROW_GAP) - TOPO_ROW_GAP;
+      for (const [depthLevel, ids] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
+        const blockH = ids.length * (TOPO_NODE_H + TOPO_ROW_GAP) - TOPO_ROW_GAP;
+        let y = yCursor + (compHeight - blockH) / 2;
+        for (const id of ids) {
+          positions.set(id, { x: depthLevel * (TOPO_NODE_W + TOPO_COL_GAP), y });
+          y += TOPO_NODE_H + TOPO_ROW_GAP;
+        }
+      }
+      yCursor += compHeight + TOPO_COMP_GAP;
+    }
+    if (isolated.length) {
+      const cols = Math.max(4, Math.ceil(Math.sqrt(isolated.length)));
+      isolated.forEach((id, i) => {
+        const col = i % cols, row = Math.floor(i / cols);
+        positions.set(id, { x: col * (TOPO_NODE_W + TOPO_COL_GAP),
+                            y: yCursor + row * (TOPO_NODE_H + TOPO_ROW_GAP) });
+      });
+    }
+    return positions;
+  }
+
+  function truncateLabel(text, max = 20) {
+    const s = String(text || '');
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  }
+
+  function topoNodeBox(x, y, node) {
+    const g = App.svgNode('g', { transform: `translate(${x},${y})` });
+    const color = node.unknown ? 'var(--line)' : (STATUS_COLOR[node.status] || 'var(--line)');
+    g.appendChild(App.svgNode('rect', {
+      width: TOPO_NODE_W, height: TOPO_NODE_H, rx: 5,
+      fill: 'var(--raised)', stroke: color, 'stroke-width': node.unknown ? 1 : 1.5,
+      'stroke-dasharray': node.unknown ? '4 3' : null,
+    }));
+    g.appendChild(App.svgNode('circle', { cx: 13, cy: TOPO_NODE_H / 2, r: 4, fill: color }));
+    g.appendChild(App.svgNode('text', {
+      x: 25, y: TOPO_NODE_H / 2 + 4, fill: 'var(--text)',
+      'font-family': 'var(--ui)', 'font-size': 'var(--fs-2xs)',
+    }, truncateLabel(node.name || node.ip || `#${node.id}`)));
+    const tipText = node.unknown
+      ? `${node.name || 'Unidentified neighbour'} — not in Nodes`
+      : `${node.name}${node.ip && node.ip !== node.name ? ` (${node.ip})` : ''} — ${node.status}`;
+    g.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
+    g.addEventListener('mouseleave', App.hideTooltip);
+    if (!node.unknown) {
+      g.style.cursor = 'pointer';
+      g.addEventListener('click', () => {
+        if (topoState.dragMoved) return;
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(node.id);
+      });
+    }
+    return g;
+  }
+
+  function drawTopology() {
+    const svg = App.el('nd-topo-svg');
+    const wrap = App.el('nd-topo-canvas');
+    if (!svg || !wrap) return;
+    svg.innerHTML = '';
+    const box = wrap.getBoundingClientRect();
+    const width = Math.max(box.width, 300), height = Math.max(box.height, 200);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    const topo = view.topology;
+    App.el('nd-topo-count').textContent = topo
+      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : '';
+    if (!topo || !topo.nodes.length) {
+      svg.appendChild(App.svgNode('text', {
+        x: width / 2, y: height / 2, 'text-anchor': 'middle',
+        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
+      }, 'No devices yet.'));
+      return;
+    }
+
+    const positions = topoLayout(topo.nodes, topo.edges);
+    const group = App.svgNode('g');
+    const edgeLayer = App.svgNode('g');
+    const nodeLayer = App.svgNode('g');
+    group.append(edgeLayer, nodeLayer);
+    svg.appendChild(group);
+
+    const byId = new Map(topo.nodes.map((n) => [String(n.id), n]));
+    for (const edge of topo.edges) {
+      const a = positions.get(String(edge.a_device_id));
+      const b = positions.get(String(edge.b_device_id));
+      if (!a || !b) continue;
+      const line = App.svgNode('line', {
+        x1: a.x + TOPO_NODE_W / 2, y1: a.y + TOPO_NODE_H / 2,
+        x2: b.x + TOPO_NODE_W / 2, y2: b.y + TOPO_NODE_H / 2,
+        stroke: edge.unknown ? 'var(--line)' : 'var(--accent)', 'stroke-width': 1.5,
+        'stroke-dasharray': edge.unknown ? '5 4' : null,
+      });
+      const aNode = byId.get(String(edge.a_device_id)) || {};
+      const bNode = byId.get(String(edge.b_device_id)) || {};
+      const tipText = `${aNode.name || edge.a_device_id} (${edge.a_port || '—'}) ` +
+        `↔ ${bNode.name || edge.b_device_id} (${edge.b_port || '—'})\n` +
+        `${(edge.protocols || []).join(', ').toUpperCase()}` +
+        `${edge.unknown ? ' — unidentified neighbour' : ''}`;
+      line.style.cursor = 'pointer';
+      line.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
+      line.addEventListener('mouseleave', App.hideTooltip);
+      // click, not just hover, so a touch or keyboard-driven pointer can
+      // still get at the local/remote port label the task calls for.
+      line.addEventListener('click', () => {
+        if (topoState.dragMoved) return;
+        App.toast(tipText.replace('\n', ' — '), 'ok');
+      });
+      edgeLayer.appendChild(line);
+    }
+    for (const node of topo.nodes) {
+      const p = positions.get(String(node.id));
+      if (p) nodeLayer.appendChild(topoNodeBox(p.x, p.y, node));
+    }
+    topoFit(svg, group, width, height);
+  }
+
+  /* Pan/zoom: netpath.js's own fit/translation/pointerAt/wheelZoom/
+     beginPan/movePan/endPan technique, scoped to topoState and this
+     module's own element ids rather than shared code, since the two
+     graphs' node/edge shapes have nothing else in common. */
+  function topoFit(svg, group, width, height) {
+    const bounds = group.getBBox ? group.getBBox() : null;
+    if (!bounds || !bounds.width) return;
+    if (!topoState.userZoom) {
+      topoState.zoom = Math.min(width / (bounds.width + 80), height / (bounds.height + 80), 1);
+      topoState.pan = { x: 0, y: 0 };
+    }
+    topoState.frame = { width, height, cx: bounds.x + bounds.width / 2, cy: bounds.y + bounds.height / 2 };
+    const t = topoTranslation(topoState.zoom);
+    group.setAttribute('transform', `translate(${t.tx},${t.ty}) scale(${topoState.zoom})`);
+  }
+
+  function topoTranslation(scale) {
+    const f = topoState.frame;
+    return { tx: f.width / 2 - f.cx * scale + topoState.pan.x,
+             ty: f.height / 2 - f.cy * scale + topoState.pan.y };
+  }
+
+  function topoPointerAt(event, svg) {
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: (event.clientX - rect.left) * (topoState.frame.width / Math.max(rect.width, 1)),
+      y: (event.clientY - rect.top) * (topoState.frame.height / Math.max(rect.height, 1)),
+    };
+  }
+
+  function topoWheelZoom(event) {
+    if (!topoState.frame) return;
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const from = topoState.zoom;
+    const to = from * factor;
+    if (to < 0.15 || to > 4) return;
+    const svg = App.el('nd-topo-svg');
+    const pointer = topoPointerAt(event, svg);
+    const before = topoTranslation(from);
+    const sceneX = (pointer.x - before.tx) / from;
+    const sceneY = (pointer.y - before.ty) / from;
+    const f = topoState.frame;
+    topoState.pan.x = pointer.x - sceneX * to - (f.width / 2 - f.cx * to);
+    topoState.pan.y = pointer.y - sceneY * to - (f.height / 2 - f.cy * to);
+    topoState.zoom = to;
+    topoState.userZoom = true;
+    drawTopology();
+  }
+
+  function topoBeginPan(event) {
+    if (event.button !== 0 || !event.isPrimary || !topoState.frame) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const selection = window.getSelection();
+    if (selection) selection.removeAllRanges();
+    topoState.panDrag = { x: event.clientX, y: event.clientY, pan: { ...topoState.pan } };
+    topoState.dragMoved = false;
+    App.el('nd-topo-svg').classList.add('dragging');
+  }
+
+  function topoMovePan(event) {
+    if (!topoState.panDrag) return;
+    const svg = App.el('nd-topo-svg');
+    const rect = svg.getBoundingClientRect();
+    const scaleX = topoState.frame.width / Math.max(rect.width, 1);
+    const scaleY = topoState.frame.height / Math.max(rect.height, 1);
+    const dx = (event.clientX - topoState.panDrag.x) * scaleX;
+    const dy = (event.clientY - topoState.panDrag.y) * scaleY;
+    App.hideTooltip();
+    if (Math.abs(dx) + Math.abs(dy) > 3) { topoState.dragMoved = true; topoState.userZoom = true; }
+    topoState.pan.x = topoState.panDrag.pan.x + dx;
+    topoState.pan.y = topoState.panDrag.pan.y + dy;
+    drawTopology();
+  }
+
+  function topoEndPan() {
+    if (!topoState.panDrag) return;
+    topoState.panDrag = null;
+    App.el('nd-topo-svg').classList.remove('dragging');
+  }
+
+  function topoZoomBy(factor) {
+    const next = topoState.zoom * factor;
+    if (next < 0.15 || next > 4) return;
+    topoState.zoom = next;
+    topoState.userZoom = true;
+    drawTopology();
+  }
+
+  function topoResetView() {
+    topoState.userZoom = false;
+    topoState.pan = { x: 0, y: 0 };
+    drawTopology();
+  }
+
   /* The selected job's `id:state:probed:responded:identified` as of the last
      tick the Discovery pane was actually on screen. The jobs list carries all
      five, so "has this sweep moved?" is answered by the list fetch that
@@ -3911,6 +4378,7 @@
       App.get('/api/nodes/device-groups'),
       App.get('/api/nodes/mibs'),
       loadDiscJobsIfNeeded(),
+      topologyVisible() ? loadTopology().catch(() => {}) : Promise.resolve(),
     ]);
     view.devices = devices.devices;
     view.pageTotal = devices.total != null ? devices.total : view.devices.length;
@@ -4132,6 +4600,20 @@
     App.el('nd-import-devices').onclick = importDevicesDialog;
     App.el('nd-export-csv').onclick = exportDevicesCsv;
     App.el('nd-if-export-csv').onclick = exportInterfacesCsv;
+    // Topology: pointer events carry the pan/zoom gesture; the buttons are
+    // the keyboard/no-wheel fallback — see topoZoomBy/topoResetView.
+    const topoSvg = App.el('nd-topo-svg');
+    if (topoSvg) {
+      topoSvg.addEventListener('wheel', topoWheelZoom, { passive: false });
+      topoSvg.addEventListener('pointerdown', topoBeginPan);
+      topoSvg.addEventListener('pointermove', topoMovePan);
+      topoSvg.addEventListener('pointerup', topoEndPan);
+      topoSvg.addEventListener('pointercancel', topoEndPan);
+    }
+    App.el('nd-topo-zoom-in').onclick = () => topoZoomBy(1.25);
+    App.el('nd-topo-zoom-out').onclick = () => topoZoomBy(0.8);
+    App.el('nd-topo-reset').onclick = topoResetView;
+    App.el('nd-topo-export-csv').onclick = () => App.exportCsv('/api/nodes/topology/export.csv', {});
     App.el('nd-page-size').onchange = () => { view.pageOffset = 0; App.refreshNow('nodes'); };
     App.el('nd-page-prev').onclick = () => {
       view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);
@@ -4309,6 +4791,13 @@
     // for a job that has since finished, there may be no next tick.
     if (name === 'discovery' && view.discSelected) {
       loadDiscResults().catch(() => {});
+    }
+    // Coming to Topology the same way: the live re-fetch above only runs
+    // while this subtab was already on screen, so switching TO it needs
+    // its own fetch rather than waiting for the next refresh tick — and a
+    // freshly opened pane with a stale svg from last time reads as broken.
+    if (name === 'topology') {
+      loadTopology().catch(() => {});
     }
   }
 

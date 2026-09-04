@@ -251,12 +251,18 @@ ROLLUP_ENTITY_KINDS = frozenset({"device", "netpath_target"})
 # The reviewer's counter-argument is real: when a chassis loses power the
 # transitions that matter come from its NEIGHBOURS' ports, and those genuinely
 # ARE implied by the downstream outage. Suppressing them needs to know which
-# port faces which device, and nothing in this application knows that —
-# devices.upstream_id (4.37) records the device relationship but not the
-# interface, and there is no LLDP/CDP neighbour walk. Guessing from MAC
-# forwarding tables would suppress a real port fault whenever the guess was
-# wrong, which is the one failure mode an alert system must not have. Left
-# undone on purpose until there is a neighbour table to consult.
+# port faces which device — devices.upstream_id (4.37) records the device
+# relationship but not the interface. An LLDP/CDP neighbour walk exists now
+# (nodesdb's `neighbors` table, neighbours_of/all_neighbours), with a
+# best-effort device match of its own (sysName, or a chassis MAC against a
+# known interface's phys_addr), but nothing here consults it: that match is
+# offered as a suggestion, not a fact an operator has confirmed, and a
+# neighbour row can go stale between walks in a way the operator-set
+# upstream_id cannot. Driving suppression off an unconfirmed guess would
+# suppress a real port fault whenever the guess was wrong, which is the one
+# failure mode an alert system must not have. Left undone on purpose until
+# the neighbour table's match is something this rollup can trust, or an
+# operator has promoted one into an upstream_id by hand.
 ROLLED_UP_BY = {
     # ping, measured by this app's own probes
     "response_time_high": "device_down",
