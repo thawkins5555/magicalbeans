@@ -26,10 +26,11 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 - [Data](#data)
 - [Deliberate limits](#deliberate-limits)
 
-**Dashboard**, **Nodes**, **Alerts**, **NetPath**, **NetFlow**, **SNMP
-Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
-and **Settings**, which stay rightmost so adding a module never moves
-them. Dashboard aggregates whatever other modules the signed-in account
+**Dashboard**, **Nodes**, **Alerts**, **Routes**, **NetFlow**, **SNMP
+Trap**, **Syslog**, **IPAM**, **FortiWireless**, **ConfigRX**, then
+**Debug** and **Settings**, which stay rightmost so adding a module never
+moves them. Routes is the NetPath module — the tab says what it shows,
+the package, database and settings keep the name they have always had. Dashboard aggregates whatever other modules the signed-in account
 can read — see Permissions, under Settings — rather than holding data of
 its own; from 4.39.0 it is a real page rather than a placeholder, and it
 is described under **Dashboard** below. A tab the signed-in account has no

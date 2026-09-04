@@ -29,7 +29,7 @@ first device polled, `BACKUP-RESTORE.md` covers the ten database files, and
 - [Layout](#layout)
 - [Notes and limits](#notes-and-limits)
 
-Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **NetPath**, a scheduled traceroute monitor; **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **Wireless**, a Fortinet access-point dashboard; **ConfigRX**, SSH configuration backups; **Debug**, a live view of what the background threads are doing; and **Settings**.
+Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows); **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **FortiWireless**, a Fortinet access-point dashboard; **ConfigRX**, SSH configuration backups; **Debug**, a live view of what the background threads are doing; and **Settings**.
 
 ## NetPath
 
