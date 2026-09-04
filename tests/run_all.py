@@ -44,9 +44,15 @@ def main(argv) -> int:
         started = time.time()
         code = 1
         try:
+            # encoding/errors rather than text=True: text=True decodes with the
+            # locale encoding, which on Windows is cp1252, and every suite here
+            # prints em dashes. That raised UnicodeDecodeError inside the reader
+            # thread, left run.stdout as None, and killed the whole runner on the
+            # first suite whose output said "—" instead of reporting a result.
             run = subprocess.run([sys.executable, path], cwd=REPO_ROOT,
-                                 capture_output=True, text=True, timeout=600)
-            code, output = run.returncode, run.stdout + run.stderr
+                                 capture_output=True, timeout=600,
+                                 encoding="utf-8", errors="replace")
+            code, output = run.returncode, (run.stdout or "") + (run.stderr or "")
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") + (exc.stderr or "") + "\n<timed out after 600 s>"
         elapsed = time.time() - started
