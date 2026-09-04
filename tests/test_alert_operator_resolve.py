@@ -35,9 +35,12 @@ def build(rollup=False, suffix=""):
     # would give a breach a reason to be dropped or absorbed that has nothing
     # to do with what sections 1-3 test, and email stays off (the default) so
     # nothing here needs SMTP. Sections 4-7 turn rollup on, because rollup is
-    # exactly what they are about.
+    # exactly what they are about. The roll-up notification hold is off too —
+    # every assertion here reads alert/resolve state, not notifications, but
+    # its default of 240 would still change when last_notified_ts gets
+    # stamped, which section 5's hand-resolve-then-still-down checks rely on.
     alerts.save_settings({"email_enabled": False, "rollup_enabled": bool(rollup),
-                          "new_device_grace_s": 0})
+                          "new_device_grace_s": 0, "notify_rollup_delay_s": 0})
     netpath_db = NetpathDatabase(os.path.join(TMPDIR, f"netpath{suffix}.db"))
     engine = AlertEngine(alerts, nodes_db=nodes,
                          snmp_db=SnmpTrapDatabase(os.path.join(TMPDIR, f"traps{suffix}.db")),

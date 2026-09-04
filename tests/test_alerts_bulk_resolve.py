@@ -48,9 +48,12 @@ service = Service(
 
 # Rollup on (the shipped default, and the whole point here); no new-device
 # grace, because every device in this test is seconds old and would otherwise
-# have its outage held back; email off so nothing needs SMTP.
+# have its outage held back; email off so nothing needs SMTP; the roll-up
+# notification hold off too, so last_notified_ts behaves exactly as it did
+# before that setting existed for the state this suite actually checks.
 service.alerts_db.save_settings({"rollup_enabled": True, "email_enabled": False,
-                                 "new_device_grace_s": 0})
+                                 "new_device_grace_s": 0,
+                                 "notify_rollup_delay_s": 0})
 
 web_port = _paths.free_tcp_port()
 server = WebServer(service, host="127.0.0.1", port=web_port,

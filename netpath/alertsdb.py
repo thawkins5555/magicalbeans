@@ -174,6 +174,17 @@ DEFAULTS = {
     "renotify_minutes": 0,          # 0 = notify once per open alert, never again while open
     "notify_on_clear": True,
     "max_emails_per_hour": 60,
+    # An alert's first email waits this long after it opens before going
+    # out, so a mass outage's worth of alerts — each one real, each one
+    # opening within seconds of the last while a poll cycle works through a
+    # dead site — coalesce into one digest instead of one email apiece, and
+    # so an alert that clears or gets rolled up under another one within the
+    # wait never has to be un-sent. The alert itself still opens immediately
+    # in the UI and database; only the OUTBOUND EMAIL is held. 0 disables
+    # the hold — an alert's first notice goes out the moment it opens, the
+    # only behaviour this database has ever had before this setting existed.
+    # See AlertEngine._sweep_notify_rollup.
+    "notify_rollup_delay_s": 240,
     # A device added a moment ago is usually mid-setup: wrong community, not
     # cabled yet, still booting. Alerts for it are held this long and then
     # fired only if the condition is still true. 0 disables the hold.
@@ -240,6 +251,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_mute_entity
 # How long a mute may last. The dropdown offers 1/6/12/24 hours; the cap is
 # here so a hand-made API call cannot silence a device until next year.
 MAX_MUTE_HOURS = 24.0
+
+# The sane range for notify_rollup_delay_s: coerce_settings only checks that
+# it is a number, never that it is a sensible one, so a hand-made API call
+# (or a fat-fingered UI value before the browser's own min= clamps it) could
+# otherwise hold an alert's first email for a year. Clamped here, in
+# settings(), rather than only where AlertEngine reads it, so every reader —
+# the engine, the settings API response, a future one — sees the same
+# already-sane number rather than each having to know the limit itself.
+NOTIFY_ROLLUP_DELAY_MAX_S = 3600
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
@@ -798,6 +818,9 @@ class AlertsDatabase:
                 except (ValueError, TypeError):
                     pass
         values = settingsutil.coerce_settings(DEFAULTS, values, strict=False)
+        values["notify_rollup_delay_s"] = max(0, min(
+            int(values.get("notify_rollup_delay_s", 0) or 0),
+            NOTIFY_ROLLUP_DELAY_MAX_S))
         values["has_smtp_credential"] = bool(cred and cred["password_enc"])
         return values
 
@@ -1115,6 +1138,30 @@ class AlertsDatabase:
                 "SELECT * FROM alerts WHERE state = 'open'"
                 " AND COALESCE(last_notified_ts, opened_ts) <= ?"
                 " ORDER BY severity, last_ts", (cutoff_ts,)).fetchall()
+
+    def alerts_due_first_notify(self, cutoff_ts: float) -> list[sqlite3.Row]:
+        """Alerts whose FIRST notification is still undecided: nobody has
+        ever attempted to email about them (last_notified_ts IS NULL), and
+        they are old enough that notify_rollup_delay_s has elapsed
+        (opened_ts <= cutoff_ts).
+
+        Not filtered on state, unlike alerts_due_renotify: an alert that
+        cleared or was absorbed into a rollup parent while its notice was
+        still held is exactly the case that needs a decision recorded (skip,
+        with a reason) rather than silence, so a resolved row with no
+        decision yet is just as "due" as an open one. See
+        AlertEngine._sweep_notify_rollup.
+
+        last_notified_ts IS NULL is what makes this restart-safe for free:
+        it is a column on the row, not in-memory queue state, so a restart
+        mid-hold picks the same alerts back up on the next tick rather than
+        losing track of what it owed an email.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alerts WHERE last_notified_ts IS NULL"
+                " AND opened_ts <= ? ORDER BY severity, opened_ts",
+                (cutoff_ts,)).fetchall()
 
     def expired_alerts(self, now: float) -> list[sqlite3.Row]:
         """Alerts whose rule gives them a lifetime that has run out.

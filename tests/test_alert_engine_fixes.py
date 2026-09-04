@@ -38,6 +38,10 @@ def build(**settings):
     Email is off and the new-device hold is disabled by default: both would
     give an occurrence a reason to be dropped that has nothing to do with
     what any section here is testing. A section that wants email says so.
+    The roll-up notification hold is off by default for the same reason —
+    every section before B16 was written against "the first notice goes out
+    the moment the alert opens", and notify_rollup_delay_s's own default of
+    240 would silently hold every one of them. B16 turns it on explicitly.
     """
     _SEQ[0] += 1
     folder = os.path.join(TMPDIR, f"case{_SEQ[0]}")
@@ -45,7 +49,7 @@ def build(**settings):
     nodes = NodesDatabase(os.path.join(folder, "nodes.db"))
     alerts = AlertsDatabase(os.path.join(folder, "alerts.db"))
     values = {"email_enabled": False, "rollup_enabled": False,
-              "new_device_grace_s": 0}
+              "new_device_grace_s": 0, "notify_rollup_delay_s": 0}
     values.update(settings)
     alerts.save_settings(values)
     snmp = SnmpTrapDatabase(os.path.join(folder, "traps.db"))
@@ -590,7 +594,7 @@ rebooted = open_rows(alerts, "device_rebooted", did)
 assert len(recovered) == 1 and len(rebooted) == 1
 alerts.acknowledge(rebooted[0]["id"], "operator", "known maintenance")
 
-engine._sweep_expired()
+engine._sweep_expired(alerts.settings())
 assert len(open_rows(alerts, "device_up", did)) == 1, "not due yet"
 
 # Back-date both past their intervals (device_up 1 h, device_rebooted 24 h).

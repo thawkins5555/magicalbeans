@@ -854,6 +854,19 @@
         ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
         ${check('as-clear', 'Send an email when an alert clears', s.notify_on_clear)}
         ${number('as-maxhour', 'Max emails per hour', s.max_emails_per_hour, 'min=1')}
+        ${number('as-rollupdelay', 'Hold notifications for roll-up',
+                 Math.round((s.notify_rollup_delay_s ?? 240) / 60), 'min=0')} min
+        <p class="hint">A new alert's own email waits this long before it is
+          sent, so several alerts opening close together — a mass outage's
+          worth of "device not responding" rows, one per device as a slow
+          poll cycle reaches each of them — go out as one digest instead of
+          one email apiece, and stay inside <b>Max emails per hour</b> rather
+          than burning through it in the first minute. Nothing about the
+          alert itself waits: it still opens on the Alerts page and counts
+          toward the totals immediately. An alert that clears, or turns out
+          to be implied by another one, before the wait is up is never
+          emailed at all. 0 sends the moment an alert opens, as before this
+          setting existed.</p>
         ${number('as-grace', 'Hold alerts on a newly added device for',
                  Math.round((s.new_device_grace_s ?? 300) / 60), 'min=0')} min
         <p class="hint">A device added a moment ago is usually still being set
@@ -936,6 +949,7 @@
           smtp_from: text('#as-from'), smtp_from_name: text('#as-fromname'),
           smtp_to_default: recipients, renotify_minutes: num('#as-renotify'),
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
+          notify_rollup_delay_s: num('#as-rollupdelay') * 60,
           new_device_grace_s: num('#as-grace') * 60,
           rollup_enabled: on('#as-rollup'),
           table_columns: App.readColumnPicker(

@@ -351,6 +351,11 @@ class MailJob:
     is_html: bool = False
     alert_id: int | None = None
     kind: str = "alert"
+    # Set only for a roll-up digest (AlertEngine._send_digest): every alert
+    # id this one message speaks for, so _mail_result can write each of them
+    # its own notification row from a single delivery. None for every other
+    # job, which still means exactly what alert_id alone always has.
+    alert_ids: list | None = None
 
 
 class MailQueue:

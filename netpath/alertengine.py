@@ -49,6 +49,22 @@ OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
 DRAIN_ROW_BUDGET = 5000
 DRAIN_TIME_BUDGET_S = 2.0
 
+# The sane range for notify_rollup_delay_s. 3600 is generous — an hour is
+# already longer than an operator would plausibly want an outage's first
+# notice held — and exists only so a fat-fingered setting cannot make every
+# alert wait until doomsday; 0 (the lower bound) is the escape hatch that
+# disables the hold entirely. See AlertEngine._notify_rollup_delay.
+NOTIFY_ROLLUP_DELAY_MAX_S = 3600.0
+
+# More than this many alerts sendable in one roll-up flush go out as a
+# single digest instead of one email each — see _sweep_notify_rollup and
+# _send_digest. Three is small enough that an operator with one or two
+# outages still gets the familiar per-alert subject line and template, and
+# small enough that the 250-device review's "5 real alerts" case never
+# becomes a digest either — the digest exists for the 377-alert case, not
+# for an ordinary Tuesday.
+DIGEST_THRESHOLD = 3
+
 # _rollup_parent's third answer, beside "this open alert already says it" and
 # "nothing does". It means "an outage implies this, but there is no open row
 # to hang a note on" — the parent was resolved by hand while the device is
@@ -282,8 +298,9 @@ class AlertEngine:
         # Only now, once every occurrence above has been applied (or
         # deliberately skipped), does any source's cursor move.
         self._flush_cursors()
-        self._sweep_expired()
+        self._sweep_expired(settings)
         self._sweep_renotify(settings)
+        self._sweep_notify_rollup(settings)
 
     # -------------------------------------------------- system occurrences
 
@@ -333,14 +350,24 @@ class AlertEngine:
 
     def _mail_result(self, job, ok: bool, error: str) -> None:
         """One delivery finished, on the mail worker's thread. AlertsDatabase
-        has its own RLock, so the notification row is safe to write here."""
+        has its own RLock, so the notification row is safe to write here.
+
+        job.alert_ids, when set, is a roll-up digest naming every alert it
+        covers (see _send_digest) — one delivery, but every alert it spoke
+        for gets its own notification row, so each alert's own history still
+        shows whether and when it was told about. job.alert_id alone (the
+        ordinary case) keeps the single row every other caller has always
+        written.
+        """
         if ok:
             self.counters["emails_sent"] += 1
         else:
             self.counters["send_errors"] += 1
-        self.db.record_notification(job.alert_id, job.kind,
-                                    ", ".join(job.to_addrs), job.subject,
-                                    ok, error)
+        alert_ids = getattr(job, "alert_ids", None) or [job.alert_id]
+        for alert_id in alert_ids:
+            self.db.record_notification(alert_id, job.kind,
+                                        ", ".join(job.to_addrs), job.subject,
+                                        ok, error)
 
     def _mail_breaker(self, is_open: bool, error: str) -> None:
         """The mail path itself became (un)usable. Raised as an ordinary
@@ -1838,8 +1865,74 @@ class AlertEngine:
             return None
         return entry[2] if entry else None
 
+    # --------------------------------------------- notification roll-up
+
+    def _notify_rollup_delay(self, settings) -> float:
+        """notify_rollup_delay_s, clamped to [0, NOTIFY_ROLLUP_DELAY_MAX_S].
+
+        Read and sanity-checked at the point of use rather than validated on
+        the way into the database, the same convention _hold_for_new_device
+        and _sweep_renotify already use for new_device_grace_s and
+        renotify_minutes. 0 (the default clamp on anything unparsable) means
+        the hold is off — see every caller below, which treats <= 0 as
+        "behave exactly as before this setting existed."
+        """
+        try:
+            delay = float(settings.get("notify_rollup_delay_s", 240) or 0)
+        except (TypeError, ValueError):
+            delay = 0.0
+        return max(0.0, min(delay, NOTIFY_ROLLUP_DELAY_MAX_S))
+
+    def _skip_held_open_notify(self, alert_row, settings, reason: str) -> bool:
+        """Close out an alert's still-pending FIRST notification without
+        sending it, when the roll-up hold is what is pending it.
+
+        True only when it actually acted — the hold is on
+        (notify_rollup_delay_s > 0) AND nobody has attempted this alert's
+        open notice yet (last_notified_ts IS NULL). Both must hold: at
+        delay 0 this is a permanent no-op, which is what makes 0 an exact
+        passthrough to the engine's pre-4.47 behaviour; and an alert whose
+        open notice already went out (or was already decided some other
+        way) must never be re-recorded here, or a second "not sent" row
+        would sit next to a real notification.
+
+        record_notification uses kind "alert": this decides the OPEN
+        notice, whatever later closed the alert (a clear, an absorption, an
+        expiry, a hand resolve) — it is not itself a clear notification.
+        mark_notified stamps last_notified_ts so alerts_due_first_notify
+        never asks about this alert again — see its own docstring on why
+        that column, not an in-memory set, is what "due" means.
+        """
+        if self._notify_rollup_delay(settings) <= 0:
+            return False
+        if "last_notified_ts" not in alert_row.keys() \
+                or alert_row["last_notified_ts"] is not None:
+            return False
+        self.db.record_notification(alert_row["id"], "alert", "", "", False, reason)
+        self.db.mark_notified(alert_row["id"])
+        return True
+
+    def _occurrence_from_alert_row(self, alert_row, rule_row) -> Occurrence:
+        """Rebuild the Occurrence an alert row was opened from, out of its
+        own stored extras — for a caller with no fresh occurrence to hand
+        _notify, _rollup_parent or _parent_operator_resolved: the renotify
+        sweep, and the roll-up flush sweep below it, both need to ask
+        questions an Occurrence answers about an alert that is not
+        recurring right now.
+        """
+        try:
+            extra = json.loads(alert_row["extra_json"] or "{}")
+        except (TypeError, ValueError):
+            extra = {}
+        return Occurrence(
+            kind=rule_row["kind"], source_kind=rule_row["source_kind"] or "",
+            entity_kind=alert_row["entity_kind"], entity_id=alert_row["entity_id"],
+            entity_label=alert_row["entity_label"], ts=alert_row["last_ts"],
+            message=alert_row["message"], detail=alert_row["detail"] or "",
+            extra=extra if isinstance(extra, dict) else {})
+
     def _absorb_subordinates(self, parent_rule, occurrence: Occurrence,
-                             parent_row) -> None:
+                             parent_row, settings) -> None:
         """Resolve the alerts a just-opened parent makes redundant.
 
         Resolved rather than left open, because an operator working the list
@@ -1868,6 +1961,15 @@ class AlertEngine:
         device recovers a still-breaching child threshold has to be free to
         re-open on the very next tick's re-derivation, not stay suppressed as
         though someone had resolved that breach run themselves.
+
+        Silent absorption is also the case the roll-up notification hold
+        exists to catch: a child absorbed here may have opened moments ago
+        with its own first email still held (see _sweep_notify_rollup), and
+        that email must now never go out — nobody should be told about an
+        alert this same tick just decided was never a separate problem. This
+        closes that out immediately, right where the absorption happens,
+        rather than leaving it for the flush sweep to work out later from
+        state alone.
         """
         for child_key in ROLLS_UP.get(parent_rule["key"] or "", ()):
             child_rule = self.db.rule_by_key(child_key)
@@ -1880,18 +1982,25 @@ class AlertEngine:
                 self.db.add_rollup_note(
                     parent_row["id"],
                     f"Resolved “{child_rule['name']}” — implied by this outage")
+                self._skip_held_open_notify(
+                    resolved, settings,
+                    f"not sent: rolled up under “{parent_row['entity_label']}”")
         if (parent_rule["key"] or "") == "device_down" \
                 and occurrence.entity_kind == "device":
-            self._absorb_downstream(parent_rule, occurrence, parent_row)
+            self._absorb_downstream(parent_rule, occurrence, parent_row, settings)
 
-    def _absorb_downstream(self, rule, occurrence: Occurrence, parent_row) -> None:
+    def _absorb_downstream(self, rule, occurrence: Occurrence, parent_row,
+                           settings) -> None:
         """Resolve the outages of everything behind a device that just went
         down, when their alerts opened before this one did.
 
         _rollup_parent covers the other order — a downstream outage noticed
         after the upstream one is suppressed before it opens. Both orders
         happen: a power event takes the whole site at once and which device
-        the poller reaches first is arbitrary.
+        the poller reaches first is arbitrary. This is exactly the order the
+        review's 499-device outage hit: 377 device-down alerts opened, each
+        with its own first email held, before the core's own alert caught up
+        and absorbed them here.
 
         Silent, like every other absorption: no clear email for an alert that
         was never a separate problem. If the upstream comes back and a
@@ -1915,6 +2024,9 @@ class AlertEngine:
                     parent_row["id"],
                     f"Resolved “{resolved['entity_label']}” — implied by the "
                     f"upstream outage of {occurrence.entity_label}")
+                self._skip_held_open_notify(
+                    resolved, settings,
+                    f"not sent: rolled up under “{parent_row['entity_label']}”")
 
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
@@ -1997,8 +2109,16 @@ class AlertEngine:
             if is_new:
                 self.counters["opened"] += 1
                 if rollup and (rule["key"] or "") in ROLLS_UP:
-                    self._absorb_subordinates(rule, occurrence, row)
-                self._notify(row, rule, occurrence, settings)
+                    self._absorb_subordinates(rule, occurrence, row, settings)
+                # notify_rollup_delay_s > 0 holds this alert's first email
+                # rather than sending it here: _sweep_notify_rollup picks it
+                # up, once it is old enough, from last_notified_ts being
+                # still NULL on the row _apply just inserted — no in-memory
+                # queue to lose on a restart, no branch here beyond the one
+                # skipped call. At 0 (the exact behaviour this replaces)
+                # _notify runs right here, exactly as it always has.
+                if self._notify_rollup_delay(settings) <= 0:
+                    self._notify(row, rule, occurrence, settings)
             # Renotify is NOT decided here any more. It used to compare
             # against row["last_ts"], which open_or_increment had just set to
             # this occurrence's timestamp a statement earlier, so the
@@ -2010,7 +2130,7 @@ class AlertEngine:
 
     # ------------------------------------------------------------- expiry
 
-    def _sweep_expired(self) -> None:
+    def _sweep_expired(self, settings) -> None:
         """Close alerts whose rule gives them a lifetime that has run out.
 
         No clear email: a rule with an auto-resolve interval reports
@@ -2025,6 +2145,13 @@ class AlertEngine:
         for row in self.db.expired_alerts(time.time()):
             self.db.resolve(row["id"], by="")
             self.counters["resolved"] += 1
+            # An expiring alert whose own open notice was still held closes
+            # that out too, with its own reason — the roll-up flush sweep
+            # would otherwise have to guess why a "resolved" row it never
+            # decided about got that way.
+            self._skip_held_open_notify(
+                row, settings,
+                "not sent: alert auto-resolved within the roll-up window")
 
     # ------------------------------------------------------------ renotify
 
@@ -2050,20 +2177,23 @@ class AlertEngine:
         # Minus one tick, so an alert due at exactly N minutes is not
         # deferred to the following tick every single time.
         cutoff = time.time() - (minutes * 60 - TICK_S)
+        delay = self._notify_rollup_delay(settings)
         for row in self.db.alerts_due_renotify(cutoff):
+            if delay > 0 and row["last_notified_ts"] is None:
+                # Its own FIRST notice is still held for roll-up coalescing
+                # (or was skipped and left pending on a mute — see
+                # _sweep_notify_rollup) — COALESCE(last_notified_ts,
+                # opened_ts) in alerts_due_renotify's own query still makes
+                # this row "due" from opened_ts alone, same as an alert that
+                # opened while email was off always has. Renotifying about
+                # something the operator has not been told about yet would
+                # announce it twice: once as a "reminder" before the actual
+                # notice ever went out.
+                continue
             rule = self.db.rule(row["rule_id"])
             if rule is None or not rule["enabled"]:
                 continue
-            try:
-                extra = json.loads(row["extra_json"] or "{}")
-            except (TypeError, ValueError):
-                extra = {}
-            occurrence = Occurrence(
-                kind=rule["kind"], source_kind=rule["source_kind"] or "",
-                entity_kind=row["entity_kind"], entity_id=row["entity_id"],
-                entity_label=row["entity_label"], ts=row["last_ts"],
-                message=row["message"], detail=row["detail"] or "",
-                extra=extra if isinstance(extra, dict) else {})
+            occurrence = self._occurrence_from_alert_row(row, rule)
             self._notify(row, rule, occurrence, settings, renotify=True)
 
     # -------------------------------------------------------------- notify
@@ -2247,6 +2377,16 @@ class AlertEngine:
         built-in templates instead of one per rule."""
         if not settings.get("notify_on_clear", True):
             return
+        # An alert whose own OPEN notice is still held (or was already
+        # skipped for some other reason and left pending — see
+        # _sweep_notify_rollup) must not get a "recovered" email either:
+        # nobody was ever told there was a problem, so telling them it is
+        # over is a message about nothing. A no-op at delay 0, same as every
+        # other _skip_held_open_notify call — see its own docstring.
+        if self._skip_held_open_notify(
+                alert_row, settings,
+                "not sent: cleared within the roll-up window"):
+            return
         # A muted device sends no email at all, resolutions included. The
         # alert itself still resolves — the list stays truthful whatever the
         # mute says — but "muted" has to mean the operator's inbox goes
@@ -2269,3 +2409,196 @@ class AlertEngine:
             extra=dict(extra or {}))
         self._notify(alert_row, rule_row, occurrence, settings,
                      notify_kind="clear", template_override=template)
+
+    # ------------------------------------------------- roll-up flush sweep
+
+    # The two _rollup_parent/_parent_operator_resolved answers that carry no
+    # open row to name in a "rolled up under X" message — the outage's own
+    # alert was resolved by hand while the condition it reports is still
+    # true. Shared text rather than composed per call site, since both
+    # branches below mean exactly the same thing to an operator reading the
+    # notification history: this was implied by an outage somebody already
+    # knows about and has worked.
+    _ROLLUP_NO_ROW_REASON = ("not sent: rolled up under an outage whose own "
+                             "alert was resolved by hand while it is still true")
+
+    def _sweep_notify_rollup(self, settings) -> None:
+        """Deliver (or finally give up on) the FIRST notification of every
+        alert whose notify_rollup_delay_s hold has elapsed.
+
+        Reads alerts_due_first_notify — last_notified_ts IS NULL and old
+        enough — rather than keeping its own queue: the row IS the queue, so
+        a restart mid-hold picks up exactly where it left off, and nothing
+        here has to reconcile in-memory state against the database on the
+        way back up. A no-op whenever the hold itself is off (delay <= 0),
+        which is what makes 0 an exact passthrough — nothing below this
+        point runs at all, and _apply's own synchronous _notify call is the
+        only thing that ever fires.
+
+        Per due alert, in order:
+
+        1. Already resolved. The two paths that resolve one on purpose — a
+           genuine recovery through _notify_clear, an absorption through
+           _absorb_subordinates/_absorb_downstream — already recorded why and
+           stamped the clock themselves, right when it happened (see
+           _skip_held_open_notify), so last_notified_ts would no longer be
+           NULL and this alert would not even be in the due list. Reaching
+           this branch at all means something else closed it first — an
+           operator's hand resolve, most likely — so there is nothing more
+           specific to say than that it cleared before its notice went out.
+        2. Still covered by a rollup parent RIGHT NOW, asked with the exact
+           predicate _apply itself asks before opening a fresh occurrence
+           (_rollup_parent, then _parent_operator_resolved): an ancestor's
+           outage alert opened after this one did and has not yet reached
+           the absorption pass for it (a race the review's 499-device outage
+           hit at 250+ devices), or an operator resolved that ancestor's
+           alert by hand while its condition still holds — the one case
+           nothing else in the engine retroactively resolves this alert for.
+        3. Muted. Left pending rather than decided — a mute is temporary, and
+           a device unmuted before the operator ever sees this in the UI
+           should still get the notice once the mute lifts, not lose it.
+           Mirrors _notify_clear's own mute check, which is likewise a quiet
+           skip rather than a recorded "not sent".
+        4. Otherwise sendable, and handed to _notify one at a time (three or
+           fewer real alerts in this flush) or to _send_digest as a batch
+           (more than three) — see DIGEST_THRESHOLD.
+
+        The system-rule and notify-column guards _notify itself opens with
+        are asked here too, before any of the above: a rule this engine will
+        never mail, held or not, must not sit "due" forever re-asking the
+        same question every five seconds.
+        """
+        delay = self._notify_rollup_delay(settings)
+        if delay <= 0:
+            return
+        due = self.db.alerts_due_first_notify(time.time() - delay)
+        if not due:
+            return
+        rollup = bool(settings.get("rollup_enabled", True))
+        sendable = []
+        for alert_row in due:
+            rule_row = self.db.rule(alert_row["rule_id"])
+            if rule_row is None or not rule_row["enabled"]:
+                self.db.mark_notified(alert_row["id"])
+                continue
+            if rule_row["kind"] == "system" or (
+                    "notify" in rule_row.keys() and not rule_row["notify"]):
+                self.db.mark_notified(alert_row["id"])
+                continue
+            if alert_row["state"] == "resolved":
+                self._skip_held_open_notify(
+                    alert_row, settings,
+                    "not sent: cleared within the roll-up window")
+                continue
+            occurrence = self._occurrence_from_alert_row(alert_row, rule_row)
+            if rollup:
+                parent = self._rollup_parent(rule_row, occurrence)
+                if parent is SUPPRESSED:
+                    self._skip_held_open_notify(
+                        alert_row, settings, self._ROLLUP_NO_ROW_REASON)
+                    continue
+                if parent is not None:
+                    self._skip_held_open_notify(
+                        alert_row, settings,
+                        f"not sent: rolled up under “{parent['entity_label']}”")
+                    continue
+                if self._parent_operator_resolved(rule_row, occurrence):
+                    self._skip_held_open_notify(
+                        alert_row, settings, self._ROLLUP_NO_ROW_REASON)
+                    continue
+            if self._muted_alert(alert_row):
+                continue
+            sendable.append((alert_row, rule_row, occurrence))
+        if not sendable:
+            return
+        if len(sendable) > DIGEST_THRESHOLD:
+            self._send_digest(sendable, settings, delay)
+        else:
+            for alert_row, rule_row, occurrence in sendable:
+                self._notify(alert_row, rule_row, occurrence, settings)
+
+    def _send_digest(self, sendable, settings, delay_s: float) -> None:
+        """One email for every alert in `sendable`, counted once against
+        max_emails_per_hour — the whole point of coalescing a mass outage's
+        alerts is that it costs the budget one send, not one per alert.
+
+        Deliberately not _notify with a batch template: every built-in and
+        custom template is written for one alert's tokens, and a digest has
+        no single {{device_name}} to render. Plain text, in the same style
+        _notify's own templates use, built directly rather than through
+        alertmail.render — there is no per-alert template to look up here,
+        each alert already rendered as a plain "label: message" line is
+        exactly what an operator scanning a mass-outage digest wants, and a
+        one-off format earns its own bespoke building over recruiting the
+        token substitution machinery for a job it was not shaped for.
+
+        Guards mirror _notify's own, in the same order, because a digest is
+        still just several first notifications going out together: the
+        hourly budget, then whether email is even configured, then whether
+        there is anyone to send it to. Each guard that stops the send still
+        has to close out every alert's pending decision, or they would sit
+        "due" forever asking the same question every tick.
+        """
+        now = time.time()
+        hour_ago = now - 3600
+        self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
+        max_per_hour = int(settings.get("max_emails_per_hour", 60))
+        current_hour = int(now // 3600)
+        if max_per_hour and len(self._sent_this_hour) >= max_per_hour:
+            self.counters["suppressed"] += 1
+            reason = f"not sent: over the {max_per_hour}/hour email limit"
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.record_notification(alert_row["id"], "alert", "", "",
+                                            False, reason)
+                self.db.mark_notified(alert_row["id"], now)
+            if self._suppression_logged_hour != current_hour:
+                self._suppression_logged_hour = current_hour
+                self.log.add(ERROR, f"Alert email volume over {max_per_hour}/hour — "
+                                    f"suppressing further sends for the rest of this hour")
+            return
+        if not settings.get("email_enabled") or not settings.get("smtp_host"):
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.mark_notified(alert_row["id"], now)
+            return
+        raw_to = settings.get("smtp_to_default", [])
+        if isinstance(raw_to, str):
+            to_addrs = [a.strip() for a in raw_to.split(",") if a.strip()]
+        else:
+            to_addrs = [str(a).strip() for a in raw_to if str(a).strip()]
+        if not to_addrs:
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.mark_notified(alert_row["id"], now)
+            return
+        password = None
+        if self.app_db is not None:
+            blob = self.db.smtp_password_enc()
+            if blob:
+                try:
+                    from . import dpapi
+                    password = dpapi.unprotect(blob).decode("utf-8")
+                except Exception:
+                    password = None
+        minutes = max(1, round(delay_s / 60.0))
+        subject = (f"SappiWhere: {len(sendable)} alerts opened in the last "
+                  f"{minutes} minute{'s' if minutes != 1 else ''}")
+        lines = [f"{row['entity_label']}: {row['message']}"
+                for row, _rule_row, _occurrence in sendable]
+        body = ("\n\n".join(lines) +
+               f"\n\nThese {len(sendable)} alerts have each occurred once so "
+               f"far and are individually visible on the Alerts page.\n\n"
+               f"-- SappiWhere")
+        job = alertmail.MailJob(
+            settings=dict(settings), password=password, to_addrs=list(to_addrs),
+            subject=subject, body=body, is_html=False,
+            alert_id=sendable[0][0]["id"], kind="alert",
+            alert_ids=[row["id"] for row, _rule_row, _occurrence in sendable])
+        password = None
+        self._sent_this_hour.append(now)
+        for alert_row, _rule_row, _occurrence in sendable:
+            self.db.mark_notified(alert_row["id"], now)
+        if not self._mail.submit(job):
+            self.counters["send_errors"] += 1
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.record_notification(alert_row["id"], "alert",
+                                            ", ".join(to_addrs), subject,
+                                            False, "send queue full")
