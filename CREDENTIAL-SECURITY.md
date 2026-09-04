@@ -12,11 +12,11 @@ ways:
 | --- | --- | --- |
 | A person's web login password | Nowhere — only a hash is stored, in `app.db` | No. Never was — a hash is a one-way function. |
 | A session token, after signing in | In memory only, on the server | Not applicable — it isn't a secret derived from anything; it's random data that exists once, in memory, and is compared to itself. |
-| An optional DHCP polling credential | Encrypted in `ipam.db`, if you chose to store one | No — SappiWhere can decrypt it (that's the point), but it never leaves the process as plaintext, and a copy of the file on other hardware cannot decrypt it at all. |
-| An optional SNMPv3 authentication password (Nodes) | Encrypted in `nodes.db`, per device or per polling profile, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
-| An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
-| An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
-| An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same DPAPI machine-scoped guarantee as the DHCP credential. |
+| An optional DHCP polling credential | Encrypted in `ipam.db`, if you chose to store one | No — SappiWhere can decrypt it (that's the point), but it never leaves the process as plaintext. On Windows, a copy of the file on other hardware cannot decrypt it at all (DPAPI ties it to this machine). Off Windows, using the portable secret store, it *can* be decrypted elsewhere — but only by something that has both the same passphrase and the per-install salt file, neither of which travels with `ipam.db` itself. See §10. |
+| An optional SNMPv3 authentication password (Nodes) | Encrypted in `nodes.db`, per device or per polling profile, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored, and the content endpoint requires `configrx: write` rather than `configrx: read`. See §6a. |
 
 Everything below explains why each row is true.
@@ -737,23 +737,29 @@ things remain outside its reach entirely:
 
 ---
 
-## 10. Non-Windows hosts cannot store a credential
+## 10. Storing a credential off Windows
 
-This is the largest limitation in this document and it deserves its own
-section rather than a footnote in five others.
+This used to be the largest limitation in this document, and it still gets
+its own section rather than a footnote in five others — the difference is
+that it now describes an opt-in, not a wall.
 
 Every encrypted credential in the table at the top of this file — the DHCP
 credential, the SNMPv3 authentication password, the SMTP password, the
 wireless controller's SNMP credential, ConfigRX's SSH password, and the
 password the interactive SSH terminal reuses — goes through
-`netpath/dpapi.py`, which is a wrapper over the Windows Data Protection API.
-`dpapi.available()` is `os.name == "nt"`. On Linux, macOS or BSD it returns
-false, and the eight API endpoints that would store a secret refuse with a
-clear error instead.
+`netpath/dpapi.py`. On Windows that has always meant, and still means, the
+Windows Data Protection API, unchanged: `dpapi.available()` is unconditionally
+true there, and `dpapi.protect()`/`dpapi.unprotect()` call `CryptProtectData`/
+`CryptUnprotectData` exactly as before. Off Windows, `dpapi.py` now dispatches
+to `netpath/secretstore.py` — a portable secret store, described in full
+below — instead of refusing outright. `dpapi.available()` there is true once
+an operator has configured a passphrase for it; false, exactly as before,
+until they have.
 
-**So, concretely, on a Linux host:**
+**So, concretely, on a Linux host with nothing configured** (still the
+out-of-the-box state — nothing about this is on by default):
 
-| Feature | On Windows | On Linux |
+| Feature | On Windows | On Linux, unconfigured |
 | --- | --- | --- |
 | SNMP v1/v2c polling | yes | yes |
 | SNMPv3 noAuthNoPriv polling | yes | yes |
@@ -764,62 +770,213 @@ clear error instead.
 | Wireless (FortiGate controller) | yes | **no** — the controller's SNMP credential cannot be stored |
 | DHCP scope and lease visibility | yes | **no** — and PowerShell/RSAT is Windows-only anyway |
 
+Configure a passphrase (below) and every row but the last turns into a
+plain **yes** — the DHCP row stays Windows-only regardless, because
+PowerShell/RSAT, not DPAPI, is what it actually depends on.
+
 Everything else — SNMP polling, NetPath, NetFlow, syslog, traps, IPAM
 scanning, alerting, the web interface, the whole browser application — works
-identically on either.
+identically on either, configured or not.
 
-The application tells you this **before** you type a secret, not after: the
-credential fields in the Nodes, Wireless, ConfigRX and Alerts dialogs render
-disabled with the text "Not available on this host (Windows DPAPI only)", and
-IPAM's DHCP form is replaced by a notice off Windows rather than accepting
-input it cannot use. `/api/state` reports `platform: {is_windows, powershell,
-secret_store: false}` so the browser can make that decision without guessing.
+**A gap this workstream did not close.** The credential fields in the Nodes,
+Wireless, ConfigRX and Alerts dialogs still render disabled with "Not
+available on this host (Windows DPAPI only)", and `/api/state`'s
+`platform.secret_store` field is still hard-coded `false` off Windows — both
+live in `netpath/web/api.py` and the front end, outside what this change
+touched. The API endpoints underneath them are not hard-coded: each one calls
+`dpapi.available()` fresh on every request, so a configured host accepts a
+credential posted to them directly (`curl`, a script, or a future browser
+build that reads the flag correctly) even while the browser's own form still
+shows the field greyed out. Wiring `secret_store` to `dpapi.available()` and
+updating the disabled-field copy is the remaining piece of this feature —
+tracked as a follow-up, not silently left for someone to discover.
 
-### Why there is no portable secret store, yet
+### The portable secret store
 
-A portable secret store was designed for 4.39.0 and **deliberately deferred**.
-The reasoning is worth writing down, because "just encrypt it with a key in a
-file" is the obvious answer and it is the wrong one.
-
-DPAPI's guarantee is specific and strong: the ciphertext can be decrypted only
-by the same Windows account on the same machine, with the key material held by
-the operating system and never present in this application's files. A copy of
-`nodes.db` taken to another machine is inert. Any portable scheme has to be
-honest about giving that up, and each of the three plausible designs gives up
-something different:
+A portable secret store was designed for 4.39.0 and deliberately deferred at
+the time. The analysis behind that deferral is worth keeping — the three
+designs it weighed are still the three designs there are, and the one it
+identified as sound is the one that shipped:
 
 - **A key file beside the database** protects against nothing that matters. An
   attacker who can read `nodes.db` can read `nodes.key` in the same directory.
   It would move the credentials from "stored in the clear" to "stored in a way
   that looks encrypted", which is worse, because it invites trust it has not
-  earned.
+  earned. **Not used.**
 - **A passphrase supplied at start-up**, deriving the key with scrypt and
   holding it in memory only, is genuinely equivalent to DPAPI for the
   file-theft case. Its cost is that the service cannot start unattended: every
   restart — a reboot at 03:00, a systemd `Restart=always` after a crash —
   stops until somebody types the passphrase, and a monitoring system that does
-  not come back by itself after a power cut has failed at its job. Working
-  around that means caching the passphrase somewhere, which is the key file
-  again.
+  not come back by itself after a power cut has failed at its job. **This is
+  the design that shipped**, with the unattended-restart cost addressed
+  head-on rather than worked around: an operator who needs restarts to
+  survive unattended can point this application at a passphrase *file*
+  instead of typing one in, explicitly and knowingly trading part of DPAPI's
+  guarantee away for that — see "What each mode actually protects" below.
 - **The platform keyring** (libsecret, gnome-keyring, KWallet) is the right
   answer for a desktop and a poor one for a headless server, where the D-Bus
   session and the unlocking agent that make it work are usually absent. It
   also means a third-party dependency, and this application ships on the
-  standard library alone by policy.
+  standard library alone by policy. **Not used**, for the same reasons as
+  before — nothing about that analysis changed.
 
-None of those is obviously right, and shipping the wrong one is worse than
-shipping none: a credential store that quietly protects less than operators
-believe it does is a bigger problem than a refusal they can plan around. The
-refusal is at least accurate, visible in the interface, and documented here.
+The reasoning for deferring in the first place still holds as a general
+principle: shipping the wrong design would have been worse than shipping
+none. What changed is that one of the three designs turned out to have a
+legitimate, honestly-documented answer to its stated cost, rather than
+requiring a fourth design or a compromise on the crypto itself.
 
-**What to do in the meantime.** Run the service on Windows if you need any of
-the credentialed features — that is the supported answer. If it must be Linux,
-use SNMPv1/v2c or v3 noAuthNoPriv with communities scoped read-only on the
-device, and an SMTP relay on the local network that accepts unauthenticated
-mail from the monitoring host by address. From 4.39.0 the data directory is
-created mode `0700` and every database file `0600`, so at least a shared Linux
-host does not expose one service's communities to every account on the
-machine — but note that a community string is not encrypted anywhere, on any
-platform, and is returned by the API to accounts with the **write** grant on
-the module that owns it. Read-only accounts now see only whether a community
-is set, not its value.
+#### How it works
+
+`netpath/secretstore.py` implements it; `netpath/dpapi.py` is still the only
+module every caller in this application imports, and dispatches to
+`secretstore.py` when `os.name != "nt"`.
+
+1. **Key derivation.** A passphrase (see the two sources below) and a random
+   16-byte salt, generated once per install and kept next to the databases it
+   protects (`secret.salt`, mode `0600`, not itself a secret — its only job is
+   to make the same passphrase derive a different key on two different
+   installs), go through `hashlib.scrypt` at the same cost OWASP-recommended
+   parameters this application already uses for login passwords (N=2^17,
+   r=8, p=1 — see §1). The 32-byte output is expanded into two independent
+   32-byte keys, `key_enc` and `key_mac`, with HMAC-SHA256 under distinct
+   labels — never the same bytes doing two jobs. This is the expensive step,
+   run once per process and cached in memory for its lifetime: "held in
+   memory only" describes these two derived keys, never the passphrase
+   sitting in a file this application wrote, and never scrypt's ~128 MiB
+   being paid again on every credential decrypt (some of them happen once per
+   device, per poll cycle).
+2. **Encryption.** A keystream built from `HMAC-SHA256(key_enc, nonce ||
+   counter)` for successive counters, concatenated and truncated to the
+   plaintext's length, XORed with the plaintext — a keyed hash run in counter
+   mode, built entirely from `hashlib`/`hmac`, not an invented cipher. The
+   16-byte nonce is fresh, from `secrets.token_bytes`, on every single call,
+   so the same plaintext encrypted twice never produces the same ciphertext.
+3. **Authentication.** `HMAC-SHA256(key_mac, version || nonce || ciphertext)`,
+   stored alongside. Verified with `hmac.compare_digest` — constant-time, so
+   a timing side channel cannot be used to guess it a byte at a time — and
+   checked *before* any plaintext is returned to the caller: a wrong
+   passphrase or a tampered blob fails cleanly, never as garbage that looks
+   like a password.
+
+**Blob format**, all fields concatenated:
+
+```
+MAGIC(4="NPSS") | version(1) | scrypt_n(4) | scrypt_r(4) | scrypt_p(4) |
+nonce(16) | ciphertext(len(plaintext)) | mac(32)
+```
+
+The scrypt parameters travel with every blob rather than being assumed from
+this module's current constants, so raising the cost in some future release
+does not strand what is already stored: `unprotect()` always rederives the
+key using whatever a given blob's own header says was used to make it, not
+whatever this build's defaults currently are. (The reverse — an *older*
+build meeting a *newer*, costlier blob — is not promised to work, the same
+way it isn't for the scrypt-hashed login passwords in §1; a fixed, generous
+ceiling on the memory any single derivation may use keeps a corrupted or
+adversarial blob's parameters from being able to ask this process to
+allocate however much memory it likes, rather than trying to honour them.)
+
+`MAGIC` is also how a portable-store blob is told apart from a DPAPI one: a
+real DPAPI blob is CMS-ish binary data with no reason to ever start with
+these four bytes. `dpapi.unprotect()` checks the tag before it checks the
+current platform — a portable-store blob decrypts wherever its passphrase is
+configured, Windows included, if someone sets one there, since the crypto
+above has no platform dependency at all (only DPAPI itself does) — while an
+untagged blob is assumed to be DPAPI's and refused on anything that isn't
+Windows, with a message saying so, rather than being handed to `secretstore`
+and either erroring confusingly or (impossible here, but worth being
+explicit about) silently misinterpreted.
+
+#### The two passphrase sources, in order
+
+1. **`NETPATH_SECRET_PASSPHRASE_FILE`** — an environment variable naming a
+   file that holds the passphrase. Checked first, and the only source
+   recommended for a service that must survive an unattended restart. The
+   file's permission bits are checked before it is read: anything a group or
+   other account can read from (`mode & 0o077`) is refused outright, with the
+   refusal saying so and naming the exact mode found, until it is `chmod 600`
+   (or narrower) and owned by the account the service runs as.
+2. **`NETPATH_SECRET_PASSPHRASE`** — the passphrase directly, in the
+   environment. Checked only if the file variable is unset. Documented here
+   as the weaker of the two, deliberately: on Linux any process running as
+   the same user (or root) can read another process's environment through
+   `/proc/<pid>/environ`, and a passphrase set this way typically also ends
+   up in shell history and in whatever supervises the process (systemd unit
+   files, container environment blocks, CI secrets that get echoed into
+   logs more often than files do). It exists because some deployment tooling
+   only has environment variables to work with, not because it is a design
+   this document endorses over the file.
+
+Neither configured: `secretstore.configured()` — and so `dpapi.available()`
+— is false, exactly as it always was on a non-Windows host, and every
+credential-storing endpoint refuses with the same clear error as before.
+
+#### What each mode actually protects
+
+This is the part every design in the original analysis had to be honest
+about, and the portable store is no exception:
+
+- **The file source, on a correctly permissioned file, is genuinely
+  equivalent to DPAPI for the file-theft case.** An attacker who steals
+  `nodes.db` (or the whole data directory) gains nothing without also
+  reading a file that only the service's own account can read. This is the
+  property the original analysis called out as the one design that actually
+  holds up — it holds up here because the permission check is enforced, not
+  assumed.
+- **It is not equivalent to DPAPI for the host-compromise case.** DPAPI's key
+  material lives inside the operating system and is never present in this
+  application's files at all. The portable store's passphrase file is a file
+  like any other: an attacker who gains the same account the service runs as
+  (not merely a copy of the database) can read it directly. This was true of
+  every non-DPAPI design considered, including the keyring, and is not
+  specific to this one.
+- **The plain environment-variable source protects against a stolen database
+  file and nothing more.** It is meant for tooling that cannot supply a file,
+  not as an equally good alternative to one — see the wording above.
+- **The per-install salt file is not a secret, but it is required.** Losing
+  it (not backing it up alongside the databases it protects) makes every
+  credential encrypted under it permanently undecryptable, passphrase or not
+  — the same practical consequence as losing the passphrase itself. Back up
+  `secret.salt` with the data directory, not separately from it.
+- **Neither mode ties a blob to a specific machine the way DPAPI does.** A
+  copy of the data directory (databases *and* `secret.salt`) taken to
+  different hardware decrypts there too, given the same passphrase. That is
+  a real difference from DPAPI's guarantee, not a bug — a passphrase-based
+  scheme cannot promise machine-binding without also caching something
+  machine-specific somewhere, which is the key-file design again.
+
+#### Limitations
+
+- **No passphrase rotation.** There is no re-key operation. Changing the
+  passphrase makes every credential already stored undecryptable under it;
+  every one of them has to be re-entered under the new passphrase, the same
+  as if DPAPI's machine key had changed. Plan a passphrase change the way
+  you would plan re-entering every credential in the interface, because
+  that is what it is.
+- **The browser UI has not caught up** — see "A gap this workstream did not
+  close" above. The backend enforces and works correctly regardless; the
+  disabled-looking form fields are a display issue, not a security one, but
+  they will confuse an operator who configured a passphrase and still sees
+  "Windows DPAPI only" until that follow-up lands.
+- **A version this build does not recognise, or a blob too short to hold its
+  own header, is refused by name** rather than guessed at — relevant mainly
+  to a future format change, not to normal operation.
+- **Still nothing to fall back to.** With neither DPAPI nor a configured
+  passphrase, storing a credential still raises rather than writing
+  plaintext or a weaker cipher — that principle from the original design
+  did not change, only the set of hosts it applies to shrank.
+
+**What to do if you configure nothing.** Run the service on Windows if you
+need any of the credentialed features, or configure the portable store above
+if it must be Linux. If neither is an option, use SNMPv1/v2c or v3
+noAuthNoPriv with communities scoped read-only on the device, and an SMTP
+relay on the local network that accepts unauthenticated mail from the
+monitoring host by address. Since 4.39.0 the data directory is created mode
+`0700` and every database file `0600`, so at least a shared Linux host does
+not expose one service's communities to every account on the machine — but
+note that a community string is not encrypted anywhere, on any platform, and
+is returned by the API to accounts with the **write** grant on the module
+that owns it. Read-only accounts see only whether a community is set, not
+its value.

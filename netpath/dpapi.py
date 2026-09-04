@@ -1,5 +1,7 @@
-"""Windows DPAPI, for the one secret this application optionally stores: a
-DHCP polling password.
+"""Windows DPAPI, for every secret this application optionally stores: a
+DHCP polling password, an SNMPv3 auth password, ConfigRX's SSH backup
+password, an authenticated SMTP password, and a wireless controller's SNMP
+credential.
 
 Everywhere else in SappiWhere, a credential lives in Windows itself — a user's
 login for the web interface is a scrypt hash, and the preferred way to reach a
@@ -21,9 +23,26 @@ for the one account that encrypted it — safer in principle, unusable in
 practice, since a headless service and the browser session that configured it
 are not reliably the same account.
 
-There is nothing to fall back to when this fails. If DPAPI is unavailable —
-every code path here except a real Windows machine — storing a credential
+On Windows, nothing below has changed: DPAPI is still the only implementation
+this module uses there, and every caller in this application still speaks
+only `available()`, `protect()`, `unprotect()` and `DpapiUnavailable`. What
+has changed is off Windows: `secretstore.py` implements the passphrase-at-
+start-up design CREDENTIAL-SECURITY.md's analysis endorses (see "The
+portable secret store" there), and this module now dispatches to it when
+`os.name != "nt"` — `available()` becomes true there once an operator has
+configured a passphrase source, and `protect()`/`unprotect()` route to it
+instead of raising outright. There is still nothing to fall back to beyond
+that: with neither DPAPI nor a configured passphrase, storing a credential
 raises rather than writing a plaintext password or a weaker cipher instead.
+
+A stored blob is tagged so the two implementations are never confused for
+each other: a portable-store blob starts with `secretstore.MAGIC`, which a
+real DPAPI blob has no reason to ever start with. `unprotect()` checks the
+tag before it checks the platform, so a portable-store blob decrypts
+wherever its passphrase is configured — Windows included, if someone sets
+one there — while an untagged blob is assumed to be DPAPI's and refused with
+a clear message on anything that isn't Windows, rather than silently
+returning garbage.
 """
 
 from __future__ import annotations
@@ -31,6 +50,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import os
+
+from . import secretstore
 
 IS_WINDOWS = os.name == "nt"
 
@@ -47,7 +68,13 @@ class _DATA_BLOB(ctypes.Structure):
 
 
 def available() -> bool:
-    return IS_WINDOWS
+    """True on Windows unconditionally (DPAPI itself may still fail for a
+    real reason, surfaced from protect()/unprotect() when it does — same as
+    always). Off Windows, true once a passphrase source is configured for
+    the portable store; see secretstore.configured(). Every caller in this
+    application gates a credential field on this one boolean, so this is
+    also the answer to "can this host store a secret at all right now"."""
+    return IS_WINDOWS or secretstore.configured()
 
 
 def _to_blob(data: bytes) -> _DATA_BLOB:
@@ -66,10 +93,16 @@ def _from_blob(blob: _DATA_BLOB) -> bytes:
 
 
 def protect(plaintext: bytes) -> bytes:
-    """Encrypt for this machine. Raises DpapiUnavailable off Windows or on
-    any OS failure — never returns a plaintext fallback."""
+    """Encrypt for this machine: DPAPI on Windows, unchanged; the portable
+    store elsewhere, if a passphrase source is configured. Raises
+    DpapiUnavailable on any failure — a missing/misconfigured passphrase
+    source off Windows, or an OS failure on it — never a plaintext or
+    weaker-cipher fallback."""
     if not IS_WINDOWS:
-        raise DpapiUnavailable("DPAPI is only available on Windows")
+        try:
+            return secretstore.protect(plaintext)
+        except secretstore.SecretStoreError as exc:
+            raise DpapiUnavailable(str(exc)) from exc
     blob_in = _to_blob(plaintext)
     blob_out = _DATA_BLOB()
     flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN
@@ -81,9 +114,28 @@ def protect(plaintext: bytes) -> bytes:
 
 
 def unprotect(ciphertext: bytes) -> bytes:
-    """Decrypt a blob this same machine produced with protect()."""
+    """Decrypt a blob protect() produced, on this machine or (for the
+    portable store only, by design — see the module docstring) any machine
+    with the same passphrase configured. Dispatches on the blob's own tag,
+    not on the current platform, so a portable-store blob is never handed
+    to CryptUnprotectData and an untagged (DPAPI) blob is never handed to
+    secretstore off Windows."""
+    ciphertext = bytes(ciphertext)
+    if secretstore.is_portable_blob(ciphertext):
+        try:
+            return secretstore.unprotect(ciphertext)
+        except secretstore.SecretStoreError as exc:
+            raise DpapiUnavailable(str(exc)) from exc
     if not IS_WINDOWS:
-        raise DpapiUnavailable("DPAPI is only available on Windows")
+        raise DpapiUnavailable(
+            "This credential was encrypted with Windows DPAPI, which only "
+            "decrypts on the machine (and OS) that encrypted it — this host "
+            "cannot read it back at all, portable secret store or not. "
+            "Re-enter it after configuring the portable secret store here "
+            "(NETPATH_SECRET_PASSPHRASE_FILE or NETPATH_SECRET_PASSPHRASE — "
+            "see CREDENTIAL-SECURITY.md, \"The portable secret store\"); a "
+            "credential protect()-ed under DPAPI has to be re-typed, not "
+            "migrated.")
     blob_in = _to_blob(ciphertext)
     blob_out = _DATA_BLOB()
     ok = ctypes.windll.crypt32.CryptUnprotectData(
@@ -95,12 +147,14 @@ def unprotect(ciphertext: bytes) -> bytes:
 
 
 def self_test() -> bool:
-    """Round-trips a throwaway value. For a "Check encryption" button in the
-    UI and for confirming a fresh install can actually do this before anyone
-    depends on it — DPAPI has no meaningful failure mode to unit test against
-    on a machine that isn't Windows, so this is the verification available.
+    """Round-trips a throwaway value through whichever implementation
+    available() says this host has right now — DPAPI on Windows, the
+    portable store elsewhere once a passphrase is configured, False (no
+    round trip attempted) otherwise. For a "Check encryption" button in the
+    UI and for confirming a fresh install can actually do this before
+    anyone depends on it.
     """
-    if not IS_WINDOWS:
+    if not available():
         return False
     probe = os.urandom(32)
     try:
