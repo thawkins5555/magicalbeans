@@ -424,18 +424,15 @@ ROUTES = [
     ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
-    # The backup's CONTENT, not its metadata: even after the redaction pass
-    # a captured config is a map of the device — interfaces, ACLs, VPN
-    # peers, management addresses — so downloading one is a ConfigRX write's
-    # privilege. The listing (dates, sizes, hashes, whether it was redacted)
-    # stays a read, which is what a read-only operator needs to answer "has
-    # this switch changed".
-    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", W)),
-    # A diff hands over the device's own configuration lines exactly as
-    # reading one backup's content does (see get_configrx_backup's own
-    # comment above), so it is gated the same way — matched before the
-    # "(\d+)" backup route above could ever apply, though "diff" would
-    # never match \d+ anyway.
+    # The backup's CONTENT, not its metadata — but reading a stored config
+    # is still a read: get_configrx_backup itself redacts any row stored
+    # verbatim (store_secrets on) when the caller lacks ConfigRX write, so
+    # a read-only operator gets the same "has this switch changed" answer
+    # without ever being handed a secret.
+    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
+    # Unlike the backup route above, left at ConfigRX write: matched before
+    # the "(\d+)" backup route could ever apply, though "diff" would never
+    # match \d+ anyway.
     ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),

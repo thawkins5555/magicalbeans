@@ -283,15 +283,11 @@
     const box = App.modal('Add destination', targetForm(null), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (b) => {
-        try {
-          const payload = await App.post('/api/netpath/targets', readTargetForm(b));
-          view.targetId = payload.id;
-          App.closeModal();
-          await refresh();
-        } catch (error) {
-          b.querySelector('#f-budget').innerHTML =
-            `<span class="err">${escape(error.message)}</span>`;
-        }
+        if (!App.requireFields(b, [['#f-host', 'Host or address']])) return;
+        const payload = await App.post('/api/netpath/targets', readTargetForm(b));
+        view.targetId = payload.id;
+        App.closeModal();
+        await refresh();
       } },
     ]);
     wireBudget(box);
@@ -303,6 +299,7 @@
     const box = App.modal('Edit destination', targetForm(target), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (b) => {
+        if (!App.requireFields(b, [['#f-host', 'Host or address']])) return;
         await App.put(`/api/netpath/targets/${target.id}`, readTargetForm(b));
         App.closeModal();
         await refresh();

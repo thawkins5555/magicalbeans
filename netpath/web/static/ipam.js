@@ -4,7 +4,7 @@
    separate top-level tabs — none of them is a whole module on its own. */
 (() => {
   const view = {
-    sub: 'dhcp',
+    sub: 'subnets',
     subnets: [], subnetId: null,
     hosts: [], hostSort: App.recallSort('ipam-hosts', { key: 'ip', descending: false }),
     conflicts: [],
@@ -214,7 +214,6 @@
         <label>CIDR <input id="sn-cidr" placeholder="10.20.3.0/24" value="${escape(s.cidr ?? '')}"></label>
         <label>Label <input id="sn-label" value="${escape(s.label ?? '')}"></label>
         <label>VLAN <input id="sn-vlan" value="${escape(s.vlan ?? '')}"></label>
-        <p class="hint" id="sn-error"></p>
       </fieldset>`;
   }
 
@@ -222,19 +221,15 @@
     App.modal('Add subnet', subnetForm(null), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (b) => {
-        try {
-          const payload = await App.post('/api/ipam/subnets', {
-            cidr: b.querySelector('#sn-cidr').value.trim(),
-            label: b.querySelector('#sn-label').value.trim(),
-            vlan: b.querySelector('#sn-vlan').value.trim(),
-          });
-          view.subnetId = payload.id;
-          App.closeModal();
-          await loadSubnets();
-        } catch (error) {
-          b.querySelector('#sn-error').innerHTML =
-            `<span class="err">${escape(error.message)}</span>`;
-        }
+        if (!App.requireFields(b, [['#sn-cidr', 'CIDR']])) return;
+        const payload = await App.post('/api/ipam/subnets', {
+          cidr: b.querySelector('#sn-cidr').value.trim(),
+          label: b.querySelector('#sn-label').value.trim(),
+          vlan: b.querySelector('#sn-vlan').value.trim(),
+        });
+        view.subnetId = payload.id;
+        App.closeModal();
+        await loadSubnets();
       } },
     ]);
   }
@@ -268,6 +263,7 @@
             }, (confirmed) => { if (!confirmed) editSubnet(); });
         } },
         { label: 'Save', primary: true, onClick: async (b) => {
+          if (!App.requireFields(b, [['#sn-cidr', 'CIDR']])) return;
           await App.put(`/api/ipam/subnets/${subnet.id}`, {
             cidr: b.querySelector('#sn-cidr').value.trim(),
             label: b.querySelector('#sn-label').value.trim(),
@@ -424,6 +420,14 @@
     const usable = Boolean(platform.is_windows && platform.powershell);
     const body = App.el('ipam-dhcp-body');
     const notice = App.el('ipam-dhcp-unavailable');
+    const tab = App.el('ipam-subtab-dhcp');
+    if (tab) {
+      tab.disabled = !usable;
+      tab.title = usable ? '' : 'DHCP visibility needs a Windows host';
+      // A disabled tab left selected shows an empty, unreachable subpage —
+      // land back on the one view every platform actually has.
+      if (!usable && view.sub === 'dhcp') selectSub('subnets');
+    }
     if (!body || !notice) return usable;
     body.hidden = !usable;
     notice.hidden = usable;
@@ -1161,7 +1165,13 @@
     // as well as on the control, so the two have to start out agreeing.
     App.restoreControls('ipam', CONTROLS);
     view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
-    selectSub(App.recallSub('ipam', view.sub));
+    // A sub-tab remembered from before this host's platform was known (or
+    // from another host entirely) must not land on a DHCP subtab this one
+    // has since disabled.
+    const recalledSub = App.recallSub('ipam', view.sub);
+    const dhcpTab = App.el('ipam-subtab-dhcp');
+    selectSub(recalledSub === 'dhcp' && dhcpTab && dhcpTab.disabled
+      ? 'subnets' : recalledSub);
   }
 
   App.pages.ipam = { init, refresh, fastTick: drawStatus };

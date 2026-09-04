@@ -329,7 +329,7 @@
         <th scope="col">Name</th><th scope="col">IP</th><th scope="col">State</th><th scope="col">Last poll</th><th scope="col"></th>
       </tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">No controllers configured</td></tr>'}</tbody></table>`,
       [
-        { label: 'Close', onClick: App.closeModal },
+        { label: 'Cancel', onClick: App.closeModal },
         { label: 'Add controller', primary: true, onClick: () => editController(null) },
       ]);
     for (const btn of box.querySelectorAll('[data-edit]')) {

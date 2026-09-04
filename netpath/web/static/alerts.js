@@ -648,8 +648,8 @@
         <tbody>${rows.length ? rows.map(windowRowHtml).join('')
           : '<tr><td colspan="6" class="hint">No maintenance windows.</td></tr>'}</tbody>
       </table></div>`, [
-      { label: 'Close', onClick: App.closeModal },
-      ...(writable ? [{ label: 'Add window', onClick: addWindowDialog }] : []),
+      { label: writable ? 'Cancel' : 'Close', onClick: App.closeModal },
+      ...(writable ? [{ label: 'Add window', primary: true, onClick: addWindowDialog }] : []),
     ], { buttonsTop: true });
     if (!writable) return box;
     for (const btn of box.querySelectorAll('.aw-end')) {

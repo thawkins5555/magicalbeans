@@ -3125,6 +3125,8 @@ const App = (() => {
   const TAB_KEY = 'sappiwhere.tab';
 
   function selectTab(name, options = {}) {
+    const leaving = pages[state.tab];
+    if (state.tab !== name && leaving && leaving.deactivate) leaving.deactivate(name);
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
     // Kept in sync with .active below, not just set once at load: index.html's

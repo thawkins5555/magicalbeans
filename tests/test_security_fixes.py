@@ -1156,16 +1156,18 @@ end
               cookie=admin_cookie)[2]["device"]["store_secrets"] is True)
     SERVICE.configrx_db.update_device_config(backup_device, store_secrets=0)
 
-    # Content needs ConfigRX write; the listing does not.
+    # Reading a stored config is a read, not a write; the endpoint itself
+    # redacts a verbatim (store_secrets) row for a caller without write.
     cx_reader = make_user("cxreader", {"configrx": "read"})
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
                               cookie=cx_reader)
-    check("D11 a read-only ConfigRX account cannot download a backup",
-          status == 403, f"{status} {payload}")
+    check("D11 a read-only ConfigRX account can download a backup",
+          status == 200 and "<redacted>" in payload.get("content", ""),
+          f"{status} {payload}")
     status, _h, payload = req("GET",
                               f"/api/configrx/devices/{backup_device}/backups",
                               cookie=cx_reader)
-    check("D11 …but still sees the listing, with the redacted flag",
+    check("D11 …and sees the listing, with the redacted flag",
           status == 200 and payload["backups"][0]["redacted"] is True,
           f"{status} {payload}")
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
@@ -1173,6 +1175,23 @@ end
     check("D11 a ConfigRX write account can still download it",
           status == 200 and "<redacted>" in payload.get("content", ""),
           str(status))
+
+    # A row stored VERBATIM (store_secrets on) is the case the endpoint's
+    # own redaction guards: a writer sees the real secret, a reader gets it
+    # redacted even though the row on disk is unredacted.
+    verbatim_id, _digest = SERVICE.configrx_db.add_backup(
+        backup_device, CISCO, redacted=False)
+    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
+                              cookie=admin_cookie)
+    check("D11 a write account reads a verbatim backup unredacted",
+          status == 200 and "pl4nt-wr1te" in payload.get("content", ""),
+          f"{status} {payload}")
+    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
+                              cookie=cx_reader)
+    check("D11 a read-only account never sees the verbatim secret",
+          status == 200 and "pl4nt-wr1te" not in payload.get("content", "")
+          and "<redacted>" in payload.get("content", ""),
+          f"{status} {payload}")
 
     # ----------------------------------------------------- D12 probe pacing
     from netpath import ipam_scan
