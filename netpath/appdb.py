@@ -30,7 +30,7 @@ import sqlite3
 import threading
 import time
 
-from . import dbopen
+from . import dbmaint, dbopen, settingsutil
 
 log_module = logging.getLogger(__name__)
 
@@ -221,6 +221,7 @@ class AppDatabase:
             had_permissions_table = self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table'"
                 " AND name='user_permissions'").fetchone() is not None
+            dbmaint.enable_incremental_vacuum(self._conn, "app.db")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
         # Neither backfill runs here. On an install that predates app.db the
@@ -396,7 +397,7 @@ class AppDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return values
+        return settingsutil.coerce_settings(GLOBAL_DEFAULTS, values, strict=False)
 
     def save_settings(self, values: dict) -> None:
         """Store the global keys. Anything else in the dict is ignored, so a
@@ -637,8 +638,12 @@ class AppDatabase:
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM hostnames WHERE resolved_ts < ?", (cutoff,))
+            removed = cur.rowcount or 0
             self._conn.commit()
-        return cur.rowcount or 0
+        # Reclaim after the lock, in steps, as every other database does.
+        if removed:
+            dbmaint.reclaim(self._conn, self._lock, label="hostnames")
+        return removed
 
     # -------------------------------------------------------------- asn_cache
 
@@ -693,8 +698,12 @@ class AppDatabase:
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM asn_cache WHERE resolved_ts < ?", (cutoff,))
+            removed = cur.rowcount or 0
             self._conn.commit()
-        return cur.rowcount or 0
+        # Reclaim after the lock, in steps, as every other database does.
+        if removed:
+            dbmaint.reclaim(self._conn, self._lock, label="asn_cache")
+        return removed
 
     # ------------------------------------------------------------------ size
 

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import random
-import socket
 import threading
 import time
 import traceback
@@ -33,7 +32,6 @@ from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
 from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request, decode_response
 
-MAX_UDP = 65535
 
 
 def _candidate_communities(text: str | None) -> list[str]:
@@ -51,24 +49,19 @@ def _snmp_identify(ip: str, version: int, community: str, timeout_s: float,
     over several community/version combinations, so a slow retry-per-guess
     would make a subnet sweep take far too long). Returns a Response or
     raises SnmpError."""
-    # AF_INET6 for a v6 literal, the same rule nodepoll._Session uses: a
-    # colon cannot appear in a dotted quad, so the address says which
-    # family to open without any parsing.
-    family = socket.AF_INET6 if ":" in str(ip) else socket.AF_INET
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(max(0.2, timeout_s))
+    # nodepoll._Session rather than a bare socket: it accepts a datagram
+    # only from the address asked and only with the request id sent. The
+    # bare socket took the first datagram that arrived, from anyone, as
+    # this host's identity. retries=0 keeps the single attempt; the import
+    # is local because nodepoll imports this module.
+    from .nodepoll import _Session
+    session = _Session(ip, DEFAULT_SNMP_PORT, timeout_s, 0)
     try:
-        packet = build_request(version, community, pdu,
-                               random.randint(1, 2 ** 16), oids)
-        sock.sendto(packet, (ip, DEFAULT_SNMP_PORT))
-        data, _addr = sock.recvfrom(MAX_UDP)
-        return decode_response(data)
-    except socket.timeout as exc:
-        raise SnmpError(f"no reply from {ip}") from exc
-    except OSError as exc:
-        raise SnmpError(str(exc)) from exc
+        request_id = random.randint(1, 2 ** 16)
+        packet = build_request(version, community, pdu, request_id, oids)
+        return session.request(packet, expect_request_id=request_id)
     finally:
-        sock.close()
+        session.close()
 
 
 def _snmp_getnext_one(ip: str, version: int, community: str, timeout_s: float,

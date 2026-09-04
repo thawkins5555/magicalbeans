@@ -24,7 +24,7 @@ import sqlite3
 import threading
 import time
 
-from . import dbmaint, dbopen
+from . import dbmaint, dbopen, settingsutil
 
 log = logging.getLogger(__name__)
 
@@ -169,7 +169,7 @@ class SnmpTrapDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return values
+        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
 
     def save_settings(self, values: dict) -> None:
         with self._lock:

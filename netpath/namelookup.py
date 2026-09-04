@@ -322,7 +322,8 @@ def asn_lookup(ip: str, server: str = "",
     return asn, org
 
 
-_NSLOOKUP_NAME = re.compile(r"name\s*=\s*([^\s]+)", re.IGNORECASE)
+# BIND prints "name = host."; Windows prints "Name:    host". Both forms.
+_NSLOOKUP_NAME = re.compile(r"name\s*[:=]\s*(\S+)", re.IGNORECASE)
 
 
 def nslookup(ip: str, server: str | None = None,

@@ -629,7 +629,7 @@ class _VendorIdJob:
                            detail=traceback.format_exc())
         finally:
             self.finished_ts = time.time()
-            poller.counters["identifications"] += 1
+            poller._bump("identifications")
 
 
 class NodePoller:
@@ -723,6 +723,12 @@ class NodePoller:
                          "unsupported": 0, "errors": 0, "overruns": 0,
                          "mac_walks": 0, "identifications": 0}
         self.error: str | None = None
+
+    def _bump(self, key: str, by: int = 1) -> None:
+        """counters[...] += 1 from a pool worker is a read-modify-write on a
+        shared dict; under the lock the totals stay exact."""
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + by
 
     @property
     def running(self) -> bool:
@@ -947,7 +953,7 @@ class NodePoller:
             except Exception as exc:
                 message = str(exc) or exc.__class__.__name__
                 self.error = f"Poller scheduling failed: {message}"
-                self.counters["errors"] += 1
+                self._bump("errors")
                 self.log.add(ERROR, self.error, detail=traceback.format_exc())
             self._stop.wait(1.0)
 
@@ -1132,7 +1138,7 @@ class NodePoller:
         """
         if device["status"] == "down" or device["consecutive_fail"]:
             return
-        self.counters["overruns"] += 1
+        self._bump("overruns")
         running_for = now - self._started.get(device["id"], now)
         if config is None:
             config = self.db.effective_config(device)
@@ -1156,10 +1162,10 @@ class NodePoller:
             if device is None or not device["enabled"]:
                 return
             config = self.db.effective_config(device)
-            self.counters["polls"] += 1
+            self._bump("polls")
             self._poll_device(device, config)
         except Exception:
-            self.counters["errors"] += 1
+            self._bump("errors")
             self.log.add(ERROR, f"Node poll worker error for device #{device_id}",
                          detail=traceback.format_exc())
             traceback.print_exc()
@@ -1239,19 +1245,19 @@ class NodePoller:
                 snmp_ok = False
                 snmp_error = str(exc)
                 snmp_unsupported = True
-                self.counters["unsupported"] += 1
+                self._bump("unsupported")
             except SnmpTimeout as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
-                self.counters["timeout"] += 1
+                self._bump("timeout")
             except _AuthFailure as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
-                self.counters["auth_fail"] += 1
+                self._bump("auth_fail")
             except SnmpError as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
-                self.counters["errors"] += 1
+                self._bump("errors")
 
         # -------------------------------------------------------- status
 
@@ -1306,7 +1312,7 @@ class NodePoller:
             return
 
         if self.counters is not None and snmp_ok:
-            self.counters["ok"] += 1
+            self._bump("ok")
 
         # ---------------------------------------------------------- debug
         # A per-poll trace, the same idea as monitor.py's own trace-logging
@@ -3104,11 +3110,11 @@ class NodePoller:
             if entries is None:
                 return
             stored = self.db.replace_mac_entries(device_id, entries)
-            self.counters["mac_walks"] += 1
+            self._bump("mac_walks")
             self.log.add(NODES, f"Learned {stored} MAC address(es) on device "
                                 f"#{device_id}")
         except Exception:
-            self.counters["errors"] += 1
+            self._bump("errors")
             self.log.add(ERROR, f"MAC table walk failed for device #{device_id}",
                          detail=traceback.format_exc())
         finally:

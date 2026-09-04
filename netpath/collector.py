@@ -344,7 +344,7 @@ class Collector:
                     self.on_batch()
 
         if pending:
-            self.db.insert_flows(pending)
+            self.counters["flows"] += self.db.insert_flows(pending)
         self._apply_learned_rates()
 
     def _apply_learned_rates(self) -> None:

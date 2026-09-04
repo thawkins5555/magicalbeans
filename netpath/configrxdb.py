@@ -35,7 +35,7 @@ import threading
 import time
 import zlib
 
-from . import dbopen
+from . import dbmaint, dbopen, settingsutil
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS device_config (
@@ -156,6 +156,7 @@ class ConfigRxDatabase:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            dbmaint.enable_incremental_vacuum(self._conn, "configrx.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -194,7 +195,7 @@ class ConfigRxDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return values
+        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
 
     def save_settings(self, values: dict) -> None:
         with self._lock:
@@ -422,7 +423,7 @@ class ConfigRxDatabase:
         with self._lock:
             cutoff = time.time() - retention_days * 86400
             cur = self._conn.execute("DELETE FROM backups WHERE ts < ?", (cutoff,))
-            removed += cur.rowcount
+            removed += cur.rowcount or 0
             if retention_count_per_device:
                 device_ids = [r["device_id"] for r in
                              self._conn.execute("SELECT DISTINCT device_id FROM backups")]
@@ -435,8 +436,11 @@ class ConfigRxDatabase:
                         marks = ",".join("?" * len(stale))
                         cur = self._conn.execute(
                             f"DELETE FROM backups WHERE id IN ({marks})", stale)
-                        removed += cur.rowcount
+                        removed += cur.rowcount or 0
             self._conn.commit()
+        # Reclaim after the lock, in steps, as every other database does.
+        if removed:
+            dbmaint.reclaim(self._conn, self._lock, label="backups")
         return removed
 
     # ------------------------------------------------------------- maintenance

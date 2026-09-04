@@ -1079,12 +1079,19 @@ class AlertEngine:
                 metric = metrics_by_device_key.get((device_id, rule["source_kind"]))
                 value = metric["last_value"] if metric else None
                 sample_ts = metric["last_ts"] if metric else None
-                if (stale_after > 0 and sample_ts is not None
-                        and now - sample_ts > stale_after):
+                stale = (stale_after > 0 and sample_ts is not None
+                         and now - sample_ts > stale_after)
+                if stale:
                     value, sample_ts = None, None
                 streak_key = (rule["id"], device_id)
                 previous_ts, streak, first_breach_ts = self._breach_streaks.get(
                     streak_key, (None, 0, None))
+                if stale:
+                    # Absent means the run resets too: otherwise
+                    # breach_seconds would span the silent gap and fire
+                    # for_seconds instantly on resume, and _operator_resolved
+                    # would still see the old run's first_breach_ts.
+                    first_breach_ts = None
                 threshold = rule["threshold"]
                 over = (value is not None and threshold is not None
                         and value >= threshold)
@@ -1213,6 +1220,9 @@ class AlertEngine:
         servers = {row["id"]: row for row in self.ipam_db.dhcp_servers()}
 
         occurrences = []
+        # Loaded on first use, same as _evaluate_thresholds: a tick with
+        # nothing breaching costs nothing extra.
+        open_keys: set | None = None
         for scope in self.ipam_db.dhcp_scopes():
             total = scope_size(scope["start_ip"], scope["end_ip"])
             if not total:
@@ -1243,7 +1253,12 @@ class AlertEngine:
                     if first_breach_ts is None:
                         first_breach_ts = polled_ts
 
-                result = evaluate_threshold(rule, value, streak)
+                # Sample time, not wall-clock, for the same reason
+                # _evaluate_thresholds uses sample_ts: breach_seconds must
+                # span polls, not five-second engine ticks.
+                breach_seconds = (0.0 if first_breach_ts is None or polled_ts is None
+                                  else max(0.0, polled_ts - first_breach_ts))
+                result = evaluate_threshold(rule, value, streak, breach_seconds)
                 if result == "clear":
                     # Only a poll that finds the scope back under its clear
                     # threshold ends the run — see the same reasoning in
@@ -1278,6 +1293,16 @@ class AlertEngine:
                         # under its clear threshold resets first_breach_ts
                         # above, so the next breach is a new run and opens.
                         continue
+                    if polled_ts is not None and polled_ts == previous_ts:
+                        # Nothing has been polled since the last tick — same
+                        # guard as _evaluate_thresholds: count means scope
+                        # polls, not five-second engine ticks, so re-raising
+                        # the same poll bumped `count` every tick instead of
+                        # every 15-minute DHCP poll.
+                        if open_keys is None:
+                            open_keys = self.db.open_dedup_keys()
+                        if dedup_key(rule, occurrence) in open_keys:
+                            continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     resolved = self.db.resolve_by_dedup(
@@ -1437,6 +1462,9 @@ class AlertEngine:
 
         occurrences = []
         live = set()
+        # Loaded on first use, same as _evaluate_thresholds: a tick with
+        # nothing breaching costs nothing extra.
+        open_keys: set | None = None
         for target in targets:
             trace = latest.get(target["id"])
             if trace is None:
@@ -1475,7 +1503,12 @@ class AlertEngine:
                     if first_breach_ts is None:
                         first_breach_ts = sample_ts
 
-                result = evaluate_threshold(rule, value, streak)
+                # Sample time, not wall-clock, for the same reason
+                # _evaluate_thresholds uses sample_ts: breach_seconds must
+                # span traces, not five-second engine ticks.
+                breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
+                                  else max(0.0, sample_ts - first_breach_ts))
+                result = evaluate_threshold(rule, value, streak, breach_seconds)
                 if result == "clear":
                     # An observed clear ends the run, the same rule as the
                     # other two evaluators — a trace that got through, not
@@ -1494,6 +1527,16 @@ class AlertEngine:
                         # hand; see the matching check in
                         # _evaluate_thresholds.
                         continue
+                    if sample_ts is not None and sample_ts == previous_ts:
+                        # Nothing has been traced since the last tick — same
+                        # guard as _evaluate_thresholds: count means traces,
+                        # not five-second engine ticks, so re-raising the
+                        # same trace bumped `count` every tick instead of
+                        # every trace interval.
+                        if open_keys is None:
+                            open_keys = self.db.open_dedup_keys()
+                        if dedup_key(rule, occurrence) in open_keys:
+                            continue
                     occurrences.append(occurrence)
                 elif result == "clear":
                     resolved = self.db.resolve_by_dedup(

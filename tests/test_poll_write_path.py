@@ -394,7 +394,9 @@ def ipv6_polling():
 
     from netpath import nodediscover
     asked = []
-    nodediscover.socket.socket = recording_socket
+    # After B4 fix, nodediscover uses _Session from nodepoll, so we mock
+    # _Session's socket usage via nodepoll module instead of nodediscover's socket
+    nodepoll_mod.socket.socket = recording_socket
     try:
         for target in ("10.0.0.1", "2001:db8::1"):
             try:
@@ -402,7 +404,7 @@ def ipv6_polling():
             except Exception:
                 pass
     finally:
-        nodediscover.socket.socket = real_socket
+        nodepoll_mod.socket.socket = real_socket
     check(asked == [_socket.AF_INET, _socket.AF_INET6],
           f"…and so does the discovery probe ({asked})")
 

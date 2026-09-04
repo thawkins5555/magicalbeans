@@ -668,6 +668,21 @@ check("query ids do not repeat across 40 queries", len(set(ids)) >= 36,
 check("...and are not a sequence",
       not all(b - a == 1 for a, b in zip(ids, ids[1:])), str(ids[:4]))
 
+# G-19b: nslookup's answer is read in both spellings. BIND prints
+# "name = host."; Windows prints "Name:    host", and the pattern only knew
+# the first, so the fallback never named anything on Windows.
+check("nslookup output is parsed in the BIND spelling",
+      namelookup._NSLOOKUP_NAME.search(
+          "3.2.1.10.in-addr.arpa\tname = host.example.com.\n").group(1).rstrip(".")
+      == "host.example.com")
+check("...and in the Windows spelling",
+      (namelookup._NSLOOKUP_NAME.search(
+          "Server:  dns.corp\nAddress:  10.0.0.53\n\nName:    host.example.com\n"
+          "Address:  10.1.2.3\n") or None) is not None
+      and namelookup._NSLOOKUP_NAME.search(
+          "Server:  dns.corp\nAddress:  10.0.0.53\n\nName:    host.example.com\n"
+          "Address:  10.1.2.3\n").group(1) == "host.example.com")
+
 # G-20: nslookup's arguments are checked here, not assumed from the callers.
 ran: list = []
 real_run = namelookup.subprocess.run

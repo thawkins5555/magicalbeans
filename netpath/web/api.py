@@ -1043,14 +1043,37 @@ def _may_change_admin_settings(service, params) -> bool:
     return _is_admin(service, params)
 
 
+def _scope_defaults(scope: str) -> dict:
+    """The defaults dict whose value types a scope's settings must match."""
+    from .. import (alertsdb, appdb, configrxdb, db, flowdb, ipamdb, nodesdb,
+                    snmptrapdb, syslogdb, wirelessdb)
+    return {
+        "netpath": db.NETPATH_DEFAULTS, "netflow": flowdb.DEFAULTS,
+        "syslog": syslogdb.DEFAULTS, "snmp": snmptrapdb.DEFAULTS,
+        "ipam": ipamdb.DEFAULTS, "nodes": nodesdb.DEFAULTS,
+        "alerts": alertsdb.DEFAULTS, "wireless": wirelessdb.DEFAULTS,
+        "configrx": configrxdb.DEFAULTS,
+    }.get(scope, appdb.GLOBAL_DEFAULTS)
+
+
 def post_settings(service, params, body) -> dict:
+    from ..settingsutil import coerce_settings
+
     scope = str(body.get("scope", "global"))
     values = body.get("values") or {}
+    if not isinstance(values, dict):
+        raise ValueError("values must be an object")
     granted = service.app_db.permissions_for(params.get("_username", ""))
     touched = [key for key in ADMIN_ONLY_SETTINGS if key in values]
     if touched and not _may_change_admin_settings(service, params):
         raise _permissions.Forbidden(
             f"Changing {', '.join(touched)} needs administrator access")
+    # Typed before anything is written. The apply_* methods update and save
+    # first and coerce later (or never), and the loaders hand back whatever
+    # was stored, so a null or "abc" for a numeric key was persisted and
+    # then raised from the next start's int() — every start, until the
+    # database was edited by hand.
+    values = coerce_settings(_scope_defaults(scope), values, strict=True)
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
@@ -2152,9 +2175,21 @@ def post_nodes_device(service, params, body) -> dict:
     group_id = body.get("group_id")
     device_group_id = body.get("device_group_id")
     _check_display_name_source(body)
+    # The same two fields put_nodes_device handles specially; add_device's
+    # filter dropped them without a word, so a device created with an
+    # upstream or a vendor pin got neither. Validated before the insert so
+    # a refused value does not leave a half-configured device behind (0 is
+    # never a device id, and a device cannot be its own upstream before it
+    # exists).
+    upstream_id = (_clean_upstream_id(service, 0, body["upstream_id"])
+                   if "upstream_id" in body else None)
+    vendor_override = str(body.get("vendor_override") or "").strip()
+    if len(vendor_override) > 64:
+        raise ValueError("A vendor name is at most 64 characters")
     overrides = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY
                 and k not in ("name", "group_id", "device_group_id",
-                              "display_name_source", "enabled")}
+                              "display_name_source", "enabled",
+                              "vendor_override", "upstream_id")}
     try:
         device_id = service.nodes_db.add_device(
             ip, name=body.get("name") or None,
@@ -2172,6 +2207,11 @@ def post_nodes_device(service, params, body) -> dict:
     if body.get("display_name_source"):
         service.nodes_db.update_device(
             device_id, display_name_source=body["display_name_source"])
+    if upstream_id is not None:
+        service.nodes_db.update_device(device_id, upstream_id=upstream_id)
+    if vendor_override:
+        service.nodes_db.set_vendor_override(
+            device_id, vendor_override, params.get("_username", ""))
     service.log.add(NODES_CATEGORY, f"Added device {ip}")
     return {"id": device_id}
 
@@ -2657,20 +2697,21 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
                                int(config.get("snmp_retries", 2)))
             try:
+                request_id = random.randint(1, 2 ** 16)
                 if version in (0, 1):
                     packet = build_request(version, identity or "public", PDU_GET,
-                                           random.randint(1, 2 ** 16), oids)
+                                           request_id, oids)
                 else:
                     engine_reply = session.request(discovery_probe())
                     auth_key = (localized_key(auth_proto, password, engine_reply.engine_id)
                                if auth_proto and password else None)
                     packet = build_v3_request(
-                        random.randint(1, 2 ** 16), random.randint(1, 2 ** 16),
+                        random.randint(1, 2 ** 16), request_id,
                         PDU_GET, oids, engine_id=engine_reply.engine_id,
                         engine_boots=engine_reply.engine_boots,
                         engine_time=engine_reply.engine_time, user=identity or "",
                         auth_proto=auth_proto, auth_key=auth_key)
-                response = session.request(packet)
+                response = session.request(packet, expect_request_id=request_id)
                 if version >= 3 and response.pdu_tag == PDU_REPORT:
                     raise SnmpError("engine resync required (Report-PDU) — check "
                                     "the SNMPv3 username and auth password")
@@ -2684,7 +2725,9 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             result["snmp"]["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
             result["snmp"]["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
             result["snmp"]["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
-        except SnmpError as exc:
+        except (SnmpError, OSError) as exc:
+            # OSError: _Session's socket() itself failed (descriptor
+            # exhaustion); the same readable answer as a protocol failure.
             result["snmp"]["ok"] = False
             result["snmp"]["error"] = str(exc)
         finally:

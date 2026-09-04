@@ -1081,7 +1081,7 @@ end
 
     for label, text, expected in (("Cisco IOS", CISCO, [
             "$1$mERr", "070C285F4D06", "$1$abcd", "104D000A0618",
-            "pl4nt-r34d", "pl4nt-wr1te", "PrivPassPhrase",
+            "pl4nt-r34d", "pl4nt-wr1te", "AuthPassPhrase", "PrivPassPhrase",
             "05080F1C2243", "R4diusSh4red", "121A0C0411045D",
             "eigrpSh4redKey", "MyPreSharedKey", "Br4nchLocalKey",
             "Br4nchRemoteKey", "060506324F41", "02050D480809"]),
@@ -1094,6 +1094,28 @@ end
         check(f"D11 every {label} secret is replaced", not leaked, str(leaked))
         check(f"D11 …and the {label} pass reports what it did", count >= len(expected),
               f"{count} replacements for {len(expected)} secrets")
+
+    # The SNMPv3 user line carries two keys, and used to lose only the last
+    # token on the line: the auth key stayed whenever a priv key followed,
+    # and an `access` clause after them kept both.
+    for label, line, secrets, keep in (
+            ("auth only", "snmp-server user ro-user NETOPS v3 auth sha OnlyAuthKey999",
+             ["OnlyAuthKey999"], "auth sha <redacted>"),
+            ("auth+priv+acl",
+             "snmp-server user netops NETOPS v3 auth sha AuthKeyA priv aes 128 PrivKeyB access 10",
+             ["AuthKeyA", "PrivKeyB"], "priv aes 128 <redacted> access 10"),
+            ("encrypted",
+             "snmp-server user svc SVC v3 encrypted auth sha EncAuthHash priv aes 256 EncPrivHash",
+             ["EncAuthHash", "EncPrivHash"], "auth sha <redacted> priv aes 256 <redacted>"),
+            ("upper case",
+             "SNMP-SERVER USER OPS OPS V3 AUTH SHA UpperAuthKey PRIV AES 192 UpperPrivKey",
+             ["UpperAuthKey", "UpperPrivKey"], "PRIV AES 192 <redacted>")):
+        out, count = configrx_redact.redact(line)
+        leaked = [secret for secret in secrets if secret in out]
+        check(f"D11 snmp-server user v3 ({label}): every key is replaced",
+              not leaked and count == len(secrets), f"{out!r} ({count})")
+        check(f"D11 snmp-server user v3 ({label}): the rest of the line survives",
+              keep in out, out)
 
     check("D11 the structure of a redacted line survives",
           "snmp-server community <redacted> RO 20" in

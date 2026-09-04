@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 
-from . import dbmaint, dbopen
+from . import dbmaint, dbopen, settingsutil
 
 log = logging.getLogger(__name__)
 
@@ -796,7 +796,7 @@ class NodesDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return values
+        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
 
     def _private_setting(self, key: str, default=None):
         """A settings row this module keeps for itself. Not in DEFAULTS, so

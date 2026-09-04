@@ -189,7 +189,9 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
     severity = alert_row["severity"]
     context = {
         "device_name": alert_row["entity_label"],
-        "device_ip": alert_row["entity_id"],
+        # Filled by the engine when the device still exists; entity_id is a
+        # database id, not an address, so it is never the fallback.
+        "device_ip": "",
         "entity_label": alert_row["entity_label"],
         "message": alert_row["message"],
         "detail": alert_row["detail"] or "",

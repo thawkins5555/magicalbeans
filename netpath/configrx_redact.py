@@ -60,10 +60,16 @@ PATTERNS = [
     ("snmp-server community", re.compile(
         r"(?P<keep>^\s*snmp-server\s+community\s+)(?P<secret>\S+)"
         r"(?P<tail>.*)$", _FLAGS)),
-    # snmp-server user <user> <group> v3 auth sha <key> priv aes 128 <key>
-    ("snmp-server user auth/priv", re.compile(
+    # snmp-server user <user> <group> v3 [encrypted] auth sha <key> priv aes 128 <key> [access <acl>]
+    # Two patterns, one per key. A single pattern anchored on the end of the
+    # line redacted only the last token: the auth key survived whenever a
+    # priv key followed it, and both survived behind an `access` clause.
+    ("snmp-server user auth key", re.compile(
         r"(?P<keep>^\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+.*?"
-        r"\b(?:auth|priv)\s+(?:\S+\s+)*?)(?P<secret>\S+)(?P<tail>\s*$)",
+        r"\bauth\s+\S+\s+)(?P<secret>\S+)(?P<tail>.*)$", _FLAGS)),
+    ("snmp-server user priv key", re.compile(
+        r"(?P<keep>^\s*snmp-server\s+user\s+\S+\s+\S+\s+v3\s+.*?"
+        r"\bpriv\s+\S+(?:\s+(?:128|192|256))?\s+)(?P<secret>\S+)(?P<tail>.*)$",
         _FLAGS)),
     # enable secret [level N] [0|5|8|9] <hash>   /   enable password ...
     ("enable secret/password", re.compile(

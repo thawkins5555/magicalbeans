@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.46.4 — Full code review: fifteen defects](#4464--full-code-review-fifteen-defects)
 - [4.46.3 — One SNMPv3 test, two ways to fail on Windows](#4463--one-snmpv3-test-two-ways-to-fail-on-windows)
 - [4.46.2 — The browser walk was red the whole time](#4462--the-browser-walk-was-red-the-whole-time)
 - [4.46.1 — Review of 4.41.0–4.46.0](#4461--review-of-44104460)
@@ -112,6 +113,91 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.46.4 — Full code review: fifteen defects
+
+The first review of the whole tree for code defects — logic, crashes,
+security, concurrency, leaks, and contracts between modules — with the
+interface out of scope. Every module was read end to end, every finding
+was re-verified against the code before it was fixed, and each fix ships
+with a test that failed before it. Fifteen defects, three of them serious.
+
+- **ConfigRX redaction left the SNMPv3 auth key in the clear.** The
+  `snmp-server user … v3 auth <p> <key> priv <p> <key>` pattern was
+  anchored on the end of the line, so it replaced only the *last* token:
+  the auth key survived whenever a priv key followed it, and behind an
+  `access <acl>` clause the ACL number was redacted and both keys kept.
+  Two patterns now, one per key, each leaving the rest of the line alone
+  (`configrx_redact.py`). The redaction test lists the auth key among the
+  secrets that must be gone, and covers the auth-only, ACL, `encrypted`
+  and upper-case spellings.
+- **A settings save could stop the application starting.** `POST
+  /api/settings` handed the body to each module's apply method, which
+  updated and saved first and coerced later, or never; `save_settings`
+  filters keys, not values, and every `settings()` loader hands back
+  whatever JSON was stored. A `null` (which is what the browser sends for
+  a numeric field that reads `NaN`) or `"abc"` under `trace_workers` was
+  therefore persisted, and `Service.__init__`'s `int()` raised on every
+  start until the database was edited by hand. New `settingsutil.
+  coerce_settings` types each value by its default: `post_settings` calls
+  it strictly and answers 400 before anything is written; all ten
+  `settings()` loaders call it leniently, so a database poisoned before
+  this release still starts. Only the keys in the request come back, so
+  a one-key save leaves every other setting as it was
+  (`tests/test_settings_types.py`).
+- **DHCP scope and NetPath threshold alerts re-fired on every engine
+  tick.** The device evaluator gained a guard in 4.34 — nothing polled
+  since the last tick and the alert already open means nothing new to
+  report — and its two siblings never did, so an open scope alert had its
+  `count` bumped and `last_ts` refreshed every five seconds between
+  fifteen-minute DHCP polls, pinning itself to the top of the list. Both
+  evaluators now carry the same guard. They also never passed
+  `breach_seconds` to `evaluate_threshold`, so `for_seconds` on a DHCP or
+  NetPath rule could never fire; it is computed from poll or trace time
+  now, as for devices. And in the device evaluator a sample gone stale
+  reset the streak but not `first_breach_ts`, so when samples resumed
+  `breach_seconds` spanned the silent gap (a `for_seconds` rule fired on
+  the first fresh sample) and an old hand-resolve still covered what was
+  a new run. Stale now resets the run too (`alertengine.py`).
+- **A device created with `upstream_id` or `vendor_override` got
+  neither.** `POST /api/nodes/devices` passed both through to
+  `add_device`, whose override filter only knows profile columns and
+  dropped them silently; `PUT` handled them. The create path now validates
+  both before the insert and applies them the way `PUT` does.
+- **The wireless poller, the device Test button and the discovery sweep
+  accepted any reply.** `_Session.request` filters replies by request id
+  when told which id to expect; `fortipoll.py` and the Test handler never
+  told it, so a late answer to the previous GETNEXT was taken as this
+  one's. The discovery probe was worse: a bare socket that took the first
+  datagram from *anywhere* as the device's identity. All three pass the
+  request id now, and discovery goes through `_Session`, which also checks
+  the source address (`tests/test_nodes_api_fixes.py`).
+- **`Service.shutdown()` could close a database under a running
+  maintenance sweep.** The maintenance thread was never joined, and a
+  Global Settings save runs a forced sweep on the HTTP thread; either
+  could still be pruning while the databases were closed. One lock now
+  serialises sweeps (the timer skips a tick if one is running, a forced
+  sweep waits), and shutdown joins the thread and takes that lock before
+  closing anything (`tests/test_service_shutdown.py`).
+- **`app.db`, `wireless.db` and `configrx.db` never gave space back.**
+  Every other database switches to incremental auto-vacuum at open and
+  reclaims after its prune; these three only deleted, so `configrx.db`,
+  which holds compressed configurations, could only grow. They now do
+  what the others do (`tests/test_db_reclaim.py`).
+- Smaller: the pollers' statistics counters were `+= 1`'d from pool
+  threads without the lock and drifted low, now bumped under it; the
+  NetFlow collector's final drain on stop wrote flows it never counted;
+  `{{device_ip}}` in a notification for a device since removed rendered
+  the row id, now blank; the nslookup fallback only understood BIND's
+  `name = host` and never Windows' `Name:    host`; and a device Test that
+  could not open a UDP socket answered 500 instead of the structured
+  `snmp.ok: false`.
+
+Reviewed and found sound, for the record: the trap, syslog and NetFlow
+decoders (also fuzzed in memory, 45,000 mutated datagrams each, no
+exception), the WebSocket transport, sessions and login throttling, the
+host-key store, the self-update tarball guard, the database schemas,
+migrations and locking, and the browser modules' calls against the API.
 
 ### 4.46.3 — One SNMPv3 test, two ways to fail on Windows
 

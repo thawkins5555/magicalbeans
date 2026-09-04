@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 
-from . import dbopen
+from . import dbmaint, dbopen, settingsutil
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS controllers (
@@ -120,6 +120,7 @@ class WirelessDatabase:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            dbmaint.enable_incremental_vacuum(self._conn, "wireless.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -163,7 +164,7 @@ class WirelessDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return values
+        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
 
     def save_settings(self, values: dict) -> None:
         import json
@@ -427,15 +428,20 @@ class WirelessDatabase:
             row = self._conn.execute("SELECT MAX(id) AS m FROM ap_events").fetchone()
         return row["m"] or 0
 
-    def prune_ap_events(self, retention_days: float = 90) -> None:
+    def prune_ap_events(self, retention_days: float = 90) -> int:
         """Same shape as nodesdb's device_events retention: lifecycle
         events are a log, not an archive. Called from the service
         maintenance loop."""
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "DELETE FROM ap_events WHERE ts < ?",
                 (time.time() - retention_days * 86400,))
+            removed = cur.rowcount or 0
             self._conn.commit()
+        # Reclaim after the lock, in steps, as every other database does.
+        if removed:
+            dbmaint.reclaim(self._conn, self._lock, label="ap_events")
+        return removed
 
     def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
                     stale_after_polls: int = 5) -> list[dict]:

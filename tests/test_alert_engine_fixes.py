@@ -100,6 +100,16 @@ print("A9 — duration and clock text")
 assert alertmail.duration_text(0.4) == "", alertmail.duration_text(0.4)
 assert alertmail.duration_text(0.0) == ""
 assert alertmail.duration_text(-3) == ""
+# {{device_ip}} defaulted to entity_id, a database id: a notification for a
+# device since removed rendered "42" where an address belonged.
+_gone = {"entity_label": "sw1", "entity_id": "42", "message": "m", "severity": 3,
+         "state": "open", "opened_ts": 0.0, "last_ts": 0.0, "count": 1, "detail": ""}
+_ctx = alertmail.build_context(_gone, {"name": "r", "kind": "threshold", "key": "k",
+                                       "severity": 3, "source_kind": ""})
+assert _ctx["device_ip"] == "", _ctx["device_ip"]
+assert alertmail.build_context(_gone, {"name": "r", "kind": "threshold", "key": "k",
+                                       "severity": 3, "source_kind": ""},
+                               {"device_ip": "10.0.0.1"})["device_ip"] == "10.0.0.1"
 ok("a sub-second outage renders as nothing, not \"0 s\"")
 
 assert alertmail.duration_text(0.6) == "1 s", alertmail.duration_text(0.6)
@@ -1106,6 +1116,204 @@ for bad, why in ((b, "itself"), (999999, "an id that is not there")):
         raise AssertionError(f"PUT accepted {why} as an upstream")
 assert nodes.device(b)["upstream_id"] is None
 ok("PUT refuses a device as its own upstream, and an unknown device id")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== B9
+print("\nB9 — DHCP scope and NetPath threshold counts mean polls/traces, "
+      "not engine ticks")
+
+
+def dhcp_poll_at(ipam, server_id, scope, ts, used):
+    """A DHCP poll of one scope with `used` leases in it, with polled_ts
+    pinned to an explicit value rather than time.time() — the same
+    raw-write trick seed_trace uses below, so a streak can be advanced (or
+    deliberately held still) without a real sleep."""
+    ipam.replace_dhcp_scopes(server_id, [scope])
+    ipam.replace_dhcp_leases(server_id, [
+        {"scope_id": scope["scope_id"], "ip": f"10.30.1.{10 + i}",
+         "mac": f"00:11:22:aa:bb:{i:02x}", "address_state": "active"}
+        for i in range(used)])
+    conn = sqlite3.connect(ipam.path)
+    conn.execute("UPDATE dhcp_scopes SET polled_ts=? WHERE server_id=? AND scope_id=?",
+                 (ts, server_id, scope["scope_id"]))
+    conn.execute("UPDATE dhcp_leases SET polled_ts=? WHERE server_id=? AND scope_id=?",
+                 (ts, server_id, scope["scope_id"]))
+    conn.commit()
+    conn.close()
+
+
+def seed_trace(netpath_db, target_id, ts, loss_pct, reached=0, rtt_ms=None):
+    """Same raw insert test_alert_operator_resolve.seed_trace uses."""
+    conn = sqlite3.connect(netpath_db.path)
+    conn.execute(
+        "INSERT INTO traces(target_id, started_ts, duration_s, status, reached,"
+        " hop_count, rtt_ms, loss_pct, path_sig, error, icmp_code, icmp_from)"
+        " VALUES (?,?,?,'ok',?,1,?,?,NULL,NULL,NULL,NULL)",
+        (target_id, ts, 0.05, 1 if reached else 0, rtt_ms, loss_pct))
+    conn.commit()
+    conn.close()
+
+
+# ---- B9a: DHCP scope — count stays 1 across ticks with the same poll,
+# and only advances on a genuinely new poll.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+server_b9 = ipam.add_dhcp_server("10.30.0.5", "dhcp-b9")
+SCOPE_B9 = {"scope_id": "10.30.1.0", "name": "B9 scope", "start_ip": "10.30.1.10",
+            "end_ip": "10.30.1.29", "mask": "255.255.255.0", "state": "active"}
+t1 = time.time()
+dhcp_poll_at(ipam, server_b9, SCOPE_B9, t1, 18)   # 18/20 = 90%, over the 85% default
+engine._tick()
+scope_entity_b9 = f"{server_b9}:{SCOPE_B9['scope_id']}"
+opened = open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b9)
+assert len(opened) == 1, opened
+alert_id_b9 = opened[0]["id"]
+last_ts_before = opened[0]["last_ts"]
+for _ in range(5):
+    engine._tick()          # no new DHCP poll happened between these ticks
+still = open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b9)
+assert len(still) == 1 and still[0]["id"] == alert_id_b9, still
+assert still[0]["count"] == 1, still[0]["count"]
+assert still[0]["last_ts"] == last_ts_before, (still[0]["last_ts"], last_ts_before)
+ok("dhcp_scope_exhaustion count stays 1 across several ticks of the same poll")
+
+t2 = t1 + 900   # a fresh DHCP poll 15 minutes later, still over threshold
+dhcp_poll_at(ipam, server_b9, SCOPE_B9, t2, 19)
+engine._tick()
+again = open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b9)
+assert len(again) == 1 and again[0]["id"] == alert_id_b9, again
+assert again[0]["count"] == 2, again[0]["count"]
+ok("a genuinely new DHCP poll still over threshold bumps count to 2")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B9b: NetPath — same shape, against an unchanged trace started_ts.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+netpath_b9 = engine.netpath_db
+target_b9 = netpath_b9.add_target("10.30.10.10", label="b9-dest", interval_s=300)
+engine._tick()
+base_b9 = time.time() - 5 * 310
+for i in range(3):   # netpath_unreachable needs for_polls=3
+    seed_trace(netpath_b9, target_b9, base_b9 + i * 310, 100.0, reached=False)
+    engine._tick()
+opened_np = open_rows(alerts, "netpath_unreachable", target_b9)
+assert len(opened_np) == 1, opened_np
+np_alert_id = opened_np[0]["id"]
+np_last_ts_before = opened_np[0]["last_ts"]
+for _ in range(5):
+    engine._tick()       # no new trace landed between these ticks
+still_np = open_rows(alerts, "netpath_unreachable", target_b9)
+assert len(still_np) == 1 and still_np[0]["id"] == np_alert_id, still_np
+assert still_np[0]["count"] == 1, still_np[0]["count"]
+assert still_np[0]["last_ts"] == np_last_ts_before, \
+    (still_np[0]["last_ts"], np_last_ts_before)
+ok("netpath_unreachable count stays 1 across several ticks of the same trace")
+
+seed_trace(netpath_b9, target_b9, base_b9 + 3 * 310, 100.0, reached=False)
+engine._tick()
+again_np = open_rows(alerts, "netpath_unreachable", target_b9)
+assert len(again_np) == 1 and again_np[0]["id"] == np_alert_id, again_np
+assert again_np[0]["count"] == 2, again_np[0]["count"]
+ok("a genuinely new trace still over threshold bumps count to 2")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== B10
+print("\nB10 — for_seconds is honoured for DHCP and NetPath rules")
+
+# ---- B10a: DHCP scope with for_seconds.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+server_b10 = ipam.add_dhcp_server("10.31.0.5", "dhcp-b10")
+SCOPE_B10 = {"scope_id": "10.31.1.0", "name": "B10 scope", "start_ip": "10.31.1.10",
+             "end_ip": "10.31.1.29", "mask": "255.255.255.0", "state": "active"}
+scope_rule_b10 = alerts.rule_by_key("dhcp_scope_exhaustion")
+alerts.update_rule(scope_rule_b10["id"], for_seconds=1800)   # 30 minutes
+scope_entity_b10 = f"{server_b10}:{SCOPE_B10['scope_id']}"
+
+base_ts = time.time()
+for i in range(3):   # three polls 15 minutes apart, all over threshold: 45 min of
+                     # streak (for_polls=1 would open instantly) but only 30 min
+                     # of for_seconds — must not open until the third
+    dhcp_poll_at(ipam, server_b10, SCOPE_B10, base_ts + i * 900, 18)
+    engine._tick()
+    if i < 2:
+        assert open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b10) == [], \
+            f"opened too early at poll {i}"
+opened_b10 = open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b10)
+assert len(opened_b10) == 1, opened_b10
+ok("dhcp_scope_exhaustion with for_seconds=1800 opens only once the breach "
+   "has spanned that long in poll time, not on the first over-threshold poll")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B10b: NetPath destination with for_seconds.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+netpath_b10 = engine.netpath_db
+target_b10 = netpath_b10.add_target("10.31.10.10", label="b10-dest", interval_s=300)
+unreach_rule_b10 = alerts.rule_by_key("netpath_unreachable")
+alerts.update_rule(unreach_rule_b10["id"], for_seconds=1200)   # 20 minutes
+engine._tick()
+
+base_np10 = time.time()
+# Five traces five minutes apart, all 100% loss: for_polls=3 (the rule's
+# shipped default, now ignored in favour of for_seconds) would open on the
+# third trace (600s in); for_seconds=1200 needs the fifth (1200s in) —
+# proving for_seconds actually gates this evaluator rather than being
+# silently dropped.
+for i in range(5):
+    seed_trace(netpath_b10, target_b10, base_np10 + i * 300, 100.0, reached=False)
+    engine._tick()
+    if i < 4:
+        assert open_rows(alerts, "netpath_unreachable", target_b10) == [], \
+            f"opened too early at trace {i}"
+opened_np10 = open_rows(alerts, "netpath_unreachable", target_b10)
+assert len(opened_np10) == 1, opened_np10
+ok("netpath_unreachable with for_seconds=1200 opens only once the breach "
+   "has spanned that long in trace time, not at for_polls' third trace")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== B11
+print("\nB11 — a stale sample resets first_breach_ts (device evaluator)")
+
+nodes, alerts, snmp, syslog, ipam, engine = build(threshold_stale_s=1)
+engine._tick()
+did_b11 = add_device(nodes, "10.32.0.1", "b11-sw")
+cpu_rule_b11 = alerts.rule_by_key("cpu_high")
+# Smaller than the real sleep below (~1.3 s), so a bugged first_breach_ts
+# that survives the stale gap would breach immediately on the fresh sample.
+FOR_SECONDS_B11 = 0.8
+alerts.update_rule(cpu_rule_b11["id"], for_seconds=FOR_SECONDS_B11)
+
+t0 = time.time()
+nodes.record_metric_sample(did_b11, "cpu_pct", "CPU", "%", "gauge", t0, 97.0)
+engine._tick()
+assert open_rows(alerts, "cpu_high", did_b11) == [], \
+    "breach_seconds is 0 on the very first sample, must not open yet"
+
+time.sleep(1.3)   # exceeds threshold_stale_s=1, and no new sample arrives:
+                  # the existing sample is now stale
+engine._tick()
+assert open_rows(alerts, "cpu_high", did_b11) == [], \
+    "still not open: the sample went stale before for_seconds was reached"
+
+t1 = time.time()   # a fresh over-threshold sample, right after the stale gap
+nodes.record_metric_sample(did_b11, "cpu_pct", "CPU", "%", "gauge", t1, 97.0)
+engine._tick()
+assert t1 - t0 >= FOR_SECONDS_B11, \
+    "test setup must make the real gap alone enough to fire a bugged for_seconds"
+assert open_rows(alerts, "cpu_high", did_b11) == [], \
+    ("a fresh sample after a stale gap must start a NEW run — breach_seconds "
+     "must not span the silent gap and fire for_seconds instantly")
+ok("a stale sample resets first_breach_ts, so resuming does not fire "
+   "for_seconds instantly off the silent gap")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 

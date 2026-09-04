@@ -125,8 +125,20 @@ def test_c1_receive_threads_survive_bad_input() -> None:
         send_udp(port, v5_packet())
         check(wait_for(lambda: collector.counters["flows"] >= 2, 6.0),
               "netflow: the next good packet is still decoded and stored")
+        # A flow still pending in the write buffer when the collector is
+        # stopped was written by the final drain but never counted.
+        counted = collector.counters["flows"]
+        packets = collector.counters["packets"]
+        send_udp(port, v5_packet())
+        check(wait_for(lambda: collector.counters["packets"] == packets + 1),
+              "netflow: one more packet arrives")
     finally:
         collector.stop()
+    try:
+        check(collector.counters["flows"] == counted + 1,
+              f"netflow: the drain on stop counts what it writes "
+              f"({collector.counters['flows']} vs {counted + 1})")
+    finally:
         flow_db.close()
 
     # status_text tells a crash apart from an operator stop.

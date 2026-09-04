@@ -148,6 +148,11 @@ class Service:
 
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
+        # Held for the body of run_maintenance: a forced call (a settings
+        # save, on an HTTP thread) and the periodic timer thread can both be
+        # pruning at once, and shutdown() below must not close a database
+        # out from under either of them.
+        self._maintenance_lock = threading.Lock()
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries — a
         # settings block, an account's grants. The browser polls /api/state
@@ -231,33 +236,42 @@ class Service:
 
     def shutdown(self) -> None:
         self._stop.set()
-        # Interactive SSH sessions first: they are the only thing here a
-        # person is watching, and each one writes a closing device event, so
-        # they must end while the databases are still open.
-        self.ssh_sessions.shutdown()
-        self.monitor.shutdown()   # waits briefly for running traces to land
-        self.hop_prober.shutdown()
-        self.resolver.shutdown()
-        self.asn_resolver.shutdown()
-        self.collector.stop()
-        self.syslog.stop()
-        self.snmp.stop()
-        self.ipam.shutdown()
-        # Alerts reads Nodes' own data, so stop the reader before the writer.
-        self.alert_engine.stop()
-        self.node_poller.stop()
-        self.wireless.stop()
-        self.configrx.stop()
-        self.db.close()
-        self.flow_db.close()
-        self.syslog_db.close()
-        self.snmp_db.close()
-        self.ipam_db.close()
-        self.nodes_db.close()
-        self.alerts_db.close()
-        self.wireless_db.close()
-        self.configrx_db.close()
-        self.app_db.close()
+        # run_maintenance also runs on an HTTP thread (apply_global_settings
+        # forces one on a settings save) and the timer thread below was
+        # never joined here, so either could still be pruning when the
+        # databases are closed further down — join the timer, then hold the
+        # same lock run_maintenance holds around the whole close sequence.
+        if self._maintenance_thread is not None:
+            self._maintenance_thread.join(timeout=10.0)
+            self._maintenance_thread = None
+        with self._maintenance_lock:
+            # Interactive SSH sessions first: they are the only thing here a
+            # person is watching, and each one writes a closing device event,
+            # so they must end while the databases are still open.
+            self.ssh_sessions.shutdown()
+            self.monitor.shutdown()   # waits briefly for running traces to land
+            self.hop_prober.shutdown()
+            self.resolver.shutdown()
+            self.asn_resolver.shutdown()
+            self.collector.stop()
+            self.syslog.stop()
+            self.snmp.stop()
+            self.ipam.shutdown()
+            # Alerts reads Nodes' own data, so stop the reader before the writer.
+            self.alert_engine.stop()
+            self.node_poller.stop()
+            self.wireless.stop()
+            self.configrx.stop()
+            self.db.close()
+            self.flow_db.close()
+            self.syslog_db.close()
+            self.snmp_db.close()
+            self.ipam_db.close()
+            self.nodes_db.close()
+            self.alerts_db.close()
+            self.wireless_db.close()
+            self.configrx_db.close()
+            self.app_db.close()
 
     # ------------------------------------------------------------- settings
 
@@ -709,8 +723,22 @@ class Service:
         now = time.time()
         if not force and now - self._last_maintenance < MAINTENANCE_INTERVAL_S:
             return
-        self._last_maintenance = now
 
+        # A forced call (a settings save, on an HTTP thread) waits for
+        # whatever sweep is already running rather than racing it; a
+        # periodic call from the timer thread just skips this tick if one is
+        # already in flight, the same as the interval check above.
+        if force:
+            self._maintenance_lock.acquire()
+        elif not self._maintenance_lock.acquire(blocking=False):
+            return
+        try:
+            self._last_maintenance = now
+            self._run_maintenance_body()
+        finally:
+            self._maintenance_lock.release()
+
+    def _run_maintenance_body(self) -> None:
         cap = int(self.settings.get("max_trace_db_mb", 0)) * 1024 * 1024
         if cap:
             removed = self.db.trim_to_size(cap)

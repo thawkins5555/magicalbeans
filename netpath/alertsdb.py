@@ -23,6 +23,7 @@ import time
 
 from . import dbmaint
 from . import dbopen
+from . import settingsutil
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rules (
@@ -796,6 +797,7 @@ class AlertsDatabase:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
+        values = settingsutil.coerce_settings(DEFAULTS, values, strict=False)
         values["has_smtp_credential"] = bool(cred and cred["password_enc"])
         return values
 

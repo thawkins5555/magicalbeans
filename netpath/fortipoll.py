@@ -122,16 +122,22 @@ class WirelessPoller:
                         self.poll_now(controller["id"])
             self._stop.wait(1.0)
 
+    def _bump(self, key: str, by: int = 1) -> None:
+        """counters[...] += 1 from a pool worker is a read-modify-write on a
+        shared dict; under the lock the totals stay exact."""
+        with self._lock:
+            self.counters[key] = self.counters.get(key, 0) + by
+
     def _run_one(self, controller_id: int) -> None:
         try:
             controller = self.db.controller(controller_id)
             if controller is None:
                 return
-            self.counters["polls"] += 1
+            self._bump("polls")
             self._poll_controller(controller)
-            self.counters["ok"] += 1
+            self._bump("ok")
         except Exception:
-            self.counters["errors"] += 1
+            self._bump("errors")
             traceback.print_exc()
             self.log.add(ERROR, f"Wireless poll of controller {controller_id} failed",
                         detail=traceback.format_exc())
@@ -272,9 +278,12 @@ class WirelessPoller:
         try:
             if version in (0, 1):
                 identity, _proto, _pw = credential_for(config)
+                request_id = random.randint(1, 2**16)
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                       random.randint(1, 2**16), [oid])
-                return session.request(packet)
+                                       request_id, [oid])
+                # The id filter is what makes a late reply to the previous
+                # GETNEXT a dropped datagram rather than this one's answer.
+                return session.request(packet, expect_request_id=request_id)
             identity, auth_proto, password = credential_for(config)
             engine = self._engines.get(controller["id"])
             if engine is None:
@@ -288,11 +297,12 @@ class WirelessPoller:
             engine_id, boots, engine_time, _learned_at = engine
             auth_key = localized_key(auth_proto, password, engine_id) \
                 if auth_proto and password else None
+            request_id = random.randint(1, 2**16)
             packet = build_v3_request(
-                random.randint(1, 2**16), random.randint(1, 2**16), PDU_GETNEXT, [oid],
+                random.randint(1, 2**16), request_id, PDU_GETNEXT, [oid],
                 engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
                 user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet)
+            response = session.request(packet, expect_request_id=request_id)
             if response.pdu_tag == PDU_REPORT:
                 self._engines.invalidate(controller["id"])
                 raise _AuthFailure(f"{controller['ip']}: engine resync required")
