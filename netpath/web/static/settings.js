@@ -38,6 +38,16 @@
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
 
+    // The four text/number fields below are ADMIN_ONLY_SETTINGS and so are
+    // absent from `s` entirely for anyone without Settings read (see
+    // SETTINGS_ONLY_KEYS in api.py) — App.el(...).value = undefined would
+    // otherwise show "undefined" in the box rather than leaving it blank.
+    App.el('set-ldap-enabled').checked = !!s.ldap_enabled;
+    App.el('set-ldap-url').value = s.ldap_url || '';
+    App.el('set-ldap-template').value = s.ldap_bind_dn_template || '';
+    App.el('set-ldap-cleartext').checked = !!s.ldap_allow_cleartext;
+    App.el('set-ldap-timeout').value = s.ldap_timeout_s ?? 10;
+
     const storage = server.storage || {};
     App.el('set-app-path').value = storage.app_path || '';
     App.el('set-trace-path').value = storage.trace_path || '';
@@ -304,6 +314,168 @@
     showUsage((App.state.serverState || {}).storage || {});
   }
 
+  /* --------------------------------------------------------------- ldap */
+
+  function ldapStatus(message, colour) {
+    const el = App.el('ldap-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
+  function ldapTestStatus(message, colour) {
+    const el = App.el('ldap-test-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
+  /* Its own save, the same way set-updates-enabled is its own save rather
+     than joining the Apply button's payload: every key here is in
+     ADMIN_ONLY_SETTINGS, and post_settings refuses the WHOLE request when
+     an admin-only key is present without the admin grant — folding these
+     into apply() would make Apply fail outright for a settings:write
+     account changing an unrelated refresh rate, for keys it never touched. */
+  async function applyLdapSettings() {
+    const values = {
+      ldap_enabled: App.el('set-ldap-enabled').checked,
+      ldap_url: App.el('set-ldap-url').value.trim(),
+      ldap_bind_dn_template: App.el('set-ldap-template').value.trim(),
+      ldap_allow_cleartext: App.el('set-ldap-cleartext').checked,
+      ldap_timeout_s: Number(App.el('set-ldap-timeout').value) || 10,
+    };
+    try {
+      await App.post('/api/settings', { scope: 'global', values });
+      await App.loadState();
+      ldapStatus(`Saved — LDAP sign-in is ${values.ldap_enabled ? 'on' : 'off'}.`,
+                 'var(--ok)');
+    } catch (error) {
+      ldapStatus(error.message, 'var(--fail)');
+    }
+  }
+
+  /* A dry-run bind against whatever is in the fields right now (so it can
+     be tried before Save is even pressed), or the saved settings for any
+     field left blank. Creates no session and stores nothing. */
+  async function testLdap() {
+    const username = App.el('ldap-test-username').value.trim();
+    const password = App.el('ldap-test-password').value;
+    if (!username || !password) {
+      ldapTestStatus('Enter a test username and password first', 'var(--fail)');
+      return;
+    }
+    ldapTestStatus('Testing…', 'var(--muted)');
+    try {
+      const result = await App.post('/api/settings/ldap-test', {
+        username, password,
+        url: App.el('set-ldap-url').value.trim(),
+        bind_dn_template: App.el('set-ldap-template').value.trim(),
+        allow_cleartext: App.el('set-ldap-cleartext').checked,
+      });
+      ldapTestStatus(result.message, result.ok ? 'var(--ok)' : 'var(--fail)');
+    } catch (error) {
+      ldapTestStatus(error.message, 'var(--fail)');
+    } finally {
+      App.el('ldap-test-password').value = '';
+    }
+  }
+
+  /* ------------------------------------------------------------- tokens */
+
+  function tokensStatus(message, colour) {
+    const el = App.el('tokens-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
+  function tokensVisible() {
+    return App.canWrite('admin');
+  }
+
+  async function loadTokens() {
+    const table = App.el('tokens-table');
+    if (!table) return;
+    if (!tokensVisible()) {
+      table.innerHTML = '<caption class="sr-only">API tokens</caption>' +
+        '<tbody><tr><td class="hint">API tokens need administrator access. ' +
+        'Ask an administrator if you need one issued.</td></tr></tbody>';
+      return;
+    }
+    const payload = await App.get('/api/tokens');
+    table.innerHTML = '<caption class="sr-only">API tokens</caption><thead><tr>' +
+      '<th scope="col">Account</th><th scope="col">Label</th>' +
+      '<th scope="col">Created</th><th scope="col">Expires</th>' +
+      '<th scope="col">Last used</th><th scope="col"></th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const token of (payload.tokens || [])) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${escape(token.username)}</td>` +
+        `<td>${escape(token.label)}</td>` +
+        `<td>${when(token.created)}</td>` +
+        `<td>${token.expires ? when(token.expires) : 'never'}</td>` +
+        `<td>${token.last_used ? when(token.last_used) : 'never'}</td>` +
+        '<td></td>';
+      const revoke = document.createElement('button');
+      revoke.textContent = 'Revoke';
+      revoke.onclick = () => confirmRevokeToken(token);
+      tr.lastElementChild.appendChild(revoke);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  function confirmRevokeToken(token) {
+    App.confirmDestructive('Revoke token',
+      `<p>Revoke the token <b>${escape(token.label)}</b> for ` +
+      `<b>${escape(token.username)}</b>? Anything using it is refused on its ` +
+      'very next request. This cannot be undone.</p>',
+      'Revoke',
+      () => App.del('/api/tokens', { id: token.id }),
+      async (confirmed) => {
+        if (!confirmed) return;
+        await loadTokens();
+        tokensStatus(`Revoked ${token.label}`, 'var(--muted)');
+      });
+  }
+
+  /* The plaintext token is in THIS response only — the server never keeps
+     it and never sends it again, so it is shown once, with a copy button
+     and an explicit warning, and dropped the moment the dialog closes. */
+  function showNewToken(payload) {
+    App.modal('Token created', `
+      <p class="hint warn-text">This is the only time this token is shown. Copy it now — it
+        cannot be displayed again, and there is no way to recover it if lost. If it is lost,
+        revoke it and issue a new one.</p>
+      <p><code style="word-break:break-all" id="new-token-value">${escape(payload.token)}</code></p>
+      <p class="hint">For account <b>${escape(payload.username)}</b>, labelled
+        “${escape(payload.label)}”. Send it as
+        <code>Authorization: Bearer ${escape(payload.token)}</code>.</p>`, [
+      { label: 'Copy token', onClick: () => {
+        navigator.clipboard.writeText(payload.token).catch(() => {});
+      } },
+      { label: 'Done', primary: true, onClick: App.closeModal },
+    ]);
+  }
+
+  async function addToken() {
+    const username = App.el('new-token-username').value.trim();
+    const label = App.el('new-token-label').value.trim();
+    const expiresRaw = App.el('new-token-expires').value.trim();
+    const body = { username, label };
+    if (expiresRaw) body.expires_days = Number(expiresRaw);
+    try {
+      const payload = await App.post('/api/tokens', body);
+      App.el('new-token-username').value = '';
+      App.el('new-token-label').value = '';
+      App.el('new-token-expires').value = '';
+      await loadTokens();
+      tokensStatus(`Created ${label} for ${username}`, 'var(--ok)');
+      showNewToken(payload);
+    } catch (error) {
+      tokensStatus(error.message, 'var(--fail)');
+    }
+  }
+
   /* ------------------------------------------------------------- users */
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -444,18 +616,40 @@
     el.style.color = colour || 'var(--muted)';
   }
 
+  /* 'local' or 'ldap' — whichever radio in the auth-source pair is checked. */
+  function newAuthSource() {
+    return App.el('new-auth-ldap').checked ? 'ldap' : 'local';
+  }
+
+  /* An LDAP account has no local password at all, so the initial-password
+     field means nothing for one — disabled (not merely ignored) so it
+     cannot look like it did something. */
+  function updateNewAuthFields() {
+    const ldap = newAuthSource() === 'ldap';
+    App.el('new-password').disabled = ldap;
+    App.el('new-password').placeholder = ldap
+      ? 'not used — verified by the directory' : 'initial password';
+    if (ldap) App.el('new-password').value = '';
+  }
+
   async function addUser() {
     const username = App.el('new-username').value.trim();
+    const authSource = newAuthSource();
     const password = App.el('new-password').value;
     const grid = App.el('new-user-grid');
     const grants = readPermissionGrid(grid, 'nu');
     try {
-      await App.post('/api/users', { username, password, grants });
+      await App.post('/api/users',
+        { username, password, auth_source: authSource, grants });
       App.el('new-username').value = '';
       App.el('new-password').value = '';
+      App.el('new-auth-local').checked = true;
+      updateNewAuthFields();
       await loadUsers();
-      usersStatus(`Added ${username}. They must change this password when ` +
-                  'they first sign in.', 'var(--ok)');
+      usersStatus(authSource === 'ldap'
+        ? `Added ${username}, signing in via the directory.`
+        : `Added ${username}. They must change this password when they ` +
+          'first sign in.', 'var(--ok)');
     } catch (error) {
       usersStatus(error.message, 'var(--fail)');
     }
@@ -468,7 +662,14 @@
   function init() {
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
+    App.el('new-auth-local').onchange = updateNewAuthFields;
+    App.el('new-auth-ldap').onchange = updateNewAuthFields;
+    updateNewAuthFields();
     loadUsers().catch(() => {});
+    loadTokens().catch(() => {});
+    App.el('add-token').onclick = addToken;
+    App.el('ldap-apply').onclick = applyLdapSettings;
+    App.el('ldap-test').onclick = testLdap;
     for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
                      'set-ipam-cap', 'set-nodes-cap', 'set-alerts-cap']) {
       App.el(id).oninput = () =>
@@ -497,7 +698,7 @@
 
   App.pages.settings = {
     init,
-    activate: () => { load(); loadUsers().catch(() => {}); },
+    activate: () => { load(); loadUsers().catch(() => {}); loadTokens().catch(() => {}); },
     refresh: () => {},
     forcePasswordChange,
   };

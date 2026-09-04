@@ -41,6 +41,17 @@ from ..wirelessdb import WirelessDatabase
 MAINTENANCE_INTERVAL_S = 900
 
 
+class LdapUnavailable(Exception):
+    """The directory could not be used at all — unreachable, timed out, or
+    misconfigured (an unset or malformed ldap_url/bind_dn_template) —
+    which is a fact about the service, not about the credential typed in.
+    api.post_login answers this with a distinct message and logs it apart
+    from a plain wrong-password refusal, and never lets it become an
+    unhandled 500 (see the `except Exception` arm server._route already
+    has for that; this is caught explicitly instead, before it gets there).
+    """
+
+
 class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                  app_db_path: str, ipam_db_path: str, snmp_db_path: str,
@@ -187,6 +198,78 @@ class Service:
         self.log.add(SYSTEM, f"Created the default {DEFAULT_USER} account. "
                              f"Change its password before this is reachable "
                              f"by anyone else.")
+
+    # --------------------------------------------------------- authentication
+
+    def authenticate_ldap(self, username: str, password: str) -> bool:
+        """True if `username`/`password` verifies against the configured
+        directory; False for a definite bad-credential answer (wrong
+        password, or a referral this minimal client cannot follow — see
+        ldapclient's module docstring). Raises LdapUnavailable when the
+        directory itself could not be used at all (unreachable, timed out,
+        or misconfigured), so the caller (api.post_login) can log and
+        answer that case distinctly from "wrong password" — the two need
+        very different next steps from whoever is failing to sign in, and
+        conflating them is what turns a network blip into "is my password
+        no longer valid?" support tickets.
+        """
+        from .. import ldapclient
+
+        try:
+            dn = ldapclient.render_bind_dn(
+                str(self.settings.get("ldap_bind_dn_template", "")), username)
+            ldapclient.simple_bind(
+                str(self.settings.get("ldap_url", "")), dn, password,
+                timeout=float(self.settings.get("ldap_timeout_s", 10.0) or 10.0),
+                allow_cleartext=bool(self.settings.get("ldap_allow_cleartext", False)))
+            return True
+        except ldapclient.LDAPInvalidCredentials:
+            return False
+        except ldapclient.LDAPReferralError:
+            return False
+        except ldapclient.LDAPBindError:
+            # No such object, unwilling to perform, and the like: not a
+            # credential the directory accepted, but also not a connectivity
+            # problem — answered the same as a wrong password.
+            return False
+        except (ldapclient.LDAPConnectError, ldapclient.LDAPProtocolError,
+                ldapclient.LDAPConfigError) as exc:
+            raise LdapUnavailable(str(exc)) from exc
+
+    def authenticate_api_token(self, raw_token: str, client: str = "") -> str | None:
+        """The username an API token authenticates as, or None if it does
+        not authenticate a request at all (unknown, or expired).
+
+        Checked wherever the session cookie is checked (server.py's Bearer
+        handling), but this is deliberately NOT a SessionStore entry: there
+        is no idle timeout here and never will be — that is the entire
+        point of a token an unattended script can hold — and nothing here
+        touches auth.SessionStore at all.
+        """
+        from .. import auth
+
+        token_hash = auth.hash_api_token(raw_token)
+        row = self.app_db.api_token_by_hash(token_hash)
+        if row is None:
+            return None
+        # Defense in depth over the indexed SQL equality match above: an
+        # explicit constant-time comparison of the exact bytes matched,
+        # documented rather than relied on implicitly (see
+        # ldapclient.constant_time_hash_eq and auth.hash_api_token's
+        # docstring for why an indexed lookup is fine here in the first
+        # place — the token's 256 bits of entropy is what actually protects
+        # it, the same property that makes SessionStore's own plain dict
+        # lookup by session token fine).
+        from .. import ldapclient
+        if not ldapclient.constant_time_hash_eq(row["token_hash"], token_hash):
+            return None
+        if row["expires_ts"] is not None and time.time() > row["expires_ts"]:
+            self.app_db.audit(row["username"], client, "token.expired_use",
+                              target=str(row["id"]),
+                              detail=f"label={row['label']}")
+            return None
+        self.app_db.touch_api_token(row["id"], row["last_used_ts"])
+        return row["username"]
 
     # ------------------------------------------------------------- lifecycle
 

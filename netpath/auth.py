@@ -57,6 +57,46 @@ COMMON_PASSWORDS = {
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 
+# API tokens (Tier 1 #10): a service-account credential that authenticates
+# an HTTP request the same way a session cookie does, checked wherever the
+# cookie is (server.py's Bearer handling), but never expires from idleness
+# and carries exactly the owning account's permission grants — see
+# appdb.api_tokens for the storage side.
+#
+# Prefixed the way GitHub's and Slack's tokens are: a leak scanner (or a
+# human skimming a log dump) can recognise "sw_api_…" as a credential on
+# sight, where a bare base64url blob looks like any other opaque string.
+API_TOKEN_PREFIX = "sw_api_"
+API_TOKEN_BYTES = 32           # 256 bits, from secrets.token_urlsafe
+
+
+def generate_api_token() -> str:
+    """A fresh token. Returned to the caller exactly once, by the route
+    that creates it — see appdb.add_api_token, which stores only its hash."""
+    return API_TOKEN_PREFIX + secrets.token_urlsafe(API_TOKEN_BYTES)
+
+
+def hash_api_token(raw_token: str) -> str:
+    """The SHA-256 hex digest of a token, which is what is actually stored
+    and looked up (appdb.api_token_by_hash) — never the token itself.
+
+    Deliberately not scrypt, and deliberately not salted, unlike
+    hash_password above. Both of those exist to make a *human-chosen*
+    secret expensive to brute-force offline, because a password's real
+    entropy is far below its length — dictionaries and pattern-mangling get
+    an attacker most of the way there. A token from generate_api_token() has
+    256 bits of entropy from `secrets.token_urlsafe`, chosen uniformly at
+    random: there is no dictionary to run, no pattern to mangle, and no
+    feasible amount of hardware makes searching a 256-bit space practical
+    before the heat death of the universe. A slow, salted hash would only
+    make every legitimate request pay a scrypt call for no matching benefit
+    — the entropy is already doing the work a salt and a cost factor exist
+    to add for a weaker secret. A plain SHA-256 lookup is what lets an
+    automation script authenticate on every request without a
+    half-second-per-call tax.
+    """
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
 
 class AuthError(Exception):
     """Anything the user is allowed to be told about."""

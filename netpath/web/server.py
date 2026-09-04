@@ -6,10 +6,15 @@ don't" rather than pulling a web framework and its dependency tree onto a
 machine whose job is watching the network.
 
 Every route carries a (module, level) permission and needs a signed-in
-session; see `permissions.py` and the ROUTES table below. Without `--cert`
-this is plain HTTP, so the session cookie and every credential typed into
-the interface cross the network in the clear — bind to 127.0.0.1, or give
-it a certificate.
+session — a browser's `sw_session` cookie, or (Tier 1 #10) an
+`Authorization: Bearer <token>` API token, checked the same place and
+against the same permission gates; see `permissions.py` and the ROUTES
+table below. A token never mints a cookie session and is exempt from the
+idle timeout that a cookie session is subject to — see `_route`'s handling
+of the two. Without `--cert` this is plain HTTP, so the session cookie,
+every credential typed into the interface and every bearer token sent
+cross the network in the clear — bind to 127.0.0.1, or give it a
+certificate.
 """
 
 from __future__ import annotations
@@ -211,6 +216,18 @@ ROUTES = [
     ("DELETE", r"^/api/users$", api.delete_user, ("admin", W)),
     ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
+    # API tokens (Tier 1 #10): a service-account credential, not a person's
+    # — issuing or revoking one is exactly as administrative an act as
+    # creating or deleting the account it authenticates as, so it sits
+    # behind the same `admin` gate as the routes above rather than being
+    # self-service. See api.post_token's docstring for the fuller reasoning.
+    ("GET", r"^/api/tokens$", api.get_tokens, ("admin", R)),
+    ("POST", r"^/api/tokens$", api.post_token, ("admin", W)),
+    ("DELETE", r"^/api/tokens$", api.delete_token, ("admin", W)),
+    # A dry-run bind against the configured (or about-to-be-saved) LDAP
+    # settings — same shape as the SMTP test route below, and gated the
+    # same way the settings that configure it are (ADMIN_ONLY_SETTINGS).
+    ("POST", r"^/api/settings/ldap-test$", api.post_ldap_test, ("admin", W)),
     ("GET", r"^/api/state$", api.get_state, None),
     ("GET", r"^/api/config$", api.get_config, None),
     ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
@@ -491,6 +508,11 @@ MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state", "/api/config",
                    "/api/heartbeat", "/api/password"}
 
 SESSION_COOKIE = "sw_session"
+
+# `Authorization: Bearer <token>` — an API token (Tier 1 #10), checked
+# wherever the session cookie above is checked, in `_route` below. Case-
+# insensitive per RFC 9110 §11.1 (the scheme name, not the token itself).
+BEARER_RE = re.compile(r"^Bearer\s+(\S+)$", re.IGNORECASE)
 
 
 class LengthRequired(ValueError):
@@ -940,9 +962,11 @@ class Handler(BaseHTTPRequestHandler):
         session = self.service.sessions.get(token) if token else None
         params["_client"] = self.client_address[0]
         params["_agent"] = self.headers.get("User-Agent", "")
+        authenticated = False
         if session:
             params["_token"] = token
             params["_username"] = session["username"]
+            authenticated = True
             # A write is something a person chose to do — add a target, change
             # a setting, send a test packet — as opposed to the state poll
             # every open tab makes on its own every couple of seconds. Only
@@ -954,8 +978,27 @@ class Handler(BaseHTTPRequestHandler):
             # have made impossible.
             if method in ("POST", "PUT", "DELETE") and path != "/api/heartbeat":
                 self.service.sessions.touch(token)
+        else:
+            # No cookie session: an API token (Tier 1 #10) may still
+            # authenticate this request, checked against `Authorization`
+            # rather than `Cookie`. Deliberately never sets params["_token"]
+            # — that key is the SessionStore's, and a token has no entry
+            # there to touch, get or extend. That single omission is what
+            # makes "no idle timeout for a token" and "a token cannot mint
+            # a browser session" true without any further special-casing
+            # below: sessions.touch("") and sessions.get("") are both
+            # no-ops (see auth.SessionStore), and no Set-Cookie is ever
+            # produced from anywhere but the login route's own response
+            # handling further down.
+            match = BEARER_RE.match((self.headers.get("Authorization") or "").strip())
+            if match:
+                username = self.service.authenticate_api_token(
+                    match.group(1), self.client_address[0])
+                if username:
+                    params["_username"] = username
+                    authenticated = True
 
-        if not session and path not in PUBLIC_PATHS and path not in PUBLIC_API:
+        if not authenticated and path not in PUBLIC_PATHS and path not in PUBLIC_API:
             if path.startswith("/api/"):
                 self._json({"error": "Not signed in", "authenticated": False}, 401)
             else:
@@ -968,9 +1011,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # The flag on the account, not on the session: a reset takes effect
         # for a session that is already open, and the check costs one indexed
-        # lookup on a table with one row per operator.
-        if session and path.startswith("/api/") and path not in MUST_CHANGE_API:
-            row = self.service.app_db.user(session["username"])
+        # lookup on a table with one row per operator. Applies to a token-
+        # authenticated request exactly the same as a browser one — an
+        # account that owes a password change is not fully trusted yet,
+        # whichever door it came in by.
+        if authenticated and path.startswith("/api/") and path not in MUST_CHANGE_API:
+            row = self.service.app_db.user(params.get("_username", ""))
             if row is not None and row["must_change"]:
                 self._json({"error": "password change required"}, 403)
                 return

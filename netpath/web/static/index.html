@@ -1086,6 +1086,41 @@
         regardless of activity. Changing either applies to every session at the next check, not
         only new ones.</p>
     </fieldset>
+    <fieldset data-requires-write="admin">
+      <legend>DIRECTORY (LDAP)</legend>
+      <p class="hint">Lets accounts created below with "Sign in via LDAP directory" verify their
+        password against a directory server instead of a locally stored one. Local accounts are
+        unaffected either way, and stay available as a fallback — which is also why the last
+        local administrator can never be removed while only directory administrators remain (see
+        the USERS section below).</p>
+      <label class="check"><input type="checkbox" id="set-ldap-enabled"> Enable LDAP sign-in</label>
+      <label>Directory URL <input id="set-ldap-url" placeholder="ldaps://dc.example.com:636" size="34"></label>
+      <label>Bind DN template
+        <input id="set-ldap-template" placeholder="uid={username},ou=people,dc=example,dc=com" size="46"></label>
+      <p class="hint"><code>{username}</code> is replaced with the account's username, which may
+        only contain letters, digits, dot, dash and underscore — the same rule every username in
+        this application already follows — so nothing typed at sign-in can change which entry the
+        bind targets.</p>
+      <label class="check"><input type="checkbox" id="set-ldap-cleartext">
+        Allow sending the password without TLS (ldap:// only)</label>
+      <p class="hint">Off by default. A simple bind sends the password inside the request itself
+        — without TLS (an <code>ldaps://</code> URL) that is in the clear on the wire, and this
+        client refuses to do it until this is switched on. Prefer <code>ldaps://</code> instead of
+        turning this on wherever the directory supports it.</p>
+      <label>Connection timeout <input type="number" id="set-ldap-timeout" min="1" max="120" step="1"> s</label>
+      <div class="row" style="margin-top:8px">
+        <button id="ldap-apply" data-requires-write="admin">Save directory settings</button>
+      </div>
+      <p class="hint" id="ldap-status"></p>
+      <div class="row" style="margin-top:8px">
+        <input id="ldap-test-username" placeholder="test username" size="16">
+        <input id="ldap-test-password" type="password" placeholder="test password" size="18">
+        <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
+      </div>
+      <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
+        ones, for any left blank) without saving anything or creating a session.</p>
+    </fieldset>
+
     <fieldset data-requires-write="settings">
       <legend>USERS</legend>
       <p class="hint">Your own password is changed from the <b>Account</b> button in the top
@@ -1095,13 +1130,36 @@
       <div class="row" style="margin-top:10px">
         <input id="new-username" placeholder="username" size="18">
         <input id="new-password" type="password" placeholder="initial password" size="22">
+        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-local" value="local" checked>
+          Local password</label>
+        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
+          Sign in via LDAP directory</label>
       </div>
       <div id="new-user-grid"></div>
       <div class="row"><button id="add-user" data-requires-write="admin">Add user</button></div>
       <p class="hint" id="users-status">A new user must change the initial password when they
         first sign in, and starts with whatever access is set above — write implies read, and
-        nothing checked means no access to that module at all.</p>
+        nothing checked means no access to that module at all. An LDAP account has no local
+        password at all — the initial-password field above is ignored for one — and its password
+        is only ever changed in the directory.</p>
       <p class="hint" id="sessions-line"></p>
+    </fieldset>
+
+    <fieldset data-requires-write="admin">
+      <legend>API TOKENS</legend>
+      <p class="hint">A token authenticates automation the same way a signed-in session
+        authenticates a browser, with the account's own permission grants and no idle timeout —
+        so an unattended script does not have to hold a person's password against the sign-in
+        timeout above. Send it as <code>Authorization: Bearer &lt;token&gt;</code>. The token
+        itself is shown once, right after you create it, and never again.</p>
+      <div class="table-wrap" style="max-height:220px"><table id="tokens-table"></table></div>
+      <div class="row" style="margin-top:10px">
+        <input id="new-token-username" placeholder="account username" size="16">
+        <input id="new-token-label" placeholder="label — what this is for" size="26">
+        <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12">
+        <button id="add-token" data-requires-write="admin">Create token</button>
+      </div>
+      <p class="hint" id="tokens-status"></p>
     </fieldset>
 
     <fieldset>

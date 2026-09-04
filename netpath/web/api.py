@@ -166,11 +166,15 @@ _STATE_MODULE_KEYS = {
 # every response — every module's own refresh cadence lives in it and every
 # tab needs those — but these keys are server internals with no reason to
 # reach an account without Settings access: where the listener binds and
-# which TLS material it loads, how long a sign-in lasts, and which resolver
-# the nslookup subprocesses are pointed at.
+# which TLS material it loads, how long a sign-in lasts, which resolver the
+# nslookup subprocesses are pointed at, and — Tier 1 #10 — the directory's
+# address, its bind DN template (which names the plant's LDAP tree
+# structure) and its cleartext opt-out.
 SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
                       "session_idle_minutes", "session_max_hours",
-                      "dns_server", "asn_server")
+                      "dns_server", "asn_server",
+                      "ldap_url", "ldap_bind_dn_template",
+                      "ldap_allow_cleartext", "ldap_timeout_s")
 
 
 def _visible_settings(settings: dict, granted: dict) -> dict:
@@ -1106,8 +1110,12 @@ SETTINGS_SCOPES = {
 
 # Global settings that are not an operator's to change even with Settings
 # write: turning this host's self-update on decides whether it will replace
-# its own code from the internet.
-ADMIN_ONLY_SETTINGS = ("updates_enabled",)
+# its own code from the internet, and the ldap_* keys decide who may sign
+# in at all and where a password gets sent — both are administrator
+# decisions in the same sense creating an account is, not preferences.
+ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
+                      "ldap_bind_dn_template", "ldap_allow_cleartext",
+                      "ldap_timeout_s")
 
 
 def _is_admin(service, params) -> bool:
@@ -5564,6 +5572,7 @@ def post_login(service, params, body) -> dict:
     """Verify a password. Deliberately slow to fail, and vague about why."""
     from ..auth import (AuthError, LockedOut, check_username, needs_rehash,
                         hash_password, verify_password)
+    from .service import LdapUnavailable
 
     password = str(body.get("password", ""))
     client = _client(params)
@@ -5601,7 +5610,10 @@ def post_login(service, params, body) -> dict:
         stored = row["password"] if row else None
 
         # Hash something even when the account does not exist, so the time
-        # taken cannot be used to discover which usernames are real.
+        # taken cannot be used to discover which usernames are real. This
+        # only distinguishes "no such account" from "an account exists" —
+        # it says nothing about whether that account is local or LDAP, so
+        # it stays exactly as it was for both kinds of account.
         if stored is None:
             verify_password(password, _dummy_hash())
             service.throttle.record_failure(username, client)
@@ -5611,7 +5623,52 @@ def post_login(service, params, body) -> dict:
                    target=label, detail="no such account")
             raise PermissionError("Wrong username or password")
 
-        if not verify_password(password, stored):
+        auth_source = row["auth_source"]
+
+        if auth_source == "ldap":
+            # An LDAP-mapped account (Tier 1 #10): the directory verifies
+            # the password, not the (empty, never-consulted) local hash. If
+            # the feature is switched off this account simply cannot sign
+            # in — it never falls back to checking an empty local hash,
+            # which verify_password already refuses outright regardless
+            # (see its own `if not stored` guard), but failing here first
+            # gives a clearer audit trail than "wrong password" would.
+            if not service.settings.get("ldap_enabled"):
+                service.throttle.record_failure(username, client)
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"Failed sign-in for {row['username']} from {client}: "
+                    f"directory sign-in is switched off")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.failed", target=row["username"],
+                       detail="ldap disabled")
+                raise PermissionError("Wrong username or password")
+            try:
+                bound = service.authenticate_ldap(row["username"], password)
+            except LdapUnavailable as exc:
+                # Fails closed, and says so honestly rather than as a 500:
+                # this is the one login outcome that is not about the
+                # credential at all, so it gets its own message and its own
+                # audit action rather than being folded into signin.failed.
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"LDAP directory unreachable while signing in "
+                    f"{row['username']} from {client}: {exc}")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.ldap_unreachable", target=row["username"],
+                       detail=str(exc)[:200])
+                raise PermissionError(
+                    "Could not reach the directory service. Try again "
+                    "shortly, or contact an administrator.") from exc
+            if not bound:
+                service.throttle.record_failure(username, client)
+                service.log.add(ERROR_CATEGORY,
+                                f"Failed sign-in for {row['username']} from {client}")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.failed", target=row["username"],
+                       detail="ldap bind refused")
+                raise PermissionError("Wrong username or password")
+        elif not verify_password(password, stored):
             service.throttle.record_failure(username, client)
             service.log.add(ERROR_CATEGORY,
                             f"Failed sign-in for {row['username']} from {client}")
@@ -5623,8 +5680,13 @@ def post_login(service, params, body) -> dict:
     service.throttle.clear(username)
     service.app_db.touch_login(row["username"])
 
-    # Upgrade the stored hash quietly, now that we hold the password.
-    if needs_rehash(stored):
+    # Upgrade the stored hash quietly, now that we hold the password. Local
+    # accounts only: an LDAP account's stored hash is the empty string it
+    # was created with and is never meant to become anything else —
+    # needs_rehash("") would otherwise say True (an unrecognised scheme
+    # "needs" upgrading) and this would happily hash the directory
+    # password into a local hash nothing ever checks.
+    if auth_source == "local" and needs_rehash(stored):
         service.app_db.set_password(row["username"], hash_password(password),
                                 must_change=bool(row["must_change"]))
 
@@ -5714,6 +5776,7 @@ def get_users(service, params, body) -> dict:
             {"username": row["username"], "created": row["created_ts"],
              "updated": row["updated_ts"], "last_login": row["last_login"],
              "must_change": bool(row["must_change"]),
+             "auth_source": row["auth_source"],
              "permissions": service.app_db.permissions_for(row["username"])}
             for row in service.app_db.users()
         ],
@@ -5727,47 +5790,82 @@ def post_user(service, params, body) -> dict:
 
     try:
         username = check_username(str(body.get("username", "")))
-        password = str(body.get("password", ""))
-        check_password_quality(password, username)
     except AuthError as exc:
         raise ValueError(str(exc)) from exc
+
+    auth_source = str(body.get("auth_source", "local") or "local").strip().lower()
+    if auth_source not in ("local", "ldap"):
+        raise ValueError("auth_source must be 'local' or 'ldap'")
 
     if service.app_db.user(username):
         raise ValueError(f"There is already an account called {username}")
 
-    service.app_db.add_user(username, hash_password(password), must_change=True)
+    if auth_source == "ldap":
+        # No local password hash is stored at all — the directory is the
+        # only place this account's credential lives (post_login's ldap
+        # branch never consults it), so there is nothing here for a
+        # database compromise to steal for this account. must_change is
+        # meaningless without a local password to change, so it starts
+        # False rather than locking the account behind a change it has no
+        # route to make (post_password refuses a password change for an
+        # ldap account outright — see there).
+        service.app_db.add_user(username, "", must_change=False, auth_source="ldap")
+    else:
+        password = str(body.get("password", ""))
+        try:
+            check_password_quality(password, username)
+        except AuthError as exc:
+            raise ValueError(str(exc)) from exc
+        service.app_db.add_user(username, hash_password(password), must_change=True,
+                                auth_source="local")
 
     grants = body.get("grants") or {}
     if grants:
         service.app_db.set_permissions(username, grants)
     service.bump_config()
     service.log.add(SYSTEM_CATEGORY,
-                    f"Account {username} created by "
+                    f"Account {username} ({auth_source}) created by "
                     f"{params.get('_username', 'someone')}")
     _audit(service, params, "user.create", target=username,
-           detail=", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
-                  or "no grants")
-    return {"username": username}
+           detail=f"auth_source={auth_source}; " +
+                  (", ".join(f"{m}:{lvl}" for m, lvl in sorted(grants.items()))
+                   or "no grants"))
+    return {"username": username, "auth_source": auth_source}
 
 
 def _last_admin_guard(service, target: str, keeps_admin: bool) -> None:
-    """Refuse a change that would leave the install with no administrator.
+    """Refuse a change that would leave the install with no LOCAL
+    administrator.
 
     Deleting the last *account* was already refused; losing the last
     administrator is the same trap by a different route — an install with
     no admin has no way back into its own user management short of editing
-    app.db by hand.
+    app.db by hand. Extended for LDAP accounts (Tier 1 #10): an
+    administrator that exists only in the directory is no fallback at all
+    if the directory is down or unreachable, so at least one *local*
+    admin:write account must always remain — an ldap admin does not count
+    toward keeping this guard satisfied, only toward the plain "some admin
+    exists" check `usernames_with` would otherwise imply.
     """
     if keeps_admin:
         return
     admins = service.app_db.usernames_with("admin", _permissions.WRITE)
-    if [name for name in admins if name.lower() != target.lower()]:
+
+    def is_local(name: str) -> bool:
+        row = service.app_db.user(name)
+        return row is not None and row["auth_source"] == "local"
+
+    others_local = [name for name in admins
+                    if name.lower() != target.lower() and is_local(name)]
+    if others_local:
         return
     if any(name.lower() == target.lower() for name in admins):
         raise ValueError(
-            f"{target} is the only account with administrator access. Give "
-            f"another account administrator access first, or there would be "
-            f"no way to manage accounts at all.")
+            f"Removing administrator access from {target} would leave no "
+            f"local administrator account — if the directory becomes "
+            f"unreachable there would be no way back into user management "
+            f"at all. Give another local account administrator access "
+            f"first.")
 
 
 def post_user_permissions(service, params, body) -> dict:
@@ -5841,6 +5939,17 @@ def post_password(service, params, body) -> dict:
     if not row:
         raise ValueError(f"No account called {target}")
 
+    if row["auth_source"] == "ldap":
+        # There is no local password for this account at all — post_login's
+        # ldap branch never looks at `row["password"]` (kept as "" since
+        # creation), so setting one here would do nothing but sit unused
+        # and misleadingly suggest a local fallback exists when it does
+        # not. The directory is the only place this account's password is
+        # ever changed.
+        raise ValueError(
+            f"{target} signs in through the directory (LDAP); there is no "
+            f"local password to change here.")
+
     if not resetting:
         # Changing your own password needs the current one, so a walk-up at an
         # unlocked screen cannot lock the real owner out.
@@ -5863,6 +5972,162 @@ def post_password(service, params, body) -> dict:
     _audit(service, params, "password.reset" if resetting else "password.change",
            target=target, detail=f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}
+
+
+# ------------------------------------------------------------- API tokens
+#
+# A token (Tier 1 #10) belongs to an account and carries exactly that
+# account's grants — there is no separate permission model to keep in sync
+# with permissions.py, and nothing about how a request is authorized
+# changes once it is past authentication (see server.py's Bearer handling).
+# All three routes are administrator-only, the same gate account creation,
+# deletion and permission changes already sit behind, rather than
+# self-service for one's own account: a token is a durable, unattended
+# credential with no idle timeout, and deciding that one should exist for a
+# given account is exactly the kind of decision this application already
+# treats as an administrative act rather than something any signed-in
+# account does to itself — the same reasoning post_user_permissions'
+# "nobody edits their own grants" already rests on. An account cannot even
+# see its own permission grid change without another administrator's
+# say-so; it should not be able to hand itself a credential that outlives
+# every session outright, either.
+
+def get_tokens(service, params, body) -> dict:
+    """Metadata for every token — never the token itself, which existed
+    only in the response that created it. `username` names the account
+    whose grants the token authenticates with; a caller wanting "my
+    account's tokens" filters this client-side, the same way the accounts
+    grid itself is one list rather than one route per account."""
+    return {
+        "tokens": [
+            {"id": row["id"], "username": row["username"], "label": row["label"],
+             "created": row["created_ts"], "created_by": row["created_by"],
+             "expires": row["expires_ts"], "last_used": row["last_used_ts"]}
+            for row in service.app_db.api_tokens()
+        ],
+    }
+
+
+def post_token(service, params, body) -> dict:
+    """Issue a token for an existing account. The plaintext token is
+    returned in THIS response only — never again, anywhere, including this
+    same account's own future GET /api/tokens — because only its SHA-256 is
+    kept (see auth.hash_api_token)."""
+    from .. import auth
+
+    username = str(body.get("username", "")).strip()
+    if not username:
+        raise ValueError("Which account is this token for?")
+    if not service.app_db.user(username):
+        raise ValueError(f"No account called {username}")
+
+    label = str(body.get("label", "")).strip()
+    if not label:
+        raise ValueError("Give this token a label — what it is for, or what "
+                         "will use it — so it can be told apart on the list "
+                         "and in the audit log later.")
+    if len(label) > 120:
+        raise ValueError("That label is too long (120 characters max)")
+
+    expires_ts = None
+    expires_days = body.get("expires_days")
+    if expires_days not in (None, "", 0):
+        try:
+            days = float(expires_days)
+        except (TypeError, ValueError):
+            raise ValueError("expires_days must be a number")
+        if days <= 0:
+            raise ValueError("expires_days must be positive, or omitted for no expiry")
+        expires_ts = time.time() + days * 86400
+
+    raw_token = auth.generate_api_token()
+    token_id = service.app_db.add_api_token(
+        username, label, auth.hash_api_token(raw_token),
+        created_by=params.get("_username", ""), expires_ts=expires_ts)
+
+    service.log.add(SYSTEM_CATEGORY,
+                    f"API token '{label}' issued for {username} by "
+                    f"{params.get('_username', 'someone')}")
+    _audit(service, params, "token.issue", target=username,
+           detail=f"id={token_id}; label={label}"
+                  + (f"; expires in {expires_days}d" if expires_ts else "; no expiry"))
+    # `token` appears in exactly one response body, ever — this one. Every
+    # other route that touches tokens (get_tokens, the audit log, the event
+    # log line above) carries only what post_token returns besides it.
+    return {"id": token_id, "token": raw_token, "username": username,
+            "label": label, "expires": expires_ts}
+
+
+def delete_token(service, params, body) -> dict:
+    """Revoke a token by id, immediately: the row is removed outright, so
+    the very next request it would have authenticated is refused like any
+    other unrecognised credential — there is no grace period and nothing
+    left for a compromised token to still do."""
+    token_id = body.get("id")
+    try:
+        token_id = int(token_id)
+    except (TypeError, ValueError):
+        raise ValueError("id must be a token id")
+
+    row = service.app_db.revoke_api_token(token_id)
+    if row is None:
+        raise ValueError(f"No token with id {token_id}")
+
+    service.log.add(SYSTEM_CATEGORY,
+                    f"API token '{row['label']}' for {row['username']} "
+                    f"revoked by {params.get('_username', 'someone')}")
+    _audit(service, params, "token.revoke", target=row["username"],
+           detail=f"id={token_id}; label={row['label']}")
+    return {"revoked": token_id}
+
+
+# ---------------------------------------------------------------- LDAP test
+#
+# A dry-run bind, so an administrator configuring the directory finds out
+# whether ldap_url/ldap_bind_dn_template/ldap_allow_cleartext actually work
+# before flipping ldap_enabled on for a real account — the same "test
+# before you trust it" shape post_alerts_smtp_test and post_snmp_test
+# already give their own modules. Never creates a session and never
+# consults or changes any stored account; it is purely a bind attempt
+# against either the saved settings or the overrides in the body, so the
+# settings dialog can be tested before Apply is even pressed.
+
+def post_ldap_test(service, params, body) -> dict:
+    from .. import ldapclient
+
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are needed to test a bind")
+
+    url = str(body.get("url", "") or service.settings.get("ldap_url", ""))
+    template = str(body.get("bind_dn_template", "")
+                   or service.settings.get("ldap_bind_dn_template", ""))
+    allow_cleartext = bool(body.get("allow_cleartext",
+                                    service.settings.get("ldap_allow_cleartext", False)))
+    timeout = float(service.settings.get("ldap_timeout_s", 10.0) or 10.0)
+
+    try:
+        dn = ldapclient.render_bind_dn(template, username)
+        ldapclient.simple_bind(url, dn, password, timeout=timeout,
+                               allow_cleartext=allow_cleartext)
+        ok, message = True, f"Bind succeeded as {dn}"
+    except ldapclient.LDAPInvalidCredentials:
+        ok, message = False, "The directory rejected that username or password"
+    except ldapclient.LDAPReferralError:
+        ok, message = False, ("The directory returned a referral, which this "
+                              "minimal client cannot follow")
+    except ldapclient.LDAPBindError as exc:
+        ok, message = False, str(exc)
+    except (ldapclient.LDAPConnectError, ldapclient.LDAPProtocolError,
+            ldapclient.LDAPConfigError) as exc:
+        ok, message = False, str(exc)
+
+    # No password, either way — only whether the test was run and against
+    # what result.
+    _audit(service, params, "ldap.test", target=username,
+           detail=f"ok={ok}: {message}"[:400])
+    return {"ok": ok, "message": message}
 
 
 # ---------------------------------------------------------------------------

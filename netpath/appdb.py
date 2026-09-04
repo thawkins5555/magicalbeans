@@ -46,7 +46,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_ts   REAL NOT NULL,
     updated_ts   REAL NOT NULL,
     last_login   REAL,
-    must_change  INTEGER NOT NULL DEFAULT 0
+    must_change  INTEGER NOT NULL DEFAULT 0,
+    -- 'local' (the default: this row's `password` hash is authoritative) or
+    -- 'ldap' (sign-in verifies against the configured directory instead —
+    -- see post_login and Service.authenticate_ldap; `password` is stored
+    -- empty and is never consulted). A column rather than a second table
+    -- because every other property of an account — its grants, its
+    -- sessions, its audit trail — is identical either way; only how the
+    -- password check is done differs. Added by _migrate() below for a
+    -- database that predates this feature, the same way every other
+    -- column added after a table's first CREATE is.
+    auth_source  TEXT NOT NULL DEFAULT 'local'
 );
 
 -- Absence of a row for (username, module) means no access at all. A
@@ -104,6 +114,33 @@ CREATE TABLE IF NOT EXISTS audit (
     detail   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit(ts);
+
+-- API tokens (Tier 1 #10): service-account credentials that authenticate an
+-- HTTP request the same way a session cookie does, but never expire from
+-- idleness and never go through the browser at all — see server.py's Bearer
+-- handling. A token belongs to an account and carries exactly that
+-- account's grants; there is no separate permission model for tokens, on
+-- purpose, so "what can this token do" is always answered by "what can
+-- that account do" with nothing extra to audit or drift.
+--
+-- Only the SHA-256 of the token is stored, never the token itself: it is
+-- 256 bits from secrets.token_urlsafe, so unlike a human password there is
+-- no feasible offline attack to slow down with a deliberately expensive
+-- hash, and a plain fast hash is what lets a busy API get through
+-- authentication without the scrypt cost login pays. See auth.hash_api_token
+-- for the full reasoning.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id           INTEGER PRIMARY KEY,
+    username     TEXT NOT NULL,
+    label        TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_ts   REAL NOT NULL,
+    created_by   TEXT NOT NULL,
+    expires_ts   REAL,              -- NULL: never expires
+    last_used_ts REAL               -- NULL: never used yet
+);
+CREATE INDEX IF NOT EXISTS ix_api_tokens_hash ON api_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS ix_api_tokens_username ON api_tokens(username);
 
 -- Housekeeping this file needs about itself. Not user-visible, and separate
 -- from `settings` so a marker can never be mistaken for a setting.
@@ -204,6 +241,33 @@ GLOBAL_DEFAULTS = {
     # A discovery job whose whole target is inside the list fails saying so
     # rather than quietly finding nothing.
     "never_scan_cidrs": "",
+    # LDAP simple-bind directory authentication (Tier 1 #10). Off by
+    # default, and every key here is administrator-only (ADMIN_ONLY_SETTINGS
+    # below) the same way updates_enabled is: this is a policy decision
+    # about who may sign in at all, not a preference a settings:write
+    # account should be able to reach for. Applies only to accounts created
+    # with auth_source='ldap' — a local account's sign-in is unaffected by
+    # any of these, on or off (see users.auth_source and post_login).
+    "ldap_enabled": False,
+    # "ldaps://host:port" (implicit TLS, via ssl.create_default_context) or
+    # "ldap://host:port" (refused unless ldap_allow_cleartext is set — see
+    # ldapclient.py). No default host: there is no safe guess for a
+    # directory address, and an empty one simply fails every ldap sign-in
+    # with an honest "not configured" rather than probing something.
+    "ldap_url": "",
+    # Where {username} is substituted after netpath.ldapclient.safe_dn_username
+    # rejects anything outside [A-Za-z0-9._-] — the same charset
+    # auth.USERNAME_RE already enforces on every username in this
+    # application, so no legitimate sign-in is ever refused by it. e.g.
+    # "uid={username},ou=people,dc=example,dc=com".
+    "ldap_bind_dn_template": "",
+    # Off: a simple-bind password is sent to the directory as plaintext
+    # inside the BindRequest, and without TLS that means on the wire in the
+    # clear. ldapclient.simple_bind refuses an "ldap://" (non-TLS) URL
+    # outright unless this is explicitly turned on — the same opt-out shape
+    # smtp_allow_plain_auth already uses for the same reason.
+    "ldap_allow_cleartext": False,
+    "ldap_timeout_s": 10.0,
 }
 
 # Tables this file took over whole. `settings` is not among them: that table
@@ -228,6 +292,7 @@ class AppDatabase:
                 " AND name='user_permissions'").fetchone() is not None
             dbmaint.enable_incremental_vacuum(self._conn, "app.db")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
         # Neither backfill runs here. On an install that predates app.db the
         # accounts they grant against are still in netpath.db at this point:
@@ -236,6 +301,23 @@ class AppDatabase:
         # backfill_permissions(). Running against the empty table would set
         # the ssh marker having granted nobody, permanently.
         self._needs_full_backfill = not had_permissions_table
+
+    def _migrate(self) -> None:
+        """Add columns introduced after `users` was first created.
+
+        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone,
+        so `auth_source` (Tier 1 #10) has to be added explicitly for an
+        install that already has an app.db — the same convention nodesdb.py,
+        db.py and the rest already use for their own post-release columns.
+        Every existing account defaults to 'local', which is exactly what it
+        already was.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "auth_source" not in columns:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL"
+                " DEFAULT 'local'")
 
     def backfill_permissions(self, log=None) -> None:
         """Grants the permissions an upgrade owes existing accounts. Call it
@@ -424,8 +506,8 @@ class AppDatabase:
     def users(self) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(
-                "SELECT username, created_ts, updated_ts, last_login, must_change"
-                " FROM users ORDER BY username COLLATE NOCASE").fetchall()
+                "SELECT username, created_ts, updated_ts, last_login, must_change,"
+                " auth_source FROM users ORDER BY username COLLATE NOCASE").fetchall()
 
     def user(self, username: str) -> sqlite3.Row | None:
         with self._lock:
@@ -439,13 +521,19 @@ class AppDatabase:
                 "SELECT COUNT(*) AS n FROM users").fetchone()["n"]
 
     def add_user(self, username: str, password_hash: str,
-                 must_change: bool = True) -> None:
+                 must_change: bool = True, auth_source: str = "local") -> None:
+        # Whatever the caller passes, only these two mean anything to
+        # post_login; anything else would silently never verify, so it is
+        # refused here rather than reaching the table at all.
+        if auth_source not in ("local", "ldap"):
+            raise ValueError("auth_source must be 'local' or 'ldap'")
         now = time.time()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO users(username, password, created_ts, updated_ts,"
-                " must_change) VALUES (?,?,?,?,?)",
-                (username, password_hash, now, now, 1 if must_change else 0))
+                " must_change, auth_source) VALUES (?,?,?,?,?,?)",
+                (username, password_hash, now, now, 1 if must_change else 0,
+                 auth_source))
             self._conn.commit()
 
     def set_password(self, username: str, password_hash: str,
@@ -471,7 +559,94 @@ class AppDatabase:
             self._conn.execute(
                 "DELETE FROM user_permissions WHERE username = ? COLLATE NOCASE",
                 (username,))
+            # A token outlives nothing about the account it belongs to: its
+            # grants are read from `permissions_for(username)` at the moment
+            # it authenticates a request (see server.py's Bearer handling),
+            # so a token whose account no longer exists would otherwise
+            # authenticate to zero permissions forever rather than being
+            # refused outright — silent, not obviously broken, and never
+            # cleaned up by anything.
+            self._conn.execute(
+                "DELETE FROM api_tokens WHERE username = ? COLLATE NOCASE",
+                (username,))
             self._conn.commit()
+
+    # ------------------------------------------------------------ api tokens
+    #
+    # A token authenticates like a session but is not one: it lives in this
+    # table rather than auth.SessionStore, has no idle timeout, and is
+    # looked up by the hash of what the caller presents rather than by an
+    # opaque key handed out at issue time (compare SessionStore.create,
+    # which stores the live token as its own dict key). See
+    # server.py's Bearer handling for where this is called from, and
+    # auth.hash_api_token for why SHA-256 with no salt is the right hash
+    # here even though scrypt is used for passwords.
+
+    def add_api_token(self, username: str, label: str, token_hash: str,
+                      created_by: str, expires_ts: float | None = None) -> int:
+        now = time.time()
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO api_tokens(username, label, token_hash, created_ts,"
+                " created_by, expires_ts, last_used_ts) VALUES (?,?,?,?,?,?,NULL)",
+                (username, label, token_hash, now, created_by, expires_ts))
+            self._conn.commit()
+            return int(cursor.lastrowid)
+
+    def api_token_by_hash(self, token_hash: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM api_tokens WHERE token_hash = ?",
+                (token_hash,)).fetchone()
+
+    # A request every 30-second poll would otherwise be a write every
+    # 30 seconds for every token in active use — cheap alone, not cheap
+    # multiplied by however many service accounts an install ends up with.
+    # Once a minute is plenty for what this field is for (a rough "still
+    # in use" signal an administrator reviews occasionally, not an access
+    # log), so a touch inside the window is simply skipped.
+    TOKEN_LAST_USED_MIN_INTERVAL_S = 60
+
+    def touch_api_token(self, token_id: int, last_used_ts: float | None) -> None:
+        now = time.time()
+        if last_used_ts is not None and now - last_used_ts < self.TOKEN_LAST_USED_MIN_INTERVAL_S:
+            return
+        with self._lock:
+            self._conn.execute(
+                "UPDATE api_tokens SET last_used_ts = ? WHERE id = ?", (now, token_id))
+            self._conn.commit()
+
+    def api_tokens(self, username: str | None = None) -> list[sqlite3.Row]:
+        """Metadata only — id, label, timestamps, the owning account — never
+        the hash and never anything the hash was made from. Callers that
+        show this to an operator (get_tokens) do not need to filter
+        anything out of it themselves."""
+        with self._lock:
+            if username is None:
+                return self._conn.execute(
+                    "SELECT * FROM api_tokens ORDER BY created_ts").fetchall()
+            return self._conn.execute(
+                "SELECT * FROM api_tokens WHERE username = ? COLLATE NOCASE"
+                " ORDER BY created_ts", (username,)).fetchall()
+
+    def api_token(self, token_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM api_tokens WHERE id = ?", (token_id,)).fetchone()
+
+    def revoke_api_token(self, token_id: int) -> sqlite3.Row | None:
+        """Removes the row outright — revocation is immediate and there is
+        no soft-deleted state for a token to sit in; the audit log (written
+        by the caller, api.delete_token) is the durable record that it ever
+        existed. Returns the row as it was, so the caller can name what it
+        removed without a second query."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_tokens WHERE id = ?", (token_id,)).fetchone()
+            if row is not None:
+                self._conn.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+                self._conn.commit()
+            return row
 
     # --------------------------------------------------------- permissions
 
