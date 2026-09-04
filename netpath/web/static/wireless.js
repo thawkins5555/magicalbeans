@@ -454,6 +454,14 @@
     drawStatus();
   }
 
+  function exportApsCsv() {
+    App.exportCsv('/api/wireless/aps/export.csv', {
+      q: App.el('wl-q').value.trim(),
+      controller_id: App.el('wl-controller').value || undefined,
+      state: App.el('wl-state').value,
+    });
+  }
+
   function init() {
     /* Registered before this module's own onchange handlers below, so a
        filter change writes the store before the refresh those handlers start
@@ -465,6 +473,7 @@
       text: ['wl-q'], selects: ['wl-controller', 'wl-state'],
       apply: 'wl-apply', clear: 'wl-clear', clears: ['wl-q', 'wl-controller', 'wl-state'],
     });
+    App.el('wl-export-csv').onclick = exportApsCsv;
     App.el('wl-state').onchange = () => App.refreshNow('wireless');
     App.el('wl-controllers').onclick = controllersModal;
     App.el('wl-settings').onclick = settingsDialog;

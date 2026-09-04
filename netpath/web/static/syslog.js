@@ -53,6 +53,10 @@
     return { t0: view.t0, t1: view.t1 };
   }
 
+  function exportMessagesCsv() {
+    App.exportCsv('/api/syslog/search/export.csv', { t0: view.t0, t1: view.t1, ...filters() });
+  }
+
   /* ---------------------------------------------------------- histogram */
 
   function drawHistogram() {
@@ -400,6 +404,7 @@
       apply: 'sl-apply', clear: 'sl-clear',
       clears: ['sl-q', 'sl-source', 'sl-host', 'sl-app', 'sl-severity', 'sl-facility'],
     });
+    App.el('sl-export-csv').onclick = exportMessagesCsv;
     App.el('sl-live').onclick = returnToLive;
     App.el('sl-follow').onchange = (event) => {
       view.follow = event.target.checked;

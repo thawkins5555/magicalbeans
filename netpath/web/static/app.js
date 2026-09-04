@@ -216,12 +216,15 @@ const App = (() => {
   /* ---------------------------------------------------- host capabilities
 
      Six features across four tabs store a secret and every one goes through
-     Windows DPAPI, so on Linux the credential fields rendered in full, the
-     operator typed a password and the save came back 400; IPAM's DHCP form
-     rendered completely, with Windows-only help text, on a host where it
-     could never work. `/api/platform` answers once at start-up (the answer
-     cannot change while the process runs) and these two helpers are what
-     the forms ask.
+     `netpath/dpapi.py` — Windows DPAPI on Windows, or a portable
+     passphrase-based store on any other host once one is configured (see
+     CREDENTIAL-SECURITY.md's "The portable secret store"). Before either was
+     known to the front end, the credential fields on Linux rendered in
+     full, the operator typed a password and the save came back 400; IPAM's
+     DHCP form rendered completely, with Windows-only help text, on a host
+     where it could never work. `/api/platform` answers once at start-up
+     (the answer cannot change while the process runs) and these two
+     helpers are what the forms ask.
 
      Defaults assume the host CAN do it: if the fetch fails, the operator
      gets today's behaviour — a form and a server-side refusal — rather than
@@ -239,9 +242,9 @@ const App = (() => {
      a password into something that will refuse it. */
   function credentialUnavailableHtml(what) {
     return `<p class="hint warn-text">${escapeHtml(what || 'A password')} cannot be` +
-      ' stored on this host: credentials are encrypted with Windows DPAPI, and' +
-      ' there is no equivalent here yet. Configure this on a Windows host, or' +
-      ' use an option that needs no stored secret.</p>';
+      ' stored on this host: it needs either Windows DPAPI or a portable' +
+      ' secret store configured with NETPATH_SECRET_PASSPHRASE_FILE (see' +
+      ' CREDENTIAL-SECURITY.md), and neither is set up here.</p>';
   }
 
   async function loadPlatform() {
@@ -356,6 +359,40 @@ const App = (() => {
   const post = (path, body) => call(path, { method: 'POST', body });
   const put = (path, body) => call(path, { method: 'PUT', body });
   const del = (path, body) => call(path, { method: 'DELETE', body });
+
+  /* Every `.../export.csv` route answers JSON — {csv, filename, count,
+     truncated, cap} — rather than a raw file: server.py's response
+     machinery sends one buffered body per request with no
+     Content-Disposition path, so this follows the precedent the OID walk
+     download already set (nodes.js) rather than inventing a second way to
+     hand a file to a browser. saveCsv does the Blob-and-anchor trick every
+     download in this app now shares; exportCsv is the button handler every
+     tab's Export CSV button wires to — one fetch, one save, one toast. */
+  function saveCsv(payload) {
+    const blob = new Blob([payload.csv], { type: 'text/csv;charset=utf-8' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = payload.filename || 'export.csv';
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+
+  async function exportCsv(path, params) {
+    try {
+      const payload = await get(path, params);
+      saveCsv(payload);
+      const n = (payload.count || 0).toLocaleString();
+      if (payload.truncated) {
+        toast(`Exported the first ${n} row(s) — more matched than the ` +
+          `${(payload.cap || 0).toLocaleString()}-row export limit; narrow ` +
+          'the filter for a complete file.', 'warn');
+      } else {
+        toast(`Exported ${n} row(s) to ${payload.filename}`, 'ok');
+      }
+    } catch (error) {
+      toast(`Export failed: ${error.message}`, 'fail');
+    }
+  }
 
   /* The dangerous failure this replaces: a wall display that has lost its
      server looked exactly like a healthy fleet, distinguished only by the
@@ -3497,7 +3534,7 @@ const App = (() => {
   const api = {
     state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
     parseRoute, buildRoute, setRoute, applyRoute,
-    get, post, put, del,
+    get, post, put, del, saveCsv, exportCsv,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
     SEV_COLOR, emptyText, stackedHistogram, filterBar, isMono,
     timeZoneLabel, timeZoneTitle, countLabel,

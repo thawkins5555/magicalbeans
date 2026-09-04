@@ -35,6 +35,15 @@
     // What the detail pane was last rendered from, so a refresh that
     // changes nothing leaves the markup (and any open dropdown) alone.
     detailSignature: null,
+    // Paging past ALERTS_LIST_CAP (4.47.0): the campaign that found
+    // alerts_truncated at fleet scale was an operator paging through an
+    // incident looking at a view that was truncated at exactly the moment
+    // completeness mattered. pageFilterSig is the last filter combination
+    // a page was fetched under — when it changes the offset resets, same
+    // as nodes.js's device pager.
+    pageOffset: 0,
+    pageLimit: 300,
+    pageFilterSig: null,
   };
 
   const MUTE_HOURS = [1, 6, 12, 24];
@@ -1304,10 +1313,13 @@
     const span = t1 - t0;
     const bucket = span <= 7200 ? 300 : (span <= 172800 ? 3600 : 21600);
     const f = filters();
+    const filterSig = JSON.stringify(f);
+    if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
+    view.pageFilterSig = filterSig;
     const [overview, list, total, rules, ruleExtras, templates, mutes] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
-      App.get('/api/alerts', f),
+      App.get('/api/alerts', { ...f, limit: view.pageLimit, offset: view.pageOffset }),
       // Same filters, in the same round trip, so the label under the table
       // can say what fraction of the matches is on screen.
       App.get('/api/alerts/total', f),
@@ -1319,6 +1331,7 @@
     view.hist = overview.buckets;
     view.alerts = list.alerts;
     view.alertTotal = total;
+    drawAlertsPager();
     view.rules = rules.rules;
     view.ruleExtras = ruleExtras.rules || {};
     view.templates = templates.templates;
@@ -1350,6 +1363,32 @@
      from the store here rather than from restoreControls. A rule that has
      since been deleted matches no option, which selects nothing at all:
      snap back to "any rule" rather than show a blank filter. */
+  function drawAlertsPager() {
+    const pager = App.el('alerts-pager');
+    const total = (view.alertTotal || {}).total || 0;
+    // Nothing to page through: the whole matching set fit on one page, so
+    // showing prev/next controls for a page that has no "next" would just
+    // be two more disabled buttons nobody needs.
+    if (total <= view.alerts.length && view.pageOffset === 0) {
+      pager.hidden = true;
+      return;
+    }
+    pager.hidden = false;
+    const shown = view.alerts.length;
+    const from = shown ? view.pageOffset + 1 : 0;
+    const to = view.pageOffset + shown;
+    App.el('alerts-page-summary').textContent = `${from}–${to} of ${total.toLocaleString()}`;
+    App.el('alerts-page-prev').disabled = view.pageOffset <= 0;
+    App.el('alerts-page-next').disabled = to >= total;
+  }
+
+  function exportAlertsCsv() {
+    // The export ceiling (50,000) is well past ALERTS_LIST_CAP (2,000):
+    // the whole filtered set leaves in one file regardless of which page
+    // is on screen.
+    App.exportCsv('/api/alerts/export.csv', filters());
+  }
+
   function fillRuleFilter() {
     const select = App.el('alerts-filter-rule');
     const current = select.value || App.savedControl('alerts', 'alerts-filter-rule') || '';
@@ -1396,6 +1435,17 @@
       clears: ['alerts-filter-device', 'alerts-filter-text', 'alerts-filter-sev',
                'alerts-filter-rule'],
     });
+    App.el('alerts-export-csv').onclick = exportAlertsCsv;
+    App.el('alerts-page-prev').onclick = () => {
+      view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);
+      App.refreshNow('alerts');
+    };
+    App.el('alerts-page-next').onclick = () => {
+      const total = (view.alertTotal || {}).total || 0;
+      if (view.pageOffset + view.pageLimit >= total) return;
+      view.pageOffset += view.pageLimit;
+      App.refreshNow('alerts');
+    };
     // Acknowledge-all and bulk-resolve don't delete rows, but they change
     // state for everything on screen in one click and there is no undo, so
     // they get the same guard as a delete.

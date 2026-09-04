@@ -1176,13 +1176,21 @@ class AlertsDatabase:
     def alerts(self, state: str | None = None, severity: int | None = None,
               rule_id: int | None = None, device_text: str | None = None,
               text: str | None = None, t0: float | None = None,
-              t1: float | None = None, limit: int = 300) -> list[sqlite3.Row]:
+              t1: float | None = None, limit: int = 300,
+              offset: int = 0) -> list[sqlite3.Row]:
+        # `offset` (4.47.0): additive, defaults to 0, so every existing
+        # caller that never knew paging existed still gets the first
+        # `limit` rows exactly as before. It is what lets an operator who
+        # has already looked at the newest 2,000 alerts ask for the next
+        # 2,000 rather than being stuck re-reading the same page — the
+        # /api/alerts route above pairs this with count_alerts() for the
+        # total the browser needs to know there is a next page at all.
         where, params = self._alert_filter(state, severity, rule_id,
                                            device_text, text, t0, t1)
         with self._lock:
             return self._conn.execute(
-                f"SELECT * FROM alerts{where} ORDER BY last_ts DESC LIMIT ?",
-                (*params, limit)).fetchall()
+                f"SELECT * FROM alerts{where} ORDER BY last_ts DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset)).fetchall()
 
     def alert(self, alert_id: int) -> sqlite3.Row | None:
         with self._lock:

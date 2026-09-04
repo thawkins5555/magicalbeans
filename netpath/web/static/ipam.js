@@ -359,6 +359,16 @@
     drawHosts();
   }
 
+  function exportHostsCsv() {
+    // "Alive only" is a client-side checkbox — see drawHosts — so the
+    // export takes the same presence-flag param the Devices "only
+    // offline" filter uses, to honour what is on screen right now.
+    App.exportCsv('/api/ipam/hosts/export.csv', {
+      subnet_id: view.subnetId,
+      alive_only: App.el('ipam-alive-only').checked ? '1' : undefined,
+    });
+  }
+
   /* ----------------------------------------------------------- conflicts */
 
   function drawConflicts() {
@@ -961,6 +971,12 @@
     drawLeases();
   }
 
+  function exportLeasesCsv() {
+    const scope = view.dhcpScopes.find((s) => s.id === view.dhcpScopeId);
+    App.exportCsv('/api/ipam/dhcp/leases/export.csv',
+      { server_id: view.dhcpServerId, scope_id: scope ? scope.scope_id : '' });
+  }
+
   /* ------------------------------------------------------------- settings */
 
   function settingsDialog() {
@@ -1134,6 +1150,8 @@
       renderDhcpScopes();
     };
     App.el('ipam-alive-only').onchange = drawHosts;
+    App.el('ipam-hosts-export-csv').onclick = exportHostsCsv;
+    App.el('ipam-leases-export-csv').onclick = exportLeasesCsv;
     App.el('ipam-show-resolved').onchange = loadConflicts;
     App.el('ipam-search-btn').onclick = searchHosts;
     App.el('ipam-search-q').onkeydown = (e) => { if (e.key === 'Enter') searchHosts(); };

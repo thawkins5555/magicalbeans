@@ -44,6 +44,10 @@
     };
   }
 
+  function exportTrapsCsv() {
+    App.exportCsv('/api/snmp/traps/export.csv', { t0: view.t0, t1: view.t1, ...filters() });
+  }
+
   function window_() {
     const seconds = Number(App.el('sn-range').value) || 86400;
     if (view.follow) {
@@ -455,6 +459,7 @@
       apply: 'sn-apply', clear: 'sn-clear',
       clears: ['sn-q', 'sn-source', 'sn-oid', 'sn-severity', 'sn-kind', 'sn-version'],
     });
+    App.el('sn-export-csv').onclick = exportTrapsCsv;
     App.el('sn-live').onclick = returnToLive;
     App.el('sn-follow').onchange = (event) => {
       view.follow = event.target.checked;

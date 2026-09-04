@@ -1155,9 +1155,9 @@ class NodesDatabase:
 
     # ---------------------------------------------------------------- devices
 
-    def devices(self, group_id: int | None = None, status: str | None = None,
-               text: str | None = None, device_group_id: int | None = None,
-               exclude_up: bool = False) -> list[sqlite3.Row]:
+    def _device_filter_clause(self, group_id: int | None, status: str | None,
+                              text: str | None, device_group_id: int | None,
+                              exclude_up: bool) -> tuple[str, list]:
         clauses, params = [], []
         if group_id is not None:
             clauses.append("group_id = ?")
@@ -1192,10 +1192,39 @@ class NodesDatabase:
                 clauses.append("(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?)")
                 params.extend([f"%{text}%"] * 3)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def devices(self, group_id: int | None = None, status: str | None = None,
+               text: str | None = None, device_group_id: int | None = None,
+               exclude_up: bool = False, limit: int | None = None,
+               offset: int = 0) -> list[sqlite3.Row]:
+        # `limit`/`offset` (4.47.0): both additive and both default to the
+        # pre-paging behaviour — `limit=None` runs no LIMIT clause at all,
+        # so a caller that has never heard of paging (there is still no
+        # guarantee this API layer's get_nodes_devices is the only one)
+        # gets the whole matching set back exactly as before. Passing a
+        # limit is what the paged Devices table now does.
+        where, params = self._device_filter_clause(
+            group_id, status, text, device_group_id, exclude_up)
+        query = f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params = [*params, limit, offset]
         with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip",
-                params).fetchall()
+            return self._conn.execute(query, params).fetchall()
+
+    def devices_count(self, group_id: int | None = None, status: str | None = None,
+                      text: str | None = None, device_group_id: int | None = None,
+                      exclude_up: bool = False) -> int:
+        """How many devices match, ignoring `limit`/`offset` — the same
+        shape alertsdb.count_alerts already established for "how many
+        pages is this", asked with the identical filter clause devices()
+        itself builds so the two can never disagree about what matched."""
+        where, params = self._device_filter_clause(
+            group_id, status, text, device_group_id, exclude_up)
+        with self._lock:
+            return int(self._conn.execute(
+                f"SELECT COUNT(*) FROM devices{where}", params).fetchone()[0])
 
     def device(self, device_id: int) -> sqlite3.Row | None:
         with self._lock:
@@ -1407,6 +1436,44 @@ class NodesDatabase:
                 (*allowed.values(), *device_ids))
             self._conn.commit()
             self._config_generation += 1
+
+    def add_devices_bulk(self, rows: list[dict]) -> list[int]:
+        """Insert many devices in one transaction — all of them or none.
+
+        Every row here has already been validated, address-checked and
+        de-duplicated by the caller (post_nodes_devices_bulk_import in
+        api.py); this method's only job is the insert, atomically, so a
+        conflict partway through a 2,000-row paste cannot leave the fleet
+        half-imported while the per-row disposition list the API returns
+        says otherwise. Each row is
+        {"ip": str, "name": str|None, "group_id": int|None,
+         "device_group_id": int|None, "overrides": {col: value, ...}} —
+         the same shape add_device's own arguments take, just pre-bundled
+        so this can loop without a second round of keyword handling.
+        """
+        if not rows:
+            return []
+        ids = []
+        with self._lock:
+            try:
+                for row in rows:
+                    cols = ["ip", "name", "group_id", "device_group_id", "created_ts"]
+                    vals = [row["ip"], row.get("name") or row["ip"],
+                           row.get("group_id"), row.get("device_group_id"), time.time()]
+                    for key in _OVERRIDE_COLUMNS:
+                        if key in (row.get("overrides") or {}):
+                            cols.append(key)
+                            vals.append(row["overrides"][key])
+                    marks = ",".join("?" * len(vals))
+                    cur = self._conn.execute(
+                        f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
+                    ids.append(cur.lastrowid)
+            except Exception:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+            self._config_generation += 1
+        return ids
 
     def bulk_remove_devices(self, device_ids: list[int]) -> int:
         if not device_ids:

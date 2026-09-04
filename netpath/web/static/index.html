@@ -94,6 +94,7 @@
     <span id="nd-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="nd-add-device" class="primary" data-requires-write="nodes">Add device</button>
+    <button id="nd-import-devices" data-requires-write="nodes">Import</button>
     <button id="nd-manage-devgroups" data-requires-write="nodes">Manage groups</button>
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
@@ -119,9 +120,25 @@
       <label class="check"><input type="checkbox" id="nd-filter-offline"> Only offline</label>
       <button id="nd-apply">Search</button>
       <button id="nd-clear">Clear</button>
+      <button id="nd-export-csv">Export CSV</button>
       <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="nd-count" class="hint"></span>
+    </div>
+    <!-- Server-side paging (4.47.0): the full-fleet fetch this table always
+         made cost 2.86 MB decoded and a table fill up to ~1s at 2,000
+         devices. A page size, a prev/next pair and a total answer the
+         question a spinner used to. -->
+    <div class="bar wrap">
+      <label>Rows per page <select id="nd-page-size">
+        <option value="100">100</option>
+        <option value="250">250</option>
+        <option value="500" selected>500</option>
+        <option value="1000">1000</option>
+      </select></label>
+      <button id="nd-page-prev" aria-label="Previous page">&lsaquo; Prev</button>
+      <span id="nd-page-summary" class="hint"></span>
+      <button id="nd-page-next" aria-label="Next page">Next &rsaquo;</button>
     </div>
     <!-- What a MAC-address search resolved to. Its own line rather than
          inside the filter bar: it can name several ports, and it must not
@@ -185,6 +202,8 @@
               <button class="subtab" data-subtab="events">EVENTS</button>
             </nav>
             <div id="nd-d-sub-interfaces" class="subpage active">
+              <div class="bar"><span class="grow"></span>
+                <button id="nd-if-export-csv">Export CSV</button></div>
               <div class="table-wrap"><table id="nd-if-table"></table></div>
             </div>
             <div id="nd-d-sub-events" class="subpage">
@@ -274,9 +293,21 @@
       <label>Window <select id="alerts-range"></select></label>
       <button id="alerts-apply">Search</button>
       <button id="alerts-clear">Clear</button>
+      <button id="alerts-export-csv">Export CSV</button>
       <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="alerts-count" class="hint"></span>
+    </div>
+    <!-- Paging past the 2,000-row screen cap (4.47.0): the campaign that
+         found alerts_truncated at fleet scale was an operator paging
+         through an incident looking at a truncated view exactly when
+         completeness mattered. Prev/next walks past the cap; the export
+         button above always gets the whole filtered set regardless of
+         which page is on screen. -->
+    <div class="bar wrap" id="alerts-pager" hidden>
+      <button id="alerts-page-prev" aria-label="Previous page">&lsaquo; Prev</button>
+      <span id="alerts-page-summary" class="hint"></span>
+      <button id="alerts-page-next" aria-label="Next page">Next &rsaquo;</button>
     </div>
     <div class="bar wrap" id="alerts-bulk-bar" hidden>
       <span id="alerts-bulk-count" class="hint"></span>
@@ -416,6 +447,7 @@
     <label class="check"><input type="checkbox" id="nf-resolve"> Resolve names</label>
     <button id="nf-apply">Search</button>
     <button id="nf-clear">Clear</button>
+    <button id="nf-export-csv">Export CSV</button>
   </div>
 
   <header class="bar">
@@ -482,6 +514,7 @@
     <label>OID or name <input id="sn-oid" size="16" placeholder="linkDown"></label>
     <button id="sn-apply">Search</button>
     <button id="sn-clear">Clear</button>
+    <button id="sn-export-csv">Export CSV</button>
     <button id="sn-live" hidden>Return to live</button>
     <label class="check"><input type="checkbox" id="sn-follow" checked> Live</label>
     <span id="sn-took" class="took"></span>
@@ -543,6 +576,7 @@
     <label>App <input id="sl-app" size="10"></label>
     <button id="sl-apply">Search</button>
     <button id="sl-clear">Clear</button>
+    <button id="sl-export-csv">Export CSV</button>
     <button id="sl-live" hidden>Return to live</button>
     <label class="check"><input type="checkbox" id="sl-follow" checked> Live</label>
     <span id="sl-took" class="took"></span>
@@ -625,6 +659,7 @@
         <span id="ipam-hosts-count" class="hint"></span>
         <span class="grow"></span>
         <label class="check"><input type="checkbox" id="ipam-alive-only" checked> Alive only</label>
+        <button id="ipam-hosts-export-csv">Export CSV</button>
       </header>
       <div id="ipam-subnet-detail" class="subnet-detail"></div>
       <div class="table-wrap"><table id="ipam-hosts-table"></table></div>
@@ -687,6 +722,8 @@
       <header class="bar">
         <span class="section">LEASES</span>
         <span id="ipam-lease-count" class="hint"></span>
+        <span class="grow"></span>
+        <button id="ipam-leases-export-csv">Export CSV</button>
       </header>
       <div id="ipam-scope-detail" class="subnet-detail"></div>
       <div class="table-wrap"><table id="ipam-dhcp-lease-table"></table></div>
@@ -723,6 +760,7 @@
     </select></label>
     <button id="wl-apply">Search</button>
     <button id="wl-clear">Clear</button>
+    <button id="wl-export-csv">Export CSV</button>
   </div>
 
   <div class="cols" data-splitter="wireless-body">

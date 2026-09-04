@@ -40,6 +40,15 @@
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
     mibFiles: [],
     mibSelected: null,
+    // Server-side paging (4.47.0): the full-fleet fetch this table always
+    // made cost 2.86 MB decoded and a ~1s table fill at 2,000 devices,
+    // measured. pageFilterSig is the last filter combination a page was
+    // fetched under — when it changes, the offset resets to the first
+    // page rather than landing on a page that may no longer exist.
+    pageOffset: 0,
+    pageLimit: 500,
+    pageTotal: 0,
+    pageFilterSig: null,
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -2214,6 +2223,140 @@
     return overrides;
   }
 
+  /* --------------------------------------------------------------- CSV */
+
+  function exportDevicesCsv() {
+    const q = App.el('nd-q').value.trim();
+    const group_id = App.controlOrSaved('nodes', 'nd-filter-group');
+    const device_group_id = App.controlOrSaved('nodes', 'nd-filter-devgroup');
+    const status = App.el('nd-filter-status').value;
+    const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    // The export route ignores paging entirely — it always answers with
+    // every device the current filter matches, not just the page on
+    // screen, which is the whole point of an export over a table read.
+    App.exportCsv('/api/nodes/devices/export.csv',
+      { q, group_id, device_group_id, status, offline_only });
+  }
+
+  function exportInterfacesCsv() {
+    if (!view.selected) return;
+    App.exportCsv(`/api/nodes/devices/${view.selected}/interfaces/export.csv`, {});
+  }
+
+  /* ---------------------------------------------------------- bulk import
+
+     Onboarding 2,000 devices one POST at a time measured 16.6/s. This
+     dialog turns a spreadsheet paste (or a JSON array, for a script that
+     already builds one) into one request; the per-row disposition table
+     below the buttons is what makes the two-minute wait replaceable with
+     a paste that says exactly what happened, row by row. */
+
+  function updateImportPreview(box) {
+    const text = box.querySelector('#nd-import-text').value;
+    const preview = box.querySelector('#nd-import-preview');
+    const trimmed = text.trim();
+    if (!trimmed) { preview.textContent = ''; return; }
+    if (trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        preview.textContent = Array.isArray(parsed)
+          ? `${parsed.length} row(s) detected (JSON)` : 'That is JSON, but not an array.';
+      } catch (error) { preview.textContent = 'Not valid JSON yet.'; }
+      return;
+    }
+    const lines = text.split(/\r\n|\r|\n/).filter((line) => line.trim() !== '');
+    preview.textContent = lines.length
+      ? `${Math.max(0, lines.length - 1)} row(s) detected` : '';
+  }
+
+  function renderImportResult(box, result) {
+    const el = box.querySelector('#nd-import-result');
+    const summary = `${result.created.length} created, ${result.duplicate.length} ` +
+      `duplicate, ${result.invalid.length} invalid — of ${result.total} row(s).`;
+    const problems = [
+      ...result.duplicate.map((r) => ({ ...r, kind: 'duplicate' })),
+      ...result.invalid.map((r) => ({ ...r, kind: 'invalid' })),
+    ].sort((a, b) => a.row - b.row);
+    let html = `<p><b>${escape(summary)}</b></p>`;
+    if (problems.length) {
+      html += '<div class="table-wrap"><table><thead><tr><th>Row</th><th>Address</th>' +
+        '<th>Problem</th></tr></thead><tbody>' +
+        problems.map((p) => `<tr><td>${p.row}</td><td>${escape(p.ip || '')}</td>` +
+          `<td>${escape(p.kind)}: ${escape(p.reason || '')}</td></tr>`).join('') +
+        '</tbody></table></div>';
+    }
+    el.innerHTML = html;
+  }
+
+  function importDevicesDialog() {
+    const body = `
+      <p class="hint">Paste CSV text with a header row, or choose a .csv file — a
+        JSON array of device objects works too, pasted in its place. Accepted CSV
+        columns: <code>address</code> (required), <code>name</code>, <code>group</code>
+        (a polling profile, by name or id), <code>device_group</code>, <code>snmp_version</code>,
+        <code>community</code>, <code>v3_user</code>, <code>v3_auth_proto</code>,
+        <code>poll_interval_s</code>, <code>snmp_timeout_s</code>, <code>snmp_retries</code>,
+        <code>ping_enabled</code>, <code>snmp_enabled</code>, <code>vendor_override</code>,
+        <code>display_name_source</code>. An unrecognised column is ignored rather than refused.</p>
+      <label>CSV file <input type="file" id="nd-import-file" accept=".csv,text/csv"></label>
+      <label>CSV or JSON text<br>
+        <textarea id="nd-import-text" rows="10" style="width:100%;font-family:var(--mono)"
+          placeholder="address,name,group&#10;10.20.3.7,core-sw-01,Switches"></textarea>
+      </label>
+      <p class="hint" id="nd-import-preview"></p>
+      <p class="hint warn-text" id="nd-import-error" hidden></p>
+      <div id="nd-import-result"></div>`;
+    const box = App.modal('Import devices', body, [
+      { label: 'Close', onClick: App.closeModal },
+      { label: 'Import', primary: true, onClick: async (box, button) => {
+        const errorEl = box.querySelector('#nd-import-error');
+        errorEl.hidden = true;
+        const text = box.querySelector('#nd-import-text').value.trim();
+        if (!text) {
+          errorEl.textContent = 'Paste CSV text, or choose a file, first.';
+          errorEl.hidden = false;
+          return;
+        }
+        let payload;
+        if (text.startsWith('[')) {
+          try {
+            payload = { devices: JSON.parse(text) };
+          } catch (error) {
+            errorEl.textContent = 'That does not parse as JSON.';
+            errorEl.hidden = false;
+            return;
+          }
+        } else {
+          payload = { csv: text };
+        }
+        button.disabled = true;
+        let result;
+        try {
+          result = await App.post('/api/nodes/devices/bulk-import', payload);
+        } catch (error) {
+          button.disabled = false;
+          errorEl.textContent = error.message;
+          errorEl.hidden = false;
+          return;
+        }
+        button.disabled = false;
+        renderImportResult(box, result);
+        if (result.created.length) App.refreshNow('nodes');
+      } },
+    ], { buttonsTop: true });
+    box.querySelector('#nd-import-file').onchange = (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        box.querySelector('#nd-import-text').value = String(reader.result || '');
+        updateImportPreview(box);
+      };
+      reader.readAsText(file);
+    };
+    box.querySelector('#nd-import-text').oninput = () => updateImportPreview(box);
+  }
+
   function addDevice() {
     const box = App.modal('Add device', deviceForm({}), [
       { label: 'Cancel', onClick: App.closeModal },
@@ -3726,6 +3869,18 @@
     App.wireColumnPickers(settingsBox);
   }
 
+  /* ------------------------------------------------------------- pager */
+
+  function drawPager() {
+    const shown = view.devices.length;
+    const from = shown ? view.pageOffset + 1 : 0;
+    const to = view.pageOffset + shown;
+    App.el('nd-page-summary').textContent =
+      `${from}–${to} of ${view.pageTotal.toLocaleString()}`;
+    App.el('nd-page-prev').disabled = view.pageOffset <= 0;
+    App.el('nd-page-next').disabled = to >= view.pageTotal;
+  }
+
   /* ----------------------------------------------------------- refresh */
 
   async function refresh() {
@@ -3742,14 +3897,24 @@
     // Omitted entirely when unchecked, not sent as "false": App.get only
     // drops params equal to '', so the API reads presence, not value.
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    // A changed filter always lands back on page one — the offset a
+    // previous filter's page 4 pointed to is meaningless once the
+    // matching set is different, and could be past the end of it.
+    const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only]);
+    if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
+    view.pageFilterSig = filterSig;
+    view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
-      App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only }),
+      App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
+                                      limit: view.pageLimit, offset: view.pageOffset }),
       App.get('/api/nodes/groups'),
       App.get('/api/nodes/device-groups'),
       App.get('/api/nodes/mibs'),
       loadDiscJobsIfNeeded(),
     ]);
     view.devices = devices.devices;
+    view.pageTotal = devices.total != null ? devices.total : view.devices.length;
+    drawPager();
     view.groups = groups.groups;
     view.deviceGroups = deviceGroups.groups;
     view.mibFiles = mibs.files;
@@ -3964,6 +4129,19 @@
       };
     }
     App.el('nd-add-device').onclick = addDevice;
+    App.el('nd-import-devices').onclick = importDevicesDialog;
+    App.el('nd-export-csv').onclick = exportDevicesCsv;
+    App.el('nd-if-export-csv').onclick = exportInterfacesCsv;
+    App.el('nd-page-size').onchange = () => { view.pageOffset = 0; App.refreshNow('nodes'); };
+    App.el('nd-page-prev').onclick = () => {
+      view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);
+      App.refreshNow('nodes');
+    };
+    App.el('nd-page-next').onclick = () => {
+      if (view.pageOffset + view.pageLimit >= view.pageTotal) return;
+      view.pageOffset += view.pageLimit;
+      App.refreshNow('nodes');
+    };
     App.el('nd-edit-device').onclick = editDevice;
     App.el('nd-ssh-device').onclick = sshDevice;
     // The "?" beside it, from the one helper that renders every help link.

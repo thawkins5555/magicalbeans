@@ -133,6 +133,14 @@
     };
   }
 
+  function exportFlowsCsv() {
+    const f = filters();
+    App.exportCsv('/api/netflow/records/export.csv', {
+      t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
+      protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
+    });
+  }
+
   /* ------------------------------------------------------------- chart */
 
   function niceCeiling(value) {
@@ -841,6 +849,7 @@
       apply: 'nf-apply', clear: 'nf-clear',
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
+    App.el('nf-export-csv').onclick = exportFlowsCsv;
     App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
     App.el('nf-resolve').onchange = async (event) => {
       await App.post('/api/settings', {

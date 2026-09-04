@@ -7,6 +7,8 @@ this file stays about the data.
 
 from __future__ import annotations
 
+import csv
+import io
 import ipaddress
 import sqlite3
 import json
@@ -40,6 +42,50 @@ from .. import permissions as _permissions
 from .. import appdb as _appdb
 
 MIN_BLOCK_PX = 3
+
+
+# ---------------------------------------------------------------------- CSV
+#
+# Every export route below answers with JSON, not a raw file download: the
+# response machinery in server.py sends one fully-buffered body per request
+# and has no Content-Disposition path, and building one just for CSV would
+# be a second way to hand a file to a browser alongside the one the OID
+# walk download already established. get_nodes_device_oid_walk hands the
+# file back as a `text` field and lets the browser do the Blob-and-anchor
+# trick client-side (App.download, app.js) — every export here follows
+# that precedent instead of inventing a competing mechanism.
+#
+# The csv module is what actually does the quoting: a device name with an
+# embedded comma, a syslog message with an embedded quote or newline, is
+# exactly what RFC 4180 quoting exists for, and hand-joining strings with
+# commas gets it wrong the first time either shows up. The BOM is prepended
+# to the text itself, not a header, since there is no raw response for a
+# header to sit on — Excel opens a BOM-led file as UTF-8 instead of
+# guessing a system codepage and mangling anything outside ASCII.
+def _csv_text(header: list[str], rows) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(header)
+    writer.writerows(rows)
+    return "\ufeff" + buf.getvalue()
+
+
+def _csv_filename(module: str) -> str:
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return f"sappiwhere-{module}-{stamp}.csv"
+
+
+def _csv_response(module: str, header: list[str], rows, *, truncated: bool = False,
+                  cap: int | None = None) -> dict:
+    """The one shape every export handler below returns. `cap` is the
+    export ceiling that applied (None when the underlying query has none —
+    devices, interfaces, IPAM hosts, DHCP leases and wireless APs are none
+    of them capped even on screen, so their export is not capped either);
+    `truncated` is whether the result actually hit it, the same "there is
+    more than this" signal the search screens already use for SEARCH_ROW_CAP."""
+    rows = list(rows)
+    return {"csv": _csv_text(header, rows), "filename": _csv_filename(module),
+            "count": len(rows), "truncated": truncated, "cap": cap}
 
 
 def _audit(service, params, action: str, target: str = "",
@@ -664,11 +710,26 @@ def get_flow_overview(service, params, body) -> dict:
     }
 
 
-def get_flow_records(service, params, body) -> dict:
+# The screen has always asked for the top 250 records by whichever order
+# is selected (nf-order in index.html); FLOW_EXPORT_CAP is the export
+# ceiling item 1 asked every capped list to lift — comfortably past what
+# one export click should ever hand back, still far short of "do not
+# buffer a million rows".
+FLOW_SCREEN_LIMIT = 250
+FLOW_EXPORT_CAP = 20000
+
+
+def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
+    """The row-producing half of get_flow_records, factored out so the
+    export handler below can ask for FLOW_EXPORT_CAP rows through the
+    identical filter/window/order path the screen uses for its 250 —
+    same params, same permission gate, just a taller limit."""
     t0, t1 = _window(params)
     filters = _flow_filters(params)
     order = params.get("order", "bytes")
-    rows = service.flow_db.flows(t0, t1, filters, limit=250, order=order)
+    rows = service.flow_db.flows(t0, t1, filters, limit=limit + 1, order=order)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
 
     resolve_ports = bool(service.flow_settings.get("resolve_ports", True))
     names = {}
@@ -725,7 +786,22 @@ def get_flow_records(service, params, body) -> dict:
             # both, and the exporter filter keys off the address.
             "exporter_name": exporter_names.get(row["exporter"]),
         })
+    return records, truncated
+
+
+def get_flow_records(service, params, body) -> dict:
+    records, _truncated = _flow_records_rows(service, params, FLOW_SCREEN_LIMIT)
     return {"records": records}
+
+
+def get_flow_records_export(service, params, body) -> dict:
+    records, truncated = _flow_records_rows(service, params, FLOW_EXPORT_CAP)
+    header = ["ts", "src_ip", "src_name", "src_port", "dst_ip", "dst_name",
+             "dst_port", "protocol", "bytes", "packets", "in_if", "out_if",
+             "exporter", "exporter_name"]
+    csv_rows = [[r.get(key) for key in header] for r in records]
+    return _csv_response("netflow", header, csv_rows, truncated=truncated,
+                         cap=FLOW_EXPORT_CAP)
 
 
 def post_collector(service, params, body) -> dict:
@@ -1243,15 +1319,22 @@ def get_syslog_overview(service, params, body) -> dict:
 # read "300 of 4,120 shown" instead of "300 shown".
 SEARCH_ROW_CAP = 2000
 
+# Item 1: the on-screen search stays capped at SEARCH_ROW_CAP — that is a
+# "do not try to render this many table rows" limit, not a data limit —
+# but an export exists precisely to leave with more than a screen can
+# hold, so both the syslog and SNMP trap exports get this taller ceiling
+# instead.
+EXPORT_ROW_CAP = 20000
 
-def get_syslog_search(service, params, body) -> dict:
+
+def _syslog_search_rows(service, params, cap: int) -> tuple[list[dict], bool, float, int, bool]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
     limit = int(_num(params, "limit", 300, int) or 300)
     filters = _syslog_filters(params)
 
     started = time.time()
-    effective = min(limit, SEARCH_ROW_CAP)
+    effective = min(limit, cap)
     rows = service.syslog_db.search(t0, t1, filters, limit=effective + 1)
     # One row past the limit says whether anything was left out; `len(rows)
     # >= effective` reported a cut-off for a window with exactly `effective`
@@ -1282,28 +1365,40 @@ def get_syslog_search(service, params, body) -> dict:
         if name:
             resolved_hosts[ip] = name
 
-    return {
-        "took_ms": round(elapsed_ms, 1),
-        "limit": effective, "cap": SEARCH_ROW_CAP,
-        "truncated": truncated,
-        "fts": service.syslog_db.fts,
-        "messages": [
-            {
-                "id": row["id"], "ts": row["ts"], "source": row["source"],
-                "source_name": names.get(row["source"], ""),
-                "host": (row["host"] or "") if row["host"] and row["host"] != row["source"]
-                        else (resolved_hosts.get(row["source"], "") or row["host"] or ""),
-                "app": row["app"] or "",
-                "procid": row["procid"] or "", "msgid": row["msgid"] or "",
-                "severity": row["severity"],
-                "severity_name": severity_name(row["severity"]),
-                "facility": row["facility"],
-                "facility_name": facility_name(row["facility"]),
-                "message": row["message"], "raw": row["raw"],
-            }
-            for row in rows
-        ],
-    }
+    messages = [
+        {
+            "id": row["id"], "ts": row["ts"], "source": row["source"],
+            "source_name": names.get(row["source"], ""),
+            "host": (row["host"] or "") if row["host"] and row["host"] != row["source"]
+                    else (resolved_hosts.get(row["source"], "") or row["host"] or ""),
+            "app": row["app"] or "",
+            "procid": row["procid"] or "", "msgid": row["msgid"] or "",
+            "severity": row["severity"],
+            "severity_name": severity_name(row["severity"]),
+            "facility": row["facility"],
+            "facility_name": facility_name(row["facility"]),
+            "message": row["message"], "raw": row["raw"],
+        }
+        for row in rows
+    ]
+    return messages, truncated, elapsed_ms, effective, service.syslog_db.fts
+
+
+def get_syslog_search(service, params, body) -> dict:
+    messages, truncated, elapsed_ms, effective, fts = _syslog_search_rows(
+        service, params, SEARCH_ROW_CAP)
+    return {"took_ms": round(elapsed_ms, 1), "limit": effective, "cap": SEARCH_ROW_CAP,
+            "truncated": truncated, "fts": fts, "messages": messages}
+
+
+def get_syslog_search_export(service, params, body) -> dict:
+    messages, truncated, _elapsed_ms, _effective, _fts = _syslog_search_rows(
+        service, params, EXPORT_ROW_CAP)
+    header = ["id", "ts", "source", "source_name", "host", "app", "procid",
+             "msgid", "severity_name", "facility_name", "message"]
+    csv_rows = [[m.get(key) for key in header] for m in messages]
+    return _csv_response("syslog", header, csv_rows, truncated=truncated,
+                         cap=EXPORT_ROW_CAP)
 
 
 def post_syslog_collector(service, params, body) -> dict:
@@ -1387,14 +1482,16 @@ def get_snmp_overview(service, params, body) -> dict:
     }
 
 
-def get_snmp_traps(service, params, body) -> dict:
+# EXPORT_ROW_CAP is defined once, alongside SEARCH_ROW_CAP above (both
+# capped lists — syslog and SNMP traps — share it).
+def _snmp_trap_rows(service, params, cap: int) -> tuple[list[dict], bool, float]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
     limit = int(_num(params, "limit", 300, int) or 300)
     filters = _snmp_filters(params)
 
     started = time.time()
-    effective = min(limit, SEARCH_ROW_CAP)
+    effective = min(limit, cap)
     rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1)
     # One row past the limit says whether anything was left out; `len(rows)
     # >= effective` reported a cut-off for a window with exactly `effective`
@@ -1441,8 +1538,23 @@ def get_snmp_traps(service, params, body) -> dict:
             "varbind_n": row["varbind_n"],
             "varbinds": varbinds,
         })
+    return traps, truncated, elapsed_ms, effective
+
+
+def get_snmp_traps(service, params, body) -> dict:
+    traps, truncated, elapsed_ms, effective = _snmp_trap_rows(service, params, SEARCH_ROW_CAP)
     return {"took_ms": round(elapsed_ms, 1), "limit": effective, "cap": SEARCH_ROW_CAP,
             "truncated": truncated, "traps": traps}
+
+
+def get_snmp_traps_export(service, params, body) -> dict:
+    traps, truncated, _elapsed_ms, _effective = _snmp_trap_rows(service, params, EXPORT_ROW_CAP)
+    header = ["id", "ts", "source", "source_name", "version_name", "trap_name",
+             "trap_oid", "trap_kind", "severity_name", "community",
+             "agent_addr", "is_inform"]
+    csv_rows = [[t.get(key) for key in header] for t in traps]
+    return _csv_response("snmp-traps", header, csv_rows, truncated=truncated,
+                         cap=EXPORT_ROW_CAP)
 
 
 def post_snmp_collector(service, params, body) -> dict:
@@ -1632,6 +1744,22 @@ def get_ipam_hosts(service, params, body) -> dict:
          "subnet_label": r["subnet_label"], "first_seen": r["first_seen"],
          "last_seen": r["last_seen"], "last_up": r["last_up"]}
         for r in rows]}
+
+
+def get_ipam_hosts_export(service, params, body) -> dict:
+    """The SUBNETS & HOSTS table. `subnet_id` is the one filter the JSON
+    route itself applies server-side; "Alive only" is a client-side
+    checkbox (ipam.js drawHosts), so the export takes the same `alive_only`
+    presence-flag the Devices "only offline" filter uses and applies it
+    here — the export honours what is on screen even though the screen
+    itself never sent that filter to the server before now."""
+    hosts = get_ipam_hosts(service, params, body)["hosts"]
+    if params.get("alive_only") is not None:
+        hosts = [h for h in hosts if h["alive"]]
+    header = ["ip", "mac", "alive", "hostname", "subnet_label",
+             "first_seen", "last_seen", "last_up"]
+    csv_rows = [[h.get(key) for key in header] for h in hosts]
+    return _csv_response("ipam-hosts", header, csv_rows)
 
 
 def get_ipam_conflicts(service, params, body) -> dict:
@@ -1841,6 +1969,15 @@ def get_ipam_dhcp_leases(service, params, body) -> dict:
          "is_reservation": bool(r["is_reservation"]),
          "description": r["description"], "polled": r["polled_ts"]}
         for r in rows]}
+
+
+def get_ipam_dhcp_leases_export(service, params, body) -> dict:
+    leases = get_ipam_dhcp_leases(service, params, body)["leases"]
+    header = ["server_label", "scope_id", "ip", "mac", "hostname",
+             "address_state", "lease_expires", "is_reservation",
+             "description", "polled"]
+    csv_rows = [[lease.get(key) for key in header] for lease in leases]
+    return _csv_response("ipam-dhcp-leases", header, csv_rows)
 
 
 def get_ipam_dhcp_scope_history(service, params, body) -> dict:
@@ -2104,19 +2241,22 @@ def get_nodes_overview(service, params, body) -> dict:
     }
 
 
-def get_nodes_devices(service, params, body) -> dict:
+def _device_filters(params) -> dict:
     group_id = params.get("group_id")
     device_group_id = params.get("device_group_id")
-    status = params.get("status") or None
-    text = params.get("q") or None
-    # The frontend only ever sends this param when the "only offline"
-    # checkbox is checked, so its mere presence is the signal — no
-    # string-vs-boolean parsing of a possible "false" needed.
-    exclude_up = params.get("offline_only") is not None
-    rows = service.nodes_db.devices(
-        group_id=int(group_id) if group_id else None,
-        device_group_id=int(device_group_id) if device_group_id else None,
-        status=status, text=text, exclude_up=exclude_up)
+    return {
+        "group_id": int(group_id) if group_id else None,
+        "device_group_id": int(device_group_id) if device_group_id else None,
+        "status": params.get("status") or None,
+        "text": params.get("q") or None,
+        # The frontend only ever sends this param when the "only offline"
+        # checkbox is checked, so its mere presence is the signal — no
+        # string-vs-boolean parsing of a possible "false" needed.
+        "exclude_up": params.get("offline_only") is not None,
+    }
+
+
+def _device_rows_json(service, params, rows) -> list[dict]:
     worker_state = service.node_poller.worker_state()
     # A mute lives in the Alerts module but has to be visible here: an
     # operator who silenced a device an hour ago and then wonders why it
@@ -2136,7 +2276,52 @@ def get_nodes_devices(service, params, body) -> dict:
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
         devices.append(device)
-    return {"devices": devices}
+    return devices
+
+
+# Item 2 of the API-heavy trio: get_nodes_devices returned the whole fleet
+# every time, unconditionally — 2.86 MB decoded and a ~1s table fill at
+# 2,000 devices, measured. Paging is opt-in rather than the new default:
+# a caller that sends neither `limit` nor `offset` still gets everything
+# back, exactly as before this existed, because nothing here can be sure
+# it is the only caller (see test_frontend_contracts.py and tests/ui/ for
+# what is pinned against the no-params shape). nodes.js is the one caller
+# switched onto the paged form; DEVICE_LIST_DEFAULT_LIMIT is its default
+# page size.
+DEVICE_LIST_DEFAULT_LIMIT = 500
+DEVICE_LIST_MAX_LIMIT = 2000
+
+
+def get_nodes_devices(service, params, body) -> dict:
+    filters = _device_filters(params)
+    total = service.nodes_db.devices_count(**filters)
+    if params.get("limit") is None and params.get("offset") is None:
+        rows = service.nodes_db.devices(**filters)
+        return {"devices": _device_rows_json(service, params, rows), "total": total}
+    offset = max(0, int(_num(params, "offset", 0, int) or 0))
+    limit = max(1, min(int(_num(params, "limit", DEVICE_LIST_DEFAULT_LIMIT, int)
+                        or DEVICE_LIST_DEFAULT_LIMIT), DEVICE_LIST_MAX_LIMIT))
+    rows = service.nodes_db.devices(limit=limit, offset=offset, **filters)
+    return {"devices": _device_rows_json(service, params, rows),
+            "total": total, "limit": limit, "offset": offset}
+
+
+def get_nodes_devices_export(service, params, body) -> dict:
+    """The Devices table's current filter, unpaged and uncapped: a CSV
+    export exists to leave with everything that matched, not one page of
+    it, and nodes_db.devices() already has no limit of its own to lift."""
+    filters = _device_filters(params)
+    rows = service.nodes_db.devices(**filters)
+    devices = _device_rows_json(service, params, rows)
+    header = ["id", "name", "ip", "status", "group_id", "device_group_id",
+             "vendor", "sys_descr", "sys_name", "polling", "muted_until",
+             "poll_interval_s", "last_poll_ts"]
+    csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
+                d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
+                d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
+                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts")]
+               for d in devices]
+    return _csv_response("devices", header, csv_rows)
 
 
 def get_nodes_mac_search(service, params, body) -> dict:
@@ -2410,6 +2595,193 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
         service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     return {"ok": True, "removed": removed}
+
+
+# ------------------------------------------------------------ bulk import
+#
+# Item 3: onboarding was measured at 16.6 devices/s through the single-
+# device POST route — 2,000 devices is over two minutes of API round
+# trips before any of them has even been polled once. This route accepts
+# the same fields the single POST accepts (see _DEVICE_EDITABLE_BODY),
+# either as a JSON array of device objects or as pasted CSV text with a
+# header row, validates every row before writing anything, and inserts
+# whatever validated in one transaction (nodesdb.add_devices_bulk) — a
+# conflict partway through cannot leave the fleet half-imported while the
+# per-row disposition list below says otherwise.
+#
+# Accepted CSV columns (case-insensitive, spaces or underscores either
+# way): address (or ip, required), name, group (or group_id — a polling
+# profile, by name or numeric id), device_group (or device_group_id — by
+# name or numeric id), snmp_version, community, v3_user, v3_auth_proto,
+# poll_interval_s, snmp_timeout_s, snmp_retries, ping_enabled,
+# snmp_enabled, vendor_override, display_name_source. An unrecognised
+# column is ignored rather than refused, so a spreadsheet carrying extra
+# inventory columns (asset tag, site, rack) still imports. upstream_id is
+# deliberately not accepted here: a bulk paste has no reliable way to name
+# a device that does not exist yet, and the single-device and Edit forms
+# already cover setting it once devices exist.
+BULK_IMPORT_MAX_ROWS = 2000
+
+_BULK_IMPORT_ALIASES = {
+    "address": "ip", "group": "group_id", "profile": "group_id",
+    "device_group": "device_group_id", "snmp_community": "community",
+}
+
+# CSV arrives as strings; these are the override columns that are not text
+# columns in the database, so a "1" or "true" typed into a spreadsheet
+# cell needs turning into what add_device's **overrides already expects.
+# Anything not listed (community, v3_user, v3_auth_proto, oid_set) passes
+# through as text exactly as typed, on both the CSV and JSON paths.
+_BULK_IMPORT_INT_FIELDS = ("snmp_version", "poll_interval_s", "snmp_timeout_s",
+                          "snmp_retries", "ping_count", "ping_timeout_ms",
+                          "mac_table_interval_s")
+_BULK_IMPORT_BOOL_FIELDS = ("ping_enabled", "snmp_enabled", "unreachable_ping_only")
+
+
+def _bulk_import_bool(value):
+    if isinstance(value, bool) or value is None:
+        return value
+    text = str(value).strip().lower()
+    return text in ("1", "true", "yes", "y", "on")
+
+
+def _parse_bulk_import_rows(body) -> list[dict]:
+    devices = body.get("devices")
+    if isinstance(devices, list):
+        if not all(isinstance(row, dict) for row in devices):
+            raise ValueError("Every entry in 'devices' must be an object")
+        return devices
+    text = body.get("csv")
+    if isinstance(text, str) and text.strip():
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("The pasted CSV has no header row")
+        rows = []
+        for raw in reader:
+            row = {}
+            for key, value in raw.items():
+                if not key:
+                    continue
+                norm = key.strip().lower().replace(" ", "_")
+                norm = _BULK_IMPORT_ALIASES.get(norm, norm)
+                value = (value or "").strip()
+                if value:                # a blank cell means "not specified"
+                    row[norm] = value
+            if row:                      # a wholly blank line, e.g. a trailing newline
+                rows.append(row)
+        return rows
+    raise ValueError("Provide either a 'devices' array or 'csv' text")
+
+
+def _resolve_bulk_named_id(value, lookup_rows):
+    """`value` is a numeric id, a name to look up in `lookup_rows`
+    (case-insensitively), or empty/absent for "none" — a CSV cell names a
+    polling profile or a device group by the label an operator actually
+    sees on screen, not by an id nobody pasting a spreadsheet would know."""
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if text.isdigit():
+        row = next((r for r in lookup_rows if r["id"] == int(text)), None)
+        if row is None:
+            raise ValueError(f"No such id: {text}")
+        return int(text)
+    row = next((r for r in lookup_rows if r["name"].lower() == text.lower()), None)
+    if row is None:
+        raise ValueError(f"No such name: {text!r}")
+    return row["id"]
+
+
+def post_nodes_devices_bulk_import(service, params, body) -> dict:
+    rows = _parse_bulk_import_rows(body)
+    if not rows:
+        raise ValueError("No rows to import")
+    if len(rows) > BULK_IMPORT_MAX_ROWS:
+        raise ValueError(f"At most {BULK_IMPORT_MAX_ROWS:,} rows at a time")
+
+    groups = service.nodes_db.groups()
+    device_groups = service.nodes_db.device_groups()
+    existing_ips = {d["ip"] for d in service.nodes_db.devices()}
+    seen_in_batch = set()
+
+    created, duplicate, invalid = [], [], []
+    to_insert = []
+    for i, raw in enumerate(rows, start=1):
+        try:
+            ip = _device_address(raw)
+        except ValueError as exc:
+            invalid.append({"row": i, "ip": str(raw.get("ip", "")), "reason": str(exc)})
+            continue
+        if ip in existing_ips or ip in seen_in_batch:
+            duplicate.append({"row": i, "ip": ip, "reason": f"{ip} is already a device"})
+            continue
+        try:
+            group_id = _resolve_bulk_named_id(raw.get("group_id"), groups)
+            device_group_id = _resolve_bulk_named_id(raw.get("device_group_id"), device_groups)
+            _check_display_name_source(raw)
+            vendor_override = str(raw.get("vendor_override") or "").strip()
+            if len(vendor_override) > 64:
+                raise ValueError("A vendor name is at most 64 characters")
+            overrides = {}
+            for key, value in raw.items():
+                if key not in _DEVICE_EDITABLE_BODY or key in (
+                        "name", "group_id", "device_group_id", "display_name_source",
+                        "enabled", "vendor_override", "upstream_id"):
+                    continue
+                if value in (None, ""):
+                    continue
+                if key in _BULK_IMPORT_INT_FIELDS:
+                    try:
+                        value = int(value)
+                    except (TypeError, ValueError):
+                        raise ValueError(f"{key} must be a whole number")
+                elif key in _BULK_IMPORT_BOOL_FIELDS:
+                    value = _bulk_import_bool(value)
+                overrides[key] = value
+        except ValueError as exc:
+            invalid.append({"row": i, "ip": ip, "reason": str(exc)})
+            continue
+        seen_in_batch.add(ip)
+        to_insert.append({
+            "row": i, "ip": ip, "name": str(raw.get("name") or "").strip() or None,
+            "group_id": group_id, "device_group_id": device_group_id,
+            "overrides": overrides, "vendor_override": vendor_override,
+            "display_name_source": raw.get("display_name_source") or None,
+        })
+
+    # Validation is entirely finished at this point — nothing below can add
+    # to `invalid`. The insert is one transaction across every row that
+    # validated; see add_devices_bulk's own docstring for why.
+    device_ids = service.nodes_db.add_devices_bulk(to_insert) if to_insert else []
+    for row, device_id in zip(to_insert, device_ids):
+        if row["display_name_source"]:
+            service.nodes_db.update_device(
+                device_id, display_name_source=row["display_name_source"])
+        if row["vendor_override"]:
+            service.nodes_db.set_vendor_override(
+                device_id, row["vendor_override"], params.get("_username", ""))
+        created.append({"row": row["row"], "ip": row["ip"], "id": device_id})
+
+    if created:
+        service.log.add(NODES_CATEGORY, f"Bulk-imported {len(created)} device(s)")
+        # The same post-add machinery post_nodes_device triggers for one
+        # device, batched: a first poll and, where SNMP is enabled, a
+        # vendor identification walk — the bulk-poll and bulk-identify
+        # routes above are the un-batched originals this mirrors. Best
+        # effort: a poller that cannot queue one of these does not undo an
+        # insert that has already committed.
+        for device_id in device_ids:
+            try:
+                service.node_poller.poll_now(device_id)
+                device_row = service.nodes_db.device(device_id)
+                if device_row is not None and service.nodes_db.effective_config(
+                        device_row).get("snmp_enabled", True):
+                    service.node_poller.start_identify(device_id, trigger="bulk-import")
+            except Exception:                                     # noqa: BLE001
+                pass
+
+    return {"ok": True, "total": len(rows), "created": created,
+            "duplicate": duplicate, "invalid": invalid}
 
 
 def post_nodes_device_poll(service, params, body, device_id) -> dict:
@@ -2764,6 +3136,20 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "last_in_octets": r["last_in_octets"], "last_out_octets": r["last_out_octets"],
          "last_seen_ts": r["last_seen_ts"]}
         for r in rows]}
+
+
+def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict:
+    """One device's port table. Bounded by its own port count — a device
+    with thousands of interfaces is not a case this network has — so
+    there is no export ceiling to lift here, only the same rows the JSON
+    handler above already reads."""
+    interfaces = get_nodes_device_interfaces(service, params, body, device_id)["interfaces"]
+    header = ["if_index", "descr", "alias", "phys_addr", "speed_bps",
+             "admin_status", "oper_status", "in_bps", "out_bps",
+             "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
+             "last_seen_ts"]
+    csv_rows = [[i.get(key) for key in header] for i in interfaces]
+    return _csv_response("interfaces", header, csv_rows)
 
 
 def get_nodes_device_metrics(service, params, body, device_id) -> dict:
@@ -3529,19 +3915,21 @@ def get_alerts_overview(service, params, body) -> dict:
     }
 
 
-def get_alerts(service, params, body) -> dict:
-    state = params.get("state") or None
+def _alert_filters(params) -> dict:
     severity = params.get("severity")
     rule_id = params.get("rule_id")
-    device_text = params.get("device") or None
-    text = params.get("q") or None
-    t0 = _num(params, "t0", None)
-    t1 = _num(params, "t1", None)
-    limit = int(_num(params, "limit", 300, int) or 300)
-    rows = service.alerts_db.alerts(
-        state=state, severity=int(severity) if severity else None,
-        rule_id=int(rule_id) if rule_id else None, device_text=device_text,
-        text=text, t0=t0, t1=t1, limit=min(limit, 2000))
+    return {
+        "state": params.get("state") or None,
+        "severity": int(severity) if severity else None,
+        "rule_id": int(rule_id) if rule_id else None,
+        "device_text": params.get("device") or None,
+        "text": params.get("q") or None,
+        "t0": _num(params, "t0", None),
+        "t1": _num(params, "t1", None),
+    }
+
+
+def _alerts_rows_json(service, rows) -> list[dict]:
     rule_names = {r["id"]: r["name"] for r in service.alerts_db.rules()}
     present_ids = _alert_device_ids(service, rows)
     alerts = []
@@ -3549,7 +3937,50 @@ def get_alerts(service, params, body) -> dict:
         alert = _alert_json(row, present_ids)
         alert["rule_name"] = rule_names.get(row["rule_id"], "")
         alerts.append(alert)
-    return {"alerts": alerts}
+    return alerts
+
+
+# Item 2: the campaign that measured alerts_truncated at fleet scale found
+# an operator paging through an incident looking at a truncated view at
+# exactly the moment completeness mattered — GET /api/alerts capped `limit`
+# at 2,000 with no way to see the rest. ALERTS_LIST_CAP is unchanged (still
+# the per-page ceiling a browser table should ever try to render); `offset`
+# is what is new, so a page past the cap is one more request away instead
+# of unreachable, and `total` says how many pages that is.
+ALERTS_LIST_CAP = 2000
+
+
+def get_alerts(service, params, body) -> dict:
+    filters = _alert_filters(params)
+    limit = min(int(_num(params, "limit", 300, int) or 300), ALERTS_LIST_CAP)
+    offset = max(0, int(_num(params, "offset", 0, int) or 0))
+    rows = service.alerts_db.alerts(limit=limit, offset=offset, **filters)
+    total = service.alerts_db.count_alerts(**filters)
+    return {"alerts": _alerts_rows_json(service, rows), "total": total,
+            "limit": limit, "offset": offset}
+
+
+# The export ceiling item 1 asked for explicitly: "alerts export must be
+# able to exceed the old 2,000 cap". 50,000 is comfortably past anything a
+# real incident produces (the alert engine already collapses repeats into
+# one row's `count`, so 50,000 open rows is 50,000 distinct problems, not
+# 50,000 flaps) while still bounding the one CSV this route will ever
+# build in memory per request.
+ALERTS_EXPORT_CAP = 50000
+
+
+def get_alerts_export(service, params, body) -> dict:
+    filters = _alert_filters(params)
+    rows = service.alerts_db.alerts(limit=ALERTS_EXPORT_CAP + 1, offset=0, **filters)
+    truncated = len(rows) > ALERTS_EXPORT_CAP
+    rows = rows[:ALERTS_EXPORT_CAP]
+    alerts = _alerts_rows_json(service, rows)
+    header = ["id", "severity_name", "state", "entity_label", "message",
+             "rule_name", "count", "opened_ts", "last_ts",
+             "acked_by", "acked_ts", "resolved_by", "resolved_ts"]
+    csv_rows = [[a.get(key) for key in header] for a in alerts]
+    return _csv_response("alerts", header, csv_rows, truncated=truncated,
+                         cap=ALERTS_EXPORT_CAP)
 
 
 def get_alert(service, params, body, alert_id) -> dict:
@@ -4360,6 +4791,20 @@ def get_wireless_aps(service, params, body) -> dict:
     return {"aps": result, "last_reported_ts": max(stamps) if stamps else None}
 
 
+def get_wireless_aps_export(service, params, body) -> dict:
+    """One row per AP, radios included as the same summary columns the
+    table already shows (radio_count, radio_modes, channels,
+    radio_station_count) rather than one row per radio — that is the
+    granularity "+radios" means on a table where an AP is the row."""
+    aps = get_wireless_aps(service, params, body)["aps"]
+    header = ["name", "controller_id", "status", "model", "mac_address", "ip",
+             "station_count", "tx_power_dbm", "power_unit", "radio_count",
+             "radio_modes", "channels", "radio_station_count",
+             "out_of_service", "last_seen_ts"]
+    csv_rows = [[ap.get(key) for key in header] for ap in aps]
+    return _csv_response("wireless-aps", header, csv_rows)
+
+
 def post_wireless_ap_service(service, params, body, ap_id) -> dict:
     ap = service.wireless_db.access_point(int(ap_id))
     if ap is None:
@@ -5146,15 +5591,7 @@ ALERT_TOTAL_CAP = 5000
 
 def get_alerts_total(service, params, body) -> dict:
     """How many alerts match the filters the list is showing."""
-    filters = {
-        "state": params.get("state") or None,
-        "severity": int(params["severity"]) if params.get("severity") else None,
-        "rule_id": int(params["rule_id"]) if params.get("rule_id") else None,
-        "device_text": params.get("device") or None,
-        "text": params.get("q") or None,
-        "t0": _num(params, "t0", None),
-        "t1": _num(params, "t1", None),
-    }
+    filters = _alert_filters(params)
     counter = getattr(service.alerts_db, "count_alerts", None)
     if callable(counter):
         return {"total": int(counter(**filters)), "capped": False,
@@ -5195,12 +5632,19 @@ def get_platform(service, params, body) -> dict:
         "platform": {
             "is_windows": bool(dpapi.IS_WINDOWS),
             "powershell": powershell,
-            # A platform-neutral secret store was considered and deferred
-            # (see the release notes); this stays False until one exists, and
-            # the front end words its refusals from it rather than hard-coding
-            # "Windows only" in nine places.
-            "secret_store": False,
-            "credential_store": "Windows DPAPI" if dpapi.IS_WINDOWS else None,
+            # dpapi.available() is the same call every credential route
+            # already makes before it accepts a POST: true unconditionally
+            # on Windows, true off Windows once secretstore.configured() has
+            # a passphrase (NETPATH_SECRET_PASSPHRASE_FILE or
+            # NETPATH_SECRET_PASSPHRASE — see CREDENTIAL-SECURITY.md §10).
+            # This used to be hard-coded False here, which is the "gap this
+            # workstream did not close" that document called out by name:
+            # a configured Linux host accepted a credential posted to the
+            # API directly while its own browser form stayed greyed out.
+            "secret_store": bool(dpapi.available()),
+            "credential_store": ("Windows DPAPI" if dpapi.IS_WINDOWS
+                                 else ("Portable secret store" if dpapi.available()
+                                       else None)),
         },
     }
 
