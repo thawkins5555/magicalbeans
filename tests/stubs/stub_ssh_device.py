@@ -19,6 +19,16 @@ defaults to one RSA key generated once per process. `host=`/`port=` pin the
 listener, for a test that needs two devices at different addresses (the
 whole 127/8 loopback range answers here) or the same address twice.
 
+`persona=` is the other way to drive this device: a dict shaped exactly like
+one of demo/fake_ssh.py's PERSONAS entries (banner, prompt, pager_off, show,
+config, mode, and — for a vendor needing the enable escalation —
+enable_command/enable_password_prompt/enable_secret/unpriv_prompt/
+priv_prompt/show_requires_priv, or pager_off_rejected for a device that
+rejects its own pager-off command). It exists so a Cisco-platform test and
+the interactive demo can drive the identical scripted device instead of two
+maintained-separately fakes; passing it makes `mode`/`pause_s`/`page` above
+unused for that instance.
+
 Imported, not spawned: unlike the SNMP stubs there is no child process and
 no "listening" banner — construct `StubDevice()` and read `.port`.
 """
@@ -64,10 +74,12 @@ class _Server(paramiko.ServerInterface):
 
 class StubDevice:
     def __init__(self, mode: str = "slow", pause_s: float = 4.0, page: int = 20,
-                 host_key=None, host: str = "127.0.0.1", port: int = 0):
+                 host_key=None, host: str = "127.0.0.1", port: int = 0,
+                 persona: dict | None = None):
         self.mode = mode
         self.pause_s = pause_s
         self.page = page
+        self.persona = persona
         self.host_key = host_key or HOST_KEY
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -123,8 +135,12 @@ class StubDevice:
             if channel is None:
                 return
             server.shell.wait(10)
-            channel.send("\r\nStub Switch, line 0\r\n\r\n" + PROMPT)
-            self._shell(channel)
+            if self.persona is not None:
+                channel.send(self.persona["banner"])
+                self._persona_shell(channel)
+            else:
+                channel.send("\r\nStub Switch, line 0\r\n\r\n" + PROMPT)
+                self._shell(channel)
         except Exception:
             pass
         finally:
@@ -167,6 +183,78 @@ class StubDevice:
             else:
                 channel.send(CONFIG.replace("\n", "\r\n"))
             channel.send("\r\n" + PROMPT)
+
+    def _persona_shell(self, channel):
+        """The persona-dict-driven twin of _shell — same shape as demo/
+        fake_ssh.py's _session loop, kept in step with it deliberately so a
+        persona behaves identically whether it is driving this stub or the
+        standalone demo server."""
+        persona = self.persona
+        prompt = persona["prompt"]
+        privileged = not persona.get("enable_command")
+        awaiting_enable_password = False
+        while True:
+            line = self._readline(channel)
+            if not line:
+                return
+            if awaiting_enable_password:
+                awaiting_enable_password = False
+                if line == persona.get("enable_secret", ""):
+                    privileged = True
+                    prompt = persona.get("priv_prompt", prompt)
+                    channel.send("\r\n" + prompt)
+                else:
+                    prompt = persona.get("unpriv_prompt", persona["prompt"])
+                    channel.send("\r\n% Access denied\r\n" + prompt)
+                continue
+            if persona.get("enable_command") and line == persona["enable_command"]:
+                awaiting_enable_password = True
+                channel.send("\r\n" + persona.get("enable_password_prompt", "Password: "))
+                continue
+            if line in persona["pager_off"]:
+                if persona.get("pager_off_rejected"):
+                    channel.send("\r\n% Unrecognized command\r\n" + prompt)
+                else:
+                    channel.send("\r\n" + prompt)
+            elif line == persona["show"]:
+                if persona.get("show_requires_priv") and not privileged:
+                    channel.send("\r\nERROR: % Invalid input\r\n" + prompt)
+                    continue
+                channel.send("\r\n")
+                self._send_persona_config(channel, persona, prompt)
+                if persona["mode"] == "truncate":
+                    return
+            else:
+                channel.send("\r\n% Invalid input detected at '^' marker.\r\n" + prompt)
+
+    def _send_persona_config(self, channel, persona, prompt):
+        mode = persona["mode"]
+        lines = persona["config"].split("\n")
+        if mode == "reject":
+            channel.send("% Invalid input detected at '^' marker.\r\n" + prompt)
+            return
+        if mode == "slow-build":
+            channel.send("Building configuration...\r\n")
+            time.sleep(3.0)
+            channel.send("\r\nCurrent configuration : %d bytes\r\n" % len(persona["config"]))
+        if mode == "pager":
+            for i, line in enumerate(lines):
+                channel.send(line + "\r\n")
+                if i and i % 20 == 0:
+                    channel.send(" --More-- ")
+                    key = channel.recv(1)
+                    self.sent_bytes.append(key)
+                    channel.send("\b" * 10 + " " * 10 + "\b" * 10)
+            channel.send(prompt)
+            return
+        if mode == "truncate":
+            for line in lines[: len(lines) // 3]:
+                channel.send(line + "\r\n")
+            channel.close()
+            return
+        for line in lines:
+            channel.send(line + "\r\n")
+        channel.send(prompt)
 
     def _send_paged(self, channel):
         lines = CONFIG.split("\n")

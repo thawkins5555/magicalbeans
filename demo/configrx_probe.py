@@ -26,7 +26,13 @@ from demo.fake_ssh import PERSONAS  # noqa: E402
 
 VENDOR_FOR = {"cisco": "cisco", "cisco-pager": "cisco", "cisco-truncate": "cisco",
               "fortinet": "fortinet", "mikrotik": "mikrotik", "menu": "cisco",
-              "unprivileged": "cisco"}
+              "unprivileged": "cisco", "cisco-nxos": "cisco-nxos",
+              "cisco-iosxr": "cisco-iosxr",
+              "cisco-sb-reject-then-page": "cisco-sb", "cisco-asa": "cisco-asa",
+              "cisco-wlc": "cisco-wlc"}
+# The one persona whose vendor needs an enable secret at all — everyone
+# else's _pull_config call below passes "" and never uses it.
+ENABLE_SECRET_FOR = {"cisco-asa": "demo"}
 
 
 def main():
@@ -44,7 +50,9 @@ def main():
         try:
             client.connect("127.0.0.1", port=port, username="admin", password="demo",
                            timeout=10, look_for_keys=False, allow_agent=False)
-            raw, ended = configrx._pull_config(client, vendor, max_s=args.max_s)
+            raw, ended = configrx._pull_config(
+                client, vendor, max_s=args.max_s,
+                enable_secret=ENABLE_SECRET_FOR.get(name, ""))
         except Exception as exc:
             rows.append((name, "connect/pull error", str(exc)[:80], 0, round(time.time() - t0, 1)))
             continue
