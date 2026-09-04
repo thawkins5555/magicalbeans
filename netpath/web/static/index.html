@@ -867,7 +867,7 @@
   <div class="bar wrap">
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
     <label>Vendor <select id="cx-filter-vendor"></select></label>
-    <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
+    <label class="check"><input type="checkbox" id="cx-enabled-only" checked> Backup-enabled only</label>
     <button id="cx-apply">Search</button>
     <button id="cx-clear">Clear</button>
     <span class="grow"></span>
@@ -898,7 +898,7 @@
    </div>
    <div class="divider"></div>
    <div class="pane" data-grow="1">
-    <header class="bar">
+    <header class="bar wrap">
       <span id="cx-backup-header" class="section">BACKUPS</span>
       <span class="grow"></span>
       <!-- Diffs the selected row against the next-OLDER one in this list —
@@ -1130,8 +1130,8 @@
       </div>
       <p class="hint" id="ldap-status"></p>
       <div class="row" style="margin-top:8px">
-        <input id="ldap-test-username" placeholder="test username" size="16">
-        <input id="ldap-test-password" type="password" placeholder="test password" size="18">
+        <input id="ldap-test-username" placeholder="test username" size="16" aria-label="Test username">
+        <input id="ldap-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
         <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
       </div>
       <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
@@ -1145,8 +1145,8 @@
         write access to Settings.</p>
       <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
       <div class="row" style="margin-top:10px">
-        <input id="new-username" placeholder="username" size="18">
-        <input id="new-password" type="password" placeholder="initial password" size="22">
+        <input id="new-username" placeholder="username" size="18" aria-label="New username">
+        <input id="new-password" type="password" placeholder="initial password" size="22" aria-label="Initial password">
         <label class="check"><input type="radio" name="new-auth-source" id="new-auth-local" value="local" checked>
           Local password</label>
         <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
@@ -1171,9 +1171,9 @@
         itself is shown once, right after you create it, and never again.</p>
       <div class="table-wrap" style="max-height:220px"><table id="tokens-table"></table></div>
       <div class="row" style="margin-top:10px">
-        <input id="new-token-username" placeholder="account username" size="16">
-        <input id="new-token-label" placeholder="label — what this is for" size="26">
-        <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12">
+        <input id="new-token-username" placeholder="account username" size="16" aria-label="Token account username">
+        <input id="new-token-label" placeholder="label — what this is for" size="26" aria-label="Token label">
+        <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12" aria-label="Token expiry, in days">
         <button id="add-token" data-requires-write="admin">Create token</button>
       </div>
       <p class="hint" id="tokens-status"></p>

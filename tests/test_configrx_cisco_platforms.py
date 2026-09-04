@@ -216,10 +216,23 @@ service = Service(
 
 asa = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco-asa"])
 try:
-    # Started before the device exists: its one immediate due-scan (see
-    # ConfigRxWorker._loop) finds nothing, and the next one is 30s away, so
-    # backup_now below is the only thing that queues this device — a device
-    # added first would race the loop's own scan for who queues it first.
+    # The global "enabled" setting is what gates _loop()'s own periodic
+    # due-scan (not whether the worker thread is running at all — backup_now
+    # below neither reads nor needs it) — switched off for the one Service
+    # this file ever starts so that scan can never fire during setup below.
+    # It used to seem enough that the scan's first pass runs "immediately"
+    # on a device-less database and the next is 30s away, but "immediately"
+    # only means the thread has been asked to start, not that it has
+    # actually been scheduled: under load that first pass can land anywhere
+    # from microseconds to whole seconds later, including squarely inside
+    # the window between update_device_config below (which makes the device
+    # due) and set_credential (which the scan cannot know is still coming).
+    # A scan landing there queued a doomed backup of its own — no stored
+    # credential yet — which then set last_backup_status to "error" before
+    # backup_now's own, correctly-credentialed backup ever got a chance,
+    # and the wait loop below took that first, unrelated status for the
+    # answer the moment it saw anything other than None.
+    service.configrx_db.save_settings({"enabled": False})
     service.configrx.start()
     try:
         device_id = service.nodes_db.add_device("127.0.0.1", name="e2e-asa")

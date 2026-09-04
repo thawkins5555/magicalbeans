@@ -385,6 +385,17 @@ class ConfigRxDatabase:
                 (device_id,)).fetchone()
         return row["sha256"] if row else None
 
+    def latest_backup_size(self, device_id: int) -> int | None:
+        """The stored byte size of the device's most recent backup, or None
+        when it has none yet — for ConfigRxWorker's own "this capture is
+        far smaller than the last one" check, run before add_backup below
+        so the caller still has a size to compare a NEW capture against."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT size_bytes FROM backups WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
+                (device_id,)).fetchone()
+        return row["size_bytes"] if row else None
+
     def add_backup(self, device_id: int, content: str,
                    redacted: bool = False) -> tuple[int | None, str]:
         """Stores `content` as a new backup unless it is byte-identical to

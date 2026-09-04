@@ -57,6 +57,15 @@ SHELL_SETUP_MAX_S = 15          # per pager_off line
 # off on this device. A real config is longer than one screen but not
 # thousands of them; a loop here would otherwise sit answering forever.
 MAX_PAGER_REPLIES = 2000
+# A capture this much smaller than the device's own last stored backup is
+# far more likely to be a read that got cut short in some way _capture_problem
+# does not already catch than a device that genuinely shed 80% of its config
+# in one change. Stored — refusing it would be worse, the same reasoning
+# _capture_problem's own docstring gives for a truncated read reaching a
+# prompt — but flagged "suspect" instead of "changed" rather than presented
+# as an ordinary diff, because the next real backup would otherwise read as
+# almost the whole config coming back.
+SUSPECT_SHRINK_RATIO = 0.2
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x08")
 _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
@@ -500,7 +509,16 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
         channel.send(vendor.show_config + "\n")
         return _read_until_prompt(channel, prompt, max_s=max_s)
     finally:
-        channel.close()
+        # Best-effort: a device that hung up (the "closed" ended value above)
+        # may have already torn down the whole transport by the time this
+        # runs, and paramiko's own close handshake then raises EOFError
+        # trying to write a channel-close message down a socket that is
+        # already gone. That must never clobber a read that already
+        # completed — the return above already happened; this is cleanup.
+        try:
+            channel.close()
+        except Exception:
+            pass
 
 
 # Two floors, because "too short to be a config" means different things
@@ -591,7 +609,8 @@ class ConfigRxWorker:
         self._queued: dict[int, float] = {}
         self._started: dict[int, float] = {}
         self._lock = threading.Lock()
-        self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0}
+        self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0,
+                        "suspect": 0}
         self.error: str | None = None
         # Last settings start() was handed; only allow_legacy_ssh is read from
         # here (the loop reads the rest from the database each pass).
@@ -870,6 +889,9 @@ class ConfigRxWorker:
         else:
             cleaned, redacted_count = configrx_redact.redact(cleaned)
 
+        # Read before add_backup inserts the new row, or this would be
+        # comparing the capture against itself.
+        previous_size = self.db.latest_backup_size(device_id)
         backup_id, _digest = self.db.add_backup(
             device_id, cleaned, redacted=not store_secrets)
         # Only when a key was actually stored, and said once: the note used to
@@ -878,14 +900,29 @@ class ConfigRxWorker:
         # time. It now marks the one backup that taught this app the key.
         note = " (host key stored on first connection)" if policy.stored_new else ""
         if backup_id is not None:
-            self.counters["changed"] += 1
-            self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
-            self.log.add(
-                CONFIGRX, f"Stored a changed config backup for {device['ip']}",
-                detail=(f"{redacted_count} secret-bearing line(s) redacted "
-                        f"before storage" if not store_secrets else
-                        "Stored verbatim: this device has \"keep secrets in "
-                        "backups\" switched on"))
+            new_size = len(cleaned.encode("utf-8"))
+            suspect = bool(previous_size) and new_size < previous_size * SUSPECT_SHRINK_RATIO
+            if suspect:
+                self.counters["suspect"] += 1
+                self.db.record_backup_attempt(
+                    device_id, ok=True, status="suspect" + note,
+                    error=f"Captured {new_size} bytes, under a fifth of the "
+                          f"previous backup's {previous_size} bytes — stored, "
+                          f"but check this capture before trusting it as a diff base.")
+                self.log.add(
+                    CONFIGRX, f"Stored a suspect config backup for {device['ip']}",
+                    detail=f"{new_size} bytes captured, {previous_size} bytes previously "
+                           f"stored — well short of the {SUSPECT_SHRINK_RATIO:.0%} floor, "
+                           f"so this is marked suspect rather than changed.")
+            else:
+                self.counters["changed"] += 1
+                self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
+                self.log.add(
+                    CONFIGRX, f"Stored a changed config backup for {device['ip']}",
+                    detail=(f"{redacted_count} secret-bearing line(s) redacted "
+                            f"before storage" if not store_secrets else
+                            "Stored verbatim: this device has \"keep secrets in "
+                            "backups\" switched on"))
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

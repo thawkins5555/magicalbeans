@@ -5246,6 +5246,9 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
         # Same has_credential convention as every other stored password in
         # this app — the encrypted blob itself never reaches the browser.
         "has_credential": bool(config["ssh_password_enc"]) if config else False,
+        # Same convention again, for the separate enable secret a vendor like
+        # cisco-asa needs to reach privileged EXEC (see _do_enable).
+        "has_enable_secret": bool(config["enable_secret_enc"]) if config else False,
         "vendor_override": (config["vendor_override"] if config else "") or "",
         "last_backup_ts": config["last_backup_ts"] if config else None,
         "last_backup_status": config["last_backup_status"] if config else None,
@@ -5464,13 +5467,24 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only, so ConfigRX refuses to store an SSH password "
             "here rather than keep it in plain text.")
+    # The enable secret is separate and optional, with set_credential's own
+    # three-way contract: the key absent from the body leaves whatever is
+    # already stored untouched, present-and-empty clears it, present-and-
+    # non-empty (re)encrypts and stores it. Needed only by a vendor whose
+    # login shell is not already privileged EXEC (currently just cisco-asa).
+    enable_kwargs = {}
+    if "enable_secret" in body:
+        enable_secret = str(body.get("enable_secret") or "")
+        enable_kwargs["enable_secret_enc"] = (
+            dpapi.protect(enable_secret.encode("utf-8")) if enable_secret else None)
+        enable_secret = None
     try:
         encrypted = dpapi.protect(password.encode("utf-8"))
     except dpapi.DpapiUnavailable as exc:
         raise ValueError(str(exc))
     finally:
         password = None
-    service.configrx_db.set_credential(device_id, username, encrypted)
+    service.configrx_db.set_credential(device_id, username, encrypted, **enable_kwargs)
     service.log.add(CONFIGRX_CATEGORY, f"Stored an SSH credential for {row['ip']}")
     _audit(service, params, "credential.store", target=f"configrx:{row['ip']}",
            detail=f"username {username}")
