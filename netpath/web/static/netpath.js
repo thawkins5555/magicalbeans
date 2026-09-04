@@ -169,14 +169,27 @@
       `(worst case ${budget}s)`;
   }
 
+  // Which destination the keyboard is on, kept by id (not index) since the
+  // whole list is rebuilt from scratch on every poll — same reason
+  // wireRowKeyboard tracks a table row's position rather than the element.
+  let targetFocusId = null;
+
   function renderTargets() {
     const list = App.el('target-list');
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-label', 'Destinations');
     list.innerHTML = '';
+    const hadFocus = document.activeElement && document.activeElement.tagName === 'LI'
+      && list.contains(document.activeElement);
+    const rows = [];
     for (const target of view.targets) {
       const li = document.createElement('li');
       li.className = target.id === view.targetId ? 'selected' : '';
-      li.onclick = () => {
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', target.id === view.targetId ? 'true' : 'false');
+      const select = () => {
         view.targetId = target.id;
+        targetFocusId = target.id;
         App.setRoute([target.id]);
         view.pinned = null;
         view.expanded.clear();
@@ -185,6 +198,7 @@
         renderTargets();
         App.refreshNow('netpath');
       };
+      li.onclick = select;
       const dot = document.createElement('span');
       dot.className = 'dot';
       dot.style.background = target.status === 'none'
@@ -206,7 +220,37 @@
                        `</div><div class="host">${escape(target.host)}</div>`;
       li.append(dot, spoken, text);
       list.appendChild(li);
+      rows.push({ li, target, select });
     }
+    const landing = rows.find((r) => r.target.id === (targetFocusId ?? view.targetId)) || rows[0];
+    rows.forEach(({ li }) => { li.tabIndex = landing && li === landing.li ? 0 : -1; });
+    if (hadFocus && landing) {
+      requestAnimationFrame(() => {
+        if (document.activeElement === document.body && list.isConnected) landing.li.focus();
+      });
+    }
+    // A destination picked with the mouse becomes the one the keyboard
+    // returns to; select() already sets targetFocusId and re-renders, which
+    // is what recomputes every row's tabIndex from it — no separate
+    // mousedown listener needed.
+    rows.forEach(({ li, select }, index) => {
+      li.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(); return; }
+        let nextIndex = -1;
+        if (event.key === 'ArrowDown') nextIndex = index + 1;
+        else if (event.key === 'ArrowUp') nextIndex = index - 1;
+        else if (event.key === 'Home') nextIndex = 0;
+        else if (event.key === 'End') nextIndex = rows.length - 1;
+        else return;
+        event.preventDefault();
+        const next = rows[Math.min(Math.max(nextIndex, 0), rows.length - 1)];
+        if (!next || next.li === li) return;
+        li.tabIndex = -1;
+        next.li.tabIndex = 0;
+        next.li.focus();
+        targetFocusId = next.target.id;
+      });
+    });
   }
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -379,9 +423,15 @@
     const svg = App.el('route-svg');
     svg.innerHTML = '';
     const topo = view.topology;
-    const box = App.el('route-canvas').getBoundingClientRect();
+    const canvas = App.el('route-canvas');
+    const box = canvas.getBoundingClientRect();
     const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    canvas.tabIndex = 0;
+    canvas.setAttribute('role', 'img');
+    canvas.setAttribute('aria-label',
+      `Route graph. ${App.el('route-summary').textContent || 'No traces in this window'}. ` +
+      'Tab into it for each hop.');
 
     if (!topo || !topo.nodes.length) {
       const message = topo && topo.snapshot && topo.snapshot.found === false
@@ -467,11 +517,20 @@
         x: left + w / 2, y: -42, 'text-anchor': 'middle',
         fill: 'var(--canvas-faint)', 'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, `${end - start + 1} silent hops — click to collapse`));
-      tab.onclick = () => {
+      const collapse = () => {
         if (view.dragMoved) return;
         view.expanded.delete(`${start}-${end}`);
         drawRoute();
       };
+      tab.onclick = collapse;
+      tab.tabIndex = 0;
+      tab.setAttribute('role', 'button');
+      tab.setAttribute('aria-label', `${end - start + 1} silent hops from hop ${start} to ${end}. Collapse.`);
+      tab.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        collapse();
+      });
       nodeLayer.appendChild(tab);
     }
 
@@ -520,12 +579,24 @@
     return null;
   }
 
+  /* tabindex plus a focus/blur pair, so a hop's or a collapsed run's detail
+     is not lost the moment a mouse is not the thing driving the page —
+     mirrors nodes.js's device status-timeline segments. */
   function attachTip(element, text) {
+    element.tabIndex = 0;
+    if (!element.hasAttribute('role')) element.setAttribute('role', 'img');
+    element.setAttribute('aria-label', text.replace(/\n/g, '; '));
     element.addEventListener('mousemove', (event) => {
       if (view.panDrag) return;   // a pan is not a hover
       App.tooltip(text, event);
     });
     element.addEventListener('mouseleave', App.hideTooltip);
+    element.addEventListener('focus', () => {
+      if (view.panDrag) return;
+      const box = element.getBoundingClientRect();
+      App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
+    });
+    element.addEventListener('blur', App.hideTooltip);
   }
 
   function nodeBox(x, y, node) {
@@ -641,12 +712,19 @@
     text(24, `${end - start + 1} hops, no reply`, 'var(--fs-2xs)', 700);
     text(40, `hops ${start}–${end}`, 'var(--fs-2xs)');
     text(55, 'click to expand', 'var(--fs-2xs)');
-    g.onclick = () => {
+    const expand = () => {
       if (view.dragMoved) return;   // that was a pan, not a click
       view.expanded.add(`${start}-${end}`);
       drawRoute();
     };
+    g.onclick = expand;
+    g.setAttribute('role', 'button');   // set before attachTip so it keeps this role, not 'img'
     attachTip(g, `Hops ${start}–${end} never replied.\nClick to expand them.`);
+    g.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      expand();
+    });
     return g;
   }
 
@@ -799,9 +877,17 @@
   function drawTimeline() {
     const svg = App.el('timeline-svg');
     svg.innerHTML = '';
-    const box = App.el('timeline').getBoundingClientRect();
+    const timelineEl = App.el('timeline');
+    const box = timelineEl.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 150);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    timelineEl.tabIndex = 0;
+    timelineEl.setAttribute('role', 'img');
+    const summary = ['stat-healthy', 'stat-rtt', 'stat-traces']
+      .map((id) => App.el(id).textContent.replace(/\s+/g, ' ').trim())
+      .filter(Boolean).join(', ');
+    timelineEl.setAttribute('aria-label', `Timeline. ${summary || 'No data'}. ` +
+      'Focus and use left/right to read each block.');
 
     const data = view.timeline;
     const t0 = view.t0, t1 = view.t1;
@@ -882,7 +968,7 @@
         // Refused was hatched and skipped was striped from the start; the
         // rest of the vocabulary now comes from the same shared definitions
         // the device status timeline uses, so no state is colour alone.
-        const texture = App.statusPatternUrl(bucket.status);
+        const texture = App.statusPatternUrl(bucket.status, svg);
         if (texture) {
           svg.appendChild(App.svgNode('rect', {
             x: x0, y: L.status.y, width: bw, height: L.status.h, fill: texture,
@@ -981,6 +1067,36 @@
       const x = event.offsetX * (width / svg.clientWidth);
       const [start, end] = App.wheelWindow(event, t0, t1, timeAt(x));
       setWindow(start, end, false);
+    };
+
+    // A wide window is hundreds of blocks, too many for a tab stop each —
+    // the container is the one stop and left/right walks a cursor across
+    // the blocks it already drew, same tooltip a mouse gets, with the
+    // crosshair following along so a sighted keyboard user can see it too.
+    const buckets = (data && data.buckets) || [];
+    let cursor = buckets.length - 1;
+    const showBucketTip = () => {
+      if (!buckets.length || cursor < 0) return;
+      const bucket = buckets[cursor];
+      const bx = xFor((bucket.t0 + bucket.t1) / 2);
+      crosshair.setAttribute('x1', bx);
+      crosshair.setAttribute('x2', bx);
+      crosshair.setAttribute('visibility', 'visible');
+      const timelineBox = timelineEl.getBoundingClientRect();
+      App.tooltip(bucketTip((bucket.t0 + bucket.t1) / 2),
+        { clientX: timelineBox.left + bx, clientY: timelineBox.top + L.rtt.y });
+    };
+    timelineEl.onkeydown = (event) => {
+      const step = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+      if (!step || !buckets.length) return;
+      event.preventDefault();
+      cursor = Math.min(Math.max(cursor + step, 0), buckets.length - 1);
+      showBucketTip();
+    };
+    timelineEl.onfocus = () => { cursor = buckets.length - 1; showBucketTip(); };
+    timelineEl.onblur = () => {
+      crosshair.setAttribute('visibility', 'hidden');
+      App.hideTooltip();
     };
   }
 

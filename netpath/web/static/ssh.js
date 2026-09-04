@@ -27,6 +27,7 @@
   const statusEl = el('ssh-status');
   const noticeEl = el('ssh-notice');
   const termEl = el('ssh-term');
+  const logEl = el('ssh-log');
   const reconnectBtn = el('ssh-reconnect');
   const disconnectBtn = el('ssh-disconnect');
   const credsBox = el('ssh-creds');
@@ -36,7 +37,7 @@
   let term = null;
   let fitAddon = null;
   let socket = null;
-  let device = null;          // {id, ip, name}
+  let device = null;          // {id, ip, name, ssh_port}
   let storedUsername = '';
   let lastSize = { cols: 0, rows: 0 };
   const encoder = new TextEncoder();
@@ -77,10 +78,53 @@
     const shown = nameEl.textContent || openerName || 'device';
     const ip = device ? device.ip : '';
     document.title = ip ? `SSH — ${shown} (${ip})` : `SSH — ${shown}`;
+    // xterm renders to a canvas a screen reader cannot see; the accessible
+    // name at least says whose shell a tab lands the operator in.
+    termEl.setAttribute('aria-label',
+      ip ? `Terminal session with ${shown} (${ip})` : `Terminal session with ${shown}`);
   }
 
   function show(box, visible) {
     box.hidden = !visible;
+  }
+
+  // -------------------------------------------------------------- sr log
+
+  /* #ssh-log mirrors completed lines of device output as plain text, for a
+     screen reader that cannot read xterm's canvas even with screenReaderMode
+     on. Buffered rather than pushed byte-for-byte: a device echoes typed
+     characters back one at a time, and announcing a line before Enter ends
+     it would read every keystroke of a typed username out loud. */
+  const logDecoder = new TextDecoder();
+  let logBuffer = '';
+  const LOG_MAX_LINES = 500;
+
+  function stripAnsi(text) {
+    return text
+      .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')   // OSC (title-setting, etc.)
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')             // CSI (colour, cursor movement)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');      // stray control bytes
+  }
+
+  function logLine(text) {
+    if (!logEl || !text) return;
+    for (const line of stripAnsi(text).split('\n')) {
+      const trimmed = line.replace(/\r$/, '');
+      if (!trimmed) continue;
+      const div = document.createElement('div');
+      div.textContent = trimmed;
+      logEl.appendChild(div);
+    }
+    while (logEl.childElementCount > LOG_MAX_LINES) logEl.removeChild(logEl.firstChild);
+  }
+
+  function logOutputBytes(bytes) {
+    logBuffer += logDecoder.decode(bytes, { stream: true });
+    let newline;
+    while ((newline = logBuffer.indexOf('\n')) !== -1) {
+      logLine(logBuffer.slice(0, newline));
+      logBuffer = logBuffer.slice(newline + 1);
+    }
   }
 
   /* Written into the terminal rather than onto the one-line notice: connect
@@ -88,6 +132,7 @@
      matters more than it fits. */
   function writeMessage(text, colour) {
     if (!term || !text) return;
+    logLine(text);
     const colourOn = colour === 'error' ? '\u001b[31m' : '\u001b[33m';
     term.write('\r\n' + colourOn + text.replace(/\n/g, '\r\n') + '\u001b[0m\r\n');
   }
@@ -112,7 +157,7 @@
       cursorAccent: cssVar('--bg', '#0E1116'),
       selectionBackground: cssVar('--checked-strong', '#2E4470'),
       black: cssVar('--nodata', '#1E242D'),
-      red: cssVar('--fail', '#F85149'),
+      red: cssVar('--fail', '#F8544C'),
       green: cssVar('--ok', '#3FB950'),
       yellow: cssVar('--warn', '#E3B341'),
       blue: cssVar('--accent', '#7AA2F7'),
@@ -129,6 +174,14 @@
       setStatus('error', 'The terminal library did not load');
       return false;
     }
+    // Defensive: nothing today calls buildTerminal() a second time, but a
+    // reconnect that ever grows one must not leave the previous Terminal's
+    // helper textarea behind, stacked a second time in the tab order.
+    if (term) {
+      term.dispose();
+      term = null;
+      fitAddon = null;
+    }
     term = new window.Terminal({
       fontFamily: cssVar('--mono', 'monospace'),
       fontSize: 13,
@@ -138,12 +191,36 @@
       // The device decides what a newline means; translating here would
       // corrupt anything full-screen (a vendor menu, top, vi).
       convertEol: false,
+      // xterm's own accessibility layer: a live region that tracks what is
+      // actually rendered, on top of #ssh-log's own coarser line-by-line one.
+      screenReaderMode: true,
     });
     if (window.FitAddon && window.FitAddon.FitAddon) {
       fitAddon = new window.FitAddon.FitAddon();
       term.loadAddon(fitAddon);
     }
     term.open(termEl);
+    /* #ssh-term, not this textarea, is the one stop in the tab order — see
+       the focus listener below, which hands real keyboard focus on to it. */
+    const helper = termEl.querySelector('.xterm-helper-textarea');
+    if (helper) helper.tabIndex = -1;
+    if (!termEl.dataset.focusWired) {
+      termEl.dataset.focusWired = '1';
+      termEl.addEventListener('focus', () => { if (term) term.focus(); });
+    }
+    /* Escape is a real keystroke inside plenty of shell programs (vi among
+       them), so it is not simply swallowed — attachCustomKeyEventHandler
+       runs before xterm decides what to do with a key, and returning false
+       here is what stops this one short of the pty. Documented in the hint
+       line under the header, since a trap with no escape is a WCAG failure
+       whichever key gets you out. */
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.key === 'Escape') {
+        reconnectBtn.focus();
+        return false;
+      }
+      return true;
+    });
     /* Keystrokes go out as binary frames exactly as typed; the server
        forwards them to the channel without looking at them. */
     term.onData((data) => {
@@ -239,7 +316,9 @@
         handleControl(message);
         return;
       }
-      if (term) term.write(new Uint8Array(event.data));
+      const bytes = new Uint8Array(event.data);
+      if (term) term.write(bytes);
+      logOutputBytes(bytes);
     };
 
     ws.onerror = () => {
@@ -304,10 +383,12 @@
         }
         break;
 
-      case 'error':
-        setStatus('error', firstLine(message.message) || 'Failed');
-        writeMessage(message.message, 'error');
+      case 'error': {
+        const friendly = friendlyError(message.message);
+        setStatus('error', firstLine(friendly) || 'Failed');
+        writeMessage(friendly, 'error');
         break;
+      }
 
       default:
         break;      // an unknown control message is not worth a failure
@@ -316,6 +397,20 @@
 
   function firstLine(text) {
     return (text || '').split('\n')[0].trim();
+  }
+
+  /* paramiko surfaces a bare socket.error on a failed TCP connect —
+     "[Errno None] Unable to connect to port 2201 on 127.0.0.250" — which
+     names neither the fix nor where to make it. Recognise that shape and
+     say what an operator actually needs instead. */
+  function friendlyError(text) {
+    const raw = text || '';
+    if (!/unable to connect to port/i.test(raw) && !/^\[errno/i.test(raw)) return raw;
+    const host = device && device.ip ? device.ip : 'the device';
+    const port = device && device.ssh_port ? device.ssh_port : '';
+    return `Could not reach ${host}${port ? `:${port}` : ''} over SSH. Check that ` +
+      'the device is reachable and listening on that port, or change the port ' +
+      'under ConfigRX → Device settings.';
   }
 
   // ------------------------------------------------------------ overlays
@@ -437,10 +532,11 @@
     }
 
     device = payload.device || { id: deviceId, ip: '' };
+    device.ssh_port = payload.ssh_port || 22;
     // The server resolves the display-name precedence once and sends the
     // answer as `name`; the opener's name is only the stand-in until it does.
     nameEl.textContent = device.name || openerName;
-    ipEl.textContent = device.ip ? `${device.ip}:${payload.ssh_port || 22}` : '';
+    ipEl.textContent = device.ip ? `${device.ip}:${device.ssh_port}` : '';
     setTitle();
 
     const paramiko = payload.paramiko || {};

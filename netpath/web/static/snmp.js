@@ -373,8 +373,14 @@
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
+      status.tabIndex = 0;
       status.onmousemove = (event) => App.tooltip(wrap(status.title), event);
       status.onmouseleave = App.hideTooltip;
+      status.onfocus = () => {
+        const box = status.getBoundingClientRect();
+        App.tooltip(wrap(status.title), { clientX: box.left + box.width / 2, clientY: box.bottom });
+      };
+      status.onblur = App.hideTooltip;
     }
 
     App.el('sn-dot').style.background = snmp.running

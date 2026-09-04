@@ -36,6 +36,18 @@ body.ssh-page {
 .ssh-status.is-closed { color: var(--muted); }
 .ssh-status.is-error { color: var(--fail); }
 
+/* Published once, plainly, rather than left implicit: the terminal below is
+   the one control on this page a keyboard cannot Tab out of on its own. */
+.ssh-kbd-hint {
+  margin: 0;
+  padding: 4px 12px;
+  flex: none;
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+}
+
 .ssh-notice {
   margin: 0;
   padding: 5px 12px;

@@ -20,17 +20,28 @@
   <span id="ssh-name" class="section"></span>
   <span id="ssh-ip" class="ssh-ip"></span>
   <span class="grow"></span>
-  <span id="ssh-status" class="ssh-status">starting…</span>
+  <span id="ssh-status" class="ssh-status" role="status">starting…</span>
   <button id="ssh-reconnect">Reconnect</button>
   <button id="ssh-disconnect">Disconnect</button>
 </div>
+
+<!-- The terminal traps Tab by design — it is a terminal, and a shell inside
+     it may well want Tab itself. Escape is the documented, keyboard-only way
+     back out, published here rather than left for an operator to discover. -->
+<p class="hint ssh-kbd-hint">Press Escape to leave the terminal and move focus to the toolbar above.</p>
 
 <!-- One line, above the terminal rather than inside it, for things the
      operator should see but that are not device output: the host key stored
      on a first connection, or the reason a session ended. -->
 <p id="ssh-notice" class="ssh-notice" hidden></p>
 
-<div id="ssh-term" class="ssh-term"></div>
+<div id="ssh-term" class="ssh-term" tabindex="0" role="application"></div>
+
+<!-- xterm's own rendering is a canvas a screen reader cannot read; this
+     mirrors completed output lines as plain text so they are announced as
+     they arrive, without repeating every keystroke's echo before its line
+     is actually finished. -->
+<div id="ssh-log" class="sr-only" role="log" aria-live="polite" aria-relevant="additions"></div>
 
 <!-- Overlays are this page's own markup, not App.modal: nothing else of the
      application is loaded here. Both sit over the terminal and are hidden

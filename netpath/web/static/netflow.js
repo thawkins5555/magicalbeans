@@ -161,11 +161,44 @@
     return `${Math.round(bits)} Tbps`;
   }
 
+  /* The chart carries too many time buckets for one tab stop each (a wide
+     window is hundreds of them), so the container is the one stop and the
+     same keys the pan/zoom/reset buttons already run answer to it directly
+     — panning IS how a keyboard user moves between buckets here, and
+     showFocusTip re-announces the totals after every move. A discrete
+     per-bucket walk would only fight those keys for the arrows. */
+  function showFocusTip(container) {
+    if (document.activeElement !== container) return;
+    const box = container.getBoundingClientRect();
+    App.tooltip(App.el('nf-totals').textContent || 'No flows in this window',
+      { clientX: box.left + box.width / 2, clientY: box.top + 24 });
+  }
+
   function drawChart() {
+    const container = App.el('nf-chart');
     const svg = App.el('nf-chart-svg');
-    const box = App.el('nf-chart').getBoundingClientRect();
+    const box = container.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 160);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    container.tabIndex = 0;
+    container.setAttribute('role', 'img');
+    container.setAttribute('aria-label', `Traffic over time chart. ` +
+      `${App.el('nf-totals').textContent || 'No flows in this window'}. Focus and use ` +
+      `left/right to pan, plus/minus to zoom, Home to reset.`);
+    if (!container.dataset.keyboardWired) {
+      container.dataset.keyboardWired = '1';
+      container.addEventListener('keydown', (event) => {
+        const zoomIn = event.key === '=' || event.key === '+';
+        const zoomOut = event.key === '-' || event.key === '_';
+        if (event.key === 'ArrowLeft') { event.preventDefault(); pan(-0.25); }
+        else if (event.key === 'ArrowRight') { event.preventDefault(); pan(0.25); }
+        else if (zoomIn) { event.preventDefault(); zoom(0.5); }
+        else if (zoomOut) { event.preventDefault(); zoom(2); }
+        else if (event.key === 'Home') { event.preventDefault(); resetWindow(); }
+      });
+      container.addEventListener('focus', () => showFocusTip(container));
+      container.addEventListener('blur', App.hideTooltip);
+    }
     // Redrawn only when the data or the drawing area changed: this ran on
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
@@ -188,6 +221,7 @@
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
         fill: 'var(--muted)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-xs)',
       }, 'No flows in this window'));
+      showFocusTip(container);
       return;
     }
 
@@ -331,6 +365,7 @@
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
       setWindow(start, end, false, true);
     };
+    showFocusTip(container);
   }
 
   function slotTip(data, slot) {
@@ -367,6 +402,7 @@
       return;
     }
     const peak = Math.max(...rows.map((r) => r.bytes), 1);
+    const bars = [];
     rows.forEach((row, index) => {
       const div = document.createElement('div');
       div.className = 'bar-row';
@@ -375,7 +411,12 @@
         `background:${SERIES[index % SERIES.length]}"></div>` +
         `<span class="bar-label">${escape(row.label)}</span>` +
         `<span class="bar-value">${row.bytes_text} · ${row.rate_text}</span>`;
-      div.onclick = () => filterByBar(row);
+      div.onclick = () => {
+        // A bar picked with the mouse becomes the one the keyboard returns
+        // to, same as a table row's own click already does.
+        for (const other of bars) other.tabIndex = other === div ? 0 : -1;
+        filterByBar(row);
+      };
       div.style.cursor = 'pointer';
       // Swatched to match its own bar, and to match the band of the same
       // name in the chart above it.
@@ -384,9 +425,39 @@
         { text: `${row.bytes_text} · ${row.rate_text}` },
         { text: `${row.flows} flow records` },
       ];
+      div.setAttribute('role', 'button');
+      div.setAttribute('aria-label',
+        `${row.label}: ${row.bytes_text}, ${row.rate_text}, ${row.flows} flow records`);
       div.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       div.addEventListener('mouseleave', App.hideTooltip);
+      div.addEventListener('focus', () => {
+        const box = div.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      div.addEventListener('blur', App.hideTooltip);
       wrap.appendChild(div);
+      bars.push(div);
+    });
+    // A short list (App.el('n-topn') caps it at 25) so every bar gets its
+    // own tab stop, roving the way wireRowKeyboard does for table rows
+    // rather than making the operator step through all of them on Tab alone.
+    bars.forEach((div, index) => {
+      div.tabIndex = index === 0 ? 0 : -1;
+      div.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          div.click();
+          return;
+        }
+        const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0;
+        if (!step) return;
+        const next = bars[index + step];
+        if (!next) return;
+        event.preventDefault();
+        div.tabIndex = -1;
+        next.tabIndex = 0;
+        next.focus();
+      });
     });
   }
 
@@ -518,6 +589,13 @@
       const text = tip.join('\n');
       tr.addEventListener('mousemove', (event) => App.tooltip(text, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
+      // wireRowKeyboard below gives the row the keyboard; this is what a
+      // mouse hover already shows it once it lands there.
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
     });
     table.appendChild(body);
     App.wireRowKeyboard(body);
@@ -664,8 +742,14 @@
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
+      status.tabIndex = 0;
       status.onmousemove = (event) => App.tooltip(status.title, event);
       status.onmouseleave = App.hideTooltip;
+      status.onfocus = () => {
+        const box = status.getBoundingClientRect();
+        App.tooltip(status.title, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      };
+      status.onblur = App.hideTooltip;
     }
 
     App.el('nf-dot').style.background = collector.running

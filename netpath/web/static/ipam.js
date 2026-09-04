@@ -195,6 +195,11 @@
       const tip = usageTooltipText(subnet);
       tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
       tr.onclick = () => {
         view.subnetId = subnet.id;
         renderSubnets();
@@ -691,6 +696,11 @@
       const tip = scopeTooltipText(scope);
       tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
       tr.onclick = () => {
         view.dhcpScopeId = scope.id;
         // Picking a scope by hand is what a later server switch should try to
@@ -806,11 +816,15 @@
     const labelEl = App.el('ipam-scope-trend-label');
     if (!chartEl) return;   // the scope changed again before this landed
     chartEl.innerHTML = '';
+    chartEl.tabIndex = 0;
+    chartEl.setAttribute('role', 'img');
 
     const points = view.scopeTrend || [];
     const windowText = view.scopeTrendWindow === '7d' ? 'last 7 days' : 'last 24 hours';
     if (points.length < 2) {
-      if (labelEl) labelEl.textContent = `Leased IPs (${windowText}): not enough history yet`;
+      const text = `Leased IPs (${windowText}): not enough history yet`;
+      if (labelEl) labelEl.textContent = text;
+      chartEl.setAttribute('aria-label', text);
       return;
     }
 
@@ -866,14 +880,33 @@
     svg.addEventListener('mouseleave', App.hideTooltip);
     chartEl.appendChild(svg);
 
+    // A day of history can be dozens of points, too many for a tab stop
+    // each — the container is the one stop and left/right arrow walks a
+    // cursor across the points it already drew, same tooltip a mouse gets.
+    let cursor = points.length - 1;
+    const showCursorTip = () => {
+      const p = points[cursor];
+      const box = chartEl.getBoundingClientRect();
+      App.tooltip(tipFor(p),
+        { clientX: box.left + x(p.ts), clientY: box.top + y(p.leased) });
+    };
+    chartEl.onkeydown = (event) => {
+      const step = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+      if (!step) return;
+      event.preventDefault();
+      cursor = Math.min(Math.max(cursor + step, 0), points.length - 1);
+      showCursorTip();
+    };
+    chartEl.onfocus = () => { cursor = points.length - 1; showCursorTip(); };
+    chartEl.onblur = App.hideTooltip;
+
     const last = points[points.length - 1].leased;
     const first = points[0].leased;
     const delta = last - first;
     const deltaText = delta === 0 ? 'flat' : (delta > 0 ? `up ${delta}` : `down ${-delta}`);
-    if (labelEl) {
-      labelEl.textContent =
-        `Leased IPs (${windowText}): ${last} now, ${deltaText} over the window`;
-    }
+    const summary = `Leased IPs (${windowText}): ${last} now, ${deltaText} over the window`;
+    if (labelEl) labelEl.textContent = summary;
+    chartEl.setAttribute('aria-label', `${summary}. Focus and use left/right to read each point.`);
   }
 
   const LEASE_COLUMNS = [

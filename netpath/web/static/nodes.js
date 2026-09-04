@@ -829,6 +829,12 @@
     const width = Math.max(box.width, 300);
     const height = Math.max(box.height, 120);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // A line chart has no per-point tab stops (a live one can carry hundreds
+    // of samples); the container itself is the one stop, described from
+    // whatever summary the caller already has for its own header.
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', opts.ariaLabel || 'Chart');
     // No data object at all (nothing has ever loaded — e.g. no metric
     // chosen yet) means there is no window to hand back for zooming
     // either. An empty series list is different: the request window
@@ -987,7 +993,7 @@
       }));
       // Colour is never the only signal: every non-`up` state carries its
       // own texture (see App.statusPatternDefs).
-      const pattern = App.statusPatternUrl(seg.status);
+      const pattern = App.statusPatternUrl(seg.status, svg);
       if (pattern) {
         group.appendChild(App.svgNode('rect', {
           x: x0, y: 0, width: w, height, fill: pattern,
@@ -1117,7 +1123,7 @@
     const box = App.modal(escape(displayName(listed || {})) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
       <div class="bar"><span class="section">PACKET LOSS</span>
-        <select id="ndd-loss-range"></select></div>
+        <select id="ndd-loss-range" aria-label="Packet-loss range"></select></div>
       <div id="ndd-loss-chart" class="canvas chart" style="height:150px">
         <svg id="ndd-loss-chart-svg"></svg></div>
       <p class="section">VENDOR IDENTIFICATION</p>
@@ -1153,6 +1159,9 @@
       const wrap = box.querySelector('#ndd-loss-chart');
       const svg = box.querySelector('#ndd-loss-chart-svg');
       if (!wrap || !svg) return;
+      const points = ((lossData.series || [])[0] || {}).points || [];
+      const last = points.length ? points[points.length - 1] : null;
+      const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
       drawSeriesChart(svg, wrap, lossData, {
         // Pinned, because loss is a percentage of a known whole and an
         // auto-scaled axis lies about a healthy device: a flat 0% series
@@ -1162,6 +1171,8 @@
         emptyText: lossData.notProbed
           ? 'This device is not being ping-probed'
           : 'No packet-loss samples in this window',
+        ariaLabel: lastValue == null ? 'Packet loss chart, no samples in this window'
+          : `Packet loss chart, ${lastValue.toFixed(1)}% most recently`,
       });
     }
 
@@ -1799,10 +1810,22 @@
       const svg = box.querySelector('#ifd-chart-svg');
       const wrap = box.querySelector('#ifd-chart');
       if (!svg || !wrap || !lastChart) return;
+      const lastOf = (series) => {
+        const pts = series.points || [];
+        if (!pts.length) return null;
+        const p = pts[pts.length - 1];
+        return p.avg !== undefined ? p.avg : p.value;
+      };
+      const parts = lastChart.series
+        .map((s) => { const v = lastOf(s); return v == null ? null : `${s.label} ${formatMetricValue('bps', v)}`; })
+        .filter(Boolean);
+      const portName = iface.descr || iface.alias || `port ${ifIndex}`;
       drawSeriesChart(svg, wrap, lastChart, {
         emptyText: 'No samples yet — they arrive with each poll',
         smooth,
         axisMemory,
+        ariaLabel: `Bandwidth chart for ${portName}, last hour` +
+          (parts.length ? `, most recently ${parts.join(', ')}` : ', no samples yet'),
       });
     }
 
@@ -2081,8 +2104,15 @@
       { metric_id: metricId, t0, t1 });
     if (!wrap.isConnected || wrap.dataset.requestId !== requestId
         || view.selected !== deviceId) return;
+    const points = result.points || [];
+    const last = points.length ? points[points.length - 1] : null;
+    const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
     drawSeriesChart(svg, wrap, { t0: result.t0, t1: result.t1, unit: metric.unit,
-      series: [{ label: metric.label, color: 'var(--accent)', points: result.points || [] }] });
+      series: [{ label: metric.label, color: 'var(--accent)', points }] }, {
+      ariaLabel: `${metric.label} chart, last hour` +
+        (lastValue == null ? ', no samples yet'
+          : `, most recently ${formatMetricValue(metric.unit, lastValue)}`),
+    });
   }
 
   /* -------------------------------------------------------------- CRUD */
@@ -2633,9 +2663,10 @@
     if (!view.deviceGroups.length) return '<p class="hint">No groups yet.</p>';
     const rows = view.deviceGroups.map((g) => `
       <tr data-devgroup-id="${g.id}">
-        <td><input type="text" class="devgroup-name" value="${escape(g.name)}"></td>
-        <td><button type="button" class="devgroup-save">Save</button></td>
-        <td><button type="button" class="devgroup-remove">Remove</button></td>
+        <td><input type="text" class="devgroup-name" value="${escape(g.name)}"
+          aria-label="Name for group ${escape(g.name)}"></td>
+        <td><button type="button" class="devgroup-save" aria-label="Save ${escape(g.name)}">Save</button></td>
+        <td><button type="button" class="devgroup-remove" aria-label="Remove ${escape(g.name)}">Remove</button></td>
       </tr>`).join('');
     return `<table><caption class="sr-only">Device groups</caption><thead><tr><th scope="col">Name</th><th scope="col"></th><th scope="col"></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
@@ -3605,6 +3636,35 @@
     return s.length > max ? `${s.slice(0, max - 1)}…` : s;
   }
 
+  /* Mirrors the status-timeline segments above: tabindex plus a focus/blur
+     pair that shows the same tooltip a mouse gets, so a hover-only detail on
+     the topology graph is not lost to the keyboard. `onActivate`, when
+     given, also wires Enter/Space to whatever the element's own click does,
+     since a focusable node or edge that only a mouse can act on is still
+     a trap. */
+  function wireHoverTip(element, tipText, onActivate) {
+    element.tabIndex = 0;
+    element.setAttribute('role', onActivate ? 'button' : 'img');
+    element.setAttribute('aria-label', tipText.replace(/\n/g, '; '));
+    element.addEventListener('mousemove', (event) => {
+      if (!topoState.panDrag) App.tooltip(tipText, event);
+    });
+    element.addEventListener('mouseleave', App.hideTooltip);
+    element.addEventListener('focus', () => {
+      if (topoState.panDrag) return;
+      const box = element.getBoundingClientRect();
+      App.tooltip(tipText, { clientX: box.left + box.width / 2, clientY: box.bottom });
+    });
+    element.addEventListener('blur', App.hideTooltip);
+    if (onActivate) {
+      element.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onActivate();
+      });
+    }
+  }
+
   function topoNodeBox(x, y, node) {
     const g = App.svgNode('g', { transform: `translate(${x},${y})` });
     const color = node.unknown ? 'var(--line)' : (STATUS_COLOR[node.status] || 'var(--line)');
@@ -3621,16 +3681,16 @@
     const tipText = node.unknown
       ? `${node.name || 'Unidentified neighbour'} — not in Nodes`
       : `${node.name}${node.ip && node.ip !== node.name ? ` (${node.ip})` : ''} — ${node.status}`;
-    g.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
-    g.addEventListener('mouseleave', App.hideTooltip);
-    if (!node.unknown) {
+    const activate = node.unknown ? null : () => {
+      if (topoState.dragMoved) return;
+      App.rememberSub('nodes', 'devices');
+      selectSub('devices');
+      selectDevice(node.id);
+    };
+    wireHoverTip(g, tipText, activate);
+    if (activate) {
       g.style.cursor = 'pointer';
-      g.addEventListener('click', () => {
-        if (topoState.dragMoved) return;
-        App.rememberSub('nodes', 'devices');
-        selectSub('devices');
-        selectDevice(node.id);
-      });
+      g.addEventListener('click', activate);
     }
     return g;
   }
@@ -3644,8 +3704,12 @@
     const width = Math.max(box.width, 300), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     const topo = view.topology;
-    App.el('nd-topo-count').textContent = topo
-      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : '';
+    const countText = topo
+      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : 'no devices';
+    App.el('nd-topo-count').textContent = topo ? countText : '';
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', `Neighbour topology: ${countText}. Tab into it for each device and link.`);
     if (!topo || !topo.nodes.length) {
       svg.appendChild(App.svgNode('text', {
         x: width / 2, y: height / 2, 'text-anchor': 'middle',
@@ -3679,14 +3743,14 @@
         `${(edge.protocols || []).join(', ').toUpperCase()}` +
         `${edge.unknown ? ' — unidentified neighbour' : ''}`;
       line.style.cursor = 'pointer';
-      line.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
-      line.addEventListener('mouseleave', App.hideTooltip);
       // click, not just hover, so a touch or keyboard-driven pointer can
       // still get at the local/remote port label the task calls for.
-      line.addEventListener('click', () => {
+      const showLink = () => {
         if (topoState.dragMoved) return;
         App.toast(tipText.replace('\n', ' — '), 'ok');
-      });
+      };
+      wireHoverTip(line, tipText, showLink);
+      line.addEventListener('click', showLink);
       edgeLayer.appendChild(line);
     }
     for (const node of topo.nodes) {
