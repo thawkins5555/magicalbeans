@@ -279,6 +279,26 @@
      the strongest of the three tints (1.55 against --raised, where --checked
      is 1.27), so "ticked and open" stays unmistakable. */
   --checked-strong: #2A3E66;
+
+  /* The route canvas is deliberately a light palette in the other two
+     themes — it is the pane addresses are read off, and it prints. Here it
+     was the same white slab, 1500x540, in a near-black interface: the
+     largest glare source in the product, on the one theme an operator
+     chooses because brightness and low separation are the problem. The
+     canvas follows the theme it is drawn in; the light palette is still
+     what the other two themes use, and still what prints from them. */
+  --canvas: #0E1319;
+  --canvas-panel: #182029;
+  --canvas-hairline: #2E3745;
+  --canvas-grid: #1F2731;
+  --canvas-text: #F2F6FA;
+  --canvas-muted: #C3CCD6;
+  --canvas-faint: #AEB8C4;
+  --canvas-accent: #9EC1FF;
+  --canvas-ok: #5FD97A;
+  --canvas-warn: #F0C25A;
+  --canvas-fail: #FF8F8A;
+  --canvas-blocked: #FFA07A;
 }
 
 /* Light: the route canvas's palette applied to the chrome. The canvas has
