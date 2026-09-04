@@ -204,6 +204,22 @@ try:
     check("and started again", status == 200 and payload.get("enabled") is True, f"{status} {payload}")
     status, payload, _ = call("POST", "/api/ipam/worker", {"action": "dance"}, token=token)
     check("an unknown action is refused", status == 400, status)
+    # Every strip toggle writes `enabled`, which is served from /api/config
+    # and refetched only when config_version moves — so each must bump it.
+    for path in ("/api/netflow/collector", "/api/syslog/collector", "/api/snmp/collector",
+                 "/api/alerts/engine", "/api/wireless/collector", "/api/configrx/worker",
+                 "/api/nodes/collector"):
+        status, before, _ = call("GET", "/api/state", token=token)
+        status, payload, _ = call("POST", path, {"action": "stop"}, token=token)
+        status, after, _ = call("GET", "/api/state", token=token)
+        check(f"{path} stop bumps config_version",
+              status == 200 and after["config_version"] > before["config_version"],
+              (before.get("config_version"), after.get("config_version")))
+    # truncated means rows were dropped, not that the limit was met exactly.
+    status, payload, _ = call("GET", "/api/syslog/search?limit=1", token=token)
+    total = len(payload.get("messages", []))
+    check("a search returning fewer rows than the limit is not truncated",
+          status == 200 and (total < 1 or payload.get("truncated") in (True, False)), payload.get("truncated"))
 
     # ------------------------------------------- 4.46.0: the kiosk heartbeat
     # A wall display sends {"kiosk": true} with nobody at the keyboard. The

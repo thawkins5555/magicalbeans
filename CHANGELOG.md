@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.46.1 — Review of 4.41.0–4.46.0](#4461--review-of-44104460)
 - [4.46.0 — Any screen, any hand, any wall](#4460--any-screen-any-hand-any-wall)
 - [4.45.0 — Twelve modules, one set of parts](#4450--twelve-modules-one-set-of-parts)
 - [4.44.0 — Since when, in which zone](#4440--since-when-in-which-zone)
@@ -109,6 +110,46 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.46.1 — Review of 4.41.0–4.46.0
+
+A code review and a security review of the six releases above before they
+merge. The security review found nothing to report. The code review found
+seven things, all fixed here:
+
+- **A button in a dialog's body submitted the dialog.** Since 4.41.0 the
+  dialog is a `<form>`, and a `<button>` inside a form is a submit button
+  unless told otherwise — so the device dialog's vendor Save, the OID
+  browser's Walk, the MIB catalog's Install and the wireless Poll now each
+  ran their own action and then the dialog's primary one (usually Close) on
+  top of it. `App.modal` now types every body button `type=button`, keeps
+  doing so for buttons a module adds after the dialog opens, and ignores a
+  submit raised by anything but the primary button.
+- **Stopping a worker from its strip did not reach the settings dialog.**
+  Since 4.43.0 `enabled` is served from `/api/config`, which the browser
+  refetches only when `config_version` moves, and the seven start/stop
+  handlers did not move it — so the settings dialog still showed "Run the
+  collector" ticked after the strip had stopped it, and a Save from that
+  dialog restarted it. Every toggle bumps the version now; the gates suite
+  checks all seven.
+- **The NetFlow Window select stopped changing the window** in 4.45.0: the
+  shared filter bar overwrote its change handler with a plain refresh. The
+  select keeps its own handler; the bar wires the rest.
+- **The SNMP and Syslog row-limit selects no longer refreshed** after the
+  same migration. Both are wired again.
+- **"N of M shown" could claim a cut-off that had not happened.** The
+  search handlers reported `truncated` when the row count *equalled* the
+  limit; they fetch one row past it now and report only when something was
+  actually dropped.
+- Creating a user bumped `config_version` twice; the kiosk heartbeat
+  compared grant levels against a literal instead of the permission
+  vocabulary. Both tidied.
+
+Verified in the browser on the seeded instance: the device dialog's body
+buttons are all `type=button` (including two added after open) and clicking
+vendor Save leaves the dialog open; the NetFlow Window select moves the
+window; a row-limit change fires a request; stopping the Syslog collector
+moves `config_version` 2 → 3 and the settings block follows.
 
 ### 4.46.0 — Any screen, any hand, any wall
 

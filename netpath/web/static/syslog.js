@@ -396,7 +396,7 @@
 
     App.filterBar('syslog', {
       text: ['sl-q', 'sl-source', 'sl-host', 'sl-app'],
-      selects: ['sl-range', 'sl-severity', 'sl-facility'],
+      selects: ['sl-range', 'sl-limit', 'sl-severity', 'sl-facility'],
       apply: 'sl-apply', clear: 'sl-clear',
       clears: ['sl-q', 'sl-source', 'sl-host', 'sl-app', 'sl-severity', 'sl-facility'],
     });

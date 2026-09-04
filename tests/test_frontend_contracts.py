@@ -166,6 +166,13 @@ check('aria-hidden="true"' in INDEX.split('id="toasts"')[1].split(">")[0]
       "the toast region is hidden from assistive technology — the same text "
       "has already gone through the live region")
 
+# A <button> inside a <form> is a submit button unless told otherwise, and
+# modules write buttons into dialog BODIES (vendor Save, OID Walk, MIB Install).
+# modal() must type them, or each one also fires the dialog's primary action.
+check("form.querySelectorAll('button:not([type])')" in read("app.js")
+      and "bodyButton.type = 'button'" in read("app.js"),
+      "modal() makes every body button type=button so only the primary submits")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

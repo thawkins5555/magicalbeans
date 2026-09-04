@@ -1249,6 +1249,21 @@ const App = (() => {
       : `<h2 id="modal-title">${heading}</h2>${openForm}` +
         `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`;
     const form = box.querySelector('form.modal-form');
+    // A <button> inside a <form> defaults to type=submit, so a Save, Walk or
+    // Install that a module wrote into the BODY would run its own onclick and
+    // then submit the form — firing the dialog's primary action (usually
+    // Close) on top of it. Every body button is type=button unless it says
+    // otherwise; only the primary button appended below submits. Modules
+    // also add buttons after the dialog opens (the device dialog fills its
+    // vendor and OID sections from a fetch), so the pass is kept up by an
+    // observer for the life of the form; the observer dies with the form.
+    const typeBodyButtons = () => {
+      for (const bodyButton of form.querySelectorAll('button:not([type])')) {
+        bodyButton.type = 'button';
+      }
+    };
+    typeBodyButtons();
+    new MutationObserver(typeBodyButtons).observe(form, { childList: true, subtree: true });
     const row = box.querySelector('.modal-buttons');
     for (const spec of buttons) {
       const button = document.createElement('button');
@@ -1268,6 +1283,10 @@ const App = (() => {
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       const button = row.querySelector('button.primary');
+      // Belt to the observer's braces: a submit raised by anything other
+      // than the primary button (or Enter in a field, whose submitter is
+      // the primary as the only submit button) is not the dialog's action.
+      if (event.submitter && event.submitter !== button) return;
       if (primarySpec && button && !button.disabled) {
         runModalAction(primarySpec, box, button);
       }

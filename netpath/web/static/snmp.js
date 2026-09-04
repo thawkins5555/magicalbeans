@@ -451,7 +451,7 @@
 
     App.filterBar('snmp', {
       text: ['sn-q', 'sn-source', 'sn-oid'],
-      selects: ['sn-range', 'sn-severity', 'sn-kind', 'sn-version'],
+      selects: ['sn-range', 'sn-limit', 'sn-severity', 'sn-kind', 'sn-version'],
       apply: 'sn-apply', clear: 'sn-clear',
       clears: ['sn-q', 'sn-source', 'sn-oid', 'sn-severity', 'sn-kind', 'sn-version'],
     });

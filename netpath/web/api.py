@@ -737,6 +737,10 @@ def post_collector(service, params, body) -> dict:
         service.flow_settings["enabled"] = False
         service.flow_db.save_settings({"enabled": False})
         service.collector.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.collector.running,
             "status": service.collector.status_text()}
 
@@ -1224,7 +1228,12 @@ def get_syslog_search(service, params, body) -> dict:
 
     started = time.time()
     effective = min(limit, SEARCH_ROW_CAP)
-    rows = service.syslog_db.search(t0, t1, filters, limit=effective)
+    rows = service.syslog_db.search(t0, t1, filters, limit=effective + 1)
+    # One row past the limit says whether anything was left out; `len(rows)
+    # >= effective` reported a cut-off for a window with exactly `effective`
+    # matches, which was a lie the count label repeated.
+    truncated = len(rows) > effective
+    rows = rows[:effective]
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
@@ -1252,7 +1261,7 @@ def get_syslog_search(service, params, body) -> dict:
     return {
         "took_ms": round(elapsed_ms, 1),
         "limit": effective, "cap": SEARCH_ROW_CAP,
-        "truncated": len(rows) >= effective,
+        "truncated": truncated,
         "fts": service.syslog_db.fts,
         "messages": [
             {
@@ -1283,6 +1292,10 @@ def post_syslog_collector(service, params, body) -> dict:
         service.syslog_settings["enabled"] = False
         service.syslog_db.save_settings({"enabled": False})
         service.syslog.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.syslog.running,
             "status": service.syslog.status_text()}
 
@@ -1358,7 +1371,12 @@ def get_snmp_traps(service, params, body) -> dict:
 
     started = time.time()
     effective = min(limit, SEARCH_ROW_CAP)
-    rows = service.snmp_db.search(t0, t1, filters, limit=effective)
+    rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1)
+    # One row past the limit says whether anything was left out; `len(rows)
+    # >= effective` reported a cut-off for a window with exactly `effective`
+    # matches, which was a lie the count label repeated.
+    truncated = len(rows) > effective
+    rows = rows[:effective]
     elapsed_ms = (time.time() - started) * 1000
 
     names = {}
@@ -1400,7 +1418,7 @@ def get_snmp_traps(service, params, body) -> dict:
             "varbinds": varbinds,
         })
     return {"took_ms": round(elapsed_ms, 1), "limit": effective, "cap": SEARCH_ROW_CAP,
-            "truncated": len(rows) >= effective, "traps": traps}
+            "truncated": truncated, "traps": traps}
 
 
 def post_snmp_collector(service, params, body) -> dict:
@@ -1413,6 +1431,10 @@ def post_snmp_collector(service, params, body) -> dict:
         service.snmp_settings["enabled"] = False
         service.snmp_db.save_settings({"enabled": False})
         service.snmp.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.snmp.running,
             "status": service.snmp.status_text()}
 
@@ -3120,6 +3142,10 @@ def post_nodes_collector(service, params, body) -> dict:
         service.nodes_settings["enabled"] = False
         service.nodes_db.save_settings({"enabled": False})
         service.node_poller.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.node_poller.running,
             "status": service.node_poller.status_text()}
 
@@ -3840,6 +3866,10 @@ def post_alerts_engine(service, params, body) -> dict:
         service.alerts_settings["enabled"] = False
         service.alerts_db.save_settings({"enabled": False})
         service.alert_engine.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.alert_engine.running,
             "status": service.alert_engine.status_text()}
 
@@ -4130,6 +4160,10 @@ def post_wireless_collector(service, params, body) -> dict:
         service.wireless_settings["enabled"] = False
         service.wireless_db.save_settings({"enabled": False})
         service.wireless.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.wireless.running,
             "status": service.wireless.status_text()}
 
@@ -4460,6 +4494,10 @@ def post_configrx_worker(service, params, body) -> dict:
         service.configrx_settings["enabled"] = False
         service.configrx_db.save_settings({"enabled": False})
         service.configrx.stop()
+    # `enabled` is served from /api/config, which the browser refetches only
+    # when config_version moves: without this bump the settings dialog kept
+    # showing the collector as running after the strip had stopped it.
+    service.bump_config()
     return {"running": service.configrx.running,
             "status": service.configrx.status_text()}
 
@@ -4661,7 +4699,7 @@ def post_heartbeat(service, params, body) -> dict:
     minutes = service.sessions.idle_seconds // 60
     if kiosk:
         granted = service.app_db.permissions_for(params.get("_username", ""))
-        if any(level == "write" for level in granted.values()):
+        if any(_permissions.allows(level, _permissions.WRITE) for level in granted.values()):
             return {"ok": False, "kiosk": False, "idle_timeout_minutes": minutes,
                     "reason": "Kiosk mode keeps only a read-only account signed in; "
                               "this account can write, so the idle sign-out applies."}
@@ -4729,11 +4767,10 @@ def post_user(service, params, body) -> dict:
 
     service.app_db.add_user(username, hash_password(password), must_change=True)
 
-    service.bump_config()
     grants = body.get("grants") or {}
     if grants:
         service.app_db.set_permissions(username, grants)
-        service.bump_config()
+    service.bump_config()
     service.log.add(SYSTEM_CATEGORY,
                     f"Account {username} created by "
                     f"{params.get('_username', 'someone')}")

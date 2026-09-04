@@ -830,12 +830,14 @@
         packets: `Top ${RECORD_LIMIT} by packets`,
         time: `Most recent ${RECORD_LIMIT}` }[option.value] || option.textContent;
     }
-    for (const id of ['nf-dimension', 'nf-protocol', 'nf-exporter', 'nf-order']) {
-      App.el(id).onchange = () => App.refreshNow('netflow');
-    }
+    App.el('nf-order').onchange = () => App.refreshNow('netflow');
+    // nf-range is deliberately NOT in this list: its change handler is
+    // resetWindow (above), which re-sizes the window before refreshing; a
+    // plain refresh here would have overwritten it and left the chart on
+    // the old window.
     App.filterBar('netflow', {
       text: ['nf-src', 'nf-dst', 'nf-port'],
-      selects: ['nf-range', 'nf-dimension', 'nf-protocol', 'nf-exporter'],
+      selects: ['nf-dimension', 'nf-protocol', 'nf-exporter'],
       apply: 'nf-apply', clear: 'nf-clear',
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
