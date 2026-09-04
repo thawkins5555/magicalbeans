@@ -394,11 +394,16 @@ def simple_bind(url: str, dn: str, password: str, *,
             "as plaintext, which this refuses to do without an explicit "
             "opt-in. Use ldaps:// instead, or set ldap_allow_cleartext.")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    # create_connection rather than a bare AF_INET socket + connect(): it
+    # resolves `host` through getaddrinfo and tries whatever families that
+    # returns, so an AAAA-only directory host or a plain IPv6 literal in
+    # ldap_url is reachable — a hard-coded AF_INET socket could never
+    # connect to either. `timeout` covers both the DNS resolution and the
+    # connect() this replaces, same as the two calls it stands in for.
+    sock = None
     try:
         try:
-            sock.connect((host, port))
+            sock = socket.create_connection((host, port), timeout=timeout)
             if use_tls:
                 context = ssl.create_default_context()
                 sock = context.wrap_socket(sock, server_hostname=host)
@@ -435,10 +440,11 @@ def simple_bind(url: str, dn: str, password: str, *,
             raise LDAPInvalidCredentials("invalid credentials")
         raise LDAPBindError(response["result_code"], response["diagnostic_message"])
     finally:
-        try:
-            sock.close()
-        except OSError:
-            pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 # hmac is imported for the one call sites that want an explicit

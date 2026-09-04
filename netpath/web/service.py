@@ -917,6 +917,16 @@ class Service:
         # sending someone to a port the address left months ago.
         self.nodes_db.prune_mac_entries(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        # LLDP/CDP neighbour rows nothing has refreshed in as long — the
+        # same present=0-then-age-out shape mac_entries uses (see the
+        # neighbors schema comment), so the same retention setting governs
+        # both rather than adding a second knob for what is the same
+        # "device stopped being walked" problem. prune_neighbors has existed
+        # since the neighbours table shipped but was never actually called
+        # from anywhere, so a device dropped from the walk schedule kept its
+        # present=1 rows forever and the table only ever grew.
+        self.nodes_db.prune_neighbors(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         cap = int(self.settings.get("max_nodes_db_mb", 0)) * 1024 * 1024
         if cap:
             removed = self.nodes_db.trim_to_size(cap)

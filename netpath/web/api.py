@@ -1336,14 +1336,30 @@ SEARCH_ROW_CAP = 2000
 EXPORT_ROW_CAP = 20000
 
 
-def _syslog_search_rows(service, params, cap: int) -> tuple[list[dict], bool, float, int, bool]:
+def _syslog_search_rows(service, params, cap: int, *,
+                        use_request_limit: bool = True
+                        ) -> tuple[list[dict], bool, float, int, bool]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
-    limit = int(_num(params, "limit", 300, int) or 300)
     filters = _syslog_filters(params)
 
     started = time.time()
-    effective = min(limit, cap)
+    # The screen's own request carries a `limit` (300 on-screen default,
+    # or whatever page size the UI asked for) that this bounds against
+    # `cap` — SEARCH_ROW_CAP for the screen. The export handler below asks
+    # for use_request_limit=False instead of threading its own `limit`
+    # through: the export buttons never send a limit param at all, so a
+    # request has no way to distinguish "the caller explicitly wants only
+    # 300 rows" from "the caller sent nothing and 300 is just the
+    # screen's on-screen default" — reading that default as a request
+    # here is what silently capped every export at 300 rows while the
+    # response's own cap field still said EXPORT_ROW_CAP. An export
+    # always wants every matching row up to the export ceiling, full stop.
+    if use_request_limit:
+        limit = int(_num(params, "limit", 300, int) or 300)
+        effective = min(limit, cap)
+    else:
+        effective = cap
     rows = service.syslog_db.search(t0, t1, filters, limit=effective + 1)
     # One row past the limit says whether anything was left out; `len(rows)
     # >= effective` reported a cut-off for a window with exactly `effective`
@@ -1402,7 +1418,7 @@ def get_syslog_search(service, params, body) -> dict:
 
 def get_syslog_search_export(service, params, body) -> dict:
     messages, truncated, _elapsed_ms, _effective, _fts = _syslog_search_rows(
-        service, params, EXPORT_ROW_CAP)
+        service, params, EXPORT_ROW_CAP, use_request_limit=False)
     header = ["id", "ts", "source", "source_name", "host", "app", "procid",
              "msgid", "severity_name", "facility_name", "message"]
     csv_rows = [[m.get(key) for key in header] for m in messages]
@@ -1493,14 +1509,23 @@ def get_snmp_overview(service, params, body) -> dict:
 
 # EXPORT_ROW_CAP is defined once, alongside SEARCH_ROW_CAP above (both
 # capped lists — syslog and SNMP traps — share it).
-def _snmp_trap_rows(service, params, cap: int) -> tuple[list[dict], bool, float]:
+def _snmp_trap_rows(service, params, cap: int, *,
+                    use_request_limit: bool = True
+                    ) -> tuple[list[dict], bool, float]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
-    limit = int(_num(params, "limit", 300, int) or 300)
     filters = _snmp_filters(params)
 
     started = time.time()
-    effective = min(limit, cap)
+    # Same use_request_limit reasoning as _syslog_search_rows above: the
+    # export path cannot tell an explicit small limit from the screen's
+    # own on-screen default arriving unasked, so export ignores the
+    # request's limit entirely and always asks for the full cap.
+    if use_request_limit:
+        limit = int(_num(params, "limit", 300, int) or 300)
+        effective = min(limit, cap)
+    else:
+        effective = cap
     rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1)
     # One row past the limit says whether anything was left out; `len(rows)
     # >= effective` reported a cut-off for a window with exactly `effective`
@@ -1557,7 +1582,8 @@ def get_snmp_traps(service, params, body) -> dict:
 
 
 def get_snmp_traps_export(service, params, body) -> dict:
-    traps, truncated, _elapsed_ms, _effective = _snmp_trap_rows(service, params, EXPORT_ROW_CAP)
+    traps, truncated, _elapsed_ms, _effective = _snmp_trap_rows(
+        service, params, EXPORT_ROW_CAP, use_request_limit=False)
     header = ["id", "ts", "source", "source_name", "version_name", "trap_name",
              "trap_oid", "trap_kind", "severity_name", "community",
              "agent_addr", "is_inform"]
@@ -4457,9 +4483,10 @@ def delete_alerts_window(service, params, body, window_id) -> dict:
 def post_alerts_window_end(service, params, body, window_id) -> dict:
     if not service.alerts_db.window(window_id):
         raise ValueError("No such maintenance window")
-    service.alerts_db.end_window_now(window_id)
+    changed = service.alerts_db.end_window_now(window_id)
     _audit(service, params, "alert.window_end", target=str(window_id))
-    return {"window": _window_json(service.alerts_db.window(window_id))}
+    return {"window": _window_json(service.alerts_db.window(window_id)),
+            "changed": changed}
 
 
 def post_alerts_ack_all(service, params, body) -> dict:

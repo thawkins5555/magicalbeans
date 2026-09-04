@@ -294,12 +294,79 @@ def real_socket_probe_and_rate_limit():
          f"({unpaced:.2f}s), confirming the 0.55s above was the pacing, not the probe")
 
 
+def selector_valueerror_falls_back():
+    """select.select() raises ValueError, not OSError, for any file
+    descriptor >= 1024 — a busy process (a 1,000-device fleet, many
+    workers/fds) hits this routinely. _ping_many_socket now waits through
+    selectors.DefaultSelector (epoll on Linux, no fd ceiling) specifically
+    to sidestep that, but the fallback in ping_once/ping_many has to
+    degrade cleanly to the subprocess path on a ValueError from that wait
+    too — not just an OSError — for whatever the selector backend still
+    throws unexpectedly. Needs a real ICMP socket to reach the wait loop
+    at all; skipped where none is available, same as
+    real_socket_probe_and_rate_limit above."""
+    reset_capability_cache()
+    kind = ipam_scan._icmp_socket_kind()
+    if kind is None:
+        print("SKIP  selector_valueerror_falls_back: no ICMP socket access on this "
+             "host (checked both SOCK_DGRAM and SOCK_RAW)")
+        return
+
+    class ExplodingSelector:
+        """Stands in for selectors.DefaultSelector: register() is a no-op,
+        select() raises ValueError the moment the wait loop calls it —
+        exactly the fd>=1024 failure mode select.select() has, reproduced
+        without actually needing 1,000+ open descriptors in this test."""
+
+        def register(self, *_args, **_kwargs):
+            pass
+
+        def select(self, *_args, **_kwargs):
+            raise ValueError("simulated: fd >= 1024")
+
+        def close(self):
+            pass
+
+    real_selector_cls = ipam_scan.selectors.DefaultSelector
+    real_run = subprocess.run
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        out = "64 bytes from 10.0.0.9: icmp_seq=1 ttl=64 time=1.00 ms\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    ipam_scan.selectors.DefaultSelector = ExplodingSelector
+    subprocess.run = fake_run
+    try:
+        result = ipam_scan.ping_once("127.0.0.1", timeout_ms=200)
+        check(result is True,
+             "ping_once falls back to the subprocess path (and reports its "
+             "result) when the wait loop raises ValueError, rather than "
+             "raising into the caller")
+        check(len(calls) == 1,
+             f"...and actually went through subprocess.run to get it: {calls}")
+
+        calls.clear()
+        sent, received, rtt = ipam_scan.ping_many("127.0.0.1", count=2, timeout_ms=200)
+        check((sent, received) == (2, 2),
+             f"ping_many also falls back cleanly on the same ValueError: "
+             f"sent={sent} received={received}")
+        check(len(calls) == 2,
+             f"...one subprocess per probe, as the fallback always does: {calls}")
+    finally:
+        ipam_scan.selectors.DefaultSelector = real_selector_cls
+        subprocess.run = real_run
+        reset_capability_cache()
+
+
 def main() -> int:
     checksum_and_framing()
     capability_detection_and_fallback()
     mode_override()
     subprocess_path_still_works()
     real_socket_probe_and_rate_limit()
+    selector_valueerror_falls_back()
 
     print()
     if FAILURES:

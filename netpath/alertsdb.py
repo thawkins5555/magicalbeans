@@ -372,6 +372,21 @@ def _window_occurrence_end(row, now: float) -> float:
 # already-sane number rather than each having to know the limit itself.
 NOTIFY_ROLLUP_DELAY_MAX_S = 3600
 
+# How far past notify_rollup_delay_s's own cutoff alerts_due_first_notify
+# still looks for a genuinely pending alert, beyond which a never-notified
+# alert is treated as history rather than something still owed a decision.
+# Exists for the upgrade case: turning notify_rollup_delay_s on (4.47's
+# default, 240s) for the first time makes EVERY alert this database has
+# ever held with last_notified_ts still NULL "due" by the plain opened_ts
+# <= cutoff test alone — months of long-resolved alerts nobody was ever
+# going to email about, all landing on the first sweep after the upgrade
+# as misleading "cleared within the roll-up window" rows, or (worse) all
+# in one digest. An hour of grace on top of the delay is generous room for
+# an engine outage that genuinely held a real alert's first notice — see
+# _sweep_notify_rollup's restart-safety — while still drawing a firm line
+# under "this is backlog, not a pending notification".
+FIRST_NOTIFY_BACKLOG_GRACE_S = 3600.0
+
 
 def _webhook_host_is_local(host: str) -> bool:
     """Whether `host` is loopback or an RFC1918 private address — the two
@@ -1310,7 +1325,15 @@ class AlertsDatabase:
         """Alerts whose FIRST notification is still undecided: nobody has
         ever attempted to email about them (last_notified_ts IS NULL), and
         they are old enough that notify_rollup_delay_s has elapsed
-        (opened_ts <= cutoff_ts).
+        (opened_ts <= cutoff_ts) — but not so old that "still undecided" has
+        stopped being plausible (opened_ts >= cutoff_ts -
+        FIRST_NOTIFY_BACKLOG_GRACE_S). `cutoff_ts` is always `now - delay`
+        (see _sweep_notify_rollup), so that floor reads as "opened within
+        roughly the last delay-plus-an-hour" — comfortably wide for any
+        real engine outage, and a hard line under an upgrade's entire
+        pre-existing backlog of alerts nobody was ever going to email about
+        (see FIRST_NOTIFY_BACKLOG_GRACE_S's own comment for why that upgrade
+        case is the one this floor exists for).
 
         Not filtered on state, unlike alerts_due_renotify: an alert that
         cleared or was absorbed into a rollup parent while its notice was
@@ -1324,11 +1347,13 @@ class AlertsDatabase:
         mid-hold picks the same alerts back up on the next tick rather than
         losing track of what it owed an email.
         """
+        floor_ts = cutoff_ts - FIRST_NOTIFY_BACKLOG_GRACE_S
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE last_notified_ts IS NULL"
-                " AND opened_ts <= ? ORDER BY severity, opened_ts",
-                (cutoff_ts,)).fetchall()
+                " AND opened_ts <= ? AND opened_ts >= ?"
+                " ORDER BY severity, opened_ts",
+                (cutoff_ts, floor_ts)).fetchall()
 
     def expired_alerts(self, now: float) -> list[sqlite3.Row]:
         """Alerts whose rule gives them a lifetime that has run out.
@@ -1569,6 +1594,20 @@ class AlertsDatabase:
                              f"{MAX_WINDOW_DAYS:g} days")
         if recurrence not in (None, "", "weekly"):
             raise ValueError("recurrence must be 'weekly' or absent")
+        if recurrence == "weekly" and end_ts - start_ts >= _WEEK_S:
+            # is_window_active's own modulo test is what makes this a real
+            # bug and not just a wasteful setting: (now - start_ts) % week
+            # is always < duration once duration >= a week, so a window
+            # this long recurring weekly is active at EVERY instant —
+            # permanently silencing its whole scope, forever, with no
+            # symptom beyond "why did nothing alert for three months".
+            # MAX_WINDOW_DAYS (14) only bounds a single occurrence's span,
+            # not this — a one-off window is still allowed the full 14
+            # days, since it has an actual end.
+            raise ValueError(
+                "A weekly recurring window's occurrence must be under 7 "
+                "days — a longer one would be active every instant of "
+                "every week, silencing its scope permanently")
         scope_kind, scope_group_id, scope_device_ids = self._validate_window_scope(
             scope_kind, scope_group_id, scope_device_ids)
         with self._lock:
@@ -1615,6 +1654,14 @@ class AlertsDatabase:
                              f"{MAX_WINDOW_DAYS:g} days")
         if recurrence not in (None, "", "weekly"):
             raise ValueError("recurrence must be 'weekly' or absent")
+        if recurrence == "weekly" and end_ts - start_ts >= _WEEK_S:
+            # Same reasoning as add_window's own check just above — an
+            # edit that turns an existing window weekly, or stretches an
+            # already-weekly one's span, must be caught here too.
+            raise ValueError(
+                "A weekly recurring window's occurrence must be under 7 "
+                "days — a longer one would be active every instant of "
+                "every week, silencing its scope permanently")
         with self._lock:
             self._conn.execute(
                 "UPDATE maintenance_windows SET name=?, scope_kind=?,"
@@ -1624,18 +1671,38 @@ class AlertsDatabase:
                  end_ts, recurrence or None, reason, window_id))
             self._conn.commit()
 
-    def end_window_now(self, window_id: int) -> None:
+    def end_window_now(self, window_id: int) -> bool:
         """"End now": stop covering anything from this moment, without
         deleting the window's own history (its name, scope and start remain
         on the record). A recurring window's recurrence is cleared in the
         same call — otherwise the next week's occurrence would start right
-        back up, which is not what an operator ending a window early means."""
+        back up, which is not what an operator ending a window early means.
+
+        The `end_ts > now` half of the WHERE clause is the "already ended,
+        nothing to do" guard for a ONE-OFF window — but a WEEKLY window's
+        stored end_ts is only ever the FIRST occurrence's end; every later
+        week's occurrence is judged by is_window_active's own
+        (now - start_ts) % week test against start_ts, never by that column.
+        Three weeks into a weekly window, end_ts sits three weeks in the
+        past while this week's occurrence is active RIGHT NOW — applying
+        the one-off guard to it made "End now" a silent no-op, and the
+        window kept firing every week after. So the guard only applies when
+        recurrence is NULL; a recurring window is always ended here, whatever
+        its stored end_ts says, by dropping it to now and clearing
+        recurrence — exactly the inert one-off [start_ts, now) shape
+        is_window_active already treats as over for good.
+
+        Returns whether a row was actually changed, so a caller does not
+        report success for what was really a no-op.
+        """
+        now = time.time()
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE maintenance_windows SET end_ts=?, recurrence=NULL"
-                " WHERE id=? AND end_ts > ?",
-                (time.time(), window_id, time.time()))
+                " WHERE id=? AND (recurrence IS NOT NULL OR end_ts > ?)",
+                (now, window_id, now))
             self._conn.commit()
+        return bool(cur.rowcount)
 
     def remove_window(self, window_id: int) -> bool:
         with self._lock:

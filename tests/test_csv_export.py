@@ -198,6 +198,32 @@ try:
           any(row[msg_col] == tricky_message for row in syslog_rows[1:]),
           [row[msg_col] for row in syslog_rows[1:]])
 
+    # The export buttons send only time/filter params, no `limit` — before
+    # the fix, the export handler fed the request's absent `limit` through
+    # its 300 on-screen default into min(300, EXPORT_ROW_CAP), so anything
+    # past the 300th matching row was silently dropped from every export
+    # while the response's own `cap` field kept claiming EXPORT_ROW_CAP.
+    print("syslog export past the 300-row screen default")
+    SYSLOG_N = 350
+    service.syslog_db.insert([
+        syslogparse.LogEntry(ts=time.time(), source="10.9.9.20",
+                             host="bulk-host", message=f"bulk row {i}")
+        for i in range(SYSLOG_N)])
+    status, bulk_syslog = call(
+        "GET", "/api/syslog/search/export.csv", {"q": "bulk row"}, token=admin)
+    check("syslog export answers 200 for the bulk filter", status == 200,
+          (status, bulk_syslog))
+    check(f"syslog export returns all {SYSLOG_N} matching rows, past the "
+          f"300-row screen default",
+          bulk_syslog.get("count") == SYSLOG_N, bulk_syslog.get("count"))
+    check("syslog export is not marked truncated (comfortably under its cap)",
+          bulk_syslog.get("truncated") is False, bulk_syslog)
+    check("syslog export cap is EXPORT_ROW_CAP (20000)",
+          bulk_syslog.get("cap") == 20000, bulk_syslog.get("cap"))
+    bulk_syslog_rows = parse_csv(bulk_syslog["csv"])
+    check("syslog export row count matches count + header",
+          len(bulk_syslog_rows) == SYSLOG_N + 1, len(bulk_syslog_rows))
+
     # ---------------------------------------------------- snmp traps
     print("snmp traps export")
     service.snmp_db.insert([trapdecode.Trap(
@@ -206,6 +232,28 @@ try:
     status, trap_export = call("GET", "/api/snmp/traps/export.csv", token=admin)
     check("snmp traps export answers 200 and sees the inserted trap",
           status == 200 and trap_export.get("count", 0) >= 1, (status, trap_export))
+
+    print("snmp traps export past the 300-row screen default")
+    TRAP_N = 350
+    service.snmp_db.insert([
+        trapdecode.Trap(ts=time.time(), source="10.9.9.21", version=1,
+                        community="bulktrap", trap_name="linkDown",
+                        trap_kind="linkDown", severity=4)
+        for _ in range(TRAP_N)])
+    status, bulk_traps = call(
+        "GET", "/api/snmp/traps/export.csv", {"community": "bulktrap"}, token=admin)
+    check("snmp traps export answers 200 for the bulk filter", status == 200,
+          (status, bulk_traps))
+    check(f"snmp traps export returns all {TRAP_N} matching rows, past the "
+          f"300-row screen default",
+          bulk_traps.get("count") == TRAP_N, bulk_traps.get("count"))
+    check("snmp traps export is not marked truncated (comfortably under its cap)",
+          bulk_traps.get("truncated") is False, bulk_traps)
+    check("snmp traps export cap is EXPORT_ROW_CAP (20000)",
+          bulk_traps.get("cap") == 20000, bulk_traps.get("cap"))
+    bulk_trap_rows = parse_csv(bulk_traps["csv"])
+    check("snmp traps export row count matches count + header",
+          len(bulk_trap_rows) == TRAP_N + 1, len(bulk_trap_rows))
 
     # --------------------------------------------------------- netflow
     print("netflow export")

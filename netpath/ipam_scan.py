@@ -23,7 +23,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-import select
+import selectors
 import shutil
 import socket
 import struct
@@ -295,6 +295,16 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
     sent = 0
     received = 0
     rtts: list[float] = []
+    # selectors.DefaultSelector rather than select.select() directly: on
+    # Linux it picks epoll, which has no ceiling on the file descriptor
+    # number, where select.select() raises ValueError (not OSError) for any
+    # fd >= 1024. A 1,000-device fleet with a poll worker per device and
+    # several sockets/handles apiece gets there easily, and that ValueError
+    # is not what either caller below is watching for — see ping_once's and
+    # ping_many's own except clauses, which now catch it precisely because
+    # of this.
+    selector = selectors.DefaultSelector()
+    selector.register(sock, selectors.EVENT_READ)
     try:
         for sequence in range(1, count + 1):
             token = os.urandom(8)
@@ -310,8 +320,7 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                readable, _w, _x = select.select([sock], [], [], remaining)
-                if not readable:
+                if not selector.select(remaining):
                     break
                 try:
                     packet, _addr = sock.recvfrom(1024)
@@ -331,6 +340,7 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
                 rtts.append((time.monotonic() - sent_at) * 1000)
                 break
     finally:
+        selector.close()
         sock.close()
     return sent, received, (sum(rtts) / len(rtts)) if rtts else None
 
@@ -342,7 +352,14 @@ def ping_once(ip: str, timeout_ms: int = 800) -> bool:
             try:
                 _sent, received, _rtt = _ping_many_socket(ip, 1, timeout_ms, kind)
                 return received > 0
-            except OSError:
+            except (OSError, ValueError):
+                # ValueError alongside OSError: selectors.DefaultSelector
+                # normally sidesteps select.select()'s fd>=1024 ceiling
+                # (see _ping_many_socket's own comment), but a poll worker
+                # is still handed whatever the platform's selector backend
+                # throws, and this path exists precisely so a probe
+                # degrades to the subprocess fallback rather than crashing
+                # the worker on anything unexpected from the socket path.
                 pass                    # socket path unavailable; fall through below
     try:
         completed = subprocess.run(
@@ -382,7 +399,8 @@ def ping_many(ip: str, count: int = 3,
         if kind is not None:
             try:
                 return _ping_many_socket(ip, count, timeout_ms, kind)
-            except OSError:
+            except (OSError, ValueError):
+                # See ping_once's matching except clause just above.
                 pass                    # socket path unavailable; fall through below
 
     from .tracer import _UNIX_PING_TIME, _WIN_PING_TIME

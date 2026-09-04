@@ -469,6 +469,129 @@ finally:
 close_all(nodes, alerts, snmp, syslog, ipam, engine)
 
 
+# ============================== 9b: over-cap release does not repeat forever
+print("\n9b — an over-the-cap release records one 'not sent' row, not one "
+      "per tick")
+
+nodes, alerts, snmp, syslog, ipam, engine, folder = build(
+    notify_rollup_delay_s=60, max_emails_per_hour=1)
+sent = FakeMail()
+alertmail.send = sent
+try:
+    engine._tick()
+    did = add_device(nodes, "10.20.9.1", "core-sw-j")
+    nodes.record_device_event(did, "down", "stopped responding")
+    engine._tick()
+    alert_id = open_rows(alerts, "device_down", did)[0]["id"]
+    backdate_opened(alerts, alert_id, 61)
+
+    # Simulate the hourly budget already spent by other traffic, so this
+    # alert's release lands squarely on _notify's over-cap early return —
+    # the one that used to leave last_notified_ts NULL.
+    engine._sent_this_hour = [time.time()]
+
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert sent.attempts == [], sent.attempts
+    notes = alerts.notifications_for(alert_id)
+    assert len(notes) == 1, [dict(n) for n in notes]
+    assert "over the 1/hour" in notes[0]["error"], dict(notes[0])
+    assert alerts.alert(alert_id)["last_notified_ts"] is not None, \
+        "the release must stamp the clock even when _notify's over-cap " \
+        "branch returns before ever touching it, or the sweep treats the " \
+        "alert as still due and re-decides it every tick forever"
+    ok("the over-cap release stamps last_notified_ts on the releasing tick")
+
+    for _ in range(4):
+        engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    notes = alerts.notifications_for(alert_id)
+    assert len(notes) == 1, [dict(n) for n in notes]
+    ok("...and later ticks do not write a fresh 'not sent' row every time")
+finally:
+    alertmail.send = real_send
+close_all(nodes, alerts, snmp, syslog, ipam, engine)
+
+
+# ============================== 9c: months-old backlog is not swept on upgrade
+print("\n9c — a pre-existing, months-old, never-notified backlog is not "
+      "swept as 'due' after an upgrade turns the roll-up hold on")
+
+nodes, alerts, snmp, syslog, ipam, engine, folder = build(notify_rollup_delay_s=240)
+sent = FakeMail()
+alertmail.send = sent
+try:
+    engine._tick()
+
+    # An "old install, upgrade to 4.47" alert: opened long before the hold
+    # ever existed, never notified (last_notified_ts NULL is exactly what a
+    # deployment that predates notify_rollup_delay_s left every alert in —
+    # nothing ever set it before this feature shipped). Still open.
+    old_open_dev = add_device(nodes, "10.20.10.1", "ancient-open-sw")
+    nodes.record_device_event(old_open_dev, "down", "stopped responding")
+    engine._tick()
+    old_open_id = open_rows(alerts, "device_down", old_open_dev)[0]["id"]
+    backdate_opened(alerts, old_open_id, 200 * 86400)   # ~200 days old
+    assert alerts.alert(old_open_id)["last_notified_ts"] is None
+
+    # Same shape, but already resolved by hand months ago — also never
+    # notified, also still sitting there with last_notified_ts NULL.
+    old_resolved_dev = add_device(nodes, "10.20.10.2", "ancient-resolved-sw")
+    nodes.record_device_event(old_resolved_dev, "down", "stopped responding")
+    engine._tick()
+    old_resolved_id = open_rows(alerts, "device_down", old_resolved_dev)[0]["id"]
+    backdate_opened(alerts, old_resolved_id, 200 * 86400)
+    alerts.resolve(old_resolved_id, by="operator")
+    assert alerts.alert(old_resolved_id)["last_notified_ts"] is None
+
+    # The sweep this represents is the very first one after the engine
+    # (re)starts with the hold on — nothing has ticked over these two rows
+    # since they were backdated.
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert sent.attempts == [], sent.attempts
+    ok("the sweep sends nothing for either backlog alert")
+
+    assert alerts.notifications_for(old_open_id) == [], \
+        alerts.notifications_for(old_open_id)
+    assert alerts.notifications_for(old_resolved_id) == [], \
+        alerts.notifications_for(old_resolved_id)
+    ok("...and writes no misleading 'not sent'/'cleared within the "
+       "roll-up window' rows onto either one")
+
+    assert alerts.alert(old_open_id)["last_notified_ts"] is None
+    assert alerts.alert(old_resolved_id)["last_notified_ts"] is None
+    ok("...both stay last_notified_ts NULL — history, not decided-and-skipped")
+
+    # Ticking several more times must not change any of that either — this
+    # is not "eventually swept", it is permanently out of scope.
+    for _ in range(3):
+        engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert sent.attempts == []
+    assert alerts.notifications_for(old_open_id) == []
+    assert alerts.notifications_for(old_resolved_id) == []
+    ok("...and stays that way on every later tick, not just the first")
+
+    # A genuinely fresh alert must still release normally once its own
+    # window elapses — the floor only excludes the ancient backlog, not
+    # real pending alerts.
+    fresh_dev = add_device(nodes, "10.20.10.3", "fresh-sw")
+    nodes.record_device_event(fresh_dev, "down", "stopped responding")
+    engine._tick()
+    fresh_id = open_rows(alerts, "device_down", fresh_dev)[0]["id"]
+    backdate_opened(alerts, fresh_id, 241)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert len(sent.attempts) == 1, sent.attempts
+    assert alerts.alert(fresh_id)["last_notified_ts"] is not None
+    ok("...while a genuinely fresh alert still releases once its own "
+       "window elapses")
+finally:
+    alertmail.send = real_send
+close_all(nodes, alerts, snmp, syslog, ipam, engine)
+
+
 # ==================================================== 9: settings round-trip
 print("\n9 — settings round-trip, defaults, and clamping")
 

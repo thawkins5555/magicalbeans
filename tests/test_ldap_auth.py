@@ -215,13 +215,18 @@ class FakeLdapServer:
     mocking simple_bind's internals.
     """
 
-    def __init__(self, respond):
+    def __init__(self, respond, host: str = "127.0.0.1"):
+        # `host` is either bound literally (an IPv6 test passes "::1") — the
+        # family follows from whether it parses as IPv6, same as any real
+        # ldap_url would decide it via getaddrinfo.
         self.respond = respond
+        self.host = host
         self.received: list[tuple[str, str]] = []
         self.connections = 0
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.sock = socket.socket(family, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
+        self.sock.bind((host, 0))
         self.port = self.sock.getsockname()[1]
         self.sock.listen(8)
         self.sock.settimeout(0.5)
@@ -230,7 +235,11 @@ class FakeLdapServer:
         self._thread.start()
 
     def url(self, tls: bool = False) -> str:
-        return f"{'ldaps' if tls else 'ldap'}://127.0.0.1:{self.port}"
+        # A literal IPv6 host needs its own [brackets] in the URL, same as
+        # any browser address bar — urlparse (and ldapclient._parse_url)
+        # requires them to tell the host apart from a port's own colon.
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{'ldaps' if tls else 'ldap'}://{host}:{self.port}"
 
     def _serve(self) -> None:
         while not self._stop.is_set():
@@ -317,6 +326,56 @@ except ldapclient.LDAPError as exc:
     check("invalidCredentials: raises LDAPInvalidCredentials, not something else",
           False, repr(exc))
 server.stop()
+
+# Deterministic even where this host has no real IPv6 stack at all (the
+# skippable end-to-end check just below needs one): simple_bind must go
+# through socket.create_connection rather than a hard-coded AF_INET
+# socket() + connect(), since create_connection is what resolves through
+# getaddrinfo and can reach an AAAA-only host or an IPv6 literal at all —
+# a bare AF_INET socket never could, whatever this test host supports.
+real_create_connection = socket.create_connection
+cc_calls = []
+
+
+def spy_create_connection(*args, **kwargs):
+    cc_calls.append((args, kwargs))
+    return real_create_connection(*args, **kwargs)
+
+
+socket.create_connection = spy_create_connection
+cc_server = FakeLdapServer(credentialed)
+try:
+    ldapclient.simple_bind(cc_server.url(), "uid=alice,ou=people,dc=example,dc=com",
+                           "correct-horse", allow_cleartext=True)
+    check("simple_bind connects through socket.create_connection, not a "
+          "hard-coded AF_INET socket", len(cc_calls) == 1, cc_calls)
+finally:
+    socket.create_connection = real_create_connection
+    cc_server.stop()
+
+print("IPv6: simple_bind reaches a directory on an IPv6 literal")
+try:
+    ipv6_server = FakeLdapServer(credentialed, host="::1")
+except OSError as exc:
+    # No IPv6 loopback on this host/container — every other check here
+    # still ran and still matters, so this one check skips rather than
+    # failing the whole suite.
+    ipv6_server = None
+    print(f"SKIP  IPv6 bind test: ::1 is not available here ({exc})")
+if ipv6_server is not None:
+    try:
+        ldapclient.simple_bind(ipv6_server.url(),
+                               "uid=alice,ou=people,dc=example,dc=com",
+                               "correct-horse", allow_cleartext=True)
+        ok = True
+    except ldapclient.LDAPError:
+        ok = False
+    check("simple_bind connects to an ldap_url on an IPv6 literal ([::1])", ok)
+    check("…and the fake server actually received the bind over that socket",
+          ipv6_server.received[-1] ==
+          ("uid=alice,ou=people,dc=example,dc=com", "correct-horse"),
+          ipv6_server.received[-1] if ipv6_server.received else None)
+    ipv6_server.stop()
 
 referral_server = FakeLdapServer(lambda dn, pw: _bind_response(
     1, 10, referral=b"ldap://elsewhere.example.com/dc=x"))

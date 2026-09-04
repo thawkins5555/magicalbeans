@@ -59,10 +59,10 @@ NOTIFY_ROLLUP_DELAY_MAX_S = 3600.0
 # More than this many alerts sendable in one roll-up flush go out as a
 # single digest instead of one email each — see _sweep_notify_rollup and
 # _send_digest. Three is small enough that an operator with one or two
-# outages still gets the familiar per-alert subject line and template, and
-# small enough that the 250-device review's "5 real alerts" case never
-# becomes a digest either — the digest exists for the 377-alert case, not
-# for an ordinary Tuesday.
+# outages still gets the familiar per-alert subject line and template; the
+# 250-device review's "5 real alerts" case is already over the threshold
+# and digests, which is the right call too — the digest exists for the
+# 377-alert case as much as the ordinary Tuesday with a small handful.
 DIGEST_THRESHOLD = 3
 
 # _rollup_parent's third answer, beside "this open alert already says it" and
@@ -2647,6 +2647,25 @@ class AlertEngine:
         else:
             for alert_row, rule_row, occurrence in sendable:
                 self._notify(alert_row, rule_row, occurrence, settings)
+                # _notify only stamps last_notified_ts itself on its own
+                # send-submitted path (the "attempt clock" comment on that
+                # line) — every one of its OTHER returns (webhook delivered
+                # but email is off or unconfigured, no template, no
+                # recipients, or over max_emails_per_hour) leaves the row
+                # NULL. Those are not "nothing happened" here: this alert
+                # was DUE and this loop just released it, webhook included
+                # (webhook fired unconditionally inside _notify above,
+                # exactly once), so the attempt clock must tick regardless
+                # of which of those branches _notify took, or
+                # alerts_due_first_notify keeps handing the same alert back
+                # every tick forever — a webhook re-sent every 5s on a
+                # webhook-only install, or a fresh "not sent: over the
+                # limit" row on every tick of an over-cap one. Mirrors the
+                # guard-by-guard stamps _send_digest makes for the same
+                # reason on the >DIGEST_THRESHOLD branch above; harmless to
+                # call again here when _notify's own send-path already
+                # stamped it a moment earlier.
+                self.db.mark_notified(alert_row["id"])
 
     def _send_digest(self, sendable, settings, delay_s: float) -> None:
         """One email for every alert in `sendable`, counted once against

@@ -76,6 +76,45 @@ try:
 except ValueError:
     check("an unsupported recurrence value is refused", True)
 
+# A weekly window whose own occurrence spans >= 7 days satisfies
+# is_window_active's (now - start_ts) % week < duration test at every
+# instant — permanently active, silencing its whole scope forever. The
+# 14-day MAX_WINDOW_DAYS cap alone does not catch this (8 days is well
+# under it), so add_window/update_window need their own, tighter check
+# for the weekly case specifically.
+try:
+    db.add_window("Permanent weekly", "devices", now, now + 8 * 86400,
+                  scope_device_ids=[1], recurrence="weekly")
+    check("an 8-day weekly window is refused", False)
+except ValueError as exc:
+    check("an 8-day weekly window is refused", True)
+    check("...with a message explaining why",
+          "7 days" in str(exc) or "permanently" in str(exc), str(exc))
+
+# The same 8-day span is fine as a one-off — the 14-day cap is the only
+# limit that shape has, unchanged.
+one_off_8day = db.add_window("8-day one-off", "devices", now, now + 8 * 86400,
+                             scope_device_ids=[1])
+check("an 8-day one-off window is still accepted",
+      db.window(one_off_8day) is not None)
+
+# A 6-day weekly window is under the 7-day boundary and must still work —
+# this is the ordinary "closed for maintenance every weekend" case.
+six_day_weekly = db.add_window("6-day weekly", "devices", now, now + 6 * 86400,
+                               scope_device_ids=[1], recurrence="weekly")
+check("a 6-day weekly window is accepted",
+      db.window(six_day_weekly) is not None)
+
+# update_window must catch the same shape — editing an existing window
+# into a permanent one is exactly as bad as creating it that way.
+editable = db.add_window("Editable", "devices", now, now + 3 * 86400,
+                         scope_device_ids=[1], recurrence="weekly")
+try:
+    db.update_window(editable, end_ts=now + 8 * 86400)
+    check("update_window refuses stretching a weekly window to 8 days", False)
+except ValueError:
+    check("update_window refuses stretching a weekly window to 8 days", True)
+
 # ---------------------------------------------------- scope resolution
 
 group_window = db.add_window("Group scope", "group", now - 5, now + 60,
@@ -95,14 +134,62 @@ row = db.window(group_window)
 check("update_window changes what it is given", row["name"] == "Group scope, renamed")
 check("...and leaves the rest (scope_kind) alone", row["scope_kind"] == "group")
 
-db.end_window_now(group_window)
+changed = db.end_window_now(group_window)
 row = db.window(group_window)
 check("end_window_now stops it covering anything as of now",
       not is_window_active(row, time.time()))
+check("...and reports that it actually changed something", changed)
 
 check("remove_window actually removes it", db.remove_window(group_window))
 check("...and a second delete reports nothing removed",
       not db.remove_window(group_window))
+
+# A weekly window past its first occurrence — is_window_active is what
+# actually decides "active", and it never looks at the stored end_ts once
+# recurrence is set, only at (now - start_ts) % week. end_window_now's own
+# guard has to agree, or "End now" silently does nothing for exactly this
+# shape: the stored end_ts is three weeks stale while this week's
+# occurrence is active right now.
+recurring = db.add_window("Weekly, three weeks in", "devices",
+                          now - 3 * week - 10, now - 3 * week + 60,
+                          scope_device_ids=[3], recurrence="weekly")
+row = db.window(recurring)
+check("setup: this weekly window is active right now, mid-occurrence",
+      is_window_active(row, now))
+
+changed = db.end_window_now(recurring)
+check("end_window_now reports it changed a weekly window past its first "
+      "occurrence", changed)
+row = db.window(recurring)
+# Checked against a fresh timestamp, not the stale `now` captured above —
+# end_window_now sets end_ts to the moment IT ran, a little later than
+# that, so "active" is still the honest answer for the instant just before
+# the call. What must be false is "active right now, after ending it".
+just_ended = time.time()
+check("...it stops being active immediately", not is_window_active(row, just_ended))
+check("...recurrence is cleared so it cannot start back up", row["recurrence"] is None)
+check("...and stays inactive next week too (permanently ended, not paused)",
+      not is_window_active(row, just_ended + week))
+
+# A one-off window ended early — the ordinary case end_window_now has
+# always handled, still working the same way.
+future_one_off = db.add_window("Future one-off", "devices", now + 100, now + 200,
+                               scope_device_ids=[4])
+changed = db.end_window_now(future_one_off)
+check("ending a future one-off window reports it changed", changed)
+row = db.window(future_one_off)
+check("...and it is inactive even during its old planned span",
+      not is_window_active(row, now + 150))
+
+# An already-ended one-off window: end_window_now must stay a genuine
+# no-op, not silently rewrite an already-closed record's end_ts to now.
+past_one_off = db.add_window("Already ended", "devices", now - 200, now - 100,
+                             scope_device_ids=[5])
+old_end_ts = db.window(past_one_off)["end_ts"]
+changed = db.end_window_now(past_one_off)
+check("ending an already-ended one-off window reports no change", not changed)
+check("...and its end_ts is left untouched",
+      db.window(past_one_off)["end_ts"] == old_end_ts)
 
 # ---------------------------------------------------------- webhook URL
 

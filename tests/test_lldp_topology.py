@@ -2,6 +2,8 @@
 CDP as a fallback/supplement on Cisco, present-flag ageing (mirroring
 mac_entries), the best-effort device-match join, and lldp_interval_s
 scheduling/inheritance (0 = off, mirroring mac_table_interval_s)."""
+import os
+import sqlite3
 import time
 
 from _paths import spawn_stub, tmpdir
@@ -11,6 +13,7 @@ TMP = tmpdir("lldp_topology_")
 import netpath.nodepoll as nodepoll_mod
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
+from netpath.web import Service
 
 FAILS = []
 
@@ -214,6 +217,55 @@ check("the shipped default is 3600s, mirroring mac_table_interval_s",
       config_default.get("lldp_interval_s") == 3600, config_default)
 db2.close()
 db.close()
+
+# ---------------------------- 8. prune_neighbors is wired into maintenance
+# prune_neighbors has existed since the neighbours table shipped (the
+# schema comment has promised it all along — "the same shape
+# prune_mac_entries already has") but was never actually called from
+# anywhere: a device dropped from the walk schedule kept its neighbour
+# rows, present=1 forever, and the table only ever grew. This drives a
+# real Service.run_maintenance(force=True), the same maintenance sweep
+# that prunes mac_entries, rather than calling nodes_db.prune_neighbors
+# directly — that already passes (see section 5 above) and would not have
+# caught a missing wire-up.
+DB_NAMES = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps", "nodes",
+           "alerts", "wireless", "configrx")
+svc_dir = os.path.join(TMP, "maintenance_svc")
+os.makedirs(svc_dir, exist_ok=True)
+service = Service(*[os.path.join(svc_dir, name + ".db") for name in DB_NAMES])
+try:
+    gid = service.nodes_db.ensure_default_group()
+    stale_dev = service.nodes_db.add_device("10.0.0.80", name="stale-sw", group_id=gid)
+    fresh_dev = service.nodes_db.add_device("10.0.0.81", name="fresh-sw", group_id=gid)
+    service.nodes_db.replace_neighbors(stale_dev, [
+        {"if_index": 1, "protocol": "lldp", "rem_index": "0.1.1",
+         "chassis_id": "aa:bb:cc:00:00:01", "chassis_id_subtype": 4,
+         "sys_name": "old-neighbour", "port_id": "Gi0/1"},
+    ])
+    service.nodes_db.replace_neighbors(fresh_dev, [
+        {"if_index": 1, "protocol": "lldp", "rem_index": "0.2.1",
+         "chassis_id": "aa:bb:cc:00:00:02", "chassis_id_subtype": 4,
+         "sys_name": "current-neighbour", "port_id": "Gi0/2"},
+    ])
+    retention_days = float(service.nodes_settings.get("mac_table_retention_days", 7))
+    # Back-date the stale device's row well past the retention window —
+    # what "this device stopped being walked" looks like on disk, mirroring
+    # test_mac_tables.py's own way of aging a row for prune_mac_entries.
+    conn = sqlite3.connect(service.nodes_db.path)
+    conn.execute("UPDATE neighbors SET seen_ts = ? WHERE device_id = ?",
+                (time.time() - (retention_days + 1) * 86400, stale_dev))
+    conn.commit()
+    conn.close()
+
+    service.run_maintenance(force=True)
+
+    remaining = {r["device_id"] for r in service.nodes_db.all_neighbours()}
+    check("run_maintenance prunes a stale device's neighbour rows",
+          stale_dev not in remaining, remaining)
+    check("...and leaves a freshly-seen device's neighbour rows alone",
+          fresh_dev in remaining, remaining)
+finally:
+    service.shutdown()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

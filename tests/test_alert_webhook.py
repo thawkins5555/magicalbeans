@@ -319,6 +319,55 @@ finally:
     target.stop()
 
 
+# ======================================================================= C7
+print("\nC7 — a webhook-only release through the roll-up sweep fires exactly "
+      "once, not once per tick")
+
+receiver = Receiver()
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    receiver.url, notify_rollup_delay_s=240)
+try:
+    engine._webhook.start()
+    dev = add_device(nodes, "10.8.5.1", "sw7")
+    engine._tick()
+    go_down(nodes, dev)
+    engine._tick()
+    alert_id = alerts.alerts(state="unresolved")[0]["id"]
+    check("nothing delivered yet — still inside the roll-up hold",
+          not receiver.received, len(receiver.received))
+    check("last_notified_ts is still NULL while held",
+          alerts.alert(alert_id)["last_notified_ts"] is None,
+          alerts.alert(alert_id)["last_notified_ts"])
+
+    import sqlite3
+    conn = sqlite3.connect(alerts.path)
+    conn.execute("UPDATE alerts SET opened_ts = opened_ts - 241 WHERE id = ?",
+                 (alert_id,))
+    conn.commit()
+    conn.close()
+
+    engine._tick()
+    assert engine._webhook.wait_idle(10.0)
+    check("exactly one delivery on release",
+          len(receiver.received) == 1, len(receiver.received))
+    check("the release stamps last_notified_ts (email is off, so _notify's "
+          "own success path never runs — the sweep itself must stamp it)",
+          alerts.alert(alert_id)["last_notified_ts"] is not None,
+          alerts.alert(alert_id)["last_notified_ts"])
+
+    # Before the fix, an alert released through the <=DIGEST_THRESHOLD
+    # per-alert path with email disabled stayed "due" forever — the same
+    # webhook fired again on every subsequent tick.
+    for _ in range(4):
+        engine._tick()
+    assert engine._webhook.wait_idle(10.0)
+    check("no repeat deliveries on later ticks",
+          len(receiver.received) == 1, len(receiver.received))
+finally:
+    engine._webhook.stop()
+    receiver.stop()
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)
