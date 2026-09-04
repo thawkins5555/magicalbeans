@@ -98,6 +98,23 @@ TEXT_ON = [
     ("--dim", "--bg", 4.5), ("--dim", "--panel", 4.5), ("--dim", "--raised", 4.5),
     ("--ok", "--bg", 4.5), ("--warn", "--bg", 4.5), ("--fail", "--bg", 4.5),
     ("--accent", "--bg", 4.5), ("--fail", "--raised", 4.5),
+    # A semantic tone used to be checked against --bg only, and --fail was the
+    # single one also checked against --raised. But --raised is every alternate
+    # row of every table, which is where these tones actually live: "unchanged"
+    # and "oper up" in --ok, the warning severity word in --warn. Both sat under
+    # AA in the light theme (4.31 and 4.21) with this list reporting green.
+    ("--ok", "--raised", 4.5), ("--warn", "--raised", 4.5),
+    ("--accent", "--raised", 4.5), ("--blocked", "--raised", 4.5),
+    ("--overrun", "--raised", 4.5), ("--error", "--raised", 4.5),
+    ("--ok", "--panel", 4.5), ("--warn", "--panel", 4.5), ("--fail", "--panel", 4.5),
+    # ...and on the row the operator has actually opened.
+    ("--ok", "--selected", 4.5), ("--warn", "--selected", 4.5),
+    ("--fail", "--selected", 4.5), ("--accent", "--selected", 4.5),
+    ("--dim", "--selected", 4.5),
+    # --checked-strong carries text too. Only the two tones that are allowed to
+    # be drawn on it are held here; tokens.css records why the rest are not.
+    ("--text", "--checked", 4.5), ("--muted", "--checked", 4.5),
+    ("--text", "--checked-strong", 4.5),
     # dark text on the three badge fills
     ("--bg", "--fail", 4.5), ("--bg", "--warn", 4.5), ("--bg", "--accent", 4.5),
     ("--focus", "--bg", 4.5),
