@@ -41,6 +41,26 @@ def connect(path: str, **kwargs) -> sqlite3.Connection:
     """
     kwargs.setdefault("check_same_thread", False)
     conn = sqlite3.connect(path, **kwargs)
+    # Every database in the app is exactly one connection behind exactly one
+    # lock, shared by every worker thread (check_same_thread above) — so the
+    # only thing standing between "a second writer waits" and "a second
+    # writer gets SQLITE_BUSY right now" is this pragma, and nothing set it
+    # before this. 5000 ms comfortably covers one write transaction held
+    # under that lock, the case this exists for. Set here rather than by
+    # each caller so it is not a thing eleven modules can each forget one
+    # of; harmless on an in-memory connection, where nothing ever contends
+    # for it. cache_size (pages; negative = KiB, so -20000 is 20 MiB) and
+    # mmap_size are set alongside it for the same reason: unset, like
+    # busy_timeout was, so every database pays SQLite's small stock
+    # defaults (a 2 MiB cache, no mmap) regardless of how large the file
+    # actually is. mmap_size is a ceiling the OS is allowed to use, not an
+    # allocation, so it costs nothing on a database smaller than it.
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA cache_size=-20000")
+        conn.execute("PRAGMA mmap_size=268435456")
+    except sqlite3.DatabaseError:
+        pass
     if path and path != ":memory:" and not path.startswith("file:"):
         _tighten(path)
         try:

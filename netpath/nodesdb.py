@@ -159,8 +159,9 @@ CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);
 -- every switch between here and the host, so a search has to be able to
 -- see them all at once.
 --
--- Filled on its own schedule (mac_table_interval_s, 0 = off, off by
--- default), never on the poll cycle: a forwarding table is a walk of
+-- Filled on its own schedule (mac_table_interval_s, 0 = off; shipped
+-- default 3600s, see effective_config), never on the poll cycle: a
+-- forwarding table is a walk of
 -- hundreds to thousands of rows per switch and belongs nowhere near a
 -- 60-second poll. `mac` is stored normalised — lowercase hex, no
 -- separators — so one stored form answers ':', '-', '.' and bare-hex
@@ -386,9 +387,15 @@ DEFAULTS = {
     "sample_row_cap_per_metric": 5_000,
     "event_retention_days": 180,
     "discovery_retention_days": 30,
-    "max_mib_bytes": 1024 * 1024,  # a real MIB module is tens of KB; the
-    # cap exists so one upload cannot occupy a parser thread, and it also
-    # bounds the bundle path, which multiplies it by the member count.
+    "max_mib_bytes": 8 * 1024 * 1024,  # most uploaded MIB modules are tens
+    # of KB, but a real vendor file can run to a few MB — the catalog's own
+    # apc-ups (PowerNet-MIB, ~2.7 MiB) and cisco-core
+    # (CISCO-ENTITY-VENDORTYPE-OID-MIB, ~1.4 MiB) both need headroom above
+    # 1 MiB, the old cap, which refused them outright: a catalog entry the
+    # app ships has to be installable by its own installer. 8 MiB clears
+    # every shipped entry with room to grow. The cap still exists so one
+    # upload cannot occupy a parser thread, and it also bounds the bundle
+    # path, which multiplies it by the member count.
     # Installing a MIB bundle from the catalog. The per-file cap is
     # max_mib_bytes above; these bound the rest of the operation so a bad
     # upstream cannot fill the disk or hang a worker thread indefinitely.
@@ -1399,11 +1406,20 @@ class NodesDatabase:
         if config.get("unreachable_ping_only") is None:
             config["unreachable_ping_only"] = \
                 1 if settings.get("unreachable_ping_only", True) else 0
-        # 0, not a global setting, is the fallback: learning forwarding
-        # tables is opt-in per profile, so an upgrade adds no SNMP load
-        # anywhere until somebody asks for it.
+        # 3600 (one hour), not a global setting, is the fallback: fleet-wide
+        # MAC-to-port search is the product's best feature, and shipping it
+        # invisible (the old 0 = off default) means most installs never see
+        # it. An hour keeps the walk far from the poll cycle's cost profile
+        # (thousands of rows per switch, see the mac_entries comment above)
+        # while still filling the table on the first day. A group or device
+        # that explicitly stores 0 to opt back out keeps that choice on
+        # every upgrade — this fallback only fires for NULL ("inherit"),
+        # so an existing install with no explicit override picks up the new
+        # default the same as a fresh one; there is no separate migration
+        # path, deliberately, since 0 was never distinguishable from "never
+        # configured" for any row that did not set it on purpose.
         if config.get("mac_table_interval_s") is None:
-            config["mac_table_interval_s"] = 0
+            config["mac_table_interval_s"] = 3600
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",

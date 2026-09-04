@@ -421,12 +421,32 @@ class SyslogDatabase:
         """Turn a plain phrase into an FTS expression, quoting each term.
 
         Users type `error 10.1.2.3`, not FTS syntax; quoting keeps punctuation
-        in addresses from being read as operators. Each term is a substring to
-        be found anywhere, and several terms must all appear, in any order and
-        any field.
+        in addresses from being read as operators (and keeps NEAR, AND and
+        stray quotes out of the query language entirely -- everything typed
+        is data). Each term is a substring to be found anywhere, and several
+        terms must all appear, in any order and any field.
+
+        The one exception is the app's universal wildcard convention: a `*`
+        at the very end of a term survives quoting as an FTS5 prefix operator
+        (`"interfac"*` matches any word starting with those letters), which is
+        what every other search box in the app means by a trailing `*`.
+        Quoting it like every other character, as before, made it a literal
+        asterisk to match against -- one the tokenizer never produces -- so a
+        prefix search silently returned zero rows. A `*` anywhere else in a
+        term (leading, embedded, or a lone `*`) has no meaning in that
+        convention and is dropped rather than quoted literally, for the same
+        reason: a quoted literal `*` can never match real content, so keeping
+        it would just be a second way to silently return nothing.
         """
         terms = [term for term in str(text).split() if term]
-        return " AND ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+        parts = []
+        for term in terms:
+            prefix = term.endswith("*") and len(term) > 1
+            core = (term[:-1] if prefix else term).replace("*", "")
+            core = core.replace(chr(34), "")
+            quoted = f'"{core}"'
+            parts.append(quoted + "*" if prefix and core else quoted)
+        return " AND ".join(parts)
 
     # The columns a free-text search looks in when it has to scan. `source` is
     # here so that typing a sending address into the search box finds it.

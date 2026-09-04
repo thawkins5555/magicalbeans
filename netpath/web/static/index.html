@@ -40,7 +40,11 @@
   <button class="tab" data-tab="snmp">SNMP TRAP</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="ipam">IPAM</button>
-  <button class="tab" data-tab="wireless">WIRELESS</button>
+  <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
+       FORTINET-FORTIGATE-MIB); the tab used to just say WIRELESS, which
+       reads as "every wireless estate" and only corrects itself once an
+       Aruba or Ubiquiti shop opens the page and finds nothing there. -->
+  <button class="tab" data-tab="wireless">WIRELESS (FORTIGATE)</button>
   <button class="tab" data-tab="configrx">CONFIGRX</button>
   <button class="tab" data-tab="debug">DEBUG</button>
   <button class="tab" data-tab="settings">SETTINGS</button>
