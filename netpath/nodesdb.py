@@ -190,6 +190,56 @@ CREATE INDEX IF NOT EXISTS ix_mac_entries_seen ON mac_entries(seen_ts);
 -- NOT here: this script runs before the migration, and on a database from
 -- before 4.34 the `present` column does not exist yet when it runs.
 
+-- LLDP/CDP neighbour table: what is plugged into what. Its own walk
+-- schedule (lldp_interval_s, 0 = off; shipped default 3600s, mirroring
+-- mac_table_interval_s exactly — see _merge_config), never the poll cycle,
+-- for the same reason the MAC table isn't: this is hundreds of rows on a
+-- core switch, not a handful of scalars.
+--
+-- `protocol` is 'lldp' or 'cdp' and is part of the primary key rather than
+-- one row per port: a Cisco box that answers both is not a conflict to
+-- resolve, it is two independent views of the same cable and both are kept
+-- (nodepoll._run_lldp_table merges them). `rem_index` is the remote row's
+-- own index suffix from whichever table produced it (LLDP's
+-- lldpRemIndex, CDP's cdpCacheDeviceIndex) — stable across polls for the
+-- same neighbour on the same protocol, which is what makes an UPSERT here
+-- mean the same thing replace_mac_entries' does.
+--
+-- present/seen_ts/first_seen_ts are exactly mac_entries' ageing scheme: a
+-- neighbour a walk no longer sees is marked present=0 and keeps its last
+-- seen_ts rather than vanishing outright, so a link that flaps between
+-- lldp_interval_s cycles reads as "last seen 20 minutes ago", not as a
+-- topology change that never happened. prune_neighbors is what eventually
+-- drops a row nothing has confirmed in a long time, the same shape
+-- prune_mac_entries already has.
+CREATE TABLE IF NOT EXISTS neighbors (
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    if_index        INTEGER NOT NULL,
+    protocol        TEXT NOT NULL,               -- 'lldp' | 'cdp'
+    rem_index       TEXT NOT NULL,
+    chassis_id      TEXT NOT NULL DEFAULT '',
+    chassis_id_subtype INTEGER,
+    port_id         TEXT NOT NULL DEFAULT '',
+    port_id_subtype INTEGER,
+    port_descr      TEXT NOT NULL DEFAULT '',
+    sys_name        TEXT NOT NULL DEFAULT '',
+    sys_descr       TEXT NOT NULL DEFAULT '',
+    platform        TEXT NOT NULL DEFAULT '',    -- CDP cdpCachePlatform; '' for LLDP
+    remote_address  TEXT NOT NULL DEFAULT '',    -- CDP cdpCacheAddress; '' for LLDP
+    seen_ts         REAL NOT NULL,
+    first_seen_ts   REAL,
+    present         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, if_index, protocol, rem_index)
+);
+CREATE INDEX IF NOT EXISTS ix_neighbors_device ON neighbors(device_id);
+-- The best-effort join to a known device: exact case-insensitive sysName
+-- match, or a chassis id that is a MAC address matching a known interface's
+-- phys_addr — both done at read time (see neighbours_of/all_neighbours),
+-- so an index on the columns those joins filter by is worth having on any
+-- fleet-wide topology read.
+CREATE INDEX IF NOT EXISTS ix_neighbors_sys_name ON neighbors(sys_name);
+CREATE INDEX IF NOT EXISTS ix_neighbors_chassis_id ON neighbors(chassis_id);
+
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -470,14 +520,16 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
                      "unreachable_ping_only", "vendor_oid", "location_oid",
-                     "mac_table_interval_s")
+                     "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
+                     "stp_enabled")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
-                   "mac_table_interval_s")
+                   "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
+                   "stp_enabled")
 
 # vendor_override is deliberately NOT an _OVERRIDE_COLUMNS entry: a vendor is a
 # fact about one box, not something a polling profile should hand down.
@@ -762,6 +814,64 @@ class NodesDatabase:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_upstream"
             " ON devices(upstream_id)")
+
+        # LLDP/CDP neighbour walk (Tier 1 #5): its own opt-out interval,
+        # inheritable device-over-group exactly like mac_table_interval_s —
+        # NULL keeps meaning "inherit", see _merge_config.
+        devices = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(devices)").fetchall()}
+        if "lldp_interval_s" not in devices:
+            self._conn.execute("ALTER TABLE devices ADD COLUMN lldp_interval_s INTEGER")
+        # PoE and STP (Tier 1 #7) ride the regular poll cycle rather than a
+        # walk of their own, so what they need per device/group is only an
+        # on/off switch, not an interval; NULL means "inherit" like every
+        # other override column. Defaulted on in _merge_config, because the
+        # capability probe below already makes the walk free on a device
+        # that does not answer the table.
+        for column in ("poe_enabled", "stp_enabled"):
+            if column not in devices:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
+        # The capability probe's memory: NULL = not yet probed (probe this
+        # poll), 0/1 = probed once and remembered, so a device without the
+        # table pays for the walk exactly once rather than on every poll.
+        # Never inherited — whether a *specific box* answers PoE or STP is a
+        # fact about that box, not something a profile should hand down, so
+        # these are deliberately absent from _OVERRIDE_COLUMNS.
+        for column in ("poe_capable", "stp_capable"):
+            if column not in devices:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
+        # Bridge-wide STP state (BRIDGE-MIB dot1dStp), refreshed every poll
+        # once stp_capable is known true. Descriptive device state, the same
+        # shape sys_name/vendor already are, not a time series — the one
+        # STP number worth charting, the topology-change counter, goes
+        # through the ordinary metrics/samples path instead (see
+        # nodepoll._run_stp), which is what gives the future alerting/UI
+        # wave a rate-of-change rule for free.
+        for column, kind in (("stp_protocol_spec", "TEXT"), ("stp_priority", "INTEGER"),
+                             ("stp_root_id", "TEXT"), ("stp_root_cost", "INTEGER"),
+                             ("stp_root_port", "INTEGER"),
+                             ("stp_time_since_change_s", "REAL")):
+            if column not in devices:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} {kind}")
+
+        groups = {row["name"] for row in
+                  self._conn.execute("PRAGMA table_info(groups)").fetchall()}
+        for column in ("lldp_interval_s", "poe_enabled", "stp_enabled"):
+            if column not in groups:
+                self._conn.execute(f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
+
+        # Per-port PoE and STP state, alongside the admin/oper status pair
+        # interfaces already carries — a PoE port's power draw and an STP
+        # port's forwarding state are exactly the same kind of fact as
+        # oper_status, refreshed by the same replace_interfaces()-adjacent
+        # poll cycle rather than deserving their own table.
+        interfaces = {row["name"] for row in
+                      self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
+        for column in ("poe_admin", "poe_detect_status", "stp_state"):
+            if column not in interfaces:
+                self._conn.execute(f"ALTER TABLE interfaces ADD COLUMN {column} TEXT")
+        if "poe_power_mw" not in interfaces:
+            self._conn.execute("ALTER TABLE interfaces ADD COLUMN poe_power_mw INTEGER")
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -1420,6 +1530,21 @@ class NodesDatabase:
         # configured" for any row that did not set it on purpose.
         if config.get("mac_table_interval_s") is None:
             config["mac_table_interval_s"] = 3600
+        # LLDP/CDP: same fallback, same reasoning, as mac_table_interval_s
+        # immediately above — an hour keeps the walk far from the poll
+        # cycle's cost profile while still filling the topology table on the
+        # first day, and a device or group that stores 0 on purpose keeps
+        # that choice on every upgrade.
+        if config.get("lldp_interval_s") is None:
+            config["lldp_interval_s"] = 3600
+        # PoE and STP ride the poll cycle rather than a walk of their own
+        # (see the devices.poe_capable/stp_capable migration comment), so
+        # there is no cost to default them on — a device that does not
+        # answer either table is probed once and never asked again.
+        if config.get("poe_enabled") is None:
+            config["poe_enabled"] = 1
+        if config.get("stp_enabled") is None:
+            config["stp_enabled"] = 1
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
@@ -1700,6 +1825,201 @@ class NodesDatabase:
                                      (time.time() - older_than_s,))
             self._conn.commit()
         return cur.rowcount or 0
+
+    # ------------------------------------------------------ LLDP/CDP neighbours
+
+    def replace_neighbors(self, device_id: int, entries: list[dict],
+                          now: float | None = None) -> int:
+        """Merge one LLDP/CDP walk's rows into the device's neighbour
+        history — replace_mac_entries' own present-flag ageing, applied to
+        `neighbors` instead of `mac_entries`: every row already stored for
+        this device is marked present=0 first, then each of this walk's
+        rows is upserted with present=1 and a fresh seen_ts. A neighbour
+        that has dropped off the wire since the last walk (a cable pulled,
+        a device rebooted mid-cycle) keeps its row and its last seen_ts
+        rather than vanishing outright — see the CREATE TABLE comment.
+
+        `entries` is a list of dicts: if_index, protocol ('lldp'|'cdp'),
+        rem_index, and whichever of chassis_id/chassis_id_subtype/port_id/
+        port_id_subtype/port_descr/sys_name/sys_descr/platform/
+        remote_address the protocol produced (missing keys default to ''/
+        None the same way replace_mac_entries defaults a missing vlan).
+        `entries` being empty is a genuine "this walk heard nothing" and
+        marks every row for this device absent; a failed walk must never
+        reach here at all, the same contract read_device_mac_table's
+        None-vs-empty-list return already established."""
+        now = now if now is not None else time.time()
+        rows = []
+        for entry in entries:
+            try:
+                if_index = int(entry["if_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            protocol = str(entry.get("protocol") or "").strip().lower()
+            rem_index = str(entry.get("rem_index") or "").strip()
+            if protocol not in ("lldp", "cdp") or not rem_index:
+                continue
+            rows.append((
+                device_id, if_index, protocol, rem_index,
+                str(entry.get("chassis_id") or ""), entry.get("chassis_id_subtype"),
+                str(entry.get("port_id") or ""), entry.get("port_id_subtype"),
+                str(entry.get("port_descr") or ""), str(entry.get("sys_name") or ""),
+                str(entry.get("sys_descr") or ""), str(entry.get("platform") or ""),
+                str(entry.get("remote_address") or ""), now, now))
+        with self._lock:
+            self._conn.execute(
+                "UPDATE neighbors SET present = 0 WHERE device_id = ?", (device_id,))
+            self._conn.executemany(
+                "INSERT INTO neighbors(device_id, if_index, protocol, rem_index,"
+                " chassis_id, chassis_id_subtype, port_id, port_id_subtype,"
+                " port_descr, sys_name, sys_descr, platform, remote_address,"
+                " seen_ts, first_seen_ts, present)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, if_index, protocol, rem_index) DO UPDATE SET"
+                " chassis_id=excluded.chassis_id,"
+                " chassis_id_subtype=excluded.chassis_id_subtype,"
+                " port_id=excluded.port_id, port_id_subtype=excluded.port_id_subtype,"
+                " port_descr=excluded.port_descr, sys_name=excluded.sys_name,"
+                " sys_descr=excluded.sys_descr, platform=excluded.platform,"
+                " remote_address=excluded.remote_address,"
+                " seen_ts=excluded.seen_ts, present=1", rows)
+            self._conn.commit()
+        return len(rows)
+
+    # The best-effort device match a neighbour row joins to: an exact,
+    # case-insensitive sysName match against a known device's own name or
+    # sysName, or — when the chassis id is a MAC address (subtype 4) — a
+    # match against any of that device's own interface phys_addr values.
+    # Either half can misfire (two sites reusing "core-sw-1", a NIC's MAC
+    # reported instead of a bridge's), so this is offered as a suggestion
+    # for the future topology-assembly wave to weigh alongside an operator's
+    # own manual upstream_id, never as the sole source of truth.
+    _NEIGHBOR_MATCH_SQL = (
+        "SELECT n.*,"
+        " COALESCE(byname.id, bymac.id) AS matched_device_id,"
+        " COALESCE(byname.name, bymac.name) AS matched_device_name"
+        " FROM neighbors n"
+        " LEFT JOIN devices byname"
+        "   ON byname.enabled = 1 AND n.sys_name != ''"
+        "   AND (LOWER(byname.name) = LOWER(n.sys_name)"
+        "        OR LOWER(byname.sys_name) = LOWER(n.sys_name))"
+        " LEFT JOIN interfaces iface"
+        "   ON n.chassis_id_subtype = 4 AND n.chassis_id != ''"
+        "   AND LOWER(iface.phys_addr) = LOWER(n.chassis_id)"
+        " LEFT JOIN devices bymac ON bymac.id = iface.device_id AND bymac.enabled = 1")
+
+    def neighbours_of(self, device_id: int) -> list[sqlite3.Row]:
+        """Every LLDP/CDP neighbour row stored for this device's ports,
+        present and stale alike, with the best-effort device match (see
+        _NEIGHBOR_MATCH_SQL) joined in as matched_device_id/
+        matched_device_name — the accessor a device detail page's topology
+        panel reads."""
+        with self._lock:
+            return self._conn.execute(
+                self._NEIGHBOR_MATCH_SQL + " WHERE n.device_id = ?"
+                " ORDER BY n.if_index, n.protocol, n.rem_index",
+                (device_id,)).fetchall()
+
+    def all_neighbours(self) -> list[sqlite3.Row]:
+        """Every neighbour row in the fleet, present and stale alike, with
+        the same device-match join as neighbours_of — the accessor a
+        fleet-wide topology assembly (the future API/UI wave) reads once
+        rather than calling neighbours_of per device."""
+        with self._lock:
+            return self._conn.execute(
+                self._NEIGHBOR_MATCH_SQL +
+                " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index"
+                ).fetchall()
+
+    def prune_neighbors(self, older_than_s: float) -> int:
+        """Drop neighbour rows nothing has refreshed for this long, present
+        or stale alike — prune_mac_entries' own by-age rule, applied to
+        `neighbors`."""
+        if older_than_s <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM neighbors WHERE seen_ts < ?",
+                                     (time.time() - older_than_s,))
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    # --------------------------------------------------------- PoE / STP
+
+    def set_poe_capable(self, device_id: int, capable: bool | None) -> None:
+        """The capability probe's verdict: True once pethMainPseTable/
+        pethPsePortTable has answered anything, False once a probe has come
+        back with neither, None to clear (a re-identify, so the next poll
+        probes again rather than trusting a verdict from a different
+        device). Never bumps config_generation — this is the poller's own
+        observation about one box, not a setting a human changed."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET poe_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    def set_stp_capable(self, device_id: int, capable: bool | None) -> None:
+        """set_poe_capable's own counterpart for dot1dStp."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET stp_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    def update_stp_bridge(self, device_id: int, *, protocol_spec: str | None,
+                          priority: int | None, root_id: str | None,
+                          root_cost: int | None, root_port: int | None,
+                          time_since_change_s: float | None) -> None:
+        """The bridge-wide dot1dStp scalars for one poll — descriptive
+        device state, refreshed in place like sys_name/vendor, not a
+        sample series (see the schema migration comment)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET stp_protocol_spec=?, stp_priority=?,"
+                " stp_root_id=?, stp_root_cost=?, stp_root_port=?,"
+                " stp_time_since_change_s=? WHERE id=?",
+                (protocol_spec, priority, root_id, root_cost, root_port,
+                 time_since_change_s, device_id))
+            self._conn.commit()
+
+    def update_interface_poe(self, device_id: int, rows: list[dict]) -> None:
+        """Per-port PoE admin/detection state and Cisco's per-port
+        milliwatt reading, one statement for the whole poll — the same
+        batching update_interface_rates uses and for the same reason (one
+        UPDATE per port is one transaction per port on a 48-port PoE
+        switch). Rows for a port this device does not have (removed since
+        the last interface poll) simply update nothing; the WHERE clause
+        makes that a no-op rather than an error."""
+        if not rows:
+            return
+        params = [(row.get("poe_admin"), row.get("poe_detect_status"),
+                   row.get("poe_power_mw"), device_id, row["if_index"])
+                  for row in rows]
+        with self._lock:
+            try:
+                self._conn.executemany(
+                    "UPDATE interfaces SET poe_admin=?, poe_detect_status=?,"
+                    " poe_power_mw=? WHERE device_id=? AND if_index=?", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+
+    def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
+        """update_interface_poe's own counterpart for per-port STP state."""
+        if not rows:
+            return
+        params = [(row.get("stp_state"), device_id, row["if_index"])
+                  for row in rows]
+        with self._lock:
+            try:
+                self._conn.executemany(
+                    "UPDATE interfaces SET stp_state=?"
+                    " WHERE device_id=? AND if_index=?", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
 
     def replace_interfaces(self, device_id: int, rows: list[dict],
                            allow_delete: bool = True) -> dict:

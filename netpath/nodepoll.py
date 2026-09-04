@@ -366,6 +366,27 @@ def _credential_label(config: dict) -> str:
 _oid_key = nodeoids.oid_key
 
 
+def _format_cdp_address(raw) -> str:
+    """cdpCacheAddress, as this app's OCTET_STRING decoder hands it back,
+    is a space-separated run of hex bytes for anything non-printable (see
+    trapdecode._octets_text) — a raw IPv4 address decodes as e.g.
+    "0A 00 00 09". Reformatted to dotted-decimal when it is exactly four
+    bytes; left as-is (and still informative) for anything else, since a
+    real cdpCacheAddress can carry a different protocol's address entirely
+    and this app does not attempt every one CISCO-CDP-MIB allows."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parts = text.split()
+    try:
+        octets = [int(part, 16) for part in parts]
+    except ValueError:
+        return text
+    if len(octets) == 4 and all(0 <= o <= 255 for o in octets):
+        return ".".join(str(o) for o in octets)
+    return text
+
+
 def _ago(ts: float) -> str:
     if not ts:
         return "never"
@@ -652,6 +673,12 @@ class NodePoller:
         # walked at most once per mac_table_interval_s, opt-in per profile.
         self._next_mac_walk: dict[int, float] = {}
         self._mac_running: set[int] = set()
+        # device_id -> when its LLDP/CDP neighbour table was last walked, and
+        # which walks are in flight. The topology walk's own cadence
+        # (lldp_interval_s), mirroring _next_mac_walk/_mac_running exactly —
+        # see _maybe_walk_lldp.
+        self._next_lldp_walk: dict[int, float] = {}
+        self._lldp_running: set[int] = set()
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
         # device_id -> the whole-device OID walk running or last finished for
@@ -721,7 +748,15 @@ class NodePoller:
         self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
                          "unsupported": 0, "errors": 0, "overruns": 0,
-                         "mac_walks": 0, "identifications": 0}
+                         "mac_walks": 0, "identifications": 0,
+                         # Tier 1 #5/#7/#8: one counter per new walk, the
+                         # same shape mac_walks already has — lldp_walks
+                         # counts completed LLDP/CDP walks, poe_polls/
+                         # stp_polls/rf_polls count poll-cycle reads that
+                         # actually produced data (a device whose capability
+                         # probe came back negative never bumps them again).
+                         "lldp_walks": 0, "poe_polls": 0, "stp_polls": 0,
+                         "rf_polls": 0}
         self.error: str | None = None
 
     def _bump(self, key: str, by: int = 1) -> None:
@@ -1006,6 +1041,7 @@ class NodePoller:
                 else:
                     self._submit(device_id)
             self._maybe_walk_mac_table(device, config, now)
+            self._maybe_walk_lldp(device, config, now)
 
     # How long the pool has to look saturated before it is worth telling
     # somebody. A burst at the top of a poll cycle is normal; five minutes
@@ -1060,6 +1096,7 @@ class NodePoller:
         together, and the review asked for the cleanup by name.
         """
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
+                      self._next_lldp_walk,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions):
             for device_id in [k for k in cache if k not in keep]:
@@ -1104,6 +1141,36 @@ class NodePoller:
         except (RuntimeError, AttributeError):
             with self._lock:
                 self._mac_running.discard(device_id)
+
+    def _maybe_walk_lldp(self, device, config: dict, now: float) -> None:
+        """Queue an LLDP/CDP neighbour walk when this device's own interval
+        has come round — _maybe_walk_mac_table's own scheduling, applied to
+        lldp_interval_s instead of mac_table_interval_s, and sharing its
+        executor: both are the same shape of thing (a whole-device table
+        walk of hundreds of rows, off the poll pool), so there is no reason
+        for a second thread pool to size separately."""
+        interval = float(config.get("lldp_interval_s") or 0)
+        if interval <= 0 or not config.get("snmp_enabled", True):
+            return
+        if device["status"] == "down" or device["consecutive_fail"]:
+            return
+        device_id = device["id"]
+        due = self._next_lldp_walk.get(device_id)
+        if due is None:
+            self._next_lldp_walk[device_id] = now + random.uniform(0, interval)
+            return
+        if now < due:
+            return
+        with self._lock:
+            if device_id in self._lldp_running:
+                return
+            self._lldp_running.add(device_id)
+        self._next_lldp_walk[device_id] = now + interval
+        try:
+            self._mac_executor.submit(self._run_lldp_table, device_id)
+        except (RuntimeError, AttributeError):
+            with self._lock:
+                self._lldp_running.discard(device_id)
 
     def _submit(self, device_id: int) -> bool:
         """True when this call put the device on the pool; False when it was
@@ -1547,6 +1614,36 @@ class NodePoller:
         # T4 — every sample this poll produced, in one transaction.
         self.db.record_metric_samples(device_id, samples)
 
+        # ------------------------------------------------------- PoE / STP
+        #
+        # After the interface rows above are written, not before: both
+        # write per-port columns onto `interfaces` keyed by (device_id,
+        # if_index), and a row that does not exist yet updates nothing.
+        # Each is its own best-effort, capability-probed read (see their
+        # own docstrings) — a device that fails one must not lose the
+        # other, so each gets its own try rather than sharing the block
+        # above's exception handling with the fields the device's up/down
+        # status actually depends on.
+        if snmp_ok and config.get("snmp_enabled"):
+            if config.get("poe_enabled", True):
+                try:
+                    self._poll_poe(device_id, device, cred_config)
+                except SnmpError:
+                    pass
+                except Exception:
+                    self._bump("errors")
+                    self.log.add(ERROR, f"PoE read failed for device #{device_id}",
+                                 detail=traceback.format_exc())
+            if config.get("stp_enabled", True):
+                try:
+                    self._poll_stp(device_id, device, cred_config)
+                except SnmpError:
+                    pass
+                except Exception:
+                    self._bump("errors")
+                    self.log.add(ERROR, f"STP read failed for device #{device_id}",
+                                 detail=traceback.format_exc())
+
     def working_config(self, device) -> dict:
         """The config an *on-demand* read should use — effective_config()
         merged with the credential this device actually answers on.
@@ -1859,6 +1956,11 @@ class NodePoller:
 
         metrics.extend(self._poll_vendor_health(device, config, identity,
                                                 already={m[0] for m in metrics}))
+        # Tier 1 #8: RSSI/SNR/capacity for a PtP wireless bridge — the same
+        # arc-gated, best-effort scalar shape _poll_vendor_health uses just
+        # above, kept as its own method because RF is not "health" and has
+        # its own OID table (nodeoids.RF_METRICS).
+        metrics.extend(self._poll_rf_metrics(device, config, identity))
         return identity, uptime_ticks, metrics
 
     # How often a device's ipAddrTable is re-read. Its addresses change when
@@ -2019,6 +2121,38 @@ class NodePoller:
             add("disk_pct", "Storage", "%",
                 self._host_resources_disk_pct(device, config))
         self._refresh_addresses(device, config)
+        return metrics
+
+    def _poll_rf_metrics(self, device, config: dict, identity: dict) -> list[tuple]:
+        """RSSI/SNR/link-capacity for a point-to-point wireless bridge
+        (Tier 1 #8), gated on the vendor arc this same poll's identity
+        already worked out — RF_METRICS has no entry for anything that
+        isn't a radio, so the scalar GET below is never sent to (and never
+        costs so much as one packet against) a device this doesn't apply
+        to. Recorded through record_metric_samples like every other metric
+        here, which is what gives the future UI wave a chart with history
+        for free rather than "current value only".
+        """
+        arc = identity.get("vendor_arc") if identity else None
+        if arc is None:
+            arc = nodeoids.enterprise_arc((identity or {}).get("sys_object_id") or "")
+        probes = nodeoids.RF_METRICS.get(arc, ())
+        if not probes:
+            return []
+        try:
+            response = self._snmp_get(device, config, [probe[3] for probe in probes])
+            values = {vb["oid"]: vb for vb in response.varbinds}
+        except SnmpError:
+            return []
+        metrics = []
+        for key, label, unit, oid, _how in probes:
+            vb = values.get(oid)
+            if vb and vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                         "endOfMibView", "null") \
+                    and isinstance(vb["value"], (int, float)):
+                metrics.append((key, label, unit, "gauge", float(vb["value"])))
+        if metrics:
+            self._bump("rf_polls")
         return metrics
 
     def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
@@ -3096,6 +3230,200 @@ class NodePoller:
                 fdb_port, set(mapping), vlan, False, mapping))
         return entries, answered
 
+    # ------------------------------------------------------------- PoE / STP
+
+    @staticmethod
+    def _last_index_component(suffix: str) -> int | None:
+        """The trailing arc of a table-column suffix, as an int — PoE's
+        pethPsePortIndex (see nodeoids' PoE block for why this is treated
+        as an ifIndex directly)."""
+        parts = suffix.split(".")
+        if not parts:
+            return None
+        try:
+            return int(parts[-1])
+        except ValueError:
+            return None
+
+    def _poll_poe(self, device_id: int, device, config: dict) -> None:
+        """POWER-ETHERNET-MIB (Tier 1 #7): PSE budget/consumption and
+        per-port admin/detection state, read every poll once the device is
+        known to answer it.
+
+        Probed at most once per device: devices.poe_capable is None until
+        the first attempt, then True or False, so a device that does not
+        implement PoE (the overwhelming majority of a fleet) pays for this
+        walk exactly once, ever — not once per poll, and not once per
+        process restart either, since the verdict is persisted rather than
+        held in memory the way _bulk_repetitions/_credentials are. A device
+        already known capable=False is skipped before sending anything.
+        """
+        capable = device["poe_capable"]
+        if capable == 0:
+            return
+        try:
+            pse_power = self._walk_column(device, config, nodeoids.PETH_MAIN_PSE_POWER)
+        except SnmpError:
+            pse_power = {}
+        if not pse_power:
+            # Nothing answered even the budget scalar: not a PSE. Recorded
+            # only on the FIRST probe (capable is None) — a device that has
+            # already been confirmed capable and simply timed out this poll
+            # must not be relabeled incapable off one missed walk, the same
+            # "a miss is not a verdict" rule read_device_mac_table's None
+            # return already follows.
+            if capable is None:
+                self.db.set_poe_capable(device_id, False)
+            return
+        if capable is None:
+            self.db.set_poe_capable(device_id, True)
+
+        try:
+            pse_consumption = self._walk_column(
+                device, config, nodeoids.PETH_MAIN_PSE_CONSUMPTION)
+        except SnmpError:
+            pse_consumption = {}
+        budget_w = sum(float(v) for v in pse_power.values()
+                       if isinstance(v, (int, float)))
+        now = time.time()
+        samples = [("poe_budget_w", "PoE power budget", "W", "gauge", now, budget_w)]
+        if pse_consumption:
+            consumption_w = sum(float(v) for v in pse_consumption.values()
+                                if isinstance(v, (int, float)))
+            samples.append(("poe_consumption_w", "PoE power in use", "W",
+                            "gauge", now, consumption_w))
+        self.db.record_metric_samples(device_id, samples)
+        self._bump("poe_polls")
+
+        try:
+            port_admin = self._walk_column(device, config, nodeoids.PETH_PSE_PORT_ADMIN)
+        except SnmpError:
+            port_admin = {}
+        try:
+            port_detect = self._walk_column(device, config, nodeoids.PETH_PSE_PORT_DETECTION)
+        except SnmpError:
+            port_detect = {}
+        try:
+            port_power_mw = self._walk_column(device, config, nodeoids.CISCO_POE_PORT_POWER_MW)
+        except SnmpError:
+            port_power_mw = {}   # not a Cisco PSE, or the extension MIB isn't there
+
+        rows: dict[int, dict] = {}
+        for suffix, value in port_admin.items():
+            if_index = self._last_index_component(suffix)
+            if if_index is None or not isinstance(value, (int, float)):
+                continue
+            rows.setdefault(if_index, {})["poe_admin"] = \
+                nodeoids.PETH_PORT_ADMIN_ENUM.get(int(value))
+        for suffix, value in port_detect.items():
+            if_index = self._last_index_component(suffix)
+            if if_index is None or not isinstance(value, (int, float)):
+                continue
+            rows.setdefault(if_index, {})["poe_detect_status"] = \
+                nodeoids.PETH_PORT_DETECTION_ENUM.get(int(value))
+        for suffix, value in port_power_mw.items():
+            if_index = self._last_index_component(suffix)
+            if if_index is None or not isinstance(value, (int, float)):
+                continue
+            rows.setdefault(if_index, {})["poe_power_mw"] = int(value)
+        if rows:
+            self.db.update_interface_poe(
+                device_id, [{"if_index": i, **fields} for i, fields in rows.items()])
+
+    def _poll_stp(self, device_id: int, device, config: dict) -> None:
+        """BRIDGE-MIB dot1dStp (Tier 1 #7): bridge-wide spanning-tree state
+        every poll once the device is known to be a bridge, plus per-port
+        state joined onto the SAME bridge-port -> ifIndex map the MAC table
+        walk already resolves (_bridge_port_map) — dot1dStpPort IS
+        dot1dBasePort, so there is no separate index guess to make here the
+        way PoE's port-index assumption is. Probed once, same capability
+        memory as PoE — see devices.stp_capable and _poll_poe's docstring.
+        """
+        capable = device["stp_capable"]
+        if capable == 0:
+            return
+        try:
+            response = self._snmp_get(device, config, [
+                nodeoids.DOT1D_STP_PROTOCOL_SPEC, nodeoids.DOT1D_STP_PRIORITY,
+                nodeoids.DOT1D_STP_TIME_SINCE_CHANGE, nodeoids.DOT1D_STP_TOP_CHANGES,
+                nodeoids.DOT1D_STP_DESIGNATED_ROOT, nodeoids.DOT1D_STP_ROOT_COST,
+                nodeoids.DOT1D_STP_ROOT_PORT])
+            values = {vb["oid"]: vb for vb in response.varbinds}
+        except SnmpError:
+            values = {}
+
+        def num(oid):
+            vb = values.get(oid)
+            if vb is None or vb["type"] in ("noSuchObject", "noSuchInstance",
+                                            "endOfMibView", "null"):
+                return None
+            return vb["value"] if isinstance(vb["value"], (int, float)) else None
+
+        protocol_spec_n = num(nodeoids.DOT1D_STP_PROTOCOL_SPEC)
+        if protocol_spec_n is None:
+            # Same "a miss on the first probe is a verdict, a miss later is
+            # just a miss" rule _poll_poe follows.
+            if capable is None:
+                self.db.set_stp_capable(device_id, False)
+            return
+        if capable is None:
+            self.db.set_stp_capable(device_id, True)
+
+        priority = num(nodeoids.DOT1D_STP_PRIORITY)
+        time_since_change = num(nodeoids.DOT1D_STP_TIME_SINCE_CHANGE)
+        top_changes = num(nodeoids.DOT1D_STP_TOP_CHANGES)
+        root_cost = num(nodeoids.DOT1D_STP_ROOT_COST)
+        root_port = num(nodeoids.DOT1D_STP_ROOT_PORT)
+        root_vb = values.get(nodeoids.DOT1D_STP_DESIGNATED_ROOT)
+        root_id = (str(root_vb["value"])
+                  if root_vb and root_vb["type"] not in
+                  ("noSuchObject", "noSuchInstance", "endOfMibView", "null")
+                  else None)
+
+        self.db.update_stp_bridge(
+            device_id,
+            protocol_spec=nodeoids.DOT1D_STP_PROTOCOL_SPEC_ENUM.get(
+                int(protocol_spec_n), str(int(protocol_spec_n))),
+            priority=int(priority) if priority is not None else None,
+            root_id=root_id,
+            root_cost=int(root_cost) if root_cost is not None else None,
+            root_port=int(root_port) if root_port is not None else None,
+            time_since_change_s=(time_since_change / 100.0
+                                 if time_since_change is not None else None))
+        self._bump("stp_polls")
+        if top_changes is not None:
+            # A cumulative counter, stored as a gauge sample the same way
+            # dot1dStpTopChanges' RFC-defined semantics are — the future
+            # alerting wave rules on it *increasing* between samples
+            # (series()), not on any single reading, so no rate math
+            # belongs here.
+            self.db.record_metric_samples(device_id, [
+                ("stp_topology_changes", "STP topology changes", "count",
+                 "gauge", time.time(), float(top_changes))])
+
+        try:
+            port_state = self._walk_column(device, config, nodeoids.DOT1D_STP_PORT_STATE)
+        except SnmpError:
+            port_state = {}
+        if not port_state:
+            return
+        port_map = self._bridge_port_map(device, config)
+        rows: dict[int, dict] = {}
+        for suffix, value in port_state.items():
+            try:
+                bridge_port = int(suffix)
+            except ValueError:
+                continue
+            if_index = port_map.get(bridge_port)
+            if if_index is None or not isinstance(value, (int, float)):
+                continue
+            state = nodeoids.DOT1D_STP_PORT_STATE_ENUM.get(int(value))
+            if state is not None:
+                rows[if_index] = {"stp_state": state}
+        if rows:
+            self.db.update_interface_stp(
+                device_id, [{"if_index": i, **fields} for i, fields in rows.items()])
+
     def _run_mac_table(self, device_id: int) -> None:
         """One scheduled forwarding-table walk, on the poll pool.
 
@@ -3120,6 +3448,167 @@ class NodePoller:
         finally:
             with self._lock:
                 self._mac_running.discard(device_id)
+
+    # ------------------------------------------------- LLDP/CDP neighbours
+
+    # LLDP-MIB columns walked for one device's remote-systems table. Each
+    # entry is walked as its own column (the same one-GETBULK-walk-per-
+    # column shape _fdb_entries' callers already use for the FDB), then
+    # joined back together on the shared lldpRemTimeMark.lldpRemLocalPortNum.
+    # lldpRemIndex suffix in _walk_lldp — a device answering some columns
+    # and timing out on others still contributes a row with whatever did
+    # answer, rather than the whole walk failing on the slowest column.
+    _LLDP_COLUMNS = {
+        "chassis_id_subtype": nodeoids.LLDP_REM_CHASSIS_ID_SUBTYPE,
+        "chassis_id":         nodeoids.LLDP_REM_CHASSIS_ID,
+        "port_id_subtype":    nodeoids.LLDP_REM_PORT_ID_SUBTYPE,
+        "port_id":            nodeoids.LLDP_REM_PORT_ID,
+        "port_descr":         nodeoids.LLDP_REM_PORT_DESC,
+        "sys_name":           nodeoids.LLDP_REM_SYS_NAME,
+        "sys_descr":          nodeoids.LLDP_REM_SYS_DESC,
+    }
+    _CDP_COLUMNS = {
+        "device_id":   nodeoids.CDP_CACHE_DEVICE_ID,
+        "device_port": nodeoids.CDP_CACHE_DEVICE_PORT,
+        "platform":    nodeoids.CDP_CACHE_PLATFORM,
+        "address":     nodeoids.CDP_CACHE_ADDRESS,
+    }
+
+    def read_device_neighbors(self, device_id: int) -> list[dict] | None:
+        """Every LLDP neighbour this device reports, plus CDP as a
+        fallback/supplement on Cisco gear (classic IOS in particular often
+        speaks CDP only). The whole-device counterpart of
+        read_device_mac_table, with the same None-vs-empty-list contract:
+        None means neither protocol answered anything at all — storage
+        must be left alone — while an empty list is a genuine "this device
+        has no neighbours right now" and ages every stored row.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.working_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+
+        entries, lldp_answered = self._walk_lldp(device, config)
+        answered = lldp_answered
+        if detected_vendor(device).lower() == "cisco":
+            cdp_entries, cdp_answered = self._walk_cdp(device, config)
+            entries.extend(cdp_entries)
+            answered = answered or cdp_answered
+        if not answered:
+            return None
+        return entries
+
+    def _walk_lldp(self, device, config: dict) -> tuple[list[dict], bool]:
+        """(neighbour rows, whether the device answered anything). See
+        nodeoids' LLDP block for why lldpRemLocalPortNum is used directly
+        as the local ifIndex rather than resolved through lldpLocPortTable.
+        """
+        values: dict[str, dict] = {}
+        answered = False
+        for key, oid in self._LLDP_COLUMNS.items():
+            try:
+                column = self._walk_column(device, config, oid)
+            except SnmpError:
+                column = {}
+            if column:
+                answered = True
+            values[key] = column
+        if not answered:
+            return [], False
+        suffixes: set = set()
+        for column in values.values():
+            suffixes.update(column)
+        entries = []
+        for suffix in suffixes:
+            parts = suffix.split(".")
+            if len(parts) < 3:
+                continue                          # not a real 3-arc index
+            try:
+                local_port = int(parts[-2])
+            except ValueError:
+                continue
+            chassis_subtype = values["chassis_id_subtype"].get(suffix)
+            entries.append({
+                "if_index": local_port,
+                "protocol": "lldp",
+                "rem_index": suffix,
+                "chassis_id": str(values["chassis_id"].get(suffix) or ""),
+                "chassis_id_subtype": (int(chassis_subtype)
+                                       if isinstance(chassis_subtype, (int, float))
+                                       else None),
+                "port_id": str(values["port_id"].get(suffix) or ""),
+                "port_id_subtype": (int(values["port_id_subtype"].get(suffix))
+                                    if isinstance(values["port_id_subtype"].get(suffix),
+                                                 (int, float)) else None),
+                "port_descr": str(values["port_descr"].get(suffix) or ""),
+                "sys_name": str(values["sys_name"].get(suffix) or ""),
+                "sys_descr": str(values["sys_descr"].get(suffix) or ""),
+            })
+        return entries, True
+
+    def _walk_cdp(self, device, config: dict) -> tuple[list[dict], bool]:
+        """(neighbour rows, whether the device answered anything) from
+        CISCO-CDP-MIB's cdpCacheTable. Indexed by cdpCacheIfIndex directly,
+        so — unlike LLDP above — no local-port assumption is needed."""
+        values: dict[str, dict] = {}
+        answered = False
+        for key, oid in self._CDP_COLUMNS.items():
+            try:
+                column = self._walk_column(device, config, oid)
+            except SnmpError:
+                column = {}
+            if column:
+                answered = True
+            values[key] = column
+        if not answered:
+            return [], False
+        suffixes: set = set()
+        for column in values.values():
+            suffixes.update(column)
+        entries = []
+        for suffix in suffixes:
+            parts = suffix.split(".")
+            if len(parts) < 2:
+                continue
+            try:
+                if_index = int(parts[0])
+            except ValueError:
+                continue
+            device_id_text = str(values["device_id"].get(suffix) or "")
+            entries.append({
+                "if_index": if_index,
+                "protocol": "cdp",
+                "rem_index": suffix,
+                "chassis_id": device_id_text,
+                "sys_name": device_id_text,
+                "port_id": str(values["device_port"].get(suffix) or ""),
+                "platform": str(values["platform"].get(suffix) or ""),
+                "remote_address": _format_cdp_address(values["address"].get(suffix)),
+            })
+        return entries, True
+
+    def _run_lldp_table(self, device_id: int) -> None:
+        """One scheduled LLDP/CDP walk, mirroring _run_mac_table exactly:
+        a worker thread must never die quietly, and a device that answers
+        neither protocol leaves its stored neighbours alone rather than
+        deleting them — see read_device_neighbors' None contract."""
+        try:
+            entries = self.read_device_neighbors(device_id)
+            if entries is None:
+                return
+            stored = self.db.replace_neighbors(device_id, entries)
+            self._bump("lldp_walks")
+            self.log.add(NODES, f"Learned {stored} LLDP/CDP neighbour(s) on "
+                                f"device #{device_id}")
+        except Exception:
+            self._bump("errors")
+            self.log.add(ERROR, f"LLDP/CDP walk failed for device #{device_id}",
+                         detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._lldp_running.discard(device_id)
 
     # Bounds for the OID browser. Generous enough to be useful on a switch,
     # small enough that a dialog someone is sitting in front of cannot hang:

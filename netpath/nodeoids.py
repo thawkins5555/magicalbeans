@@ -134,6 +134,142 @@ HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
 # nobody. Walked rarely (see nodepoll._ADDRESS_REFRESH_S), not every poll.
 IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
 
+# -------------------------------------------------------------- L2 topology
+#
+# LLDP-MIB (IEEE 802.1AB-2005) lldpRemTable — "what is plugged into what",
+# the walk the review's Tier 1 #5 named as entirely missing. Each row is one
+# neighbour heard on one local port, indexed by
+# lldpRemTimeMark.lldpRemLocalPortNum.lldpRemIndex (three arcs); the columns
+# below are walked separately (one GETBULK column walk each, the same shape
+# _walk_column already uses for the FDB) and joined back together on that
+# shared index suffix in nodepoll._run_lldp_table.
+#
+# lldpRemLocalPortNum is NOT necessarily an ifIndex — RFC 802.1AB leaves how
+# a local port is numbered to lldpLocPortTable, which maps it to a port only
+# via lldpLocPortIdSubtype/lldpLocPortId (interfaceAlias, macAddress, ...),
+# not to ifIndex directly. In practice the overwhelming majority of agents
+# this app polls (net-snmp's own LLDP implementation included) number
+# lldpLocPortNum identically to ifIndex, so that identity is used directly
+# rather than resolving the local-port table — the same pragmatic call
+# CISCO_MEMORY_* above makes for a vendor table nobody here has walked
+# against every implementation. A device that numbers them differently
+# stores neighbours against the wrong local port rather than not at all,
+# which read_device_lldp_neighbors's docstring says plainly.
+LLDP_REM_CHASSIS_ID_SUBTYPE = "1.0.8802.1.1.2.1.4.1.1.4"
+LLDP_REM_CHASSIS_ID         = "1.0.8802.1.1.2.1.4.1.1.5"
+LLDP_REM_PORT_ID_SUBTYPE    = "1.0.8802.1.1.2.1.4.1.1.6"
+LLDP_REM_PORT_ID            = "1.0.8802.1.1.2.1.4.1.1.7"
+LLDP_REM_PORT_DESC          = "1.0.8802.1.1.2.1.4.1.1.8"
+LLDP_REM_SYS_NAME           = "1.0.8802.1.1.2.1.4.1.1.9"
+LLDP_REM_SYS_DESC           = "1.0.8802.1.1.2.1.4.1.1.10"
+
+# lldpRemChassisIdSubtype's enumeration — needed to tell "this chassis id is
+# a MAC address" (4, the common case, joinable against an interface's
+# phys_addr) from a locally-assigned string or a network address.
+LLDP_CHASSIS_SUBTYPE_MAC_ADDRESS = 4
+
+# CDP (CISCO-CDP-MIB) cdpCacheTable, read as a fallback/supplement on Cisco
+# gear: plenty of older Cisco switches speak CDP only, or speak both and
+# CDP's cdpCachePlatform says something LLDP's sysDescr does not. Indexed by
+# cdpCacheIfIndex.cdpCacheDeviceIndex — the first arc genuinely *is* the
+# local ifIndex, unlike LLDP's local port number above, so no join is
+# needed to place a row on its interface.
+CDP_CACHE_ADDRESS     = "1.3.6.1.4.1.9.9.23.1.2.1.1.4"
+CDP_CACHE_DEVICE_ID   = "1.3.6.1.4.1.9.9.23.1.2.1.1.6"
+CDP_CACHE_DEVICE_PORT = "1.3.6.1.4.1.9.9.23.1.2.1.1.7"
+CDP_CACHE_PLATFORM    = "1.3.6.1.4.1.9.9.23.1.2.1.1.8"
+
+# ------------------------------------------------------------------- PoE
+#
+# POWER-ETHERNET-MIB (RFC 3621). pethMainPseTable is the PSE's own power
+# budget, indexed by pethMainPseGroupIndex alone (one row per power supply
+# unit — almost always just "1" on an access switch). pethPsePortTable is
+# per-port admin/detection state, indexed by
+# pethPsePortGroupIndex.pethPsePortIndex; as with LLDP's local port number
+# above, pethPsePortIndex is not guaranteed to equal ifIndex by the MIB
+# itself, but is on every agent this app has been checked against — see
+# nodepoll._run_poe for the same caveat LLDP's local-port comment carries.
+PETH_MAIN_PSE_POWER      = "1.3.6.1.2.1.105.1.3.1.1.2"   # watts, nominal budget
+PETH_MAIN_PSE_OPER_STATUS = "1.3.6.1.2.1.105.1.3.1.1.3"  # on(1)/off(2)/faulty(3)
+PETH_MAIN_PSE_CONSUMPTION = "1.3.6.1.2.1.105.1.3.1.1.4"  # watts, in use now
+PETH_PSE_PORT_ADMIN       = "1.3.6.1.2.1.105.1.1.1.1.3"  # enabled(1)/disabled(2)
+PETH_PSE_PORT_DETECTION   = "1.3.6.1.2.1.105.1.1.1.1.6"  # disabled/searching/
+                                                          # deliveringPower/fault/...
+
+PETH_PORT_ADMIN_ENUM = {1: "enabled", 2: "disabled"}
+PETH_PORT_DETECTION_ENUM = {1: "disabled", 2: "searching", 3: "deliveringPower",
+                            4: "fault", 5: "test", 6: "otherFault"}
+
+# CISCO-POWER-ETHERNET-EXT-MIB's per-port milliwatt reading — the actual
+# draw, which the standard MIB above only gives at PSE-wide granularity on
+# most Cisco IOS trains. Shares pethPsePortTable's own
+# group-index.port-index numbering, so it joins onto the same rows.
+CISCO_POE_PORT_POWER_MW = "1.3.6.1.4.1.9.9.402.1.2.1.1.5"
+
+# ------------------------------------------------------------------- STP
+#
+# BRIDGE-MIB (RFC 4188) dot1dStp: the bridge-wide spanning-tree state as six
+# scalars, read in one GET like SYSTEM_SCALARS, plus a per-port state table
+# indexed by dot1dStpPort — which IS dot1dBasePort, the same bridge-port
+# numbering the MAC table walk already resolves to ifIndex via
+# nodepoll._bridge_port_map, so no separate local-port guess is needed here.
+DOT1D_STP_PROTOCOL_SPEC   = "1.3.6.1.2.1.17.2.1.0"   # unknown(1)/decLb100(2)/ieee8021d(3)
+DOT1D_STP_PRIORITY        = "1.3.6.1.2.1.17.2.2.0"
+DOT1D_STP_TIME_SINCE_CHANGE = "1.3.6.1.2.1.17.2.3.0"  # TimeTicks
+DOT1D_STP_TOP_CHANGES     = "1.3.6.1.2.1.17.2.4.0"   # cumulative Counter
+DOT1D_STP_DESIGNATED_ROOT = "1.3.6.1.2.1.17.2.5.0"   # 8-octet bridge id
+DOT1D_STP_ROOT_COST       = "1.3.6.1.2.1.17.2.6.0"
+DOT1D_STP_ROOT_PORT       = "1.3.6.1.2.1.17.2.7.0"
+DOT1D_STP_PORT_STATE      = "1.3.6.1.2.1.17.2.15.1.3"  # per dot1dStpPort
+
+DOT1D_STP_PORT_STATE_ENUM = {1: "disabled", 2: "blocking", 3: "listening",
+                             4: "learning", 5: "forwarding", 6: "broken"}
+DOT1D_STP_PROTOCOL_SPEC_ENUM = {1: "unknown", 2: "decLb100", 3: "ieee8021d"}
+
+# ---------------------------------------------------------- PtP radio links
+#
+# Point-to-point wireless bridges (Tier 1 #8): a PtP link has exactly one
+# remote end, so its RF quality is a handful of scalars, not a walkable
+# table — read the same way VENDOR_HEALTH's "scalar" probes are, one GET,
+# best-effort, and stored as ordinary metric samples so the existing
+# series()/chart machinery shows RF history for free (see
+# nodepoll._poll_rf_metrics). Keyed by enterprise arc exactly like
+# VENDOR_HEALTH, so a device that is not a radio costs nothing extra.
+#
+# The instance numbering below matches what this app's own demo fleet
+# answers (demo/personas.py's ubiquiti_airfiber/cambium_ptp personas), which
+# is the only ground truth available without a live unit of either vendor
+# on hand — the same caveat CISCO_MEMORY_* above has always carried for a
+# vendor table this app has not walked against every firmware. A real
+# airFiber's AIRFIBER-MIB and a real PTP 670's CAMBIUM-PTP670-MIB should be
+# checked against a live device and this table adjusted if its numbering
+# differs.
+RF_METRICS = {
+    41112: (    # Ubiquiti airFiber/airMAX
+        ("rf_rssi_dbm", "RSSI", "dBm", "1.3.6.1.4.1.41112.1.3.2.1.1.0", "scalar"),
+        ("rf_snr_db", "SNR", "dB", "1.3.6.1.4.1.41112.1.3.2.1.2.0", "scalar"),
+        ("rf_capacity_bps", "Link capacity", "bps",
+         "1.3.6.1.4.1.41112.1.3.2.1.3.0", "scalar"),
+        ("rf_remote_rssi_dbm", "Remote RSSI", "dBm",
+         "1.3.6.1.4.1.41112.1.3.2.1.4.0", "scalar"),
+    ),
+    17713: (    # Cambium PTP-series
+        ("rf_rx_level_dbm", "Receive level", "dBm",
+         "1.3.6.1.4.1.17713.21.1.2.1.0", "scalar"),
+        ("rf_path_loss_db", "Path loss", "dB",
+         "1.3.6.1.4.1.17713.21.1.2.2.0", "scalar"),
+        ("rf_capacity_bps", "Link capacity", "bps",
+         "1.3.6.1.4.1.17713.21.1.2.3.0", "scalar"),
+        ("rf_vector_error_db", "Vector error (modulation quality)", "dB",
+         "1.3.6.1.4.1.17713.21.1.2.4.0", "scalar"),
+    ),
+}
+
+# Enterprise arcs RF_METRICS covers — the gate that keeps the RF read off
+# every non-radio device's poll, named separately so nodepoll doesn't
+# reach into RF_METRICS' keys directly.
+RF_VENDOR_ARCS = frozenset(RF_METRICS)
+
 
 ENUMS = {
     "if_admin_status": {1: "up", 2: "down", 3: "testing"},
