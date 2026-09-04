@@ -53,26 +53,31 @@ const App = (() => {
               window.location.href = '/login';
             } }]
           : [{ label: 'Cancel', onClick: closeModal }]),
-        { label: 'Change password', primary: true, onClick: async () => {
-          // A thrown Error (mismatch, or the server's own refusal) is
-          // caught by runModalAction and shown through showModalError —
-          // the same place and style as every other dialog's failure,
-          // rather than this one writing its own #am-status text.
+        // Its own failures go through showModalError like every other
+        // dialog now does; #am-status stays put for the success/hint text,
+        // which is not a failure and has nowhere else to say it.
+        { label: 'Change password', primary: true, onClick: async (dialogBox) => {
+          const status = document.getElementById('am-status');
           const next = document.getElementById('am-new').value;
           const repeat = document.getElementById('am-repeat').value;
-          if (next !== repeat) throw new Error('The two new passwords differ');
+          if (next !== repeat) {
+            showModalError(dialogBox, 'The two new passwords differ');
+            return;
+          }
           await post('/api/password', {
             current_password: document.getElementById('am-current').value,
             new_password: next,
           });
-          const status = document.getElementById('am-status');
           status.textContent = 'Changed. Signing you back in…';
           status.style.color = 'var(--ok)';
           setTimeout(() => { window.location.href = '/login'; }, 1200);
         } },
-      // Reachable even from a kiosk display: a must-change-password account
-      // cannot be waved off with a toast, there is nowhere else to go.
-      ], forced ? { kioskSafe: true } : {});
+      ],
+      // Forced, this is the must-change-password prompt: it can be reached
+      // from a kiosk session (a shared login left with an expired
+      // password) and has to actually open there rather than degrade to a
+      // toast like every other dialog does under state.kiosk.
+      { kioskSafe: forced });
     // Escape and a backdrop click must not dismiss this one. Without the
     // lock the prompt was advisory: it closed on a stray keypress, came back
     // only on the next reload, and the account stayed usable throughout.
@@ -1134,8 +1139,8 @@ const App = (() => {
     if (!box) return;
     for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
       field.removeAttribute('aria-invalid');
-      field.classList.remove('invalid');
       field.removeAttribute('aria-describedby');
+      field.classList.remove('invalid');
     }
   }
 
@@ -1144,12 +1149,6 @@ const App = (() => {
     if (!node) return false;
     node.textContent = message;
     node.hidden = false;
-    // Point every already-marked-invalid field at the sentence explaining
-    // why, so a screen reader announces it while the field itself has
-    // focus, not only once when the error first appears.
-    for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
-      field.setAttribute('aria-describedby', 'modal-error');
-    }
     announce(message);
     return true;
   }
@@ -1203,14 +1202,15 @@ const App = (() => {
       if (!node || String(node.value || '').trim()) continue;
       missing.push(label);
       node.setAttribute('aria-invalid', 'true');
+      node.setAttribute('aria-describedby', 'modal-error');
       node.classList.add('invalid');
       // The mark comes off as soon as the operator answers it, rather than
       // waiting for the next press: a field still outlined in red while it
       // is being typed into reads as a second, different complaint.
       node.addEventListener('input', () => {
         node.removeAttribute('aria-invalid');
-        node.classList.remove('invalid');
         node.removeAttribute('aria-describedby');
+        node.classList.remove('invalid');
       }, { once: true });
       if (!firstEmpty) firstEmpty = node;
     }
@@ -1245,21 +1245,24 @@ const App = (() => {
   }
 
   function modal(title, bodyHtml, buttons, options = {}) {
-    // A wall display has no one at the keyboard to answer a dialog, so one
-    // that pops up over the rotation just sits there until someone walks
-    // over — the whole screen stops updating for whoever it was meant to
-    // inform. A toast says the same thing without holding the page hostage;
-    // {kioskSafe: true} is the one honest exception (the must-change-
-    // password prompt), where there truly is nothing else the account can
-    // do.
-    if (state.kiosk && !options.kioskSafe) {
-      const plain = title && typeof title === 'object' && title.html !== undefined
-        ? String(title.html).replace(/<[^>]+>/g, '') : String(title);
-      toast(plain, 'info');
-      return document.createElement('div');
-    }
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
+    // A kiosk display has nobody at the keyboard to answer a dialog (UI-002):
+    // opening one would just sit there, inert background and all, until the
+    // idle timer or the absolute ceiling ends the session with it still
+    // open. Every dialog degrades to a toast unless the caller marks it
+    // kioskSafe — only the forced password prompt does, since that one has
+    // to be answerable from a wall display. The heading still becomes the
+    // toast text, and this still builds and returns the full box below
+    // rather than something bare, since call sites go on to query and wire
+    // it before anyone ever clicks a button.
+    const kioskDegraded = state.kiosk && !options.kioskSafe;
+    if (kioskDegraded) {
+      const titleText = title && typeof title === 'object'
+        ? String(title.html || '').replace(/<[^>]*>/g, '')
+        : String(title || '');
+      toast(titleText, 'info');
+    }
     // Remembered before the dialog takes focus. `options.trigger` lets a
     // caller name the control explicitly when the dialog is opened from
     // code rather than from a click.
@@ -1275,9 +1278,9 @@ const App = (() => {
     // says so by passing {html}.
     const heading = title && typeof title === 'object' && title.html !== undefined
       ? String(title.html) : escapeHtml(title);
-    // Buttons sit at the top by default, so Save is reachable without
-    // scrolling past every field first; a short confirm passes
-    // {buttonsTop: false} to keep its Cancel/confirm pair beneath the body.
+    // Buttons default to the top, sticky, so Save is reachable without
+    // scrolling past every field first — most dialogs are long forms; a
+    // short confirm passes {buttonsTop: false} to stay bottom-anchored.
     /* The body and the buttons go inside a real <form>.
 
        Enter did nothing in any of the fifty-odd dialogs in this product
@@ -1294,16 +1297,16 @@ const App = (() => {
 
        The button row carries its own class rather than being found as
        '.row': three dialog bodies lay out checkboxes in a <div class="row">
-       of their own (netflow.js, snmp.js, syslog.js), and it is the
-       `.modal-buttons` class rather than position that keeps the buttons
-       out of them. */
+       of their own (netflow.js, snmp.js, syslog.js), and only the fact that
+       all three happen to pass {buttonsTop} keeps the buttons out of them
+       today. */
     const errorHtml = '<p class="modal-error" id="modal-error" hidden></p>';
     const openForm = '<form class="modal-form" novalidate>';
-    box.innerHTML = options.buttonsTop === false
+    box.innerHTML = options.buttonsTop !== false
       ? `<h2 id="modal-title">${heading}</h2>${openForm}` +
-        `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`
+        `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`
       : `<h2 id="modal-title">${heading}</h2>${openForm}` +
-        `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`;
+        `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`;
     const form = box.querySelector('form.modal-form');
     // A <button> inside a <form> defaults to type=submit, so a Save, Walk or
     // Install that a module wrote into the BODY would run its own onclick and
@@ -1362,24 +1365,30 @@ const App = (() => {
     box.setAttribute('role', 'dialog');
     box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-labelledby', 'modal-title');
-    wrap.hidden = false;
-    setBackgroundInert(true);
-    // A dialog with no field to fill still has to take the keyboard, or the
-    // trap has nothing to hold and Escape is the only way to answer it.
-    const first = box.querySelector('input, select, textarea')
-      || box.querySelector('.row button');
-    if (first) first.focus();
-    else {
-      const anything = focusableIn(box)[0];
-      if (anything) anything.focus();
+    // The box above is fully built either way, so a caller that goes on to
+    // query and wire it (several do, before anyone has clicked a button)
+    // works the same in both cases; what a kiosk skips is everything that
+    // would make it visible or trap the keyboard.
+    if (!kioskDegraded) {
+      wrap.hidden = false;
+      setBackgroundInert(true);
+      // A dialog with no field to fill still has to take the keyboard, or
+      // the trap has nothing to hold and Escape is the only way to answer it.
+      const first = box.querySelector('input, select, textarea')
+        || box.querySelector('.row button');
+      if (first) first.focus();
+      else {
+        const anything = focusableIn(box)[0];
+        if (anything) anything.focus();
+      }
     }
     return box;
   }
 
   const closeModal = () => {
-    // Un-inert first: a locked dialog (forced password change) still bars the
-    // rest of this function, but the background must never be stranded
-    // inert with no way to reach it, whatever called this while locked.
+    // Un-inert the background before the lock check below can return early:
+    // a locked dialog must never be able to strand the page behind an
+    // inert #tabs and an inert section.page with no way back in.
     setBackgroundInert(false);
     if (state.modalLocked) return;
     const wrap = document.getElementById('modal');
@@ -1543,8 +1552,9 @@ const App = (() => {
         await onConfirm();
         done(true);
       } },
-    // Short and single-screen: keep Cancel/confirm under the warning text
-    // rather than above it.
+    // A one-sentence confirm has no fold to be below; bottom-anchored
+    // matches the discard prompt beside it rather than the sticky top row
+    // long forms need.
     ], { buttonsTop: false });
   }
 
@@ -3125,8 +3135,6 @@ const App = (() => {
   const TAB_KEY = 'sappiwhere.tab';
 
   function selectTab(name, options = {}) {
-    const leaving = pages[state.tab];
-    if (state.tab !== name && leaving && leaving.deactivate) leaving.deactivate(name);
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
     // Kept in sync with .active below, not just set once at load: index.html's

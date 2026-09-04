@@ -34,24 +34,6 @@
     return `${(n / 1048576).toFixed(1)} MB`;
   }
 
-  /* Shared by the single-device and bulk settings dialogs: a port field
-     left blank/out of range is caught here rather than trusted to the
-     server, so the operator sees which field is wrong and why. Returns
-     true (and leaves the field alone) when `raw` is a valid TCP port. */
-  function rejectBadPort(box, field, raw) {
-    const n = Number(raw);
-    if (raw !== '' && Number.isInteger(n) && n >= 1 && n <= 65535) return false;
-    field.setAttribute('aria-invalid', 'true');
-    field.classList.add('invalid');
-    field.addEventListener('input', () => {
-      field.removeAttribute('aria-invalid');
-      field.classList.remove('invalid');
-    }, { once: true });
-    App.showModalError(box, 'SSH port must be between 1 and 65535.');
-    field.focus();
-    return true;
-  }
-
   const STATUS_COLOR = { changed: 'var(--ok)', unchanged: 'var(--accent)',
     error: 'var(--fail)' };
   /* Backup outcomes mapped onto the tones App.statusMark draws. "changed"
@@ -208,6 +190,28 @@
     drawDevices();
   }
 
+  /* Shared by the single-device and bulk settings dialogs, which both take
+     an SSH port through a plain number input — `min`/`max` are advisory
+     only, since App.modal's forms are novalidate. `allowBlank` is the bulk
+     dialog's "leave unchanged" case; the single-device port is always a
+     real value. */
+  function checkPortField(box, selector, { allowBlank = false } = {}) {
+    const el = box.querySelector(selector);
+    const raw = el.value.trim();
+    const port = Number(raw);
+    if (raw && Number.isInteger(port) && port >= 1 && port <= 65535) return true;
+    if (!raw && allowBlank) return true;
+    App.showModalError(box, 'The SSH port must be a number from 1 to 65535.');
+    el.setAttribute('aria-invalid', 'true');
+    el.classList.add('invalid');
+    el.addEventListener('input', () => {
+      el.removeAttribute('aria-invalid');
+      el.classList.remove('invalid');
+    }, { once: true });
+    el.focus();
+    return false;
+  }
+
   function drawBulkBar() {
     const n = view.devicesChecked.size;
     App.el('cx-bulk-bar').hidden = n === 0;
@@ -258,13 +262,12 @@
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
+        if (!checkPortField(m, '#cx-bulk-port', { allowBlank: true })) return;
         const username = m.querySelector('#cx-bulk-username').value.trim();
         const password = (m.querySelector('#cx-bulk-password') || {}).value || '';
         const enabled = m.querySelector('#cx-bulk-enabled').value;
         const vendor = m.querySelector('#cx-bulk-vendor').value.trim();
-        const portField = m.querySelector('#cx-bulk-port');
-        const port = portField.value.trim();
-        if (port && rejectBadPort(m, portField, port)) return;
+        const port = m.querySelector('#cx-bulk-port').value.trim();
         if (password && !username) {
           App.showModalError(m, 'A username is required with a password: the pair'
             + ' is what gets encrypted, and half of one would lock the batch out.');
@@ -438,7 +441,8 @@
           drawBackupBulkBar();
         };
       }
-      tr.onclick = () => selectBackup(row.id);
+      tr.onclick = () => selectBackup(row.id).catch((error) =>
+        App.toast(`Could not read that backup: ${error.message}`, 'fail'));
     });
     table.appendChild(body);
     App.wireRowKeyboard(body);
@@ -514,13 +518,7 @@
       App.setRoute(['device', view.selectedDeviceId, 'backup', backupId]);
     }
     drawBackups();
-    let result;
-    try {
-      result = await App.get(`/api/configrx/backups/${backupId}`, {});
-    } catch (error) {
-      App.toast(error.message, 'warn');
-      return;
-    }
+    const result = await App.get(`/api/configrx/backups/${backupId}`, {});
     view.backupContent = result.content || '';
     drawViewer();
   }
@@ -685,11 +683,10 @@
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
-        const portField = m.querySelector('#cx-port');
-        if (rejectBadPort(m, portField, portField.value.trim())) return;
+        if (!checkPortField(m, '#cx-port')) return;
         await App.post(`/api/configrx/devices/${device.id}/config`, {
           backup_enabled: m.querySelector('#cx-enabled').checked,
-          ssh_port: Number(portField.value),
+          ssh_port: Number(m.querySelector('#cx-port').value),
           ssh_username: m.querySelector('#cx-username').value.trim(),
           vendor_override: m.querySelector('#cx-vendor').value.trim(),
         });

@@ -648,7 +648,7 @@
         <tbody>${rows.length ? rows.map(windowRowHtml).join('')
           : '<tr><td colspan="6" class="hint">No maintenance windows.</td></tr>'}</tbody>
       </table></div>`, [
-      { label: writable ? 'Cancel' : 'Close', onClick: App.closeModal },
+      { label: 'Cancel', onClick: App.closeModal },
       ...(writable ? [{ label: 'Add window', primary: true, onClick: addWindowDialog }] : []),
     ], { buttonsTop: true });
     if (!writable) return box;

@@ -41,9 +41,9 @@
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="ipam">IPAM</button>
   <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
-       FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than just
-       WIRELESS, which reads as "every wireless estate" and only corrects
-       itself once an Aruba or Ubiquiti shop opens the page and finds
+       FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than plain
+       WIRELESS, which read as "every wireless estate" and only corrected
+       itself once an Aruba or Ubiquiti shop opened the page and found
        nothing there. -->
   <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
   <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
@@ -100,13 +100,17 @@
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
-
-  <!-- A finished discovery scan's approval no longer pops a dialog over
-       whatever the operator is doing (see maybeShowApproval/drawDiscBanner
-       in nodes.js) — this line says a scan is waiting and lets Review open
-       the same dialog on demand. Built entirely in JS; empty and hidden
-       when nothing is waiting. -->
-  <div class="bar wrap" id="nd-disc-banner" hidden></div>
+  <!-- P1-9: a finished/cancelled scan no longer pops its approval dialog on
+       every arrival at this tab — that ambushed whoever opened it next,
+       in every session. This line offers the same dialog instead of
+       forcing it; nodes.js's drawDiscStrip hides it when nothing is
+       unreviewed. -->
+  <div class="bar wrap" id="nd-disc-strip" hidden>
+    <span id="nd-disc-strip-text" class="hint"></span>
+    <span class="grow"></span>
+    <button id="nd-disc-strip-review">Review</button>
+    <button id="nd-disc-strip-dismiss">Dismiss</button>
+  </div>
 
   <nav class="subtabs">
     <button class="subtab active" data-subtab="devices">DEVICES</button>
@@ -191,6 +195,10 @@
                  label, as App.helpLink documents. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
+            <!-- P1-4: a plain outbound link to the device's own web UI, set
+                 by nodes.js from the selected device's IP. No write gate —
+                 unlike SSH it opens nothing on this server, just a tab in
+                 the browser. -->
             <a id="nd-web-device" class="linkish" target="_blank" rel="noopener" hidden>WEB</a>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
@@ -688,7 +696,7 @@
   <nav class="subtabs">
     <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
     <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
-    <button id="ipam-subtab-dhcp" class="subtab" data-subtab="dhcp">DHCP</button>
+    <button class="subtab" data-subtab="dhcp">DHCP</button>
   </nav>
 
   <div id="ipam-sub-subnets" class="subpage active">
@@ -741,13 +749,10 @@
     <!-- Shown instead of the form on a host with no PowerShell: reading a
          Windows DHCP server needs it, and the whole subtab rendered in full
          on Linux with Windows-only help text and no hint it could not work.
-         ipam.js unhides one of these two on start-up from /api/platform, and
-         disables the DHCP subtab itself alongside ipam-dhcp-unavailable. -->
+         ipam.js unhides one of these two on start-up from /api/platform. -->
     <div id="ipam-dhcp-unavailable" class="pad-x pad-b" hidden style="padding-top:14px">
       <h2>DHCP is a Windows feature</h2>
       <p class="hint" id="ipam-dhcp-unavailable-why"></p>
-      <p class="hint">Scanned subnets and hosts are still tracked on this platform — see
-        <b>Subnets &amp; hosts</b>.</p>
     </div>
     <div id="ipam-dhcp-body">
     <div class="bar">
@@ -1033,14 +1038,14 @@
     </fieldset>
     <fieldset>
       <legend>REFRESH RATES</legend>
-      <label>Routes <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
+      <label>NetPath <input type="number" id="set-refresh-netpath" min="1" max="300" step="1"> s</label>
       <label>Nodes <input type="number" id="set-refresh-nodes" min="1" max="3600" step="1"> s</label>
       <label>Alerts <input type="number" id="set-refresh-alerts" min="1" max="3600" step="1"> s</label>
       <label>NetFlow <input type="number" id="set-refresh-netflow" min="1" max="3600" step="5"> s</label>
       <label>SNMP <input type="number" id="set-refresh-snmp" min="1" max="3600" step="5"> s</label>
       <label>Syslog <input type="number" id="set-refresh-syslog" min="1" max="3600" step="5"> s</label>
       <label>IPAM <input type="number" id="set-refresh-ipam" min="1" max="3600" step="5"> s</label>
-      <label>FortiWireless <input type="number" id="set-refresh-wireless" min="1" max="3600" step="1"> s</label>
+      <label>Wireless <input type="number" id="set-refresh-wireless" min="1" max="3600" step="1"> s</label>
       <label>ConfigRX <input type="number" id="set-refresh-configrx" min="1" max="3600" step="1"> s</label>
       <label>Dashboard <input type="number" id="set-refresh-dashboard" min="1" max="3600" step="1"> s</label>
       <label>Debug <input type="number" id="set-refresh-debug" min="1" max="60" step="1"> s</label>

@@ -218,8 +218,10 @@ body.tiny .brand span { display: none; }
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
-/* ConfigRX is a proper noun (mixed case), not an acronym: opt out of the
-   strip's uppercase treatment the way .brand does for "SappiWhere". */
+/* A tab whose real name is mixed-case (ConfigRX) rather than an acronym:
+   mirrors .brand's size and tracking instead of shouting in caps like every
+   other tab. Never set font-weight here — weight is what marks the active
+   tab, and this rule must not compete with it. */
 .tab--proper { font-size: var(--fs-sm); line-height: var(--fs-xs); letter-spacing: 0.02em; text-transform: none; }
 
 /* Sub-navigation inside a single tab (IPAM's Subnets / Conflicts / DHCP),
@@ -315,17 +317,19 @@ body.tiny .brand span { display: none; }
 .badge.sev-info { background: var(--accent); color: var(--bg); }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: 4px; }
 .conn.user { color: var(--muted); }
+/* WEB, beside SSH on the device pane, is a real link — it opens the device's
+   own web interface in a tab — so it is an <a>, and this rule has to reach it
+   or it renders as browser-default blue underline beside a button. */
 button.linkish, a.linkish {
   background: none;
-  text-decoration: none;
   border: none;
   color: var(--muted);
   font-size: var(--fs-xs);
   padding: 2px 8px;
   cursor: pointer;
+  text-decoration: none;
 }
 button.linkish:hover, a.linkish:hover { color: var(--accent); }
-#set-apply.dirty { outline: 2px solid var(--warn); outline-offset: 2px; }
 .conn.bad { color: var(--fail); }
 .conn.good { color: var(--ok); }
 

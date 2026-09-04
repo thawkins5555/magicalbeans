@@ -1156,18 +1156,18 @@ end
               cookie=admin_cookie)[2]["device"]["store_secrets"] is True)
     SERVICE.configrx_db.update_device_config(backup_device, store_secrets=0)
 
-    # Reading a stored config is a read, not a write; the endpoint itself
-    # redacts a verbatim (store_secrets) row for a caller without write.
+    # P1-8: reading a stored config is a read, not a write — a ConfigRX
+    # reader gets the content, same as the listing beside it.
     cx_reader = make_user("cxreader", {"configrx": "read"})
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
                               cookie=cx_reader)
-    check("D11 a read-only ConfigRX account can download a backup",
+    check("D11 a read-only ConfigRX account can read an already-redacted backup",
           status == 200 and "<redacted>" in payload.get("content", ""),
           f"{status} {payload}")
     status, _h, payload = req("GET",
                               f"/api/configrx/devices/{backup_device}/backups",
                               cookie=cx_reader)
-    check("D11 …and sees the listing, with the redacted flag",
+    check("D11 …and still sees the listing, with the redacted flag",
           status == 200 and payload["backups"][0]["redacted"] is True,
           f"{status} {payload}")
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
@@ -1176,22 +1176,40 @@ end
           status == 200 and "<redacted>" in payload.get("content", ""),
           str(status))
 
-    # A row stored VERBATIM (store_secrets on) is the case the endpoint's
-    # own redaction guards: a writer sees the real secret, a reader gets it
-    # redacted even though the row on disk is unredacted.
+    # The case the read-only route change actually has to guard: a backup
+    # stored VERBATIM (store_secrets was on for the capture) still cannot
+    # reach a caller without ConfigRX write — it comes back redacted on the
+    # fly instead of 403ing, and the response says so.
     verbatim_id, _digest = SERVICE.configrx_db.add_backup(
         backup_device, CISCO, redacted=False)
-    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
-                              cookie=admin_cookie)
-    check("D11 a write account reads a verbatim backup unredacted",
-          status == 200 and "pl4nt-wr1te" in payload.get("content", ""),
-          f"{status} {payload}")
+    verbatim_row = SERVICE.configrx_db.backup(verbatim_id)
+    check("D11 the verbatim row records that it was NOT redacted",
+          not bool(verbatim_row["redacted"]))
     status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
                               cookie=cx_reader)
-    check("D11 a read-only account never sees the verbatim secret",
-          status == 200 and "pl4nt-wr1te" not in payload.get("content", "")
+    check("D11 a read-only account reading a verbatim backup gets 200, not 403",
+          status == 200, f"{status} {payload}")
+    check("D11 …with the secret taken out",
+          "pl4nt-wr1te" not in payload.get("content", "")
           and "<redacted>" in payload.get("content", ""),
+          payload.get("content", ""))
+    check("D11 …and the response says it was redacted for this caller",
+          payload.get("backup", {}).get("redacted") is True, str(payload))
+    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
+                              cookie=admin_cookie)
+    check("D11 a ConfigRX write account reads the verbatim backup unredacted",
+          status == 200 and "pl4nt-wr1te" in payload.get("content", ""),
           f"{status} {payload}")
+    check("D11 …and the stored row's own flag is reported, still False",
+          payload.get("backup", {}).get("redacted") is False, str(payload))
+
+    # The diff route stays ConfigRX write, unlike the single-backup route
+    # above: a comparison view hands over the same configuration lines.
+    status, _h, payload = req(
+        "GET", f"/api/configrx/diff?device={backup_device}"
+        f"&from={stored_id}&to={verbatim_id}", cookie=cx_reader)
+    check("D11 the diff route still needs ConfigRX write",
+          status == 403, f"{status} {payload}")
 
     # ----------------------------------------------------- D12 probe pacing
     from netpath import ipam_scan

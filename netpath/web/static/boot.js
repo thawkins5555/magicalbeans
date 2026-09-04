@@ -13,7 +13,7 @@
    never affected: app.js reads the same key on load and selects the tab
    regardless. This is only about painting it without a flicker.
 
-   The key and the 'dashboard' fallback must stay in step with app.js's own
+   The key and the 'netpath' fallback must stay in step with app.js's own
    TAB_KEY / default tab. */
 (function () {
   /* The theme comes first and runs on every page — index, sign-in and the

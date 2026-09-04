@@ -44,6 +44,13 @@
     discSeen: new Set(),
     discSort: App.recallSort('nodes-discovery', { key: 'ip', descending: false }),
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
+    // P1-9: the approval dialog auto-opens only for a job THIS page load
+    // itself started (discStartedThisLoad), and only the first time it is
+    // ever seen finished (discAutoOffered) — a job someone else's session
+    // started, or one this page already offered and the operator escaped
+    // out of, gets the dismissible strip line instead, never the popup.
+    discStartedThisLoad: new Set(),
+    discAutoOffered: new Set(),
     mibFiles: [],
     mibSelected: null,
     // Server-side paging (4.47.0): the full-fleet fetch this table always
@@ -630,19 +637,22 @@
     drawEventTable();
   }
 
-  /* IPv6 needs brackets in a URL host (http://[::1]/) or the trailing colon
-     reads as a port separator; IPv4 and hostnames never do. */
-  function ipForUrl(ip) {
-    return ip && ip.includes(':') ? `[${ip}]` : ip;
-  }
-
   function drawDetailHeader() {
     App.el('nd-d-name').textContent = displayName(view.detail);
     App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
-    const web = App.el('nd-web-device');
-    const ip = view.detail && view.detail.ip;
-    web.hidden = !ip;
-    if (ip) web.href = `http://${ipForUrl(ip)}/`;
+    drawWebLink(view.detail);
+  }
+
+  /* P1-4: the WEB button beside SSH, a plain link to the device's own web
+     UI rather than anything this app opens a socket for — IPv6 needs its
+     host bracketed in a URL, IPv4 does not. */
+  function drawWebLink(d) {
+    const link = App.el('nd-web-device');
+    if (!link) return;
+    const ip = d && d.ip;
+    if (!ip) { link.hidden = true; return; }
+    link.href = `http://${ip.includes(':') ? `[${ip}]` : ip}/`;
+    link.hidden = false;
   }
 
   /* The identity line for one device, as markup. Takes the device rather
@@ -2534,12 +2544,13 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Test', onClick: () => testDevice(box, null) },
       { label: 'Add', primary: true, onClick: async (box) => {
-        // A blank address used to return without a word, and a refusal from
-        // the server (a duplicate, or an address that is not one) rejected
-        // into nothing, so the dialog just sat there and the button looked
-        // broken. requireFields marks the field for the blank case; a
-        // server refusal propagates out of here for runModalAction to show
-        // in .modal-error and to re-enable the button.
+        // Both halves of this used to be silent: a blank address returned
+        // without a word, and a refusal from the server (a duplicate, or an
+        // address that is not one) rejected into nothing, so the dialog just
+        // sat there and the button looked broken. requireFields announces
+        // and marks the blank field; a server refusal now propagates
+        // instead of being caught here, so runModalAction (App.modal) is
+        // the one place that renders it, in .modal-error.
         if (!App.requireFields(box, [['#nd-f-ip', 'IP address']])) return;
         const ip = box.querySelector('#nd-f-ip').value.trim();
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
@@ -2663,22 +2674,25 @@
   }
 
   function manageDeviceGroups() {
+    // Add is the affirmative action and the one Enter should reach — a
+    // plain body button never submits the form (App.modal types every
+    // untyped body button "button"), so it moves into the button row as
+    // the primary; Close, which discards nothing, reads Cancel beside it.
     const box = App.modal('Manage device groups', `
       <div id="nd-devgroups-list">${deviceGroupListHtml()}</div>
-      <label>New group <input id="nd-devgroup-new" placeholder="e.g. Core Switches"></label>
-      <button type="button" id="nd-devgroup-add">Add</button>`, [
+      <label>New group <input id="nd-devgroup-new" placeholder="e.g. Core Switches"></label>`, [
       { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (box) => {
+        const input = box.querySelector('#nd-devgroup-new');
+        const name = input.value.trim();
+        if (!name) return;
+        await App.post('/api/nodes/device-groups', { name });
+        input.value = '';
+        await refreshDeviceGroupsList(box);
+        App.refreshNow('nodes');
+      } },
     ]);
     wireDeviceGroupRows(box);
-    box.querySelector('#nd-devgroup-add').onclick = async () => {
-      const input = box.querySelector('#nd-devgroup-new');
-      const name = input.value.trim();
-      if (!name) return;
-      await App.post('/api/nodes/device-groups', { name });
-      input.value = '';
-      await refreshDeviceGroupsList(box);
-      App.refreshNow('nodes');
-    };
   }
 
   async function testDevice(box, deviceId) {
@@ -3245,7 +3259,7 @@
     for (const x of view.discResults) {
       if (!view.discSeen.has(x.id)) {
         view.discSeen.add(x.id);
-        if (x.snmp_ok && !x.promoted_device_id && !x.existing_device_id) view.discChecked.add(x.id);
+        if (x.snmp_ok && !x.existing_device_id) view.discChecked.add(x.id);
       }
     }
     drawDiscResultsTable();
@@ -3267,27 +3281,27 @@
     return view.discJobs.find((j) => j.id === view.discSelected);
   }
 
-  /* A result can be ticked when nothing has promoted it yet, it is not the
-     IP of a device already added independently, and the scan is allowed to
-     add it: SNMP-identified always, ping-only only when the job was
-     started with that option. */
+  /* A result can be ticked when nothing has already added it: not this
+     job's own promote, not an earlier job's, not one added some other way
+     entirely (existing_device_id covers all three; see
+     api._discovery_result_json). And the scan has to be allowed to add it:
+     SNMP-identified always, ping-only only when the job was started with
+     that option. */
   function discSelectable(r, job) {
-    return !r.promoted_device_id && !r.existing_device_id &&
-      !!(r.snmp_ok || (job && job.allow_ping_only));
+    return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
   /* The first cell of a discovery row: a box for a result that may be
-     added, a link to the existing device for an IP already monitored, an
-     em dash carrying the reason for one no credential identified, and
-     nothing at all for one already promoted by this job. Shared by the
-     grid and the approval dialog, which differ only in the class on the box
-     and in which set holds the ticks. */
+     added, an em dash carrying the reason for one no credential
+     identified, and a link to the device it already is for one that is
+     already added, whether by this job, an earlier one, or by hand.
+     Shared by the grid and the approval dialog, which differ only in the
+     class on the box and in which set holds the ticks. */
   function discCheckCell(r, job, checkedSet, cls) {
     if (!discSelectable(r, job)) {
-      if (r.promoted_device_id) return '';
       if (r.existing_device_id) {
-        return `Already added \u2014 <a href="#/nodes/device/${r.existing_device_id}">` +
-          `${escape(r.existing_device_name || r.ip || '')}</a>`;
+        return `<span class="hint">Already added \u2014 <a href="#/nodes/device/${
+          r.existing_device_id}">${escape(r.existing_device_name || r.ip)}</a></span>`;
       }
       return '<span class="hint" title="Only devices identified over SNMP can be ' +
         'added from this scan">\u2014</span>';
@@ -3297,12 +3311,13 @@
       `${checkedSet.has(r.id) ? ' checked' : ''}>`;
   }
 
-  /* Vendor with its confidence marker and the "install these MIBs" hint.
-     The arcs tooltip is NOT part of this: hung on a <span> around the text
-     it only covered the words, so hovering the rest of a wide Vendor
-     column said nothing. It goes on the <td> instead — in the grid through
-     App.drawRows' onRow callback, in the approval dialog on the cell this
-     string is written into. */
+  /* Vendor with its confidence marker and the "install these MIBs" hint;
+     an already-added result says so in the check cell now, so this needs
+     no separate "(added)" tag. The arcs tooltip is NOT part of this: hung on a
+     <span> around the text it only covered the words, so hovering the rest
+     of a wide Vendor column said nothing. It goes on the <td> instead — in
+     the grid through App.drawRows' onRow callback, in the approval dialog
+     on the cell this string is written into. */
   function discVendorCell(r) {
     return `${escape(r.vendor || '\u2014')}${vendorMarker(r)}` +
       (r.suggest_bundle && !r.suggest_bundle_installed
@@ -3401,16 +3416,15 @@
     const selectable = view.discResults.filter((r) => discSelectable(r, job));
     const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
     const chosen = ticked();
-    // promoted_device_id, snmp_ok and existing_device_id are the only fields
-    // the server ever changes on a result that already exists; everything
-    // else about a row is fixed when the scanner writes it. So an unchanged
-    // list under an unchanged sort renders identically, and the only thing
-    // that still has to be corrected is the header's select-all box.
+    // existing_device_id and snmp_ok are the only fields the server ever
+    // changes on a result that already exists; everything else about a row is
+    // fixed when the scanner writes it. So an unchanged list under an
+    // unchanged sort renders identically, and the only thing that still has
+    // to be corrected is the header's select-all box.
     const signature = [
       view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
       view.discResults.map((r) =>
-        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.promoted_device_id || ''}:` +
-        `${r.existing_device_id || ''}`).join(','),
+        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}`).join(','),
     ].join('|');
     if (!force && signature === discDrawnSignature) {
       App.refreshSelectAll(table, selectable.length, ticked());
@@ -3838,7 +3852,7 @@
         view.discChecked = new Set();
         view.discSeen = new Set();
         view.discCheckedJob = result.id;
-        discAutoAsk.add(result.id);
+        view.discStartedThisLoad.add(result.id);
         App.refreshNow('nodes');
       } },
     ]);
@@ -3850,25 +3864,16 @@
     el.className = isError ? 'err' : 'hint';
   }
 
-  // Jobs this browser session itself started (the only candidates for the
-  // automatic pop) and jobs that have already had their one automatic turn,
-  // whatever the operator did with it — approved, dismissed, or just hit
-  // Escape. A scan finishing while the operator works elsewhere must not
-  // ambush them with a dialog; the strip banner is what is left for that
-  // job, and for every other unreviewed one, to be opened by choice.
-  const discAutoAsk = new Set();
-  const discAutoOffered = new Set();
+  /* The approve/deny dialog: lists everything a finished/cancelled scan
+     found, SNMP-identified ones pre-checked, ping-only ones per the job's
+     own option. Approving promotes the checked ones; dismissing adds
+     nothing. Either answer marks the job reviewed so it never asks again —
+     the RESULTS pane remains for changing one's mind later.
 
-  function unreviewedDiscJobs() {
-    return (view.discJobs || []).filter(
-      (j) => (j.state === 'done' || j.state === 'cancelled') && !j.reviewed);
-  }
-
-  /* The approve/deny dialog for one job: lists every discovered device with
-     a checkbox (SNMP-identified ones pre-checked, ping-only ones per the
-     job's own option). Approving promotes the checked ones; dismissing
-     adds nothing. Either answer marks the job reviewed so it never pops
-     again — the RESULTS pane remains for changing one's mind later. */
+     Opened two ways (P1-9): maybeAutoOpenApproval pops it, unasked, only
+     for a job THIS page load itself started; the strip line's Review
+     button opens this same dialog for any other unreviewed job, on
+     request rather than by ambush. */
   async function openApprovalDialog(job) {
     if (view.approvalOpenFor !== null) return;
     if (!App.el('modal').hidden) return;   // never clobber an open dialog
@@ -3877,8 +3882,7 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    const seed = new Set(results
-      .filter((x) => x.snmp_ok && !x.promoted_device_id && !x.existing_device_id)
+    const seed = new Set(results.filter((x) => x.snmp_ok && !x.existing_device_id)
       .map((x) => x.id));
     const finish = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -3915,6 +3919,7 @@
     if (!found.length) {   // nothing to approve — don't pop an empty dialog
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
       view.approvalOpenFor = null;
+      App.refreshNow('nodes');
       return;
     }
     const checked = new Set(seed);
@@ -3930,16 +3935,20 @@
       cancelled ? { label: 'Discard scan', onClick: discard }
                 : { label: 'Dismiss', onClick: finish },
       { label: 'Add approved', primary: true, onClick: async () => {
-        let added = 0;
+        // Every already-added row is unselectable (discSelectable), so
+        // `already` is what "found" carries that "checked" cannot: how many
+        // of this scan's hits were monitored before the operator ever
+        // pressed this button, said back so the count of newly-added
+        // devices is never mistaken for the size of the sweep.
+        const already = found.filter((x) => x.existing_device_id).length;
+        const added = checked.size;
         if (checked.size) {
-          const promoted = await App.post(`/api/nodes/discovery/${job.id}/promote`,
-            { result_ids: [...checked] }).catch(() => null);
-          added = promoted && promoted.device_ids ? promoted.device_ids.length : 0;
+          await App.post(`/api/nodes/discovery/${job.id}/promote`,
+            { result_ids: [...checked] }).catch(() => {});
         }
-        const flagged = results.filter((x) => x.existing_device_id).length;
-        App.toast(`Added ${added} device(s)` +
-          (flagged ? `; ${flagged} already monitored` : ''), 'ok');
         await finish();
+        App.toast(already ? `Added ${added}; ${already} already monitored.`
+                          : `Added ${added}.`, 'ok');
       } },
     ];
     const box = App.modal(title, `
@@ -3950,6 +3959,20 @@
         <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
       </div>`, buttons);
+    // Escape or a backdrop click dismisses this dialog without any button's
+    // onClick running, so nothing else would clear approvalOpenFor — left
+    // stuck, neither a later auto-open nor the strip's own Review could ever
+    // open ANY approval dialog again this session (P1-9 regression: the
+    // strip's Review has to work after an Escape, not just before the
+    // first one). modalToken() still names the generation this box held
+    // even once hidden, which is how a nested confirm (Discard scan)
+    // replacing it first is told apart from a plain dismissal of this
+    // dialog itself — that flow clears/reopens approvalOpenFor on its own.
+    const token = App.modalToken();
+    window.addEventListener('modal-closed', () => {
+      if (App.modalToken() !== token) return;
+      if (view.approvalOpenFor === job.id) view.approvalOpenFor = null;
+    }, { once: true });
     const approveTable = box.querySelector('table');
     const syncApprove = () => {
       for (const cb of approveTable.querySelectorAll('.disc-approve')) {
@@ -3967,42 +3990,63 @@
     syncApprove();
   }
 
-  /* Called on every refresh tick. Opens the approval dialog by itself only
-     for a job this browser session started, and only the first time — see
-     discAutoAsk/discAutoOffered above. Every other finished, unreviewed job
-     (including one this session started and already dismissed with Escape)
-     is left to the strip banner. */
-  async function maybeShowApproval() {
+  /* P1-9: a finished/cancelled scan used to pop the dialog above on every
+     arrival at the Nodes tab, in every session — a 62-row approval dialog
+     ambushing whoever opened the tab next. It now opens itself only for a
+     job THIS page load started, and only the first time it is ever seen
+     finished: discAutoOffered is set before the dialog is even built, so a
+     later Escape (or simply switching tabs and back) can never bring the
+     same job back as a popup. Anything else unreviewed sits in the strip
+     line (drawDiscStrip) instead, offered rather than forced. */
+  async function maybeAutoOpenApproval() {
     if (view.approvalOpenFor !== null) return;
-    const job = unreviewedDiscJobs().find(
-      (j) => discAutoAsk.has(j.id) && !discAutoOffered.has(j.id));
+    if (!App.el('modal').hidden) return;
+    const job = view.discJobs.find((j) =>
+      (j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+      && view.discStartedThisLoad.has(j.id) && !view.discAutoOffered.has(j.id));
     if (!job) return;
-    discAutoOffered.add(job.id);
+    view.discAutoOffered.add(job.id);
     await openApprovalDialog(job);
   }
 
-  /* The dismissible strip line: at most one, for the most recently finished
-     unreviewed job, whether or not it already had its automatic turn.
-     Review opens the same dialog on demand; Dismiss marks it reviewed the
-     same way the dialog's own Dismiss button does. */
-  function drawDiscBanner() {
-    const el = App.el('nd-disc-banner');
-    if (!el) return;
-    const jobs = unreviewedDiscJobs().filter((j) => j.id !== view.approvalOpenFor);
-    if (!jobs.length) { el.hidden = true; el.innerHTML = ''; return; }
-    const job = jobs.slice().sort((a, b) => (b.finished_ts || 0) - (a.finished_ts || 0))[0];
-    const found = Math.max(job.responded || 0, job.identified || 0);
-    el.hidden = false;
-    el.innerHTML =
-      `<span>Discovery of ${escape(job.target)} found ${found} new device(s)` +
-      ' · <button type="button" class="linkish" id="nd-disc-banner-review">Review</button></span>' +
-      '<span class="grow"></span>' +
-      '<button type="button" class="linkish" id="nd-disc-banner-dismiss">Dismiss</button>';
-    el.querySelector('#nd-disc-banner-review').onclick = () => {
-      discAutoOffered.add(job.id);
+  /* Any unreviewed finished/cancelled job that answered nothing at all —
+     no ping, no SNMP — is marked reviewed on sight rather than surfaced
+     anywhere: openApprovalDialog already refused to pop an empty dialog
+     for one, and a strip line offering to review zero devices would be
+     the same dead end with extra steps. */
+  function reviewEmptyDiscJobs() {
+    for (const j of view.discJobs) {
+      if ((j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+          && !j.responded && !j.identified) {
+        App.post(`/api/nodes/discovery/${j.id}/reviewed`, {}).catch(() => {});
+      }
+    }
+  }
+
+  /* The one line in the Nodes strip for everything reviewEmptyDiscJobs
+     didn't already clear: a job someone else's session started, or one
+     this page already auto-offered and the operator escaped rather than
+     answered. Review opens the identical approval dialog, on request;
+     Dismiss marks the job reviewed exactly as the dialog's own Dismiss
+     does, without ever opening it. */
+  function discStripJob() {
+    return view.discJobs.find((j) =>
+      (j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+      && (j.responded > 0 || j.identified > 0));
+  }
+
+  function drawDiscStrip() {
+    const strip = App.el('nd-disc-strip');
+    if (!strip) return;
+    const job = discStripJob();
+    if (!job) { strip.hidden = true; return; }
+    strip.hidden = false;
+    App.el('nd-disc-strip-text').textContent =
+      `Discovery of ${job.target} found ${job.identified} new device(s).`;
+    App.el('nd-disc-strip-review').onclick = () => {
       openApprovalDialog(job).catch(() => { view.approvalOpenFor = null; });
     };
-    el.querySelector('#nd-disc-banner-dismiss').onclick = async () => {
+    App.el('nd-disc-strip-dismiss').onclick = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
       App.refreshNow('nodes');
     };
@@ -4598,8 +4642,9 @@
         await loadDiscResults().catch(() => {});
       }
     }
-    maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
-    drawDiscBanner();
+    reviewEmptyDiscJobs();
+    drawDiscStrip();
+    maybeAutoOpenApproval().catch(() => { view.approvalOpenFor = null; });
   }
 
   /* Snap a filter back to "any" and drop the stored value with it: while it

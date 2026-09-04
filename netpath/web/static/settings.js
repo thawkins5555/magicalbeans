@@ -1,13 +1,49 @@
 /* The global Settings page. Changes are staged and applied together, because
    applying on every keystroke would restart the resolver constantly. */
 (() => {
-  // The settings this page last loaded from or saved to the server —
-  // Revert repaints from this snapshot rather than from App.state.settings,
-  // which a concurrent poll can update out from under an open edit.
+  /* Every field Apply/Revert round-trips through /api/settings: the
+     server key, the input id, and how to read/paint it. Shared by apply(),
+     the range check ahead of it, and the dirty-tracking below, so the three
+     cannot drift the way three separate id lists would. */
+  const APPLY_FIELDS = [
+    ['dns_enabled', 'set-dns-enabled', 'bool'],
+    ['dns_workers', 'set-dns-workers', 'num'],
+    ['dns_timeout_s', 'set-dns-timeout', 'num'],
+    ['dns_cache_days', 'set-dns-cache', 'num'],
+    ['dns_server', 'set-dns-server', 'str'],
+    ['dns_use_nslookup', 'set-dns-nslookup', 'bool'],
+    ['asn_enabled', 'set-asn-enabled', 'bool'],
+    ['asn_cache_days', 'set-asn-cache', 'num'],
+    ['asn_server', 'set-asn-server', 'str'],
+    ['netpath_refresh_s', 'set-refresh-netpath', 'num'],
+    ['nodes_refresh_s', 'set-refresh-nodes', 'num'],
+    ['alerts_refresh_s', 'set-refresh-alerts', 'num'],
+    ['netflow_refresh_s', 'set-refresh-netflow', 'num'],
+    ['snmp_refresh_s', 'set-refresh-snmp', 'num'],
+    ['syslog_refresh_s', 'set-refresh-syslog', 'num'],
+    ['ipam_refresh_s', 'set-refresh-ipam', 'num'],
+    ['debug_refresh_s', 'set-refresh-debug', 'num'],
+    ['dashboard_refresh_s', 'set-refresh-dashboard', 'num'],
+    ['wireless_refresh_s', 'set-refresh-wireless', 'num'],
+    ['configrx_refresh_s', 'set-refresh-configrx', 'num'],
+    ['max_trace_db_mb', 'set-trace-cap', 'num'],
+    ['max_flow_db_mb', 'set-flow-cap', 'num'],
+    ['max_snmp_db_mb', 'set-snmp-cap', 'num'],
+    ['max_syslog_db_mb', 'set-syslog-cap', 'num'],
+    ['max_ipam_db_mb', 'set-ipam-cap', 'num'],
+    ['max_nodes_db_mb', 'set-nodes-cap', 'num'],
+    ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
+    ['session_idle_minutes', 'set-idle-minutes', 'num'],
+    ['session_max_hours', 'set-session-hours', 'num'],
+  ];
+  const APPLY_FIELD_IDS = new Set(APPLY_FIELDS.map(([, id]) => id));
+
+  // Captured at load() and again after a successful apply() — the one point
+  // both agree is "what the server has". Revert repaints from this, not
+  // from the live App.state.settings, which a background poll (another
+  // operator applying their own changes) can move out from under an
+  // operator with a half-edited form open here.
   let saved = null;
-  // Sticky across a tab switch: activate() would otherwise repaint from
-  // the server on every return to this page, discarding an edit that was
-  // never applied. Cleared by a successful Apply or an explicit Revert.
   let dirty = false;
 
   function paint(s, server) {
@@ -68,22 +104,57 @@
     showUpdateInfo(server);
   }
 
-  function clearDirty() {
-    dirty = false;
-    App.el('set-apply').classList.remove('dirty');
-  }
-
   function load() {
     saved = { ...App.state.settings };
     paint(saved, App.state.serverState || {});
-    clearDirty();
+    dirty = false;
     status('Showing saved settings', 'var(--muted)');
   }
 
+  // Repaints from the snapshot taken at load()/apply(), not from
+  // App.state.settings — see the note on `saved` above.
   function revert() {
     paint(saved || App.state.settings, App.state.serverState || {});
-    clearDirty();
-    status('Reverted to the last saved settings', 'var(--muted)');
+    dirty = false;
+    status('Reverted — unsaved changes discarded', 'var(--muted)');
+  }
+
+  function markDirty() {
+    if (dirty) return;
+    dirty = true;
+    status('Unsaved changes', 'var(--warn)');
+  }
+
+  /* Compares each number field's own min/max — set per-field in index.html
+     — against what is actually typed in it, since the form is novalidate
+     and these are otherwise only advisory. Marks and focuses the first
+     offender and says why in the status line, the same shape as a refused
+     dialog field. */
+  function checkRanges() {
+    for (const [, id, kind] of APPLY_FIELDS) {
+      if (kind !== 'num') continue;
+      const el = App.el(id);
+      const raw = el.value.trim();
+      const value = Number(raw);
+      const min = el.min !== '' ? Number(el.min) : null;
+      const max = el.max !== '' ? Number(el.max) : null;
+      const bad = raw === '' || Number.isNaN(value)
+        || (min !== null && value < min) || (max !== null && value > max);
+      if (!bad) continue;
+      el.setAttribute('aria-invalid', 'true');
+      el.classList.add('invalid');
+      el.addEventListener('input', () => {
+        el.removeAttribute('aria-invalid');
+        el.classList.remove('invalid');
+      }, { once: true });
+      el.focus();
+      const label = (el.closest('label') || {}).textContent || id;
+      const range = min !== null && max !== null ? `between ${min} and ${max}`
+        : min !== null ? `at least ${min}` : `at most ${max}`;
+      status(`${label.replace(/\s+/g, ' ').trim()} must be ${range}.`, 'var(--fail)');
+      return false;
+    }
+    return true;
   }
 
   /* --------------------------------------------------------------- update */
@@ -251,113 +322,22 @@
     el.style.color = colour || 'var(--muted)';
   }
 
-  /* The text before the <input> in its own <label> — "Lookup timeout" out
-     of "Lookup timeout <input> s" — used to name the field in the range
-     refusal below without a second, separately-maintained label table. */
-  function fieldLabel(input) {
-    const label = input.closest('label');
-    if (!label) return input.id;
-    let text = '';
-    for (const node of label.childNodes) {
-      if (node === input) break;
-      if (node.nodeType === Node.TEXT_NODE) text += node.textContent;
-    }
-    return text.trim() || input.id;
-  }
-
-  /* The number fields Apply actually stages (the ids `apply()` reads
-     below) — NOT every input[type=number] on the settings page: that also
-     catches #new-token-expires ("blank = never", not a staged setting) and
-     the LDAP timeout (its own Apply, applyLdapSettings). */
-  const APPLY_NUMBER_FIELDS = [
-    'set-dns-workers', 'set-dns-timeout', 'set-dns-cache', 'set-asn-cache',
-    'set-refresh-netpath', 'set-refresh-nodes', 'set-refresh-alerts',
-    'set-refresh-netflow', 'set-refresh-snmp', 'set-refresh-syslog',
-    'set-refresh-ipam', 'set-refresh-debug', 'set-refresh-dashboard',
-    'set-refresh-wireless', 'set-refresh-configrx',
-    'set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
-    'set-ipam-cap', 'set-nodes-cap', 'set-alerts-cap',
-    'set-idle-minutes', 'set-session-hours',
-  ];
-
-  /* Each staged field against its own min/max — server-side values are
-     re-checked in post_settings regardless, this only saves a round trip
-     and says which field is wrong. Returns the first offending field, or
-     null when everything is in range. */
-  function firstOutOfRange() {
-    let first = null;
-    for (const id of APPLY_NUMBER_FIELDS) {
-      const input = App.el(id);
-      const raw = input.value.trim();
-      const value = Number(raw);
-      const min = input.min === '' ? null : Number(input.min);
-      const max = input.max === '' ? null : Number(input.max);
-      const bad = raw === '' || Number.isNaN(value)
-        || (min !== null && value < min) || (max !== null && value > max);
-      if (bad) {
-        input.setAttribute('aria-invalid', 'true');
-        if (!first) first = input;
-      } else {
-        input.removeAttribute('aria-invalid');
-      }
-    }
-    return first;
-  }
-
   async function apply() {
-    const bad = firstOutOfRange();
-    if (bad) {
-      const bounds = bad.max
-        ? `between ${bad.min} and ${bad.max}`
-        : `at least ${bad.min}`;
-      status(`${fieldLabel(bad)} must be ${bounds}.`, 'var(--fail)');
-      bad.focus();
-      return;
+    if (!checkRanges()) return;
+    const values = {};
+    for (const [key, id, kind] of APPLY_FIELDS) {
+      const el = App.el(id);
+      values[key] = kind === 'bool' ? el.checked
+        : kind === 'num' ? Number(el.value) : el.value.trim();
     }
-    const values = {
-      dns_enabled: App.el('set-dns-enabled').checked,
-      dns_workers: Number(App.el('set-dns-workers').value),
-      dns_timeout_s: Number(App.el('set-dns-timeout').value),
-      dns_cache_days: Number(App.el('set-dns-cache').value),
-      dns_server: App.el('set-dns-server').value.trim(),
-      dns_use_nslookup: App.el('set-dns-nslookup').checked,
-      asn_enabled: App.el('set-asn-enabled').checked,
-      asn_cache_days: Number(App.el('set-asn-cache').value),
-      asn_server: App.el('set-asn-server').value.trim(),
-      netpath_refresh_s: Number(App.el('set-refresh-netpath').value),
-      nodes_refresh_s: Number(App.el('set-refresh-nodes').value),
-      alerts_refresh_s: Number(App.el('set-refresh-alerts').value),
-      netflow_refresh_s: Number(App.el('set-refresh-netflow').value),
-      snmp_refresh_s: Number(App.el('set-refresh-snmp').value),
-      syslog_refresh_s: Number(App.el('set-refresh-syslog').value),
-      ipam_refresh_s: Number(App.el('set-refresh-ipam').value),
-      debug_refresh_s: Number(App.el('set-refresh-debug').value),
-      dashboard_refresh_s: Number(App.el('set-refresh-dashboard').value),
-      wireless_refresh_s: Number(App.el('set-refresh-wireless').value),
-      configrx_refresh_s: Number(App.el('set-refresh-configrx').value),
-      max_trace_db_mb: Number(App.el('set-trace-cap').value),
-      max_flow_db_mb: Number(App.el('set-flow-cap').value),
-      max_snmp_db_mb: Number(App.el('set-snmp-cap').value),
-      max_syslog_db_mb: Number(App.el('set-syslog-cap').value),
-      max_ipam_db_mb: Number(App.el('set-ipam-cap').value),
-      max_nodes_db_mb: Number(App.el('set-nodes-cap').value),
-      max_alerts_db_mb: Number(App.el('set-alerts-cap').value),
-      session_idle_minutes: Number(App.el('set-idle-minutes').value),
-      session_max_hours: Number(App.el('set-session-hours').value),
-    };
-    try {
-      await App.post('/api/settings', { scope: 'global', values });
-    } catch (error) {
-      status(error.message, 'var(--fail)');
-      return;
-    }
+    await App.post('/api/settings', { scope: 'global', values });
     await App.loadState();
-    clearDirty();
+    saved = { ...App.state.settings };
+    dirty = false;
     // The list used to name seven of the eleven refresh rates (IPAM had a
     // field and was left out; three had no field at all).
     status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
            `eleven refresh rates · idle timeout ${values.session_idle_minutes} min`, 'var(--ok)');
-    saved = { ...App.state.settings };
   }
 
   /* What each maintenance action actually destroys. Several of these are
@@ -777,31 +757,6 @@
       App.announce(`Theme: ${theme.options[theme.selectedIndex].text}`);
     };
     App.el('set-revert').onclick = revert;
-    // Delegated rather than one listener per field: the page has ~40 staged
-    // inputs, and #set-theme/#set-updates-enabled save themselves the
-    // instant they change, so they are excluded rather than counted as an
-    // unapplied edit.
-    const markDirty = (event) => {
-      const el = event.target;
-      if (!el || el.id === 'set-theme' || el.id === 'set-updates-enabled') return;
-      if (el.tagName !== 'INPUT' && el.tagName !== 'SELECT') return;
-      if (el.readOnly) return;
-      el.removeAttribute('aria-invalid');
-      dirty = true;
-      App.el('set-apply').classList.add('dirty');
-      status('Unsaved changes', 'var(--warn)');
-    };
-    App.el('page-settings').addEventListener('input', markDirty);
-    App.el('page-settings').addEventListener('change', markDirty);
-    // A real navigation away (reload, close, another site) is the one exit
-    // this page CAN intercept without a hook into App.selectTab, which is
-    // app.js's and not this module's to add — see App.pages.settings.activate
-    // below for how switching tabs inside the app is handled instead.
-    window.addEventListener('beforeunload', (event) => {
-      if (!dirty) return;
-      event.preventDefault();
-      event.returnValue = '';
-    });
     App.el('update-now').onclick = checkForUpdate;
     App.el('set-updates-enabled').onchange = setUpdatesEnabled;
     for (const button of document.querySelectorAll('[data-maint]')) {
@@ -811,21 +766,41 @@
       App.resetLayout();
       status('Panel sizes reset', 'var(--muted)');
     };
+    // A page-wide "dirty" used to discard silently on a tab change while
+    // every dialog already asked first (App.requestCloseModal). Delegated
+    // on the scroll container rather than one listener per field, so a
+    // field added later here is covered for free — scoped to the Apply
+    // fields specifically, not LDAP/tokens/users, which save on their own.
+    const scroll = document.querySelector('#page-settings .scroll');
+    if (scroll) {
+      const onEdit = (event) => { if (APPLY_FIELD_IDS.has(event.target.id)) markDirty(); };
+      scroll.addEventListener('input', onEdit);
+      scroll.addEventListener('change', onEdit);
+    }
+    // app.js has no hook to ask before a tab switch discards an unsaved
+    // page — the tab strip's own onclick calls App.selectTab() straight
+    // away (see start() in app.js) — so this listens ahead of it, in the
+    // capture phase, and only while Settings is open and dirty swaps in
+    // the same confirm-then-discard shape used for destructive actions.
+    document.addEventListener('click', (event) => {
+      if (!dirty || App.state.tab !== 'settings') return;
+      const tab = event.target.closest('.tab[data-tab]');
+      if (!tab || tab.dataset.tab === 'settings') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      App.confirmDestructive('Leave Settings?',
+        '<p>This page has changes that have not been applied. Leaving now ' +
+        'discards them.</p>', 'Discard changes', async () => {},
+        (confirmed) => {
+          if (confirmed) { dirty = false; App.selectTab(tab.dataset.tab); }
+        });
+    }, true);
     load();
   }
 
   App.pages.settings = {
     init,
-    // A dirty page is left exactly as the operator left it: the fields stay
-    // in the DOM, so activate only has to not repaint over them.
-    activate: () => {
-      if (!dirty) load();
-      loadUsers().catch(() => {});
-      loadTokens().catch(() => {});
-    },
-    deactivate: () => {
-      if (dirty) App.toast('Settings has unsaved changes \u2014 they are kept until you Apply or Revert', 'warn');
-    },
+    activate: () => { load(); loadUsers().catch(() => {}); loadTokens().catch(() => {}); },
     refresh: () => {},
     forcePasswordChange,
   };

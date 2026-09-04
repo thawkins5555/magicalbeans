@@ -263,7 +263,6 @@
             }, (confirmed) => { if (!confirmed) editSubnet(); });
         } },
         { label: 'Save', primary: true, onClick: async (b) => {
-          if (!App.requireFields(b, [['#sn-cidr', 'CIDR']])) return;
           await App.put(`/api/ipam/subnets/${subnet.id}`, {
             cidr: b.querySelector('#sn-cidr').value.trim(),
             label: b.querySelector('#sn-label').value.trim(),
@@ -420,13 +419,10 @@
     const usable = Boolean(platform.is_windows && platform.powershell);
     const body = App.el('ipam-dhcp-body');
     const notice = App.el('ipam-dhcp-unavailable');
-    const tab = App.el('ipam-subtab-dhcp');
+    const tab = document.querySelector('#page-ipam .subtab[data-subtab="dhcp"]');
     if (tab) {
       tab.disabled = !usable;
-      tab.title = usable ? '' : 'DHCP visibility needs a Windows host';
-      // A disabled tab left selected shows an empty, unreachable subpage —
-      // land back on the one view every platform actually has.
-      if (!usable && view.sub === 'dhcp') selectSub('subnets');
+      tab.title = usable ? '' : 'Unavailable on this host - see Subnets & hosts.';
     }
     if (!body || !notice) return usable;
     body.hidden = !usable;
@@ -436,13 +432,16 @@
         ? 'This host is Windows but no PowerShell was found on it. Reading a '
           + 'DHCP server needs PowerShell with the DhcpServer module (part of '
           + 'RSAT: DHCP Server Tools), installed on the machine running '
-          + 'SappiWhere — not necessarily on the DHCP server itself.'
+          + 'SappiWhere — not necessarily on the DHCP server itself. '
+          + 'Subnets & hosts still works here.'
         : 'Scopes and leases are read by running PowerShell with the '
           + 'DhcpServer module on the machine running SappiWhere, so this '
           + 'subtab only works when SappiWhere itself runs on Windows. '
           + 'Everything else in IPAM — subnets, scans, hosts and conflicts — '
           + 'works here. Subnet scanning finds the same addresses; it just '
           + 'cannot read the server\u2019s own lease records.';
+      // Never leave the page parked on a subtab it just disabled.
+      if (view.sub === 'dhcp') { App.rememberSub('ipam', 'subnets'); selectSub('subnets'); }
     }
     return usable;
   }
@@ -1117,7 +1116,7 @@
     const CONTROLS = ['ipam-alive-only', 'ipam-show-resolved', 'ipam-scope-sort'];
     App.rememberControls('ipam', CONTROLS);
     // /api/platform has already answered by the time any module inits.
-    applyDhcpAvailability();
+    const dhcpUsable = applyDhcpAvailability();
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => {
         App.rememberSub('ipam', btn.dataset.subtab);
@@ -1165,13 +1164,12 @@
     // as well as on the control, so the two have to start out agreeing.
     App.restoreControls('ipam', CONTROLS);
     view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
-    // A sub-tab remembered from before this host's platform was known (or
-    // from another host entirely) must not land on a DHCP subtab this one
-    // has since disabled.
-    const recalledSub = App.recallSub('ipam', view.sub);
-    const dhcpTab = App.el('ipam-subtab-dhcp');
-    selectSub(recalledSub === 'dhcp' && dhcpTab && dhcpTab.disabled
-      ? 'subnets' : recalledSub);
+    // A stored choice of the DHCP subtab from a Windows session does not
+    // survive a load where DHCP cannot work — recallSub only checks that
+    // the button still exists, not that it is enabled.
+    let startSub = App.recallSub('ipam', view.sub);
+    if (startSub === 'dhcp' && !dhcpUsable) startSub = 'subnets';
+    selectSub(startSub);
   }
 
   App.pages.ipam = { init, refresh, fastTick: drawStatus };

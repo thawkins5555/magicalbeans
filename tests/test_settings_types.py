@@ -301,6 +301,41 @@ def main() -> int:
               service.settings.get("dns_workers") == 4
               and isinstance(service.settings.get("dns_workers"), int),
               str(service.settings.get("dns_workers")))
+
+        # ------------------------------------------------- (e) range guard
+        # P1-7: a value that types fine but is out of the field's own
+        # min/max (dns_workers is 1..32 on both the Settings page and here)
+        # must be refused too, not just a wrong type.
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_workers": 999}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_workers out of range (999) -> 400",
+              status == 400, f"{status} {payload}")
+        check("HTTP refused dns_workers left service.settings unchanged",
+              service.settings.get("dns_workers") == 4,
+              str(service.settings.get("dns_workers")))
+
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"session_idle_minutes": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP session_idle_minutes below its floor (0) -> 400",
+              status == 400, f"{status} {payload}")
+
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"max_trace_db_mb": 8}},
+                                   cookie=admin_cookie)
+        check("HTTP max_trace_db_mb below its floor (8), which has no ceiling -> 400",
+              status == 400, f"{status} {payload}")
+
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_workers": 32}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_workers at its upper bound (32) -> 200",
+              status == 200, f"{status} {payload}")
     finally:
         try:
             server.stop()

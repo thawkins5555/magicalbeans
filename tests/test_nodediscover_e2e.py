@@ -12,7 +12,6 @@ from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 from netpath.ipam_scan import SubnetTooLarge
 import netpath.nodediscover as nodediscover_mod
-from netpath.web import api as web_api
 
 
 def main():
@@ -66,39 +65,46 @@ def main():
     assert db.device_count() == 1, "re-promoting must not create a duplicate device"
     print("promote: re-promoting the same result is idempotent OK")
 
-    # --- a device already added independently (127.0.0.1, promoted above)
-    # is found again by a fresh discovery job. The result must carry
-    # existing_device_id/name (api._discovery_result_json, built from a
-    # single ip->device map the way get_nodes_discovery_job does it) rather
-    # than looking like a brand new find, and promoting it must resolve to
-    # the existing device rather than creating a duplicate row.
-    job_id_existing = poller.start_discovery("device", "127.0.0.1",
-                                    overrides={"default_snmp_timeout_s": 1.0,
-                                               "discovery_communities": "public"})
+    # --- P1-2: a device present in Nodes for reasons that have nothing to
+    # do with this job — added by hand here, standing in for one promoted
+    # from an earlier scan or imported — must still come back flagged as
+    # already added, and promoting its result must reuse that row rather
+    # than create a duplicate.
+    db.remove_device(device_ids[0])
+    manual_id = db.add_device("127.0.0.1", name="manually-added")
+    job_id5 = poller.start_discovery("device", "127.0.0.1",
+                                     overrides={"default_snmp_timeout_s": 1.0,
+                                                "discovery_communities": "public"})
     for _ in range(50):
-        job = db.discovery_job(job_id_existing)
+        job = db.discovery_job(job_id5)
         if job["state"] != "running":
             break
         time.sleep(0.1)
-    job = db.discovery_job(job_id_existing)
+    job = db.discovery_job(job_id5)
     assert job["state"] == "done", job["state"]
-    results_existing = db.discovery_results(job_id_existing)
-    assert len(results_existing) == 1, results_existing
-    result_existing = results_existing[0]
-    assert result_existing["promoted_device_id"] is None
+    results5 = db.discovery_results(job_id5)
+    assert len(results5) == 1, results5
+    result5 = results5[0]
+    assert result5["promoted_device_id"] is None, \
+        "this job never promoted the result itself"
 
-    device_by_ip = {d["ip"]: d for d in db.devices()}
-    result_json = web_api._discovery_result_json(result_existing, device_by_ip=device_by_ip)
-    assert result_json["existing_device_id"] == device_ids[0], result_json
-    assert result_json["existing_device_name"] == device["name"], result_json
-    print("_discovery_result_json: an already-added IP carries existing_device_id OK")
+    from netpath.web import api as web_api
 
-    before_count = db.device_count()
-    device_ids_existing = poller.promote(job_id_existing, [result_existing["id"]])
-    assert device_ids_existing == [device_ids[0]], device_ids_existing
-    assert db.device_count() == before_count, \
-        "promoting an already-monitored IP must not create a new device"
-    print("promote: an independently-added IP resolves to the existing device, no duplicate OK")
+    class _FakeService:
+        def __init__(self, nodes_db):
+            self.nodes_db = nodes_db
+
+    served = web_api.get_nodes_discovery_job(_FakeService(db), {}, {}, job_id5)
+    served_result = served["results"][0]
+    assert served_result["existing_device_id"] == manual_id, served_result
+    assert served_result["existing_device_name"] == "manually-added", served_result
+    print("discovery serialiser: independently-added device flagged existing OK")
+
+    device_ids5 = poller.promote(job_id5, [result5["id"]])
+    assert device_ids5 == [manual_id], device_ids5
+    assert db.device_count() == 1, \
+        "promoting an already-present IP must not create a duplicate device"
+    print("promote: independently-added device reused, no duplicate row OK")
 
     # --- subnet-kind discovery: a tiny real loopback-only subnet
     job_id2 = poller.start_discovery("subnet", "127.0.0.0/30",
