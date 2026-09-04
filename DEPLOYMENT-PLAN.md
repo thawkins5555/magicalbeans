@@ -19,6 +19,15 @@ is committed only after the affected suites pass.
 - T0-4 Wireless tab labelled FortiGate (`web/static/index.html`)
 - T0-5 `busy_timeout` (plus `cache_size`/`mmap_size`) set centrally in `dbopen`
 
+**W1-D: Tier 0 addition (user-requested) — notification roll-up window**
+- T0-6 A configurable hold on first notifications (`notify_rollup_delay_s`,
+  default 240 s): alerts open immediately in the UI as today, but their
+  first email waits out the window so the dependency rollup can suppress
+  children before anything is sent; everything due in the same flush is
+  coalesced into one digest email, which counts once against the hourly
+  budget. Directly addresses the §3.3 race (377 child alerts, 1,355 emails
+  at 1000 devices) and the §3.4 budget exhaustion.
+
 **W1-B: Tier 2 performance pair**
 - T2-1 Hoist the `Intl.Collator` in `app.js` sort
 - T2-2 Batch ICMP in `ipam_scan.py` (ICMP datagram sockets where permitted,
