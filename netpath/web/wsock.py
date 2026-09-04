@@ -448,12 +448,32 @@ class WebSocket:
             if not self.closed:
                 self.closed = True
                 self._write(_frame(OP_CLOSE, payload))
+        # Windows resets a connection that is closed with data still unread in
+        # its receive buffer, and a reset discards whatever WE last sent — so
+        # the peer loses the close frame naming the reason, and reads a bare
+        # ConnectionResetError instead of "There are already 16 SSH sessions".
+        # Draining what the peer already sent turns that reset back into an
+        # orderly FIN. Bounded, because the point is to empty a buffer, not to
+        # keep reading a peer that is still talking, and best-effort because
+        # every failure here ends the same way as success: shut the socket.
+        self._drain()
         # No waiting for the peer's answering close: the handler thread is
         # about to let the connection go, and a half-closed socket is what
         # unblocks a recv() parked in another thread.
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except (OSError, AttributeError):
+            pass
+
+    def _drain(self, rounds: int = 8) -> None:
+        """Discard what is already in the receive buffer, without blocking."""
+        try:
+            for _ in range(rounds):
+                if not select.select([self.sock], [], [], 0)[0]:
+                    return
+                if not self.sock.recv(65536):
+                    return
+        except (OSError, ValueError, AttributeError):
             pass
 
     def unblock(self) -> None:
