@@ -2,7 +2,7 @@
    The per-tab modules hang their render functions off App.pages. */
 const App = (() => {
   const state = {
-    tab: 'netpath',
+    tab: 'dashboard',
     settings: {},
     flowSettings: {},
     dimensions: [],
@@ -34,7 +34,7 @@ const App = (() => {
      sharing DOM ids with anything in settings.js. `forced` is set for the
      must-change-password prompt: Cancel is hidden, since there's nowhere
      else useful to go until it's done. */
-  function accountModal(forced = false) {
+  function accountModal({ forced = false } = {}) {
     const box = modal('Change your password', `
       <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
       <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
@@ -54,28 +54,25 @@ const App = (() => {
             } }]
           : [{ label: 'Cancel', onClick: closeModal }]),
         { label: 'Change password', primary: true, onClick: async () => {
-          const status = document.getElementById('am-status');
+          // A thrown Error (mismatch, or the server's own refusal) is
+          // caught by runModalAction and shown through showModalError —
+          // the same place and style as every other dialog's failure,
+          // rather than this one writing its own #am-status text.
           const next = document.getElementById('am-new').value;
           const repeat = document.getElementById('am-repeat').value;
-          if (next !== repeat) {
-            status.textContent = 'The two new passwords differ';
-            status.style.color = 'var(--fail)';
-            return;
-          }
-          try {
-            await post('/api/password', {
-              current_password: document.getElementById('am-current').value,
-              new_password: next,
-            });
-            status.textContent = 'Changed. Signing you back in…';
-            status.style.color = 'var(--ok)';
-            setTimeout(() => { window.location.href = '/login'; }, 1200);
-          } catch (error) {
-            status.textContent = error.message;
-            status.style.color = 'var(--fail)';
-          }
+          if (next !== repeat) throw new Error('The two new passwords differ');
+          await post('/api/password', {
+            current_password: document.getElementById('am-current').value,
+            new_password: next,
+          });
+          const status = document.getElementById('am-status');
+          status.textContent = 'Changed. Signing you back in…';
+          status.style.color = 'var(--ok)';
+          setTimeout(() => { window.location.href = '/login'; }, 1200);
         } },
-      ]);
+      // Reachable even from a kiosk display: a must-change-password account
+      // cannot be waved off with a toast, there is nowhere else to go.
+      ], forced ? { kioskSafe: true } : {});
     // Escape and a backdrop click must not dismiss this one. Without the
     // lock the prompt was advisory: it closed on a stray keypress, came back
     // only on the next reload, and the account stayed usable throughout.
@@ -87,8 +84,8 @@ const App = (() => {
      below. A key missing here is a bug in the markup rather than a reason
      to say nothing, so the raw key is the fallback. */
   const MODULE_NAMES = {
-    nodes: 'Nodes', alerts: 'Alerts', netpath: 'NetPath', netflow: 'NetFlow',
-    snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'Wireless',
+    nodes: 'Nodes', alerts: 'Alerts', netpath: 'Routes', netflow: 'NetFlow',
+    snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'FortiWireless',
     configrx: 'ConfigRX', settings: 'Settings', ssh: 'SSH',
   };
 
@@ -1138,6 +1135,7 @@ const App = (() => {
     for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
       field.removeAttribute('aria-invalid');
       field.classList.remove('invalid');
+      field.removeAttribute('aria-describedby');
     }
   }
 
@@ -1146,6 +1144,12 @@ const App = (() => {
     if (!node) return false;
     node.textContent = message;
     node.hidden = false;
+    // Point every already-marked-invalid field at the sentence explaining
+    // why, so a screen reader announces it while the field itself has
+    // focus, not only once when the error first appears.
+    for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
+      field.setAttribute('aria-describedby', 'modal-error');
+    }
     announce(message);
     return true;
   }
@@ -1206,6 +1210,7 @@ const App = (() => {
       node.addEventListener('input', () => {
         node.removeAttribute('aria-invalid');
         node.classList.remove('invalid');
+        node.removeAttribute('aria-describedby');
       }, { once: true });
       if (!firstEmpty) firstEmpty = node;
     }
@@ -1240,6 +1245,19 @@ const App = (() => {
   }
 
   function modal(title, bodyHtml, buttons, options = {}) {
+    // A wall display has no one at the keyboard to answer a dialog, so one
+    // that pops up over the rotation just sits there until someone walks
+    // over — the whole screen stops updating for whoever it was meant to
+    // inform. A toast says the same thing without holding the page hostage;
+    // {kioskSafe: true} is the one honest exception (the must-change-
+    // password prompt), where there truly is nothing else the account can
+    // do.
+    if (state.kiosk && !options.kioskSafe) {
+      const plain = title && typeof title === 'object' && title.html !== undefined
+        ? String(title.html).replace(/<[^>]+>/g, '') : String(title);
+      toast(plain, 'info');
+      return document.createElement('div');
+    }
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
     // Remembered before the dialog takes focus. `options.trigger` lets a
@@ -1257,8 +1275,9 @@ const App = (() => {
     // says so by passing {html}.
     const heading = title && typeof title === 'object' && title.html !== undefined
       ? String(title.html) : escapeHtml(title);
-    // Long forms put their buttons at the top, so Save is reachable without
-    // scrolling past every field first.
+    // Buttons sit at the top by default, so Save is reachable without
+    // scrolling past every field first; a short confirm passes
+    // {buttonsTop: false} to keep its Cancel/confirm pair beneath the body.
     /* The body and the buttons go inside a real <form>.
 
        Enter did nothing in any of the fifty-odd dialogs in this product
@@ -1275,16 +1294,16 @@ const App = (() => {
 
        The button row carries its own class rather than being found as
        '.row': three dialog bodies lay out checkboxes in a <div class="row">
-       of their own (netflow.js, snmp.js, syslog.js), and only the fact that
-       all three happen to pass {buttonsTop} keeps the buttons out of them
-       today. */
-    const errorHtml = '<p class="modal-error" hidden></p>';
+       of their own (netflow.js, snmp.js, syslog.js), and it is the
+       `.modal-buttons` class rather than position that keeps the buttons
+       out of them. */
+    const errorHtml = '<p class="modal-error" id="modal-error" hidden></p>';
     const openForm = '<form class="modal-form" novalidate>';
-    box.innerHTML = options.buttonsTop
+    box.innerHTML = options.buttonsTop === false
       ? `<h2 id="modal-title">${heading}</h2>${openForm}` +
-        `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`
+        `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`
       : `<h2 id="modal-title">${heading}</h2>${openForm}` +
-        `${bodyHtml}${errorHtml}<div class="row modal-buttons"></div></form>`;
+        `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`;
     const form = box.querySelector('form.modal-form');
     // A <button> inside a <form> defaults to type=submit, so a Save, Walk or
     // Install that a module wrote into the BODY would run its own onclick and
@@ -1358,12 +1377,15 @@ const App = (() => {
   }
 
   const closeModal = () => {
+    // Un-inert first: a locked dialog (forced password change) still bars the
+    // rest of this function, but the background must never be stranded
+    // inert with no way to reach it, whatever called this while locked.
+    setBackgroundInert(false);
     if (state.modalLocked) return;
     const wrap = document.getElementById('modal');
     const wasOpen = wrap && !wrap.hidden;
     if (wrap) wrap.hidden = true;
     modalDirty = false;
-    setBackgroundInert(false);
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
@@ -1521,7 +1543,9 @@ const App = (() => {
         await onConfirm();
         done(true);
       } },
-    ]);
+    // Short and single-screen: keep Cancel/confirm under the warning text
+    // rather than above it.
+    ], { buttonsTop: false });
   }
 
   /* ------------------------------------------------- charts, shared
@@ -3370,7 +3394,7 @@ const App = (() => {
       };
     }
     const accountBtn = document.getElementById('account-btn');
-    if (accountBtn) accountBtn.onclick = accountModal;
+    if (accountBtn) accountBtn.onclick = () => accountModal();
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') requestCloseModal();
     };
@@ -3488,14 +3512,14 @@ const App = (() => {
     });
     if (!applyRoute(true)) {
       // A refresh should land back on whichever module was open, rather than
-      // resetting to NetPath — but only if that tab is one this browser can
-      // actually show: a build could drop it, the account may not be allowed
-      // to read it, or its module may have just failed above.
-      let initialTab = 'netpath';
+      // resetting to Dashboard — but only if that tab is one this browser
+      // can actually show: a build could drop it, the account may not be
+      // allowed to read it, or its module may have just failed above.
+      let initialTab = 'dashboard';
       try {
         const stored = localStorage.getItem(TAB_KEY);
         if (stored) initialTab = stored;
-      } catch (error) { /* private browsing, or storage full: default to netpath */ }
+      } catch (error) { /* private browsing, or storage full: default to dashboard */ }
       if (!usableTab(initialTab)) {
         // Dashboard is the last resort rather than an error page: it is
         // never permission-gated and has no module state of its own to break.

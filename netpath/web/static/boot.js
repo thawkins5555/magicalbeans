@@ -13,7 +13,7 @@
    never affected: app.js reads the same key on load and selects the tab
    regardless. This is only about painting it without a flicker.
 
-   The key and the 'netpath' fallback must stay in step with app.js's own
+   The key and the 'dashboard' fallback must stay in step with app.js's own
    TAB_KEY / default tab. */
 (function () {
   /* The theme comes first and runs on every page — index, sign-in and the
@@ -35,7 +35,7 @@
   // sign-in and SSH pages have no tabs and stop here.
   if (!/^\/(index\.html)?$/.test(window.location.pathname)) return;
 
-  var DEFAULT_TAB = 'netpath';
+  var DEFAULT_TAB = 'dashboard';
   var TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
               'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
   var tab = null;

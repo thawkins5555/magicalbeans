@@ -9,7 +9,7 @@
   const CATEGORY_LABEL = {
     trace: 'Traceroute', dns: 'Reverse DNS', netflow: 'NetFlow',
     snmp: 'SNMP traps', nodes: 'Nodes', alerts: 'Alerts', ipam: 'IPAM',
-    wireless: 'Wireless', configrx: 'ConfigRX', system: 'System',
+    wireless: 'FortiWireless', configrx: 'ConfigRX', system: 'System',
     error: 'Errors',
   };
   const STATUS_COLOR = {

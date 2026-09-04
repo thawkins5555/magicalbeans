@@ -8,6 +8,11 @@
   function show(message) {
     error.textContent = message;
     error.hidden = !message;
+    const invalid = !!message;
+    for (const field of [document.getElementById('username'), document.getElementById('password')]) {
+      if (invalid) field.setAttribute('aria-invalid', 'true');
+      else field.removeAttribute('aria-invalid');
+    }
   }
 
   async function submit(event) {

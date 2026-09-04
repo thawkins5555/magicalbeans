@@ -17,11 +17,12 @@
 
   <form id="login-form" autocomplete="on">
     <label for="username">Username</label>
-    <input id="username" name="username" autocomplete="username" autofocus required>
+    <input id="username" name="username" autocomplete="username" autofocus required
+           aria-describedby="login-error">
 
     <label for="password">Password</label>
     <input id="password" name="password" type="password"
-           autocomplete="current-password" required>
+           autocomplete="current-password" required aria-describedby="login-error">
 
     <p id="login-error" class="err" role="alert" hidden></p>
     <button id="login-button" type="submit" class="primary">Sign in</button>

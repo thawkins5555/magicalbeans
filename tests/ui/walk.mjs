@@ -451,6 +451,97 @@ async function checkDialog(page, dir, tag) {
   });
 
   await closeAnything(page);
+
+  await check('Account opens with a Cancel button and closes on Escape', async () => {
+    await page.click('#account-btn');
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await sleep(300);
+    const before = await page.evaluate(() => ({
+      title: (document.getElementById('modal-title') || {}).textContent,
+      hasCancel: [...document.querySelectorAll('.modal-buttons button')]
+        .some((b) => b.textContent.trim() === 'Cancel'),
+    }));
+    assert(before.hasCancel, `no Cancel button in "${before.title}"`);
+    await page.keyboard.press('Escape');
+    await sleep(400);
+    const closed = await page.evaluate(() => document.getElementById('modal').hidden);
+    assert(closed, 'Escape did not close the Account dialog');
+    return `"${before.title}" had Cancel, Escape closed it`;
+  });
+
+  await closeAnything(page);
+
+  await check('the WEB link on a selected device points at http://<ip>/', async () => {
+    await selectTab(page, 'nodes');
+    await settle(page, 900);
+    await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
+    await page.click('#nodes-table tbody tr:first-child');
+    await sleep(500);
+    const web = await page.evaluate(() => {
+      const el = document.getElementById('nd-web-device');
+      return { hidden: el ? el.hidden : true, href: el ? el.getAttribute('href') : null };
+    });
+    assert(!web.hidden, 'the WEB link stayed hidden with a device selected');
+    assert(web.href && web.href.startsWith('http://'), `href was ${web.href}`);
+    return web.href;
+  });
+
+  await check('a discovery result for an already-added IP is not checkable', async () => {
+    const setup = await page.evaluate(async () => {
+      const devices = await App.get('/api/nodes/devices', { limit: 1 });
+      const device = (devices.devices || [])[0];
+      if (!device) return { error: 'no devices to reuse' };
+      const groups = await App.get('/api/nodes/groups');
+      const group = (groups.groups || [])[0];
+      if (!group) return { error: 'no polling profile to scan with' };
+      // allow_ping_only sidesteps the "no v1/v2c community" refusal — the
+      // point here is only that the address matches an existing device,
+      // which nodediscover.py records regardless of ping/SNMP outcome.
+      const job = await App.post('/api/nodes/discovery',
+        { target: device.ip, group_id: group.id, allow_ping_only: true });
+      for (let i = 0; i < 40; i += 1) {
+        const status = await App.get(`/api/nodes/discovery/${job.id}`);
+        if (status.job.state !== 'running') {
+          return { jobId: job.id, deviceId: device.id, target: device.ip,
+                    state: status.job.state };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return { jobId: job.id, deviceId: device.id, target: device.ip, state: 'timeout' };
+    });
+    if (setup.error) return `skipped: ${setup.error}`;
+    try {
+      assert(setup.state === 'done', `job ended in state ${setup.state}`);
+      await page.click('#page-nodes .subtabs [data-subtab="discovery"]');
+      await settle(page, 500);
+      await page.waitForSelector('#disc-jobs-table tbody tr', { timeout: 10000 });
+      await page.locator('#disc-jobs-table tbody tr', { hasText: setup.target })
+        .first().click();
+      await sleep(500);
+      const row = await page.evaluate(() => {
+        const hit = [...document.querySelectorAll('#disc-results-table tbody tr')]
+          .find((tr) => tr.textContent.includes('Already added'));
+        if (!hit) return null;
+        const link = hit.querySelector('a');
+        return { text: hit.textContent.trim(),
+                 hasCheckbox: !!hit.querySelector('input[type=checkbox]'),
+                 href: link ? link.getAttribute('href') : null };
+      });
+      assert(row, 'no "Already added" row found in the results table');
+      assert(!row.hasCheckbox, 'an "Already added" row still carries a checkbox');
+      assert(row.href === `#/nodes/device/${setup.deviceId}`, `link was ${row.href}`);
+      return row.text;
+    } finally {
+      await page.evaluate((id) => App.del(`/api/nodes/discovery/${id}`).catch(() => {}),
+        setup.jobId).catch(() => {});
+      // Leave the Nodes subtab as every other check here found it — the
+      // devices grid other checks (checkRouting) rely on being visible.
+      await page.click('#page-nodes .subtabs [data-subtab="devices"]').catch(() => {});
+      await settle(page, 300);
+    }
+  });
+
+  await closeAnything(page);
 }
 
 async function checkRouting(page, base, dir, tag) {

@@ -35,17 +35,18 @@
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab" data-tab="nodes">NODES</button>
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
-  <button class="tab" data-tab="netpath">NETPATH</button>
+  <button class="tab" data-tab="netpath">ROUTES</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="snmp">SNMP TRAP</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="ipam">IPAM</button>
   <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
-       FORTINET-FORTIGATE-MIB); the tab used to just say WIRELESS, which
-       reads as "every wireless estate" and only corrects itself once an
-       Aruba or Ubiquiti shop opens the page and finds nothing there. -->
-  <button class="tab" data-tab="wireless">WIRELESS (FORTIGATE)</button>
-  <button class="tab" data-tab="configrx">CONFIGRX</button>
+       FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than just
+       WIRELESS, which reads as "every wireless estate" and only corrects
+       itself once an Aruba or Ubiquiti shop opens the page and finds
+       nothing there. -->
+  <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
+  <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
   <button class="tab" data-tab="debug">DEBUG</button>
   <button class="tab" data-tab="settings">SETTINGS</button>
   <span class="grow"></span>
@@ -99,6 +100,13 @@
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
+
+  <!-- A finished discovery scan's approval no longer pops a dialog over
+       whatever the operator is doing (see maybeShowApproval/drawDiscBanner
+       in nodes.js) — this line says a scan is waiting and lets Review open
+       the same dialog on demand. Built entirely in JS; empty and hidden
+       when nothing is waiting. -->
+  <div class="bar wrap" id="nd-disc-banner" hidden></div>
 
   <nav class="subtabs">
     <button class="subtab active" data-subtab="devices">DEVICES</button>
@@ -183,6 +191,7 @@
                  label, as App.helpLink documents. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
+            <a id="nd-web-device" class="linkish" target="_blank" rel="noopener" hidden>WEB</a>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The status timeline, with its own range picker: "how long has
@@ -677,12 +686,12 @@
   </div>
 
   <nav class="subtabs">
-    <button class="subtab active" data-subtab="dhcp">DHCP</button>
+    <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
     <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
-    <button class="subtab" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
+    <button id="ipam-subtab-dhcp" class="subtab" data-subtab="dhcp">DHCP</button>
   </nav>
 
-  <div id="ipam-sub-subnets" class="subpage">
+  <div id="ipam-sub-subnets" class="subpage active">
    <div class="cols" data-splitter="ipam-subnets">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
@@ -728,14 +737,17 @@
     <div class="table-wrap pad-x pad-b" style="flex:1"><table id="ipam-conflicts-table"></table></div>
   </div>
 
-  <div id="ipam-sub-dhcp" class="subpage active">
+  <div id="ipam-sub-dhcp" class="subpage">
     <!-- Shown instead of the form on a host with no PowerShell: reading a
          Windows DHCP server needs it, and the whole subtab rendered in full
          on Linux with Windows-only help text and no hint it could not work.
-         ipam.js unhides one of these two on start-up from /api/platform. -->
+         ipam.js unhides one of these two on start-up from /api/platform, and
+         disables the DHCP subtab itself alongside ipam-dhcp-unavailable. -->
     <div id="ipam-dhcp-unavailable" class="pad-x pad-b" hidden style="padding-top:14px">
       <h2>DHCP is a Windows feature</h2>
       <p class="hint" id="ipam-dhcp-unavailable-why"></p>
+      <p class="hint">Scanned subnets and hosts are still tracked on this platform — see
+        <b>Subnets &amp; hosts</b>.</p>
     </div>
     <div id="ipam-dhcp-body">
     <div class="bar">

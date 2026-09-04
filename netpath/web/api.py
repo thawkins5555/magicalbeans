@@ -21,6 +21,7 @@ from ..alertrules import device_id_for
 from ..alertsdb import is_window_active
 from ..analysis import availability, build_timeline, build_topology
 from .. import hostresolve
+from .. import namelookup
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
@@ -385,11 +386,22 @@ def get_targets(service, params, body) -> dict:
                         for row in rows]}
 
 
-def post_target(service, params, body) -> dict:
-    defaults = service.settings
-    host = str(body.get("host", "")).strip()
+def _valid_target_host(host: str) -> str:
+    """The destination is pinged and traced by name, so — unlike a Nodes
+    device address — a hostname is fine here; what is not is a value that
+    is neither an IP literal nor a syntactically valid name, which would
+    otherwise sit unpollable until someone noticed."""
+    host = str(host or "").strip()
     if not host:
         raise ValueError("A destination host or address is required")
+    if not namelookup.is_resolver_address(host):
+        raise ValueError(f"'{host}' is not an IP address or a resolvable name")
+    return host
+
+
+def post_target(service, params, body) -> dict:
+    defaults = service.settings
+    host = _valid_target_host(body.get("host", ""))
     target_id = service.db.add_target(
         host=host,
         label=str(body.get("label") or host).strip(),
@@ -408,6 +420,8 @@ def put_target(service, params, body, target_id: int) -> dict:
     fields = {k: v for k, v in body.items()
               if k in {"host", "label", "interval_s", "max_hops", "probes",
                        "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
+    if "host" in fields:
+        fields["host"] = _valid_target_host(fields["host"])
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
@@ -1142,6 +1156,52 @@ def _scope_defaults(scope: str) -> dict:
     }.get(scope, appdb.GLOBAL_DEFAULTS)
 
 
+# Numeric bounds the Settings page's own <input min max> attributes declare
+# (index.html ~997-1112). Enforced here too so a request that bypasses the
+# browser cannot store a refresh rate of 0 or a negative database cap.
+# max of None means "no documented upper bound".
+GLOBAL_SETTINGS_RANGES = {
+    "dns_workers": (1, 32),
+    "dns_timeout_s": (0.5, 30),
+    "dns_cache_days": (1, 365),
+    "asn_cache_days": (1, 365),
+    "netpath_refresh_s": (1, 300),
+    "nodes_refresh_s": (1, 3600),
+    "alerts_refresh_s": (1, 3600),
+    "netflow_refresh_s": (1, 3600),
+    "snmp_refresh_s": (1, 3600),
+    "syslog_refresh_s": (1, 3600),
+    "ipam_refresh_s": (1, 3600),
+    "wireless_refresh_s": (1, 3600),
+    "configrx_refresh_s": (1, 3600),
+    "dashboard_refresh_s": (1, 3600),
+    "debug_refresh_s": (1, 60),
+    "max_trace_db_mb": (16, None),
+    "max_flow_db_mb": (16, None),
+    "max_snmp_db_mb": (16, None),
+    "max_syslog_db_mb": (16, None),
+    "max_ipam_db_mb": (16, None),
+    "max_nodes_db_mb": (16, None),
+    "max_alerts_db_mb": (16, None),
+    "session_idle_minutes": (1, 1440),
+    "session_max_hours": (1, 168),
+    "ldap_timeout_s": (1, 120),
+}
+
+
+def _check_settings_ranges(values: dict) -> None:
+    for key, (lo, hi) in GLOBAL_SETTINGS_RANGES.items():
+        if key not in values:
+            continue
+        value = values[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        if value < lo or (hi is not None and value > hi):
+            raise ValueError(
+                f"{key} must be between {lo} and {hi}" if hi is not None
+                else f"{key} must be at least {lo}")
+
+
 def post_settings(service, params, body) -> dict:
     from ..settingsutil import coerce_settings
 
@@ -1160,6 +1220,7 @@ def post_settings(service, params, body) -> dict:
     # then raised from the next start's int() — every start, until the
     # database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
+    _check_settings_ranges(values)
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
@@ -2216,9 +2277,12 @@ def _discovery_job_json(row) -> dict:
             "error": row["error"]}
 
 
-def _discovery_result_json(row, installed=None) -> dict:
-    """`installed` is the set of MIB filenames present, passed by the caller
-    once per listing so the "install these MIBs" hint is not a query per row."""
+def _discovery_result_json(row, installed=None, device_by_ip=None) -> dict:
+    """`installed` is the set of MIB filenames present, and `device_by_ip`
+    an ip -> devices-row map, both passed by the caller once per listing so
+    neither the "install these MIBs" hint nor the "already added" flag is a
+    query per row."""
+    existing = (device_by_ip or {}).get(row["ip"])
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
@@ -2226,6 +2290,8 @@ def _discovery_result_json(row, installed=None) -> dict:
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
             "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
             "promoted_device_id": row["promoted_device_id"],
+            "existing_device_id": existing["id"] if existing else None,
+            "existing_device_name": existing["name"] if existing else "",
             **_discovery_identification(row, installed)}
 
 
@@ -3794,8 +3860,10 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
         raise ValueError("No such discovery job")
     results = service.nodes_db.discovery_results(job_id)
     installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
+    device_by_ip = {d["ip"]: d for d in service.nodes_db.devices()}
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r, installed) for r in results]}
+            "results": [_discovery_result_json(r, installed, device_by_ip)
+                        for r in results]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -5395,10 +5463,18 @@ def get_configrx_device_backups(service, params, body, device_id) -> dict:
 
 
 def get_configrx_backup(service, params, body, backup_id) -> dict:
+    """Reading a stored config is a read, not a write — but a backup taken
+    with store_secrets on is stored verbatim (see configrx.py's
+    _pull_config), so a reader without ConfigRX write is redacted here,
+    same as get_configrx_diff always is, rather than trusted with the raw
+    text the row itself carries."""
     row = service.configrx_db.backup(backup_id)
     if not row:
         raise ValueError("No such backup")
-    content = service.configrx_db.backup_content(backup_id)
+    content = service.configrx_db.backup_content(backup_id) or ""
+    already_redacted = bool(row["redacted"]) if "redacted" in row.keys() else False
+    if not already_redacted and not _may_read_secrets(service, params, "configrx"):
+        content, _ = configrx_redact.redact(content)
     return {"backup": _configrx_backup_json(row), "content": content}
 
 
