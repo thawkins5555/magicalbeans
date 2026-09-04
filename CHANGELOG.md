@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.46.2 — The browser walk was red the whole time](#4462--the-browser-walk-was-red-the-whole-time)
 - [4.46.1 — Review of 4.41.0–4.46.0](#4461--review-of-44104460)
 - [4.46.0 — Any screen, any hand, any wall](#4460--any-screen-any-hand-any-wall)
 - [4.45.0 — Twelve modules, one set of parts](#4450--twelve-modules-one-set-of-parts)
@@ -110,6 +111,44 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.46.2 — The browser walk was red the whole time
+
+Every commit from 4.41.0 to 4.46.1 failed CI, and nobody looked. The four
+Python suite jobs passed throughout — GitHub's runners install
+`traceroute`, so the one failure that shows up locally does not exist
+there — but the **browser walk** job (`tests/ui/walk.mjs`, 46 checks
+against a seeded 50-device fleet) failed on all of them, while `main`
+stayed green. Two checks, both of which the branch itself had invalidated.
+
+- **`no write-gated control is visible to the viewer`.** This asserted the
+  rule 4.41.0 deliberately replaced. Gating used to HIDE a control a
+  read-only account could not use; that release made it disable the control
+  and say why, because hiding taught an operator their install simply
+  lacked the feature, and because it was one-way — a grant made
+  mid-session could never bring the control back without a reload. The
+  product changed and its own UI test did not, so the two had disagreed
+  about what correct looks like ever since. The check now asserts what
+  actually matters, and is the stronger of the two: every write-gated
+  control the viewer can *see* must be inactive — `disabled` for the five
+  tags `applyWriteGate` disables (a disabled `<fieldset>` takes every
+  control inside it, which is how the USERS grid is neutralised), `inert`
+  for anything else — and must carry `data-write-denied` and the
+  `write-denied` class. A control that is visible *and* live now fails
+  here, where the old assertion passed anything as long as it was hidden.
+  Checked against the running application before the check was rewritten:
+  fifteen gated controls are on screen for a read-only account and all
+  fifteen are already disabled or inert, so nothing in the product needed
+  fixing.
+- **`the tile grid renders with real numbers`.** The check read
+  `#dash-grid .dash-tile` and `.dash-value`; 4.46.0 renamed those to
+  `.tile` and `.figure-value` when `tile()` and `figure()` moved into
+  `app.js` so the kiosk strips could share them. The Dashboard was fine
+  throughout — the very next check, which follows a tile's link through to
+  a filtered Nodes view, passed on every one of those red runs.
+
+Nothing in the application changed. The walk now reports 46/46 against a
+seeded instance.
 
 ### 4.46.1 — Review of 4.41.0–4.46.0
 

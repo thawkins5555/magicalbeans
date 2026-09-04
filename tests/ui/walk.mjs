@@ -549,8 +549,11 @@ async function checkDashboard(page, dir, tag) {
     await settle(page, 2500);
     await shoot(page, dir, `tab-dashboard-${tag}`);
     const grid = await page.evaluate(() => {
-      const tiles = [...document.querySelectorAll('#dash-grid .dash-tile')];
-      const values = [...document.querySelectorAll('#dash-grid .dash-value')]
+      // .tile / .figure-value since 4.46.0, when tile() and figure() moved
+      // out of dashboard.js into app.js (App.tile / App.figure) so the kiosk
+      // strips could render the same figures. The dash- prefix went with them.
+      const tiles = [...document.querySelectorAll('#dash-grid .tile')];
+      const values = [...document.querySelectorAll('#dash-grid .figure-value')]
         .map((v) => v.textContent.trim());
       return {
         tiles: tiles.length,
@@ -824,7 +827,7 @@ async function checkMisc(page) {
 }
 
 async function checkReadOnly(browser, base, creds, dir, tag) {
-  section('A read-only account sees no write control, and is refused nothing');
+  section('A read-only account can act on nothing, and is refused nothing');
 
   const password = creds.viewer_password;
   if (!password) {
@@ -852,15 +855,35 @@ async function checkReadOnly(browser, base, creds, dir, tag) {
     return `${seen.length} tab(s): ${seen.join(', ')}`;
   });
 
-  await check('no write-gated control is visible to the viewer', async () => {
-    const shown = await page.evaluate(() => [...document.querySelectorAll(
-      '[data-requires-write]')]
-      .filter((el) => !el.hidden && el.offsetParent !== null)
-      .map((el) => el.id || el.textContent.trim().slice(0, 24)));
-    assert(shown.length === 0,
-           `visible write controls: ${shown.join(', ')}`);
-    return 'none';
-  });
+  /* Until 4.41.0 this asserted that a read-only account could see no
+     write-gated control at all, because gating HID them. That release
+     deliberately replaced hiding with disabling: hiding taught an operator
+     that their install simply lacked the feature, and it was one-way, so a
+     grant made mid-session could never restore the control without a
+     reload. What matters is not that the control is out of sight but that
+     it cannot be used, so that is what is checked — and it is the stronger
+     of the two, because a control that is visible AND live now fails here
+     where the old assertion would have passed it by hiding nothing. */
+  await check('every write-gated control the viewer can see is inactive',
+    async () => {
+      const live = await page.evaluate(() => {
+        // The same set app.js gates with. These five take `disabled` — and a
+        // disabled <fieldset> takes every control inside it with it, which is
+        // how the USERS grid is neutralised — while anything else (a div, a
+        // hint paragraph) is made `inert`.
+        const GATEABLE = new Set(['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'FIELDSET']);
+        return [...document.querySelectorAll('[data-requires-write]')]
+          .filter((el) => !el.hidden && el.offsetParent !== null)
+          .filter((el) => !(el.dataset.writeDenied === '1'
+                            && el.classList.contains('write-denied')
+                            && (GATEABLE.has(el.tagName) ? el.disabled : el.inert)))
+          .map((el) => `${el.tagName}#${el.id || el.textContent.trim().slice(0, 24)}`);
+      });
+      assert(live.length === 0, `live write controls: ${live.join(', ')}`);
+      const seen = await page.evaluate(() => [...document.querySelectorAll(
+        '[data-requires-write]')].filter((el) => !el.hidden && el.offsetParent !== null).length);
+      return `${seen} gated control(s) on screen, every one disabled or inert`;
+    });
 
   await check('Settings explains the accounts grid instead of 403ing (E9)',
     async () => {
