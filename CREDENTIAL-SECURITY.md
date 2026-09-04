@@ -778,18 +778,15 @@ Everything else — SNMP polling, NetPath, NetFlow, syslog, traps, IPAM
 scanning, alerting, the web interface, the whole browser application — works
 identically on either, configured or not.
 
-**A gap this workstream did not close.** The credential fields in the Nodes,
-Wireless, ConfigRX and Alerts dialogs still render disabled with "Not
-available on this host (Windows DPAPI only)", and `/api/state`'s
-`platform.secret_store` field is still hard-coded `false` off Windows — both
-live in `netpath/web/api.py` and the front end, outside what this change
-touched. The API endpoints underneath them are not hard-coded: each one calls
-`dpapi.available()` fresh on every request, so a configured host accepts a
-credential posted to them directly (`curl`, a script, or a future browser
-build that reads the flag correctly) even while the browser's own form still
-shows the field greyed out. Wiring `secret_store` to `dpapi.available()` and
-updating the disabled-field copy is the remaining piece of this feature —
-tracked as a follow-up, not silently left for someone to discover.
+**A gap this workstream did not close — closed since.** When the store first
+landed, the credential fields in the Nodes, Wireless, ConfigRX and Alerts
+dialogs still rendered disabled with "Not available on this host (Windows
+DPAPI only)", and `/api/state`'s `platform.secret_store` field was still
+hard-coded `false` off Windows, even though the endpoints underneath called
+`dpapi.available()` fresh on every request. That follow-up shipped in the
+same release: `platform.secret_store` now reports the real availability, and
+the disabled-field copy names both remedies — run on Windows, or configure a
+passphrase source as described below.
 
 ### The portable secret store
 

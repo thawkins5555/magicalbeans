@@ -72,6 +72,12 @@ User dialog or edited later per account. Changing your own password
 always works regardless of any of that, from an "Account" control in the
 top bar rather than the Settings tab.
 
+An account can instead be bound to an LDAP directory (simple bind, LDAPS or
+an explicit cleartext opt-in) rather than a local password, and Settings can
+issue a scoped API token for a script or another system to authenticate
+with instead of holding a session. Local accounts are unaffected either
+way, and the last local administrator can never be converted or demoted.
+
 Passwords are stored as salted scrypt hashes at the parameters OWASP currently
 recommends, never in plain text and never recoverable. If the only account's
 password is lost, the way back is to stop the service and delete the `users`
@@ -691,16 +697,24 @@ sappiwhere` after `daemon-reload`.
 Run this way the service keeps collecting whether or not anyone has a browser
 open, and with no console window to close by accident.
 
-Note what a Linux service **cannot** do: it cannot store any credential.
-Encrypted credential storage is Windows DPAPI only, so SNMPv3 authentication
-passwords, the SSH password ConfigRX and the terminal need, an authenticated
-SMTP password, the wireless controller's SNMP credential and the DHCP
-credential can all be entered on Windows and none of them on Linux. A Linux
-deployment polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a server
-that does not ask for authentication, and does not back up configurations. This
-is a deliberate limitation, not an oversight — `CREDENTIAL-SECURITY.md`
-explains what a portable secret store would have to promise and why the
-application would rather refuse than promise it weakly.
+Note what a Linux service can and cannot do about stored credentials. On
+Windows, credential encryption is DPAPI, unconditionally. On Linux it needs
+one thing configured: a passphrase. Set `NETPATH_SECRET_PASSPHRASE_FILE` to
+a file private to the service's own account (recommended — it survives an
+unattended restart the way a passphrase typed in cannot) or
+`NETPATH_SECRET_PASSPHRASE` directly (weaker: readable by anything else
+running as the same account), and SNMPv3 authentication passwords, the SSH
+password ConfigRX and the terminal need, an authenticated SMTP password and
+the wireless controller's SNMP credential can all be stored exactly as they
+are on Windows. The DHCP credential is the one exception, Windows or not —
+it depends on PowerShell/RSAT, not on DPAPI, so it stays Windows-only
+regardless. With no passphrase configured, the pre-4.47.0 behaviour is
+unchanged: none of those credentials can be stored, a Linux deployment polls
+SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a server that does not
+ask for authentication, and does not back up configurations.
+`CREDENTIAL-SECURITY.md` §10 sets out exactly what the passphrase-based
+store protects and what it does not — it is not tied to one machine the
+way DPAPI is.
 
 ## Layout
 

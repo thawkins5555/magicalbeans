@@ -21,6 +21,7 @@ can see on a screen, then the checks in the order worth doing them.
 - [A ConfigRX backup says the host key changed](#a-configrx-backup-says-the-host-key-changed)
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
 - [A flood of alerts nobody asked for](#a-flood-of-alerts-nobody-asked-for)
+- [Planned maintenance](#planned-maintenance)
 - [Nobody can sign in](#nobody-can-sign-in)
 - [A database is corrupt](#a-database-is-corrupt)
 
@@ -199,6 +200,9 @@ in the log.
    default) or `syslog.db` (1 GB). Syslog storage is about 455 bytes per
    message — the decoded fields, the original line, and its entry in the
    full-text search index — so 10 messages a second is roughly 390 MB a day.
+   `snmptraps.db` can burst hard during a real storm — a 250-device install
+   logged 98.6 MB in 75 seconds — which is why its cap is 1024 MB (raised
+   from 256 MB in 4.47.0) rather than the tighter figure it shipped at.
 3. **The size cap should already be holding it.** Three limits run every
    fifteen minutes, in order: retention by age, then a row cap, then the size
    cap, which deletes oldest-first in chunks until the file fits. The size cap
@@ -239,11 +243,19 @@ raised in the application instead.
 3. **The hourly cap.** If mail simply stopped mid-incident and resumed on the
    hour, you hit it. Every suppressed message is recorded against its alert as
    a failed notification, so the alert's detail pane tells you. Raise the cap,
-   or use the rollup below to send fewer.
-4. **On Linux, check you are not trying to authenticate.** An SMTP password
-   cannot be stored on a non-Windows host at all; if the relay has started
-   demanding authentication, this host can no longer send through it. See
-   `CREDENTIAL-SECURITY.md` §10.
+   or use the rollup below to send fewer. From 4.47.0, a mass-outage flush of
+   more than three sendable alerts already goes out as one digest email
+   rather than one each, counted once against this cap — see
+   `notify_rollup_delay_s` under **A flood of alerts nobody asked for**
+   below; a cap still being hit after that usually means the cap itself is
+   too low for the fleet, not that the coalescing failed.
+4. **On Linux, check whether a passphrase is configured for the portable
+   secret store.** From 4.47.0 an SMTP password can be stored off Windows
+   too, once `NETPATH_SECRET_PASSPHRASE_FILE` or `NETPATH_SECRET_PASSPHRASE`
+   is set — see `CREDENTIAL-SECURITY.md` §10. With neither configured, the
+   old limit still applies: no SMTP password can be stored on this host at
+   all, and if the relay has started demanding authentication, it can no
+   longer send through it.
 5. **The breaker closes itself.** The first job after the cooldown is the
    probe; if it succeeds the alert resolves on its own. You do not need to
    restart anything.
@@ -330,6 +342,16 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    its own alert, means the **upstream device** field is not set on them. Set
    it — on the device form — and the next outage is one alert. This is the
    single most valuable field in the product for anyone with more than a rack.
+   Even correctly configured, which device a poller reaches first during a
+   mass outage is arbitrary, so a child alert can briefly exist before its
+   parent's does. From 4.47.0, **Alerts → Settings →
+   `notify_rollup_delay_s`** (default 240 s) holds a new alert's first email
+   for exactly that window, giving the parent time to open and absorb its
+   children before anything is sent — the alerts still appear in the list
+   immediately, only the email is held. More than three alerts still due
+   when the window closes go out as one digest instead of one each. Raising
+   the window helps a fleet with a slow poll cycle; 0 restores sending
+   immediately, which is what every install before 4.47.0 did.
 2. **Onboarding.** Adding devices raises `mib_missing` on every device with a
    recognised vendor and no uploaded MIB. From 4.39.0 that rule does not email
    and auto-resolves; on earlier builds every one of them arrived titled
@@ -344,9 +366,37 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    its severity gate.
 
 **To stop the noise now:** mute the device or devices (Alerts → the device's
-row), or turn off the offending rule. **Acknowledge all** clears the badge
-without resolving anything and ignores the current filter — its confirmation
-says so.
+row), **Mute selected** for several at once, or turn off the offending rule.
+**Acknowledge all** clears the badge without resolving anything and ignores
+the current filter — its confirmation says so.
+
+---
+
+## Planned maintenance
+
+**Use this instead of muting by hand for anything over 24 hours.** Muting a
+device or a group ad hoc is capped at 24 hours by design — it is meant for
+"I am working on this right now", not for a weekend cutover. From 4.47.0,
+**Alerts → Maintenance** creates a named window instead: scoped to a
+device group or an explicit device list, one-off or weekly, up to fourteen
+days, and it can be created ahead of the work rather than started at the
+moment it begins.
+
+**What it does while it is active.** Exactly what a mute does — occurrences
+for covered devices are dropped rather than raised, an interface goes quiet
+with the switch it is on, and a first notification still held by the
+roll-up window (above) stays pending rather than being sent — and the
+device list shows the coverage the same way it shows an ordinary mute, so
+a planned window is never invisible to someone glancing at the fleet.
+Nothing needs to be undone by hand afterwards: the window simply lapses (or
+**End now** ends it early) and alerting resumes on the next tick.
+
+**Before a large cutover:** create the window first, covering every device
+or group involved, generously — an outage that outlasts its window starts
+alerting normally again, which is a stricter failure mode than the window
+running a little long. Bulk-muting the same set by hand as a fallback is
+still there (**Mute selected**, capped at 24 hours), but a window is the
+mechanism built for this.
 
 ---
 
@@ -371,6 +421,15 @@ says so.
    directory matter: anyone who can write `app.db` can do this.
 5. **After it is back**, check the audit log (Settings → Audit, `admin`
    capability) for what happened before the lockout.
+
+**Automation should not be holding a human's password.** A script that
+polls the API, triggers a bulk import, or pulls a CSV export on a schedule
+should authenticate with an **API token** (Settings → Users, from 4.47.0)
+scoped to a dedicated account's own grants, not with an admin's session
+cookie or a password sitting in a cron job's environment. A token has no
+idle timeout and is revocable on its own without touching anyone's sign-in
+— rotate it by issuing a new one and revoking the old, rather than
+changing a shared password every script depends on.
 
 ---
 

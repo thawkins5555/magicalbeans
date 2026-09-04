@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.47.0 — A fleet operator's list, answered](#4470--a-fleet-operators-list-answered)
 - [4.46.4 — Full code review: fifteen defects](#4464--full-code-review-fifteen-defects)
 - [4.46.3 — One SNMPv3 test, two ways to fail on Windows](#4463--one-snmpv3-test-two-ways-to-fail-on-windows)
 - [4.46.2 — The browser walk was red the whole time](#4462--the-browser-walk-was-red-the-whole-time)
@@ -113,6 +114,189 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.47.0 — A fleet operator's list, answered
+
+A fleet operator evaluated 4.46.4 at scale — around a thousand devices — and
+wrote up what broke, what disappointed, and what a real NOC needed that this
+product simply did not have. `DEMO-EVALUATION.md` (on its own branch) graded
+every finding Tier 0 (fix before use), Tier 1 (should ship) or Tier 2 (worth
+the trip); `DEPLOYMENT-PLAN.md` on this branch worked through the whole list
+in six waves. This release is that list, answered: five Tier 0 fixes that
+make the shipped defaults tell the truth, five Tier 1 features the
+evaluation asked for by name, two Tier 2 performance fixes, and one thing
+nobody put in the report — an operator, watching the alert storm the
+evaluation's own review reproduced, asked for a notification hold, and
+that's in here too.
+
+**The five Tier 0 fixes are defaults and caps that made the product worse
+than it had to be, out of the box.** MAC-to-port search — arguably the
+single most useful thing this product does for a NOC with more than a rack
+— shipped with table learning off; `mac_table_interval_s` now inherits an
+hour instead of 0, so a fresh install finds MACs on day one, and a group or
+device that explicitly set 0 keeps that choice through the upgrade. Syslog
+search silently returned nothing for a prefix query (`interfac*`), because
+the query builder quoted the trailing asterisk into a literal character the
+FTS5 tokenizer never produces; a trailing `*` is a prefix operator now, and
+anywhere else in a search term it is dropped rather than quoted, since a
+literal `*` could never have matched real content anyway. The shipped MIB
+catalog's own `apc-ups` (PowerNet-MIB, ~2.7 MiB) and `cisco-core`
+(CISCO-ENTITY-VENDORTYPE-OID-MIB, ~1.4 MiB) entries could not be installed
+by the catalog's own installer, because `max_mib_bytes` capped uploads at
+1 MiB; it is 8 MiB now, with room to grow, and a test pins the invariant
+that every shipped entry installs. The Wireless tab said `WIRELESS`,
+unqualified, which reads as "every wireless estate" to anyone who has not
+opened Settings and found it only speaks FortiGate; it now says `WIRELESS
+(FORTIGATE)`. And `dbopen.connect` sets `busy_timeout`, `cache_size` and
+`mmap_size` centrally now, so write contention under load waits instead of
+raising `SQLITE_BUSY` — nothing set any of the three before, on any of the
+databases that open through it.
+
+**Notifications now wait for the rollup, then arrive as one message.** The
+evaluation's worst finding: a simulated thousand-device outage opened 377
+child alerts and sent 1,355 emails in four minutes, because suppression
+only wins if the parent device is polled — and its alert opened — before
+the children are. New alert setting `notify_rollup_delay_s` (default
+240 s, 0 restores today's immediate send, clamped to an hour): an alert
+still opens in the UI the instant it is detected, but its first email
+waits out the window. Whatever decides the alert's fate before the window
+closes — absorption under a parent, a clear, an expiry — records the
+reason on the alert then and there (`not sent: rolled up under "<parent>"`,
+`not sent: cleared within the roll-up window`) and skips the matching
+clear email too, because telling someone "recovered" about an outage they
+were never told began is its own kind of noise. Whatever is still due when
+the window closes goes out singly, one email each, if three or fewer
+alerts are sendable in that flush, or as a single digest email if there
+are more — counted once against `max_emails_per_hour` either way, which is
+the point: a storm no longer spends the hourly budget in the first two
+minutes of itself. The due set is read back from the database
+(`last_notified_ts IS NULL`), not held in memory, so a restart mid-window
+still delivers rather than losing the notice. This one was not in the
+evaluation — an operator watching the fix land asked for it directly.
+
+**Alert operations gained the vocabulary a NOC actually plans around:
+maintenance windows, bulk mute, a second channel, and undo.** Maintenance
+windows are named, scheduled (once, or weekly), scoped to a device group
+or an explicit device list, up to fourteen days, creatable in advance and
+endable early — during one, covered devices behave exactly like muted ones
+(occurrences dropped, children quiet with their parent, held roll-up
+notices kept pending until it lifts), and the device list shows the
+coverage as a mute so it is never invisible. Bulk mute mutes a list of
+devices or a whole group in one call, still under the 24-hour ad-hoc cap
+ordinary mute has always had — windows are the mechanism for anything
+longer. A webhook is a second notification channel beside email: an
+operator-configured URL and headers, a JSON payload carrying the same
+rendered subject a mail gets, delivered off the engine's tick through its
+own queue, redirects refused, HTTPS required off private networks, its own
+hourly budget, and a digest goes out as one webhook the same way it goes
+out as one email. Un-acknowledge — single and bulk — mirrors Acknowledge's
+own routes and gates. And `snmptraps.db`'s size cap moves from 256 MB to
+1024 MB to match every other database's cap: a 250-device review install
+logged a 75-second trap burst that wrote 98.6 MB — 38% of the old cap — so
+a real storm could start discarding trap history, the exact history an
+incident needs, in under four minutes.
+
+**Nodes now walks the wire past the SNMP poll: LLDP/CDP neighbours, PoE,
+STP and point-to-point RF.** A device's LLDP remote table (CDP as the
+Cisco fallback) is walked on its own schedule, `lldp_interval_s`, inherited
+like `mac_table_interval_s` and defaulting to the same hour, stored with
+the same present/ageing semantics MAC entries already have and best-effort
+joined to known devices by sysName or chassis MAC. POWER-ETHERNET-MIB
+budget and per-port draw, and BRIDGE-MIB's STP bridge and port state, ride
+the regular poll cycle behind a persisted capability probe, so a device
+without the tables is only ever asked once. airFiber/airMAX and Cambium
+radios' RSSI, remote RSSI and capacity poll as their own metric series.
+All of it now has somewhere to be seen: a new TOPOLOGY subtab under Nodes
+draws the stored neighbour table as a pan-and-zoom SVG, unidentified
+neighbours included as their own dashed nodes; the device pane gains
+NEIGHBOURS and BRIDGE & RF sections; the interface table shows PoE power
+and STP state; RF and PSE history rides the series charts every other
+metric already has.
+
+**Every operator-facing table exports CSV now** — devices, a device's
+interfaces, alerts, NetFlow, traps, syslog, IPAM hosts, DHCP leases,
+wireless APs, and the new topology view — honouring whatever filter the
+tab currently has applied, through the same transport the OID-walk
+download already used: RFC 4180 quoting, a UTF-8 BOM, a timestamped
+filename. Alerts export up to 50,000 rows, far past the console's own
+2,000-row page. The device list itself now takes `limit`/`offset` and
+returns a real total, with a pager in the UI — no params still returns
+everything, so nothing that reads it today breaks — and the alert console
+pages past its cap instead of silently truncating whatever is left of an
+incident. A whole site can be onboarded in one call now, too: a JSON array
+or pasted CSV, up to 2,000 rows, every row validated before any of them is
+written, with a per-row disposition in the reply — the single-device route
+was measured at 16.6 devices a second, which is over two minutes of API
+round trips before a 2,000-device fleet has been polled even once.
+
+**Credentials can now be stored off Windows.** `CREDENTIAL-SECURITY.md` has
+carried a section since 4.39.0 explaining why a portable secret store was
+designed and deliberately not shipped: a key file beside the database
+protects against nothing an attacker who can already read the database
+cannot also read, the platform keyring is the wrong answer for a headless
+server, and a passphrase held only in memory cannot survive an unattended
+restart. That last objection now has an honest answer instead of a
+deferral: `netpath/secretstore.py` derives a key with scrypt — the same
+OWASP-recommended cost this application already pays for login passwords —
+from a passphrase read from `NETPATH_SECRET_PASSPHRASE_FILE` (a file
+refused unless it is private to the account that owns it) or
+`NETPATH_SECRET_PASSPHRASE` (weaker, documented as such: a plain
+environment variable is readable by anything else running as the same
+account), and encrypts with an HMAC-SHA256 counter-mode keystream,
+encrypt-then-MAC, verified in constant time. It is genuinely equivalent to
+DPAPI for the case that matters most — a stolen copy of the data directory
+— and is honest about the case it is not: an attacker who gains the same
+account the service runs as can read the passphrase file directly, the
+same as any other file it holds. Configure nothing and every credentialed
+feature refuses exactly as before; configure a passphrase and SNMPv3
+authNoPriv polling, ConfigRX backups, the SSH terminal, authenticated SMTP
+and the wireless controller credential all work identically to Windows.
+`/api/state` reports the real availability now instead of a hard-coded
+`false`, and the credential dialogs name both remedies — Windows, or a
+passphrase — rather than pointing at DPAPI alone.
+
+**ICMP moved off a subprocess per probe, and API access grew a second
+door.** IPAM's discovery scan now opens one ICMP echo socket per process —
+an unprivileged datagram ping socket where the kernel allows it, a raw one
+otherwise, detected once — instead of forking `ping` for every probe; a
+1,000-device scan was measured forking 88 to 134 processes a second with a
+load average of 15. The subprocess path is unchanged and stays the
+fallback (`NETPATH_PING_MODE` forces either), and the 200-probes-a-second
+pacing that protects fragile legacy PLC stacks is unchanged and now has a
+test of its own. Unrelated but in the same commit: the browser's table
+sort was building a new `Intl.Collator` on every pair it compared instead
+of once for the whole sort. And two ways to reach the API without a
+browser session: an admin can issue a bearer token — `sw_api_`-prefixed,
+256 bits from `secrets`, stored only as an unsalted SHA-256 hash (a random
+token's protection is its entropy, not hash cost), scoped to exactly its
+owning account's own grants, revocable, shown once — and an account can
+authenticate against an LDAP directory instead of a local password, over a
+minimal hand-rolled simple-bind client (BER encode/decode written out by
+hand, since the standard library has no LDAP support and this application
+takes no third-party dependency), with local accounts and the last local
+administrator untouched and always available as a fallback if the
+directory is unreachable.
+
+**ConfigRX can show you what changed.** `GET /api/configrx/diff` renders a
+unified diff between two backups of a device — adjacent by default —
+gated exactly like reading a backup, with both sides re-redacted
+unconditionally before the diff runs, so a changed secret is elided rather
+than ever appearing in a diff, and a same-hash pair short-circuits to an
+empty diff before redaction is even asked to run.
+
+**What the evaluation asked for that this release deliberately does not
+do.** SAML and MFA, per-site RBAC (permissions are still per-module, not
+per-object or per-site), remote pollers, high availability, sFlow, and
+multi-vendor wireless were all named in the evaluation and all remain
+absent. None of them is a small addition bolted onto what is already
+here — a remote poller changes the process model, HA changes what "one
+SQLite writer" means, per-site RBAC changes the shape of the permission
+table, SAML and MFA are a different authentication story than the LDAP
+bind this release adds — and shipping a thin version of any of them would
+cost more in false confidence than it would buy in a checked box. They are
+deferred, not declined; `DEPLOYMENT-PLAN.md`'s outcome section notes them
+as later work, the same way this document once deferred the secret store
+above.
 
 ### 4.46.4 — Full code review: fifteen defects
 

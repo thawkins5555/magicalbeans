@@ -90,8 +90,12 @@ open a browser. Closing it stops the service.
 
 Signing in is required. A fresh install starts with **admin / admin** — the
 sign-in page says so until someone has signed in — and insists on a new
-password. Accounts are local for now, managed on the Settings
-tab; TACACS is the next step.
+password. Accounts are managed on the Settings tab and are local by
+default; from 4.47.0 an account can instead be bound to an LDAP directory
+(**auth_source: ldap**), verified against the directory on every sign-in
+rather than a locally stored hash — see **Permissions** below. A script or
+another system reaches the API through a bearer **API token** rather than
+a stored username and password; see the same section.
 
 The server uses only the Python standard library. PySide6 is needed for the
 console window and nothing else, so a headless install needs neither it nor a
@@ -117,6 +121,11 @@ set of table behaviours:
 - **Where rows have checkboxes**, a select-all box sits in the header directly
   above them. It shows a dash when only some rows are ticked, and clicking it
   again clears the selection.
+- **Export CSV**, from 4.47.0, honours whatever filter the table currently
+  has applied — it is the rows on screen, not a fixed dump — and writes
+  RFC 4180-quoted CSV with a UTF-8 BOM and a timestamped filename. Alerts
+  exports up to 50,000 rows, well past its own console page; every other
+  table exports what its search already caps at.
 
 The Debug page is deliberately outside this: its tables are live worker state
 rather than records to work through.
@@ -331,6 +340,14 @@ own subtabs.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
   server test already uses.
+- **A whole site can be imported in one call, from 4.47.0.** A JSON array
+  or pasted CSV of up to 2,000 rows, the same fields the single-device
+  form accepts, every row validated before any of them is written, with a
+  per-row disposition in the reply so a bad row is named rather than
+  silently dropped — and the same identify-and-first-poll queueing the
+  single-device Add already triggers. The device list itself takes
+  `limit`/`offset` and a pager past the default page, for a fleet too
+  large to load in one response.
 
 ### Discovery
 
@@ -646,15 +663,20 @@ now** is not a dead end: the search says where and when it was last seen —
 kept for the retention window, so an address that has gone quiet or moved
 still points somewhere.
 
-**Learning MAC addresses is off by default and separately paced.** A
+**Learning MAC addresses is on by default, hourly, and separately paced.** A
 forwarding table is still read on its own schedule, not the poll cycle,
 but it is no longer expensive: table walks use GETBULK, so a table that
 once cost a hundred SNMP round trips now costs about five, and it can be
 refreshed far more often for the same load. A polling profile (or a single
-device) sets **Learn MAC addresses every N seconds**; 0 means never, and 0
-is the shipped value, so this costs nothing until you switch it on for the
-switches you actually trace hosts through. Five minutes is a fine starting
-point now. A switch that is down or whose last poll failed is not walked.
+device) sets **Learn MAC addresses every N seconds**; 0 means never. From
+4.47.0 the shipped default is 3600 (one hour) rather than 0, so fleet-wide
+MAC-to-port search works the day a switch is added rather than only once
+somebody finds the setting; an existing install upgrading into this release
+keeps 0 wherever it was set explicitly; only a profile or device that had
+never set the field at all — where "inherit" meant "never" by accident —
+picks up the new hourly default. Five minutes is a fine setting to switch
+down to once you know the load is affordable. A switch that is down or
+whose last poll failed is not walked.
 A MAC that leaves a port is not erased on the next walk: it is kept, marked
 absent, with the time it was last confirmed, so the Find box can still say
 where it was; entries no walk has refreshed for the retention window (a
@@ -735,6 +757,32 @@ VLAN list read from CISCO-VTP-MIB). The first source that returns
 anything wins. Devices that answer none of them show "no MAC address
 data" instead of an empty table. Per-interface "show run" still appears as a placeholder
 until SSH integration lands.
+
+### Topology, neighbours, PoE and STP
+
+From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
+
+- **LLDP neighbours** (CDP as the Cisco fallback) are walked on their own
+  schedule — **Learn neighbours every N seconds**, inherited like MAC
+  learning and defaulting to the same hour — and kept with the same
+  present/ageing semantics as the MAC table: a neighbour that drops off a
+  port is marked absent rather than erased, so a stale link is visible as
+  stale rather than gone. A neighbour is best-effort matched to a known
+  device by sysName or chassis MAC.
+- **A TOPOLOGY subtab** draws the stored neighbour table as a pan-and-zoom
+  map, coloured by device status, with port names on hover; an
+  unidentified neighbour — seen over LLDP/CDP but not itself polled —
+  still gets its own node, dashed, rather than being left out. It exports
+  CSV like every other table.
+- **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
+  lists what that device's own ports have reported; BRIDGE & RF shows STP
+  bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
+  RSSI and capacity (airFiber/airMAX and Cambium PtP links) as history
+  alongside the other metric charts.
+- **PoE power draw** — budget and per-port wattage, Cisco's own per-port
+  milliwatt object where present — appears on the interface table for a
+  device that answers POWER-ETHERNET-MIB. A device is asked for any of
+  these tables once and remembered rather than re-asked every poll.
 
 ---
 
@@ -866,6 +914,21 @@ alerts and optionally emailing about them.
   read-only account can see what is muted but cannot mute, and sees no
   Resolve or Acknowledge in the detail either, the same gate the bulk
   buttons carry.
+- **A whole list or group can be muted in one call, from 4.47.0** —
+  **Mute selected**, alongside the other bulk actions — still under the
+  same 24-hour ad-hoc cap a single mute has always had.
+- **Maintenance windows cover planned work longer than 24 hours.** Named,
+  scheduled once or weekly, scoped to a device group or an explicit device
+  list, up to fourteen days, creatable ahead of time and endable early.
+  While one is active the devices it covers behave exactly like muted
+  ones — new occurrences dropped, an interface quiet with its switch, a
+  held roll-up notice kept pending until the window lifts — and the device
+  list shows the coverage the same way it shows a mute, so a planned
+  cutover never looks like an unexplained gap in monitoring. Alerts →
+  **Maintenance** is where they are created and ended.
+- **Un-acknowledge, single and bulk**, undoes an Acknowledge the same way
+  Resolve is undone by the alert simply re-opening — the button and its
+  gate sit beside Acknowledge in the detail pane and the bulk actions bar.
 - **A poll overrun on a device that is not answering is not reported at
   all.** "Poll taking longer than its interval" is recorded when the
   previous poll is still running as the next falls due — which is exactly
@@ -1062,6 +1125,33 @@ hard to trip — a path monitor that cries wolf gets turned off.
   off is a deliberate, explicit opt-out, never a silent downgrade). A
   rate limit caps emails per hour; past it, sending is suspended for the
   rest of that hour and logged once, not per suppressed alert.
+- **A webhook is a second channel, beside email, from 4.47.0.** An
+  operator-configured URL and headers receive a JSON payload carrying the
+  same rendered subject an email gets, delivered off the engine's tick
+  through its own queue: redirects are refused, HTTPS is required unless
+  the URL points at a private network, and it has its own hourly budget,
+  separate from email's, since what it rations is attempts rather than
+  recipients. Every delivery or failure is recorded on the alert exactly
+  as an email attempt is. A roll-up digest (below) goes out as one
+  webhook the same way it goes out as one email.
+- **A first notification can wait for the roll-up, from 4.47.0.**
+  **Alerts → Settings → Hold the first email for N seconds**
+  (`notify_rollup_delay_s`, default 240, 0 restores immediate sending) —
+  an alert still opens in the UI and the list the instant it is detected;
+  only its first *email* (or webhook) is held. It exists because roll-up
+  only suppresses a child alert once its parent's own alert has opened,
+  and which device a poller reaches first during a mass outage is
+  arbitrary — a hundred children can each fire their own email before the
+  parent's outage is even recorded. Holding the first notice gives the
+  parent time to open and absorb them. Whatever decides the alert's fate
+  before the window closes — it is absorbed under a parent, it clears, it
+  expires —
+  is recorded on the alert as the reason its first notice was never sent,
+  and the matching clear email is skipped too, since nobody was told a
+  problem began. More than three alerts still due when the window closes
+  arrive as one digest email (or webhook) rather than one each, counted
+  once against the hourly budget. A restart mid-window loses nothing: what
+  is still due is read back from the database, not kept in memory.
 - **Mail is sent off the engine's tick.** From 4.39.0 a notification is
   handed to a queue drained by its own thread, so a relay that has stopped
   answering delays mail and nothing else: the rule engine keeps evaluating,
@@ -1863,6 +1953,13 @@ to a manual name in Nodes.
   There is no editable field and no save-back action anywhere in this
   module: it only ever pulls a config, never pushes one, and there is no
   free-form command box anywhere in its UI or API.
+- **Diff two backups, from 4.47.0.** A unified diff between any two of a
+  device's stored backups — adjacent by default — gated exactly like
+  reading a backup itself. Both sides are re-redacted before the diff
+  runs regardless of what was stored, so a changed secret is elided
+  rather than ever appearing in the diff text, and two backups that
+  hash the same short-circuit to an empty diff before redaction is even
+  asked to run.
 - **A backup is only stored when it differs from the device's previous
   one** (compared by SHA-256 hash) — an unchanged config updates that
   device's last-checked time without growing the database. **Back up
@@ -2123,6 +2220,25 @@ imply it — so on upgrade only accounts that already hold write access to
 every other module receive it, and everyone else gets it when an
 administrator grants it.
 
+**API tokens let a script authenticate without a stored password, from
+4.47.0.** Admin write can issue a bearer token for any account — `sw_api_`
+plus 256 bits from `secrets`, shown once — that carries exactly that
+account's own grants, never wider. It is checked wherever the session
+cookie is, but it is not a session: it never enters the session store, so
+no idle timeout applies to it and it can never be used to open a kiosk. A
+token is revocable, and every issue and revoke is audited.
+
+**An account can authenticate against an LDAP directory instead of a local
+password, from 4.47.0.** Set on the account (`auth_source: ldap`) in the
+Add/Edit User dialog: the account keeps no local password hash and every
+sign-in binds against the configured directory instead, over LDAPS or an
+explicitly opted-in cleartext connection. If the directory cannot be
+reached, sign-in fails closed rather than falling back to anything stored
+locally, and the attempt is audited as its own action. Local accounts are
+completely unaffected, and the last local administrator can never be
+converted to `ldap` or demoted — an LDAP outage can never be the reason
+nobody can reach the application at all.
+
 ---
 
 ## Data
@@ -2183,20 +2299,29 @@ moves its settings, accounts and name cache into it on the first start.
   write when the database was upgraded were granted `admin` automatically,
   nobody can grant it to themselves, and the last account holding it cannot
   be stripped of it.
-- **Credentials cannot be stored on anything but Windows.** Every stored
-  secret goes through Windows DPAPI, and there is no portable equivalent in
-  this release: on Linux, macOS or BSD the SNMPv3 authentication password,
-  the SSH password ConfigRX and the terminal need, an authenticated SMTP
-  password, the wireless controller's SNMP credential and the DHCP
-  credential can none of them be saved, and the API says so plainly rather
-  than accepting the value and losing it. A headless Linux deployment
-  therefore polls SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a
-  server that does not require authentication, and does not run config
-  backups. The forms concerned say this before you type into them rather
-  than after you submit. A portable secret store was considered for 4.39.0
-  and deliberately deferred — `CREDENTIAL-SECURITY.md` sets out what it
-  would have to promise and why a weak version of it is worse than an
-  honest refusal.
+- **Storing a credential off Windows now needs one thing configured: a
+  passphrase.** Every stored secret goes through Windows DPAPI on Windows,
+  unchanged; from 4.47.0 it goes through a portable, scrypt-backed secret
+  store on Linux, macOS or BSD once an operator sets
+  `NETPATH_SECRET_PASSPHRASE_FILE` (a file private to the account the
+  service runs as — recommended, since it survives an unattended restart)
+  or `NETPATH_SECRET_PASSPHRASE` (weaker: readable by anything else running
+  as the same account, documented as the fallback for tooling that can only
+  set an environment variable). Configured, the SNMPv3 authentication
+  password, the SSH password ConfigRX and the terminal need, an
+  authenticated SMTP password and the wireless controller's SNMP
+  credential all work the same as on Windows. The DHCP credential is the
+  one exception, passphrase or not: it depends on PowerShell/RSAT rather
+  than on credential encryption, so it stays Windows-only regardless.
+  Configure nothing, and the behaviour off Windows is exactly what it
+  always was: none of those credentials can be saved, and the API says so
+  plainly rather than accepting the value and losing it. What the portable
+  store protects, and what it
+  deliberately does not — it is not tied to one machine the way DPAPI is,
+  and it protects against a stolen copy of the data directory rather than
+  against an attacker who gains the account the service itself runs
+  as — is set out in full in `CREDENTIAL-SECURITY.md` §10, along with the
+  two designs that were considered and rejected before this one.
 - **Sessions do not survive a restart.** They are held in memory deliberately;
   restarting the service signs everyone out.
 - **IPAM discovery is ARP-based, so MAC addresses and conflict detection only

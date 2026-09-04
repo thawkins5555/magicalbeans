@@ -40,13 +40,17 @@ headless server needs nothing but the standard library, so `requirements.txt`
 is optional.
 
 **Decide the host now, because it changes what you can do.** On Windows,
-everything works. On Linux, macOS or BSD, no credential can be stored: SNMPv3
-authentication, ConfigRX backups, the SSH terminal, authenticated SMTP,
-wireless and DHCP are all unavailable, because credential encryption uses
-Windows DPAPI and there is no portable equivalent in this release. This is
-covered properly in `CREDENTIAL-SECURITY.md` §10, and again in step 8. SNMP
-v1, v2c and v3 noAuthNoPriv polling, NetPath, NetFlow, syslog, traps, IPAM and
-alerting all work identically either way.
+everything works out of the box. On Linux, macOS or BSD, storing a
+credential needs one extra step: set `NETPATH_SECRET_PASSPHRASE_FILE` (or
+the weaker `NETPATH_SECRET_PASSPHRASE`) before you start the service, and
+SNMPv3 authentication, ConfigRX backups, the SSH terminal, authenticated
+SMTP and the wireless controller credential all work the same as on
+Windows. Skip that step and none of them can be stored — DHCP stays
+Windows-only regardless of the passphrase, since it depends on
+PowerShell/RSAT rather than on credential encryption. This is covered
+properly in `CREDENTIAL-SECURITY.md` §10, and again in step 8. SNMP v1, v2c
+and v3 noAuthNoPriv polling, NetPath, NetFlow, syslog, traps, IPAM and
+alerting all work identically regardless.
 
 ## 2. Start the service
 
@@ -184,13 +188,16 @@ password; the password is encrypted with DPAPI for the account the service runs
 as, which is why the service should run as a dedicated account rather than as
 whoever installed it.
 
-**On Linux, macOS or BSD you cannot store an SMTP password at all.** The field
-refuses it, deliberately and visibly, rather than accepting the value and
-losing it. Your options are an internal relay that accepts unauthenticated mail
-from this host by address — which is the normal arrangement inside a plant
-network — or running the service on Windows. `CREDENTIAL-SECURITY.md` §10
-explains why there is no portable secret store and why shipping a weak one
-would be worse than refusing.
+**On Linux, macOS or BSD, storing an SMTP password needs a passphrase
+configured first** — `NETPATH_SECRET_PASSPHRASE_FILE` pointed at a file
+private to the account the service runs as, set before you start the
+service (see step 1 and `CREDENTIAL-SECURITY.md` §10). With that done, the
+field works exactly as it does on Windows. With nothing configured, which
+is still the state a fresh Linux install starts in, the field refuses the
+value deliberately and visibly rather than accepting it and losing it; your
+options are then an internal relay that accepts unauthenticated mail from
+this host by address — the normal arrangement inside a plant network — or
+configuring the passphrase.
 
 Either way, check three things before you trust the alerting:
 
@@ -213,9 +220,11 @@ In rough order of value:
 - **Point your devices' syslog and traps here** — UDP 514 and 162 — and watch
   the Syslog and SNMP Trap tabs fill. Both listeners are off until you enable
   them in their settings.
-- **Add the rest of the fleet.** There is no bulk import in this release; a
-  discovery sweep (Nodes → Discovery) over a subnet is the fast way, and it
-  will not guess `public` as a community.
+- **Add the rest of the fleet.** A discovery sweep (Nodes → Discovery) over a
+  subnet is the fast way for anything reachable by ping, and it will not
+  guess `public` as a community. For a fleet you already have listed
+  elsewhere, **bulk import** (Nodes → Devices) takes a pasted CSV or a JSON
+  array in one call, up to 2,000 rows, and reports which rows it took.
 - **Fill in "Upstream device"** on everything behind a distribution switch.
 - **Read `RUNBOOK.md` once**, before you need it, so you know that the
   collector status strips carry a `kernel_dropped` counter and what it means.

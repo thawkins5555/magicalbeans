@@ -88,3 +88,36 @@ API/UI surfacing deferred to Wave 4 to avoid file conflicts)
 1. No wave commits until its own suites and the previously-passing suites pass.
 2. `demo/selftest.py` (623 wire-format checks) must stay green after Wave 2.
 3. Final gate: everything in `tests/run_all.py` green at 4.47.0.
+
+## Outcome
+
+Every wave landed. Ten implementation commits, oldest first:
+
+- `afc0c2a` Plan: add T0-6, the user-requested notification roll-up window
+- `4c1ec4a` Tier 0: MAC tables on by default, prefix search, MIB cap, FortiGate label, pragmas
+- `ec455f9` Tier 2: socket ICMP with subprocess fallback, one collator for the sort
+- `d04809a` Tier 1: a portable secret store, the passphrase design the security doc endorses
+- `3aef650` Tier 0: hold notifications for the rollup, then send one digest
+- `0505578` Tier 1: LLDP/CDP neighbours, PoE, STP and PtP RF polling — the backend
+- `e2b17e8` Tier 1+2: maintenance windows, bulk mute, a webhook channel, un-ack, trap cap
+- `ee1394c` Tier 1: CSV export everywhere, paged lists, bulk import, store surfaced
+- `82cf862` Tier 1+2: an L2 topology from the stored neighbours, PoE/STP/RF on screen, ConfigRX diff
+- `8bef57c` Tier 1: API tokens and LDAP simple-bind directory authentication
+
+Wave 6's own work — the `CHANGELOG.md` entry, the `FEATURES.md`/`RUNBOOK.md`/
+`README.md`/`QUICKSTART.md`/`demo/README.md` corrections, and the version
+bump to 4.47.0 — lands as an eleventh commit on top of these ten, along
+with retiring `CREDENTIAL-SECURITY.md`'s "gap this workstream did not
+close" note, whose gap `ee1394c` closed.
+
+**Final suite state:** `tests/run_all.py` 50/50 suites passed at 4.47.0
+(two skips as always: the SSH suites, which need paramiko), up from 29
+suites before this plan — the waves added 21 suites of their own.
+`demo/selftest.py`: all 623 wire-format checks pass.
+
+**Deliberately deferred**, named in the evaluation and not attempted in this
+plan: SAML/MFA, per-site RBAC (permissions stay per-module), remote pollers,
+high availability, sFlow, and multi-vendor wireless. Each changes something
+more structural than a wave of this plan's shape was scoped for — the
+process model, the permission table's shape, what "one SQLite writer" means
+— and is later work, not declined work.

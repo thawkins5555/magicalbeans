@@ -147,7 +147,7 @@ like.
 | --- | --- | --- | --- |
 | profile `poll_interval_s` | 120 s | 60 s | 120 s |
 | profile `snmp_timeout_s` / `snmp_retries` | 3.0 s / 2 | 2 s / 1 | 3.0 s / 2 |
-| profile `mac_table_interval_s` | 0 (off) | 300 s | 0 (off) |
+| profile `mac_table_interval_s` | 3600 s | 300 s | 3600 s |
 | `poll_workers` | 16 | 32 (`--workers`) | 16 |
 | `new_device_grace_s` | 300 s | 0 | 300 s |
 | `max_emails_per_hour` | 60 | 10,000 | 60 |
@@ -278,24 +278,35 @@ Two quirks worth knowing, both in the app rather than here:
   (`10.0.0.1` multihop, `.2` route change, `.3` refused `!X`, `.4` silent hop,
   `.5` dead, `.6` degraded). Nothing leaves the machine. Remove `demo/bin` from
   `PATH` and NetPath will trace the real network instead.
-* **No credential can be stored on Linux.** Every "save this password"
-  endpoint goes through Windows DPAPI and refuses with a 400 off Windows —
-  SNMPv3 auth passwords, the SMTP password, ConfigRX SSH passwords, DHCP
-  server credentials. `seed.py` calls them anyway and records the exact
-  refusal text in `seed_log.json` under `refusals`. That is intended evidence,
-  not a failure.
+* **No credential can be stored on Linux unless a passphrase is
+  configured**, from 4.47.0 — see `CREDENTIAL-SECURITY.md` §10. This
+  harness does not set `NETPATH_SECRET_PASSPHRASE_FILE` or
+  `NETPATH_SECRET_PASSPHRASE`, so every "save this password" endpoint still
+  refuses with a 400 exactly as before — SNMPv3 auth passwords, the SMTP
+  password, ConfigRX SSH passwords, DHCP server credentials. `seed.py` calls
+  them anyway and records the exact refusal text in `seed_log.json` under
+  `refusals`. That is intended evidence, not a failure; set one of those two
+  environment variables before starting the fleet to seed a run with
+  credentials actually stored instead.
 * **ConfigRX backups will not succeed** without something answering SSH, and
-  the credential above cannot be stored anyway. The seeding proves the
-  configuration path, not a completed backup.
+  (absent the passphrase above) the credential cannot be stored anyway. The
+  seeding proves the configuration path, not a completed backup.
 * **`GET /api/alerts` caps `limit` at 2000** (`netpath/web/api.py:2973`), so a
   very large outage can truncate the per-rule counts. `results-<count>.json`
-  records `alerts_truncated` when it does.
-* **`GET /api/nodes/devices` has no paging** — it returns the whole fleet in
-  one JSON body. The UI walk measures how big that gets
-  (`ui/metrics-<count>.json`, `devices_payload_bytes`).
-* **There is no bulk device-add endpoint.** Seeding a fleet is one
-  `POST /api/nodes/devices` per device; `seed.py` prints the rate it achieved,
-  which is itself one of the measurements.
+  records `alerts_truncated` when it does. **Export CSV** on the Alerts tab is
+  not subject to this cap — it goes to 50,000 rows — but the seeding scripts
+  do not exercise it.
+* **`GET /api/nodes/devices` still returns the whole fleet in one JSON body
+  when called with no parameters**, which is what every script in this
+  harness does — the UI walk measures how big that gets
+  (`ui/metrics-<count>.json`, `devices_payload_bytes`). From 4.47.0 the route
+  also accepts `limit`/`offset` for a paged caller; nothing here uses that
+  path, so this harness's numbers are still the whole-fleet cost.
+* **Seeding a fleet is still one `POST /api/nodes/devices` per device.** A
+  bulk-import route (`POST /api/nodes/devices/bulk-import`) exists from
+  4.47.0, but `seed.py` does not use it — the per-device rate it prints is
+  deliberately measuring the single-device path's cost, which is what a
+  script written against an older release still pays.
 * **Ports 161/162/514 are shared.** If another copy of the fleet or the app is
   already running on the machine, the second one silently loses the race —
   check `app-<count>.log` and `fleet-<count>.log` before believing a zero.
