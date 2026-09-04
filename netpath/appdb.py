@@ -175,7 +175,12 @@ GLOBAL_DEFAULTS = {
     "max_flow_db_mb": 2048,
     "max_nodes_db_mb": 1024,       # samples accumulate; closer to flows than traps
     "max_alerts_db_mb": 128,       # alert/notification history, much lighter
-    "max_snmp_db_mb": 256,
+    # Was 256: a 75-second burst on a 250-device review install wrote 98.6 MB
+    # (38% of that cap) — a real storm reaches 256 MB in minutes and starts
+    # discarding trap history while the incident is still active. Raised to
+    # match max_syslog_db_mb/max_nodes_db_mb below, which see comparable or
+    # worse burst volume. See snmptrapdb.py's own comment for the arithmetic.
+    "max_snmp_db_mb": 1024,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,
     # Whether this host may replace its own code with what GitHub offers

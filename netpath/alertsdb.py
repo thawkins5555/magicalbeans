@@ -15,11 +15,13 @@ occurrence increments that alert's `count` rather than opening a duplicate.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import sqlite3
 import threading
 import time
+from urllib.parse import urlparse
 
 from . import dbmaint
 from . import dbopen
@@ -117,6 +119,10 @@ CREATE TABLE IF NOT EXISTS notifications (
     id              INTEGER PRIMARY KEY,
     alert_id        INTEGER REFERENCES alerts(id) ON DELETE SET NULL,
     kind            TEXT NOT NULL,           -- 'alert'|'renotify'|'clear'|'test'
+                                              -- or the webhook channel's own
+                                              -- 'webhook_'-prefixed versions
+                                              -- of the same four (see
+                                              -- alertengine._webhook_notify)
     ts              REAL NOT NULL,
     to_addr         TEXT NOT NULL,
     subject         TEXT NOT NULL,
@@ -208,6 +214,23 @@ DEFAULTS = {
     # and survives Reset layout, which clears per-browser column widths
     # but must not eat a settings choice.
     "table_columns": "",
+    # Outbound webhook: one HTTP POST per notification, alongside (or instead
+    # of) email — Slack/Teams/PagerDuty/a ticketing system all speak this,
+    # so one channel buys every one of them rather than shipping a client
+    # for each. See alertmail.send_webhook and AlertEngine._webhook_notify.
+    "webhook_enabled": False,
+    "webhook_url": "",
+    # "Name: value" lines, same shape smtp_to_default's own list-of-strings
+    # setting already uses, so the settings type machinery (coerce_settings)
+    # needs no new case. Parsed at send time — see alertmail.parse_headers.
+    "webhook_headers": [],
+    "webhook_timeout_s": 10.0,
+    # A webhook receiver is a machine, not an inbox: max_emails_per_hour's
+    # 60 is sized for a person's mailbox, and a Slack/PagerDuty endpoint can
+    # take far more before anyone notices. Its own budget rather than
+    # sharing the email one, so turning webhooks on for a big fleet does not
+    # eat into the mail quota an operator already tuned.
+    "webhook_max_per_hour": 600,
 }
 
 PENDING_SCHEMA = """
@@ -246,11 +269,99 @@ CREATE TABLE IF NOT EXISTS alert_mutes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mute_entity
     ON alert_mutes(entity_kind, entity_id);
+
+-- A planned period during which alerts for a scope of devices behave as
+-- though every one of them were muted: a weekend cutover, a maintenance
+-- window on a site, a firmware rollout. Distinct from alert_mutes rather
+-- than another row shape in it, because a window has a scope (a device
+-- group, or an explicit list) and a fixed start/end an operator sets in
+-- advance, where a mute is always "this one device, starting now, for N
+-- hours" — cramming both into one table would make every mute reader carry
+-- branches for a shape that ad-hoc muting never uses. What they share is the
+-- ANSWER, not the storage: is_window_active + window_covered_device_ids
+-- resolve a window down to the same {entity_id: until_ts} shape mutes()
+-- already produces, and every reader (the engine's occurrence gate, the
+-- device list, the single-device page) folds the two together there. See
+-- muted_entity_ids and AlertEngine._muted/_muted_alert.
+--
+-- scope_kind is 'group' (every device currently in scope_group_id — a
+-- device added to the group mid-window is covered, one added to a NEW group
+-- of the same name is not, which is what "the group" means) or 'devices'
+-- (exactly the ids in scope_device_ids, a JSON array, chosen once at
+-- creation). Nullable columns rather than two tables, matching alert_mutes'
+-- own "general enough for the next shape, no migration to add it" reasoning
+-- above.
+--
+-- recurrence is NULL (a one-off window, exactly [start_ts, end_ts)) or
+-- 'weekly' (the same clock-time span recurs every 7 days from start_ts,
+-- forever, until the window is deleted or edited) — see is_window_active.
+-- Deliberately the only two shapes: a monthly maintenance calendar is a
+-- feature in its own right, and "none or weekly" already covers the case
+-- the review asked for, a recurring weekend cutover.
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id                INTEGER PRIMARY KEY,
+    name              TEXT NOT NULL,
+    scope_kind        TEXT NOT NULL,       -- 'group'|'devices'
+    scope_group_id    INTEGER,             -- nodesdb device_groups.id, when 'group'
+    scope_device_ids  TEXT,                -- JSON array of device ids, when 'devices'
+    start_ts          REAL NOT NULL,
+    end_ts            REAL NOT NULL,
+    recurrence        TEXT,                -- NULL|'weekly'
+    created_ts        REAL NOT NULL,
+    created_by        TEXT NOT NULL DEFAULT '',
+    reason            TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_maint_windows_start ON maintenance_windows(start_ts);
 """
 
 # How long a mute may last. The dropdown offers 1/6/12/24 hours; the cap is
 # here so a hand-made API call cannot silence a device until next year.
 MAX_MUTE_HOURS = 24.0
+
+# How long a single maintenance window occurrence may span. Long enough for
+# any real cutover (a "weekend" is 60 hours) with room to spare; short enough
+# that a fat-fingered end date years out cannot silence a device group
+# indefinitely under the banner of "maintenance" rather than a mute. Applies
+# to end_ts - start_ts, which for a weekly recurrence is the length of each
+# WEEK's occurrence, not how long the window recurs for — a weekly window has
+# no end date at all, see is_window_active.
+MAX_WINDOW_DAYS = 14.0
+
+_WEEK_S = 7 * 86400.0
+
+
+def is_window_active(row, now: float | None = None) -> bool:
+    """Whether `row` (a maintenance_windows row) covers anything right now.
+
+    A one-off window (recurrence NULL) is the plain interval test. A weekly
+    one recurs every 7 days from start_ts forever: `elapsed` is how far `now`
+    sits into the current 7-day cycle, and the window is active exactly when
+    that is still inside the occurrence's own duration — the same
+    (end_ts - start_ts) span, replayed every week. A non-positive duration
+    (a corrupt or hand-edited row) never matches, rather than matching
+    everything forever the way a naive modulo could.
+    """
+    now = time.time() if now is None else now
+    duration = row["end_ts"] - row["start_ts"]
+    if duration <= 0:
+        return False
+    if row["recurrence"] == "weekly":
+        if now < row["start_ts"]:
+            return False
+        return (now - row["start_ts"]) % _WEEK_S < duration
+    return row["start_ts"] <= now < row["end_ts"]
+
+
+def _window_occurrence_end(row, now: float) -> float:
+    """When the CURRENT occurrence of `row` stops covering anything — for a
+    one-off window, its own end_ts; for a weekly one, the end of this
+    week's span (not next week's, and not the window's own end_ts, which for
+    a recurring window is only the first occurrence's)."""
+    duration = row["end_ts"] - row["start_ts"]
+    if row["recurrence"] == "weekly":
+        elapsed = (now - row["start_ts"]) % _WEEK_S
+        return now - elapsed + duration
+    return row["end_ts"]
 
 # The sane range for notify_rollup_delay_s: coerce_settings only checks that
 # it is a number, never that it is a sensible one, so a hand-made API call
@@ -260,6 +371,52 @@ MAX_MUTE_HOURS = 24.0
 # the engine, the settings API response, a future one — sees the same
 # already-sane number rather than each having to know the limit itself.
 NOTIFY_ROLLUP_DELAY_MAX_S = 3600
+
+
+def _webhook_host_is_local(host: str) -> bool:
+    """Whether `host` is loopback or an RFC1918 private address — the two
+    cases plaintext http is allowed for a webhook URL, on the reasoning that
+    both stay on this machine or this network and never cross the open
+    internet in the clear. A bare hostname that is not a literal IP (and is
+    not "localhost") answers False: without a DNS lookup here there is no
+    honest way to know where it resolves, and refusing http for anything
+    that is not OBVIOUSLY local is the safe default."""
+    host = (host or "").strip().lower()
+    if host == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private
+
+
+def validate_webhook_url(url: str) -> None:
+    """Raise ValueError for a webhook_url this application should refuse to
+    save, not just refuse to send to. An empty string (webhooks off, or not
+    yet configured) is always fine.
+
+    https is required unless the host is loopback or RFC1918 — the same
+    trust level the SMTP relay setting already gets (an operator-configured
+    endpoint, not user input), but a webhook receiver is far more likely to
+    sit on the open internet (Slack, PagerDuty, a ticketing SaaS) than an
+    SMTP relay ever is, so plaintext is the exception here rather than the
+    rule smtp_security defaults to. The scheme and redirect checks are
+    repeated at SEND time in alertmail.send_webhook — this function only
+    stops a bad URL from being saved in the first place, it is not the only
+    guard.
+    """
+    url = (url or "").strip()
+    if not url:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("webhook_url must be an http:// or https:// URL")
+    if parsed.scheme == "http" and not _webhook_host_is_local(parsed.hostname or ""):
+        raise ValueError(
+            "webhook_url must use https:// unless it points at localhost or"
+            " a private (RFC1918) address")
+
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
@@ -825,6 +982,8 @@ class AlertsDatabase:
         return values
 
     def save_settings(self, values: dict) -> None:
+        if "webhook_url" in values:
+            validate_webhook_url(values["webhook_url"])
         with self._lock:
             for key, value in values.items():
                 if key not in DEFAULTS:
@@ -1255,6 +1414,33 @@ class AlertsDatabase:
             self._conn.commit()
         return self.mute_row(entity_kind, entity_id)
 
+    def mute_many(self, entity_kind: str, entity_ids: list[str], hours: float,
+                  by: str = "", reason: str = "") -> list[sqlite3.Row]:
+        """Bulk mute: one call, one hour figure, one reason, applied to every
+        id in `entity_ids` — the "hundreds of API calls" the review's planned
+        cutover reduces to one. Same ad-hoc cap as a single mute() and the
+        same replace-on-remute behaviour, just looped: a maintenance WINDOW
+        (below) is the mechanism for something longer than MAX_MUTE_HOURS,
+        this is still the ad-hoc one."""
+        hours = max(0.0, min(float(hours), MAX_MUTE_HOURS))
+        if hours <= 0 or not entity_ids:
+            return []
+        now = time.time()
+        until = now + hours * 3600.0
+        with self._lock:
+            for entity_id in entity_ids:
+                self._conn.execute(
+                    "INSERT INTO alert_mutes(entity_kind, entity_id, until_ts,"
+                    " created_ts, created_by, reason) VALUES (?,?,?,?,?,?)"
+                    " ON CONFLICT(entity_kind, entity_id) DO UPDATE SET"
+                    " until_ts=excluded.until_ts, created_ts=excluded.created_ts,"
+                    " created_by=excluded.created_by, reason=excluded.reason",
+                    (entity_kind, str(entity_id), until, now, by, reason))
+            self._conn.commit()
+        return [row for row in
+               (self.mute_row(entity_kind, entity_id) for entity_id in entity_ids)
+               if row is not None]
+
     def unmute(self, entity_kind: str, entity_id: str) -> bool:
         with self._lock:
             cur = self._conn.execute(
@@ -1282,12 +1468,34 @@ class AlertsDatabase:
         with self._lock:
             return self._conn.execute(sql + " ORDER BY until_ts", args).fetchall()
 
-    def muted_entity_ids(self, entity_kind: str = "device") -> dict[str, float]:
-        """entity_id -> until_ts for every active mute of this kind. Read once
-        per engine tick, so the per-occurrence check is a dict lookup rather
-        than a query."""
-        return {row["entity_id"]: row["until_ts"]
-                for row in self.mutes(entity_kind)}
+    def muted_entity_ids(self, entity_kind: str = "device",
+                         window_covered: dict[str, float] | None = None
+                         ) -> dict[str, float]:
+        """entity_id -> until_ts for every active mute of this kind, PLUS
+        every device an active maintenance window covers right now, so every
+        reader — the engine's per-tick occurrence gate, the Nodes device
+        list — answers "is this device quiet" the same way for either
+        mechanism.
+
+        `window_covered` is resolved by the CALLER (window_covered_device_ids
+        below) rather than here: a window's scope can be a device GROUP, and
+        alertsdb has no nodesdb of its own to expand "group 4" into device
+        ids without importing a module a step below it in the layering.
+        Passing None (the default) answers exactly as before windows
+        existed — every existing caller that has not been taught about
+        windows yet keeps working unchanged.
+
+        Where both a manual mute and a window cover the same device, the
+        LATER until_ts wins — that is the later moment either mechanism
+        stops applying, which is what "muted" ought to mean for a device
+        covered by both.
+        """
+        ids = {row["entity_id"]: row["until_ts"] for row in self.mutes(entity_kind)}
+        if entity_kind == "device" and window_covered:
+            for device_id, until_ts in window_covered.items():
+                if device_id not in ids or until_ts > ids[device_id]:
+                    ids[device_id] = until_ts
+        return ids
 
     def purge_expired_mutes(self, now: float | None = None) -> int:
         with self._lock:
@@ -1295,6 +1503,190 @@ class AlertsDatabase:
                                      (now if now is not None else time.time(),))
             self._conn.commit()
         return cur.rowcount or 0
+
+    # ------------------------------------------------- maintenance windows
+
+    def windows(self) -> list[sqlite3.Row]:
+        """Every window, past, active and future — the list an operator's
+        Maintenance windows page shows. Callers that only care whether a
+        window is covering anything RIGHT NOW want active_windows()."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM maintenance_windows ORDER BY start_ts DESC"
+            ).fetchall()
+
+    def window(self, window_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM maintenance_windows WHERE id = ?",
+                (window_id,)).fetchone()
+
+    def active_windows(self, now: float | None = None) -> list[sqlite3.Row]:
+        """Every window covering something RIGHT NOW — a small, Python-side
+        filter over windows() rather than a recurrence-aware SQL WHERE
+        clause, because a real deployment has a handful of maintenance
+        windows at a time (unlike alerts or traps, which justify a live
+        GROUP BY over thousands of rows), the same "small enough that Python
+        is the honest cost" reasoning trim_to_size's own docstring already
+        leans on elsewhere in this file."""
+        now = time.time() if now is None else now
+        return [row for row in self.windows() if is_window_active(row, now)]
+
+    def _validate_window_scope(self, scope_kind: str, scope_group_id,
+                               scope_device_ids) -> tuple:
+        if scope_kind == "group":
+            if not scope_group_id:
+                raise ValueError("A maintenance window scoped to a group needs a group id")
+            return "group", int(scope_group_id), None
+        if scope_kind == "devices":
+            ids = [int(i) for i in (scope_device_ids or [])]
+            if not ids:
+                raise ValueError("A maintenance window scoped to devices needs at least one")
+            return "devices", None, json.dumps(ids, separators=(",", ":"))
+        raise ValueError("scope_kind must be 'group' or 'devices'")
+
+    def add_window(self, name: str, scope_kind: str, start_ts: float, end_ts: float,
+                   scope_group_id=None, scope_device_ids=None,
+                   recurrence: str | None = None, created_by: str = "",
+                   reason: str = "") -> int:
+        """A window may be created in advance — start_ts in the future is
+        exactly the "planned weekend cutover" case, not an error."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("A maintenance window needs a name")
+        if end_ts <= start_ts:
+            raise ValueError("A maintenance window must end after it starts")
+        if end_ts - start_ts > MAX_WINDOW_DAYS * 86400.0:
+            raise ValueError(f"A maintenance window is capped at "
+                             f"{MAX_WINDOW_DAYS:g} days")
+        if recurrence not in (None, "", "weekly"):
+            raise ValueError("recurrence must be 'weekly' or absent")
+        scope_kind, scope_group_id, scope_device_ids = self._validate_window_scope(
+            scope_kind, scope_group_id, scope_device_ids)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO maintenance_windows(name, scope_kind, scope_group_id,"
+                " scope_device_ids, start_ts, end_ts, recurrence, created_ts,"
+                " created_by, reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (name, scope_kind, scope_group_id, scope_device_ids,
+                 float(start_ts), float(end_ts), recurrence or None, time.time(),
+                 created_by, reason))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def update_window(self, window_id: int, **fields) -> None:
+        """Edit before or while a window is active — a cutover that runs long
+        gets its end_ts pushed out without having to be deleted and
+        recreated (which would lose its id, and anything that links to it)."""
+        row = self.window(window_id)
+        if row is None:
+            return
+        name = fields.get("name", row["name"])
+        start_ts = float(fields.get("start_ts", row["start_ts"]))
+        end_ts = float(fields.get("end_ts", row["end_ts"]))
+        recurrence = fields.get("recurrence", row["recurrence"])
+        reason = fields.get("reason", row["reason"])
+        if "scope_kind" in fields or "scope_group_id" in fields or "scope_device_ids" in fields:
+            scope_kind, scope_group_id, scope_device_ids = self._validate_window_scope(
+                fields.get("scope_kind", row["scope_kind"]),
+                fields.get("scope_group_id", row["scope_group_id"]),
+                fields.get("scope_device_ids",
+                          json.loads(row["scope_device_ids"] or "[]")
+                          if row["scope_kind"] == "devices" else None))
+        else:
+            scope_kind = row["scope_kind"]
+            scope_group_id = row["scope_group_id"]
+            scope_device_ids = row["scope_device_ids"]
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("A maintenance window needs a name")
+        if end_ts <= start_ts:
+            raise ValueError("A maintenance window must end after it starts")
+        if end_ts - start_ts > MAX_WINDOW_DAYS * 86400.0:
+            raise ValueError(f"A maintenance window is capped at "
+                             f"{MAX_WINDOW_DAYS:g} days")
+        if recurrence not in (None, "", "weekly"):
+            raise ValueError("recurrence must be 'weekly' or absent")
+        with self._lock:
+            self._conn.execute(
+                "UPDATE maintenance_windows SET name=?, scope_kind=?,"
+                " scope_group_id=?, scope_device_ids=?, start_ts=?, end_ts=?,"
+                " recurrence=?, reason=? WHERE id=?",
+                (name, scope_kind, scope_group_id, scope_device_ids, start_ts,
+                 end_ts, recurrence or None, reason, window_id))
+            self._conn.commit()
+
+    def end_window_now(self, window_id: int) -> None:
+        """"End now": stop covering anything from this moment, without
+        deleting the window's own history (its name, scope and start remain
+        on the record). A recurring window's recurrence is cleared in the
+        same call — otherwise the next week's occurrence would start right
+        back up, which is not what an operator ending a window early means."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE maintenance_windows SET end_ts=?, recurrence=NULL"
+                " WHERE id=? AND end_ts > ?",
+                (time.time(), window_id, time.time()))
+            self._conn.commit()
+
+    def remove_window(self, window_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM maintenance_windows WHERE id = ?", (window_id,))
+            self._conn.commit()
+        return bool(cur.rowcount)
+
+    def _window_scope_matches(self, row, device_id: str, device_group_id) -> bool:
+        if row["scope_kind"] == "group":
+            return (device_group_id is not None and row["scope_group_id"] is not None
+                    and int(device_group_id) == int(row["scope_group_id"]))
+        try:
+            ids = json.loads(row["scope_device_ids"] or "[]")
+        except (TypeError, ValueError):
+            return False
+        return device_id in {str(i) for i in ids}
+
+    def window_covered_device_ids(self, devices, now: float | None = None,
+                                  windows=None) -> dict[str, float]:
+        """entity_id -> the covering window's current until_ts, for every
+        device in `devices` (an iterable of (device_id, device_group_id)
+        pairs, exactly the two columns Nodes' own device rows already carry)
+        that an active window covers.
+
+        Scope resolution stays purely ids-in/ids-out on purpose: alertsdb
+        has no nodesdb of its own, so the caller (AlertEngine, or the API
+        layer, both of which already have a nodesdb) supplies the pairs
+        rather than this module reaching sideways for one.
+        """
+        now = time.time() if now is None else now
+        active = self.active_windows(now) if windows is None else windows
+        if not active:
+            return {}
+        result: dict[str, float] = {}
+        for device_id, device_group_id in devices:
+            did = str(device_id)
+            for row in active:
+                if self._window_scope_matches(row, did, device_group_id):
+                    until = _window_occurrence_end(row, now)
+                    if did not in result or until > result[did]:
+                        result[did] = until
+        return result
+
+    def window_covers_device(self, device_id, device_group_id,
+                             now: float | None = None) -> float | None:
+        """The single-device version of window_covered_device_ids, for a
+        caller (a device's own page, the engine's per-alert clear check)
+        that only ever asks about one device and would rather not build a
+        one-item iterable to ask."""
+        now = time.time() if now is None else now
+        did = str(device_id)
+        best = None
+        for row in self.active_windows(now):
+            if self._window_scope_matches(row, did, device_group_id):
+                until = _window_occurrence_end(row, now)
+                if best is None or until > best:
+                    best = until
+        return best
 
     def acknowledge_many(self, alert_ids: list[int], by: str = "") -> int:
         """Acknowledge exactly the given alerts — the selection-respecting
@@ -1426,6 +1818,42 @@ class AlertsDatabase:
             cursor = self._conn.execute(
                 "UPDATE alerts SET state='acked', acked_ts=?, acked_by=?"
                 " WHERE state='open'", (time.time(), by))
+            self._conn.commit()
+            return cursor.rowcount or 0
+
+    def unacknowledge(self, alert_id: int) -> None:
+        """Undo a mistaken (or simply premature) Acknowledge, returning the
+        alert to plain 'open'. acked_ts/acked_by/ack_note are cleared rather
+        than kept alongside a new "unacked" marker — this alert is, again,
+        exactly an unacknowledged one, and who reversed the acknowledgement
+        and when is the API layer's own audit-log entry (alert.unack), the
+        same place who acknowledged it in the first place is NOT recorded on
+        the row either. Only from 'acked': an open alert has nothing to
+        undo, and a resolved one is not brought back to life by this.
+
+        No downstream state to reconcile: renotify_minutes' own sweep
+        (alerts_due_renotify) already reads state='open', so an alert that
+        goes back to 'open' here is simply due for renotify again on
+        whatever the normal schedule already is — nothing special to it.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE alerts SET state='open', acked_ts=NULL, acked_by=NULL,"
+                " ack_note=NULL WHERE id=? AND state='acked'", (alert_id,))
+            self._conn.commit()
+
+    def unacknowledge_many(self, alert_ids: list[int]) -> int:
+        """The bulk counterpart, mirroring acknowledge_many's own shape —
+        acts on exactly the given ids, ignoring any that are not currently
+        acked rather than raising for them."""
+        if not alert_ids:
+            return 0
+        marks = ",".join("?" * len(alert_ids))
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE alerts SET state='open', acked_ts=NULL, acked_by=NULL,"
+                f" ack_note=NULL WHERE id IN ({marks}) AND state='acked'",
+                alert_ids)
             self._conn.commit()
             return cursor.rowcount or 0
 

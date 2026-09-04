@@ -171,6 +171,14 @@ class AlertEngine:
         # is exactly when evaluation matters most. See alertmail.MailQueue.
         self._mail = alertmail.MailQueue(on_result=self._mail_result,
                                          on_breaker=self._mail_breaker)
+        # Same reasoning, same shape, for the webhook channel — see
+        # alertmail.WebhookQueue.
+        self._webhook = alertmail.WebhookQueue(on_result=self._webhook_result)
+        # Webhook's own hourly budget, kept apart from _sent_this_hour: a
+        # webhook receiver is a machine, not an inbox, and the two channels
+        # must not compete for the same quota. See webhook_max_per_hour.
+        self._webhook_sent_this_hour: list[float] = []
+        self._webhook_suppression_logged_hour: int | None = None
         # Occurrences raised by the application about itself (the mail path,
         # the poll pool) rather than read from a source. Appended from any
         # thread — the mail worker raises the SMTP one — and drained on the
@@ -181,7 +189,8 @@ class AlertEngine:
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
                          "rolled_up": 0, "muted": 0, "apply_errors": 0,
-                         "backlog": 0}
+                         "backlog": 0, "webhooks_sent": 0, "webhook_errors": 0,
+                         "webhook_suppressed": 0}
         self.error: str | None = None
         self._last_tick_ts: float = 0.0
 
@@ -193,6 +202,7 @@ class AlertEngine:
         self.stop()
         self._stop.clear()
         self._mail.start()
+        self._webhook.start()
         self._thread = threading.Thread(target=self._loop, name="alert-engine", daemon=True)
         self._thread.start()
 
@@ -209,6 +219,7 @@ class AlertEngine:
             self._thread.join(timeout=2)
         self._thread = None
         self._mail.stop()
+        self._webhook.stop()
 
     def shutdown(self) -> None:
         self.stop()
@@ -270,7 +281,21 @@ class AlertEngine:
         occurrences += self._drain_pending()
         # Read once per tick rather than per occurrence, and usually empty —
         # when nothing is muted the gate below costs one dict truth test.
-        muted = self.db.muted_entity_ids("device")
+        # window_covered is folded in here rather than left for _muted to ask
+        # about separately: a maintenance window behaves EXACTLY like a
+        # device mute for occurrence gating (see the maintenance_windows
+        # schema comment in alertsdb.py), so one dict serves both. Resolved
+        # against nodesdb.devices() only when a window is actually active —
+        # active_windows() is one cheap query, so a fleet with no window
+        # running today (almost always) never pays for the device read at
+        # all.
+        window_covered = None
+        active_windows = self.db.active_windows()
+        if active_windows:
+            window_covered = self.db.window_covered_device_ids(
+                ((row["id"], row["device_group_id"]) for row in self.nodes_db.devices()),
+                windows=active_windows)
+        muted = self.db.muted_entity_ids("device", window_covered=window_covered)
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
             # Per occurrence, not per tick. The apply path is not
@@ -381,6 +406,21 @@ class AlertEngine:
                 message=f"Alert email is failing and delivery is paused: {error}")
         else:
             self.clear_system_occurrence("smtp_failing", "smtp")
+
+    def _webhook_result(self, job, ok: bool, error: str) -> None:
+        """The webhook counterpart of _mail_result — same shape, a separate
+        counter pair (webhooks_sent/webhook_errors) so an operator watching
+        the two channels can tell them apart, and to_addr holds the URL
+        rather than a recipient list, which is what an operator reading the
+        alert's notification history wants to see for a webhook row."""
+        if ok:
+            self.counters["webhooks_sent"] += 1
+        else:
+            self.counters["webhook_errors"] += 1
+        alert_ids = getattr(job, "alert_ids", None) or [job.alert_id]
+        for alert_id in alert_ids:
+            self.db.record_notification(alert_id, job.kind, job.url,
+                                        job.subject, ok, error)
 
     # ------------------------------------------------------- drain plumbing
 
@@ -513,7 +553,8 @@ class AlertEngine:
         return True
 
     def _muted_alert(self, alert_row) -> bool:
-        """Whether an existing alert's device is muted.
+        """Whether an existing alert's device is muted OR covered by an
+        active maintenance window.
 
         Its own lookup rather than the per-tick dict, because the clear path
         runs inside the drains — before _tick reads that dict — and a clear
@@ -522,7 +563,11 @@ class AlertEngine:
         device_id = device_id_for(alert_row["entity_kind"], alert_row["entity_id"])
         if device_id is None:
             return False
-        return self.db.mute_row("device", str(device_id)) is not None
+        if self.db.mute_row("device", str(device_id)) is not None:
+            return True
+        device = self.nodes_db.device(device_id)
+        device_group_id = device["device_group_id"] if device is not None else None
+        return self.db.window_covers_device(device_id, device_group_id) is not None
 
     # ------------------------------------------- newly added device hold
 
@@ -2214,6 +2259,18 @@ class AlertEngine:
         # behaviour every rule had before.
         if "notify" in rule_row.keys() and not rule_row["notify"]:
             return
+        # The webhook channel's own decision, entirely independent of
+        # email's below it: its own enabled flag, its own URL, its own
+        # hourly budget (webhook_max_per_hour) and its own queue, so an
+        # operator can run one channel with the other off. Reached from
+        # every caller of _notify — a fresh alert's own notice, a renotify,
+        # a clear (through _notify_clear's template_override) and a small
+        # roll-up flush's per-alert release — which is every decision point
+        # except the digest, which has no single alert row; see
+        # _send_digest's own webhook call.
+        self._webhook_notify(alert_row, rule_row, occurrence, settings,
+                             notify_kind or ("renotify" if renotify else "alert"),
+                             template_override)
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
@@ -2306,6 +2363,80 @@ class AlertEngine:
             # global counter.
             self.counters["send_errors"] += 1
             self.db.record_notification(alert_row["id"], kind, ", ".join(to_addrs),
+                                        subject, False, "send queue full")
+
+    def _webhook_notify(self, alert_row, rule_row, occurrence: Occurrence,
+                        settings, kind: str, template_override=None) -> None:
+        """One JSON POST for one alert, at exactly the point _notify reached
+        for email — see the call site's own comment for which decision
+        points that covers. `kind` is _notify's own "alert"/"renotify"/
+        "clear" vocabulary; the JSON payload's "state" field says "open"
+        for "alert", matching what the rest of this application calls a
+        freshly-opened alert (alerts.state itself is 'open', not 'alert').
+
+        Deliberately does not require a template: email returns with
+        nothing sent when a rule has no template_id, because there is no
+        body to render, but a webhook's JSON body is fixed shape (see the
+        schema comment above WebhookQueue) and does not need one — only the
+        one line rendered FROM a template (the subject) is optional, and
+        falls back to the rule's own name when there is none.
+        """
+        if not settings.get("webhook_enabled"):
+            return
+        url = str(settings.get("webhook_url") or "").strip()
+        if not url:
+            return
+        now = time.time()
+        hour_ago = now - 3600
+        self._webhook_sent_this_hour = [
+            ts for ts in self._webhook_sent_this_hour if ts >= hour_ago]
+        max_per_hour = int(settings.get("webhook_max_per_hour", 600) or 0)
+        current_hour = int(now // 3600)
+        webhook_kind = f"webhook_{kind}"
+        if max_per_hour and len(self._webhook_sent_this_hour) >= max_per_hour:
+            self.counters["webhook_suppressed"] += 1
+            self.db.record_notification(
+                alert_row["id"], webhook_kind, url, "", False,
+                f"not sent: over the {max_per_hour}/hour webhook limit")
+            if self._webhook_suppression_logged_hour != current_hour:
+                self._webhook_suppression_logged_hour = current_hour
+                self.log.add(ERROR, f"Alert webhook volume over {max_per_hour}/hour"
+                                    f" — suppressing further sends for the rest of"
+                                    f" this hour")
+            return
+        if template_override is not None:
+            template = template_override
+        else:
+            template = (self.db.template(rule_row["template_id"])
+                       if rule_row["template_id"] else None)
+        extra = dict(occurrence.extra)
+        device_ip = self._device_ip_for(alert_row)
+        if device_ip:
+            extra["device_ip"] = device_ip
+        context = alertmail.build_context(alert_row, rule_row, extra=extra)
+        subject = (alertmail.render(template["subject"], context)
+                  if template is not None else (rule_row["name"] or ""))
+        payload = {
+            "alert_id": alert_row["id"],
+            "rule": rule_row["key"] or "",
+            "rule_name": rule_row["name"],
+            "kind": rule_row["kind"],
+            "entity_label": alert_row["entity_label"],
+            "message": alert_row["message"],
+            "detail": alert_row["detail"] or "",
+            "ts": now,
+            "state": "open" if kind == "alert" else kind,
+            "subject": subject,
+        }
+        self._webhook_sent_this_hour.append(now)
+        job = alertmail.WebhookJob(
+            url=url, headers=alertmail.parse_headers(settings.get("webhook_headers", [])),
+            timeout=float(settings.get("webhook_timeout_s", 10.0) or 10.0),
+            payload=payload, subject=subject, alert_id=alert_row["id"],
+            kind=webhook_kind)
+        if not self._webhook.submit(job):
+            self.counters["webhook_errors"] += 1
+            self.db.record_notification(alert_row["id"], webhook_kind, url,
                                         subject, False, "send queue full")
 
     def _device_ip_for(self, alert_row) -> str:
@@ -2539,6 +2670,9 @@ class AlertEngine:
         has to close out every alert's pending decision, or they would sit
         "due" forever asking the same question every tick.
         """
+        # The webhook channel's own digest, entirely independent of email's
+        # below it — same reasoning as _notify's own webhook call.
+        self._webhook_digest(sendable, settings, delay_s)
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
@@ -2602,3 +2736,62 @@ class AlertEngine:
                 self.db.record_notification(alert_row["id"], "alert",
                                             ", ".join(to_addrs), subject,
                                             False, "send queue full")
+
+    def _webhook_digest(self, sendable, settings, delay_s: float) -> None:
+        """One webhook delivery for every alert in `sendable`, mirroring
+        _send_digest's own one-email-for-many shape and counted once
+        against webhook_max_per_hour for the same reason. Unlike the email
+        digest, the JSON body is not a bespoke plain-text format — it is the
+        fixed schema's own "alerts" list (see the comment above
+        WebhookQueue), so a receiver parses a digest exactly the way it
+        parses a single notification, just with more rows.
+        """
+        if not settings.get("webhook_enabled"):
+            return
+        url = str(settings.get("webhook_url") or "").strip()
+        if not url:
+            return
+        now = time.time()
+        hour_ago = now - 3600
+        self._webhook_sent_this_hour = [
+            ts for ts in self._webhook_sent_this_hour if ts >= hour_ago]
+        max_per_hour = int(settings.get("webhook_max_per_hour", 600) or 0)
+        current_hour = int(now // 3600)
+        if max_per_hour and len(self._webhook_sent_this_hour) >= max_per_hour:
+            self.counters["webhook_suppressed"] += 1
+            reason = f"not sent: over the {max_per_hour}/hour webhook limit"
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.record_notification(alert_row["id"], "webhook_digest",
+                                            url, "", False, reason)
+            if self._webhook_suppression_logged_hour != current_hour:
+                self._webhook_suppression_logged_hour = current_hour
+                self.log.add(ERROR, f"Alert webhook volume over {max_per_hour}/hour"
+                                    f" — suppressing further sends for the rest of"
+                                    f" this hour")
+            return
+        minutes = max(1, round(delay_s / 60.0))
+        subject = (f"SappiWhere: {len(sendable)} alerts opened in the last "
+                  f"{minutes} minute{'s' if minutes != 1 else ''}")
+        alerts = [{"alert_id": row["id"], "rule": rule_row["key"] or "",
+                   "rule_name": rule_row["name"], "entity_label": row["entity_label"],
+                   "message": row["message"]}
+                  for row, rule_row, _occurrence in sendable]
+        first_row, first_rule, _occ = sendable[0]
+        payload = {
+            "alert_id": None, "rule": first_rule["key"] or "",
+            "rule_name": first_rule["name"], "kind": first_rule["kind"],
+            "entity_label": first_row["entity_label"], "message": first_row["message"],
+            "detail": "", "ts": now, "state": "digest", "subject": subject,
+            "alerts": alerts,
+        }
+        self._webhook_sent_this_hour.append(now)
+        job = alertmail.WebhookJob(
+            url=url, headers=alertmail.parse_headers(settings.get("webhook_headers", [])),
+            timeout=float(settings.get("webhook_timeout_s", 10.0) or 10.0),
+            payload=payload, subject=subject, kind="webhook_digest",
+            alert_ids=[row["id"] for row, _rule_row, _occurrence in sendable])
+        if not self._webhook.submit(job):
+            self.counters["webhook_errors"] += 1
+            for alert_row, _rule_row, _occurrence in sendable:
+                self.db.record_notification(alert_row["id"], "webhook_digest",
+                                            url, subject, False, "send queue full")

@@ -16,6 +16,7 @@ import threading
 import time
 
 from ..alertrules import device_id_for
+from ..alertsdb import is_window_active
 from ..analysis import availability, build_timeline, build_topology
 from .. import hostresolve
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
@@ -2119,8 +2120,15 @@ def get_nodes_devices(service, params, body) -> dict:
     worker_state = service.node_poller.worker_state()
     # A mute lives in the Alerts module but has to be visible here: an
     # operator who silenced a device an hour ago and then wonders why it
-    # is quiet should be able to see why without opening Alerts.
-    muted = service.alerts_db.muted_entity_ids("device")
+    # is quiet should be able to see why without opening Alerts. A
+    # maintenance window is folded into the same field for the same reason
+    # — muted_until is "why is this device quiet", and a window answers
+    # that exactly as a mute does. window_covered_device_ids is asked with
+    # the rows this call already fetched (id, device_group_id) rather than
+    # a second devices() read.
+    window_covered = service.alerts_db.window_covered_device_ids(
+        ((row["id"], row["device_group_id"]) for row in rows))
+    muted = service.alerts_db.muted_entity_ids("device", window_covered=window_covered)
     reveal = _may_read_secrets(service, params, "nodes")
     devices = []
     for row in rows:
@@ -2233,7 +2241,14 @@ def get_nodes_device(service, params, body, device_id) -> dict:
         device["group_name"] = group["name"] if group else None
     device["polling"] = device_id in service.node_poller.worker_state()
     mute = service.alerts_db.mute_row("device", str(device_id))
-    device["muted_until"] = mute["until_ts"] if mute else None
+    window_until = service.alerts_db.window_covers_device(
+        device_id, row["device_group_id"])
+    # The later of the two, matching muted_entity_ids' own tie-break: a
+    # device can be both hand-muted and inside an active window at once,
+    # and "muted until" ought to name whichever one stops applying last.
+    device["muted_until"] = max(
+        (v for v in (mute["until_ts"] if mute else None, window_until)
+         if v is not None), default=None)
     device.update(_identification_json(service, row))
     return {"device": device}
 
@@ -3560,6 +3575,14 @@ def post_alert_ack(service, params, body, alert_id) -> dict:
     return {"ok": True}
 
 
+def post_alert_unack(service, params, body, alert_id) -> dict:
+    if not service.alerts_db.alert(alert_id):
+        raise ValueError("No such alert")
+    service.alerts_db.unacknowledge(alert_id)
+    _audit(service, params, "alert.unack", target=str(alert_id))
+    return {"ok": True}
+
+
 def post_alert_resolve(service, params, body, alert_id) -> dict:
     if not service.alerts_db.alert(alert_id):
         raise ValueError("No such alert")
@@ -3622,6 +3645,162 @@ def delete_alerts_mute(service, params, body) -> dict:
     return {"lifted": lifted}
 
 
+def _bulk_mute_device_ids(service, body) -> list[str]:
+    """Every device id a bulk-mute request names — an explicit list, a
+    device group's whole current membership, or both together, refusing
+    (like _mute_entity above) a request that would end up silencing
+    nothing."""
+    ids = {str(i) for i in (body.get("device_ids") or [])}
+    group_id = body.get("group_id")
+    if group_id:
+        try:
+            group_id = int(group_id)
+        except (TypeError, ValueError):
+            raise ValueError("group_id must be a number")
+        ids |= {str(row["id"]) for row in
+               service.nodes_db.devices(device_group_id=group_id)}
+    if not ids:
+        raise ValueError("device_ids and/or group_id is required, naming at "
+                         "least one device")
+    try:
+        wanted = {int(i) for i in ids}
+    except (TypeError, ValueError):
+        raise ValueError("device_ids must be device ids")
+    present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
+    ids = [i for i in ids if int(i) in present]
+    if not ids:
+        raise ValueError("No such device(s)")
+    return sorted(ids, key=int)
+
+
+def post_alerts_bulk_mute(service, params, body) -> dict:
+    """One call, many devices — the planned-cutover case the ad-hoc mute
+    route makes hundreds of calls. Same ad-hoc cap (MAX_MUTE_HOURS) as a
+    single mute; a longer silence is what a maintenance WINDOW is for."""
+    entity_ids = _bulk_mute_device_ids(service, body)
+    try:
+        hours = float(body.get("hours", 1))
+    except (TypeError, ValueError):
+        raise ValueError("Mute duration must be a number of hours")
+    if hours <= 0:
+        raise ValueError("Mute duration must be more than zero")
+    reason = str(body.get("reason", ""))
+    rows = service.alerts_db.mute_many("device", entity_ids, hours,
+                                       by=params.get("_username", ""),
+                                       reason=reason)
+    _audit(service, params, "alert.mute_bulk",
+          detail=f"{len(rows)} device(s), {hours:g}h: {reason}")
+    return {"muted": len(rows), "mutes": [_mute_json(r) for r in rows]}
+
+
+# --------------------------------------------------- maintenance windows
+
+def _window_json(row) -> dict:
+    try:
+        device_ids = json.loads(row["scope_device_ids"] or "[]")
+    except (TypeError, ValueError):
+        device_ids = []
+    return {
+        "id": row["id"], "name": row["name"], "scope_kind": row["scope_kind"],
+        "scope_group_id": row["scope_group_id"], "scope_device_ids": device_ids,
+        "start_ts": row["start_ts"], "end_ts": row["end_ts"],
+        "recurrence": row["recurrence"], "created_ts": row["created_ts"],
+        "created_by": row["created_by"], "reason": row["reason"],
+        # So the list can show "active now" without every viewer re-deriving
+        # is_window_active from start/end/recurrence itself.
+        "active": is_window_active(row),
+    }
+
+
+def get_alerts_windows(service, params, body) -> dict:
+    return {"windows": [_window_json(r) for r in service.alerts_db.windows()]}
+
+
+def _window_body_fields(service, body) -> dict:
+    """The maintenance_windows columns a create/update request supplied,
+    validated against Nodes where the field names something Nodes owns —
+    alertsdb has no nodesdb of its own to check a group or device id is
+    real, so that check happens here, once, for both routes below."""
+    fields: dict = {}
+    if "name" in body:
+        fields["name"] = str(body["name"])
+    if "start_ts" in body:
+        try:
+            fields["start_ts"] = float(body["start_ts"])
+        except (TypeError, ValueError):
+            raise ValueError("start_ts must be a number")
+    if "end_ts" in body:
+        try:
+            fields["end_ts"] = float(body["end_ts"])
+        except (TypeError, ValueError):
+            raise ValueError("end_ts must be a number")
+    if "recurrence" in body:
+        fields["recurrence"] = body["recurrence"] or None
+    if "reason" in body:
+        fields["reason"] = str(body["reason"])
+    if "scope_kind" in body:
+        scope_kind = str(body["scope_kind"])
+        fields["scope_kind"] = scope_kind
+        if scope_kind == "group":
+            group_id = body.get("scope_group_id")
+            if not group_id or not service.nodes_db.device_group(int(group_id)):
+                raise ValueError("No such device group")
+            fields["scope_group_id"] = int(group_id)
+            fields["scope_device_ids"] = None
+        elif scope_kind == "devices":
+            ids = body.get("scope_device_ids") or []
+            try:
+                wanted = {int(i) for i in ids}
+            except (TypeError, ValueError):
+                raise ValueError("scope_device_ids must be device ids")
+            present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
+            missing = wanted - present
+            if missing:
+                raise ValueError(f"No such device(s): {sorted(missing)}")
+            fields["scope_group_id"] = None
+            fields["scope_device_ids"] = sorted(wanted)
+    return fields
+
+
+def post_alerts_window(service, params, body) -> dict:
+    fields = _window_body_fields(service, body)
+    for required in ("name", "scope_kind", "start_ts", "end_ts"):
+        if required not in fields:
+            raise ValueError(f"{required} is required")
+    window_id = service.alerts_db.add_window(
+        fields["name"], fields["scope_kind"], fields["start_ts"], fields["end_ts"],
+        scope_group_id=fields.get("scope_group_id"),
+        scope_device_ids=fields.get("scope_device_ids"),
+        recurrence=fields.get("recurrence"), created_by=params.get("_username", ""),
+        reason=fields.get("reason", ""))
+    _audit(service, params, "alert.window_create", target=fields["name"],
+          detail=fields["scope_kind"])
+    return {"window": _window_json(service.alerts_db.window(window_id))}
+
+
+def put_alerts_window(service, params, body, window_id) -> dict:
+    if not service.alerts_db.window(window_id):
+        raise ValueError("No such maintenance window")
+    fields = _window_body_fields(service, body)
+    service.alerts_db.update_window(window_id, **fields)
+    _audit(service, params, "alert.window_update", target=str(window_id))
+    return {"window": _window_json(service.alerts_db.window(window_id))}
+
+
+def delete_alerts_window(service, params, body, window_id) -> dict:
+    removed = service.alerts_db.remove_window(window_id)
+    _audit(service, params, "alert.window_delete", target=str(window_id))
+    return {"removed": removed}
+
+
+def post_alerts_window_end(service, params, body, window_id) -> dict:
+    if not service.alerts_db.window(window_id):
+        raise ValueError("No such maintenance window")
+    service.alerts_db.end_window_now(window_id)
+    _audit(service, params, "alert.window_end", target=str(window_id))
+    return {"window": _window_json(service.alerts_db.window(window_id))}
+
+
 def post_alerts_ack_all(service, params, body) -> dict:
     n = service.alerts_db.acknowledge_all(params.get("_username", ""))
     _audit(service, params, "alert.ack_all", detail=f"{n} alert(s)")
@@ -3640,6 +3819,13 @@ def post_alerts_bulk_ack(service, params, body) -> dict:
     n = service.alerts_db.acknowledge_many(alert_ids, params.get("_username", ""))
     _audit(service, params, "alert.ack_bulk", detail=f"{n} of {len(alert_ids)}")
     return {"acknowledged": n}
+
+
+def post_alerts_bulk_unack(service, params, body) -> dict:
+    alert_ids = _bulk_alert_ids(body)
+    n = service.alerts_db.unacknowledge_many(alert_ids)
+    _audit(service, params, "alert.unack_bulk", detail=f"{n} of {len(alert_ids)}")
+    return {"unacknowledged": n}
 
 
 def post_alerts_bulk_resolve(service, params, body) -> dict:

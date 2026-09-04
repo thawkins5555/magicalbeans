@@ -99,6 +99,12 @@
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
       (c.send_errors ? ` · ${c.send_errors} send errors` : '') +
+      // Only shown once the webhook channel has actually done something —
+      // most installs never turn it on, and a permanent ". 0 webhooks sent"
+      // would be noise on every one of them.
+      (c.webhooks_sent || c.webhook_errors
+        ? ` · ${c.webhooks_sent || 0} webhooks sent` +
+          (c.webhook_errors ? ` (${c.webhook_errors} failed)` : '') : '') +
       // How far behind the engine is, and how many events it could not
       // apply: an engine that has stopped keeping up used to look exactly
       // like one with nothing to do.
@@ -111,6 +117,16 @@
     const openCount = alerts.open_count || 0;
     badge.textContent = openCount;
     badge.hidden = openCount === 0;
+    // Both injected in init() (see its own comment on why) rather than
+    // declared with data-requires-write, so this is what keeps them honest
+    // against a grant that changes while the page is open.
+    const writable = App.canWrite('alerts');
+    for (const id of ['alerts-bulkmute-btn', 'alerts-bulk-unack']) {
+      const btn = document.getElementById(id);
+      if (!btn) continue;
+      btn.disabled = !writable;
+      btn.title = writable ? '' : 'Needs Alerts write';
+    }
   }
 
   /* --------------------------------------------------------- histogram */
@@ -427,7 +443,8 @@
         <span class="grow"></span>
         ${muteHtml}
         ${writable && row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
-        ${writable && row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}</div>
+        ${writable && row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}
+        ${writable && row.state === 'acked' ? '<button id="alerts-d-unack">Unacknowledge</button>' : ''}</div>
       ${muteHint}
       <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
       <p>${escape(row.message)}</p>
@@ -450,6 +467,9 @@
     const ackBtn = document.getElementById('alerts-d-ack');
     if (ackBtn) ackBtn.onclick = () =>
       detailAction('Acknowledge', () => App.post(`/api/alerts/${row.id}/ack`, {}));
+    const unackBtn = document.getElementById('alerts-d-unack');
+    if (unackBtn) unackBtn.onclick = () =>
+      detailAction('Unacknowledge', () => App.post(`/api/alerts/${row.id}/unack`, {}));
     const muteBtn = muteable ? document.getElementById('alerts-d-mute') : null;
     if (muteBtn) muteBtn.onclick = () => detailAction('Mute', () => {
       const hours = Number(App.el('alerts-d-mute-hours').value) || 1;
@@ -467,6 +487,227 @@
         `<div>${App.when(n.ts)} — ${escape(n.kind)} to ${escape(n.to_addr)}: ` +
         `${n.ok ? 'sent' : `<span class="err">failed (${escape(n.error)})</span>`}</div>`).join('');
     }).catch(() => {});
+  }
+
+  /* ---------------------------------- bulk unacknowledge, and unack gate */
+
+  async function bulkUnacknowledge() {
+    await bulkAction('/api/alerts/bulk-unack', 'Unacknowledged', 'unacknowledged');
+  }
+
+  /* -------------------------------- maintenance windows and bulk mute
+
+     Both dialogs below share one "scope" picker: a device GROUP (whatever
+     currently carries that device_group_id in Nodes) or an explicit list of
+     devices — the same two shapes maintenance_windows.scope_kind and the
+     bulk-mute route both take. Neither the group list nor the device list
+     lives in `view`: both are fetched fresh each time one of these dialogs
+     opens rather than kept in step with the page's own poll, since they are
+     used rarely enough that one extra round trip on open costs nothing and
+     is simpler than another thing refresh() has to keep current. */
+
+  async function scopeSources() {
+    try {
+      const [groups, devices] = await Promise.all([
+        App.get('/api/nodes/device-groups'), App.get('/api/nodes/devices'),
+      ]);
+      return { groups: groups.groups || [], devices: devices.devices || [] };
+    } catch (error) {
+      // Nodes read is what serves both lists. An account with Alerts write
+      // but no Nodes read still gets a working dialog — device_ids typed
+      // into the "Specific devices" box the fallback below offers — just
+      // not a picker to choose them from.
+      return { groups: [], devices: [] };
+    }
+  }
+
+  function scopeFieldsHtml(prefix, groups, devices, current) {
+    current = current || {};
+    const scopeKind = current.scope_kind || 'group';
+    const groupOptions = groups.length
+      ? groups.map((g) => `<option value="${g.id}" ${
+          current.scope_group_id === g.id ? 'selected' : ''}>${escape(g.name)}</option>`).join('')
+      : '<option value="">(no device groups — use Specific devices)</option>';
+    const selected = new Set((current.scope_device_ids || []).map(String));
+    const deviceOptions = devices.length
+      ? devices.map((d) => `<option value="${d.id}" ${
+          selected.has(String(d.id)) ? 'selected' : ''}>${escape(d.name || d.ip)}</option>`).join('')
+      : '';
+    return `
+      <label>Scope <select id="${prefix}-scope-kind">
+        <option value="group" ${scopeKind === 'group' ? 'selected' : ''}>A device group</option>
+        <option value="devices" ${scopeKind === 'devices' ? 'selected' : ''}>Specific devices</option>
+      </select></label>
+      <div id="${prefix}-scope-group" ${scopeKind !== 'group' ? 'hidden' : ''}>
+        <label>Device group <select id="${prefix}-group">${groupOptions}</select></label>
+      </div>
+      <div id="${prefix}-scope-devices" ${scopeKind !== 'devices' ? 'hidden' : ''}>
+        ${devices.length
+          ? `<label>Devices (ctrl/cmd-click for several) <select id="${prefix}-devices" multiple size="6">${deviceOptions}</select></label>`
+          : `<label>Device ids, comma-separated <input id="${prefix}-devices-text" value="${
+              [...selected].join(', ')}"></label>`}
+      </div>`;
+  }
+
+  function wireScopeFields(box, prefix) {
+    const select = box.querySelector(`#${prefix}-scope-kind`);
+    const groupBox = box.querySelector(`#${prefix}-scope-group`);
+    const devicesBox = box.querySelector(`#${prefix}-scope-devices`);
+    select.onchange = () => {
+      groupBox.hidden = select.value !== 'group';
+      devicesBox.hidden = select.value !== 'devices';
+    };
+  }
+
+  function readScopeFields(box, prefix) {
+    const kind = box.querySelector(`#${prefix}-scope-kind`).value;
+    if (kind === 'group') {
+      const groupId = box.querySelector(`#${prefix}-group`).value;
+      if (!groupId) throw new Error('Choose a device group');
+      return { scope_kind: 'group', scope_group_id: Number(groupId) };
+    }
+    const picker = box.querySelector(`#${prefix}-devices`);
+    const ids = picker
+      ? [...picker.selectedOptions].map((o) => Number(o.value))
+      : box.querySelector(`#${prefix}-devices-text`).value.split(',')
+          .map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0);
+    if (!ids.length) throw new Error('Choose at least one device');
+    return { scope_kind: 'devices', scope_device_ids: ids };
+  }
+
+  async function bulkMuteDialog() {
+    const { groups, devices } = await scopeSources();
+    App.modal('Bulk mute', `
+      ${scopeFieldsHtml('bm', groups, devices)}
+      <label>For <select id="bm-hours" class="fixed">${MUTE_HOURS.map((h) =>
+        `<option value="${h}">${h} hour${h === 1 ? '' : 's'}</option>`).join('')}</select></label>
+      <label>Reason (optional) <input id="bm-reason"></label>
+      <p class="hint">Same 24-hour cap as muting one device. For a planned
+        cutover measured in days, use a <b>maintenance window</b> instead —
+        its duration is set by when it ends, not by this cap.</p>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Mute', primary: true, onClick: async (box) => {
+        const scope = readScopeFields(box, 'bm');
+        const result = await App.post('/api/alerts/bulk-mute', {
+          ...scope, hours: Number(box.querySelector('#bm-hours').value) || 1,
+          reason: box.querySelector('#bm-reason').value.trim(),
+        });
+        App.announce(`Muted ${result.muted} device(s)`);
+        App.closeModal();
+        App.refreshNow('alerts');
+      } },
+    ]);
+    wireScopeFields(App.el('modal-box'), 'bm');
+  }
+
+  function windowStatus(w) {
+    if (w.active) return 'active now';
+    return w.start_ts > Date.now() / 1000 ? 'upcoming' : 'ended';
+  }
+
+  function windowRowHtml(w) {
+    const scope = w.scope_kind === 'group'
+      ? `device group #${w.scope_group_id ?? '—'}`
+      : `${w.scope_device_ids.length} device(s)`;
+    const canEnd = w.active || w.start_ts > Date.now() / 1000;
+    return `<tr data-id="${w.id}">
+      <td>${escape(w.name)}</td>
+      <td>${escape(scope)}${w.recurrence ? ' · weekly' : ''}</td>
+      <td>${App.when(w.start_ts)}</td>
+      <td>${App.when(w.end_ts)}</td>
+      <td>${windowStatus(w)}</td>
+      <td>${canEnd ? `<button type="button" class="aw-end" data-id="${w.id}">End now</button>` : ''}
+        <button type="button" class="aw-delete" data-id="${w.id}">Delete</button></td>
+    </tr>`;
+  }
+
+  async function windowsDialog() {
+    const writable = App.canWrite('alerts');
+    const { windows } = await App.get('/api/alerts/windows');
+    const rows = (windows || []).slice().sort((a, b) => b.start_ts - a.start_ts);
+    const box = App.modal('Maintenance windows', `
+      <p class="hint">While a window is active, alerts for its covered
+        devices behave exactly like muting each of them by hand — their
+        interfaces and access points go quiet too, and any notification
+        already held for the roll-up wait is released once the window ends
+        if the alert is still standing.</p>
+      <div class="table-wrap"><table id="aw-table">
+        <caption class="sr-only">Maintenance windows</caption>
+        <thead><tr><th scope="col">Name</th><th scope="col">Scope</th>
+          <th scope="col">Start</th><th scope="col">End</th>
+          <th scope="col">Status</th><th scope="col"></th></tr></thead>
+        <tbody>${rows.length ? rows.map(windowRowHtml).join('')
+          : '<tr><td colspan="6" class="hint">No maintenance windows.</td></tr>'}</tbody>
+      </table></div>`, [
+      { label: 'Close', onClick: App.closeModal },
+      ...(writable ? [{ label: 'Add window', onClick: addWindowDialog }] : []),
+    ], { buttonsTop: true });
+    if (!writable) return box;
+    for (const btn of box.querySelectorAll('.aw-end')) {
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await App.post(`/api/alerts/windows/${btn.dataset.id}/end`, {});
+          await windowsDialog();
+        } catch (error) {
+          App.announce(`End window failed: ${error.message}`);
+          btn.disabled = false;
+        }
+      };
+    }
+    for (const btn of box.querySelectorAll('.aw-delete')) {
+      btn.onclick = () => {
+        const w = (windows || []).find((x) => String(x.id) === btn.dataset.id);
+        App.confirmDestructive('Delete maintenance window',
+          `<p>Delete <b>${escape(w ? w.name : 'this window')}</b>?</p>` +
+          '<p class="hint">Alerts for its covered devices resume the moment ' +
+          'this is deleted, if the window is currently active.</p>', 'Delete',
+          () => App.del(`/api/alerts/windows/${btn.dataset.id}`, {}),
+          () => windowsDialog());
+      };
+    }
+    return box;
+  }
+
+  function localInputValue(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+      `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  async function addWindowDialog() {
+    const { groups, devices } = await scopeSources();
+    const start = new Date(Date.now() + 5 * 60000);
+    const end = new Date(start.getTime() + 2 * 3600000);
+    App.modal('Add maintenance window', `
+      <label>Name <input id="aw-name" placeholder="Weekend core cutover"></label>
+      ${scopeFieldsHtml('aw', groups, devices)}
+      <label>Start <input id="aw-start" type="datetime-local" value="${localInputValue(start)}"></label>
+      <label>End <input id="aw-end" type="datetime-local" value="${localInputValue(end)}"></label>
+      <label class="check"><input type="checkbox" id="aw-weekly"> Repeats weekly</label>
+      <p class="hint">Silences alerts for the covered devices for the whole
+        span above, every 7 days, until this window is deleted or ended —
+        not just the once. A window may start in the future: it has no
+        effect until then.</p>
+      <label>Reason (optional) <input id="aw-reason"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (box) => {
+        if (!App.requireFields(box, [['#aw-name', 'Name']])) return;
+        const scope = readScopeFields(box, 'aw');
+        const startTs = new Date(box.querySelector('#aw-start').value).getTime() / 1000;
+        const endTs = new Date(box.querySelector('#aw-end').value).getTime() / 1000;
+        if (!(endTs > startTs)) throw new Error('End must be after start');
+        await App.post('/api/alerts/windows', {
+          ...scope, name: box.querySelector('#aw-name').value.trim(),
+          start_ts: startTs, end_ts: endTs,
+          recurrence: box.querySelector('#aw-weekly').checked ? 'weekly' : null,
+          reason: box.querySelector('#aw-reason').value.trim(),
+        });
+        App.closeModal();
+        await windowsDialog();
+      } },
+    ]);
+    wireScopeFields(App.el('modal-box'), 'aw');
   }
 
   /* --------------------------------------------------------------- rules */
@@ -850,6 +1091,26 @@
         <label>Add recipient <input id="as-to-add" placeholder="name@example.com"></label>
         <button type="button" id="as-to-add-btn">Add</button>
       </fieldset>
+      <fieldset><legend>WEBHOOK</legend>
+        ${check('as-webhook', 'Send an HTTP POST for notifications', s.webhook_enabled)}
+        <label>URL <input id="as-webhook-url" value="${escape(s.webhook_url || '')}"
+          placeholder="https://hooks.example.com/..."></label>
+        <p class="hint">https:// required unless the host is localhost or a
+          private (RFC1918) address — the same trust level the SMTP host
+          above gets, since this is an operator-configured endpoint too.
+          Delivered at the same points email is: a fresh alert, a clear, a
+          re-notify and the roll-up digest, one JSON POST each, whether or
+          not email itself is configured.</p>
+        <label>Extra headers, one "Name: value" per line
+          <textarea id="as-webhook-headers" rows="3" placeholder="Authorization: Bearer ...">${
+            escape((s.webhook_headers || []).join('\n'))}</textarea></label>
+        ${number('as-webhook-timeout', 'Timeout', s.webhook_timeout_s ?? 10, 'min=1 step=0.5')} s
+        ${number('as-webhook-maxhour', 'Max webhooks per hour', s.webhook_max_per_hour ?? 600, 'min=1')}
+        <p class="hint">Its own budget, kept apart from Max emails per hour
+          above — a webhook receiver is a machine, not an inbox, and turning
+          this on for a big fleet should not eat into a mail quota someone
+          already tuned.</p>
+      </fieldset>
       <fieldset><legend>VOLUME</legend>
         ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
         ${check('as-clear', 'Send an email when an alert clears', s.notify_on_clear)}
@@ -947,7 +1208,13 @@
           smtp_security: box.querySelector('#as-security').value,
           smtp_verify_cert: on('#as-verify'), smtp_username: text('#as-user'),
           smtp_from: text('#as-from'), smtp_from_name: text('#as-fromname'),
-          smtp_to_default: recipients, renotify_minutes: num('#as-renotify'),
+          smtp_to_default: recipients,
+          webhook_enabled: on('#as-webhook'), webhook_url: text('#as-webhook-url'),
+          webhook_headers: box.querySelector('#as-webhook-headers').value
+            .split('\n').map((line) => line.trim()).filter(Boolean),
+          webhook_timeout_s: num('#as-webhook-timeout'),
+          webhook_max_per_hour: num('#as-webhook-maxhour'),
+          renotify_minutes: num('#as-renotify'),
           notify_on_clear: on('#as-clear'), max_emails_per_hour: num('#as-maxhour'),
           notify_rollup_delay_s: num('#as-rollupdelay') * 60,
           new_device_grace_s: num('#as-grace') * 60,
@@ -1142,8 +1409,8 @@
         'open alert(s)?</p>' +
         '<p class="hint">Every open alert on the server — not your ticked ' +
         'selection, and not just the ones matching the current filter. Use ' +
-        '"Acknowledge selected" for the rows you have ticked. They cannot be ' +
-        'un-acknowledged in bulk.</p>', 'Acknowledge', async () => {
+        '"Acknowledge selected" for the rows you have ticked, or Unacknowledge ' +
+        'afterwards for any that were acted on too soon.</p>', 'Acknowledge', async () => {
           await App.post('/api/alerts/ack-all', {});
           view.checked.clear();
           clearSelection();
@@ -1156,8 +1423,25 @@
       App.confirmDestructive('Acknowledge alerts',
         `<p>Acknowledge the <b>${n}</b> selected alert(s)?</p>` +
         '<p class="hint">Only the ones you have ticked, and only those still ' +
-        'open. They cannot be un-acknowledged in bulk.</p>',
+        'open.</p>',
         'Acknowledge', bulkAcknowledge);
+    };
+    // Injected rather than declared in the bulk bar's own markup: it is the
+    // one bulk action that reverses another one (Acknowledge selected /
+    // Acknowledge all), which is why it earns a button at all where a
+    // resolved alert's own reversal does not.
+    const bulkUnackBtn = document.createElement('button');
+    bulkUnackBtn.id = 'alerts-bulk-unack';
+    bulkUnackBtn.textContent = 'Unacknowledge selected';
+    App.el('alerts-bulk-resolve').insertAdjacentElement('afterend', bulkUnackBtn);
+    bulkUnackBtn.onclick = () => {
+      const n = view.checked.size;
+      if (!n) return;
+      App.confirmDestructive('Unacknowledge alerts',
+        `<p>Return the <b>${n}</b> selected alert(s) to unacknowledged?</p>` +
+        '<p class="hint">Only the ones you have ticked, and only those ' +
+        'currently acknowledged.</p>',
+        'Unacknowledge', bulkUnacknowledge);
     };
     App.el('alerts-bulk-resolve').onclick = () => {
       const n = view.checked.size;
@@ -1175,6 +1459,25 @@
       App.refreshNow('alerts');
     };
     App.el('alerts-settings').onclick = settingsDialog;
+    // Both injected rather than declared in index.html: neither has a
+    // subpage of its own — everything either does lives inside a modal, the
+    // same way Settings itself does — so there is no static markup for them
+    // to hang off. Write-gated by hand rather than with data-requires-write,
+    // since these are added after this module's own init() runs and the
+    // very first applyPermissions() sweep (on the initial config load) would
+    // otherwise miss them; refresh() below keeps them current on any later
+    // permission change the same way applyPermissions does for everything
+    // declared in markup.
+    const windowsBtn = document.createElement('button');
+    windowsBtn.id = 'alerts-windows-btn';
+    windowsBtn.textContent = 'Maintenance windows';
+    windowsBtn.onclick = windowsDialog;
+    App.el('alerts-settings').insertAdjacentElement('beforebegin', windowsBtn);
+    const bulkMuteBtn = document.createElement('button');
+    bulkMuteBtn.id = 'alerts-bulkmute-btn';
+    bulkMuteBtn.textContent = 'Bulk mute';
+    bulkMuteBtn.onclick = bulkMuteDialog;
+    App.el('alerts-settings').insertAdjacentElement('beforebegin', bulkMuteBtn);
     App.el('alerts-add-rule').onclick = addRule;
     App.el('alerts-edit-rule').onclick = editRule;
     App.el('alerts-remove-rule').onclick = removeRule;

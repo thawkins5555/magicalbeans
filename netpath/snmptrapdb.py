@@ -41,6 +41,26 @@ TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
 TRIM_PASSES = 40             # delete/reclaim rounds before giving up
 TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
 
+# This database's SIZE CAP (max_snmp_db_mb, what trim_to_size above is given
+# as max_bytes) lives in appdb.py's GLOBAL_DEFAULTS, not here — every
+# module's own *_db_mb setting does, one place, so Settings can show them
+# side by side. Documented here anyway, since this is the module an operator
+# sizing that cap would actually open:
+#
+#   A 250-device review install logged a 75-second trap burst that wrote
+#   98.6 MB — 38% of the 256 MB the cap shipped at — which is roughly
+#   1.3 MB/s, ~197 MB of traps per minute sustained. At that rate a REAL
+#   storm (a site-wide power event, a flapping upstream link fanning traps
+#   out from everything behind it) reaches a 256 MB cap in under four
+#   minutes and starts discarding trap HISTORY while the incident that
+#   produced it is still active — the exact moment an operator most needs
+#   all of it. retention_days (90, above) is meant to be what decides how
+#   long trap history lives; a cap this tight let the size limit win that
+#   argument silently, deleting rows the day-count setting had not asked to
+#   lose yet. max_snmp_db_mb is 1024 in appdb.py now, matching
+#   max_syslog_db_mb and max_nodes_db_mb — both of which see comparable or
+#   worse burst volume and were never shipped at 256 to begin with.
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traps (
     id           INTEGER PRIMARY KEY,

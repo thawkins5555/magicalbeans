@@ -7,6 +7,7 @@ rest of this app follows for BER/ASN.1, MIB parsing, and everything else.
 
 from __future__ import annotations
 
+import json
 import queue
 import re
 import smtplib
@@ -14,9 +15,12 @@ import ssl
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr
+from urllib.parse import urlparse
 
 BUILTIN_TEMPLATES = {
     "device_down": {
@@ -537,6 +541,228 @@ class MailQueue:
             traceback.print_exc()
 
     def _finish(self, job: MailJob, ok: bool, error: str) -> None:
+        if self._on_result is None:
+            return
+        try:
+            self._on_result(job, ok, error)
+        except Exception:
+            traceback.print_exc()
+
+
+# --------------------------------------------------------- outbound webhook
+
+# ~40 lines of urllib buys Slack, Teams, PagerDuty and every ticketing
+# system at once, per the review this shipped from: one HTTP POST, JSON
+# body, at the same points email already fires. The JSON shape is FIXED —
+# not run through the {{token}} template engine the way the subject line is
+# — so a receiver can parse it without knowing this application's template
+# syntax. It is documented here, once, rather than only in whichever engine
+# method happens to build the dict:
+#
+#   {
+#     "alert_id": 123,              # null for a roll-up digest
+#     "rule": "device_down",        # the rule's key
+#     "rule_name": "Device not responding",
+#     "kind": "device_event",       # the rule's kind — device_event, threshold, trap, ...
+#     "entity_label": "acc-sw-070 (10.0.4.12)",
+#     "message": "acc-sw-070 stopped responding",
+#     "detail": "",
+#     "ts": 1730000000.0,
+#     "state": "open",              # open|clear|renotify|digest
+#     "subject": "SappiWhere: acc-sw-070 is not responding",
+#     # digest only: every alert the one delivery speaks for, so a receiver
+#     # that only reads the top-level fields still gets a sane single-alert
+#     # shape (rule/entity_label/message describe the FIRST one) and a
+#     # receiver that wants the rest can walk this.
+#     "alerts": [{"alert_id": 124, "rule": "device_down",
+#                 "entity_label": "...", "message": "..."}],
+#   }
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Raise rather than follow. A webhook URL is operator-configured (the
+    same trust level as the SMTP relay setting), but the receiver at the
+    OTHER end of a redirect it returns is not — following it would let
+    whatever machine sent us to `/redirect` decide where the payload
+    (including everything build_context puts in the JSON body) actually
+    goes. redirect_request is the one extension point every 3xx handler
+    (301/302/303/307/308) calls through, so overriding it here covers all
+    of them rather than only the couple urllib's default handler names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"refusing to follow redirect to {newurl}",
+            headers, fp)
+
+
+def parse_headers(lines) -> list[tuple[str, str]]:
+    """"Name: value" lines (webhook_headers' own storage shape, the same
+    list-of-strings coerce_settings already knows how to type-check) into
+    (name, value) pairs. A line with no colon, or an empty name, is skipped
+    rather than raising — this runs on every send, and a malformed line
+    already saved should cost that one header, not the whole delivery."""
+    headers = []
+    for line in lines or []:
+        name, sep, value = str(line).partition(":")
+        name = name.strip()
+        if not sep or not name:
+            continue
+        headers.append((name, value.strip()))
+    return headers
+
+
+def send_webhook(url: str, headers: list[tuple[str, str]], timeout: float,
+                 payload: dict) -> None:
+    """One POST of `payload` as JSON. Raises on any failure — same contract
+    as send() above, and the same caller-decides-what-to-do-with-it split
+    between "how to send" (here) and "what a failure means" (the queue,
+    the engine).
+
+    Refuses anything but http(s) and refuses to follow a redirect (see
+    _RefuseRedirects) — both are re-checked here even though
+    alertsdb.validate_webhook_url already refused a bad URL at SAVE time,
+    because that only ever runs against a value on its way into Settings: a
+    URL already sitting in the database from before validation existed, or
+    written by hand into alerts.db, reaches this function directly.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported webhook scheme: {parsed.scheme or '(none)'}")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("User-Agent", "SappiWhere-alert-webhook/1.0")
+    for name, value in headers:
+        request.add_header(name, value)
+    opener = urllib.request.build_opener(_RefuseRedirects)
+    with opener.open(request, timeout=timeout) as response:
+        status = response.status
+    if status >= 300:
+        raise ValueError(f"webhook receiver returned HTTP {status}")
+
+
+# How many webhook deliveries may wait to be sent. Separate from QUEUE_SIZE
+# rather than shared with it: the two channels have independent hourly
+# budgets (see alertsdb.DEFAULTS' webhook_max_per_hour comment) precisely so
+# a big webhook-only fleet does not compete with email for the same queue
+# slots, and a receiver that is merely slow (not down) is exactly the case
+# a deep queue helps with.
+WEBHOOK_QUEUE_SIZE = 500
+
+
+@dataclass
+class WebhookJob:
+    """One delivery, with everything send_webhook needs already resolved —
+    same "nothing may need a database read later" contract as MailJob."""
+    url: str
+    headers: list = field(default_factory=list)
+    timeout: float = 10.0
+    payload: dict = field(default_factory=dict)
+    # Carried alongside payload (which already has it as payload["subject"])
+    # purely so _webhook_result can write a notification row the same shape
+    # record_notification's other callers already write, without reaching
+    # into the JSON body to find it.
+    subject: str = ""
+    alert_id: int | None = None
+    kind: str = "webhook_alert"
+    # Mirrors MailJob.alert_ids: set only for a roll-up digest, so
+    # _webhook_result can still write every covered alert its own
+    # notification row from the one delivery.
+    alert_ids: list | None = None
+
+
+class WebhookQueue:
+    """A bounded queue of WebhookJobs drained by one worker thread — the
+    same shape as MailQueue and for the same reason: a slow or dead
+    receiver must cost the worker thread time, never the engine tick, which
+    only ever pays the cost of an enqueue.
+
+    No circuit breaker, unlike MailQueue: bounded retry is explicitly not
+    required for this channel (a failed POST records why and counts toward
+    the hourly budget, and that is the whole story), and webhook_max_per_hour
+    already caps how often a dead receiver's timeout is paid at all. A
+    breaker would be free to add but is one more piece of state to reason
+    about for a channel the spec deliberately keeps simple.
+    """
+
+    def __init__(self, *, maxsize: int = WEBHOOK_QUEUE_SIZE, on_result=None):
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
+        self._on_result = on_result
+        self._stopping = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._busy = False
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stopping.clear()
+        self._thread = threading.Thread(target=self._run, name="alert-webhook",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        thread = self._thread
+        self._thread = None
+        self._stopping.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def submit(self, job: WebhookJob) -> bool:
+        if not self.running:
+            self.start()
+        try:
+            self._queue.put_nowait(job)
+        except queue.Full:
+            return False
+        return True
+
+    def depth(self) -> int:
+        return self._queue.qsize()
+
+    def wait_idle(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                if self._queue.empty() and not self._busy:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def _run(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                job = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            with self._lock:
+                self._busy = True
+            try:
+                self._deliver(job)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                with self._lock:
+                    self._busy = False
+                self._queue.task_done()
+
+    def _deliver(self, job: WebhookJob) -> None:
+        try:
+            # Resolved from the module namespace at call time, like
+            # MailQueue's own send — so a test that replaces
+            # alertmail.send_webhook is honoured for jobs already queued.
+            send_webhook(job.url, job.headers, job.timeout, job.payload)
+        except Exception as exc:
+            self._finish(job, False, str(exc) or exc.__class__.__name__)
+        else:
+            self._finish(job, True, "")
+
+    def _finish(self, job: WebhookJob, ok: bool, error: str) -> None:
         if self._on_result is None:
             return
         try:
