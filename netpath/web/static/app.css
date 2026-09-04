@@ -333,6 +333,11 @@ button.linkish, a.linkish {
   text-decoration: none;
 }
 button.linkish:hover, a.linkish:hover { color: var(--accent); }
+/* A link the sentence around it made, not a control beside it — "Stored
+   configurations live in ConfigRX" (nodes.js). The 8px toolbar padding and
+   fixed size read as a button dropped mid-paragraph; this sits in the text
+   the way the plain <a> version already does. */
+button.linkish.inline { padding: 0; font-size: inherit; text-decoration: underline; }
 .conn.bad { color: var(--fail); }
 .conn.good { color: var(--ok); }
 
@@ -412,6 +417,24 @@ button.primary:disabled {
   border: 1px solid var(--grid);
 }
 button.primary:disabled:hover { background: var(--grid); }
+/* The fourth tier: irreversible actions (confirmDestructive; a Remove or
+   Delete beside a Save). Before this the product had three informal
+   weights — plain, primary, disabled — and "Delete 40 devices" rendered
+   with primary:true, identical to Save and just as focus-default. Same
+   fill/text pairing as the fail badge (.badge.sev-fail), so red already
+   means the same thing here it means everywhere else in the app. */
+button.danger { background: var(--fail); color: var(--bg); border: none; font-weight: 600; }
+button.danger:hover { filter: brightness(1.08); }
+button.danger:disabled { background: var(--grid); color: var(--muted); border: 1px solid var(--grid); }
+button.danger:disabled:hover { background: var(--grid); filter: none; }
+/* A destructive control shares the dialog's button row with Save and Cancel
+   but must not read as equal weight to them — Edit device's row was
+   Cancel · Clear credential · Remove · Test · Save, Remove sitting no
+   differently from Save right beside it. The row already justifies its
+   buttons to the end (.modal-box .row); this peels a danger button to the
+   opposite one, the way a destructive action sits apart in a dialog that
+   takes the tiering seriously. */
+.modal-box .row button.danger { margin-right: auto; }
 
 /* A control the account may not use (App.applyPermissions). It is disabled
    and carries the reason in its title; one line under the bar says the same
@@ -470,6 +493,10 @@ input[type=checkbox] { accent-color: var(--accent); }
    .hint is not decorative: it carries every device's IP address, the mute
    tag, alert counts and every empty state. --muted is 5.18:1. */
 .hint { color: var(--muted); font-size: var(--fs-xs); }
+/* A paragraph of .hint prose used to run to a 250-character line (1858px
+   wide) with nothing capping its measure. `ch` rather than a pixel width so
+   the cap tracks the font rather than fighting it at a different size. */
+p.hint, .help-body p { max-width: 68ch; }
 /* The IP under a device name is the network engineer's primary key and the
    first thing to disappear on a NOC wall screen: its own class, a size up
    from a hint, so it is not carried along by whatever .hint becomes next. */
@@ -533,7 +560,7 @@ body.tiny .terms { display: none; }
    .panel.float is the lifted tier — a dialog, the sign-in card, the SSH
    overlay's card — rounder and with the one dialog shadow. */
 .panel, .card, fieldset, .target-list, .detail, .subnet-detail, .table-wrap,
-.canvas.chart, .bars, .timeline,
+.canvas.chart, .bars, .timeline, .scrollbox,
 .login-box, .ssh-panel, .modal-box {
   background: var(--panel);
   border: 1px solid var(--hairline);
@@ -772,6 +799,13 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 }
 .table-wrap.workers { flex: 1; min-height: 80px; margin: 0 12px; }
 .table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 12px 10px; }
+/* A bounded scrolling panel — five call sites each picked their own
+   max-height (120px/140px/220px, 26vh-52vh) for what is the same two
+   shapes: a short preview list and a full sub-table inside a dialog. Combine
+   with .table-wrap on a table, or use alone for a plain list of content. */
+.scrollbox { overflow: auto; }
+.scrollbox.small { max-height: 160px; }
+.scrollbox.large { max-height: 50vh; }
 /* Tables are set in the interface face. Every table used to be monospace
    — device names, alert messages, status words, all in the type reserved
    for machine output. A column that holds an address, an identifier, a
@@ -962,7 +996,27 @@ fieldset {
   padding: 10px 14px 14px;
 }
 legend { padding: 0 4px; }
-fieldset label { display: flex; margin: 8px 0; gap: 8px; align-items: center; }
+/* A shared control column, instead of each label's own text width deciding
+   where its control starts — control left edges used to spread 42px within
+   one fieldset. label.check leads with its box, not a text column, so it
+   keeps a plain row.
+
+   grid-auto-flow: column, not the grid default of row: a label with a unit
+   after its control ("Poll interval <input> s") is three inline items, not
+   two, and row-flow wrapped the third into a new implicit row under the
+   label text — the unit landing on its own line, the very bug this
+   codebase already has elsewhere (nodes.js's number()). Column-flow instead
+   opens a third, content-sized column after the 1fr one for it, which is
+   where "s" was already sitting under the old flex row. */
+fieldset label {
+  display: grid;
+  grid-template-columns: minmax(140px, max-content) 1fr;
+  grid-auto-flow: column;
+  column-gap: 8px;
+  margin: 8px 0;
+  align-items: center;
+}
+fieldset label.check { display: flex; gap: 8px; }
 fieldset label input:not([type=checkbox]) { width: 220px; }
 fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: var(--fs-xs); }
 fieldset .hint { margin: 8px 0 0; }
@@ -1215,8 +1269,17 @@ body.login-page {
 .help-body li { margin: 4px 0; line-height: 1.4; }
 /* The body of every dialog is wrapped in <form class="modal-form"> so that
    Enter submits it (see App.modal), which put one element between
-   .modal-box and the labels this rule reaches. */
-.modal-box.wide > .modal-form > label { display: flex; }
+   .modal-box and the labels this rule reaches. Same shared control column
+   as fieldset label, and for the same reason: a Settings dialog with
+   fieldset-less labels spread control edges 82px apart without it. */
+.modal-form > label {
+  display: grid;
+  grid-template-columns: minmax(140px, max-content) 1fr;
+  grid-auto-flow: column;
+  column-gap: 8px;
+  align-items: center;
+}
+.modal-form > label.check { display: flex; gap: 8px; }
 .modal-box h2 { margin: 0 0 12px; }
 /* The interface dialog's parent device name: its own line above the port
    name and inside the same h2, so it is the same size rather than dropping

@@ -28,19 +28,57 @@ const App = (() => {
     return state.permissions[module] === 'write';
   }
 
+  /* What this account can do, for the Account dialog below. `state.session`
+     carries only a username and the idle/absolute clocks — there is no
+     "role" on the wire, only a {module: read|write} grant map — so this
+     reads the same map applyPermissions() already reads, in the same
+     module names MODULE_NAMES gives the rest of the product. `admin` is a
+     module like any other on the wire (writeDeniedReason's "Administrator
+     access is needed") but reads oddly in a list of modules, so it is
+     named on its own rather than folded in as "Admin". */
+  function accountAccessSummary() {
+    const perms = state.permissions || {};
+    const keys = Object.keys(perms).filter((k) => k !== 'admin');
+    const write = keys.filter((k) => perms[k] === 'write').map((k) => MODULE_NAMES[k] || k);
+    const readOnly = keys.filter((k) => perms[k] === 'read').map((k) => MODULE_NAMES[k] || k);
+    const bits = [];
+    if (perms.admin === 'write') bits.push('administrator access');
+    if (write.length) bits.push(`write access to ${write.join(', ')}`);
+    if (readOnly.length) bits.push(`read-only access to ${readOnly.join(', ')}`);
+    return bits.length ? bits.join('; ') : 'no module access granted';
+  }
+
   /* Changing your own password has to be reachable no matter what module
      access you have (or don't) — it lives in the top bar, not gated
      behind Settings, and is a small self-contained modal rather than
      sharing DOM ids with anything in settings.js. `forced` is set for the
      must-change-password prompt: Cancel is hidden, since there's nowhere
-     else useful to go until it's done. */
+     else useful to go until it's done.
+
+     Titled "Change your password" and showing nothing about the account it
+     belonged to, this used to do two unrelated things and say who neither
+     was for. It now leads with who is signed in, what they can do and when
+     the session ends — the same clock the kiosk bar already computes —
+     with the password form under its own legend rather than being the
+     whole dialog. */
   function accountModal({ forced = false } = {}) {
-    const box = modal('Change your password', `
-      <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
-      <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
-      <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
-      <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
-        session using this account, including this one.</p>`,
+    const session = state.session || {};
+    const sessionLine = maxRemainingMs != null
+      ? `Session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}.` : '';
+    const box = modal('Account', `
+      <p><b>${escapeHtml(session.username || state.username || '')}</b></p>
+      <p class="hint">${escapeHtml(accountAccessSummary())}.</p>
+      ${sessionLine ? `<p class="hint" id="am-session">${escapeHtml(sessionLine)}</p>` : ''}
+      <fieldset><legend>Password</legend>
+        <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
+        <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
+        <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
+        <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
+          session using this account, including this one.</p>
+      </fieldset>`,
+      // The version string in the tab bar moves here in a later phase —
+      // nothing to render yet, so no placeholder element sits empty until
+      // then.
       [
         // Forced, this dialog is the only thing the account can do — the
         // server refuses everything else until the password is replaced — so
@@ -1216,6 +1254,79 @@ const App = (() => {
     toast(message, 'fail');
   }
 
+  // How long a button keeps saying what just happened before it goes back
+  // to naming the action again. Matches the toast beside it roughly, rather
+  // than the tone-dependent TOAST_MS: the button only ever carries a short
+  // word ("Done", "Failed"), not the sentence the toast can afford to hold
+  // onto longer.
+  const JOB_REVERT_MS = 4000;
+
+  /* Generalises the one thing in this product that already told an operator
+     what happened rather than leaving a table to eventually agree with the
+     click — ConfigRX's "Back up now" (configrx.js): queueing, then queued
+     or running, then the real outcome, the button disabled throughout. Six
+     actions shipped with no outcome message at all before this — Add
+     device, Acknowledge, bulk Acknowledge, Trace now, Back up now and every
+     module Settings Save — and Acknowledge was the sharpest: the detail
+     pane kept offering "Acknowledge" after it had worked, so the only way
+     to tell was to re-read the State column.
+
+     `labels` is `{ queued, done, fail }`. `queued` is shown the instant the
+     button is pressed, before `promise` has settled — a caller free to go
+     on writing to the same button's textContent from inside its own async
+     work (the way ConfigRX's watch loop moves between "Queued…" and
+     "Backing up…") gets that multi-phase text for free, since this only
+     touches the button again once `promise` settles. `done`/`fail` are
+     each either a string or a function of the resolved value/rejection,
+     defaulting to the resolved value when it is itself a string (else
+     "Done"), and to the same sentence a dialog's own .modal-error already
+     shows (failureText) for a failure.
+
+     The outcome is toasted (App.toast, which announces it) and written
+     onto the button itself, briefly, so both a sighted operator watching
+     the button and one who has looked away catch it. A failure inside an
+     open dialog goes to .modal-error instead of a second toast — the place
+     every other dialog failure already lands — the same choice
+     reportActionFailure makes.
+
+     Returns the settled promise, so a modal button spec's onClick can
+     `return App.runJob(...)`: the rejection still propagates, and
+     runModalAction's own disable/error handling composes with this rather
+     than fighting it. */
+  function runJob(button, labels, promise) {
+    if (!button) return promise;
+    const opts = labels || {};
+    const resting = button.textContent;
+    const box = button.closest ? button.closest('#modal-box') : null;
+    const generation = box ? box.dataset.modalGen : null;
+    button.disabled = true;
+    button.textContent = opts.queued || 'Working…';
+    const settle = (text) => {
+      button.textContent = text;
+      button.disabled = false;
+      window.setTimeout(() => {
+        if (button.textContent === text) button.textContent = resting;
+      }, JOB_REVERT_MS);
+    };
+    return promise.then((result) => {
+      const text = typeof opts.done === 'function' ? opts.done(result)
+        : (opts.done || (typeof result === 'string' ? result : 'Done'));
+      settle(text);
+      toast(text, 'ok');
+      return result;
+    }, (error) => {
+      const message = failureText(error);
+      const text = typeof opts.fail === 'function' ? opts.fail(error) : (opts.fail || 'Failed');
+      settle(text);
+      // Said where the operator is already looking rather than doubled
+      // into a toast on top of it — showModalError also announces.
+      if (!(box && modalIsCurrent(generation) && showModalError(box, message))) {
+        toast(message, 'fail');
+      }
+      throw error;
+    });
+  }
+
   /* "A name is required", said once, in the place every dialog already
      says what went wrong.
 
@@ -1365,7 +1476,11 @@ const App = (() => {
       // Only the primary submits; everything else is type=button so a
       // Cancel or a Copy can never submit the form by accident.
       button.type = spec.primary ? 'submit' : 'button';
+      // danger is its own tier, not primary with a colour swapped in: it is
+      // never the implicit-submit button, so Enter in a field can never run
+      // an irreversible action by reflex (see confirmDestructive below).
       if (spec.primary) button.className = 'primary';
+      else if (spec.danger) button.className = 'danger';
       button.onclick = () => {
         // A click on the submit button raises submit, which runs the
         // handler there. Running it here as well would run it twice.
@@ -1569,13 +1684,26 @@ const App = (() => {
      no button deletes on a single click. Body should name the collateral
      damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
      "Clear"). Matches the eight hand-written confirms this app already
-     had — Cancel first, the destructive action as the primary button.
+     had — Cancel first, the destructive action as the danger button.
+
+     The confirm button is `danger`, not `primary`: "Delete 40 devices" used
+     to render identically to Save and, being the form's implicit submit
+     button, fire on Enter in a field. danger is never the submit button
+     (see modal(), which only ever makes primary type=submit), so the
+     destructive action now needs an actual click — and modal()'s own
+     auto-focus already lands on Cancel, the first button in the row, so
+     nothing here changes which control the keyboard opens on.
 
      There is only one modal box, so a confirm raised from inside another
      dialog replaces it. Such callers pass `afterClose(confirmed)` to
      reopen their parent — which is how removing a wireless controller
      already behaves. It is told whether the action ran, since a parent
-     rebuilt from now-stale data is usually only wanted on cancel. */
+     rebuilt from now-stale data is usually only wanted on cancel.
+
+     `onConfirm` is called with the dialog's own confirm button, so a caller
+     that wants the queued/outcome treatment can wrap its body in
+     `App.runJob(button, ...)` — the button already carries modal()'s own
+     disable/error handling, so runJob only adds the label and the toast. */
   function confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
                               afterClose = null) {
     const done = (confirmed) => {
@@ -1584,7 +1712,7 @@ const App = (() => {
     };
     return modal(title, bodyHtml, [
       { label: 'Cancel', onClick: () => done(false) },
-      { label: confirmLabel, primary: true, onClick: async () => {
+      { label: confirmLabel, danger: true, onClick: async (box, button) => {
         // No try/catch and no button juggling here any more: this dialog
         // used to be the only one in the product that held its button down
         // while the request ran and stayed open saying why when the request
@@ -1592,7 +1720,7 @@ const App = (() => {
         // rule it exists to keep is unchanged — done() runs only after the
         // await resolves, so a delete that did not happen is never
         // reported as one that did.
-        await onConfirm();
+        await onConfirm(button);
         done(true);
       } },
     // A one-sentence confirm has no fold to be below; bottom-anchored
@@ -2936,12 +3064,40 @@ const App = (() => {
     box.title = box.checked ? 'Clear selection' : name;
   }
 
+  /* One full-width row carrying the same look a detail pane's empty state
+     already has (.empty) — Syslog and SNMP used to render their header over
+     a wholly empty tbody with no word about it, NetFlow drew three
+     different empty treatments on one screen, and the Nodes interfaces
+     table showed headers over nothing when a device's SNMP auth had
+     failed. `columns` only supplies the count to span; `message` is the
+     caller's own sentence. The house pattern is two parts — what is empty,
+     and what would change it ("No messages match these filters. Widen the
+     time window or clear a filter."), not just "Nothing here." */
+  function emptyRow(tbody, columns, message) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = Math.max(1, (columns || []).length) || 1;
+    td.className = 'empty';
+    td.textContent = message;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return tbody;
+  }
+
   /* Builds a table body from column descriptors: `cell(row)` renders when
      given, otherwise the raw field with an em dash for blank. This is what
      makes hiding a column safe — every other table in this app used to zip a
      positional array of <td> strings against its column list, so removing one
-     column silently shifted every cell after it into the wrong header. */
-  function drawRows(tbody, rows, columns, onRow) {
+     column silently shifted every cell after it into the wrong header.
+
+     `emptyMessage`, when the caller has one, is what appears in place of the
+     rows when there are none (see emptyRow) — every table gets the plumbing
+     for free; the sentence is still the caller's to write. */
+  function drawRows(tbody, rows, columns, onRow, emptyMessage) {
+    if (!rows.length && emptyMessage) {
+      emptyRow(tbody, columns, emptyMessage);
+      return tbody;
+    }
     // Built into a fragment and attached once: a tbody that is already in
     // the document would otherwise lay out after each of 300 appends.
     const fragment = document.createDocumentFragment();
@@ -2999,7 +3155,7 @@ const App = (() => {
         // Only if nothing else has claimed the keyboard in the meantime —
         // an operator who tabbed away during the redraw keeps where they went.
         if (document.activeElement !== document.body || !tbody.isConnected) return;
-        for (const other of rows) other.tabIndex = -1;
+        for (const other of rows) if (other.tabIndex !== -1) other.tabIndex = -1;
         rows[restoreIndex].tabIndex = 0;
         rows[restoreIndex].focus();
       });
@@ -3008,7 +3164,14 @@ const App = (() => {
     // The open row is where the keyboard should land; failing that, the first.
     const landing = rows.find((tr) => tr.classList.contains('selected')) || rows[0];
     for (const tr of rows) {
-      tr.tabIndex = tr === landing ? 0 : -1;
+      // A table that reuses its row elements across polls (Nodes; Debug's
+      // event table, pinned at its 2,000-row cap on a busy fleet) called
+      // this on nearly every tick, and every row got its tabIndex written
+      // whether or not it changed — ~8,000 writes/10s measured on Debug.
+      // Writing only the row whose value is actually moving cut that to the
+      // rows that changed, typically at most two (old landing, new landing).
+      const wantIndex = tr === landing ? 0 : -1;
+      if (tr.tabIndex !== wantIndex) tr.tabIndex = wantIndex;
       // The Nodes table reuses its row elements across refreshes rather than
       // rebuilding them, so this can be called repeatedly on the same <tr>.
       // The position above is recomputed every time; the listeners are
@@ -3816,6 +3979,7 @@ const App = (() => {
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
+    runJob, emptyRow,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,
