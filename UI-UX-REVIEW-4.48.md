@@ -102,6 +102,8 @@ Open, with uncommitted work visible in the working tree: `fastTick` write-on-cha
 
 **PERF-004, minification, was declined.** The application is stdlib-only Python with vanilla JS/CSS and no build step; gzip is already negotiated in `_send` at the server's own `GZIP_LEVEL = 6` (`netpath/web/server.py`). Measured directly against the 4.47.0 build this review was run on — the fourteen files a cold load actually pulls in (`index.html`, `boot.js`, `app.js`, the twelve module scripts, `tokens.css`, `app.css`), gzipped at that level — the cold load is about 285 KB. A build step buys marginal bytes on top of a compression scheme that is already doing the real work, for a project that otherwise ships with nothing to compile; the cache work above was judged the higher-value use of the same budget.
 
+That figure is the one the decision was argued from, and it has since moved: the same fourteen files at the end of this release gzip to roughly 324 KB, because the accessibility and feature work described above added to every one of them. The reasoning is unchanged — there is still nothing to compile and compression is still doing the real work — but a reader comparing this release against a future one should start from 324 KB, not 285. If the front end keeps growing at this rate the decision is worth taking again rather than inheriting.
+
 ### Test infrastructure and Windows portability
 
 Three commits outside the phase numbering fixed the harness itself rather than the product, all found chasing the Windows leg of the test matrix:
