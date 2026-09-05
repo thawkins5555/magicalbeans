@@ -773,7 +773,11 @@
                 'nd-v warn-text')
         : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
-      field('error', d.snmp_error, 'nd-err'),
+      // 'snmp', not 'error': the value is the agent's own words, and those
+      // already start with one — "error authorization error" is what the
+      // eyebrow and the message read as together. Naming the source instead
+      // of the severity is true whatever the agent says.
+      field('snmp', d.snmp_error, 'nd-err'),
     ].filter(Boolean);
     return parts.join('');
   }
