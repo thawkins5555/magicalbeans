@@ -260,11 +260,30 @@ def _session(client_sock, persona):
             pass
 
 
-def serve(name, persona, port):
+def bind(port):
+    """A listening socket on the loopback, bound before anything is
+    announced. Binding here rather than inside the serving thread is what
+    makes the "listening" line below mean something: a port already in use
+    used to raise on the thread, print a traceback nobody was reading, and
+    leave the parent announcing readiness for a persona that was not there —
+    which a caller then met as a connection refused, several steps later,
+    against a device it had been told was up."""
     srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        # Windows only, and the opposite of what the name suggests to a POSIX
+        # reader: there SO_REUSEADDR lets a second process bind a port another
+        # is already listening on and quietly take its connections, so binding
+        # early would detect nothing. This asks for the behaviour POSIX gives
+        # SO_REUSEADDR by default — a port in use is an error.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(8)
+    return srv
+
+
+def serve(srv, persona):
     while True:
         client, _ = srv.accept()
         threading.Thread(target=_session, args=(client, persona), daemon=True).start()
@@ -274,9 +293,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base-port", type=int, default=2201)
     args = ap.parse_args()
+    bound = []
     for i, (name, persona) in enumerate(PERSONAS.items()):
         port = args.base_port + i
-        threading.Thread(target=serve, args=(name, persona, port), daemon=True).start()
+        try:
+            bound.append((name, persona, port, bind(port)))
+        except OSError as exc:
+            for _, _, _, srv in bound:
+                srv.close()
+            print(f"{name}: cannot bind 127.0.0.1:{port} — {exc}", file=sys.stderr,
+                  flush=True)
+            print("Another fake_ssh is probably already on this range; pass "
+                  "--base-port to move out of its way.", file=sys.stderr, flush=True)
+            return 1
+    for name, persona, port, srv in bound:
+        threading.Thread(target=serve, args=(srv, persona), daemon=True).start()
         print(f"{name}: 127.0.0.1:{port}")
     print("listening", flush=True)
     try:
@@ -287,4 +318,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
