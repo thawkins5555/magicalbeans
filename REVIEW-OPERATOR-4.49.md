@@ -866,6 +866,55 @@ availability of these thirty devices" and "which twenty links came closest to
 saturation". Both are a `GROUP BY` away from data already on disk. This is the cheapest
 large win in the product.
 
+Both were built in this pass, and building them produced three findings that are worth
+more than the feature.
+
+**O-38 — a maintenance window is remembered forever; a mute is deleted the moment it
+lapses. CONFIRMED.** `alertsdb.windows()` retains every window — past, active and
+future, by its own docstring — so a report covering last Tuesday can retroactively
+exclude a window that ran last Tuesday, weekly recurrence included.
+`purge_expired_mutes` **deletes** the row. A mute that lapsed before the report ran
+leaves no trace at all.
+
+The consequence is sharper than the fact. Because a still-visible mute requires
+`until_ts > now`, and a historical report ends at or before now, a visible mute can only
+ever exclude "from when it was created onward" — never a bounded middle slice the way a
+window can — since there is no record of a mute being *lifted* early either. So the two
+mechanisms an operator reaches for to say the same thing ("do not count this against me,
+I was working on it") behave completely differently in a report, and nothing tells them
+which to pick if they ever want the number to be defensible afterwards. On a plant where
+the monthly availability figure is a deliverable, that is the difference between a number
+and an argument. The report now carries it as an unconditional caveat; the real fix is to
+stop deleting the row.
+
+**O-39 — a month-wide top-N at full fleet scale takes about a hundred seconds.
+CONFIRMED (measured, then projected on an established scaling law).** Against a real
+fixture of 2,000 devices × 48 ports × 6 metric families — 576,000 series, **97.3 million
+rows** in `samples_hourly` — ranking one family of 96,000 candidates cost **45.8 s** with
+a naive `JOIN` that SQLite reordered into a whole-table scan, and **22–23 s** with a
+forced `CROSS JOIN` letting candidates drive the loop.
+
+The half that makes the projection trustworthy: re-running with and without five decoy
+metric families produced the same time either way, establishing that the cost tracks
+(candidates × hours) rather than table size. A month is 730 hours against the 168
+measured, so a full-fleet month-wide ranking is **95–100 seconds**. For context, a year
+of hourly rollups at that shape is about 5.05 billion rows, and at the shipped 400-day
+retention 5.53 billion — a conservative floor, since the poller emits ten interface
+metric keys per port and the fixture used six.
+
+**A hundred seconds is not a page load.** Whatever surfaces this has to be a job with a
+result, not a request. That is a design constraint discovered before the feature was
+built rather than after it shipped, which is the entire argument for measuring first.
+
+**O-40 — `samples_hourly` is a ROWID table, so its own primary key costs an extra lookup
+per row.** `PRIMARY KEY(metric_id, hour)` on a ROWID table indexes *into* rowids rather
+than being the rows' storage, so even a perfect range scan pays a second lookup per
+matched row. Declaring it `WITHOUT ROWID` makes that pair the clustering key and puts the
+aggregate columns inline. No new index is needed — the existing key already leads
+correctly; the original fault was a query letting SQLite reorder away from it. Specified
+with its numbers rather than applied, because a schema migration on a populated table is
+not a thing to slip into a review.
+
 ### 5.9 Performance and scale
 
 #### Tier A — 250 devices, all nine incidents

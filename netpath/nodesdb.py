@@ -775,6 +775,23 @@ class NodesDatabase:
             # is an IANA arc assignment or a substring guess.
             self._conn.execute(
                 "ALTER TABLE devices ADD COLUMN vendor_source TEXT")
+        if "vendor_arc" not in devices:
+            # The enterprise arc identify_vendor()/vendorid.decide() worked
+            # out this poll, or NULL. NOT the same fact as vendor_source:
+            # a device whose sysObjectID sits under a real, just-unnamed arc
+            # gets vendor_source='sysDescr' with a real arc here, while a
+            # PLC or appliance that answers only a generic net-snmp
+            # sysObjectID and was named from its sysDescr text gets
+            # vendor_source='sysDescr' too but NULL here — the two read
+            # identically by vendor_source alone. This column is what a
+            # device pane needs to tell "named with confidence but has no
+            # arc a vendor-health table could ever be keyed on" (Rockwell-
+            # class PLCs, the review's own finding) apart from every other
+            # sysDescr-sourced name, so an empty health section can say why
+            # instead of reading as a fault. See nodepoll._poll_vendor_health
+            # and nodeoids.VENDOR_HEALTH, which are keyed on exactly this
+            # value already — this just stops throwing it away afterward.
+            self._conn.execute("ALTER TABLE devices ADD COLUMN vendor_arc INTEGER")
         if "mib_covered" not in devices:
             # Last vendor-MIB coverage verdict for this device: NULL =
             # never evaluated (or not applicable), 0/1 = uncovered/covered.
@@ -1778,6 +1795,7 @@ class NodesDatabase:
                     "vendor_detected": identity.get("vendor_detected"),
                     "vendor_source": identity.get("vendor_source"),
                     "vendor_confidence": identity.get("vendor_confidence") or "",
+                    "vendor_arc": identity.get("vendor_arc"),
                 })
             if uptime_ticks is not None:
                 fields["last_uptime_ticks"] = uptime_ticks

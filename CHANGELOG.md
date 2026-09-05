@@ -281,11 +281,14 @@ and the scroll-into-view fix are what make the other two reachable rather
 than merely present.
 
 **The rollup that stops a site outage becoming a mailbox full of alerts
-depended on a field an operator had to set by hand, once per device.**
-4.47.0's alert rollup only ever trusted `upstream_id`, deliberately never an
-unconfirmed LLDP/CDP neighbour match — suppressing a real port fault on a
-wrong guess is the one failure an alert system must not have, and that
-reasoning is unchanged. What was missing was the means: the neighbour data
+depended on a field an operator had to set by hand, once per device.** The
+topology-aware rollup that lets one core switch's outage absorb every
+access switch behind it, rather than opening one alert per device, has only
+ever trusted an operator-confirmed `upstream_id` (shipped 4.37.0),
+deliberately never an unconfirmed LLDP/CDP neighbour match — suppressing a
+real, unrelated fault on a wrong guess is the one failure an alert system
+must not have, and that reasoning is unchanged. What was missing was the
+means: the neighbour data
 and the product's own best-effort device match already existed and nothing
 ever offered it to an operator to review. `GET /api/nodes/upstream-suggestions`
 now lists, per device with no `upstream_id` set, every neighbour-matched

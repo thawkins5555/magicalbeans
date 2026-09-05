@@ -362,6 +362,11 @@
     App.setText(App.el('sl-toggle'), syslog.running ? 'Stop collector' : 'Start collector');
     const c = syslog.counters || {};
     const parts = [`${c.messages || 0} received`, `${c.stored || 0} stored`];
+    // "received" and "stored" alone used to look like an unexplained gap —
+    // a message folded into an existing row's repeat_count (syslogdb.py's
+    // consecutive-duplicate collapsing) is still counted here, not lost,
+    // just not stored as a row of its own.
+    if (c.collapsed) parts.push(`${c.collapsed} collapsed into repeats`);
     if (c.filtered) parts.push(`${c.filtered} filtered by severity`);
     if (c.dropped) parts.push(`${c.dropped} dropped`);
     if (c.rejected) parts.push(`${c.rejected} rejected`);

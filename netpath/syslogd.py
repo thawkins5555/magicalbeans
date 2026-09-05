@@ -55,10 +55,10 @@ class SyslogCollector:
         self.error: str | None = None
         self.bound: tuple[str, int] | None = None
         self.family = socket.AF_INET
-        self.counters = {"messages": 0, "stored": 0, "dropped": 0,
-                         "rejected": 0, "filtered": 0, "errors": 0,
-                         "throttled": 0, "tcp_refused": 0, "tcp_clients": 0,
-                         "last_message": 0.0}
+        self.counters = {"messages": 0, "stored": 0, "collapsed": 0,
+                         "dropped": 0, "rejected": 0, "filtered": 0,
+                         "errors": 0, "throttled": 0, "tcp_refused": 0,
+                         "tcp_clients": 0, "last_message": 0.0}
         # A receive thread must never die on message content; failures are
         # counted here and _crash records a thread that ended anyway so the
         # status strip does not read like a deliberate stop.
@@ -450,7 +450,15 @@ class SyslogCollector:
             due = time.time() - last_flush >= FLUSH_S
             if pending and (due or len(pending) >= BATCH):
                 try:
-                    self.counters["stored"] += self.db.insert(pending)
+                    stored, collapsed = self.db.insert(pending)
+                    self.counters["stored"] += stored
+                    # A row's own repeat_count already carries a collapsed
+                    # message forward (see syslogdb._collapse), so nothing is
+                    # lost — but "stored" alone undercounts "messages" by
+                    # exactly this much, and a reader with no way to see that
+                    # reads it as an unexplained gap instead of a storm being
+                    # folded into fewer rows.
+                    self.counters["collapsed"] += collapsed
                 except Exception:
                     import traceback
                     traceback.print_exc()

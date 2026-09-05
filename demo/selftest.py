@@ -712,6 +712,151 @@ def wire_test() -> None:
         sock.close()
 
 
+# ------------------------------------------------------- L2 topology (4.49.0)
+#
+# LLDP/CDP neighbours, PoE and STP were three of 4.47.0's Tier 1 features
+# that no persona had ever answered — the Topology tab, the device pane's
+# Neighbours/Bridge&RF subtabs and the upstream-suggestion feature all had
+# nothing to draw against this fleet. personas.py now answers all four on
+# a deliberate, named subset of switches shaped like the fleet's own site
+# plan (see personas.py's own "L2 topology" section comment) rather than
+# wired so every device claims to neighbour every other one.
+
+LLDP_PERSONAS = {"cisco_access", "cisco_core", "aruba_switch",
+                 "siemens_scalance", "moxa", "juniper"}
+CDP_PERSONAS = {"cisco_access", "cisco_core"}
+POE_PERSONAS = {"cisco_access", "aruba_switch"}
+STP_PERSONAS = {"cisco_access", "cisco_core", "aruba_switch",
+                "siemens_scalance", "moxa", "juniper"}
+
+LLDP_SYS_NAME = "1.0.8802.1.1.2.1.4.1.1.9"
+CDP_DEVICE_ID = "1.3.6.1.4.1.9.9.23.1.2.1.1.6"
+POE_PORT_ADMIN = "1.3.6.1.2.1.105.1.1.1.1.3"
+POE_PSE_POWER = "1.3.6.1.2.1.105.1.3.1.1.2.1"
+STP_PROTOCOL_SPEC = "1.3.6.1.2.1.17.2.1.0"
+STP_SCALARS = ("1.3.6.1.2.1.17.2.1.0", "1.3.6.1.2.1.17.2.2.0",
+              "1.3.6.1.2.1.17.2.5.0", "1.3.6.1.2.1.17.2.6.0",
+              "1.3.6.1.2.1.17.2.7.0")
+
+
+def test_l2_topology(key: str, dev) -> None:
+    """Per persona: LLDP/CDP/PoE/STP each walk and terminate correctly for
+    the personas that should answer them — and, just as important, a
+    persona that should NOT answer one of these genuinely does not, the
+    same "probed once, capability remembered" contract nodepoll.py's own
+    _poll_poe/_poll_stp docstrings describe: a device that never answers
+    the first probe must never be asked again, so it had better actually
+    stay silent rather than answer a stray row that would relabel it
+    capable by accident."""
+    table = dev.table(None)
+
+    values, reason, _ = bulk_walk(dev, LLDP_SYS_NAME)
+    if key in LLDP_PERSONAS:
+        check(bool(values), f"{key}: expected LLDP neighbours, found none")
+        check(reason in ("endOfMibView", "left subtree"),
+              f"{key}: LLDP walk stopped with {reason!r}")
+    else:
+        check(not values, f"{key}: should not answer LLDP at all, got {values}")
+
+    values, _reason, _ = bulk_walk(dev, CDP_DEVICE_ID)
+    if key in CDP_PERSONAS:
+        check(bool(values), f"{key}: expected CDP neighbours, found none")
+    else:
+        check(not values, f"{key}: should not answer CDP at all, got {values}")
+
+    values, reason, _ = bulk_walk(dev, POE_PORT_ADMIN)
+    if key in POE_PERSONAS:
+        check(bool(values), f"{key}: expected a PoE port table, found none")
+        check(reason in ("endOfMibView", "left subtree"),
+              f"{key}: PoE port walk stopped with {reason!r}")
+        check(table.has(POE_PSE_POWER), f"{key}: PSE power-budget scalar missing")
+    else:
+        check(not values, f"{key}: should not answer any PoE port row, got {values}")
+        check(not table.has(POE_PSE_POWER),
+              f"{key}: should not answer the PSE power-budget scalar at all")
+
+    if key in STP_PERSONAS:
+        for oid in STP_SCALARS:
+            check(table.has(oid), f"{key}: dot1dStp scalar {oid} is missing")
+    else:
+        check(not table.has(STP_PROTOCOL_SPEC),
+              f"{key}: should not answer dot1dStpProtocolSpecification at all")
+
+
+def test_topology_consistency() -> None:
+    """The neighbour graph the fleet reports has to be internally
+    consistent, not merely present: every neighbour a device claims (by
+    LLDP sysName or CDP device id) resolves to a device that genuinely
+    exists in this SAME fleet_plan(), and the ten deliberately-paired
+    core<->access links (personas.py's own L2-topology comment) agree
+    from both ends — by name, and by the chassis MAC nodesdb's own join
+    checks (see personas.py._mac_for), not merely "some string matches"."""
+    count = 250
+    plan = personas.fleet_plan(count)
+    names = {row["name"] for row in plan}
+    topology_rows = [row for row in plan
+                    if row["persona"] in (LLDP_PERSONAS | CDP_PERSONAS)]
+    now = time.time()
+
+    claimed: dict[str, set[str]] = {}
+    chassis_claim: dict[tuple[str, str], bytes] = {}   # (device, neighbor) -> mac claimed
+    real_mac: dict[str, dict[int, bytes]] = {}          # device -> {if_index: real mac}
+
+    for row in topology_rows:
+        dev = personas.build_device(row)
+        table = dev.table(None)
+        name = row["name"]
+        for oid, (_tag, value) in table.entries.items():
+            if oid.startswith(f"{LLDP_SYS_NAME}."):
+                claimed.setdefault(name, set()).add(str(value))
+            elif oid.startswith(f"{CDP_DEVICE_ID}."):
+                claimed.setdefault(name, set()).add(str(value))
+            elif oid.startswith("1.0.8802.1.1.2.1.4.1.1.5."):   # chassis id
+                chassis_claim[(name, oid)] = value
+        real_mac[name] = {}
+        for oid, (_tag, value) in table.entries.items():
+            if oid.startswith("1.3.6.1.2.1.2.2.1.6."):          # ifPhysAddress
+                if_index = int(oid.rsplit(".", 1)[-1])
+                real_mac[name][if_index] = value(dev, now) if callable(value) else value
+
+    unresolved = [(name, neighbor) for name, neighbors in claimed.items()
+                 for neighbor in neighbors if neighbor not in names]
+    check(not unresolved,
+          f"every claimed neighbour resolves to a real device in a "
+          f"{count}-device plan: unresolved={unresolved[:10]}")
+
+    core = claimed.get("core-sw-01", set())
+    expected_access = {f"acc-sw-{n:03d}" for n in range(1, 11)}
+    check(expected_access <= core,
+          "core-sw-01 claims all ten of its deliberately-paired access "
+          f"switches as LLDP/CDP neighbours: has {core}")
+    for acc_name in expected_access:
+        check("core-sw-01" in claimed.get(acc_name, set()),
+              f"{acc_name} reciprocally claims core-sw-01 as its neighbour: "
+              f"has {claimed.get(acc_name)}")
+
+    # Chassis-MAC join, both directions, for the first pair — the same
+    # cross-reference personas._mac_for exists to make correct (see
+    # nodesdb._NEIGHBOR_MATCH_SQL's chassis_id_subtype=4 join). Looked up
+    # by the exact suffix personas.lldp_neighbor's own indexing produces:
+    # timeMark 0, local port (1 on the core, 49 on the access switch — its
+    # uplink), remIndex 1.
+    core_claim_re_acc1 = chassis_claim.get(
+        ("core-sw-01", "1.0.8802.1.1.2.1.4.1.1.5.0.1.1"))
+    check(core_claim_re_acc1 is not None
+          and core_claim_re_acc1 == real_mac.get("acc-sw-001", {}).get(49),
+          "core-sw-01's chassis-MAC claim about acc-sw-001 matches "
+          "acc-sw-001's own real ifPhysAddress on its uplink port",
+          (core_claim_re_acc1, real_mac.get("acc-sw-001", {}).get(49)))
+    acc1_claim_re_core = chassis_claim.get(
+        ("acc-sw-001", "1.0.8802.1.1.2.1.4.1.1.5.0.49.1"))
+    check(acc1_claim_re_core is not None
+          and acc1_claim_re_core == real_mac.get("core-sw-01", {}).get(1),
+          "acc-sw-001's chassis-MAC claim about core-sw-01 matches "
+          "core-sw-01's own real ifPhysAddress on port 1",
+          (acc1_claim_re_core, real_mac.get("core-sw-01", {}).get(1)))
+
+
 # ------------------------------------------------------------------- main
 
 def main() -> int:
@@ -721,6 +866,7 @@ def main() -> int:
         dev = make_device(key)
         test_scalars(key, dev)
         test_if_walk(key, dev)
+        test_l2_topology(key, dev)
         print(f"  {key:<20} {len(dev.table(None)):>5} OIDs, "
               f"{port_count(dev):>3} ports  ok")
 
@@ -744,6 +890,8 @@ def main() -> int:
     test_windows_server()
     test_windows_endpoint()
     test_tablet_ouis()
+    print("L2 topology: neighbour graph consistency across a 250-device plan ...")
+    test_topology_consistency()
     print("wire path on 127.0.0.250:161 ...")
     wire_test()
 
