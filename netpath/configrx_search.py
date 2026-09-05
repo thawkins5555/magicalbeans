@@ -296,7 +296,7 @@ def compile_bounded(pattern: str, flags: int = 0) -> re.Pattern:
         raise UnsafeRegex(f"Not a valid regular expression: {exc}") from exc
 
 
-def _bounded_line(line: str) -> str:
+def bounded_line(line: str) -> str:
     return line if len(line) <= MAX_LINE_CHARS_FOR_MATCH else line[:MAX_LINE_CHARS_FOR_MATCH]
 
 
@@ -383,7 +383,7 @@ def _scan(db, matches_line, device_ids: list[int] | None, limit: int) -> dict:
             break
         if len(out) >= limit:
             break
-        if matches_line(_bounded_line(row["line"])):
+        if matches_line(bounded_line(row["line"])):
             out.append({"device_id": row["device_id"], "line_no": row["line_no"],
                        "line": row["line"]})
     return {"matches": out, "truncated": truncated, "indexed": False}

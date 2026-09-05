@@ -268,6 +268,9 @@ def get_state(service, params, body) -> dict:
     # One lookup, not two: this expression used to call user() twice.
     account = service.app_db.user(session["username"]) if session else None
     names = service.cached_poll("hostname_stats", 10, service.hostname_stats)
+    # One lookup, not two: open_worst and unresolved_count below both read
+    # off this same summary rather than each running their own query.
+    alert_summary = service.alerts_db.open_summary()
     result = {
         "config_version": service.config_version,
         "session": {
@@ -328,7 +331,12 @@ def get_state(service, params, body) -> dict:
             # The badge on the tab is coloured by this. A count alone
             # said "there are alerts" in the same amber whether the
             # worst of them was a notice or a device being down.
-            "open_worst": service.alerts_db.open_summary()["worst"],
+            "open_worst": alert_summary["worst"],
+            # open_count above is state='open' only, but the Alerts list's
+            # own default State filter is "unresolved" — state IN ('open',
+            # 'acked') — so a tab badge built from open_count alone starts
+            # undercounting the moment anyone acknowledges anything.
+            "unresolved_count": alert_summary["open"] + alert_summary["acked"],
         },
         "wireless": {
             "running": service.wireless.running,

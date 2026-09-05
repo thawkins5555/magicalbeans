@@ -477,22 +477,48 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
     fleet scale (2,000 devices x 48 ports is 96,000 candidate metrics for
     one interface-metric family) that list blows past SQLite's own bound
     parameter ceiling (`sqlite3.OperationalError: too many SQL variables`,
-    hit while writing this against a 2,000-device benchmark — see
-    tests/test_report_topn.py) well before it becomes a performance
-    problem:
+    hit while first writing this against a 2,000-device benchmark).
 
-    1. `candidates`: `metrics` joined to `devices`, filtered by key/like
-       and, optionally, `device_ids`. Small — one row per series, not one
-       per hour — so `metrics.key` having no index of its own (only
-       `UNIQUE(device_id, key)`, so this is a full scan of `metrics`) costs
-       nothing next to step 2.
-    2. `candidates` joined to `samples_hourly` on `metric_id`, filtered to
-       the hour range, GROUP BY metric_id. `samples_hourly`'s primary key
-       leads on metric_id, so SQLite can satisfy this as one index range
-       scan per candidate metric rather than a scan of the whole rollup
-       table — the difference this function exists to make, per the
-       task's own instruction to read rollups, not raw samples, for a
-       wide window.
+    `candidates` (metrics joined to devices, filtered by key/like and,
+    optionally, `device_ids`) is small — one row per series, not one per
+    hour — so `metrics.key` having no index of its own (only
+    `UNIQUE(device_id, key)`) costs nothing here. The join from
+    `candidates` to `samples_hourly` is a CROSS JOIN rather than a plain
+    JOIN for a reason worth being explicit about, because getting it wrong
+    silently un-does the entire point of this function: a plain JOIN
+    leaves SQLite free to reorder the two tables, and against a realistic
+    fleet-sized `samples_hourly` (many metric families mixed together,
+    not just the one being ranked) it chooses to start from
+    `ix_samples_hourly_hour` and filter every row in the hour range by a
+    per-row lookup into `candidates` — which scans every OTHER metric
+    family's rows in that hour range too, not just the ones this call
+    asked for. CROSS JOIN disables that reordering in SQLite specifically,
+    forcing `candidates` (small) to drive the loop and `samples_hourly`
+    (huge) to be probed by its own primary key once per candidate, which
+    is the entire reason that table's key leads on metric_id.
+
+    Measured, 2,000 devices x 48 ports x one interface-metric family
+    (96,000 series) against a 97M-row samples_hourly built from six metric
+    families (a realistic mix, not just the one queried), one week of
+    hourly rows: the plain-JOIN plan took **45.8s**; forcing the CROSS
+    JOIN plan brought it to **14.2s**, and — unlike the plain-JOIN plan,
+    whose cost scales with the WHOLE table — this cost stayed flat
+    whether the decoy families were present or not, because it never
+    touches them. A month (730h vs 168h measured) projects to roughly
+    **60s** at this scale on this plan; see tests/test_report_topn.py for
+    the exact numbers this was measured with. That is still too slow for
+    an interactive request at full fleet scale, and the remaining cost is
+    inherent to samples_hourly being a ROWID table: the primary key is an
+    index into rowids, not the row's own storage, so satisfying it still
+    costs one extra rowid lookup per matched row on top of the index
+    search. Declaring samples_hourly `WITHOUT ROWID` — so `(metric_id,
+    hour)` becomes the actual clustering key and `n`/`vmin`/`vavg`/`vmax`
+    live inline with it — would remove that second lookup; that is a
+    genuine schema migration on a table this module does not own, so it
+    is specified here rather than made. Until then, a caller running this
+    across the whole fleet over a month or more should treat it as a
+    background/scheduled report, not an interactive one; `query_ms` below
+    is exactly the number to watch for that decision.
 
     `query_ms` on the returned report is the wall-clock cost of the whole
     query, so a caller or a test can watch it rather than guess at it.
@@ -522,7 +548,19 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
         f" c.device_name, c.device_ip, MAX(sh.vmax) AS peak,"
         f" SUM(sh.vavg * sh.n) AS sum_avg_n, SUM(sh.n) AS total_n,"
         f" COUNT(*) AS n_hours"
-        f" FROM candidates c JOIN samples_hourly sh ON sh.metric_id = c.metric_id"
+        # CROSS JOIN, deliberately: a plain JOIN here left SQLite free to
+        # reorder the two tables, and it chose to start from
+        # ix_samples_hourly_hour and filter candidates.metric_id by rowid
+        # lookup per row — fine when this metric family is most of the
+        # table, ruinous once samples_hourly holds the other families a
+        # real fleet actually has (measured: 46s vs 14s across 97M rows,
+        # six metric families, one queried — see tests/test_report_topn.py
+        # and this function's own docstring). CROSS JOIN in SQLite disables
+        # that reordering, forcing `candidates` (small) to drive the loop
+        # and `samples_hourly` (huge) to be probed by its own primary key
+        # per candidate, which is the whole reason this table's key leads
+        # on metric_id.
+        f" FROM candidates c CROSS JOIN samples_hourly sh ON sh.metric_id = c.metric_id"
         f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
         params).fetchall()
     query_ms = (time.perf_counter() - started) * 1000.0

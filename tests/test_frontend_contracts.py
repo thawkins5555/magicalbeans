@@ -282,6 +282,70 @@ if digit_range:
           "the kiosk-bar title promises the same %s-%s the handler "
           "implements (found a different range in index.html)" % (lo, hi))
 
+# ---------------------------------------------------------------------------
+# 14. Global search: one failure costs one group, not every group after it,
+#     and coverage reaches the endpoints that already exist.
+#
+# gsearchRun used to wrap all four lookups (MAC, devices, alerts, NetPath)
+# in a single try/catch carrying the comment "a failed lookup just leaves
+# that group out" — which was not true: an exception partway through
+# skipped every group written after it. Matched on shape (an `await get(`
+# inside its own `try` block, each followed by its own `catch`), not on a
+# fixed count, since a group added later must keep the same shape.
+GSEARCH = APP[APP.index("async function gsearchRun("):APP.index("function gsearchRender(")]
+gsearch_tries = re.findall(r"try\s*\{[^}]*await get\(", GSEARCH, re.S)
+check(len(gsearch_tries) >= 8,
+      "gsearchRun wraps each lookup in its own try (found %d, want >= 8)"
+      % len(gsearch_tries))
+check("catch (error) { /* a failed lookup just leaves that group out */ }" not in APP,
+      "the old single try/catch's comment is gone (it never matched the code under it)")
+check("get('/api/ipam/search'" in GSEARCH and "IPAM hosts" in GSEARCH,
+      "global search reaches IPAM hosts")
+check("get('/api/ipam/subnets'" in GSEARCH and "IPAM subnets" in GSEARCH,
+      "global search reaches IPAM subnets")
+check("/api/syslog/search" in GSEARCH and "'Syslog'" in GSEARCH,
+      "global search reaches syslog messages")
+check("/api/wireless/aps" in GSEARCH and "Wireless access points" in GSEARCH,
+      "global search reaches wireless access points")
+check("ConfigRX" in GSEARCH and "search endpoint" in GSEARCH,
+      "a marked, not-yet-wired place for ConfigRX search is left in gsearchRun")
+
+# ---------------------------------------------------------------------------
+# 15. Eleven of the twelve tab modules are lazy; Dashboard is not.
+#
+# Thirteen unconditional <script defer> tags (this file plus all twelve
+# modules) used to cost 1.17 MB uncompressed on every visit. Only app.js,
+# boot.js and dashboard.js may still be unconditional script tags in
+# index.html; every other module's tag must be gone, fetched instead by
+# app.js's own loader the first time its tab is selected.
+EAGER_SCRIPTS = {"app.js", "boot.js", "dashboard.js"}
+LAZY_MODULES = [name[:-3] for name in MODULES
+                if name.endswith(".js") and name not in EAGER_SCRIPTS
+                and name not in ("login.js", "ssh.js")]
+check(len(LAZY_MODULES) >= 10, "found the expected set of lazy tab modules (%s)"
+      % ", ".join(sorted(LAZY_MODULES)))
+tags = re.findall(r'<script src="/(\w[\w.-]*?)\.js\?v=__SW_VERSION__"[^>]*></script>', INDEX)
+check(set(tags) == {"boot", "app", "dashboard"},
+      "index.html's own <script> tags are exactly boot.js, app.js and "
+      "dashboard.js (found: %s)" % (", ".join(sorted(tags)) or "none"))
+for name in LAZY_MODULES:
+    check('src="/%s.js' % name not in INDEX,
+          "%s.js has no <script> tag of its own in index.html (loaded lazily)" % name)
+check("function ensureModuleReady(" in APP, "app.js's lazy-module loader exists")
+check("function isLazyModule(" in APP and "!== 'dashboard'" in APP,
+      "dashboard is the one module lazy loading does not apply to")
+check("function activateTab(" in APP,
+      "selectTab and applyRoute hand off to a loaded module through one function")
+check(APP.count("activateTab(") >= 3,
+      "activateTab is used by both selectTab and applyRoute's same-tab branch")
+check("moduleLoads.set(name, promise)" in APP or "moduleLoads.get(name)" in APP,
+      "concurrent selections of the same not-yet-loaded module share one load")
+check("brokenPages.add(name)" in APP.split("function ensureModuleReady(")[1].split("function activateTab(")[0],
+      "a module that fails to load degrades through the same brokenPages contract "
+      "a module that failed to init() during eager startup already uses")
+check('section.setAttribute(\'aria-busy\', \'true\')' in APP,
+      "a loading module shows the same in-flight signal an ordinary slow refresh already does")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

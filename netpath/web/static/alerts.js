@@ -682,19 +682,28 @@
     return w.start_ts > Date.now() / 1000 ? 'upcoming' : 'ended';
   }
 
-  function windowRowHtml(w) {
+  // Built outside the generic write-gate (this table is assembled fresh
+  // every open, not static markup applyPermissions() can find), so a
+  // read-only account used to get "End now"/"Delete" rendered as ordinary,
+  // fully-enabled buttons that simply had no onclick wired — the wiring
+  // loop below returns early for that account, but the row markup never
+  // knew that. A button that looks live and does nothing when pressed is
+  // worse than one that says why it can't be: teaches nothing, and reads
+  // as broken rather than as permission.
+  function windowRowHtml(w, writable) {
     const scope = w.scope_kind === 'group'
       ? `device group #${w.scope_group_id ?? '—'}`
       : `${w.scope_device_ids.length} device(s)`;
     const canEnd = w.active || w.start_ts > Date.now() / 1000;
+    const gate = writable ? '' : ' disabled title="Needs Alerts write"';
     return `<tr data-id="${w.id}">
       <td>${escape(w.name)}</td>
       <td>${escape(scope)}${w.recurrence ? ' · weekly' : ''}</td>
       <td>${App.when(w.start_ts)}</td>
       <td>${App.when(w.end_ts)}</td>
       <td>${windowStatus(w)}</td>
-      <td>${canEnd ? `<button type="button" class="aw-end" data-id="${w.id}">End now</button>` : ''}
-        <button type="button" class="aw-delete" data-id="${w.id}">Delete</button></td>
+      <td>${canEnd ? `<button type="button" class="aw-end" data-id="${w.id}"${gate}>End now</button>` : ''}
+        <button type="button" class="aw-delete" data-id="${w.id}"${gate}>Delete</button></td>
     </tr>`;
   }
 
@@ -713,7 +722,7 @@
         <thead><tr><th scope="col">Name</th><th scope="col">Scope</th>
           <th scope="col">Start</th><th scope="col">End</th>
           <th scope="col">Status</th><th scope="col"></th></tr></thead>
-        <tbody>${rows.length ? rows.map(windowRowHtml).join('')
+        <tbody>${rows.length ? rows.map((w) => windowRowHtml(w, writable)).join('')
           : '<tr><td colspan="6" class="hint">No maintenance windows.</td></tr>'}</tbody>
       </table></div>`, [
       { label: 'Cancel', onClick: App.closeModal },

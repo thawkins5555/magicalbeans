@@ -468,15 +468,15 @@ ROUTES = [
     # is the point of the module. Narrow it here, not in the handler, if
     # that judgement is ever revisited.
     ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
-    # A diff hands over the device's own configuration lines exactly as
-    # reading one backup's content does, and until this release the two were
-    # gated identically. They are not any more: the content route above is a
-    # read, and this one is still a write. Worth stating plainly rather than
-    # leaving the older "gated the same way" comment to say otherwise — and
-    # worth revisiting, since a caller who can fetch two backups can diff
-    # them without this route at all. Matched before the "(\d+)" backup route
-    # above could ever apply, though "diff" would never match \d+ anyway.
-    ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", W)),
+    # Revisited (4.49.0): a diff hands over the same device configuration
+    # lines reading one backup's content already does — a caller who can
+    # fetch two backups could already reconstruct the diff by hand without
+    # this route at all, so gating it stricter than the content it diffs
+    # bought nothing except making the most common thing anyone does with a
+    # backup ("what changed before the line stopped") need the same grant
+    # as pushing a credential. Matched before the "(\d+)" backup route above
+    # could ever apply, though "diff" would never match \d+ anyway.
+    ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", R)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),

@@ -1,6 +1,24 @@
 /* Shared plumbing: server calls, tab switching, the refresh loop and modals.
    The per-tab modules hang their render functions off App.pages. */
 const App = (() => {
+  // Every asset URL this product serves carries `?v=<version>` — server.py
+  // stamps it in at request time so a year-long immutable cache cannot
+  // outlive the release that filled it (see boot.js, index.html). This
+  // script's own <script src="/app.js?v=X"> tag already carries that same
+  // query string; captured here, at the very top of this file's own
+  // execution — before anything else can run — so a lazily inserted
+  // <script> for a module loaded on demand (see "lazy modules", below) asks
+  // for the identical URL a defer tag would have, rather than one that
+  // skips the cache header entirely. document.currentScript is only valid
+  // synchronously, during a script's own top-level execution; there is no
+  // reading it back later.
+  const ASSET_VERSION_QUERY = (() => {
+    const own = document.currentScript;
+    if (!own || !own.src) return '';
+    const at = own.src.indexOf('?');
+    return at === -1 ? '' : own.src.slice(at);
+  })();
+
   const state = {
     tab: 'dashboard',
     settings: {},
@@ -332,6 +350,127 @@ const App = (() => {
   }
 
   const pages = {};
+
+  /* ---------------------------------------------------- lazy modules
+
+     Twelve tabs, one script each, all thirteen files (this one plus the
+     twelve) loaded unconditionally on every visit used to cost 1.17 MB
+     uncompressed (~324 KB gzipped) whether or not the operator ever opened
+     eleven of those twelve tabs — worst exactly where it is least
+     affordable, a tablet on plant Wi-Fi. dashboard.js stays eager
+     (index.html's own <script defer>, alongside this file and boot.js):
+     Dashboard is the tab everyone lands on, and it is what start() below
+     still initialises unconditionally, the same way it always has. Every
+     other module's <script> tag is gone from index.html; its file is
+     fetched the first time its tab actually becomes current, through
+     ensureModuleReady, called only from selectTab/applyRoute.
+
+     A module's name is its filename's stem (nodes -> nodes.js) for every
+     one of the eleven, so there is nothing to keep in step beyond the one
+     name this never applies to. */
+  function isLazyModule(name) { return name !== 'dashboard'; }
+  function moduleScriptUrl(name) { return `/${name}.js${ASSET_VERSION_QUERY}`; }
+
+  const loadedScripts = new Set();
+  function loadScript(src) {
+    if (loadedScripts.has(src)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src;
+      el.onload = () => { loadedScripts.add(src); resolve(); };
+      el.onerror = () => reject(new Error(`could not load ${src}`));
+      document.head.appendChild(el);
+    });
+  }
+
+  /* The only visible sign a script is still in flight: the same accent
+     line app.css already draws for an ordinary data refresh that takes
+     more than 400 ms (.page[aria-busy="true"]::before) — a lazy tab's
+     first open reads as "this is still working" through the identical
+     mechanism, rather than as a blank pane explaining nothing, or a second
+     vocabulary invented just for this. */
+  function showModuleLoading(name) {
+    const section = document.getElementById(`page-${name}`);
+    if (section) section.setAttribute('aria-busy', 'true');
+  }
+  function hideModuleLoading(name) {
+    const section = document.getElementById(`page-${name}`);
+    if (section) section.removeAttribute('aria-busy');
+  }
+
+  // One in-flight load per module, keyed by tab name — a digit shortcut, a
+  // click and a hash route can all name the same not-yet-loaded tab inside
+  // the same second, and must share one fetch and one init(), never three.
+  const moduleLoads = new Map();
+
+  /* Resolves once `name`'s module is loaded AND initialised. dashboard (and
+     any name lazy loading does not apply to) resolves immediately with
+     whatever start() already registered and initialised. A module already
+     marked __ready also resolves immediately — init() runs exactly once
+     per module, no matter how many times this is called for it.
+
+     A module whose script fails to fetch, or whose own init() throws,
+     degrades exactly the way brokenPages already degrades a module that
+     failed during eager startup (below, in start()): the tab is hidden,
+     the failure is logged once, aria-keyshortcuts/has-overflow are
+     recalculated for the tab that just disappeared, and the operator is
+     moved off it if it was the one they were looking at. Never a blank
+     pane with nothing said about why, and never a silent retry loop —
+     the tab being hidden is what stops a second attempt, the same "a
+     reload is the way back" contract a permission-denied or broken module
+     already has. */
+  function ensureModuleReady(name) {
+    if (!isLazyModule(name)) return Promise.resolve(pages[name]);
+    if (pages[name] && pages[name].__ready) return Promise.resolve(pages[name]);
+    const inFlight = moduleLoads.get(name);
+    if (inFlight) return inFlight;
+    showModuleLoading(name);
+    const promise = loadScript(moduleScriptUrl(name))
+      .then(() => {
+        const page = pages[name];
+        if (!page) {
+          throw new Error(`${name}.js loaded but never registered App.pages.${name}`);
+        }
+        if (page.init && !page.__ready) page.init();
+        page.__ready = true;
+        moduleLoads.delete(name);
+        return page;
+      })
+      .catch((error) => {
+        brokenPages.add(name);
+        const tab = stripTabs().find((t) => t.dataset.tab === name);
+        if (tab) tab.hidden = true;
+        console.error(`${name}: module failed to load, tab hidden`, error);
+        updateTabOverflow();
+        updateTabShortcuts();
+        if (state.tab === name) {
+          const next = visibleTabs().map((t) => t.dataset.tab).find(usableTab);
+          if (next) selectTab(next);
+        }
+        throw error;
+      })
+      .finally(() => hideModuleLoading(name));
+    moduleLoads.set(name, promise);
+    return promise;
+  }
+
+  /* The one place selectTab/applyRoute hand off to a module once it is
+     ready: activate() (a route) or activate()+refreshNow (a plain tab
+     switch). Guarded on state.tab still naming this module when the load
+     finishes — the operator may have already moved to a different tab
+     while this one was loading, and a stale activation must not run a
+     refresh, or steal focus, on a page they are no longer looking at. The
+     module itself still finishes loading and initialising regardless (see
+     ensureModuleReady): only the activation this specific call wanted is
+     skipped. */
+  function activateTab(name, options = {}) {
+    ensureModuleReady(name).then((page) => {
+      if (state.tab !== name) return;
+      if (options.route) { deliverRoute(options.route); return; }
+      if (page && page.activate) page.activate();
+      refreshNow(name);
+    }).catch(() => { /* ensureModuleReady already reported and degraded this */ });
+  }
 
   /* ---------------------------------------------------- host capabilities
 
@@ -1807,9 +1946,28 @@ const App = (() => {
      opens this one instead of focusing whichever box the current page
      happens to have; it queries devices, MACs/interfaces (the same
      mac-search endpoint nodes.js's own MAC lookup uses — a hit reads the
-     way that one already does), alerts and NetPath destinations through
+     way that one already does), alerts, NetPath destinations, IPAM hosts
+     and subnets, syslog messages and wireless access points, through
      endpoints the product already had, and routes to a hit through the
-     hash exactly as every other selection in this app does. */
+     hash exactly as every other selection in this app does.
+
+     Eight independent groups, eight independent try/catches: one lookup
+     failing (a slow endpoint, a device timing out) used to cost every
+     group after it in whatever order they happened to be written in this
+     function — the comment here promised "a failed lookup just leaves
+     that group out" while a single try/catch around the whole function
+     did not deliver that at all. A group that has nothing to add (no
+     permission, no match) is simply absent; a group that failed is
+     logged and also simply absent — indistinguishable to the operator,
+     which is the point: a working search that came back empty must not
+     look different from a search one dependency broke.
+
+     Not yet covered: interface descriptions/aliases and a device's
+     sys_location (both need a server-side query that does not exist
+     yet — api.py/nodesdb.py are another agent's files) and ConfigRX's
+     stored configurations (a search endpoint for it is being built
+     separately; see the marked gap below rather than a guess at its
+     shape). */
   let gsearchTrigger = null;
   let gsearchToken = 0;
   let gsearchTimer = null;
@@ -1825,8 +1983,8 @@ const App = (() => {
       wrap.hidden = true;
       wrap.innerHTML = `<div class="gsearch-box" role="dialog" aria-modal="true" aria-label="Search">
         <input id="gsearch-input" class="gsearch-input" type="text" autocomplete="off"
-          aria-label="Search devices, interfaces, MACs, alerts and NetPath destinations"
-          placeholder="Search devices, interfaces, MACs, alerts, destinations…">
+          aria-label="Search devices, interfaces, MACs, alerts, NetPath destinations, IPAM hosts and subnets, syslog messages and wireless access points"
+          placeholder="Search devices, interfaces, MACs, alerts, destinations, IPAM, syslog, wireless…">
         <div id="gsearch-results" class="gsearch-results"></div>
         <p class="gsearch-hint">&uarr;&darr; to move &middot; Enter to open &middot; Esc to close</p>
       </div>`;
@@ -1876,12 +2034,14 @@ const App = (() => {
   async function gsearchRun(q) {
     const token = ++gsearchToken;
     const groups = [];
+    const needle = q.toLowerCase();
     // A MAC in any of the notations nodes.js already accepts is worth a
     // lookup on its own; a plain name never is, so this never fires one
     // for every keystroke of an ordinary search.
     const hexOnly = q.replace(/[^0-9a-fA-F]/g, '');
-    try {
-      if (hexOnly.length >= 4 && canRead('nodes')) {
+
+    if (hexOnly.length >= 4 && canRead('nodes')) {
+      try {
         const mac = await get('/api/nodes/mac-search', { q });
         if (mac.locations && mac.locations.length) {
           groups.push({ title: 'MAC address / interface', hits: mac.locations.slice(0, 8).map((loc) => ({
@@ -1892,8 +2052,10 @@ const App = (() => {
             route: `#/nodes/device/${loc.device_id}/port/${loc.if_index}`,
           })) });
         }
-      }
-      if (canRead('nodes')) {
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('nodes')) {
+      try {
         const devices = await get('/api/nodes/devices', { q, limit: 8 });
         if (devices.devices && devices.devices.length) {
           groups.push({ title: 'Devices', hits: devices.devices.map((d) => ({
@@ -1902,8 +2064,10 @@ const App = (() => {
             route: `#/nodes/device/${d.id}`,
           })) });
         }
-      }
-      if (canRead('alerts')) {
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('alerts')) {
+      try {
         const alerts = await get('/api/alerts', { q, limit: 8 });
         if (alerts.alerts && alerts.alerts.length) {
           groups.push({ title: 'Alerts', hits: alerts.alerts.map((a) => ({
@@ -1912,10 +2076,11 @@ const App = (() => {
             route: `#/alerts/${a.id}`,
           })) });
         }
-      }
-      if (canRead('netpath')) {
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('netpath')) {
+      try {
         const targets = await get('/api/netpath/targets');
-        const needle = q.toLowerCase();
         const hits = (targets.targets || []).filter((t) =>
           (t.label || '').toLowerCase().includes(needle)
           || (t.host || '').toLowerCase().includes(needle)).slice(0, 8);
@@ -1926,8 +2091,70 @@ const App = (() => {
             route: `#/netpath/${t.id}`,
           })) });
         }
-      }
-    } catch (error) { /* a failed lookup just leaves that group out */ }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('ipam')) {
+      // Two calls, two groups, two independent failures: hosts (the
+      // product's own /api/ipam/search — everything IPAM's sweep, DHCP and
+      // reverse DNS know about an address) and subnets, which that
+      // endpoint does not cover at all. Subnets are few enough per site
+      // that filtering the same list ipam.js already polls, client-side,
+      // is the netpath-targets pattern above rather than a new endpoint.
+      try {
+        const found = await get('/api/ipam/search', { q });
+        if (found.results && found.results.length) {
+          groups.push({ title: 'IPAM hosts', hits: found.results.slice(0, 8).map((r) => ({
+            name: r.hostname || r.ip,
+            meta: [r.ip, r.mac, r.subnet].filter(Boolean).join(' · '),
+            // No per-host route exists in IPAM (its own Find is a modal,
+            // not a page of its own) — the tab is the honest destination.
+            route: '#/ipam',
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+      try {
+        const subnets = await get('/api/ipam/subnets');
+        const hits = (subnets.subnets || []).filter((s) =>
+          (s.label || '').toLowerCase().includes(needle)
+          || (s.cidr || '').toLowerCase().includes(needle)).slice(0, 8);
+        if (hits.length) {
+          groups.push({ title: 'IPAM subnets', hits: hits.map((s) => ({
+            name: s.label || s.cidr,
+            meta: s.label && s.label !== s.cidr ? s.cidr : '',
+            route: '#/ipam',
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('syslog')) {
+      try {
+        const found = await get('/api/syslog/search', { q, limit: 8 });
+        if (found.messages && found.messages.length) {
+          groups.push({ title: 'Syslog', hits: found.messages.slice(0, 8).map((m) => ({
+            name: m.message ? m.message.slice(0, 80) : `Message ${m.id}`,
+            meta: [m.host || m.source, m.severity_name].filter(Boolean).join(' · '),
+            route: `#/syslog/${m.id}`,
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if (canRead('wireless')) {
+      try {
+        const found = await get('/api/wireless/aps', { q });
+        const hits = (found.aps || []).slice(0, 8);
+        if (hits.length) {
+          groups.push({ title: 'Wireless access points', hits: hits.map((ap) => ({
+            name: ap.name || ap.mac_address,
+            meta: [ap.ip, ap.status].filter(Boolean).join(' · '),
+            route: `#/wireless/${ap.id}`,
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    // ConfigRX: a search endpoint for stored configurations is being built
+    // separately (4.49.0). Wire a "Stored configurations" group here, the
+    // same one-try-per-group shape as every group above, once it exists.
+
     if (token !== gsearchToken) return;   // superseded by a newer keystroke
     gsearchRender(groups);
   }
@@ -1938,7 +2165,7 @@ const App = (() => {
     gsearchActive = -1;
     if (!groups.length) {
       results.innerHTML = '<p class="gsearch-empty">Type to search devices, interfaces, '
-        + 'MACs, alerts and NetPath destinations.</p>';
+        + 'MACs, alerts, NetPath destinations, IPAM, syslog and wireless.</p>';
       return;
     }
     results.innerHTML = groups.map((group) => `<div class="gsearch-group">
@@ -3992,8 +4219,12 @@ const App = (() => {
       return false;
     }
     const changed = initial || state.tab !== route.tab;
+    // "Already on this tab" no longer guarantees the module is loaded and
+    // ready — a second hash change can land here while the first one's
+    // module is still in flight — so this goes through the same
+    // ensureModuleReady gate selectTab uses, not straight to deliverRoute.
     if (changed) selectTab(route.tab, { fromRoute: true, route });
-    else deliverRoute(route);
+    else activateTab(route.tab, { route });
     return true;
   }
 
@@ -4116,15 +4347,14 @@ const App = (() => {
     // The tab itself is a history entry: Back walks the tabs the operator
     // visited. A selection inside a tab replaces instead (setRoute).
     if (!options.fromRoute) writeRoute(buildRoute(name), { push: true });
-    const page = pages[name];
-    if (options.route) {
-      // A route names both the tab and what to select in it; the selection
-      // has to wait for the module's first refresh.
-      deliverRoute(options.route);
-      return;
-    }
-    if (page && page.activate) page.activate();
-    refreshNow(name);
+    // Everything above is synchronous — the strip, the page panel and the
+    // URL all update on this same tick, whether or not the module behind
+    // them has loaded yet. What happens once it has (deliverRoute, or
+    // activate()+refreshNow for a plain switch) is activateTab's job: a
+    // lazy module (everything but Dashboard) fetches its script here, the
+    // first time its tab is ever selected, rather than on every load of
+    // the application.
+    activateTab(name, options);
   }
 
   /* --------------------------------------------------------- lifecycle */
@@ -4484,11 +4714,19 @@ const App = (() => {
     // undefined `dimensions` list and lost the whole app — including the
     // modules it *could* read. Each module now fails alone: its tab is
     // hidden, the rest of the app starts normally.
+    //
+    // Lazy modules (above) are not loaded yet at this point in start(), so
+    // `pages` holds only Dashboard here — the one module still eager
+    // (index.html). This loop is what ensureModuleReady's own init() call
+    // mirrors for every other module, the first time its tab is selected;
+    // __ready marks a module init() must never run for twice, whichever of
+    // the two places did it.
     const strip = stripTabs();
     for (const [name, page] of Object.entries(pages)) {
       if (!page.init) continue;
       try {
         page.init();
+        page.__ready = true;
       } catch (error) {
         // Hiding matches applyPermissions' one-way rule: a tab whose module
         // never initialised cannot render, and clicking it would be a worse

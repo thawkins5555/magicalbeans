@@ -1333,23 +1333,20 @@
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
-<!-- `defer` on every module script, and never on boot.js above: these
-     thirteen download in parallel while the markup parses, run in this
-     order, and all finish before DOMContentLoaded — which is also what
-     makes app.js's start-up ordering sound (see the end of app.js).
-     boot.js must keep blocking: its whole job is to run before <body>. -->
+<!-- `defer` on both scripts below, and never on boot.js above: they
+     download in parallel while the markup parses and run in this order,
+     finishing before DOMContentLoaded — which is also what makes app.js's
+     start-up ordering sound (see the end of app.js). boot.js must keep
+     blocking: its whole job is to run before <body>.
+
+     The other eleven modules — everything but Dashboard — used to sit
+     here too, thirteen unconditional <script defer> tags totalling 1.17 MB
+     uncompressed on every single visit, most of it for tabs a given
+     operator may never open. Each of those now loads the first time its
+     own tab is actually selected (app.js's ensureModuleReady), not before
+     — there is nothing to tag here for a script that may never be
+     fetched at all. -->
 <script src="/app.js?v=__SW_VERSION__" defer></script>
 <script src="/dashboard.js?v=__SW_VERSION__" defer></script>
-<script src="/nodes.js?v=__SW_VERSION__" defer></script>
-<script src="/alerts.js?v=__SW_VERSION__" defer></script>
-<script src="/netpath.js?v=__SW_VERSION__" defer></script>
-<script src="/netflow.js?v=__SW_VERSION__" defer></script>
-<script src="/snmp.js?v=__SW_VERSION__" defer></script>
-<script src="/syslog.js?v=__SW_VERSION__" defer></script>
-<script src="/ipam.js?v=__SW_VERSION__" defer></script>
-<script src="/wireless.js?v=__SW_VERSION__" defer></script>
-<script src="/configrx.js?v=__SW_VERSION__" defer></script>
-<script src="/debug.js?v=__SW_VERSION__" defer></script>
-<script src="/settings.js?v=__SW_VERSION__" defer></script>
 </body>
 </html>

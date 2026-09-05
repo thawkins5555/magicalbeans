@@ -714,10 +714,16 @@
      cannot look like it did something. */
   function updateNewAuthFields() {
     const ldap = newAuthSource() === 'ldap';
-    App.el('new-password').disabled = ldap;
-    App.el('new-password').placeholder = ldap
+    const field = App.el('new-password');
+    field.disabled = ldap;
+    field.placeholder = ldap
       ? 'not used — verified by the directory' : 'initial password';
-    if (ldap) App.el('new-password').value = '';
+    // The placeholder alone said this to a sighted operator who noticed it
+    // change; a title says it to anyone who hovers a disabled field instead
+    // of reading it, the same courtesy every write-denied control gets.
+    if (ldap) field.title = 'LDAP accounts have no local password to set.';
+    else field.removeAttribute('title');
+    if (ldap) field.value = '';
   }
 
   async function addUser() {

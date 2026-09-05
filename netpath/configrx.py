@@ -39,6 +39,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
+from . import configrx_compliance
 from . import configrx_redact
 from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
@@ -66,6 +67,16 @@ MAX_PAGER_REPLIES = 2000
 # as an ordinary diff, because the next real backup would otherwise read as
 # almost the whole config coming back.
 SUSPECT_SHRINK_RATIO = 0.2
+
+# How often ConfigRxWorker._loop re-evaluates EVERY device against EVERY
+# enabled compliance rule set, on top of the per-device evaluation
+# _backup_device already runs right after a new capture. An hour, not
+# every 30s tick: a rule set's own text or scope changes far less often
+# than a device's config does, so this exists only to catch up on those
+# edits (or a device group someone just re-scoped a rule set to) rather
+# than to notice a config change itself, which _backup_device's own call
+# already does the moment it happens.
+COMPLIANCE_SWEEP_INTERVAL_S = 3600.0
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x08")
 _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
@@ -615,6 +626,15 @@ class ConfigRxWorker:
         # Last settings start() was handed; only allow_legacy_ssh is read from
         # here (the loop reads the rest from the database each pass).
         self.settings: dict = {}
+        # Last periodic compliance sweep (configrx_compliance.evaluate_all),
+        # in-memory only — a process restart just runs one sooner, the same
+        # tradeoff _ADDRESS_REFRESH_S-style cadences already make elsewhere
+        # in this app. Evaluating every device against every rule set also
+        # happens right after each device's own new capture
+        # (_backup_device), so this sweep exists only to catch up a rule
+        # set someone just edited, or a device group someone just re-scoped
+        # one to, rather than waiting for that device's next backup.
+        self._last_compliance_sweep = 0.0
 
     @property
     def running(self) -> bool:
@@ -708,6 +728,21 @@ class ConfigRxWorker:
                         # Shutting down between the due-list and the submit;
                         # the next start picks these up again.
                         break
+            now = time.time()
+            if now - self._last_compliance_sweep >= COMPLIANCE_SWEEP_INTERVAL_S:
+                self._last_compliance_sweep = now
+                try:
+                    configrx_compliance.evaluate_all(self.db, self.nodes_db)
+                except Exception:
+                    # Best-effort, the same standing every other periodic
+                    # pass in this loop already has: a broken rule set must
+                    # not take backups down with it. _run_one's own
+                    # try/except is what already protects one device's
+                    # backup from a bug in another device's; this is the
+                    # equivalent guard for the sweep that runs across all
+                    # of them in one call.
+                    self.log.add(ERROR, "ConfigRX compliance sweep failed",
+                                detail=traceback.format_exc())
             self._stop.wait(30.0)
 
     def worker_state(self) -> dict:
@@ -923,6 +958,27 @@ class ConfigRxWorker:
                             f"before storage" if not store_secrets else
                             "Stored verbatim: this device has \"keep secrets in "
                             "backups\" switched on"))
+
+            # The cross-device search index (configrx_search.py) is built
+            # ONLY from redacted text, regardless of this device's own
+            # store_secrets setting — `cleaned` above is redacted already
+            # when store_secrets is off, but reused verbatim otherwise, so
+            # a device with it ON needs its own separate redaction pass
+            # here. See configrx_search.py's module docstring for why a
+            # cross-device search view gets this stricter, unconditional
+            # treatment — the same one get_configrx_diff already gives a
+            # comparison view — rather than the single-backup route's
+            # permission-gated one.
+            search_text = cleaned if not store_secrets else configrx_redact.redact(cleaned)[0]
+            self.db.replace_search_lines(device_id, search_text)
+            # Compliance re-evaluates right away too, so a rule set someone
+            # is watching reflects this exact change rather than waiting
+            # for the next periodic sweep (see _loop and
+            # configrx_compliance.py's own module docstring for why the
+            # sweep exists at all: on a schedule and on a new capture,
+            # never recomputed from a page load).
+            configrx_compliance.evaluate_device_all_rule_sets(
+                self.db, self.nodes_db, device_id)
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

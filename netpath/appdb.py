@@ -739,7 +739,7 @@ class AppDatabase:
         return int(row["n"] or 0)
 
     def audit_query(self, t0: float, t1: float, *, username: str = "",
-                    action: str = "", q: str = "",
+                    action: str = "", target: str = "", q: str = "",
                     before_id: int | None = None,
                     limit: int = 200) -> list[sqlite3.Row]:
         """Rows in [t0, t1], newest first, capped at `limit` + 1.
@@ -755,9 +755,20 @@ class AppDatabase:
         known set (the accounts that exist, the handful of `action`
         strings this file's callers use), so the caller is expected to
         offer a dropdown built from audit_usernames()/audit_action_names()
-        below rather than free text. `q` is the free-text half - a LIKE
-        search across `target` and `detail`, which is where "which device"
-        or a threshold's old-and-new value actually live.
+        below rather than free text.
+
+        `target` is also an exact match, for "what changed on device N"
+        rather than "what did user X do": most of this file's callers
+        already write `target` as "<kind>:<identifier>" - "device:10.0.0.5",
+        "profile:core-switches" - so a Nodes device page can link straight
+        to its own history with target=f"device:{ip}" and get an index
+        lookup rather than a table scan. A caller that does not already
+        know the exact target string still has `q` below.
+
+        `q` is the free-text half - a LIKE search across `target` and
+        `detail`, for a person who knows a substring (an IP, a device
+        name) but not the exact "<kind>:<identifier>" form a given action
+        happened to write.
 
         `before_id` pages backward in time: pass the smallest id from the
         page you already have to ask for the next one older than it,
@@ -776,6 +787,9 @@ class AppDatabase:
         if action:
             clauses.append("action = ?")
             args.append(action)
+        if target:
+            clauses.append("target = ?")
+            args.append(target)
         if q:
             clauses.append("(target LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')")
             like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"

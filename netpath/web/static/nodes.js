@@ -2730,7 +2730,12 @@
       // app.js) is peeled to the start of the row away from Save, so the
       // two are no longer indistinguishable at a glance. Each still opens
       // its own confirm rather than acting immediately.
-      { label: 'Clear credential', danger: true, onClick: () => {
+      // Harmless today only because the dialog itself needs nodes write to
+      // open at all (nd-edit-device carries data-requires-write) — but that
+      // is exactly why this should already match Remove below rather than
+      // wait for some other route into editDevice() to make it reachable
+      // on its own.
+      ...(App.canWrite('nodes') ? [{ label: 'Clear credential', danger: true, onClick: () => {
         App.confirmDestructive('Clear credential',
           `<p>Clear the SNMP credential stored on <b>${escape(displayName(d))}</b>?</p>` +
           '<p class="hint">The device falls back to its profile\'s credentials on ' +
@@ -2739,7 +2744,7 @@
             await App.del(`/api/nodes/devices/${d.id}/credential`);
             loadDetail();
           }, (confirmed) => { if (!confirmed) editDevice(); });
-      } },
+      } }] : []),
       // Built here rather than declared in index.html, so — like every
       // dynamically built control — it checks the permission itself.
       ...(App.canWrite('nodes') ? [{ label: 'Remove', danger: true, onClick: () => removeDevice(d) }] : []),

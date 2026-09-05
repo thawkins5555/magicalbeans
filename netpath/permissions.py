@@ -13,6 +13,20 @@ its own module, granted to nobody by default.
 "dashboard" is intentionally excluded: it's an aggregate view of whatever
 other modules a user can already read, not a module with its own data to
 gate (see api.get_state's per-section filtering).
+
+configrx's read tier is the least obvious grant in this table, so it is
+worth stating plainly what it hands over: GET /api/configrx/backups/<id>
+gives a configrx:read account a device's stored configuration verbatim —
+secrets redacted, but topology intact, meaning interface addressing, ACLs,
+routes and VPN peers for every device with a capture on file. Reading one
+backup's content used to require write, the same as every other module's
+read/write split; a security review ahead of 4.48.1 raised the question
+of whether "read" should carry that much and the operator's answer was
+yes, on the reasoning that seeing what changed on a switch is the point
+of the module and should not itself require the permission to change one
+(see server.py's ROUTES comment beside that route for the fuller
+argument). Granting configrx:read is granting that, not merely "may see
+backup metadata" — know it before handing it out.
 """
 
 from __future__ import annotations
