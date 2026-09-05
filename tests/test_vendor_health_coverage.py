@@ -85,6 +85,57 @@ try:
 finally:
     stub.kill()
 
+# ------------------------------------------- vendor_arc persisted, either way
+
+# The Rockwell finding: a device identified by sysDescr text alone (a PLC on
+# a generic net-snmp agent, say) gets vendor_arc=None from vendorid.decide()
+# -- and VENDOR_HEALTH is keyed by arc, so nothing could ever be looked up
+# for it, no matter how good the vendor-specific OID knowledge is. That was
+# invisible to a device pane because vendor_arc was computed fresh every
+# poll and thrown away. This section proves it now survives to the device
+# row, both when a real arc was found and when it deliberately was not.
+
+stub, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("vendor_arc_real")
+    did = device_against(db, "cisco-sw-2")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+    identity, uptime_ticks, _metrics = poller._poll_snmp_scalars(device, config)
+    db.record_poll(did, ping_ok=None, ping_rtt_ms=None, snmp_ok=True,
+                   snmp_error="", identity=identity, uptime_ticks=uptime_ticks,
+                   status="up", reachable=True)
+    check("a device identified from a real sysObjectID arc persists that "
+          "arc on the device row (9, Cisco)",
+          db.device(did)["vendor_arc"] == 9, dict(db.device(did)))
+    db.close()
+finally:
+    stub.kill()
+
+db = new_db("vendor_arc_none")
+did = device_against(db, "rockwell-plc-1")
+synthetic_identity = {
+    "sys_descr": "Rockwell Automation 1756-EN2T/B EtherNet/IP Bridge",
+    "sys_name": "plc-1", "sys_object_id": "1.3.6.1.4.1.8072.3.2.10",
+    "sys_contact": "", "sys_location": "",
+    "vendor": "rockwellAutomation", "vendor_detected": "rockwellAutomation",
+    "vendor_source": "sysDescr", "vendor_confidence": "low",
+    "vendor_arc": None,   # the exact case vendorid.decide() produces for this
+}
+db.record_poll(did, ping_ok=None, ping_rtt_ms=None, snmp_ok=True,
+              snmp_error="", identity=synthetic_identity, uptime_ticks=None,
+              status="up", reachable=True)
+row = db.device(did)
+check("a device named with confidence from sysDescr text alone, with no "
+      "real enterprise arc behind it, persists vendor_arc as NULL -- "
+      "distinguishable from the real-arc case above by more than "
+      "vendor_source alone (both say 'sysDescr')",
+      row["vendor_source"] == "sysDescr" and row["vendor_confidence"] == "low"
+      and row["vendor_arc"] is None, dict(row))
+db.close()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

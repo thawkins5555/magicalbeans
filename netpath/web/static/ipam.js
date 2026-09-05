@@ -192,6 +192,9 @@
     const table = App.el('ipam-subnet-table');
     table.innerHTML = '<caption class="sr-only">Subnets</caption>';
     const body = document.createElement('tbody');
+    if (!view.subnets.length) {
+      App.emptyRow(body, [1], 'No subnets added yet. Use Add above to start scanning one.');
+    }
     for (const subnet of view.subnets) {
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (subnet.id === view.subnetId ? ' selected' : '');
@@ -370,7 +373,11 @@
     const rows = App.sortRows(
       aliveOnly ? view.hosts.filter((h) => h.alive) : view.hosts,
       view.hostSort.key, view.hostSort.descending, columns);
-    App.drawRows(body, rows, columns);
+    App.drawRows(body, rows, columns, undefined, !view.subnetId
+      ? 'Select a subnet on the left to see its hosts.'
+      : view.hosts.length
+        ? 'No alive hosts match. Turn off "Alive only" to see the rest.'
+        : 'No hosts recorded yet for this subnet — scan it to populate this list.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
     App.el('ipam-hosts-count').textContent = `${rows.length} of ${view.hosts.length}`;
@@ -415,6 +422,15 @@
       '<th scope="col">Second MAC</th><th scope="col">Source</th><th scope="col">Detected</th><th scope="col">Last seen</th>' +
       '<th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
+    // Mirrors App.emptyRow (this table builds its own rows rather than
+    // going through App.drawRows, for the resolve/mark-resolved button
+    // each row needs) — "no conflicts" is good news, not an empty search,
+    // so the sentence says what was checked rather than "widen a filter".
+    if (!view.conflicts.length) {
+      App.emptyRow(body, new Array(7), App.el('ipam-show-resolved').checked
+        ? 'No resolved conflicts to show.'
+        : 'No open address conflicts detected.');
+    }
     for (const c of view.conflicts) {
       const tr = document.createElement('tr');
       const sourceText = c.source === 'scan_dhcp'
@@ -1007,7 +1023,11 @@
     const body = document.createElement('tbody');
     const rows = App.sortRows(view.dhcpLeases, view.leaseSort.key,
       view.leaseSort.descending, columns);
-    App.drawRows(body, rows, columns);
+    App.drawRows(body, rows, columns, undefined, !view.dhcpServerId
+      ? 'No DHCP server configured yet.'
+      : !view.dhcpScopeId
+        ? 'Select a scope on the left to see its leases.'
+        : 'No leases recorded for this scope yet.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
     App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;

@@ -161,7 +161,7 @@
         showDetail(row);
         drawTable();
       };
-    });
+    }, 'No access points match these filters. Widen the search or clear a filter.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
     App.el('wl-count').textContent = `${rows.length} AP(s)`;

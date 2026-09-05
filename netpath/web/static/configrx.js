@@ -166,7 +166,7 @@
         };
       }
       tr.onclick = () => selectDevice(row.id);
-    });
+    }, 'No devices match these filters. Widen the search or clear a filter.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
     App.el('cx-device-count').textContent = `${view.devices.length} device(s)`;

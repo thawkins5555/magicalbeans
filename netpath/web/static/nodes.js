@@ -293,6 +293,23 @@
     const rows = App.sortRows(view.devices, view.deviceSort.key,
                               view.deviceSort.descending, columns);
 
+    // This table keeps its own row cache below rather than going through
+    // App.drawRows, so it has to ask for App.emptyRow's plumbing by hand
+    // too — the main Devices list showed a bare header over nothing under
+    // any filter that matched zero rows, the one table in this file that
+    // had never been given the "widen or clear a filter" sentence every
+    // sibling list already has.
+    if (!rows.length) {
+      // No row survives a filter that matches nothing: same cleanup the
+      // non-empty path does below, just with an empty `seen`.
+      for (const id of rowCache.keys()) rowCache.delete(id);
+      App.emptyRow(body, columns, 'No devices match these filters. Widen the search or clear a filter.');
+      table.appendChild(body);
+      App.wireRowKeyboard(body);
+      App.el('nd-count').textContent = App.countLabel(view.devices.length, view.pageTotal);
+      drawBulkBar();
+      return;
+    }
     // Changes when the operator picks different columns (Nodes → Settings →
     // Columns) — a layout change, not a data change, so a row cached under
     // the old column set is rebuilt rather than cell-diffed against a
@@ -3685,7 +3702,11 @@
         // table under the pointer is what made picking several feel slow.
         App.refreshSelectAll(table, selectable.length, ticked());
       };
-    });
+    }, !view.discSelected
+      ? 'Select a scan on the left to see its results.'
+      : job && job.state === 'running'
+        ? 'No addresses have answered yet — the scan is still running.'
+        : 'No addresses in this range answered ping or SNMP.');
     table.appendChild(body);
     if (wrap && scroll) wrap.scrollTop = scroll;
   }
