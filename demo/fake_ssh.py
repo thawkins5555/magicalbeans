@@ -14,11 +14,14 @@ rejects its own pager-off and pages instead), a WLC whose privileged
 prompt ends '>' with no enable step, and an ASA that must escalate via
 `enable` + a stored secret before it will do anything at all.
 
-    python3 demo/fake_ssh.py [--base-port 2201] [--host-key PATH]
+    python3 demo/fake_ssh.py [--base-port 2201] [--host-key PATH] [--read-timeout SECS]
 
 Accepts any username with password "demo". Needs paramiko (not a
 SappiWhere dependency for anything but ConfigRX). Never used by the app
-itself; demo/configrx_probe.py drives it.
+itself; demo/configrx_probe.py drives it — and, with --read-timeout 0, a
+live interactive session against sshterm.py can drive it too, for testing
+that side's own idle timeout instead of ConfigRX's scripted probe (see
+--read-timeout's own help text).
 """
 from __future__ import annotations
 
@@ -180,9 +183,12 @@ class _Server(paramiko.ServerInterface):
         return True
 
 
-def _read_line(chan) -> str | None:
+def _read_line(chan, timeout_s: float | None = 30.0) -> str | None:
+    """timeout_s=None disables the read timeout (chan.settimeout(None),
+    a blocking channel) — see --read-timeout's own help text for why a
+    caller would ever want that."""
     buf = b""
-    chan.settimeout(30)
+    chan.settimeout(timeout_s)
     while not buf.endswith(b"\n"):
         try:
             data = chan.recv(1024)
@@ -223,7 +229,7 @@ def _send_config(chan, persona, prompt):
     chan.send(prompt)
 
 
-def _session(client_sock, persona):
+def _session(client_sock, persona, read_timeout_s: float | None = 30.0):
     t = paramiko.Transport(client_sock)
     t.add_server_key(HOST_KEY or load_host_key(DEFAULT_HOST_KEY_PATH))
     server = _Server()
@@ -241,7 +247,7 @@ def _session(client_sock, persona):
         privileged = not persona.get("enable_command")
         awaiting_enable_password = False
         while True:
-            line = _read_line(chan)
+            line = _read_line(chan, read_timeout_s)
             if line is None:
                 break
             if awaiting_enable_password:
@@ -307,10 +313,11 @@ def bind(port):
     return srv
 
 
-def serve(srv, persona):
+def serve(srv, persona, read_timeout_s: float | None = 30.0):
     while True:
         client, _ = srv.accept()
-        threading.Thread(target=_session, args=(client, persona), daemon=True).start()
+        threading.Thread(target=_session, args=(client, persona, read_timeout_s),
+                         daemon=True).start()
 
 
 def main():
@@ -319,7 +326,23 @@ def main():
     ap.add_argument("--host-key", default=DEFAULT_HOST_KEY_PATH,
                     help="where to keep the persistent host key "
                          "(default: beside this script)")
+    ap.add_argument(
+        "--read-timeout", type=float, default=30.0, metavar="SECS",
+        help="how long a session's channel waits for the client's next "
+             "line before hanging up from the device side (default: 30). "
+             "0 or negative disables it (the channel blocks indefinitely "
+             "instead). ConfigRX's own scripted probe (configrx_probe.py) "
+             "never needs more than a few seconds of silence, which is what "
+             "the default is sized for — but a live SSH TERMINAL session "
+             "sitting idle to exercise the app's own 900s idle timeout "
+             "(sshterm.IDLE_TIMEOUT_S) would be hung up on by this fixture "
+             "at the 30s default long before that timer could ever fire, "
+             "and any keystroke sent to keep the device side alive resets "
+             "the app's own idle clock too — the same activity on the wire "
+             "counts for both. --read-timeout 0 is what makes that 900s "
+             "timer provable against a live device instead of only PLAUSIBLE.")
     args = ap.parse_args()
+    read_timeout_s = args.read_timeout if args.read_timeout > 0 else None
     global HOST_KEY
     HOST_KEY = load_host_key(args.host_key)
     bound = []
@@ -336,7 +359,8 @@ def main():
                   "--base-port to move out of its way.", file=sys.stderr, flush=True)
             return 1
     for name, persona, port, srv in bound:
-        threading.Thread(target=serve, args=(srv, persona), daemon=True).start()
+        threading.Thread(target=serve, args=(srv, persona, read_timeout_s),
+                         daemon=True).start()
         print(f"{name}: 127.0.0.1:{port}")
     print("listening", flush=True)
     try:

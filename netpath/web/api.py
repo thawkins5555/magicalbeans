@@ -3083,6 +3083,15 @@ def post_nodes_device(service, params, body) -> dict:
         service.nodes_db.set_vendor_override(
             device_id, vendor_override, params.get("_username", ""))
     service.log.add(NODES_CATEGORY, f"Added device {ip}")
+    detail_parts = []
+    if group_id:
+        detail_parts.append(f"group_id={group_id}")
+    if device_group_id:
+        detail_parts.append(f"device_group_id={device_group_id}")
+    if vendor_override:
+        detail_parts.append(f"vendor_override={vendor_override}")
+    _audit(service, params, "device.create", target=f"device:{ip}",
+          detail=", ".join(detail_parts))
     return {"id": device_id}
 
 
@@ -3203,7 +3212,11 @@ def _device_address(body) -> str:
 
 
 def put_nodes_device(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
+    # Captured for the audit diff below — this existence check discarded
+    # the row entirely before now, though it was already the "before" side
+    # of every field this route can change.
+    before = service.nodes_db.device(device_id)
+    if not before:
         raise ValueError("No such device")
     _check_display_name_source(body)
     fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
@@ -3216,14 +3229,23 @@ def put_nodes_device(service, params, body, device_id) -> dict:
         # the fleet (when the sysObjectID is specific enough) and clearing
         # it re-decides the row, both of which nodesdb.set_vendor_override
         # owns. Everything else in the body still goes the ordinary way.
+        # Audited on its own line rather than folded into the generic diff
+        # below — a vendor pin is a different kind of change from the rest.
         value = fields.pop("vendor_override")
         value = str(value or "").strip()
         if len(value) > 64:
             raise ValueError("A vendor name is at most 64 characters")
         result["vendor"] = service.nodes_db.set_vendor_override(
             device_id, value or None, params.get("_username", ""))
+        _audit(service, params, "device.update", target=f"device:{before['ip']}",
+              detail=f"vendor_override: {before['vendor_override'] or ''!r} -> {value!r}")
     if fields:
         service.nodes_db.update_device(device_id, **fields)
+        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
+                           if before[k] != v)
+        if detail:
+            _audit(service, params, "device.update", target=f"device:{before['ip']}",
+                  detail=detail)
     return result
 
 
@@ -3234,6 +3256,7 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     service.nodes_db.remove_device(device_id)
     service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
+    _audit(service, params, "device.delete", target=f"device:{row['ip']}")
     return {"ok": True}
 
 
@@ -3262,6 +3285,13 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
     service.nodes_db.bulk_update_devices(device_ids, **fields)
     service.log.add(NODES_CATEGORY,
                     f"Bulk-updated {len(device_ids)} device(s): {', '.join(fields)}")
+    # The fields changed, not one line per device — a real batch (hundreds
+    # or thousands of ids) would blow the 512-char detail clip instantly,
+    # and "was device N touched by this bulk op" is a known, accepted gap
+    # (see this route's own audit-widening discussion): no per-device
+    # target this can carry without a many-to-many audit-target table.
+    _audit(service, params, "device.bulk_update", target=f"{len(device_ids)} devices",
+          detail=", ".join(fields))
     return {"ok": True, "updated": len(device_ids)}
 
 
@@ -3271,6 +3301,7 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     for device_id in device_ids:
         service.configrx_db.forget_device(device_id)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
+    _audit(service, params, "device.bulk_delete", target=f"{len(device_ids)} devices")
     return {"ok": True, "removed": removed}
 
 
@@ -3457,6 +3488,9 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
             except Exception:                                     # noqa: BLE001
                 pass
 
+    _audit(service, params, "device.bulk_import",
+          detail=f"created={len(created)}, duplicate={len(duplicate)}, "
+                 f"invalid={len(invalid)}")
     return {"ok": True, "total": len(rows), "created": created,
             "duplicate": duplicate, "invalid": invalid}
 
@@ -4018,6 +4052,7 @@ def post_nodes_device_group(service, params, body) -> dict:
         raise ValueError("A name is required")
     device_group_id = service.nodes_db.add_device_group(name)
     service.log.add(NODES_CATEGORY, f"Added device group {name}")
+    _audit(service, params, "device_group.create", target=name)
     return {"id": device_group_id}
 
 
@@ -4028,6 +4063,8 @@ def put_nodes_device_group(service, params, body, device_group_id) -> dict:
     if not name:
         raise ValueError("A name is required")
     service.nodes_db.rename_device_group(device_group_id, name)
+    _audit(service, params, "device_group.update", target=str(device_group_id),
+          detail=f"renamed to {name}")
     return {"ok": True}
 
 
@@ -4037,6 +4074,7 @@ def delete_nodes_device_group(service, params, body, device_group_id) -> dict:
         raise ValueError("No such device group")
     service.nodes_db.remove_device_group(device_group_id)
     service.log.add(NODES_CATEGORY, f"Removed device group {row['name']}")
+    _audit(service, params, "device_group.delete", target=row["name"])
     return {"ok": True}
 
 
@@ -4054,14 +4092,29 @@ def post_nodes_group(service, params, body) -> dict:
              if k in _GROUP_EDITABLE_BODY and k != "name"}
     group_id = service.nodes_db.add_group(name, **fields)
     service.log.add(NODES_CATEGORY, f"Added polling profile {name}")
+    _audit(service, params, "profile.create", target=f"profile:{name}")
     return {"id": group_id}
 
 
 def put_nodes_group(service, params, body, group_id) -> dict:
-    if not service.nodes_db.group(group_id):
+    # Captured for the audit diff below — the same discarded-row shape
+    # put_nodes_device had: this is the literal "changed the threshold from
+    # 90 to 99" case, since poll intervals/community defaults live in
+    # _GROUP_EDITABLE_BODY.
+    before = service.nodes_db.group(group_id)
+    if not before:
         raise ValueError("No such polling profile")
     fields = {k: v for k, v in body.items() if k in _GROUP_EDITABLE_BODY}
     service.nodes_db.update_group(group_id, **fields)
+    # community is the SNMP community string — credential-adjacent, same as
+    # every other secret this file redacts before it reaches an audit
+    # trail or a log line. Named as changed, never with either value.
+    detail = "; ".join(
+        "community: changed" if k == "community" else f"{k}: {before[k]} -> {v}"
+        for k, v in fields.items() if before[k] != v)
+    if detail:
+        _audit(service, params, "profile.update", target=f"profile:{before['name']}",
+              detail=detail)
     return {"ok": True}
 
 
@@ -4075,6 +4128,7 @@ def delete_nodes_group(service, params, body, group_id) -> dict:
                          "move them to another profile first")
     service.nodes_db.remove_group(group_id)
     service.log.add(NODES_CATEGORY, f"Removed polling profile {row['name']}")
+    _audit(service, params, "profile.delete", target=f"profile:{row['name']}")
     return {"ok": True}
 
 
@@ -4084,6 +4138,7 @@ def post_nodes_group_default(service, params, body, group_id) -> dict:
         raise ValueError("No such polling profile")
     service.nodes_db.set_default_group(group_id)
     service.log.add(NODES_CATEGORY, f"{row['name']} is now the default polling profile")
+    _audit(service, params, "profile.set_default", target=f"profile:{row['name']}")
     return {"ok": True}
 
 
