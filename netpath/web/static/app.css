@@ -149,12 +149,15 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .dash-row-note { flex-basis: 100%; font-size: var(--fs-xs); }
 .dash-bar {
   flex-basis: 100%;
-  height: 4px;
-  /* --data-neutral, not --grid: the track is the "not yet used" part of
-     the figure and has to be seen to be read. --grid on --panel is 1.19:1 —
-     the same invisible track the Settings meter had, rebuilt here while
-     that one was being fixed. */
-  background: var(--data-neutral);
+  height: 6px;
+  /* --data-neutral read at 1.66-2.82:1 against the fills below — under the
+     3:1 a graphical object needs, and the fill is the figure this bar
+     exists to show. --raised is close to --panel by design (a hairline
+     apart), so it clears --ok/--warn/--fail by 4.9:1 or more in every theme
+     (measured; see GRAPHIC_ON), and the --line border is what makes ITS
+     edge read against --panel instead (already held at 3:1 there). */
+  background: var(--raised);
+  border: 1px solid var(--line);
   border-radius: var(--radius-pill);
   overflow: hidden;
 }
@@ -303,7 +306,16 @@ body.tiny .brand span { display: none; }
   border-bottom: 1px solid var(--hairline);
   padding: 0 var(--space-md);
   flex: none;
+  /* The same containment #tabs already has: a subtab bar absorbs its own
+     overflow instead of pushing the page wider at 320px (Settings measured
+     637px of scrollWidth without this). */
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
 }
+.subtabs > * { flex: none; }
 .subtab {
   background: none;
   border: none;
@@ -637,6 +649,18 @@ body.tiny .terms { display: none; }
    alert detail's 30 % pane a shrinking duration picker collapsed to a
    sliver of arrow with no readable value. Only the selects that ask. */
 .bar > select.fixed { flex: none; }
+/* The rest of a bar's selects give way like everything else here: a label
+   is itself a flex row (label { display: inline-flex }), so both it and the
+   select inside default to a minimum width of their content — a select with
+   a long option list (Alerts' Rule filter, one rule name wide) held the
+   whole bar past 320px even inside .bar.wrap, since wrapping only breaks
+   between items, not within one that is already too wide on its own. */
+.bar label { min-width: 0; }
+.bar label select, .bar label input { min-width: 0; max-width: 100%; }
+/* NetFlow's chart-window toolbar (prev/zoom/reset) has no .wrap class of
+   its own — its markup is outside this file — so it is reached by a child
+   id instead, to wrap rather than push the page wider at 320px. */
+.bar:has(#nf-back) { flex-wrap: wrap; }
 /* A status line in a bar carries a sentence — a DHCP server's connection
    error, say. A flex item's minimum width is its longest word, so between a
    fixed select and the spacer it was squeezed to about sixty pixels and
@@ -863,6 +887,16 @@ body.tiny .terms { display: none; }
   border: 1px solid var(--canvas-hairline);
   border-radius: var(--radius);
   overflow: hidden;
+  /* A histogram's sr-only data table (App.histogramTable) is absolutely
+     positioned to clip to 1x1px, but a <table> in auto layout ignores a
+     width narrower than its content needs — so without a positioned
+     ancestor of its own, it used its containing block's, sized at its real,
+     wide, unclipped layout width. Alerts' canvas sits directly in the
+     subpage rather than inside a .pane (which already clips), so that
+     width reached all the way to #page-alerts's own overflow: visible and
+     pushed the page 34px past 320px. Every other histogram host happened to
+     have a clipping .pane in between and never showed it. */
+  position: relative;
 }
 .canvas svg {
   width: 100%;
@@ -1156,9 +1190,15 @@ fieldset .hint { margin: var(--space-sm) 0 0; }
 .usage .meter {
   display: inline-block;
   width: 90px;
-  height: 6px;
+  height: 8px;
   border-radius: var(--radius-pill);
-  background: var(--data-neutral);   /* the track has to be visible to read */
+  /* --raised, not --data-neutral: the fill is what this meter exists to
+     show, and --data-neutral only cleared --ok/--warn/--fail/--accent at
+     1.66-2.82:1, under the 3:1 floor. --raised clears all four by 4.9:1 or
+     better (measured; see GRAPHIC_ON); the --line border is what makes the
+     track's own edge read against --panel, since --raised barely does. */
+  background: var(--raised);
+  border: 1px solid var(--line);
   margin: 0 6px;
   vertical-align: middle;
   overflow: hidden;

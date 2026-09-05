@@ -140,6 +140,12 @@ GRAPHIC_ON = [
     ("--line", "--raised", 3.0), ("--line", "--panel", 3.0), ("--line", "--bg", 3.0),
     ("--data-neutral", "--panel", 3.0),
     ("--accent", "--raised", 3.0),       # the selected-row bar, the focus ring
+    # The meter fill against its own track (.usage .meter, .dash-bar), which
+    # is --raised, not --accent/--ok/--warn/--fail against --data-neutral —
+    # the pair that was actually failing (1.66-2.82:1) while the track read
+    # fine against --panel. --accent's copy of this pair already existed
+    # above for an unrelated reason and is not repeated here.
+    ("--ok", "--raised", 3.0), ("--warn", "--raised", 3.0), ("--fail", "--raised", 3.0),
 ]
 # High contrast is held to AAA: 7:1 for text, 4.5:1 for a line or a ring.
 FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5)}
@@ -259,10 +265,21 @@ for name in sorted(os.listdir(STATIC)):
 
 # --------------------------------------------------------------------------
 # 4. tokens.css is where it has to be: first on every page, and public.
+# The asset URLs carry `?v=__SW_VERSION__`, substituted with the running
+# version as the file is loaded (server.py's static cache) so that a
+# year-long immutable cache cannot outlive the release that filled it. These
+# checks are about which file is asked for and in what order, so they match
+# the path and let the query alone — but the placeholder itself is asserted
+# below, because markup that lost it would be served with a literal
+# "?v=__SW_VERSION__" and cache the wrong bytes forever.
 for page in ("index.html", "login.html", "ssh.html"):
     body = read(STATIC, page)
-    check('href="/tokens.css"' in body and body.index("tokens.css") < body.index("app.css"),
+    check('href="/tokens.css?v=' in body and body.index("tokens.css") < body.index("app.css"),
           "%s links tokens.css before app.css" % page)
+    for asset in re.findall(r'(?:src|href)="(/[\w./-]+\.(?:js|css))([^"]*)"', body):
+        path, query = asset
+        check(query.startswith("?v=__SW_VERSION__"),
+              "%s: %s carries the version placeholder (found %r)" % (page, path, query))
 server = read(REPO_ROOT, "netpath", "web", "server.py")
 check('"/tokens.css"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
       "server.py serves /tokens.css before sign-in")
@@ -273,7 +290,8 @@ check("sappiwhere.theme" in boot and "dataset.theme" in boot,
       "boot.js applies the stored theme before first paint")
 for page in ("index.html", "login.html", "ssh.html"):
     body = read(STATIC, page)
-    check('<script src="/boot.js"></script>' in body, "%s loads boot.js blocking, in <head>" % page)
+    check(re.search(r'<script src="/boot\.js\?v=[^"]*"></script>', body),
+          "%s loads boot.js blocking, in <head>" % page)
     check('class="brand"' in body and 'class="mark"' in body, "%s carries the wordmark" % page)
     marks = re.findall(r"<svg class=\"mark\".*?</svg>", body, re.S)
     check(marks and not any(re.search(r"#[0-9A-Fa-f]{3,6}\b", m) for m in marks),

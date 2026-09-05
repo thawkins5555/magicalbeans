@@ -1774,7 +1774,14 @@ const App = (() => {
       input.addEventListener('input', () => gsearchQueued(input.value));
       input.addEventListener('keydown', gsearchKeydown);
     }
+    // The '/' shortcut can fire with nothing focused (activeElement is then
+    // document.body), which is not a trigger Escape can usefully return to;
+    // fall back to the button that opens the same dialog.
     gsearchTrigger = document.activeElement;
+    if (!gsearchTrigger || gsearchTrigger === document.body) {
+      gsearchTrigger = document.getElementById('global-search-btn');
+    }
+    setBackgroundInert(true);
     wrap.hidden = false;
     const input = wrap.querySelector('#gsearch-input');
     input.value = '';
@@ -1786,6 +1793,7 @@ const App = (() => {
     const wrap = document.getElementById('gsearch');
     if (!wrap || wrap.hidden) return;
     wrap.hidden = true;
+    setBackgroundInert(false);
     gsearchToken++;                    // any answer still in flight is stale
     if (gsearchTrigger && document.contains(gsearchTrigger)) gsearchTrigger.focus();
     gsearchTrigger = null;
