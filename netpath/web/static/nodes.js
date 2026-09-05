@@ -1670,7 +1670,15 @@
     // Starting a walk is a write (it drives the device over SNMP), and
     // applyPermissions only ever runs over markup that already exists, so
     // dynamically-built controls check canWrite themselves — see app.js.
-    if (!App.canWrite('nodes')) fullBtn.hidden = true;
+    // Disabled with a reason, not hidden: hiding taught a read-only operator
+    // that the feature simply is not there, the same failure applyPermissions
+    // itself moved away from for exactly this reason (see its own comment in
+    // app.js) — the button sits alone at the end of the bar with nothing
+    // after it, so disabling it in place costs nothing layout has to absorb.
+    if (!App.canWrite('nodes')) {
+      fullBtn.disabled = true;
+      fullBtn.title = 'Needs Nodes write';
+    }
 
     function stopWatching() {
       if (watchTimer) clearInterval(watchTimer);

@@ -497,28 +497,36 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
     (huge) to be probed by its own primary key once per candidate, which
     is the entire reason that table's key leads on metric_id.
 
-    Measured, 2,000 devices x 48 ports x one interface-metric family
-    (96,000 series) against a 97M-row samples_hourly built from six metric
-    families (a realistic mix, not just the one queried), one week of
-    hourly rows: the plain-JOIN plan took **45.8s**; forcing the CROSS
-    JOIN plan brought it to **14.2s**, and — unlike the plain-JOIN plan,
-    whose cost scales with the WHOLE table — this cost stayed flat
-    whether the decoy families were present or not, because it never
-    touches them. A month (730h vs 168h measured) projects to roughly
-    **60s** at this scale on this plan; see tests/test_report_topn.py for
-    the exact numbers this was measured with. That is still too slow for
-    an interactive request at full fleet scale, and the remaining cost is
-    inherent to samples_hourly being a ROWID table: the primary key is an
-    index into rowids, not the row's own storage, so satisfying it still
-    costs one extra rowid lookup per matched row on top of the index
-    search. Declaring samples_hourly `WITHOUT ROWID` — so `(metric_id,
-    hour)` becomes the actual clustering key and `n`/`vmin`/`vavg`/`vmax`
-    live inline with it — would remove that second lookup; that is a
-    genuine schema migration on a table this module does not own, so it
-    is specified here rather than made. Until then, a caller running this
-    across the whole fleet over a month or more should treat it as a
-    background/scheduled report, not an interactive one; `query_ms` below
-    is exactly the number to watch for that decision.
+    Measured (this function itself, not a simplified stand-in — see
+    tests/test_report_topn.py for the exact fixture), 2,000 devices x 48
+    ports x six interface-metric families (576,000 series, 97.3M rows in
+    samples_hourly, a realistic mix of families rather than only the one
+    ranked), ranking one family (96,000 candidate series) over one week
+    of hourly rows: **22-23 seconds**, for either `rank_by`. Isolating
+    just the join strategy on a smaller version of the same fixture (see
+    this module's own dev notes) showed why CROSS JOIN is not optional:
+    a plain JOIN there measured **45.8s** against the same row count, and
+    critically its cost scales with the WHOLE table (it degrades further
+    as more unrelated metric families are added), where the CROSS JOIN
+    plan's cost stayed flat regardless, because it never touches them.
+
+    A month (730h vs the 168h measured) projects to roughly **95-100
+    seconds** at this scale — too slow for an interactive request against
+    the full fleet, and the remaining cost is inherent to samples_hourly
+    being a ROWID table: its primary key is an index into rowids, not the
+    row's own storage, so satisfying it still costs one extra rowid
+    lookup per matched row on top of the index search. Declaring
+    samples_hourly `WITHOUT ROWID` — so `(metric_id, hour)` becomes the
+    actual clustering key and `n`/`vmin`/`vavg`/`vmax` live inline with it
+    — would remove that second lookup; that is a genuine schema migration
+    on a table this module does not own, so it is specified here rather
+    than made. Until then, a caller running this across the whole fleet
+    over a month or more should treat it as a background/scheduled
+    report, not an interactive one; `query_ms` below is exactly the
+    number to watch for that decision, and narrowing `device_ids` to the
+    devices actually in scope (team lead's own example — "these thirty
+    devices" — rather than the whole fleet) is the other lever a caller
+    already has without any schema change at all.
 
     `query_ms` on the returned report is the wall-clock cost of the whole
     query, so a caller or a test can watch it rather than guess at it.

@@ -54,10 +54,19 @@ HR_PROCESSOR_TABLE = {
 # hrStorageTable: type/size/used per row. Row 1 RAM (75% used), row 2 fixed
 # disk (20% used), row 3 virtual memory (95% used -- must never be counted
 # as either RAM or disk).
+#
+# hrStorageType is HOST-RESOURCES-MIB's AutonomousType -- an OBJECT
+# IDENTIFIER naming one of the hrStorageTypes arcs (1.3.6.1.2.1.25.2.1.x),
+# not a bare integer enum. Encoded here as ("str", "<the full OID>"), the
+# same "wire type doesn't matter, only the string this app's own code reads
+# back out of it does" convention every OID-valued field in this stub
+# ecosystem already uses for sysObjectID -- nodepoll._worst_storage_pct
+# compares str(value) against nodeoids.HR_STORAGE_FIXED_DISK/HR_STORAGE_RAM,
+# both full dotted OIDs, exactly the way a real agent's answer decodes.
 HR_STORAGE_TABLE = {
-    "1.3.6.1.2.1.25.2.3.1.2.1": ("int", 2),          # type: hrStorageRam
-    "1.3.6.1.2.1.25.2.3.1.2.2": ("int", 4),          # type: hrStorageFixedDisk
-    "1.3.6.1.2.1.25.2.3.1.2.3": ("int", 3),          # type: hrStorageVirtualMemory
+    "1.3.6.1.2.1.25.2.3.1.2.1": ("str", "1.3.6.1.2.1.25.2.1.2"),  # type: hrStorageRam
+    "1.3.6.1.2.1.25.2.3.1.2.2": ("str", "1.3.6.1.2.1.25.2.1.4"),  # type: hrStorageFixedDisk
+    "1.3.6.1.2.1.25.2.3.1.2.3": ("str", "1.3.6.1.2.1.25.2.1.3"),  # type: hrStorageVirtualMemory
     "1.3.6.1.2.1.25.2.3.1.5.1": ("int", 1_000_000),  # RAM size
     "1.3.6.1.2.1.25.2.3.1.5.2": ("int", 500_000),    # disk size
     "1.3.6.1.2.1.25.2.3.1.5.3": ("int", 2_000_000),  # vmem size

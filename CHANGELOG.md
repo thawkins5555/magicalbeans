@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.49.0 — The estate it couldn't see](#4490--the-estate-it-couldnt-see)
 - [4.48.0 — The interface, reviewed](#4480--the-interface-reviewed)
 - [4.47.0 — A fleet operator's list, answered](#4470--a-fleet-operators-list-answered)
 - [4.46.4 — Full code review: fifteen defects](#4464--full-code-review-fifteen-defects)

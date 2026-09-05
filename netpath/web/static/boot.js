@@ -75,6 +75,16 @@
      Worse than the flash the mechanism exists to prevent. Generated from the
      stored name, the rule cannot fall behind the tab strip again.
 
+     "Half a megabyte of module scripts" was true before 4.49.0 made every
+     module but Dashboard load lazily, on first selection rather than
+     unconditionally — a cold load's own scripts are tens of KB now, not
+     hundreds. The flash this file exists to prevent got shorter; it did
+     not go away. A remembered tab that is one of the eleven lazy modules
+     still waits on that one module's own script fetch before its data can
+     paint — smaller than before, since it is one script rather than all
+     twelve, but not instant, and this file's own CSS-only illusion still
+     covers exactly that gap the same way it always has.
+
      A <style> element is allowed where an inline <script> is not: the
      server sends `style-src 'self' 'unsafe-inline'`. Appending it to <head>
      puts it after app.css, so it wins on source order at equal specificity —
