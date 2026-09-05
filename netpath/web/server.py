@@ -430,6 +430,16 @@ ROUTES = [
     # "has this switch changed". get_configrx_backup itself is what still
     # guards a verbatim (store_secrets) capture: a caller without ConfigRX
     # write gets it redacted rather than 403ing outright.
+    #
+    # Weakened from write to read deliberately, and reviewed as such: the
+    # redaction strips secrets, not topology, so a read-only account can now
+    # see interface addressing, ACLs, routes and VPN peers for any device
+    # with a stored capture. That is a wider grant than "read" carries in
+    # most other modules, it was raised as such by this release's security
+    # review, and the operator's answer was to keep it — being able to see
+    # what changed on a switch without holding the permission to change it
+    # is the point of the module. Narrow it here, not in the handler, if
+    # that judgement is ever revisited.
     ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
     # A diff hands over the device's own configuration lines exactly as
     # reading one backup's content does, and until this release the two were
