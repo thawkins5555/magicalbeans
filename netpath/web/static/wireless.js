@@ -42,15 +42,20 @@
     return App.statusMark(STATUS_TONE[status] || 'none', label, title);
   }
 
+  // drawStatus runs on every fastTick — ten times a second whether or not
+  // anything changed — and a write to textContent/style still queues a
+  // real DOM mutation even when the new value equals the old one.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   /* ------------------------------------------------------------ status */
 
   function drawStatus() {
     const server = App.state.serverState || {};
     const wireless = server.wireless || { counters: {} };
-    const text = wireless.status || 'Poller stopped';
-    App.el('wl-status').textContent = text;
-    App.el('wl-dot').style.background = wireless.running ? 'var(--ok)' : 'var(--line)';
-    App.el('wl-toggle').textContent = wireless.running ? 'Stop poller' : 'Start poller';
+    setText(App.el('wl-status'), wireless.status || 'Poller stopped');
+    setBg(App.el('wl-dot'), wireless.running ? 'var(--ok)' : 'var(--line)');
+    setText(App.el('wl-toggle'), wireless.running ? 'Stop poller' : 'Start poller');
     const counts = wireless.ap_counts || {};
     const c = wireless.counters || {};
     const parts = [`${wireless.controller_count || 0} controller(s)`,
@@ -58,9 +63,9 @@
       `${counts.offline || 0} offline`];
     if (counts.out_of_service) parts.push(`${counts.out_of_service} out of service`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
-    App.el('wl-counters').textContent = parts.join(' · ');
-    App.el('wl-last-reported').textContent = view.lastReportedTs
-      ? `last reported ${ago(view.lastReportedTs)}` : 'never reported';
+    setText(App.el('wl-counters'), parts.join(' · '));
+    setText(App.el('wl-last-reported'), view.lastReportedTs
+      ? `last reported ${ago(view.lastReportedTs)}` : 'never reported');
   }
 
   /* ------------------------------------------------------------- table */

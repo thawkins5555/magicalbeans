@@ -745,7 +745,11 @@
     const bounds = group.getBBox ? group.getBBox() : null;
     if (!bounds || !bounds.width) return;
     if (!view.userZoom) {
-      view.zoom = Math.min(width / (bounds.width + 60), height / (bounds.height + 60), 1);
+      // No ceiling at 100%: a two-hop route used to sit at ~4% of a
+      // 1500x540 pane because "fit" only ever meant "shrink to fit". 2.5x
+      // is generous enough to fill the pane on a short route without a
+      // single hop turning into a wall.
+      view.zoom = Math.min(width / (bounds.width + 60), height / (bounds.height + 60), 2.5);
       view.pan = { x: 0, y: 0 };
     }
     // Kept so the wheel handler can work out which scene point is under the
@@ -856,6 +860,18 @@
 
   /* ---------------------------------------------------------- timeline */
 
+  /* Sub-millisecond round trips (loopback, or a target on the same LAN)
+     rounded to whole milliseconds all read as "0 ms" — the lane's one
+     quantitative label asserting the data is zero over thirty bars of
+     visibly different heights. The product already has the precision
+     (probe_rtt_avg etc. are floats); this is the only place that threw it
+     away. */
+  function rttText(ms) {
+    if (ms < 1) return `${Math.round(ms * 1000)} µs`;
+    if (ms < 10) return `${ms.toFixed(1)} ms`;
+    return `${Math.round(ms)} ms`;
+  }
+
   function lanes(width, height) {
     const usable = width - 2 * PAD_X;
     let spare = height - AXIS_H - TICKS_H - 3 * LABEL_H - 2 * LANE_GAP - STATUS_H;
@@ -874,12 +890,46 @@
     return out;
   }
 
+  /* Where "now" falls along the window, in viewBox units — the one thing
+     about the timeline that is true every beat rather than only when the
+     data or the window changes. */
+  function playheadX(width, t0, t1) {
+    const span = Math.max(t1 - t0, 1e-6);
+    const frac = Math.min(Math.max((Date.now() / 1000 - t0) / span, 0), 1);
+    return PAD_X + frac * (width - 2 * PAD_X);
+  }
+
   function drawTimeline() {
     const svg = App.el('timeline-svg');
-    svg.innerHTML = '';
     const timelineEl = App.el('timeline');
     const box = timelineEl.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 150);
+    const data = view.timeline;
+    const t0 = view.t0, t1 = view.t1;
+
+    // fastTick calls this ten times a second while the tab sits idle. The
+    // geometry, the window and the data essentially never change between
+    // two of those calls — this used to rebuild the whole SVG regardless,
+    // 1,010 DOM mutations per ten idle seconds against Dashboard's 6. The
+    // live playhead is the one thing that genuinely moves every beat, so
+    // when the key below still matches what was last drawn, only that
+    // line's position is touched and nothing else is rebuilt.
+    const sig = `${width}x${height}:${t0}:${t1}:${data ? data.buckets.length : 'x'}` +
+      `:${view.pinned || ''}:${view.drag ? `${view.drag.from}-${view.drag.to}` : ''}`;
+    if (svg.dataset.timelineSig === sig) {
+      if (view.playhead) {
+        const x = playheadX(width, t0, t1);
+        if (svg.dataset.playheadX !== String(x)) {
+          view.playhead.setAttribute('x1', x);
+          view.playhead.setAttribute('x2', x);
+          svg.dataset.playheadX = String(x);
+        }
+      }
+      return;
+    }
+    svg.dataset.timelineSig = sig;
+    view.playhead = null;
+    svg.innerHTML = '';
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     timelineEl.tabIndex = 0;
     timelineEl.setAttribute('role', 'img');
@@ -889,8 +939,6 @@
     timelineEl.setAttribute('aria-label', `Timeline. ${summary || 'No data'}. ` +
       'Focus and use left/right to read each block.');
 
-    const data = view.timeline;
-    const t0 = view.t0, t1 = view.t1;
     const xFor = (ts) => PAD_X + (ts - t0) / Math.max(t1 - t0, 1e-6) * (width - 2 * PAD_X);
     const timeAt = (x) => t0 + (x - PAD_X) / Math.max(width - 2 * PAD_X, 1) * (t1 - t0);
     const L = lanes(width, height);
@@ -912,7 +960,7 @@
         stroke: 'var(--grid)',
       }));
     };
-    label(L.rtt, 'ROUND-TRIP TIME', peak ? `peak ${Math.round(peak)} ms` : '');
+    label(L.rtt, 'ROUND-TRIP TIME', peak ? `peak ${rttText(peak)}` : '');
     label(L.loss, 'PACKET LOSS', '100%');
     label(L.status, 'STATUS', '');
 
@@ -1006,6 +1054,18 @@
           stroke: 'var(--text)', 'stroke-width': 1.5,
         }));
       }
+    } else {
+      // "Now" inside the window — the one line fastTick repositions on its
+      // own, between the real redraws above (see the signature check).
+      view.playhead = App.svgNode('line', {
+        y1: L.rtt.y - 6, y2: L.status.y + L.status.h,
+        stroke: 'var(--accent)', 'stroke-dasharray': '1 2',
+      });
+      svg.appendChild(view.playhead);
+      const x = playheadX(width, t0, t1);
+      view.playhead.setAttribute('x1', x);
+      view.playhead.setAttribute('x2', x);
+      svg.dataset.playheadX = String(x);
     }
     if (view.drag) {
       const a = xFor(Math.min(view.drag.from, view.drag.to));
@@ -1340,5 +1400,5 @@
     resetWindow();
   }
 
-  App.pages.netpath = { init, refresh, activate };
+  App.pages.netpath = { init, refresh, activate, fastTick: drawTimeline };
 })();

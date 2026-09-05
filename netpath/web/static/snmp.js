@@ -21,6 +21,12 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
+  // drawStatus runs on every fastTick — ten times a second whether or not
+  // anything changed — and a write to textContent/className/style still
+  // queues a real DOM mutation even when the new value equals the old one.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   /* Long status lines need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
     const out = [];
@@ -59,10 +65,26 @@
 
   /* ---------------------------------------------------------- histogram */
 
+  /* See syslog.js's plottedRange: same fix, same reasoning — a handful of
+     traps inside a day-long window plotted as a sliver at the far right of
+     an empty chart. Narrows only what gets drawn, never the request. */
+  function plottedRange(buckets, bucketWidth, t0, t1) {
+    const span = t1 - t0;
+    const first = buckets.findIndex((b) => b.total);
+    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
+    let last = buckets.length - 1;
+    while (last > first && !buckets[last].total) last -= 1;
+    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
+    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
+    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
+             span: pt1 - pt0, narrowed: true };
+  }
+
   function drawHistogram() {
+    const plot = view.histPlot || { buckets: (view.hist || {}).buckets || [], span: view.t1 - view.t0 };
     App.stackedHistogram(App.el('sn-hist-svg'), App.el('sn-hist'), {
-      buckets: (view.hist || {}).buckets || [],
-      unit: 'traps', span: view.t1 - view.t0,
+      buckets: plot.buckets,
+      unit: 'traps', span: plot.span,
       empty: 'No traps in this window',
       onBucket: (bucket) => pinWindow(bucket.t0, bucket.t1),
     });
@@ -367,9 +389,9 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sn-status');
-    status.textContent = text;
-    status.title = text;
-    status.classList.toggle('error', failed);
+    setText(status, text);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
@@ -383,10 +405,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    App.el('sn-dot').style.background = snmp.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('sn-toggle').textContent = snmp.running
-      ? 'Stop receiver' : 'Start receiver';
+    setBg(App.el('sn-dot'), snmp.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    setText(App.el('sn-toggle'), snmp.running ? 'Stop receiver' : 'Start receiver');
 
     const c = snmp.counters || {};
     const d = snmp.decoder || {};
@@ -400,7 +421,7 @@
     if (d.v3_encrypted) parts.push(`${d.v3_encrypted} authPriv (not decoded)`);
     if (d.v3_auth_failed) parts.push(`${d.v3_auth_failed} failed authentication`);
     parts.push(...extraCounterParts(c));
-    App.el('sn-counters').textContent = parts.join(' · ');
+    setText(App.el('sn-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -420,8 +441,11 @@
     view.hist = overview;
     view.traps = search.traps;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
+    view.histPlot = plottedRange(overview.buckets, bucket, t0, t1);
+    const p = view.histPlot;
     App.el('sn-hist-summary').textContent =
-      `${total.toLocaleString()} traps · ${App.stamp(t0, span)} – ${App.stamp(t1, span)}` +
+      `${total.toLocaleString()} traps · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
+      (p.narrowed ? ` (of a ${App.duration(span)} window)` : '') +
       ` · ${overview.stats.rows.toLocaleString()} stored in total`;
     // "300 of 4,120 shown": the total is the histogram's own sum over the
     // same window and filters, already in hand on this tick.

@@ -59,6 +59,13 @@
 
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
+
+  // drawStatus runs on every fastTick — ten times a second whether or not
+  // anything changed — and a write to textContent/className/style still
+  // queues a real DOM mutation even when the new value equals the old one.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   // How many flow records the table asks the server for. The select's three
   // labels and its title are written from this in init(), so the number
   // lives in one place instead of four copies of "250" in the markup.
@@ -736,9 +743,9 @@
     const text = collector.status || 'Collector stopped';
     const failed = /^Could not bind/.test(text);
     const status = App.el('nf-status');
-    status.textContent = text;
-    status.title = text;
-    status.classList.toggle('error', failed);
+    setText(status, text);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
@@ -752,10 +759,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    App.el('nf-dot').style.background = collector.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('nf-toggle').textContent = collector.running
-      ? 'Stop collector' : 'Start collector';
+    setBg(App.el('nf-dot'), collector.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    setText(App.el('nf-toggle'), collector.running ? 'Stop collector' : 'Start collector');
 
     const counters = collector.counters || {};
     const decoder = collector.decoder || {};
@@ -776,7 +782,7 @@
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);
     }
-    App.el('nf-counters').textContent = parts.join(' · ');
+    setText(App.el('nf-counters'), parts.join(' · '));
   }
 
   async function refresh() {

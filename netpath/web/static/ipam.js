@@ -27,12 +27,28 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
+  // drawStatus runs on every fastTick — ten times a second, whether or not
+  // anything actually changed — and a write to textContent/hidden/style
+  // still queues a real DOM mutation even when the new value equals the
+  // old one. These three guard the assignment instead of always making it.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   /* A small utilization donut, drawn with the standard stroke-dasharray
      trick — one circle per slice, each dashed to show only its own arc —
      rather than computing SVG arc paths by hand for three fixed slices.
      Takes slices directly so subnets and DHCP scopes, which break their
-     addresses down into genuinely different categories, can both use it. */
-  function donut(slices, size) {
+     addresses down into genuinely different categories, can both use it.
+
+     A panel-coloured circle is drawn under the slices first, and each
+     slice is shortened by a small gap, so two adjacent slices read as
+     separated rather than one ring of touching colour — otherwise a full
+     ring and an empty one differ only by hue. `centerPct`, when given,
+     is the headroom figure the two larger call sites print in the middle
+     ("free" — the address space nothing has claimed yet); the small
+     list-row donuts pass nothing and stay a bare ring. */
+  function donut(slices, size, centerPct) {
     const total = slices.reduce((sum, s) => sum + (s.value || 0), 0);
     const radius = size / 2 - 3;
     const circumference = 2 * Math.PI * radius;
@@ -45,10 +61,15 @@
       }));
       return svg;
     }
+    const visible = slices.filter((s) => s.value);
+    svg.appendChild(App.svgNode('circle', {
+      cx: size / 2, cy: size / 2, r: radius, fill: 'none',
+      stroke: 'var(--panel)', 'stroke-width': 5,
+    }));
+    const gap = visible.length > 1 ? 3 : 0;
     let offset = 0;
-    for (const slice of slices) {
-      if (!slice.value) continue;
-      const length = (slice.value / total) * circumference;
+    for (const slice of visible) {
+      const length = Math.max((slice.value / total) * circumference - gap, 0);
       svg.appendChild(App.svgNode('circle', {
         cx: size / 2, cy: size / 2, r: radius, fill: 'none',
         stroke: slice.color, 'stroke-width': 5,
@@ -56,27 +77,38 @@
         'stroke-dashoffset': -offset,
         transform: `rotate(-90 ${size / 2} ${size / 2})`,
       }));
-      offset += length;
+      offset += length + gap;
+    }
+    if (centerPct !== undefined) {
+      svg.appendChild(App.svgNode('text', {
+        x: size / 2, y: size / 2 - 1, 'text-anchor': 'middle',
+        fill: 'var(--text)', 'font-family': 'var(--mono)', 'font-weight': 600,
+        'font-size': 'var(--fs-2xl)',
+      }, `${centerPct}%`));
+      svg.appendChild(App.svgNode('text', {
+        x: size / 2, y: size / 2 + 16, 'text-anchor': 'middle',
+        fill: 'var(--dim)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-2xs)',
+      }, 'free'));
     }
     return svg;
   }
 
-  function usageDonut(usage, size) {
+  function usageDonut(usage, size, big) {
     const u = usage || {};
     return donut([
       { value: u.alive || 0, color: 'var(--ok)' },
       { value: u.seen_down || 0, color: 'var(--warn)' },
       { value: u.never_seen || 0, color: 'var(--data-neutral)' },
-    ], size);
+    ], size, big && u.total ? Math.round((u.never_seen || 0) / u.total * 100) : undefined);
   }
 
-  function scopeDonut(usage, size) {
+  function scopeDonut(usage, size, big) {
     const u = usage || {};
     return donut([
       { value: u.leased || 0, color: 'var(--ok)' },
       { value: u.reserved || 0, color: 'var(--accent)' },
       { value: u.available || 0, color: 'var(--data-neutral)' },
-    ], size);
+    ], size, big && u.total ? Math.round((u.available || 0) / u.total * 100) : undefined);
   }
 
   function usageTooltipText(subnet) {
@@ -103,7 +135,7 @@
       return;
     }
 
-    container.appendChild(usageDonut(subnet.usage, 120));
+    container.appendChild(usageDonut(subnet.usage, 120, true));
 
     const u = subnet.usage || {};
     const total = u.total || 0;
@@ -147,21 +179,19 @@
 
   function drawStatus() {
     const ipam = (App.state.serverState || {}).ipam || {};
-    const dot = App.el('ipam-dot');
-    dot.style.background = ipam.running ? 'var(--ok)' : 'var(--line)';
-    App.el('ipam-status').textContent = ipam.running
-      ? 'Worker running' : 'Worker stopped';
+    setBg(App.el('ipam-dot'), ipam.running ? 'var(--ok)' : 'var(--line)');
+    setText(App.el('ipam-status'), ipam.running ? 'Worker running' : 'Worker stopped');
     const toggle = App.el('ipam-toggle');
-    if (toggle) toggle.textContent = ipam.running ? 'Stop worker' : 'Start worker';
+    if (toggle) setText(toggle, ipam.running ? 'Stop worker' : 'Start worker');
     const parts = [];
     if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
     if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
-    App.el('ipam-counters').textContent = parts.join(' · ');
+    setText(App.el('ipam-counters'), parts.join(' · '));
 
     const badge = App.el('ipam-conflict-badge');
     const count = ipam.open_conflicts || 0;
-    badge.textContent = count;
-    badge.hidden = count === 0;
+    setText(badge, String(count));
+    setHidden(badge, count === 0);
   }
 
   /* -------------------------------------------------------------- subnets */
@@ -311,8 +341,11 @@
       cell: (r) => escape(r.mac || '\u2014') },
     { key: 'alive', label: 'Alive', width: 70, on: true,
       value: (r) => (r.alive ? 1 : 0),
-      cell: (r) => (r.alive ? '<span class="sev sev-3">up</span>'
-                            : '<span class="sev sev-7">down</span>') },
+      // `none`, not `fail`, for an address that has never answered at all
+      // (alive=0, last_up=NULL) — that's what the sidebar legend already
+      // calls "never seen", not a live outage.
+      cell: (r) => App.statusMark(r.alive ? 'ok' : (r.last_up ? 'fail' : 'none'),
+                                  r.alive ? 'up' : (r.last_up ? 'down' : 'never')) },
     { key: 'hostname', label: 'Hostname', width: 220, on: true,
       value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
     { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
@@ -733,7 +766,7 @@
 
     const top = document.createElement('div');
     top.className = 'subnet-detail-row';
-    top.appendChild(scopeDonut(scope.usage, 120));
+    top.appendChild(scopeDonut(scope.usage, 120, true));
 
     const u = scope.usage || {};
     const total = u.total || 0;
@@ -920,7 +953,7 @@
     { key: 'state', label: 'State', width: 140, on: true,
       value: (r) => r.address_state || '',
       cell: (r) => (r.is_reservation
-        ? `<span class="sev sev-5">${escape(r.address_state || 'reservation')}</span>`
+        ? `<span class="mono">${escape(r.address_state || 'reservation')}</span>`
         : escape(r.address_state || '')) },
     { key: 'expires', label: 'Lease expires', width: 150, numeric: true, on: true,
       align: 'left', value: (r) => r.lease_expires || 0,
@@ -1131,7 +1164,7 @@
       `<td style="white-space:nowrap">${escape(r.ip)}</td>` +
       `<td style="white-space:nowrap">${escape(r.mac || '—')}</td>` +
       `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'
-        : r.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
+        : App.statusMark(r.alive ? 'ok' : 'fail', r.alive ? 'up' : 'down')}</td>` +
       `<td>${escape(r.subnet || '—')}</td>` +
       `<td class="hint">${escape(r.sources.join(', '))}</td>` +
       `</tr>`).join('');

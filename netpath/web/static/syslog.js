@@ -21,6 +21,12 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
+  // drawStatus runs on every fastTick — ten times a second whether or not
+  // anything changed — and a write to textContent/className/style still
+  // queues a real DOM mutation even when the new value equals the old one.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   /* Long messages need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
     const out = [];
@@ -59,13 +65,33 @@
 
   /* ---------------------------------------------------------- histogram */
 
+  /* Five messages inside a 24 h window used to draw as one sliver of bars
+     at the far right of an otherwise-empty chart. When whatever buckets
+     have anything in them span less than a fifth of the requested window,
+     plot just that populated stretch instead — the request itself (t0/t1,
+     the filters) is untouched, only what gets drawn narrows. Buckets are
+     drawn one per equal-width slot regardless of their timestamps, so a
+     contiguous slice of the array is all stackedHistogram needs. */
+  function plottedRange(buckets, bucketWidth, t0, t1) {
+    const span = t1 - t0;
+    const first = buckets.findIndex((b) => b.total);
+    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
+    let last = buckets.length - 1;
+    while (last > first && !buckets[last].total) last -= 1;
+    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
+    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
+    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
+             span: pt1 - pt0, narrowed: true };
+  }
+
   function drawHistogram() {
     // The stacked histogram is App.stackedHistogram: this page, SNMP and
     // Alerts each drew their own, two of them character-for-character the
     // same. The click narrows the search to the hour and leaves Live.
+    const plot = view.histPlot || { buckets: (view.hist || {}).buckets || [], span: view.t1 - view.t0 };
     App.stackedHistogram(App.el('sl-hist-svg'), App.el('sl-hist'), {
-      buckets: (view.hist || {}).buckets || [],
-      unit: 'messages', span: view.t1 - view.t0,
+      buckets: plot.buckets,
+      unit: 'messages', span: plot.span,
       empty: 'No messages in this window',
       onBucket: (bucket) => pinWindow(bucket.t0, bucket.t1),
     });
@@ -307,11 +333,11 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sl-status');
-    status.textContent = text;
+    setText(status, text);
     // The line is ellipsized so it can never push the buttons out of the card,
     // so the full text has to be reachable some other way.
-    status.title = text;
-    status.classList.toggle('error', failed);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
@@ -325,10 +351,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    App.el('sl-dot').style.background = syslog.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('sl-toggle').textContent = syslog.running
-      ? 'Stop collector' : 'Start collector';
+    setBg(App.el('sl-dot'), syslog.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    setText(App.el('sl-toggle'), syslog.running ? 'Stop collector' : 'Start collector');
     const c = syslog.counters || {};
     const parts = [`${c.messages || 0} received`, `${c.stored || 0} stored`];
     if (c.filtered) parts.push(`${c.filtered} filtered by severity`);
@@ -345,7 +370,7 @@
     } else {
       parts.push('indexed search, matches anywhere in a word');
     }
-    App.el('sl-counters').textContent = parts.join(' · ');
+    setText(App.el('sl-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -365,8 +390,11 @@
     view.hist = overview;
     view.messages = search.messages;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
+    view.histPlot = plottedRange(overview.buckets, bucket, t0, t1);
+    const p = view.histPlot;
     App.el('sl-hist-summary').textContent =
-      `${total.toLocaleString()} messages · ${App.stamp(t0, span)} – ${App.stamp(t1, span)}` +
+      `${total.toLocaleString()} messages · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
+      (p.narrowed ? ` (of a ${App.duration(span)} window)` : '') +
       ` · ${overview.stats.rows.toLocaleString()} stored in total`;
     // "300 of 4,120 shown": the total is the histogram's own sum over the
     // same window and filters, already in hand on this tick.

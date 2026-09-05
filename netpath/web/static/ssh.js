@@ -145,27 +145,46 @@
     return value || fallback;
   }
 
-  /* The palette is the application's, read from the CSS variables rather
+  /* The 16-colour ANSI palette, read from the application's tokens rather
      than copied, so the terminal keeps matching the rest of the product if
-     those ever move. */
+     a theme's colours ever move. The six hues keep one tone for both their
+     base and bright slot — an accent already chosen for contrast against
+     that theme's own background needs to exist, not be lightened or
+     darkened again, the same principle Solarized's light and dark variants
+     use the identical hues for. --nodata/--text/--line/--muted/--dim are
+     different roles, not opposite ends of one ladder, and on the dark
+     themes they happen to double as black/white/brightBlack; the light
+     theme needs the ladder read the other way, or "white" text vanishes
+     into white paper — black/white/brightBlack/brightWhite are the one
+     group that has to be picked by the resolved theme rather than by
+     token role, which is what left brightWhite a hardcoded #FFFFFF (1:1
+     on light) and six bright hues undefined (xterm's own dark-terminal
+     defaults, #FFFF00 among them, 1.07:1 on light) in the first place. */
+  function ansiColors() {
+    const light = document.documentElement.getAttribute('data-theme') === 'light';
+    const red = cssVar('--fail', '#F8544C'), green = cssVar('--ok', '#3FB950'),
+          yellow = cssVar('--warn', '#E3B341'), blue = cssVar('--accent', '#7AA2F7'),
+          magenta = cssVar('--error', '#A371F7'), cyan = cssVar('--overrun', '#4DB6AC');
+    return {
+      black: light ? cssVar('--text', '#161C24') : cssVar('--nodata', '#1E242D'),
+      brightBlack: light ? cssVar('--muted', '#4E5967') : cssVar('--line', '#646E7C'),
+      white: light ? cssVar('--dim', '#5E6975') : cssVar('--text', '#DCE3EA'),
+      brightWhite: light ? cssVar('--line', '#76818F') : cssVar('--text', '#DCE3EA'),
+      red, green, yellow, blue, magenta, cyan,
+      brightRed: red, brightGreen: green, brightYellow: yellow,
+      brightBlue: cssVar('--accent-hover', '#97B6FF'),
+      brightMagenta: magenta, brightCyan: cyan,
+    };
+  }
+
   function theme() {
-    const fg = cssVar('--text', '#DCE3EA');
     return {
       background: cssVar('--bg', '#0E1116'),
-      foreground: fg,
+      foreground: cssVar('--text', '#DCE3EA'),
       cursor: cssVar('--accent', '#7AA2F7'),
       cursorAccent: cssVar('--bg', '#0E1116'),
       selectionBackground: cssVar('--checked-strong', '#2E4470'),
-      black: cssVar('--nodata', '#1E242D'),
-      red: cssVar('--fail', '#F8544C'),
-      green: cssVar('--ok', '#3FB950'),
-      yellow: cssVar('--warn', '#E3B341'),
-      blue: cssVar('--accent', '#7AA2F7'),
-      magenta: cssVar('--error', '#A371F7'),
-      cyan: cssVar('--overrun', '#4DB6AC'),
-      white: fg,
-      brightBlack: cssVar('--line', '#646E7C'),
-      brightWhite: '#FFFFFF',
+      ...ansiColors(),
     };
   }
 

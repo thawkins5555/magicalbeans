@@ -72,6 +72,13 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
+  // drawStatus runs on every fastTick — ten times a second whether or not
+  // anything changed — and a write to textContent/innerHTML/style still
+  // queues a real DOM mutation even when the new value equals the old one.
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--line)' };
   /* This module's vocabulary mapped onto the five tones App.statusMark
@@ -103,9 +110,9 @@
     const server = App.state.serverState || {};
     const nodes = server.nodes || { counters: {} };
     const text = nodes.status || 'Poller stopped';
-    App.el('nd-status').textContent = text;
-    App.el('nd-dot').style.background = nodes.running ? 'var(--ok)' : 'var(--line)';
-    App.el('nd-toggle').textContent = nodes.running ? 'Stop poller' : 'Start poller';
+    setText(App.el('nd-status'), text);
+    setBg(App.el('nd-dot'), nodes.running ? 'var(--ok)' : 'var(--line)');
+    setText(App.el('nd-toggle'), nodes.running ? 'Stop poller' : 'Start poller');
     const counts = nodes.device_counts || {};
     const c = nodes.counters || {};
     const parts = [`${counts.total || 0} device(s)`, `${counts.up || 0} up`,
@@ -115,14 +122,14 @@
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
     // On a wall the counts are the point: figures, not a line of prose.
     if (App.state.kiosk) {
-      App.el('nd-counters').innerHTML = App.figures([
+      setHtml(App.el('nd-counters'), App.figures([
         { value: counts.total || 0, label: 'devices' },
         { value: counts.up || 0, label: 'up', className: 'ok' },
         { value: counts.down || 0, label: 'down', className: counts.down ? 'fail' : '' },
-      ]);
+      ]));
       return;
     }
-    App.el('nd-counters').textContent = parts.join(' · ');
+    setText(App.el('nd-counters'), parts.join(' · '));
   }
 
   /* ----------------------------------------------------------- devices */
@@ -958,27 +965,42 @@
     svg.innerHTML = '';
     App.statusPatternDefs(svg);
     const data = view.timeline;
+    // Room under the bar for start/end tick labels, the same way the
+    // histograms reserve space for theirs — a bare colour strip with no
+    // time axis left "how long ago did this start" to a hover. The CSS
+    // class only reserves 28px; this is the one draw that needs more.
+    el.style.height = '40px';
     const width = el.clientWidth || 400;
-    const height = el.clientHeight || 24;
+    const height = el.clientHeight || 40;
+    const barH = Math.max(height - 12, 14);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     if (!data || !data.segments || !data.segments.length) {
       svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2 + 4, 'text-anchor': 'middle',
+        x: width / 2, y: barH / 2 + 4, 'text-anchor': 'middle',
         fill: 'var(--muted)', 'font-size': 'var(--fs-xs)' }, 'No history in this window'));
       return;
     }
     const { t0, t1, segments } = data;
     const span = Math.max(t1 - t0, 1);
     const x = (ts) => ((ts - t0) / span) * width;
-    for (const seg of segments) {
+    segments.forEach((seg, index) => {
       const x0 = x(seg.ts_start);
       const w = Math.max(x(seg.ts_end) - x0, 1);
+      // device_status_segments (nodesdb.py) only ever reports "unknown" for
+      // the very first segment, and only when it found no event before the
+      // window at all — so this is never a genuinely ambiguous state, it is
+      // the device not having been watched yet. Flat fill, no texture, and
+      // its own label rather than "Unknown  hh:mm – hh:mm", so the absence
+      // reads as absence instead of one more state to decode.
+      const isPreHistory = index === 0 && seg.status === 'unknown' && seg.ts_start <= t0;
       // Two endpoints and how long between them: this label is the only
       // channel a keyboard or screen-reader user has to the timeline, and
       // "Down 14:02 – 14:47" left them doing the subtraction.
-      const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
-        ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
+      const label = isPreHistory
+        ? `No data before ${App.stamp(seg.ts_end, span)}`
+        : `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
+          ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
       // The segment is a <g> rather than a bare rect so the colour, the
       // texture over it and the keyboard focus are one thing the operator
       // can Tab to and read, instead of a colour with a mouse-only tooltip.
@@ -988,15 +1010,16 @@
       });
       group.appendChild(App.svgNode('title', {}, label));
       group.appendChild(App.svgNode('rect', {
-        x: x0, y: 0, width: w, height,
-        fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+        x: x0, y: 0, width: w, height: barH,
+        fill: isPreHistory ? 'var(--nodata)' : (STATUS_COLOR[seg.status] || 'var(--nodata)'),
       }));
       // Colour is never the only signal: every non-`up` state carries its
-      // own texture (see App.statusPatternDefs).
-      const pattern = App.statusPatternUrl(seg.status, svg);
+      // own texture (see App.statusPatternDefs) — except pre-history, which
+      // is deliberately plain, the same way `none`/`up`/`ok` are.
+      const pattern = isPreHistory ? null : App.statusPatternUrl(seg.status, svg);
       if (pattern) {
         group.appendChild(App.svgNode('rect', {
-          x: x0, y: 0, width: w, height, fill: pattern,
+          x: x0, y: 0, width: w, height: barH, fill: pattern,
         }));
       }
       group.addEventListener('mousemove', (event) => App.tooltip(label, event));
@@ -1007,7 +1030,15 @@
       });
       group.addEventListener('blur', App.hideTooltip);
       svg.appendChild(group);
-    }
+    });
+    svg.appendChild(App.svgNode('text', {
+      x: 0, y: height - 2, 'text-anchor': 'start', fill: 'var(--dim)',
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+    }, App.stamp(t0, span)));
+    svg.appendChild(App.svgNode('text', {
+      x: width, y: height - 2, 'text-anchor': 'end', fill: 'var(--dim)',
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+    }, App.stamp(t1, span)));
   }
 
   const IFACE_COLUMNS = [
@@ -3695,11 +3726,37 @@
     return g;
   }
 
+  function topologyEmptyState(svg, wrap, message) {
+    // A lattice of every device as its own disconnected box (the isolated
+    // grid in topoLayout) is not a topology — it is 62 identical boxes with
+    // nothing to say about how they relate. When there is nothing to draw
+    // this shows the same plain .empty block every other page uses instead,
+    // rather than filling the canvas with a picture of the absence.
+    // style.display, not the `hidden` property: a bare <svg> root does not
+    // reflect `.hidden` onto the content attribute in every engine, so
+    // [hidden]'s display:none never applied and the box stayed laid out at
+    // its full height with the message pushed below the fold.
+    svg.style.display = 'none';
+    let empty = wrap.querySelector(':scope > .empty');
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.className = 'empty';
+      wrap.appendChild(empty);
+    }
+    empty.textContent = message;
+    wrap.removeAttribute('tabindex');
+    wrap.removeAttribute('role');
+    wrap.removeAttribute('aria-label');
+  }
+
   function drawTopology() {
     const svg = App.el('nd-topo-svg');
     const wrap = App.el('nd-topo-canvas');
     if (!svg || !wrap) return;
     svg.innerHTML = '';
+    svg.style.display = '';
+    const empty = wrap.querySelector(':scope > .empty');
+    if (empty) empty.remove();
     const box = wrap.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
@@ -3707,16 +3764,18 @@
     const countText = topo
       ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : 'no devices';
     App.el('nd-topo-count').textContent = topo ? countText : '';
+    if (!topo || !topo.nodes.length) {
+      topologyEmptyState(svg, wrap, 'No devices yet.');
+      return;
+    }
+    if (!topo.edges.length) {
+      topologyEmptyState(svg, wrap, `${topo.nodes.length} device(s), no links between them yet. ` +
+        'LLDP or CDP has to be enabled and answering on them before a connection can be drawn here.');
+      return;
+    }
     wrap.tabIndex = 0;
     wrap.setAttribute('role', 'img');
     wrap.setAttribute('aria-label', `Neighbour topology: ${countText}. Tab into it for each device and link.`);
-    if (!topo || !topo.nodes.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
-      }, 'No devices yet.'));
-      return;
-    }
 
     const positions = topoLayout(topo.nodes, topo.edges);
     const group = App.svgNode('g');
