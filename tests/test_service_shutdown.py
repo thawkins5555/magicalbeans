@@ -11,8 +11,10 @@ call into a database `shutdown()` had just closed underneath it, raising
 This suite never starts the timer thread (`service.start()` is not needed to
 exercise `run_maintenance`/`shutdown()` directly) and drives both from plain
 threads instead."""
+import io
 import os
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -150,6 +152,121 @@ check("...and did not overlap (the second waited for the lock)",
 
 service2.shutdown()
 shutil.rmtree(os.path.join(TMPDIR, "t2"), ignore_errors=True)
+
+
+# --------------------------------------- 3. the trace scheduler, same bug class
+# 4.48.1: the same "closed database under work still in flight" bug as
+# sections 1/2 above, in Monitor (netpath/monitor.py)'s trace scheduler
+# rather than the maintenance sweep — found from a stray traceback at the
+# end of tests/test_web_gates.py, not from a report against a running
+# instance.
+#
+# The failure mode is different from sections 1/2, though, and that
+# difference is why this needs its own check rather than reusing theirs
+# unchanged: _run_one runs on Monitor's own ThreadPoolExecutor with nothing
+# waiting on the future, so the exception never reaches a caller's
+# sys.exc_info() the way run_maintenance's did. Before the fix, the only
+# sign was _run_one's own "must never die quietly" handler printing a raw
+# traceback to stderr — indistinguishable, in a log an operator checks
+# right after a service stop, from an actual crash. Caught on stderr here
+# for that reason.
+import netpath.monitor as monitor_mod
+from netpath.tracer import TraceResult
+
+service3 = new_service("t3")
+target_id = service3.db.add_target("10.0.0.9", max_hops=2, probes=1, timeout_s=1.0)
+real_record_trace = service3.db.record_trace
+real_run_trace = monitor_mod.run_trace
+
+
+def closed_db_record_trace(*a, **k):
+    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+
+
+def instant_run_trace(host, **kwargs):
+    return TraceResult(host=host, dest_ip=host, hops=[], reached=True,
+                       started_ts=time.time(), duration_s=0.0)
+
+
+service3.db.record_trace = closed_db_record_trace
+# 3a/3b call _run_one directly rather than through a real trace, so they do
+# not depend on this host actually having a working tracert/traceroute —
+# see REVIEW-OPERATOR-4.49.md's W-1/W-2 on how little that can be assumed.
+monitor_mod.run_trace = instant_run_trace
+
+# 3a. Forced directly rather than by racing a real shutdown against a real
+# trace, so this is deterministic instead of timing-dependent: _stop set
+# first, exactly as Monitor.shutdown() would already have done before a
+# trace still in flight could reach record_trace.
+old_stderr = sys.stderr
+sys.stderr = captured = io.StringIO()
+service3.monitor._stop.set()
+try:
+    service3.monitor._run_one(target_id)
+finally:
+    sys.stderr = old_stderr
+    service3.monitor._stop.clear()
+
+check("a trace that hits a closed database DURING a stop prints no traceback",
+     "Traceback" not in captured.getvalue(), captured.getvalue())
+last_message = service3.log.all()[-1].message if service3.log.all() else ""
+check("...and says so plainly in the event log instead of staying silent",
+     "scheduler stopped" in last_message, last_message)
+
+# 3b. The same exception NOT during a stop is still a real bug (some other
+# thread closed the database out from under a scheduler that was not told
+# to stop, which is its own problem worth knowing about) and must still get
+# the loud treatment -- the guard is scoped to "we asked for this", not to
+# every closed-database error, or a real one would go silent too.
+sys.stderr = captured2 = io.StringIO()
+try:
+    service3.monitor._run_one(target_id)   # _stop is clear again here
+finally:
+    sys.stderr = old_stderr
+
+check("the same error NOT during a stop still prints -- the guard did not "
+     "swallow more than the one case it exists for",
+     "Traceback" in captured2.getvalue())
+
+service3.db.record_trace = real_record_trace
+
+# 3c. End to end, through the real scheduler thread and a real (slowed)
+# trace: shutdown()'s drain window is sized to the in-flight target's own
+# settings (expected_budget), not a flat guess, so a trace that is merely
+# slow -- not hung -- gets to finish and be recorded rather than losing its
+# result to a drain window that gave up too early.
+trace_started = threading.Event()
+
+
+def slow_run_trace(host, **kwargs):
+    trace_started.set()
+    time.sleep(1.5)
+    return TraceResult(host=host, dest_ip=host, hops=[], reached=True,
+                       started_ts=time.time(), duration_s=1.5)
+
+
+monitor_mod.run_trace = slow_run_trace
+service3.monitor.start()
+try:
+    service3.monitor.trace_now(target_id)
+    check("the (slowed) trace actually started before shutdown was asked for",
+         trace_started.wait(timeout=5.0))
+    sys.stderr = captured3 = io.StringIO()
+    t0 = time.time()
+    service3.shutdown()
+    elapsed = time.time() - t0
+    sys.stderr = old_stderr
+finally:
+    monitor_mod.run_trace = real_run_trace
+
+check("shutdown() waited for the slow-but-not-hung trace rather than "
+     "cutting it off at a flat few seconds", elapsed >= 1.5, elapsed)
+check("shutdown() still returned in a bounded time, not an unlimited wait",
+     elapsed < 20.0, elapsed)
+check("...and printed no traceback while doing it",
+     "Traceback" not in captured3.getvalue(), captured3.getvalue())
+
+shutil.rmtree(os.path.join(TMPDIR, "t3"), ignore_errors=True)
 
 shutil.rmtree(TMPDIR, ignore_errors=True)
 

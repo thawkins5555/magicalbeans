@@ -68,10 +68,15 @@ UCD_SNMP = {           # UCD-SNMP-MIB — net-snmp / most Linux agents
     "mem_total_kb": "1.3.6.1.4.1.2021.4.5.0",
     "load1":        "1.3.6.1.4.1.2021.10.1.3.1",
 }
-HOST_RESOURCES = {     # HOST-RESOURCES-MIB — Windows, many appliances
-    "hr_processor_load": "1.3.6.1.2.1.25.3.3.1.2",   # table, one row per CPU, averaged
-    "hr_storage_table":  "1.3.6.1.2.1.25.2.3.1",      # table: size/used per storage unit
-}
+# A HOST_RESOURCES dict with the two OIDs above used to live here, named but
+# never read — the 4.35.0 review's own finding, still true two releases
+# later. GENERIC_HEALTH below and HR_STORAGE_TYPE/UNITS/SIZE/USED/RAM/
+# FIXED_DISK further down are the real, live definitions of the same two
+# HOST-RESOURCES-MIB tables; keeping a second, unread copy beside them is
+# how a future fix gets applied to the wrong one. Removed rather than
+# wired up, since GENERIC_HEALTH's single-column shape and the storage
+# constants' multi-column shape are already the two real consumers and
+# don't share a dict either.
 
 # ------------------------------------------------------------ vendor health
 #
@@ -93,6 +98,19 @@ HOST_RESOURCES = {     # HOST-RESOURCES-MIB — Windows, many appliances
 VENDOR_HEALTH = {
     9: (        # Cisco — CISCO-PROCESS-MIB cpmCPUTotal5minRev
         ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.9.9.109.1.1.1.1.8", "column_first"),
+        # CISCO-ENVMON-MIB ciscoEnvMonTemperatureStatusValue: one row per
+        # sensor the chassis has (supervisor, PSU, individual line cards on
+        # a stack), degrees Celsius. Cisco has answered this MIB since
+        # classic IOS, long before CISCO-PROCESS-MIB or CISCO-MEMORY-POOL-
+        # MIB below existed, and it is the vendor-coverage sweep's single
+        # highest-value addition: 862 of the fleet this review is about are
+        # Cisco 2960X access switches, and every one of them had zero
+        # temperature coverage before this line — no vendor entry existed,
+        # and they do not answer ENTITY-SENSOR-MIB either. Same key,
+        # same reduction, as Juniper's jnxOperatingTable reading just below:
+        # temp_chassis_c, worst sensor wins.
+        ("temp_chassis_c", "Chassis temperature", "°C",
+         "1.3.6.1.4.1.9.9.13.1.3.1.3", "column_max"),
     ),
     12356: (    # Fortinet — FORTINET-FORTIGATE-MIB, all plain scalars
         ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.12356.101.4.1.3.0", "scalar"),
@@ -114,6 +132,14 @@ VENDOR_HEALTH = {
         # alertsdb._BUILTIN_RULES for the three rules this now feeds.
         ("temp_chassis_c", "Chassis temperature", "°C",
          "1.3.6.1.4.1.2636.3.1.13.1.7", "column_max"),
+        # jnxOperatingBuffer, same table, one column over: JUNIPER-MIB's own
+        # "percentage of buffer pool in use" reading, the closest thing
+        # Junos exposes to a memory-pressure figure over SNMP and the
+        # object Junos monitoring templates use as one. Worst routing
+        # engine/PIC wins, same reasoning as the temperature column beside
+        # it — a device answering both never had a mem_pct at all before.
+        ("mem_pct", "Memory", "%",
+         "1.3.6.1.4.1.2636.3.1.13.1.11", "column_max"),
     ),
 }
 

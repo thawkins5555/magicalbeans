@@ -224,10 +224,10 @@ directly, checking it from inside itself every 4,096 iterations, so a phase
 slow enough to blow the whole budget on its own is now cut off during it
 rather than needing to finish first. This is the third instance of one bug
 class in a file whose own docstring already named two earlier ones fixed by
-patching a single call site each time; the fuzzing that found it also
-confirmed both earlier fixes still hold, and left the two most obvious
-levers — trap decoding and the permission gate on every route — checked and
-clean (see below).
+patching a single call site each time; the same fuzzing pass also confirmed
+both earlier fixes still hold, and left `trapdecode` and `nfdecode` — the
+other two decoders that take input straight off the wire — checked and clean
+(see below).
 
 **Twelve modules loaded before the Dashboard painted, on every visit,
 regardless of which of them anyone opened.** `app.js` 220 KB, `nodes.js`
@@ -281,7 +281,10 @@ assignments in the same batch, each valid alone, that together point two
 devices at each other — and refuses the batch outright, naming the devices
 involved, rather than applying whatever isn't part of it. Nothing here ever
 picks a suggestion for an operator; the review is still what turns a guess
-into something the rollup may trust.
+into something the rollup may trust. The rollup itself, unchanged since
+4.47.0, held up at this campaign's scale: a scripted site outage — a core
+switch and 108 devices behind it — opened 228 alerts and sent 11 emails,
+where the same shape of event measured against 4.35.0 produced 1,355.
 
 **A dozen interface defects, one of them a real functional break.** Bulk mute
 failed for every selection, silently: the bulk-mute and maintenance-window

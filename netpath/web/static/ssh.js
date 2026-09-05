@@ -133,11 +133,19 @@
   }
 
   function logOutputBytes(bytes) {
+    window.clearTimeout(logIdleTimer);
     logBuffer += logDecoder.decode(bytes, { stream: true });
     let newline;
     while ((newline = logBuffer.indexOf('\n')) !== -1) {
       logLine(logBuffer.slice(0, newline));
       logBuffer = logBuffer.slice(newline + 1);
+    }
+    if (logBuffer) {
+      logIdleTimer = window.setTimeout(() => {
+        if (!logBuffer) return;
+        logLine(logBuffer);
+        logBuffer = '';
+      }, LOG_IDLE_MS);
     }
   }
 
@@ -317,6 +325,11 @@
     show(credsBox, false);
     show(hostkeyBox, false);
     setStatus('connecting', 'Connecting…');
+    // A reconnect starts a new device session; a partial line left over
+    // from the last one (its final, promptless prompt, most likely) is not
+    // this session's output and must not be glued onto whatever it sends.
+    window.clearTimeout(logIdleTimer);
+    logBuffer = '';
     let ws;
     try {
       ws = new WebSocket(socketUrl());

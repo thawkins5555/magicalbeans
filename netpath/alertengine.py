@@ -265,6 +265,7 @@ class AlertEngine:
         self._drain_deadline = time.monotonic() + DRAIN_TIME_BUDGET_S
         self.counters["backlog"] = 0
         self._parent_conditions = {}
+        self._upstream_outage_cache = {}
         occurrences = []
         occurrences += self._drain_device_events(settings)
         occurrences += self._drain_interface_events(settings)
@@ -1687,6 +1688,18 @@ class AlertEngine:
            the topology half: without it a core switch failure arrives as one
            alert per access switch behind it, each true and none of them the
            one worth reading.
+        4. A child rule (case 1's `parent_key`), where the device's OWN
+           device_down is not open for the same reason case 3 exists at
+           all — an ancestor's outage got there first, and this device's own
+           device_down alert is never going to open one to check against.
+           A child rolls up exactly as far as device_down itself does, so it
+           asks the same topology question case 3 asks, just on behalf of a
+           different rule. Without this, a device fully covered by a site
+           outage still opened (or kept open) its own packet_loss_high,
+           cpu_high and the rest, because their own rollup check only ever
+           looked for THIS device's own device_down — which a topology
+           cover guarantees never exists — and never thought to ask whether
+           an ancestor covered it instead.
         """
         if occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
             return None
@@ -1705,13 +1718,24 @@ class AlertEngine:
             parent = self.db.open_by_dedup(dedup_key(parent_rule, occurrence))
             if parent is not None:
                 return parent
-            # No open parent alert. Whether the outage behind it is still
-            # real is _parent_operator_resolved's question, immediately below
-            # this in _apply: it asks the same predicate but also remembers
-            # the cover (so it outlives the resolve window) and says so once
-            # in the Nodes log. Answering it here as well suppressed the
-            # occurrence before that ran, so the cover was silent and
-            # forgotten on the next restart.
+            # No open parent alert for THIS device. Before falling through to
+            # _parent_operator_resolved (case 2, immediately below this in
+            # _apply), ask case 3's own question on this device's behalf: is
+            # device_down itself covered by an ancestor's outage? Only for
+            # parent_key == "device_down" — a NetPath child's parent,
+            # netpath_unreachable, has no topology to walk, and
+            # _upstream_outage is specifically about nodesdb's device chain.
+            if parent_key == "device_down" and occurrence.entity_kind == "device":
+                covered = self._upstream_outage(parent_rule, occurrence)
+                if covered is not None:
+                    return covered
+            # Whether the outage behind it is still real by the OPERATOR-
+            # resolved route is _parent_operator_resolved's question,
+            # immediately below this in _apply: it asks the same predicate
+            # but also remembers the cover (so it outlives the resolve
+            # window) and says so once in the Nodes log. Answering it here
+            # as well suppressed the occurrence before that ran, so the
+            # cover was silent and forgotten on the next restart.
             return None
         if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
             return self._upstream_outage(rule, occurrence)
@@ -1766,10 +1790,27 @@ class AlertEngine:
         getattr rather than a direct call so an engine running against a
         database module without the topology columns behaves exactly as it
         did before them.
+
+        Memoised per tick per device, same shape as _parent_still_failing's
+        cache and for the same reason: case 4 above asks this once per
+        rollup child (a dozen or so rule keys) on top of case 3's own ask
+        for the device_down occurrence itself, all for the SAME device in
+        the SAME outage, and the answer — which ancestor, if any, covers it
+        — cannot change mid-tick. Without this a site outage covering N
+        devices costs N times a dozen chain walks instead of N.
         """
         chain_of = getattr(self.nodes_db, "upstream_chain", None)
         if chain_of is None:
             return None
+        cache_key = (rule["key"] or "", occurrence.entity_id)
+        if cache_key in self._upstream_outage_cache:
+            return self._upstream_outage_cache[cache_key]
+        result = self._upstream_outage_uncached(rule, occurrence)
+        self._upstream_outage_cache[cache_key] = result
+        return result
+
+    def _upstream_outage_uncached(self, rule, occurrence: Occurrence):
+        chain_of = self.nodes_db.upstream_chain
         try:
             device_id = int(occurrence.entity_id)
         except (TypeError, ValueError):

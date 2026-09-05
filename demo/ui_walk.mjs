@@ -1083,6 +1083,17 @@ async function driveSafeControls(page, dir, tag, recorder, account) {
       if (gate.disabled) return 'absent — disabled (no data to act on)';
       await page.click(`#${id}`, { timeout: 5000 });
       await settle(page, 400);
+      // `ipam-search-btn` (ipam.js searchHosts) is not a plain filter like
+      // its neighbours here — with the query box empty (this walk never
+      // fills it) it opens a real #modal prompting for more input, which
+      // then sat open behind every click after it: every SAFE_CLICKS entry
+      // from here on failed with "modal intercepts pointer events", the
+      // exact same way, every run. That was this loop's own sequencing bug,
+      // not a product defect — confirmed by reading searchHosts() itself
+      // and by the failures starting at the exact same step every time.
+      // Closing defensively after every entry, not just this one, in case
+      // another SAFE_CLICKS control turns out to share the same shape.
+      await closeAnyModal(page);
       return 'clicked';
     });
   }

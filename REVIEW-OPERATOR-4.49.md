@@ -284,12 +284,22 @@ are `ping_enabled = 1`, `ping_interval_s = 0` (ping on *every* poll,
 `nodesdb.py:423`) and `ping_count = 3`. At 2,000 devices on a 60-second interval that
 is **6,000 process creations a minute, 100 a second, sustained**.
 
-Measured here, `ping_many(ip, 3, 1000)` took 239 ms and 227 ms per device against the
-harness's Python shim; the shim pays interpreter startup three times, so the honest
-figure for real gear is a real `ping.exe` at around 6 ms plus process creation — call
-it 20–25 ms per device per poll, or roughly 40 seconds of pure `CreateProcess` work in
-every 60-second window, on the same box that has to run the poller. On Linux the
-datagram-socket path avoids all of it.
+Measured properly, eight runs of `ping_many(ip, 3, 1000)` each:
+
+| Path | Mean per call | Per probe |
+| --- | ---: | ---: |
+| Real `C:\WINDOWS\system32\ping.EXE` | 46.7 ms | **15.6 ms** |
+| Through the harness's Python shim | 192.3 ms | 64 ms |
+
+The shim's figure is a harness artefact — `ping.cmd` is a two-hop chain through cmd.exe's
+batch dispatch and then the `py` launcher — and must not be quoted as a product cost.
+**15.6 ms per probe is the number that describes a production Windows install.**
+
+At 2,000 devices, three probes, a 60-second interval: 6,000 process creations a minute,
+at 15.6 ms each, is **94 seconds of `CreateProcess` work to be done inside every
+60-second window**. It does not fit serially. It works at all only because the poller
+spreads it across its worker pool — which is then doing that instead of polling. On
+Linux the datagram-socket path avoids every bit of it.
 
 This is not a bug: the code explains the fallback and the subprocess path is
 deliberate. It is a real, measurable Windows deployment cost that nothing in the
