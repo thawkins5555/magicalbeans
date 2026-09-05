@@ -1230,23 +1230,27 @@ end
     # different stored bytes — different sha256, which the response itself
     # reports — but one was stored redacted and the other verbatim, so after
     # get_configrx_diff redacts BOTH the secret reads as the identical
-    # "<redacted>" token on each side and the diff comes back empty.
+    # "<redacted>" token on each side and the visible diff comes back empty.
     #
     # Empty is the honest answer to "what changed in the text you are allowed
-    # to see". It is a misleading answer to "did anything change", which is
-    # what an operator clicking Diff is actually asking, and the response as
-    # it stands says both at once: hashes that differ, and a diff that says
-    # nothing does. See O-57 — the response needs to distinguish "identical"
-    # from "differs only in redacted material". Until it does, this asserts
-    # the current behaviour explicitly so the day it changes is a visible
-    # test failure and not a silent one.
+    # to see". It used to be a misleading answer to "did anything change",
+    # which is what an operator clicking Diff is actually asking — O-57:
+    # the response now distinguishes "identical" (the two rows genuinely are
+    # the same) from "differs only in redacted material" (`identical` is
+    # False and `redacted_only_change` is True), rather than reporting
+    # hashes that differ alongside a diff that implied nothing did.
     check("D11 …the two rows really do differ on disk",
           payload["from"]["sha256"] != payload["to"]["sha256"],
           f'{payload["from"]["sha256"]} vs {payload["to"]["sha256"]}')
-    check("D11 …yet double redaction collapses the diff to empty, and nothing "
-          "in the response says why (O-57)",
+    check("D11 …the visible diff is empty (the secret change is invisible "
+          "to it, same as before)",
           payload.get("diff") == "" and payload.get("additions") == 0
           and payload.get("removals") == 0, str(payload)[:300])
+    check("D11 …but the response no longer calls this 'identical' (O-57)",
+          payload.get("identical") is False, str(payload)[:300])
+    check("D11 …and says plainly that the difference is entirely in "
+          "redacted material (O-57)",
+          payload.get("redacted_only_change") is True, str(payload)[:300])
     status, _h, payload = req(
         "GET", f"/api/configrx/diff?device={backup_device}"
         f"&from={stored_id}&to={verbatim_id}", cookie=admin_cookie)

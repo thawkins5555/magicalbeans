@@ -6199,7 +6199,8 @@ def get_configrx_diff(service, params, body) -> dict:
     # picking the same backup twice never runs a diff over its own secrets.
     if from_row["id"] == to_row["id"] or from_row["sha256"] == to_row["sha256"]:
         return {"diff": "", "additions": 0, "removals": 0,
-                "from": from_json, "to": to_json, "identical": True}
+                "from": from_json, "to": to_json, "identical": True,
+                "redacted_only_change": False}
 
     from_content = service.configrx_db.backup_content(from_row["id"]) or ""
     to_content = service.configrx_db.backup_content(to_row["id"]) or ""
@@ -6208,8 +6209,16 @@ def get_configrx_diff(service, params, body) -> dict:
     text, additions, removals = configrx.diff_texts(
         from_redacted, to_redacted,
         _configrx_backup_label(from_row), _configrx_backup_label(to_row))
+    # Reaching here already means from_row["sha256"] != to_row["sha256"]
+    # (the fast path above caught the equal-hash case), so these two rows
+    # are never actually identical — an empty `text` here is only ever the
+    # O-57 case: the stored bytes genuinely differ, and that difference is
+    # entirely inside material configrx_redact.redact() maps onto the same
+    # literal token on both sides, so nothing about it survives into the
+    # rendered diff.
     return {"diff": text, "additions": additions, "removals": removals,
-            "from": from_json, "to": to_json, "identical": not text}
+            "from": from_json, "to": to_json, "identical": False,
+            "redacted_only_change": not text}
 
 
 def post_configrx_device_backup(service, params, body, device_id) -> dict:

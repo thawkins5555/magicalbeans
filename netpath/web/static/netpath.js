@@ -1318,11 +1318,22 @@
   /* Entry point for other tabs (NetFlow's "view route" jump): select a
      target and, optionally, a time window, without waiting for the user to
      click it in the target list. Safe to call with no args — App.selectTab
-     already calls this with none on every ordinary tab switch. */
+     already calls this with none on every ordinary tab switch.
+
+     Reached only through a real #/netpath/<targetId>?t0=&t1= route now —
+     NetFlow used to call App.pages.netpath.activate(...) directly, which
+     read `App.pages.netpath` before the lazy loader had any reason to have
+     put it there: a "→ Route" click from NetFlow before this tab had ever
+     been opened once this session threw straight out of the click handler
+     (App.pages.netpath was undefined), and the tab switch on the next line
+     never ran either. window.location.hash goes through the same
+     hashchange -> applyRoute -> selectTab -> ensureModuleReady path every
+     other cross-tab link already uses, so this module is guaranteed loaded
+     before activate() is ever called with real data — see netflow.js. */
   function activate(opts) {
     // A hash route (#/netpath/<targetId>) names the destination in its path;
-    // NetFlow's "view route" jump passes it as targetId directly. Both end
-    // up in the same place.
+    // a direct call (there are none left, but the shape is harmless to keep)
+    // could still pass targetId itself. Both end up in the same place.
     if (opts && opts.parts && opts.parts[0] !== undefined && !opts.targetId) {
       const fromRoute = Number(opts.parts[0]);
       if (Number.isFinite(fromRoute)) opts = { ...opts, targetId: fromRoute };
@@ -1334,8 +1345,15 @@
     view.expandAll = false;
     view.userZoom = false;
     view.pan = { x: 0, y: 0 };
-    if (opts.t0 !== undefined && opts.t1 !== undefined) {
-      setWindow(opts.t0, opts.t1, false);
+    // t0/t1 arrive as query string text now (a real route, not a direct
+    // call with numbers already in hand — see the comment above), so both
+    // need parsing back, and a route with only one of the two (a hand-typed
+    // link, say) is treated as neither rather than pinning half a window.
+    const query = opts.query || {};
+    const t0 = query.t0 !== undefined ? Number(query.t0) : undefined;
+    const t1 = query.t1 !== undefined ? Number(query.t1) : undefined;
+    if (Number.isFinite(t0) && Number.isFinite(t1)) {
+      setWindow(t0, t1, false);
     }
   }
 

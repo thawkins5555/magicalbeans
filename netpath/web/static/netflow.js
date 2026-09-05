@@ -564,13 +564,20 @@
         btn.className = 'linkish';
         btn.title = `View the NetPath route to ${dst}`;
         btn.textContent = '\u2192 Route';
+        // A real route (window.location.hash), not App.pages.netpath.activate
+        // called directly: NetPath is a lazy module, and this button is
+        // reachable long before an operator has ever opened that tab —
+        // App.pages.netpath does not exist yet until its own script has run,
+        // and calling straight into it threw out of this handler (so the
+        // App.selectTab call that used to follow it never ran either,
+        // leaving the click looking like it did nothing). The hash change
+        // goes through the same applyRoute -> ensureModuleReady path every
+        // other cross-tab link in this app already relies on; see the
+        // matching comment on netpath.js's activate().
         btn.onclick = (event) => {
           event.stopPropagation();
-          App.pages.netpath.activate({
-            targetId: record.dst_target_id,
-            t0: record.ts - 300, t1: record.ts + 300,
-          });
-          App.selectTab('netpath');
+          window.location.hash = App.buildRoute('netpath', [record.dst_target_id],
+            { t0: record.ts - 300, t1: record.ts + 300 });
         };
         routeCell.appendChild(btn);
       } else if (routeCell) {

@@ -621,7 +621,7 @@ class ConfigRxWorker:
         self._started: dict[int, float] = {}
         self._lock = threading.Lock()
         self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0,
-                        "suspect": 0}
+                        "suspect": 0, "compliance_truncated": 0}
         self.error: str | None = None
         # Last settings start() was handed; only allow_legacy_ssh is read from
         # here (the loop reads the rest from the database each pass).
@@ -732,7 +732,31 @@ class ConfigRxWorker:
             if now - self._last_compliance_sweep >= COMPLIANCE_SWEEP_INTERVAL_S:
                 self._last_compliance_sweep = now
                 try:
-                    configrx_compliance.evaluate_all(self.db, self.nodes_db)
+                    stats: dict = {}
+                    configrx_compliance.evaluate_all(self.db, self.nodes_db, stats=stats)
+                    if stats.get("truncated"):
+                        # evaluate_all's own COMPLIANCE_SWEEP_BUDGET_S ceiling
+                        # was reached before every device x rule-set pair in
+                        # scope was checked — expected occasionally under a
+                        # rule shaped like a typo, not a sign this loop is
+                        # broken. Counted here (worker_state already exposes
+                        # self.counters) so an operator can see a sweep is
+                        # giving up early rather than that being invisible,
+                        # the same "no counter tells anyone" gap this was
+                        # written to close. The next sweep, or the next
+                        # per-device evaluation right after its own backup,
+                        # picks up whatever this one left not-yet-assessed.
+                        self.counters["compliance_truncated"] += 1
+                        self.log.add(
+                            CONFIGRX, "ConfigRX compliance sweep ran out of "
+                            "time before checking every device",
+                            detail=f"Stopped at the "
+                                   f"{configrx_compliance.COMPLIANCE_SWEEP_BUDGET_S:.0f}s "
+                                   f"budget rather than run unbounded — a rule "
+                                   f"is likely costly to evaluate. Devices not "
+                                   f"reached keep their previous result; the "
+                                   f"next sweep or per-device evaluation will "
+                                   f"retry them.")
                 except Exception:
                     # Best-effort, the same standing every other periodic
                     # pass in this loop already has: a broken rule set must
@@ -976,9 +1000,23 @@ class ConfigRxWorker:
             # for the next periodic sweep (see _loop and
             # configrx_compliance.py's own module docstring for why the
             # sweep exists at all: on a schedule and on a new capture,
-            # never recomputed from a page load).
+            # never recomputed from a page load). Bounded by
+            # evaluate_device_all_rule_sets' own default budget — this
+            # runs on this device's own executor thread, not the loop
+            # thread, but a rule that never finishes here still ties up a
+            # worker slot other devices' backups need.
+            compliance_stats: dict = {}
             configrx_compliance.evaluate_device_all_rule_sets(
-                self.db, self.nodes_db, device_id)
+                self.db, self.nodes_db, device_id, stats=compliance_stats)
+            if compliance_stats.get("truncated"):
+                self.counters["compliance_truncated"] += 1
+                self.log.add(
+                    CONFIGRX, f"Compliance re-evaluation for {device['ip']} "
+                    f"ran out of time before checking every rule set",
+                    detail="Stopped at the budget rather than run unbounded "
+                           "— a rule is likely costly to evaluate. The next "
+                           "periodic sweep will retry whatever was not "
+                           "reached.")
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

@@ -42,9 +42,15 @@ Simple And Fast" — so three independent, imperfect bounds apply instead:
 
        - a group that can already match input more than one way — because
          it repeats internally, or is a top-level alternation — and is
-         ITSELF quantified again: (a+)+, (a*)+, (a|aa)+ and their many
-         variants (_has_nested_repetition). `(a|aa)+$` against 35
-         characters already takes 2.6 seconds.
+         ITSELF quantified again with nothing bounding how many times:
+         (a+)+, (a*)+, (a|aa)+ and their many variants
+         (_has_nested_repetition). `(a|aa)+$` against 35 characters
+         already takes 2.6 seconds. A FIXED-count outer repeat is exempt
+         — (\\d{1,3}\\.){3}\\d{1,3}, the dotted-quad idiom written with a
+         counted group instead of four separate \\d+ octets, is accepted
+         for the same reason \\d+\\.\\d+\\.\\d+\\.\\d+ below is: repeating
+         something a fixed number of times cannot grow exponentially with
+         input length, only an open-ended repeat can.
        - more than MAX_ADJACENT_QUANTIFIER_RUN quantified atoms that can
          match the SAME characters, back to back with nothing
          disambiguating between them: \\d+\\d+\\d+\\d+, a+a+a+a+,
@@ -116,22 +122,28 @@ class UnsafeRegex(ValueError):
 _COUNTED_RE = re.compile(r"\{\d*(?:,\d*)?\}")
 
 
-def _quantifier_at(pattern: str, i: int) -> tuple[bool, int]:
-    """(is there a quantifier starting at index i, how many chars it is) —
-    '+', '*' and a counted '{m,n}' (including its lazy '?' suffix, which
-    changes backtracking order but not whether the atom can repeat)."""
+def _quantifier_at(pattern: str, i: int) -> tuple[bool, int, bool]:
+    """(is there a quantifier starting at index i, how many chars it is,
+    is it UNBOUNDED) — '+', '*' and a counted '{m,n}' (including its lazy
+    '?' suffix, which changes backtracking order but not whether the atom
+    can repeat). '+' and '*' are always unbounded; a counted '{m}' or
+    '{m,n}' is bounded (a fixed ceiling on how many times it can repeat),
+    while '{m,}' is not — see _has_nested_repetition for why that
+    distinction, not just "is there a quantifier at all", is what decides
+    whether repeating an already-ambiguous group is actually dangerous."""
     if i >= len(pattern):
-        return False, 0
+        return False, 0, False
     if pattern[i] in "+*":
         lazy = i + 1 < len(pattern) and pattern[i + 1] == "?"
-        return True, 2 if lazy else 1
+        return True, 2 if lazy else 1, True
     if pattern[i] == "{":
         m = _COUNTED_RE.match(pattern, i)
         if m:
             end = m.end()
             lazy = end < len(pattern) and pattern[end] == "?"
-            return True, (end - i) + (1 if lazy else 0)
-    return False, 0
+            unbounded = pattern[i + 1:end - 1].endswith(",")
+            return True, (end - i) + (1 if lazy else 0), unbounded
+    return False, 0, False
 
 
 def _skip_char_class(pattern: str, i: int) -> int:
@@ -150,8 +162,22 @@ def _has_nested_repetition(pattern: str) -> bool:
     """True when `pattern` contains a group that can already match the same
     text more than one way — because it repeats internally ((a+)+, (a*)+,
     ((a|b)+)+) or because it is a top-level alternation (a|aa)+ — and is
-    ITSELF quantified again. See the module docstring for what this shape
+    ITSELF quantified again with an UNBOUNDED quantifier (+, *, or {m,}
+    with no upper limit). See the module docstring for what this shape
     does and why it is checked for.
+
+    A BOUNDED outer quantifier — (foo){3}, (\\d{1,3}\\.){3} — is exempt:
+    repeating an ambiguous group a fixed, finite number of times cannot
+    itself grow exponentially with input length the way an unbounded
+    repeat can, and (\\d{1,3}\\.){3}\\d{1,3} is simply the dotted-quad IP
+    address idiom written the other common way (compare
+    \\d+\\.\\d+\\.\\d+\\.\\d+ in the module docstring, which was already
+    accepted). The exemption only applies to the quantifier immediately
+    wrapping the group — an ambiguous group still propagates "ambiguous"
+    to its own parent regardless of whether ITS wrapping quantifier was
+    bounded, because a bounded inner repeat wrapped by an UNBOUNDED outer
+    one ((a+){3})+ is exactly as dangerous as if the bounding were never
+    there.
 
     Not a full analysis (undecidable in general for the constructs
     Python's `re` supports). A character class is skipped whole rather
@@ -182,15 +208,15 @@ def _has_nested_repetition(pattern: str) -> bool:
         if c == ")":
             if open_groups:
                 ambiguous = open_groups.pop()
-                quantified_after, consumed = _quantifier_at(pattern, i + 1)
-                if ambiguous and quantified_after:
+                quantified_after, consumed, unbounded_after = _quantifier_at(pattern, i + 1)
+                if ambiguous and quantified_after and unbounded_after:
                     return True
                 # Propagate to the parent group if THIS group was already
                 # ambiguous (nested one level deeper), or if this group is
-                # itself being quantified right now — either way the
-                # parent now contains something that can match more than
-                # one way, which is what matters if the parent is
-                # quantified too.
+                # itself being quantified right now (bounded or not) —
+                # either way the parent now contains something that can
+                # match more than one way, which is what matters if the
+                # parent is quantified UNBOUNDED too.
                 if open_groups and (ambiguous or quantified_after):
                     open_groups[-1] = True
                 i += 1 + consumed
@@ -201,7 +227,7 @@ def _has_nested_repetition(pattern: str) -> bool:
             open_groups[-1] = True
             i += 1
             continue
-        quantifier_here, consumed = _quantifier_at(pattern, i)
+        quantifier_here, consumed, _unbounded_here = _quantifier_at(pattern, i)
         if quantifier_here and open_groups:
             open_groups[-1] = True
         i += max(consumed, 1)
@@ -248,7 +274,7 @@ def _has_adjacent_quantifiers(pattern: str, max_run: int = MAX_ADJACENT_QUANTIFI
         else:
             atom_end = i + 1
             plain_literal = True
-        quantified, consumed = _quantifier_at(pattern, atom_end)
+        quantified, consumed, _unbounded = _quantifier_at(pattern, atom_end)
         if quantified:
             if plain_literal and last_literal is not None and last_literal != c:
                 run = 1
@@ -276,11 +302,15 @@ def compile_bounded(pattern: str, flags: int = 0) -> re.Pattern:
             f"compliance rule run against every device's capture")
     if _has_nested_repetition(pattern):
         raise UnsafeRegex(
-            "Pattern repeats a group that can already repeat (something "
+            "Pattern repeats a group that can already repeat, with nothing "
+            "bounding how many times the outer repeat can happen (something "
             "shaped like (a+)+ or (a|aa)+) — this is the construct behind "
             "almost every regular expression that runs in exponential "
             "time on ordinary text. Rewrite it without the nested "
-            "repetition, e.g. a+ instead of (a+)+.")
+            "repetition, e.g. a+ instead of (a+)+. A group repeated a "
+            "small FIXED number of times, like (\\d{1,3}\\.){3}\\d{1,3}, "
+            "is fine — only an open-ended outer repeat (+, *, or {n,} "
+            "with no upper limit) of an already-repeating group is refused.")
     if _has_adjacent_quantifiers(pattern):
         raise UnsafeRegex(
             f"Pattern chains more than {MAX_ADJACENT_QUANTIFIER_RUN} "

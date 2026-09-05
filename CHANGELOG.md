@@ -290,21 +290,22 @@ real, unrelated fault on a wrong guess is the one failure an alert system
 must not have, and that reasoning is unchanged. What was missing was the
 means: the neighbour data
 and the product's own best-effort device match already existed and nothing
-ever offered it to an operator to review. `GET /api/nodes/upstream-suggestions`
-now lists, per device with no `upstream_id` set, every neighbour-matched
-candidate with its evidence — a chassis-MAC match ranked over a sysName one
-(a name can collide across two sites' switches both called "core-sw-1"; a MAC
-collision is far rarer), a stale neighbour row ranked down regardless of match
-kind — and a device with more than one plausible match comes back flagged
-rather than one candidate being silently chosen for it.
-`POST /api/nodes/upstream-suggestions/apply` takes a batch of accepted
-device/upstream pairs and applies them in one transaction, after checking the
-*whole proposed graph* for a cycle no single pair could show on its own — two
-assignments in the same batch, each valid alone, that together point two
-devices at each other — and refuses the batch outright, naming the devices
-involved, rather than applying whatever isn't part of it. Nothing here ever
-picks a suggestion for an operator; the review is still what turns a guess
-into something the rollup may trust. The topology rollup this feeds
+ever offered it to an operator to review. A new dialog, opened from a
+button on the Topology subtab, lists every device with no `upstream_id` set
+and every neighbour-matched candidate with its evidence — a chassis-MAC
+match ranked over a sysName one (a name can collide across two sites'
+switches both called "core-sw-1"; a MAC collision is far rarer), a stale
+neighbour row ranked down regardless of match kind, each shown beside which
+protocol saw it and which of the device's own ports it rode in on — and a
+device with more than one plausible match is shown with every candidate
+rather than one silently chosen for it. Accepting one, or a batch of them,
+applies them in one transaction, after checking the *whole proposed graph*
+for a cycle no single pair could show on its own — two assignments in the
+same batch, each valid alone, that together point two devices at each
+other — and refuses the batch outright, naming the devices involved, rather
+than applying whatever isn't part of it. Nothing here ever picks a
+suggestion for an operator; the review is still what turns a guess into
+something the rollup may trust. The topology rollup this feeds
 (`upstream_id`, shipped in 4.37.0) held up at this campaign's scale: a
 scripted site outage — a core switch and 108 devices behind it — opened 228
 alerts and sent 11 emails, where the same shape of event measured against
@@ -363,11 +364,26 @@ write-gated control already does. `resolveMacSearch` said nothing when a
 search box held something that wasn't a MAC at all, rather than
 distinguishing "not a MAC" from "the server refused this MAC" — the far more
 common reason to type digits and dots into that box is an IP address, whose
-octets are valid hex too. And ConfigRX's Diff buttons were gated
-`configrx: write`, left over from before 4.48.0 moved reading a single
-stored backup to `configrx: read`; comparing two backups a reader can
-already open one at a time is not a write, and it's the single most common
-thing anyone does with a config backup.
+octets are valid hex too.
+
+**A permission change worth its own line, not just a bullet.**
+`GET /api/configrx/diff` moved from `configrx: write` to `configrx: read` —
+comparing two backups a reader can already open one at a time is not
+itself a write, and it's the single most common thing anyone does with a
+config backup, so the client-side Diff buttons that had been gated write
+(left over from before 4.48.0 moved the single-backup route the same way)
+were a real, if narrower, defect on their own. Widening the gate needed a
+compensating control, and got one: redaction is applied a *second* time,
+unconditionally, regardless of what either backup's own stored `redacted`
+flag says — so a device backed up with "keep secrets in backups" switched
+on, which stores its single-backup view verbatim on purpose for a write
+account, still never shows a diff reader an unredacted secret. Because
+every secret redacts to the identical literal token, a secret that merely
+changed value reads as no visible difference at all — the honest answer to
+"did the password change" is "this diff cannot tell you," not silence — so
+a `redacted_only_change` flag is set whenever the visible diff is empty but
+the two backups' own stored hashes disagree, naming the one case an empty
+diff must not be allowed to read as "nothing changed."
 
 **Started under a service manager, the application printed nothing at all —
 including the one line that warns a sign-in is travelling in the clear.**
@@ -460,29 +476,105 @@ spawn-storm shape `ipam_scan.py`'s own docstring already describes for an
 unpaced ping sweep. All five are now clamped (`interval_s` 5 s–30 days,
 `max_hops` 1–255, one byte on the wire so no path is ever longer, `probes`
 1–20, `timeout_s` 0.1–30 s, `trace_workers` 1–64), each bound justified by
-the mechanism it guards rather than picked round.
+the mechanism it guards rather than picked round. A trace's own worst-case
+runtime arithmetic (`expected_budget`) is separately capped at
+`MAX_EXPECTED_BUDGET_S` (600 s), so an operator who clamps every input to
+its generous high end still cannot construct a single trace this product
+will wait ten minutes past for.
 
-Still open, and part of why this campaign keeps running rather than closing
-here: a printer, identified correctly, that still answers with nothing but
-an interface counter and a ping time; and an audit trail that still does not
-cover adding a device, editing an alert rule (with its threshold's old and
-new value) or deleting a ConfigRX backup — ConfigRX only ever pulls a
-read-only capture, never pushes one, so "restore" was never the missing
-half of that pair. The audit table itself gained the filtered, paged query
-and the dropdown sources a browsing page would need (`audit_query()`,
-`audit_usernames()`, `audit_action_names()`, all in `appdb.py`) this pass;
-what's still missing is the roughly two dozen new call sites across the
-actions above and the Settings subtab to read any of it from, both
-specified but not yet written. Two more things are further along than
-"open" but not yet reachable: search and named compliance rule sets
-across stored ConfigRX backups are built and tested against the database
-directly — redacted text only, ever — and device availability and top-N
-utilisation reporting (`netpath/report.py`) are likewise built and tested
-against real history, four different ways a gap in that history is *not*
-the same as "the device was down" reasoned through and handled explicitly
-(a maintenance window, an expired mute, the device not existing yet, the
-poller itself having been stopped). Neither has a route serving it to the
-interface yet.
+**A syslog TCP connection could hold the collector's memory open
+indefinitely without ever completing a message.** RFC 6587 octet counting
+reads a length prefix of up to ten digits — up to 9,999,999,999 — with
+nothing that bounded how large the message behind it could grow while it
+was still arriving; the newline-framed shape has no length prefix at all
+and had the same gap. Measured directly before the fix: a connection that
+declared a 2 GB octet count and trickled data toward it at 1 MB/s held the
+collector's own traced memory at 42 MB after 50 MB sent (peaking at
+82.5 MB, since appending a chunk briefly holds the old and new buffer at
+once), every counter — messages, errors, rejected, dropped — still at
+zero, on 514/tcp, unauthenticated, for as long as the connection was kept
+open. `MAX_TCP_MESSAGE_BYTES` (1 MB — already the ceiling the
+newline-framed path used for its own cutoff, unified across both framings
+now) bounds it: a connection that exceeds it is cut off rather than let
+run, and no real syslog message, even one carrying a sizeable RFC 5424
+structured-data block, comes close to that ceiling.
+
+**ConfigRX gained the two things the evaluation named as the difference
+between a backup tool and a configuration management tool: search across
+every device's stored capture, and named compliance rule sets** — twelve
+new routes (search; rule-set create/read/update/delete; a rule set's own
+rules; its stored results; a manual evaluate; one device's compliance
+standing), all gated as a ConfigRX read, matching the diff route's own
+gate rather than the metadata list's, since neither a search hit nor a
+compliance result ever carries an unredacted secret or the actual matching
+line. Both a rule's pattern and a search query can be an operator-supplied
+regular expression, which is a harder problem than the quadratic bugs
+fixed above — those were this application's own regexes misbehaving on
+ordinary input and could be rewritten; this is an arbitrary pattern that
+may be the thing that misbehaves, on input that is not otherwise unusual
+at all. Three independent, deliberately over-inclusive bounds apply
+instead of a rewrite: a pattern shaped to blow up regardless of input (a
+self-repeating group repeated again, or too many quantified atoms chained
+back to back with nothing to disambiguate between them) is refused before
+it is ever run; every line actually tested is capped at 250 characters,
+measured as the point past which even the worst shape the first bound
+still lets through costs a quarter-second and grows roughly cubically from
+there; and a wall-clock budget bounds the whole search or sweep, checked
+before every line, so a search or a compliance run that hits it returns
+what it found so far rather than pretending to be complete. Compliance
+rules are evaluated the same way, line by line against a device's latest
+capture rather than as one whole-document match, for the identical reason
+— every rule this feature's own brief actually needs (an NTP server, an
+SNMP community, port security, a VLAN) is a single directive on a single
+line, a real but narrow scope limit stated plainly rather than silently.
+No page serves either feature to the interface yet — both are reachable
+through the API today.
+
+**Two reports an operator is asked for by name every month — device
+availability and which links came closest to saturation — are computable
+now, over any stored window, without writing the SQL by hand.**
+`GET /api/nodes/reports/availability` answers per-device or fleet-wide
+availability, outage count, longest outage and mean time to recovery over
+`[t0, t1]`, built on the same status-segment history the device pane's own
+timeline already reads rather than the devices table's current-status
+snapshot — four different ways a gap in that history is deliberately
+*not* treated as downtime (a maintenance window, a mute still active
+enough to have a row on file, the device not having existed yet, the
+poller itself having gone quiet) are reasoned through and handled
+explicitly, because an availability figure that quietly counts the wrong
+things is worse than not reporting one at all.
+`GET /api/nodes/reports/top-metrics` ranks the top (or bottom) N series by
+peak or mean over the same kind of window — any metric key the poller
+already records, so "which twenty links came closest to saturation" is one
+call away. A whole-fleet-equivalent ask over more than a week is refused
+outright rather than left to block a request thread for the roughly
+100 seconds the underlying query measured at 2,000 devices over a month —
+narrower `device_ids` or a shorter window get an answer; a fleet-wide
+month does not, yet. No page serves either report to the interface yet
+either.
+
+**The audit trail gained a Settings subtab before the server route it
+needs.** A filterable, paged view — by time window, username, action,
+target or free text — opened directly rather than through the old
+since/limit live cursor `GET /api/audit` has always answered. The two
+sides shipped out of step: the page asks for `t0`/`t1`/`username`/
+`action`/`target`/`q`/`before_id`, and the route still only answers
+`since`/`limit`. Rather than a silent, misleadingly-empty table, the page
+detects the shape mismatch and says so in as many words — "the server has
+not been updated to answer this search yet... this is not an empty audit
+trail" — because a real gap between two halves of the same feature must
+never read as "nothing happened here."
+
+Still open, and part of why this campaign keeps running rather than
+closing here: a printer, identified correctly, that still answers with
+nothing but an interface counter and a ping time; `GET /api/audit` itself,
+which needs to be widened to `audit_query()`'s filtered shape before the
+subtab above can show anything; and the roughly two dozen new `_audit()`
+call sites — adding a device, editing an alert rule with its threshold's
+old and new value, deleting a ConfigRX backup (never "restore": ConfigRX
+only ever pulls a read-only capture, never pushes one) — that would widen
+what the trail covers in the first place. Both are specified, not yet
+written.
 
 ### 4.48.0 — The interface, reviewed
 

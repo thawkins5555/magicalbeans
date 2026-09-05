@@ -18,7 +18,7 @@ ways:
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional enable-mode secret (ConfigRX) | Encrypted in `configrx.db`, if the device's vendor needs one to reach privileged EXEC and you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
-| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored. Reading one backup's content is `configrx: read`, same as the listing beside it, with a verbatim (unredacted) capture redacted on the fly for a caller without `configrx: write`; comparing two backups still requires `configrx: write`. See §6a. |
+| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored. Reading one backup's content is `configrx: read`, same as the listing beside it, with a verbatim (unredacted) capture redacted on the fly for a caller without `configrx: write`; comparing two backups is `configrx: read` too as of 4.49.0 (through 4.48.0 it required `configrx: write`), with redaction applied unconditionally to both sides regardless of caller or stored flag. See §6a. |
 
 Everything below explains why each row is true.
 
@@ -546,27 +546,43 @@ an operator has put in a description field. A redacted backup is
 sanitised document you should treat as public. Read it as defence in depth
 underneath the permission change, not as a replacement for it.
 
-**Reading one backup's content is `configrx: read`, the same as the listing
-beside it — comparing two is `configrx: write`.** Listing which backups
-exist, when they were taken and whether the configuration changed, and the
-configuration text of a single stored backup, all sit on `configrx: read`:
-that is the useful read-only view, "has this switch changed" being exactly
-the question a read-only operator needs answered. The one case that still
-needs guarding is a backup captured **verbatim** — `store_secrets` was on
+**Reading one backup's content, and comparing two, are both `configrx:
+read`, the same as the listing beside them — as of 4.49.0.** Listing which
+backups exist, when they were taken and whether the configuration changed,
+the configuration text of a single stored backup, and a diff between two of
+them, all sit on `configrx: read`: that is the useful read-only view, "has
+this switch changed, and how" being exactly the question a read-only
+operator needs answered. `get_configrx_diff` was gated `configrx: write`
+through 4.48.0, on the reasoning that comparing two configurations was not
+the same kind of act as reading the alert list; it moved to match the
+single-backup route because a reader who can already open either backup on
+its own is not being handed anything new by being shown both at once side
+by side, and it is the single most common thing anyone does with a config
+backup — a real, if narrow, defect in its own right (see `CHANGELOG.md`
+4.49.0) while it stayed write-gated after the single-backup route had
+already moved.
+
+Both routes handle a backup captured **verbatim** — `store_secrets` was on
 for that device at capture time, so the stored row itself holds the
-device's real secrets rather than `<redacted>` in their place — and a
-caller without `configrx: write` reading that row gets it redacted on the
-fly, through the identical `configrx_redact.redact()` pass, rather than
-403ing outright; the response's own `redacted` flag says so, even though
-the stored row's flag still correctly says it was not. Comparing two
-backups is a different act: `get_configrx_diff` hands over the device's own
-configuration lines exactly as a single-backup read does, but it stays
-behind `configrx: write` regardless of either backup's own redacted flag,
-and applies redaction unconditionally on top — a secret that merely changed
-value reads as no line at all in the hunks, never what it became. The diff
-route is the one place left in the product where a read operation
-deliberately requires a write grant, and it is because "compare two
-configurations" is not the same kind of act as "read the alert list".
+device's real secrets rather than `<redacted>` in their place — but not
+identically, and the difference is the compensating control that made
+widening the diff route's gate safe. A single-backup read from a caller
+*without* `configrx: write` gets that row redacted on the fly, through the
+identical `configrx_redact.redact()` pass, rather than 403ing outright; a
+caller *with* `configrx: write` gets the verbatim text, because that grant
+is what "store_secrets" trusts to receive it. The diff route does not
+carry that distinction forward: it applies `configrx_redact.redact()`
+unconditionally, to both sides, regardless of either backup's own stored
+`redacted` flag or the caller's own permission — nothing here may hand an
+unredacted secret to a diff reader even when the device's own setting
+would let the single-backup view do exactly that, because a diff is a
+comparison view, not a download of the file `store_secrets` exists to
+produce. Because every secret redacts to the identical literal token, a
+secret that merely changed value reads as no line at all in the hunks —
+the diff route's own `redacted_only_change` flag is set whenever the
+visible diff is empty but the two backups' stored hashes disagree, so a
+rotated password or a changed community reads as "something changed here
+you cannot see" rather than a clean, reassuring, and wrong, empty diff.
 
 Everything in §6 about the SSH password that *fetches* the backup is
 unchanged, including the host-key store described there.

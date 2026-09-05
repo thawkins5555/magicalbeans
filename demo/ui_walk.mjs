@@ -110,15 +110,26 @@
  *                                   failed requests and every response >= 400
  *                                   (from every pass above — admin, viewer,
  *                                   noc, kiosk, theme x3, viewport x3)
- *   metrics-<tag>.json              nodes-table fill time, long tasks (a
- *                                   count and longest duration overall,
- *                                   plus longtasks_by_tab and
- *                                   longtasks_by_phase — coarse attribution
- *                                   to which of the twelve tabs or which of
- *                                   walkDialogs/driveSafeControls/census was
- *                                   running when each one landed, admin
- *                                   pass only, since that is the only
- *                                   context with the PerformanceObserver),
+ *   metrics-<tag>.json              nodes-table fill time, long tasks — a
+ *                                   count and longest duration overall
+ *                                   (longtask_entries_observed/_longest_ms),
+ *                                   longtasks_by_tab and longtasks_by_phase
+ *                                   (coarse: which of the twelve tabs or
+ *                                   which of walkDialogs/driveSafeControls/
+ *                                   census was running when each one
+ *                                   landed), and `longtasks` itself — every
+ *                                   entry the PerformanceObserver saw across
+ *                                   the whole admin pass, each with
+ *                                   start_ms, duration_ms, which tab
+ *                                   App.state.tab named when the entry's
+ *                                   callback fired, and the Long Tasks
+ *                                   API's own `attribution` (usually just a
+ *                                   containerType of "same-origin" — the
+ *                                   browser does not name a function; a CDP
+ *                                   Profiler session around a specific
+ *                                   moment is still what answers that).
+ *                                   Admin pass only, since that is the only
+ *                                   context with the PerformanceObserver.
  *                                   payload size, each account's visible
  *                                   tabs/write-controls/permissions, and —
  *                                   when demo/out/ping_state.json exists —
@@ -547,7 +558,7 @@ async function walkTabs(page, dir, tag, recorder, prefix = 'tab', longtaskSink =
       const after = await page.evaluate(() => window.__longtasks || []).catch(() => []);
       const delta = after.slice(before);
       longtaskSink[tab] = { count: delta.length,
-        longest_ms: delta.length ? Math.round(Math.max(...delta)) : 0 };
+        longest_ms: delta.length ? Math.round(Math.max(...delta.map((lt) => lt.duration))) : 0 };
     }
 
     for (const sub of SUBTABS[tab] || []) {
@@ -1457,13 +1468,27 @@ async function measure(page, recorder) {
       try {
         buffered = performance.getEntriesByType('longtask').length;
       } catch { buffered = -1; }
-      return { buffered, observed: window.__longtasks ? window.__longtasks.length : -1,
+      const entries = window.__longtasks || [];
+      return { buffered, observed: window.__longtasks ? entries.length : -1,
                longest: window.__longtasks
-                 ? Math.round(Math.max(0, ...window.__longtasks)) : -1 };
+                 ? Math.round(Math.max(0, ...entries.map((lt) => lt.duration))) : -1,
+               entries };
     });
     metrics.longtask_entries_buffered = info.buffered;
     metrics.longtask_entries_observed = info.observed;
     metrics.longtask_longest_ms = info.longest;
+    // The full per-entry table this campaign asked for: start, duration,
+    // which tab was current, and whatever attribution the browser gave —
+    // alongside the three summary integers above rather than instead of
+    // them, so nothing already reading those three breaks. Rounded to the
+    // millisecond; performance.now()'s sub-millisecond precision is not
+    // meaningful once written through JSON to a report a person reads.
+    metrics.longtasks = info.entries.map((lt) => ({
+      start_ms: Math.round(lt.start),
+      duration_ms: Math.round(lt.duration),
+      tab: lt.tab,
+      attribution: lt.attribution,
+    }));
     return `buffered=${info.buffered} observed=${info.observed} longest=${info.longest}ms`;
   });
 
@@ -1558,11 +1583,44 @@ async function main() {
     // Count long tasks ourselves: getEntriesByType('longtask') is empty
     // without an observer, and this has to be installed before any script
     // on the page runs.
+    //
+    // Each entry now carries what it takes to attribute it rather than just
+    // count it: `start` (performance.now(), so entries can be ordered and
+    // matched against anything else timestamped the same way), `duration`,
+    // `tab` (window.App.state.tab read at the moment the observer's
+    // callback fires — the callback runs as soon as the main thread is free
+    // again after the task that produced the entry, so this is "whichever
+    // tab was current when the task finished" rather than a guess; it can
+    // only be wrong if a tab switch happened inside the same task, which
+    // would itself be part of what made that task long), and `attribution`
+    // — the Long Tasks API's own TaskAttributionTiming list, where the
+    // browser provides one. In practice that list rarely names a function:
+    // per spec it is container info (an iframe's src/id/name) plus a
+    // same-origin/cross-origin/multiple-origins containerType, so most
+    // entries here will show containerType "same-origin" and nothing more
+    // specific — a real limit of the browser API, not of this collector.
+    // The precise "which function" answer still needs a CDP Profiler
+    // session around a specific moment, the way it was done by hand for
+    // the dateShort finding; this is what turns "we don't know" into
+    // "here is the tab and the timing to go point that at."
     await context.addInitScript(() => {
       window.__longtasks = [];
       try {
         new PerformanceObserver((list) => {
-          for (const entry of list.getEntries()) window.__longtasks.push(entry.duration);
+          for (const entry of list.getEntries()) {
+            window.__longtasks.push({
+              start: entry.startTime,
+              duration: entry.duration,
+              tab: (window.App && window.App.state && window.App.state.tab) || null,
+              attribution: (entry.attribution || []).map((a) => ({
+                name: a.name,
+                containerType: a.containerType,
+                containerSrc: a.containerSrc,
+                containerId: a.containerId,
+                containerName: a.containerName,
+              })),
+            });
+          }
         }).observe({ type: 'longtask', buffered: true });
       } catch { /* not supported here */ }
     });
@@ -1600,6 +1658,19 @@ async function main() {
     longtasksByPhase.census = phaseEnd - phaseStart;
     metrics.longtasks_by_tab = longtasksByTab;
     metrics.longtasks_by_phase = longtasksByPhase;
+    // measure() (above) captured metrics.longtasks partway through the
+    // admin pass — before driveSafeControls/censusAccount ran — because
+    // that is also where it reports the three summary integers this file
+    // always recorded. Re-read the full array here, at the last possible
+    // moment before this context closes, so the per-entry table actually
+    // covers the whole admin pass rather than silently stopping at
+    // walkDialogs.
+    metrics.longtasks = await page.evaluate(() => (window.__longtasks || []).map((lt) => ({
+      start_ms: Math.round(lt.start),
+      duration_ms: Math.round(lt.duration),
+      tab: lt.tab,
+      attribution: lt.attribution,
+    }))).catch(() => metrics.longtasks || []);
     await context.close();
 
     // ---- viewer pass: which tabs a read-only account actually sees, every

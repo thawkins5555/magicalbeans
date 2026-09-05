@@ -1219,20 +1219,20 @@ name can collide (two sites both naming a switch "core-sw-1"); suppressing a
 real, unrelated fault because of a guess is the one failure this feature must
 never have, so the neighbour table alone never sets `upstream_id`.
 
-**From 4.49.0, reviewing that guess no longer has to mean one Edit dialog per
-device.** An API pair does the work a review screen will eventually sit in
-front of: one route lists every device with no `upstream_id` set whose own
-collected neighbours matched another monitored device, ranked by evidence —
-a chassis-MAC match rated above a sysName match, a neighbour nothing has
-confirmed recently rated down regardless of match kind — and flags a device
-with more than one plausible match rather than picking one for you; a second
-route takes a batch of accepted device/upstream pairs and applies them
-together, after checking the whole proposed graph for a cycle no single pair
-could show on its own, refusing the batch outright and naming the devices
-involved if it would create one. This is still a proposal to be confirmed,
-never something the rollup applies on its own — the review is the fix for
-"two thousand manual edits", not a reason to stop
-requiring one.
+**From 4.49.0, reviewing that guess no longer means one Edit dialog per
+device.** A button on the TOPOLOGY subtab opens a dialog listing every
+device with no `upstream_id` set whose own collected neighbours matched
+another monitored device, ranked by evidence — a MAC-address match rated
+above a name match, a neighbour nothing has confirmed on the last walk rated
+down regardless of match kind, shown beside which protocol(s) saw it and
+which of the device's own ports it rode in on — and a device with more than
+one plausible match is shown with every candidate rather than one picked for
+you. Accepting a candidate, or a batch of them, is one confirmation; the
+whole proposed set is checked for a cycle no single pair could show on its
+own before anything is written, and a set that would create one is refused
+outright, naming the devices involved. This is still a proposal an operator
+confirms, never something the rollup applies on its own — the review is the
+fix for "two thousand manual edits", not a reason to stop requiring one.
 
 When a device stops answering and its upstream is also down, the alert rolls up
 under the upstream's rather than opening on its own, with a note saying which

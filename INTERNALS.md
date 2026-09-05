@@ -4372,18 +4372,33 @@ hidden is what stops a second attempt — never a silent retry loop.
 ### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
 
 4.48.0 wrapped the twelve tabs in four `<div class="tab-group" data-label="…">`
-wrappers (Now/Inventory/Telemetry/Admin) purely for a CSS `::before` label.
-4.49.0 flattens them back to twelve direct children of `#tabs` — still one
-`role="tablist"` and twelve `role="tab"` buttons, which `tests/ui/walk.mjs`
-asserts by scoping its counts to `#tabs` either way — with a
-`.tab.tab--group-start` hairline (`border-left`, `margin-left`) on the first
-tab of each group after the first standing in for the label a wrapper div
-used to draw with generated content, without introducing another DOM layer
-for a hidden tab to end up orphaned inside. It's written as the compound
-selector `.tab.tab--group-start` (specificity 0,2,0,0) rather than the bare
-class alone, because two later breakpoints (1500px, 360px) redeclare `.tab`'s
-own padding as a shorthand — a bare class would lose that specificity fight
-by source order and the divider gap would vanish under 1500px.
+wrappers (Now/Inventory/Telemetry/Admin) purely for a CSS `::before` label —
+and that wrapping carried two real accessibility defects along with the
+label, not merely a style choice later reverted on taste. First,
+`role="tablist"`'s children were no longer the twelve `role="tab"` buttons
+themselves but four plain `<div>`s each holding some of them, so every
+screen reader's computed position for a tab ("tab 3 of 12") came out wrong,
+counted against the wrapper's own child position rather than the tablist's.
+Second, permissions can hide every tab in one of these groups at once (an
+account with no read grant anywhere in Telemetry, say, or every module in a
+group failing to start) — and a `<div>` is not itself hidden by any tab
+inside it being hidden, so its `::before` label stood alone over empty
+space, a heading with nothing under it. Both are defects of the *wrapper
+existing at all*, not of which four names it carried, so removing it is
+what fixes them rather than any relabelling would.
+
+4.49.0 flattens the tabs back to twelve direct children of `#tabs` — one
+`role="tablist"` and twelve `role="tab"` buttons with nothing between them,
+which `tests/ui/walk.mjs` asserts by scoping its counts to `#tabs` either
+way — with a `.tab.tab--group-start` hairline (`border-left`,
+`margin-left`) on the first tab of each group after the first standing in
+for the label the wrapper div used to draw with generated content, without
+introducing another DOM layer for a hidden tab to end up orphaned inside.
+It's written as the compound selector `.tab.tab--group-start` (specificity
+0,2,0,0) rather than the bare class alone, because two later breakpoints
+(1500px, 360px) redeclare `.tab`'s own padding as a shorthand — a bare
+class would lose that specificity fight by source order and the divider
+gap would vanish under 1500px.
 
 **The overflow fade moved off `#tabs` itself.** It used to be `#tabs::after`
 — an absolutely positioned child of the scrolling container, which put it at

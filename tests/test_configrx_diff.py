@@ -175,18 +175,45 @@ try:
     check("picking the same backup twice: empty diff, identical",
           status == 200 and payload.get("diff") == "" and payload.get("identical") is True,
           (status, payload))
+    check("...and NOT flagged as a redacted-only change — it's genuinely identical",
+          payload.get("redacted_only_change") is False, payload)
     status, payload = call(
         "GET", "/api/configrx/diff",
         {"device": device_id, "from": backup1_id, "to": backup3_id}, token=admin)
     check("two DIFFERENT rows sharing a hash (v3 reverted to v1) also fast-path to empty",
           status == 200 and payload.get("diff") == "" and payload.get("identical") is True,
           (status, payload))
+    check("...and also not a redacted-only change — same hash, genuinely identical",
+          payload.get("redacted_only_change") is False, payload)
 
     print("default adjacent pair (no from/to)")
     status, payload = call("GET", "/api/configrx/diff", {"device": device_id}, token=admin)
     check("diffs the two most recent stored backups (v2 -> v3, i.e. v2 -> v1)",
           status == 200 and payload["from"]["id"] == backup2_id
           and payload["to"]["id"] == backup3_id, (status, payload))
+
+    print("O-57: a config that changed in NOTHING but a secret's value")
+    # A fourth backup, created after the adjacent-pair check above so it
+    # does not disturb that ordering-dependent test: identical to v1 in
+    # every line except the enable secret's value.
+    v4 = ("hostname cx-diff-sw\n"
+         "snmp-server community s3cr3t-v1 RO\n"
+         "enable secret 5 $1$ccc$CCCCCCCCCCCCCCCCCCCCCC\n"  # ONLY this changed
+         "interface Gi0/1\n description uplink\n")
+    backup4_id, hash4 = service.configrx_db.add_backup(device_id, v4, redacted=False)
+    check("v4's hash differs from v1's — a real byte-level change on disk",
+          backup4_id is not None and hash4 != hash1, (backup4_id, hash4, hash1))
+
+    status, payload = call(
+        "GET", "/api/configrx/diff",
+        {"device": device_id, "from": backup1_id, "to": backup4_id}, token=admin)
+    check("200, empty visible diff (the secret change is invisible to a redacted diff)",
+          status == 200 and payload.get("diff") == "" and payload.get("additions") == 0
+          and payload.get("removals") == 0, (status, payload))
+    check("...NOT reported as identical — the two rows really do differ on disk",
+          payload.get("identical") is False, payload)
+    check("...and the response says plainly the difference is entirely redacted material",
+          payload.get("redacted_only_change") is True, payload)
 
     print("refusals")
     other_device_id = service.nodes_db.add_device(

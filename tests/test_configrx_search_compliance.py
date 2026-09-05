@@ -43,7 +43,18 @@ Covers:
   - a rule's pattern (and kind) validated at add_rule time, before it is
     ever stored;
   - forget_device removing a device's search-index rows and compliance
-    results along with its backups.
+    results along with its backups;
+  - a bounded outer repeat of an already-ambiguous group, like the dotted-
+    quad IP idiom (\d{1,3}\.){3}\d{1,3}, is NOT refused as unsafe — only
+    an unbounded outer repeat (+, *, {n,}) of one is;
+  - a compliance sweep against an adversarial MUST_NOT_MATCH rule
+    (measured, not assumed: the worst-case shape compile_bounded still
+    lets through, against enough worst-case lines to blow well past the
+    budget if the deadline were not checked) is bounded by
+    COMPLIANCE_SWEEP_BUDGET_S rather than left to run for the hours this
+    shape would otherwise cost across a real fleet, with a device it
+    never reaches left untouched and a device it starts but cannot finish
+    marked not_yet_assessed rather than a silent pass.
 """
 from __future__ import annotations
 
@@ -337,6 +348,149 @@ check("a compliance result exists before forgetting",
 db.forget_device(6)
 check("search lines are gone after forget_device", db.all_search_lines([6]) == [])
 check("the compliance result is gone too", db.compliance_result(6, rule_set_id) is None)
+
+
+# ---------------------------------------- bounded-quantifier false positive
+#
+# Found by an adversarial pass against compile_bounded: the dotted-quad IP
+# idiom written as (\d{1,3}\.){3}\d{1,3} (a bounded outer group, {3} — the
+# single most common way anyone writes an IPv4 match) was refused as
+# "unsafe", because _has_nested_repetition could not tell a BOUNDED outer
+# quantifier (cannot itself blow up whatever it wraps) from an unbounded
+# one (+, *, {n,}) that can. Fixed by teaching the check the difference —
+# see _quantifier_at's "unbounded" flag and _has_nested_repetition's own
+# docstring in configrx_search.py.
+
+print("a fixed-count outer repeat of an ambiguous group is not refused "
+      "(the dotted-quad idiom written with a bounded group)")
+check("(\\d{1,3}\\.){3}\\d{1,3} — the common way to write an IPv4 match — "
+      "is accepted, not refused as unsafe",
+      cs.compile_bounded(r"(\d{1,3}\.){3}\d{1,3}") is not None)
+check("(a+){3} — a bounded outer repeat of a single quantified atom — "
+      "is accepted too",
+      cs.compile_bounded(r"(a+){3}") is not None)
+
+print("an UNBOUNDED outer repeat of an ambiguous group is still refused, "
+      "bounded or not underneath")
+for still_unsafe in (r"(a+)+", r"(a|aa)+", r"((a+){3})+", r"(\d{1,3}\.){3,}"):
+    try:
+        cs.compile_bounded(still_unsafe)
+        check(f"{still_unsafe!r} should still be refused (unbounded outer "
+              f"repeat)", False)
+    except cs.UnsafeRegex:
+        check(f"{still_unsafe!r} still refused", True)
+
+
+# --------------------------------------------- compliance sweep wall-clock budget
+#
+# Found by the same adversarial pass, and severe rather than merely slow:
+# evaluate_all/evaluate_device_all_rule_sets had NO wall-clock ceiling at
+# all, unlike configrx_search.py's own _scan(), whose docstring explains
+# exactly why one is needed ("a device with thousands of lines could still
+# add those up... without a check this fine-grained"). A MUST_NOT_MATCH
+# rule that legitimately never matches must scan every line to prove that
+# — the expensive case — and a pattern shaped like an honest doubled
+# quantifier (a+a+a+c, exactly MAX_ADJACENT_QUANTIFIER_RUN atoms, still
+# accepted by compile_bounded on purpose) costs ~0.33s on one worst-case
+# 250-character line with no match. Measured against a realistic-but-
+# adversarial fixture, evaluate_all() over 200 devices x 200 such lines
+# did not finish in 120 measured seconds and projected to roughly two and
+# a half hours. Severe because evaluate_all runs on ConfigRxWorker's OWN
+# scheduling thread (configrx.py:_loop) — an unbounded sweep is an
+# unbounded pause on ever checking devices_due() again, silently switching
+# off backups for the entire fleet.
+#
+# This is NOT a synthetic timing assumption — it reproduces the exact
+# adversarial shape and measures that COMPLIANCE_SWEEP_BUDGET_S actually
+# bounds the wall-clock cost of the call, the same standard the regex
+# safety tests above hold themselves to ("a test that passes at eight
+# seconds proves nothing" — this asserts against elapsed time, not just
+# that the call returned).
+
+print("a MUST_NOT_MATCH rule shaped like an honest doubled-quantifier "
+      "mistake does not hang the sweep — it is bounded by "
+      "COMPLIANCE_SWEEP_BUDGET_S instead")
+
+budget_db = ConfigRxDatabase(os.path.join(TMPDIR, "configrx_budget.db"))
+budget_nodes = FakeNodesDB()
+budget_nodes.add(101, device_group_id=None)
+budget_nodes.add(102, device_group_id=None)
+
+# 250-char lines of nothing but 'a' — the worst case _has_adjacent_
+# quantifiers still lets through, forcing full backtracking with no match
+# ever found. ~40 lines is already enough to blow well past the budget at
+# ~0.33s/line if the deadline were not checked per line.
+worst_line = "a" * 250
+adversarial_capture = "\n".join([worst_line] * 40)
+budget_db.add_backup(101, adversarial_capture)
+budget_db.add_backup(102, adversarial_capture)
+
+budget_rule_set = cc.add_rule_set(budget_db, "adversarial")
+cc.add_rule(budget_db, budget_rule_set,
+           "must not contain the doubled-quantifier shape",
+           cc.RuleKind.MUST_NOT_MATCH, r"a+a+a+c")
+
+t0 = time.monotonic()
+budget_stats: dict = {}
+evaluated_count = cc.evaluate_all(budget_db, budget_nodes, budget_rule_set,
+                                  stats=budget_stats)
+elapsed = time.monotonic() - t0
+print(f"  evaluate_all over the adversarial fixture: {elapsed:.2f}s elapsed, "
+     f"{evaluated_count} device(s) reached, truncated={budget_stats.get('truncated')}")
+check("stopped at (or shortly after) COMPLIANCE_SWEEP_BUDGET_S, not left to "
+     "run for the ~2.5h this shape projects to unbounded",
+     elapsed < cc.COMPLIANCE_SWEEP_BUDGET_S + 5.0, f"{elapsed:.2f}s")
+check("evaluate_all reports truncated=True through the stats out-param",
+     budget_stats.get("truncated") is True, budget_stats)
+
+result_101 = budget_db.compliance_result(101, budget_rule_set)
+check("device 101 (the one reached) is marked not_yet_assessed, never a "
+     "silent pass, because its one rule never finished being checked",
+     result_101 is not None and result_101["status"] == cc.STATUS_NOT_YET_ASSESSED,
+     dict(result_101) if result_101 else None)
+check("device 102 (never reached before the budget ran out) has no result "
+     "row at all — left untouched rather than written over with a rushed "
+     "status",
+     budget_db.compliance_result(102, budget_rule_set) is None)
+check("a not_yet_assessed device records no compliance_fail_count sample "
+     "either — an absent metric key, same as not_assessed, never a 0 a "
+     "threshold rule would read as compliant",
+     101 not in budget_nodes.metrics, budget_nodes.metrics.get(101))
+
+print("a realistic fleet-scale sweep (no adversarial rule) is unaffected "
+     "by the budget and finishes well under it")
+normal_db = ConfigRxDatabase(os.path.join(TMPDIR, "configrx_normal.db"))
+normal_nodes = FakeNodesDB()
+realistic_lines = (["!", "hostname sw", "ntp server 10.10.0.1",
+                    "snmp-server community PlantRO2026 RO",
+                    "interface GigabitEthernet1/0/1",
+                    " switchport mode access", " switchport port-security",
+                    "line vty 0 4", " transport input ssh"] * 89)  # ~800 lines
+realistic_capture = "\n".join(realistic_lines)
+for dev_id in range(1, 51):
+    normal_nodes.add(dev_id, device_group_id=None)
+    normal_db.add_backup(dev_id, realistic_capture)
+normal_rule_set = cc.add_rule_set(normal_db, "baseline")
+cc.add_rule(normal_db, normal_rule_set, "ntp present", cc.RuleKind.MUST_MATCH,
+           r"^ntp server \d+\.\d+\.\d+\.\d+$")
+cc.add_rule(normal_db, normal_rule_set, "no telnet", cc.RuleKind.MUST_NOT_MATCH,
+           r"transport input telnet")
+cc.add_rule(normal_db, normal_rule_set, "no default snmp community",
+           cc.RuleKind.MUST_NOT_MATCH, r"snmp-server community public")
+cc.add_rule(normal_db, normal_rule_set,
+           "port security dotted-quad-bounded-group idiom compiles and runs",
+           cc.RuleKind.MUST_NOT_MATCH, r"(\d{1,3}\.){3}999")
+t0 = time.monotonic()
+normal_stats: dict = {}
+normal_count = cc.evaluate_all(normal_db, normal_nodes, normal_rule_set,
+                               stats=normal_stats)
+normal_elapsed = time.monotonic() - t0
+print(f"  {normal_count} devices x 4 rules x ~800 lines: {normal_elapsed:.3f}s")
+check("every device was evaluated", normal_count == 50, normal_count)
+check("not truncated — nowhere near the budget for realistic rules",
+     normal_stats.get("truncated") is False, normal_stats)
+check("finishes in a small fraction of the budget",
+     normal_elapsed < cc.COMPLIANCE_SWEEP_BUDGET_S / 2, f"{normal_elapsed:.3f}s")
 
 
 print()
