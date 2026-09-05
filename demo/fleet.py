@@ -18,17 +18,25 @@ the same banner contract tests/_paths.spawn_stub() waits for.
 
 Design notes
 ------------
-* One selectors.DefaultSelector over every device socket. The loop is
-  purely reactive: nothing is recomputed on a timer, and every
-  time-varying value (uptime, counters, flapping ports, the scheduled
-  outage and reboot devices) is derived from the clock at reply time.
-  Idle CPU is therefore ~0 regardless of fleet size.
+* The device sockets are sharded across selectors.DefaultSelector
+  instances, MAX_SOCKETS_PER_SHARD each, one selector loop per shard
+  running in its own thread. This exists because selectors.DefaultSelector
+  on Windows is selectors.SelectSelector, and select() there is capped at
+  FD_SETSIZE (512) file descriptors — a single selector simply cannot hold
+  a 1000- or 2000-device fleet. Below that cap, though, each shard's loop
+  is purely reactive exactly as a single selector would be: nothing is
+  recomputed on a timer, and every time-varying value (uptime, counters,
+  flapping ports, the scheduled outage and reboot devices) is derived from
+  the clock at reply time. Idle CPU is therefore ~0 regardless of fleet
+  size, and a device answers on whichever shard's thread holds its socket
+  without the shards needing to know about each other.
 * A slow device's reply is computed on arrival and parked on a due-time
-  heap that the selector loop drains, so one 2.6 s device cannot stall the
-  loop and a hundred of them cannot queue behind each other either. (A
-  fixed-size thread pool was the obvious alternative and is wrong: with 87
-  devices at 400 ms and 8 workers, replies queue ~4 s deep and the poller
-  sees timeouts no device actually caused.)
+  heap that its shard's selector loop drains, so one 2.6 s device cannot
+  stall that loop (and, since the heap is per shard, cannot stall any
+  other shard's loop either) and a hundred of them cannot queue behind
+  each other. (A fixed-size thread pool was the obvious alternative and is
+  wrong: with 87 devices at 400 ms and 8 workers, replies queue ~4 s deep
+  and the poller sees timeouts no device actually caused.)
 * A control HTTP server on 127.0.0.1:<control-port> exposes GET /state and
   POST /event, so a demo script can knock devices over and bring them back
   while the app watches.
@@ -66,6 +74,22 @@ from netpath.trapdecode import (                            # noqa: E402
 SNMP_PORT = 161
 MAX_UDP = 65535
 MAX_VARBINDS_PER_REPLY = 120        # keeps a GETBULK reply inside one datagram
+
+# select.select()'s FD_SETSIZE limit is 512 on every platform CPython
+# builds for, but on Windows selectors.DefaultSelector *is* SelectSelector
+# (epoll/kqueue/poll do not exist there), so it is the only selector this
+# process can use and 512 sockets is therefore a hard ceiling per selector,
+# not just a soft default. Measured on this machine: 512 registered sockets
+# selects fine (0.08 ms/call), 513 raises "ValueError: too many file
+# descriptors in select()" — and it raises from inside serve_forever(),
+# not from bind(), so an oversized shard binds all its sockets without
+# complaint and only falls over on the very first poll, which looks at a
+# glance like a fleet that started fine and then mysteriously died. 400
+# rather than 512 leaves headroom for the handful of other descriptors a
+# Python process already holds open (stdio, the interpreter's own
+# housekeeping fds, the signal module's wakeup socket pair) so a shard
+# that is otherwise full does not tip a select() call over FD_SETSIZE.
+MAX_SOCKETS_PER_SHARD = 400
 
 # usmStats counters, the objects a Report-PDU carries (RFC 3414 s5).
 USM_UNKNOWN_ENGINE_IDS = "1.3.6.1.6.3.15.1.1.4.0"
@@ -432,55 +456,33 @@ def _handle_v3(dev: DeviceState, data: bytes, request, now: float) -> bytes | No
 
 # ------------------------------------------------------------- the fleet
 
-class Fleet:
-    def __init__(self, count: int, quiet: bool = False):
-        self.quiet = quiet
-        self.plan = fleet_plan(count)
-        self.devices: dict[str, DeviceState] = {}
-        self.sockets: list[socket.socket] = []
+class _Shard:
+    """One selector's worth of device sockets, served by one thread.
+
+    Everything a serve loop touches — the selector, the slow-responder
+    due-time heap, the tie-breaking sequence counter — lives here rather
+    than on Fleet, because it is precisely the state that must NOT be
+    shared between shards: two threads pushing onto one heap or registering
+    on one selector would need locking on every single packet, which is
+    exactly the per-packet overhead sharding is meant to avoid. A device's
+    socket is registered on exactly one shard for its whole life, so its
+    deferred replies only ever need that shard's heap.
+    """
+
+    def __init__(self, index: int):
+        self.index = index
         self.selector = selectors.DefaultSelector()
+        self.sockets: list[socket.socket] = []
         # (due_ts, seq, sock, addr, reply) for devices with slow_ms set.
         self._deferred: list[tuple] = []
         self._seq = itertools.count()
-        self.started_ts = time.time()
-        self._stop = threading.Event()
 
-    def log(self, message: str) -> None:
-        if not self.quiet:
-            print(message, flush=True)
+    def register(self, sock: socket.socket, dev: DeviceState) -> None:
+        self.sockets.append(sock)
+        self.selector.register(sock, selectors.EVENT_READ, dev)
 
-    def bind(self) -> None:
-        failures = 0
-        for entry in self.plan:
-            dev = build_device(entry)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind((dev.ip, SNMP_PORT))
-            except OSError as exc:
-                sock.close()
-                failures += 1
-                if failures <= 5:
-                    hint = ""
-                    if exc.errno == errno.EACCES:
-                        hint = " (port 161 needs root)"
-                    elif exc.errno == errno.EMFILE:
-                        hint = " (raise the open-file limit: ulimit -n 8192)"
-                    print(f"bind {dev.ip}:{SNMP_PORT} failed: {exc}{hint}",
-                          file=sys.stderr, flush=True)
-                continue
-            sock.setblocking(False)
-            self.devices[dev.ip] = dev
-            self.sockets.append(sock)
-            self.selector.register(sock, selectors.EVENT_READ, dev)
-        if failures:
-            print(f"{failures} of {len(self.plan)} sockets failed to bind",
-                  file=sys.stderr, flush=True)
-        if not self.devices:
-            raise SystemExit("no device sockets bound; nothing to serve")
-
-    def serve_forever(self) -> None:
-        while not self._stop.is_set():
+    def serve(self, stop: threading.Event) -> None:
+        while not stop.is_set():
             timeout = 0.5
             if self._deferred:
                 timeout = max(0.0, min(0.5, self._deferred[0][0] - time.time()))
@@ -522,9 +524,6 @@ class Fleet:
             except OSError:
                 pass
 
-    def stop(self) -> None:
-        self._stop.set()
-
     def close(self) -> None:
         self._deferred.clear()
         for sock in self.sockets:
@@ -534,6 +533,122 @@ class Fleet:
                 pass
             sock.close()
         self.selector.close()
+
+
+class Fleet:
+    def __init__(self, count: int, quiet: bool = False):
+        self.quiet = quiet
+        self.plan = fleet_plan(count)
+        self.devices: dict[str, DeviceState] = {}
+        self.sockets: list[socket.socket] = []
+        # Filled in by bind(), one shard per MAX_SOCKETS_PER_SHARD bound
+        # devices; shard 0's loop runs on the main thread (see
+        # serve_forever) and every other shard gets its own thread.
+        self._shards: list[_Shard] = []
+        self.started_ts = time.time()
+        self._stop = threading.Event()
+
+    def log(self, message: str) -> None:
+        if not self.quiet:
+            print(message, flush=True)
+
+    def _shard_for(self, position: int) -> _Shard:
+        """The shard that owns the `position`-th successfully bound socket,
+        creating shards on demand so a device count that does not fill the
+        last shard does not leave an empty one dangling."""
+        index = position // MAX_SOCKETS_PER_SHARD
+        while len(self._shards) <= index:
+            self._shards.append(_Shard(len(self._shards)))
+        return self._shards[index]
+
+    def bind(self) -> None:
+        failures = 0
+        bound = 0
+        for entry in self.plan:
+            dev = build_device(entry)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # SO_REUSEADDR means "let me rebind a port stuck in TIME_WAIT"
+            # on POSIX, which is exactly the harmless, useful thing a demo
+            # that restarts a lot wants. On Windows it means something else
+            # entirely: a second process can bind the SAME 127.0.0.x:161
+            # that a first fleet already owns, and the OS then delivers
+            # each inbound datagram to whichever of the two it feels like,
+            # with no error raised anywhere — verified on this machine, and
+            # exactly the kind of bug that only shows up as "the poller got
+            # a reply from the wrong device" hours later. SO_EXCLUSIVEADDRUSE
+            # is the Windows option that actually means "fail the bind if
+            # anyone else already has this address," which is what every
+            # other platform's default bind behaviour already gives you.
+            # The two options are mutually exclusive and EXCLUSIVEADDRUSE
+            # has to be set before bind(), same as REUSEADDR.
+            if os.name == "nt":
+                sock.setsockopt(socket.SOL_SOCKET,
+                                socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((dev.ip, SNMP_PORT))
+            except OSError as exc:
+                sock.close()
+                failures += 1
+                if failures <= 5:
+                    hint = ""
+                    if exc.errno == errno.EACCES:
+                        # On POSIX this is unambiguous: binding 161 needs
+                        # root. On Windows the same errno also covers a
+                        # port RESERVED by another process (netsh
+                        # excludedportrange, a Hyper-V NAT reservation) or
+                        # simply another listener already sitting on that
+                        # address — "needs root" would be actively
+                        # misleading advice on that platform.
+                        hint = (" (port 161 needs root)" if os.name != "nt"
+                                else " (port reserved, or already in use "
+                                     "by another listener)")
+                    elif exc.errno == errno.EMFILE:
+                        # ulimit -n only exists on POSIX; raising Windows'
+                        # per-process handle ceiling is a registry change
+                        # (USER Object/Handle quotas), not a shell command,
+                        # so the two platforms need different hints for the
+                        # same errno.
+                        hint = (" (raise the open-file limit: ulimit -n 8192)"
+                                if os.name != "nt" else
+                                " (too many open handles for this process)")
+                    print(f"bind {dev.ip}:{SNMP_PORT} failed: {exc}{hint}",
+                          file=sys.stderr, flush=True)
+                continue
+            sock.setblocking(False)
+            self.devices[dev.ip] = dev
+            self.sockets.append(sock)
+            self._shard_for(bound).register(sock, dev)
+            bound += 1
+        if failures:
+            print(f"{failures} of {len(self.plan)} sockets failed to bind",
+                  file=sys.stderr, flush=True)
+        if not self.devices:
+            raise SystemExit("no device sockets bound; nothing to serve")
+
+    def serve_forever(self) -> None:
+        # Shard 0 runs on the calling thread so Ctrl-C/SIGTERM keep working
+        # exactly as before sharding existed (the signal handler sets
+        # self._stop, and it is this thread's blocking select() call that
+        # has to notice it and return); every other shard is driven from
+        # its own thread and joined once shard 0's loop exits.
+        threads = [threading.Thread(target=shard.serve, args=(self._stop,),
+                                    name=f"shard-{shard.index}", daemon=True)
+                  for shard in self._shards[1:]]
+        for thread in threads:
+            thread.start()
+        if self._shards:
+            self._shards[0].serve(self._stop)
+        for thread in threads:
+            thread.join()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def close(self) -> None:
+        for shard in self._shards:
+            shard.close()
 
     # -------------------------------------------------------- control API
 
@@ -593,6 +708,23 @@ class Fleet:
             dev.toobig = True
         elif action == "toobig_off":
             dev.toobig = False
+        elif action == "on_battery":
+            # personas._build_apc_ups reads nothing but this one flag: every
+            # upsBattery/PowerNet scalar (upsSecondsOnBattery, the charge and
+            # runtime-remaining counters, upsOutputSource) is a pure function
+            # of dev.on_battery and the clock, so flipping it is the whole
+            # event — the charge is already seen to count down against real
+            # elapsed time with no further action needed here.
+            dev.on_battery = True
+        elif action == "on_mains":
+            dev.on_battery = False
+        elif action == "temp_hot_on":
+            # Same shape for personas._room_temp_c: a Room Alert has exactly
+            # two states, not an arbitrary setpoint, so "over a threshold"
+            # is this flag rather than a temperature value.
+            dev.temp_hot = True
+        elif action == "temp_hot_off":
+            dev.temp_hot = False
         else:
             return False
         return True

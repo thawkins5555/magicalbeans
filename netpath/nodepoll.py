@@ -700,6 +700,12 @@ class NodePoller:
         # device_id -> when its ipAddrTable was last read. See
         # _refresh_addresses: once an hour, not once a poll.
         self._addresses_read: dict[int, float] = {}
+        # device_id -> when its ENTITY-SENSOR-MIB table was last walked.
+        # See _poll_environment/_SENSOR_REFRESH_S: a fixed cadence, in
+        # memory only, the same shape _addresses_read already uses for a
+        # walk that answers something that does not change between one
+        # poll and the next.
+        self._sensor_read: dict[int, float] = {}
         # device_id -> the GETBULK repetition count that last worked for it.
         # A device that answers "tooBig" is retried at half as many rows, and
         # remembering that means the next walk starts where the last one
@@ -1098,7 +1104,8 @@ class NodePoller:
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
                       self._next_lldp_walk,
                       self._credentials, self._credential_probe_failed,
-                      self._addresses_read, self._bulk_repetitions):
+                      self._addresses_read, self._bulk_repetitions,
+                      self._sensor_read):
             for device_id in [k for k in cache if k not in keep]:
                 cache.pop(device_id, None)
         with self._lock:
@@ -1614,16 +1621,16 @@ class NodePoller:
         # T4 — every sample this poll produced, in one transaction.
         self.db.record_metric_samples(device_id, samples)
 
-        # ------------------------------------------------------- PoE / STP
+        # ---------------------------------------- PoE / STP / environment
         #
-        # After the interface rows above are written, not before: both
-        # write per-port columns onto `interfaces` keyed by (device_id,
-        # if_index), and a row that does not exist yet updates nothing.
-        # Each is its own best-effort, capability-probed read (see their
-        # own docstrings) — a device that fails one must not lose the
-        # other, so each gets its own try rather than sharing the block
-        # above's exception handling with the fields the device's up/down
-        # status actually depends on.
+        # After the interface rows above are written, not before: PoE and
+        # STP write per-port columns onto `interfaces` keyed by
+        # (device_id, if_index), and a row that does not exist yet updates
+        # nothing. Each of the three is its own best-effort, independently
+        # gated read (see their own docstrings) — a device that fails one
+        # must not lose the others, so each gets its own try rather than
+        # sharing the block above's exception handling with the fields the
+        # device's up/down status actually depends on.
         if snmp_ok and config.get("snmp_enabled"):
             if config.get("poe_enabled", True):
                 try:
@@ -1643,6 +1650,16 @@ class NodePoller:
                     self._bump("errors")
                     self.log.add(ERROR, f"STP read failed for device #{device_id}",
                                  detail=traceback.format_exc())
+            try:
+                self._poll_environment(device_id, device, cred_config,
+                                       {m[0] for m in metrics}, now)
+            except SnmpError:
+                pass
+            except Exception:
+                self._bump("errors")
+                self.log.add(ERROR, f"Environmental sensor read failed for "
+                                    f"device #{device_id}",
+                             detail=traceback.format_exc())
 
     def working_config(self, device) -> dict:
         """The config an *on-demand* read should use — effective_config()
@@ -1956,6 +1973,13 @@ class NodePoller:
 
         metrics.extend(self._poll_vendor_health(device, config, identity,
                                                 already={m[0] for m in metrics}))
+        # UPS-MIB: battery/output health for anything wired to a UPS that
+        # answers SNMP. Not arc-gated the way _poll_vendor_health is — see
+        # nodeoids.UPS_HEALTH's module comment for why — so it is read here,
+        # best-effort, on every device exactly like the UCD-SNMP block
+        # above rather than folded into _poll_vendor_health's per-arc loop.
+        metrics.extend(self._poll_ups_health(device, config, identity,
+                                             already={m[0] for m in metrics}))
         # Tier 1 #8: RSSI/SNR/capacity for a PtP wireless bridge — the same
         # arc-gated, best-effort scalar shape _poll_vendor_health uses just
         # above, kept as its own method because RF is not "health" and has
@@ -2154,6 +2178,86 @@ class NodePoller:
         if metrics:
             self._bump("rf_polls")
         return metrics
+
+    def _poll_ups_health(self, device, config: dict, identity: dict,
+                         already=()) -> list[tuple]:
+        """UPS-MIB (RFC 1628) battery/output health.
+
+        Tried on EVERY device, not gated by enterprise arc the way
+        VENDOR_HEALTH is — see nodeoids.UPS_HEALTH's module comment for
+        why keying this to a vendor list would not work for a UPS the way
+        it does for a switch or router.
+
+        Cost is still controlled, just not by an arc lookup: the first
+        read is one GET of every scalar in the table, which is no more
+        expensive than the UCD-SNMP read every device already gets, and
+        the two per-line TABLE reads (upsInputVoltage, upsOutputPercent-
+        Load — each its own GETBULK walk) are only attempted once that
+        GET shows at least one scalar answered. A device that is not a
+        UPS answers none of them and is never asked for the tables at
+        all, so a non-UPS device in the fleet pays for exactly one extra
+        GET per poll, the same one UCD_SNMP already costs it.
+        """
+        metrics: list[tuple] = []
+        scalars = [probe for probe in nodeoids.UPS_HEALTH if probe[4] == "scalar"]
+        try:
+            response = self._snmp_get(device, config, [probe[3] for probe in scalars])
+            values = {vb["oid"]: vb for vb in response.varbinds}
+        except SnmpError:
+            return metrics
+        answered = False
+        for key, label, unit, oid, _how, scale in scalars:
+            vb = values.get(oid)
+            if vb and vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                         "endOfMibView", "null") \
+                    and isinstance(vb["value"], (int, float)):
+                answered = True
+                if key not in already:
+                    metrics.append((key, label, unit, "gauge",
+                                    float(vb["value"]) * scale))
+        if not answered:
+            # Nothing in the scalar batch answered: not a UPS (or a UPS
+            # that does not implement UPS-MIB at all), so the two column
+            # walks below are skipped rather than sent to every non-UPS
+            # device in the fleet on every poll.
+            return metrics
+        for key, label, unit, oid, how, scale in nodeoids.UPS_HEALTH:
+            if how == "scalar" or key in already:
+                continue
+            value = self._health_column(device, config, oid, how)
+            if value is not None:
+                metrics.append((key, label, unit, "gauge", value * scale))
+        if "ups_runtime_min" not in already and \
+                not any(m[0] == "ups_runtime_min" for m in metrics):
+            arc = identity.get("vendor_arc") if identity else None
+            if arc is None:
+                arc = nodeoids.enterprise_arc((identity or {}).get("sys_object_id") or "")
+            if arc == 318:   # APC / Schneider
+                runtime = self._apc_runtime_fallback(device, config)
+                if runtime is not None:
+                    metrics.append(("ups_runtime_min", "Estimated runtime remaining",
+                                    "min", "gauge", runtime))
+        return metrics
+
+    def _apc_runtime_fallback(self, device, config: dict) -> float | None:
+        """APC PowerNet-MIB's upsAdvBatteryRunTimeRemaining, in TimeTicks
+        (hundredths of a second), converted to minutes — read only when
+        the standard upsEstimatedMinutesRemaining scalar did not answer.
+        See nodeoids.APC_BATTERY_RUNTIME_TIMETICKS for why this one
+        fallback, alone among everything else this module reads, is not
+        cross-checked against a live unit."""
+        try:
+            response = self._snmp_get(
+                device, config, [nodeoids.APC_BATTERY_RUNTIME_TIMETICKS])
+        except SnmpError:
+            return None
+        for vb in response.varbinds:
+            if vb["oid"] == nodeoids.APC_BATTERY_RUNTIME_TIMETICKS \
+                    and vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                           "endOfMibView", "null") \
+                    and isinstance(vb["value"], (int, float)):
+                return float(vb["value"]) / 100.0 / 60.0
+        return None
 
     def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
                           defer_assignment: bool = False) -> None:
@@ -2824,6 +2928,55 @@ class NodePoller:
                           12: ""}
     _SENSOR_STATUS = {1: "ok", 2: "unavailable", 3: "nonoperational"}
 
+    # entPhySensorType values this app turns into a device-level metric —
+    # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (voltage,
+    # current, power, frequency, fan speed, airflow) are real DOM readings
+    # on a transceiver, which read_dom already surfaces, but none of them
+    # is something a *device* has one true value for the way temperature
+    # and humidity are, so none of them is promoted to a metric here.
+    _SENSOR_TYPE_TEMPERATURE = 8
+    _SENSOR_TYPE_HUMIDITY = 9
+
+    def _decode_entity_sensor(self, suffix: str, raw, types: dict, scales: dict,
+                              precisions: dict, statuses: dict, units: dict,
+                              descrs: dict) -> dict | None:
+        """One ENTITY-SENSOR-MIB row (RFC 3433) -> {"entity", "label",
+        "value", "unit", "status"}, or None when `raw` is not the number
+        entPhySensorValue is supposed to be (an unpopulated row, or an
+        agent answering the wrong ASN.1 type for this instance).
+
+        Factored out of read_dom so it and _poll_environment do the exact
+        same scaling arithmetic in exactly one place. Before this, only
+        read_dom had it — reachable solely through entAliasMappingIdentifier,
+        which maps a sensor to the PORT it rides on. An environmental
+        monitor's temperature and humidity probes belong to the chassis,
+        not to any port, map to nothing in that table, and so were
+        invisible everywhere in this app: read_dom returned [] and the
+        interface dialog said "no sensors" for a device that had plenty.
+        """
+        if not isinstance(raw, (int, float)):
+            return None
+        try:
+            entity = int(suffix)
+        except ValueError:
+            return None
+        sensor_type = int(types.get(suffix) or 0)
+        scale = int(scales.get(suffix) or 9)       # 9 = units (10^0)
+        precision = int(precisions.get(suffix) or 0)
+        # RFC 3433: the reading is value x 10^(3*(scale-9)) with
+        # `precision` decimal places already folded into the integer.
+        value = raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+        unit = str(units.get(suffix) or "").strip() or \
+            self._SENSOR_TYPE_UNITS.get(sensor_type, "")
+        return {
+            "entity": entity,
+            "label": str(descrs.get(suffix) or f"sensor {entity}"),
+            "value": round(value, max(precision, 4)),
+            "unit": unit,
+            "status": self._SENSOR_STATUS.get(
+                int(statuses.get(suffix) or 0), "unknown"),
+        }
+
     def read_dom(self, device_id: int, if_index: int) -> list[dict]:
         """Live on-demand read of ENTITY-SENSOR-MIB sensors belonging to one
         interface — DOM/DDM data on an SFP port (light levels, bias
@@ -2889,26 +3042,114 @@ class NodePoller:
                 entity = int(suffix)
             except ValueError:
                 continue
-            if not belongs_to_port(entity) or not isinstance(raw, (int, float)):
+            if not belongs_to_port(entity):
                 continue
-            sensor_type = int(types.get(suffix) or 0)
-            scale = int(scales.get(suffix) or 9)       # 9 = units (10^0)
-            precision = int(precisions.get(suffix) or 0)
-            # RFC 3433: the reading is value x 10^(3*(scale-9)) with
-            # `precision` decimal places already folded into the integer.
-            value = raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
-            unit = str(units.get(suffix) or "").strip() or \
-                self._SENSOR_TYPE_UNITS.get(sensor_type, "")
-            sensors.append({
-                "entity": entity,
-                "label": str(descrs.get(suffix) or f"sensor {entity}"),
-                "value": round(value, max(precision, 4)),
-                "unit": unit,
-                "status": self._SENSOR_STATUS.get(
-                    int(statuses.get(suffix) or 0), "unknown"),
-            })
+            reading = self._decode_entity_sensor(
+                suffix, raw, types, scales, precisions, statuses, units, descrs)
+            if reading is not None:
+                sensors.append(reading)
         sensors.sort(key=lambda s: s["entity"])
         return sensors
+
+    # How often the whole-device ENTITY-SENSOR-MIB walk in _poll_environment
+    # runs, per device. Six column walks (type, scale, precision, value,
+    # status, units, plus physical descr for a label — the same set
+    # read_dom already does, just for every entity rather than one port's)
+    # is the same shape of cost the LLDP/MAC walks are, so it gets a
+    # cadence rather than running on the poll cycle — but a temperature or
+    # a humidity reading does not change between one poll and the next the
+    # way an interface counter does, so there is nothing to buy by
+    # re-walking it that often either.
+    #
+    # Fixed here rather than a per-device config column the way
+    # lldp_interval_s/mac_table_interval_s are: adding one of those means a
+    # schema migration, a group-inheritance column and a settings-page
+    # control, none of which is this change's to make. A fixed cadence,
+    # in-memory only (see _sensor_read, and _refresh_addresses just above
+    # for the identical tradeoff already made for ipAddrTable), costs
+    # nothing extra to add and re-walks once per process restart at worst.
+    #
+    # Kept safely under alertengine's threshold_stale_s (900s shipped
+    # default): a metric older than that reads as "absent" to a threshold
+    # rule (see alertengine._evaluate_thresholds), and a sensor cadence
+    # equal to or slower than that would make temp_high/humidity_high
+    # flicker in and out of "no data" between refreshes instead of holding
+    # a value. Five minutes leaves three refreshes of margin inside that
+    # 900-second window.
+    _SENSOR_REFRESH_S = 300.0
+
+    def _poll_environment(self, device_id: int, device, config: dict,
+                          already: set, now: float) -> None:
+        """Device-level temperature/humidity from ENTITY-SENSOR-MIB (RFC
+        3433) — a Room Alert-class environmental monitor, or any switch,
+        router or PDU that exposes its own chassis sensors through the
+        standard MIB rather than (or in addition to) a vendor-specific one.
+
+        Deliberately does NOT require entAliasMappingIdentifier the way
+        read_dom() does — see _decode_entity_sensor's docstring for why
+        that gate exists and why it made an environmental monitor's
+        sensors unreachable everywhere in this app. Every entity the walk
+        finds is used here, whether or not it maps to a port; an entity
+        read_dom also uses (a transceiver's temperature sensor) is not
+        excluded either; a hot SFP is still a true reading of "how hot is
+        this chassis running."
+
+        Best-effort and gated by _SENSOR_REFRESH_S rather than run every
+        poll — see that constant's comment. A device with no ENTITY-MIB
+        support (or nothing currently past its cadence) costs one failed
+        GETBULK and returns; nothing here counts as a poll failure.
+        """
+        if now - self._sensor_read.get(device_id, 0.0) < self._SENSOR_REFRESH_S:
+            return
+        self._sensor_read[device_id] = now
+        try:
+            sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+        except SnmpError:
+            return
+        if not sensor_values:
+            return
+        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
+        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
+        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
+        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
+        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
+        descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+
+        temps: list[float] = []
+        humidities: list[float] = []
+        for suffix, raw in sensor_values.items():
+            sensor_type = int(types.get(suffix) or 0)
+            if sensor_type not in (self._SENSOR_TYPE_TEMPERATURE,
+                                   self._SENSOR_TYPE_HUMIDITY):
+                continue
+            reading = self._decode_entity_sensor(
+                suffix, raw, types, scales, precisions, statuses, units, descrs)
+            # A sensor reporting anything other than "ok" (unplugged,
+            # failed, out of range) contributes nothing rather than a
+            # bogus reading — an alert on a physical quantity is worth
+            # nothing if it can silently be sourced from a dead probe.
+            if reading is None or reading["status"] != "ok":
+                continue
+            (temps if sensor_type == self._SENSOR_TYPE_TEMPERATURE
+             else humidities).append(reading["value"])
+
+        samples = []
+        if temps and "temp_c" not in already:
+            # Worst (hottest) sensor wins — the same "the hot spot is what
+            # matters" reasoning VENDOR_HEALTH's Juniper jnxOperatingTable
+            # read already uses for column_max — and deliberately the SAME
+            # metric key: a device answering both jnxOperatingTable and
+            # ENTITY-SENSOR-MIB must report one temperature, not two that
+            # disagree depending on which the poller happened to read
+            # this cycle. `already` is what this poll's vendor-health pass
+            # produced; a device with a better vendor-specific reading
+            # keeps it, and this only fills in for one that has none.
+            samples.append(("temp_c", "Temperature", "°C", "gauge", now, max(temps)))
+        if humidities:
+            samples.append(("humidity_pct", "Humidity", "%RH", "gauge", now,
+                            max(humidities)))
+        if samples:
+            self.db.record_metric_samples(device_id, samples)
 
     # BRIDGE-MIB (RFC 4188) columns used by read_mac_table() to map the
     # forwarding-database entries learned on a switch port back to the

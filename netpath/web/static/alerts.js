@@ -639,8 +639,21 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Mute', primary: true, onClick: async (box) => {
         const scope = readScopeFields(box, 'bm');
+        // readScopeFields answers in the maintenance-window shape
+        // (scope_kind/scope_group_id/scope_device_ids), because both
+        // dialogs share the same picker. Bulk mute is the older of the two
+        // routes and never grew that shape — it still wants device_ids
+        // and/or group_id (_bulk_mute_device_ids in api.py) — so every
+        // choice made in this dialog used to reach the server as fields it
+        // does not read, and every mute failed with "device_ids and/or
+        // group_id is required" regardless of what was picked. Translated
+        // here rather than reshaping readScopeFields, since the windows
+        // dialog beside it is right to keep the shape it has.
+        const body = scope.scope_kind === 'group'
+          ? { group_id: scope.scope_group_id }
+          : { device_ids: scope.scope_device_ids };
         const result = await App.post('/api/alerts/bulk-mute', {
-          ...scope, hours: Number(box.querySelector('#bm-hours').value) || 1,
+          ...body, hours: Number(box.querySelector('#bm-hours').value) || 1,
           reason: box.querySelector('#bm-reason').value.trim(),
         });
         App.announce(`Muted ${result.muted} device(s)`);
@@ -1007,6 +1020,21 @@
       view.templates.find((x) => x.id === view.templatesSelected);
     if (!t) return;
     const tokens = t.tokens || [];
+    // Preview renders whatever the server has stored (post_alerts_template_
+    // preview reads the row, not the request body), so Preview has always
+    // had to save first — that used to mean an operator who previewed an
+    // edit and then thought better of it had already overwritten the
+    // template with no way back. `original` is what was on the server when
+    // this dialog opened; Cancel puts it back with the same PUT Save uses,
+    // but only if Preview actually got as far as saving something, so a
+    // Cancel that never touched Preview costs nothing extra. This covers the
+    // Cancel button; Escape and a backdrop click go through app.js's own
+    // discard prompt, which closes the dialog directly and has no hook for
+    // per-dialog cleanup — a real fix there is app.js's to make (or, on the
+    // server, letting the preview route take an unsaved subject/body instead
+    // of always reading the stored row).
+    const original = { name: t.name, subject: t.subject, body: t.body, is_html: t.is_html };
+    let previewSaved = false;
     const box = App.modal(`Edit template: ${t.name}`, `
       <label>Name <input id="at-name" value="${escape(t.name)}" ${t.is_builtin ? 'readonly' : ''}></label>
       <label>Subject <input id="at-subject" value="${escape(t.subject)}"></label>
@@ -1017,12 +1045,22 @@
         ${tokens.map((tok) => `<div class="clickable token-row" data-token="${escape(tok.token)}"><code>{{${escape(tok.token)}}}</code> — ${escape(tok.description)}</div>`).join('')}
       </div>
       <div id="at-preview" class="hint"></div>`, [
-      { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Preview', onClick: async (box) => {
-        // Preview requires the template already saved; save first then preview.
-        await saveTemplate(box, t, true);
+      { label: 'Cancel', onClick: async () => {
+        if (previewSaved) {
+          try { await App.put(`/api/alerts/templates/${t.id}`, original); }
+          catch (error) { /* best effort — the previewed draft stays saved,
+            which is real content and beats losing it with no message at all */ }
+        }
+        App.closeModal();
       } },
-      ...(t.is_builtin ? [{ label: 'Reset to default', onClick: () => {
+      { label: 'Preview', onClick: async (box) => {
+        await saveTemplate(box, t, true);
+        previewSaved = true;
+      } },
+      // danger: it discards edits with no way back, the same as Remove or
+      // Clear credential elsewhere — it used to sit beside Save with no
+      // more visual weight than Preview.
+      ...(t.is_builtin ? [{ label: 'Reset to default', danger: true, onClick: () => {
         App.confirmDestructive('Reset template',
           `<p>Reset <b>${escape(t.name)}</b> to the text it shipped with?</p>` +
           '<p class="hint">Your edits to this template\'s subject and body are ' +
@@ -1089,6 +1127,26 @@
 
   /* ---------------------------------------------------------- settings */
 
+  // "(syslog only)" on its own does not say what it excludes, and the word
+  // "severity" beside it invites reading this as a floor on every alert the
+  // engine raises. It only ever gates syslog: rules on traps, thresholds and
+  // device/interface events read every occurrence regardless of this
+  // setting (alertengine.py's _drain_syslog is the only reader).
+  App.registerHelp({
+    'alerts.settings.minsev': { title: 'Evaluate severity and worse', html: `
+      <p>Syslog messages worse (numerically higher) than this are dropped
+      before the alert engine ever looks at them for a rule match — the
+      default, 7, keeps everything. It exists because a busy syslog source
+      can produce far more "info" and "debug" lines than anything worth
+      alerting on, and every one of them is still a row the engine has to
+      read past on every tick.</p>
+      <p>It only filters <b>syslog</b>. A trap, a threshold breach, a device
+      or interface event is evaluated at whatever severity it arrives with
+      regardless of this setting — lowering it does not make traps or
+      thresholds quieter, and a syslog rule set to fire on notices (severity
+      5) will never fire if this is set below 5.</p>` },
+  });
+
   function normalizeRecipients(raw) {
     if (Array.isArray(raw)) return raw.slice();
     return String(raw || '').split(',').map((a) => a.trim()).filter(Boolean);
@@ -1114,7 +1172,7 @@
     const box = App.modal('Alerts settings', `
       <fieldset><legend>ENGINE</legend>
         ${check('as-enabled', 'Run the alert engine', s.enabled)}
-        <label>Evaluate severity <select id="as-minsev"></select> and worse (syslog only)</label>
+        <label>Evaluate severity <select id="as-minsev"></select> and worse (syslog only)</label>${App.helpLink('alerts.settings.minsev')}
         ${number('as-retention', 'Keep resolved alerts for', s.retention_days, 'min=1')} days
       </fieldset>
       <fieldset><legend>EMAIL SERVER</legend>
@@ -1490,8 +1548,16 @@
       text: ['alerts-filter-device', 'alerts-filter-text'],
       selects: ['alerts-filter-sev', 'alerts-filter-state', 'alerts-filter-rule', 'alerts-range'],
       apply: 'alerts-apply', clear: 'alerts-clear',
+      // alerts-filter-state was missing here, so Clear left State exactly
+      // where the operator last set it — pressing Clear and then wondering
+      // where an alert went, because State was still "acknowledged" from an
+      // earlier triage pass. alerts-range stays out on purpose, the same as
+      // every other list page's own range control (see syslog.js/snmp.js):
+      // it has no empty option, so clearing it to '' would just snap to
+      // whichever option happens to be first rather than a deliberate
+      // default — sticky is the right behaviour here, not a bug.
       clears: ['alerts-filter-device', 'alerts-filter-text', 'alerts-filter-sev',
-               'alerts-filter-rule'],
+               'alerts-filter-state', 'alerts-filter-rule'],
     });
     App.el('alerts-export-csv').onclick = exportAlertsCsv;
     App.el('alerts-page-prev').onclick = () => {

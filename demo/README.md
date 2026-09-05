@@ -31,20 +31,77 @@ python3 demo/scenario.py --count 25 --out demo/out --fast --skip-ui
 
 ## Prerequisites
 
-| Need | Why | If you skip it |
-| --- | --- | --- |
-| **root** (or `CAP_NET_BIND_SERVICE`) | the app listens on syslog **514/udp+tcp**, SNMP traps **162/udp** and the simulated agents answer on **161/udp** | those collectors report `running: false` and steps 6 and 7 measure nothing |
-| **`ulimit -n` ≥ 4096** | one UDP socket per simulated device, plus the poller's own | `fleet.py` dies part-way through `bind()` |
-| **Python 3.9+** (stdlib only) | everything except the UI walk | — |
-| **Node 22 + Playwright 1.56** installed globally | `demo/ui_walk.mjs` | the scenario records `skipped` and carries on |
-| `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` | where Chromium lives | Playwright cannot find a browser |
-| *(optional)* real `ping`/`traceroute` | not needed — `demo/bin` shadows both | — |
+| Need (Linux) | Need (Windows) | Why | If you skip it |
+| --- | --- | --- | --- |
+| **root** (or `CAP_NET_BIND_SERVICE`) | *(nothing — see below)* | the app listens on syslog **514/udp+tcp**, SNMP traps **162/udp** and the simulated agents answer on **161/udp** | those collectors report `running: false` and steps 6 and 7 measure nothing |
+| **`ulimit -n` ≥ 4096** | *(nothing — see below)* | one UDP socket per simulated device, plus the poller's own | `fleet.py` dies part-way through `bind()` |
+| **Python 3.9+** (stdlib only) | **Python 3.9+** (stdlib only), via the **`py` launcher** | everything except the UI walk | — |
+| **Node 22 + Playwright 1.56** installed globally | same | `demo/ui_walk.mjs` | the scenario records `skipped` and carries on |
+| `PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers` | `$env:PLAYWRIGHT_BROWSERS_PATH = "C:\pw-browsers"` | where Chromium lives | Playwright cannot find a browser |
+| *(optional)* real `ping`/`traceroute` | *(optional)* real `ping`/`tracert` | not needed — `demo/bin`'s POSIX scripts (`ping`, `traceroute`) shadow both on Linux, and their `.cmd` twins (`ping.cmd`, `traceroute.cmd`, `tracert.cmd`) do the same on Windows | — |
 
 Raise the file-descriptor limit before a large fleet:
 
 ```bash
 ulimit -n 8192
 ```
+
+### Windows
+
+A Windows evaluator needs none of the Linux column above, for reasons worth
+being explicit about rather than just omitting the row:
+
+* **No root, ever.** Ports 161/162/514 are unprivileged on Windows — there is
+  no low-port restriction the way there is on Linux — so nothing here needs
+  an elevated prompt.
+* **No `ulimit`, because Windows has none**, and it would not have helped
+  anyway: the real ceiling is `select()`'s own `FD_SETSIZE` (512 sockets, a
+  hard compiled-in limit, not a raisable one), because
+  `selectors.DefaultSelector` on Windows *is* `SelectSelector` — there is no
+  epoll/kqueue/poll to fall back to. `fleet.py` handles this itself by
+  sharding device sockets across multiple selectors (400 per shard, one
+  thread per shard beyond the first), so a Windows evaluator does not have
+  to do anything to reach the large tiers — just be aware of how many
+  threads that means: at `--count 250` fleet.py runs **1 shard** (everything
+  on the one thread, same as before sharding existed); at `--count 1000`,
+  **3 shards**; at `--count 2000`, **5 shards**.
+* **Use `py`, not `python3`.** A stock Windows install has no `python3` on
+  `PATH` at all — every `python3` in this document is `py` on Windows
+  (`py demo/scenario.py --count 250 --out demo/out`, etc.). `py` also
+  replaces `python3 -m netpath` (`py -m netpath`) and every `python3
+  demo/...` invocation below.
+* **`demo/bin`'s `.cmd` wrappers, not the extension-less scripts — and only
+  because of how the app looks them up.** `PATHEXT` resolution of a bare
+  `ping`/`traceroute`/`tracert` (trying `.cmd` before falling through to
+  `.exe`) is something the shell and `shutil.which()` do; it is NOT
+  something `CreateProcess` does for a caller that runs
+  `subprocess.run(["ping", ...])` directly — that path appends only `.exe`
+  to an extension-less name and never consults `PATHEXT` at all, so it
+  reaches System32's real `PING.EXE` regardless of what sits earlier on
+  `PATH`. Whether putting `demo\bin` first on `PATH` actually reaches the
+  `.cmd` shim therefore depends on which of the app's own call sites is
+  asking: `netpath/tracer.py:436` resolves through `shutil.which("ping")`
+  first, so it does find `ping.cmd` there; a bare-argv `subprocess.run`
+  call bypasses the lookup and would not, which is exactly why
+  `netpath/ipam_scan.py`'s `_ping_command` path needs to resolve through
+  `shutil.which()` too rather than relying on `PATH` order alone. Put
+  `demo\bin` first on `PATH` regardless, since it is a precondition every
+  `shutil.which()`-based caller needs and costs nothing for the others:
+  ```powershell
+  $env:PATH = "$PWD\demo\bin;$env:PATH"
+  ```
+* **Stop any previously-running fleet before starting a new one.** Two
+  fleets racing for the same `127.0.0.x:161` addresses is exactly the
+  scenario that has already cost a real run devices it should have bound —
+  the second fleet now fails loudly instead of silently losing devices to
+  the first (`fleet.py` sets `SO_EXCLUSIVEADDRUSE` on Windows for precisely
+  this reason), but "fails loudly" still means the run is wrong, so check
+  first:
+  ```powershell
+  Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%fleet.py%'" |
+      Select-Object ProcessId, CommandLine
+  Stop-Process -Id <ProcessId> -Force   # once you've confirmed it's stale
+  ```
 
 Playwright is resolved through `npm root -g`, so it does not have to be
 installed next to the repository:
@@ -106,9 +163,18 @@ curl -s -X POST http://127.0.0.1:8099/event -H 'Content-Type: application/json' 
 ```
 
 Actions: `down up reboot flap_start flap_stop slow community auth_fail_on
-auth_fail_off toobig_on toobig_off`. `flap_start`/`flap_stop` take the
-interface index as `arg`; `slow` takes milliseconds; `community` takes a
-string.
+auth_fail_off toobig_on toobig_off on_battery on_mains temp_hot_on
+temp_hot_off`. `flap_start`/`flap_stop` take the interface index as `arg`;
+`slow` takes milliseconds; `community` takes a string. `on_battery`/
+`on_mains` put an `apc_ups` device on battery or back on mains — every
+UPS-MIB/PowerNet reading that matters (charge remaining, runtime remaining,
+upsOutputSource) is computed from that one flag and the clock, so the
+charge is already seen counting down once `on_battery` is set, with no
+separate "drain" step. `temp_hot_on`/`temp_hot_off` pin a `room_alert`
+device's temperature sensor above (or back below) a safe threshold — it is
+a two-state flag, not an arbitrary setpoint, so there is no action to set
+an exact temperature or humidity value; humidity on this persona is not
+independently controllable at all yet.
 
 **2. The app on its own**
 

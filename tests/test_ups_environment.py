@@ -1,0 +1,307 @@
+"""UPS-MIB battery/output health (RFC 1628) and the device-level
+ENTITY-SENSOR-MIB environmental read (RFC 3433) -- the gap: a UPS's own
+*traps* were already decoded (trapoids.py) and its enterprise arc already
+named a vendor (enterprises.py, nodeoids.VENDOR_HEALTH's neighbours), but
+nothing ever asked a UPS how it was doing, and an environmental monitor's
+sensors were reachable only through read_dom()'s interface dialog, which
+requires an ifIndex mapping a chassis sensor never has.
+
+Four sections, matching the four things asked for:
+  1. nodeoids.UPS_HEALTH decoded correctly off real BER wire responses,
+     through the actual poll path (nodepoll._poll_snmp_scalars) --
+     including the /10 voltage scale, the column_first/column_max table
+     reductions, the "not a UPS" cost gate, and the APC TimeTicks runtime
+     fallback.
+  2. nodepoll._decode_entity_sensor's RFC 3433 arithmetic against synthetic
+     scale/precision combinations, including a negative exponent.
+  3. A sensor with no ifIndex mapping now visible at DEVICE level
+     (_poll_environment) while read_dom()'s own, unchanged, port-only view
+     still sees only what it always saw.
+  4. Each new built-in alert rule (alertsdb._BUILTIN_RULES) opening and
+     clearing against synthetic metric samples, through a real AlertEngine
+     tick -- not evaluate_threshold alone.
+"""
+import socket
+import time
+
+from _paths import spawn_stub, tmpdir
+
+TMP = tmpdir("ups_env_")
+
+import netpath.nodepoll as nodepoll_mod
+from netpath.nodesdb import NodesDatabase
+from netpath.nodepoll import NodePoller
+from netpath.alertsdb import AlertsDatabase
+from netpath.alertengine import AlertEngine
+from netpath.ipamdb import IpamDatabase
+from netpath.snmptrapdb import SnmpTrapDatabase
+from netpath.syslogdb import SyslogDatabase
+from netpath.db import Database as NetpathDatabase
+
+FAILS = []
+
+
+def check(name, ok, detail=""):
+    print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
+    if not ok:
+        FAILS.append(name)
+
+
+def new_nodes_db(name: str) -> NodesDatabase:
+    return NodesDatabase(f"{TMP}/{name}.db")
+
+
+def stub_stat(port: int, command: bytes) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    s.sendto(command, ("127.0.0.1", port))
+    try:
+        return s.recv(256).decode("utf-8", "replace")
+    finally:
+        s.close()
+
+
+def request_count(port: int) -> int:
+    return int(stub_stat(port, b"STATS"))
+
+
+def reset_count(port: int) -> None:
+    stub_stat(port, b"RESET")
+
+
+def device_against(db: NodesDatabase, name: str, **overrides) -> int:
+    gid = db.ensure_default_group()
+    db.update_group(gid, snmp_version=1, community="public",
+                    snmp_timeout_s=1.0, snmp_retries=0)
+    return db.add_device("127.0.0.1", name=name, group_id=gid, **overrides)
+
+
+# ============================================================== § 1 UPS-MIB
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "ups")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("ups")
+    did = device_against(db, "ups-1")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    identity, uptime_ticks, metrics = poller._poll_snmp_scalars(device, config)
+    values = {key: value for key, label, unit, kind, value in metrics}
+
+    check("battery status is stored as its raw enum code (batteryLow=3)",
+          values.get("ups_battery_status") == 3.0, values)
+    check("seconds on battery",
+          values.get("ups_on_battery_s") == 45.0, values)
+    check("estimated runtime remaining, standard scalar",
+          values.get("ups_runtime_min") == 12.0, values)
+    check("battery charge percent",
+          values.get("ups_battery_charge_pct") == 63.0, values)
+    check("battery voltage scaled from decivolts (243 -> 24.3 V)",
+          values.get("ups_battery_voltage") == 24.3, values)
+    check("battery temperature, no scaling needed",
+          values.get("ups_battery_temp_c") == 31.0, values)
+    check("output source is stored as its raw enum code (battery=5)",
+          values.get("ups_output_source") == 5.0, values)
+    check("active alarm count",
+          values.get("ups_alarms") == 2.0, values)
+    check("input voltage takes the first line (column_first): 118, not 121",
+          values.get("ups_input_voltage") == 118.0, values)
+    check("output load takes the worst line (column_max): 72, not 55",
+          values.get("ups_output_load_pct") == 72.0, values)
+    db.close()
+finally:
+    stub.kill()
+
+# ---------------------------------- not a UPS: the two table walks never run
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("no_ups")
+    did = device_against(db, "not-a-ups")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    reset_count(port)
+    metrics = poller._poll_ups_health(device, config, identity={}, already=set())
+    requests = request_count(port)
+    check("a device that answers no UPS-MIB scalar produces no UPS metrics",
+          metrics == [], metrics)
+    check("...and cost exactly the one scalar GET, not a walk on top of it",
+          requests == 1, requests)
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------------------------------- APC TimeTicks fallback
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "apc_ups")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("apc_ups")
+    did = device_against(db, "apc-ups-1")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    identity, uptime_ticks, metrics = poller._poll_snmp_scalars(device, config)
+    values = {key: value for key, label, unit, kind, value in metrics}
+    check("the vendor arc identified this device as APC (318)",
+          identity.get("vendor_arc") == 318, identity)
+    check("upsEstimatedMinutesRemaining absent, upsAdvBatteryRunTimeRemaining "
+          "used instead (900000 TimeTicks / 100 / 60 = 150 min)",
+          values.get("ups_runtime_min") == 150.0, values)
+    db.close()
+finally:
+    stub.kill()
+
+# ========================================================== § 2 sensor decode
+
+db = new_nodes_db("decode")
+poller = NodePoller(db)
+
+reading = poller._decode_entity_sensor(
+    "1", 451, types={"1": 8}, scales={"1": 9}, precisions={"1": 1},
+    statuses={"1": 1}, units={}, descrs={"1": "Inlet"})
+check("scale=units(9), precision=1: 451 -> 45.1 °C",
+      reading is not None and reading["value"] == 45.1
+      and reading["unit"] == "°C" and reading["status"] == "ok", reading)
+
+reading = poller._decode_entity_sensor(
+    "2", 65000, types={"2": 9}, scales={"2": 8}, precisions={"2": 0},
+    statuses={"2": 1}, units={}, descrs={"2": "Chassis RH"})
+check("negative exponent: scale=milli(8) is 10^-3, precision=0: "
+      "65000 -> 65.0 %RH",
+      reading is not None and reading["value"] == 65.0
+      and reading["unit"] == "%RH", reading)
+
+reading = poller._decode_entity_sensor(
+    "3", 12345, types={"3": 6}, scales={"3": 10}, precisions={"3": 2},
+    statuses={"3": 2}, units={}, descrs={"3": "PSU"})
+check("positive exponent: scale=kilo(10) is 10^3, precision=2: "
+      "12345 -> 123450.0, and status 2 decodes to \"unavailable\"",
+      reading is not None and reading["value"] == 123450.0
+      and reading["status"] == "unavailable", reading)
+
+check("a non-numeric reading decodes to None rather than raising",
+      poller._decode_entity_sensor("4", "not-a-number", {}, {}, {}, {}, {}, {}) is None)
+check("an unparsable suffix decodes to None rather than raising",
+      poller._decode_entity_sensor("x.y", 10, {}, {}, {}, {}, {}, {}) is None)
+db.close()
+
+# ============================================= § 3 device-level sensor visibility
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "sensors")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("sensors")
+    did = device_against(db, "env-mon-1")
+    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    now = time.time()
+    poller._poll_environment(did, device, config, set(), now)
+    dev_metrics = {m["key"]: m for m in db.metrics(did)}
+    check("the device-level scan reports the hottest OK sensor (52, not the "
+          "excluded 99 nonoperational reading, and not the port-mapped "
+          "45.1 alone)",
+          "temp_c" in dev_metrics and dev_metrics["temp_c"]["last_value"] == 52.0,
+          dev_metrics.get("temp_c"))
+    check("...and the humidity reading, decoded through a negative scale exponent",
+          "humidity_pct" in dev_metrics
+          and dev_metrics["humidity_pct"]["last_value"] == 65.0,
+          dev_metrics.get("humidity_pct"))
+
+    sensors = poller.read_dom(did, 1)
+    check("read_dom's own port-mapped view is unchanged by the device scan: "
+          "exactly the one entity aliased to ifIndex 1, at its own reading",
+          len(sensors) == 1 and sensors[0]["value"] == 45.1
+          and sensors[0]["unit"] == "°C", sensors)
+
+    reset_count(port)
+    poller._poll_environment(did, device, config, set(), now + 1.0)
+    check("a second call inside the cadence window does not re-walk the device",
+          request_count(port) == 0, request_count(port))
+
+    poller._poll_environment(
+        did, device, config, set(), now + NodePoller._SENSOR_REFRESH_S + 1.0)
+    check("...but one past the cadence window does",
+          request_count(port) >= 1, request_count(port))
+    db.close()
+finally:
+    stub.kill()
+
+# ================================================================ § 4 rules
+
+
+def build_alert_harness():
+    folder = tmpdir("ups_env_alerts_")
+    nodes = NodesDatabase(f"{folder}/nodes.db")
+    alerts = AlertsDatabase(f"{folder}/alerts.db")
+    alerts.save_settings({"email_enabled": False, "rollup_enabled": False,
+                          "new_device_grace_s": 0, "notify_rollup_delay_s": 0})
+    snmp = SnmpTrapDatabase(f"{folder}/traps.db")
+    syslog = SyslogDatabase(f"{folder}/syslog.db")
+    ipam = IpamDatabase(f"{folder}/ipam.db")
+    netpath_db = NetpathDatabase(f"{folder}/netpath.db")
+    engine = AlertEngine(alerts, nodes_db=nodes, snmp_db=snmp, syslog_db=syslog,
+                         ipam_db=ipam, netpath_db=netpath_db)
+    return nodes, alerts, snmp, syslog, ipam, engine
+
+
+def add_device(nodes, ip, name):
+    gid = nodes.ensure_default_group()
+    return nodes.add_device(ip, name=name, group_id=gid)
+
+
+def open_rows(alerts, rule_key, device_id):
+    rule = alerts.rule_by_key(rule_key)
+    rows = alerts.alerts(state="unresolved", rule_id=rule["id"])
+    return [r for r in rows if r["entity_id"] == str(device_id)]
+
+
+# rule key, metric key, label, unit, a value that breaches, a value that clears
+CASES = [
+    ("ups_on_battery", "ups_on_battery_s", "Seconds on battery", "s", 45.0, 0.0),
+    ("ups_battery_low", "ups_battery_status", "Battery status", "", 3.0, 2.0),
+    ("ups_battery_replace", "ups_battery_status", "Battery status", "", 4.0, 2.0),
+    ("ups_load_high", "ups_output_load_pct", "Output load", "%", 95.0, 40.0),
+    ("temp_high", "temp_c", "Temperature", "°C", 40.0, 25.0),
+    ("humidity_high", "humidity_pct", "Humidity", "%RH", 90.0, 50.0),
+]
+
+for rule_key, metric_key, label, unit, breach_value, clear_value in CASES:
+    nodes, alerts, snmp, syslog, ipam, engine = build_alert_harness()
+    try:
+        engine._tick()   # seeds every cursor, evaluates nothing yet
+        did = add_device(nodes, "10.9.0.1", f"{rule_key}-dev")
+        base = time.time()
+        for_polls = max(1, int(alerts.rule_by_key(rule_key)["for_polls"] or 1))
+        for i in range(for_polls):
+            nodes.record_metric_sample(did, metric_key, label, unit, "gauge",
+                                       base + i, breach_value)
+            engine._tick()
+        opened = open_rows(alerts, rule_key, did)
+        check(f"{rule_key} opens once its threshold is breached for "
+              f"{for_polls} poll(s)",
+              len(opened) == 1, opened)
+
+        nodes.record_metric_sample(did, metric_key, label, unit, "gauge",
+                                   base + for_polls + 1, clear_value)
+        engine._tick()
+        still_open = open_rows(alerts, rule_key, did)
+        check(f"{rule_key} clears once the value drops back below the "
+              f"clear threshold",
+              still_open == [], still_open)
+    finally:
+        engine.stop()
+        nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+print()
+print("FAILURES:", FAILS if FAILS else "none")
+raise SystemExit(1 if FAILS else 0)

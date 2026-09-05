@@ -413,6 +413,134 @@ def test_vendor_identity() -> None:
                   f"{key}: expected identification from sysObjectID, got {how}")
 
 
+# ------------------------------------------------------ 6. estate personas
+
+def _decode_entity_sensor(dev, entity: int) -> float:
+    """nodepoll.read_dom()'s own RFC 3433 arithmetic (nodepoll.py:2897-2899):
+    value x 10^(3*(scale-9)) / 10^precision. Applied directly to a
+    persona's table rather than through read_dom() itself, which needs a
+    live device-DB row this offline harness has no use for — the formula is
+    the part actually worth proving, and it is copied here verbatim."""
+    entries = dev.table(None).entries
+    scale = entries[f"{personas.ENT_SENSOR}.2.{entity}"][1]
+    precision = entries[f"{personas.ENT_SENSOR}.3.{entity}"][1]
+    raw_field = entries[f"{personas.ENT_SENSOR}.4.{entity}"][1]
+    raw = raw_field(dev, time.time()) if callable(raw_field) else raw_field
+    return raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+
+
+def test_room_alert_dom() -> None:
+    """entPhySensorValue must decode to a sensible °C and %RH — the point
+    of the whole persona — on a plain device and on the temp_hot SPECIALS
+    variant (index 15)."""
+    normal = make_device("room_alert", index=930)
+    temp = _decode_entity_sensor(normal, 10011)   # if_index 1, slot 1
+    humidity = _decode_entity_sensor(normal, 10012)               # slot 2
+    check(15.0 <= temp <= 30.0,
+          f"room_alert: decoded temperature {temp}°C looks wrong")
+    check(30.0 <= humidity <= 60.0,
+          f"room_alert: decoded humidity {humidity}%RH looks wrong")
+
+    hot = make_device("room_alert", index=931, temp_hot=True)
+    hot_temp = _decode_entity_sensor(hot, 10011)
+    check(hot_temp > 38.0,
+          f"room_alert: temp_hot did not push the decoded reading up "
+          f"({hot_temp}°C)")
+
+
+def test_apc_ups() -> None:
+    """RFC 1628 scalars answer, typed as INTEGER, and on_battery (SPECIALS
+    index 14) flips upsOutputSource from normal(3) to battery(5)."""
+    dev = make_device("apc_ups", index=932)
+    packet = build_request(V2C, "public", PDU_GET, 1,
+                           [f"{personas.UPS_MIB}.1.2.4.0",    # charge remaining
+                            f"{personas.UPS_MIB}.1.4.1.0"])   # output source
+    response = ask(dev, packet)
+    if not check(response is not None and len(response.varbinds) == 2,
+                 "apc_ups: RFC 1628 scalars did not answer"):
+        return
+    charge, source = response.varbinds
+    check(charge["type"] == "INTEGER" and 0 <= int(charge["value"]) <= 100,
+          f"apc_ups: upsEstimatedChargeRemaining decoded as {charge}")
+    check(source["type"] == "INTEGER" and int(source["value"]) == 3,
+          f"apc_ups: upsOutputSource should read normal(3) on mains, got {source}")
+
+    battery = make_device("apc_ups", index=933, on_battery=True)
+    response = ask(battery, build_request(
+        V2C, "public", PDU_GET, 1, [f"{personas.UPS_MIB}.1.4.1.0"]))
+    check(response is not None and int(response.varbinds[0]["value"]) == 5,
+          "apc_ups: on_battery did not flip upsOutputSource to battery(5)")
+
+
+def test_printer_mfp() -> None:
+    """A supply level and its max capacity both read, and the level never
+    exceeds the capacity it is a fraction of."""
+    dev = make_device("printer_mfp", index=934)
+    packet = build_request(V2C, "public", PDU_GET, 1,
+                           [f"{personas.PRT_MARKER_SUPPLIES}.8.1.1",  # max capacity
+                            f"{personas.PRT_MARKER_SUPPLIES}.9.1.1"])  # level
+    response = ask(dev, packet)
+    if not check(response is not None and len(response.varbinds) == 2,
+                 "printer_mfp: prtMarkerSuppliesMaxCapacity/Level did not answer"):
+        return
+    cap, level = response.varbinds
+    check(cap["type"] == "INTEGER" and int(cap["value"]) > 0,
+          f"printer_mfp: max capacity read as {cap}")
+    check(level["type"] == "INTEGER" and 0 <= int(level["value"]) <= int(cap["value"]),
+          f"printer_mfp: supply level read as {level}")
+
+
+def test_windows_server() -> None:
+    """hrStorageTable types matter: exactly one row reads as
+    hrStorageFixedDisk (the RAM and virtual-memory rows must not), and
+    hrSystemUptime/hrSWRunTable both answer."""
+    dev = make_device("windows_server", index=935)
+    table = dev.table(None)
+    types, sizes, used = {}, {}, {}
+    for oid, (_tag, value) in table.entries.items():
+        if oid.startswith("1.3.6.1.2.1.25.2.3.1.2."):
+            types[oid.rsplit(".", 1)[-1]] = value
+        elif oid.startswith("1.3.6.1.2.1.25.2.3.1.5."):
+            sizes[oid.rsplit(".", 1)[-1]] = value
+        elif oid.startswith("1.3.6.1.2.1.25.2.3.1.6."):
+            used[oid.rsplit(".", 1)[-1]] = value(dev, time.time())
+    fixed = [i for i, t in types.items() if t == personas.HR_STORAGE_FIXED_DISK]
+    other = [i for i, t in types.items() if t != personas.HR_STORAGE_FIXED_DISK]
+    check(len(fixed) == 1,
+          f"windows_server: expected exactly one hrStorageFixedDisk row, "
+          f"found {len(fixed)}")
+    check(len(other) == 2,
+          f"windows_server: expected a RAM row and a virtual-memory row "
+          f"alongside the disk, found {len(other)}")
+    if fixed:
+        pct = 100.0 * used[fixed[0]] / sizes[fixed[0]]
+        check(0 < pct < 100, f"windows_server: disk-used percentage is {pct}")
+    check(table.has(f"{personas.HR_SW_RUN}.2.1"),
+          "windows_server: hrSWRunTable is empty")
+    check(table.has(personas.HR_SYSTEM_UPTIME),
+          "windows_server: hrSystemUptime is missing")
+
+
+def test_windows_endpoint() -> None:
+    """The cheap, single-interface shape: one wireless-looking adapter and
+    still exactly one hrStorageFixedDisk row."""
+    dev = make_device("windows_endpoint", index=936)
+    table = dev.table(None)
+    check(port_count(dev) == 1,
+          f"windows_endpoint: {port_count(dev)} interfaces, expected 1")
+    descr = table.entries["1.3.6.1.2.1.2.2.1.2.1"][1]
+    kind = table.entries["1.3.6.1.2.1.2.2.1.3.1"][1]
+    check(kind == 71, f"windows_endpoint: ifType is {kind}, expected 71 (ieee80211)")
+    check("wi-fi" in descr.lower() or "wireless" in descr.lower(),
+          f"windows_endpoint: ifDescr {descr!r} does not look wireless")
+    fixed = [oid for oid, (_tag, v) in table.entries.items()
+             if oid.startswith("1.3.6.1.2.1.25.2.3.1.2.")
+             and v == personas.HR_STORAGE_FIXED_DISK]
+    check(len(fixed) == 1,
+          f"windows_endpoint: expected exactly one fixed-disk storage row, "
+          f"found {len(fixed)}")
+
+
 # ----------------------------------------------------------- the wire path
 
 def wire_test() -> None:
@@ -495,6 +623,12 @@ def main() -> int:
     test_dom_and_fdb()
     print("vendor identification ...")
     test_vendor_identity()
+    print("estate device personas (UPS, Room Alert, printer, Windows) ...")
+    test_room_alert_dom()
+    test_apc_ups()
+    test_printer_mfp()
+    test_windows_server()
+    test_windows_endpoint()
     print("wire path on 127.0.0.250:161 ...")
     wire_test()
 

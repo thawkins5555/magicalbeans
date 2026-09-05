@@ -26,7 +26,9 @@ does, `RUNBOOK.md` what to do when one of them stops.
 
 You need:
 
-- **Python 3.10 or newer.** `python3 --version`.
+- **Python 3.10 or newer.** `python3 --version` on Linux/macOS; on Windows
+  there is no `python3` on `PATH` at all in a stock install, so check with
+  the launcher instead: `py --version`.
 - **`traceroute`** on Linux or macOS (`sudo apt install traceroute`), or the
   built-in `tracert` on Windows. NetPath shells out to it, which is why this
   application needs no raw sockets and no root.

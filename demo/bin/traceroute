@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
-"""A scripted stand-in for traceroute(8), for the SappiWhere demo.
+"""A scripted stand-in for traceroute(8) and tracert.exe, for the SappiWhere
+demo.
 
-netpath/tracer.py runs whatever `traceroute` is first on PATH and parses its
-stdout with tracer._parse_unix.  Putting demo/bin at the front of PATH makes
-the app trace a network that does not exist, on demand, with no privileges and
-no packets.
+netpath/tracer.py._binary() runs `tracert` on Windows and `traceroute`
+everywhere else (see netpath/tracer.py:214), whichever one shows up first on
+PATH, and parses its stdout with tracer._parse_windows or tracer._parse_unix
+to match. demo/bin/tracert.cmd and demo/bin/traceroute.cmd both point back at
+this one script (see their own one-line bodies), so both names answer and
+both are this same emulation - putting demo/bin at the front of PATH makes
+the app trace a network that does not exist, on demand, with no privileges
+and no packets, under either name.
 
-Paths come from demo/routes.json (see its "_doc" key for the schema).  RTTs are
+Which output dialect a given invocation owes is not "whichever OS python
+happens to be running under": tracert.exe's own flags ("-d -h <hops> -w <ms>",
+see netpath/tracer.py:234) share no letter with traceroute(8)'s ("-n -q
+<probes> -m <hops> -w <seconds>", see netpath/tracer.py:235-247) except -w,
+whose unit differs (milliseconds vs seconds), so the two are told apart by
+"-h" being present only in the tracert grammar - see detect_mode below.
+
+Paths come from demo/routes.json (see its "_doc" key for the schema) and are
+shared between both dialects: the route data (which address answers at which
+hop, which hops are silent, which are lossy, which alternate) is identical
+either way, only the wire format of what gets printed changes. RTTs are
 jittered from a seed of int(time.time() // 60), so two traces inside the same
 minute are byte-identical and consecutive minutes differ slightly - alive, but
 not noisy enough to make every run look like a route change.
 
-Always exits 0, which is what traceroute(8) does even when nothing answers.
+Either dialect asks the fleet's control API before tracing a 127.x.y.z
+address (see fleet_alive below), for the same reason demo/bin/ping does: a
+device the fleet has been told is "down" needs to stop answering altogether,
+not just fail its ping, or a trace would keep drawing a healthy path to a
+host the rest of the app has already marked unreachable.
+
+traceroute(8) always exits 0, even when nothing answers; tracert.exe does the
+same.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import random
@@ -91,6 +114,84 @@ def parse_args(argv):
     return host, opts
 
 
+# tracert.exe's own value-taking flags. "-h" (max hops) is the one no
+# traceroute(8) build spells that way - see detect_mode below - and "-w" is
+# shared with the Unix grammar in letter only, milliseconds here rather than
+# seconds. "-j" (loose source route) is accepted and its value discarded;
+# netpath never passes it, but a stray one should not be mistaken for the
+# destination.
+WIN_VALUE_FLAGS = {"-h", "-w", "-j"}
+
+
+def detect_mode(argv: list[str]) -> str:
+    """"linux" or "windows" - mirrors demo/bin/ping's function of the same
+    name and the same reasoning: this is not simply `"windows" if os.name ==
+    "nt" else "linux"`, because a Linux-dialect invocation of this very
+    script must still produce traceroute(8)-shaped output even when it
+    happens to run under a Windows python. "-h" is conclusive either way:
+    tracert.exe is the only one of the two that spells max-hops that way.
+    """
+    if os.name != "nt":
+        return "linux"
+    if "-h" in argv:
+        return "windows"
+    return "linux"
+
+
+def parse_args_windows(argv):
+    opts = {"h": 30, "w": 4000.0}
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        index += 1
+        if arg.startswith("-") and arg != "-":
+            if arg in WIN_VALUE_FLAGS:
+                if index < len(argv):
+                    value = argv[index]
+                    index += 1
+                else:
+                    continue
+                if arg == "-h":
+                    try:
+                        opts["h"] = max(1, int(value))
+                    except ValueError:
+                        pass
+                elif arg == "-w":
+                    try:
+                        opts["w"] = float(value)
+                    except ValueError:
+                        pass
+                # -j: accepted, value consumed, otherwise ignored.
+                continue
+            # Bare switch (-d, -4, -6, ...): no value.
+            continue
+        positional.append(arg)
+    return (positional[0] if positional else ""), opts
+
+
+def _is_ip_literal(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def fleet_alive(host: str):
+    """True/False from the fleet's control API, or None when no fleet is
+    running (then routes.json alone decides). Identical to demo/bin/ping's
+    function of the same name - see its docstring."""
+    port = os.environ.get("FLEET_CONTROL_PORT", "8099")
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/alive?ip={host}", timeout=0.3) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("alive")
+    except Exception:                       # noqa: BLE001 - no fleet, no opinion
+        return None
+
+
 def load_routes():
     try:
         with open(ROUTES, "r", encoding="utf-8") as handle:
@@ -148,6 +249,13 @@ def run(host: str, opts: dict) -> None:
     print(f"traceroute to {host} ({host}), {max_hops} hops max, 60 byte packets")
 
     if host.startswith("127."):
+        # A simulated device the fleet has taken "down" must go silent on a
+        # trace too, or the app would keep drawing a healthy path to a host
+        # it has (correctly) marked unreachable on ping alone.
+        if host != "127.0.0.1" and fleet_alive(host) is False:
+            for ttl in range(1, max_hops + 1):
+                emit_hop(["*"] * probes, ttl)
+            return
         parts = []
         for probe in range(probes):
             parts.append(probe_text(rtt(host, 1, probe, 0.048, minute)))
@@ -211,8 +319,136 @@ def run(host: str, opts: dict) -> None:
         emit_hop(parts, ttl)
 
 
+# ICMP destination-unreachable phrasing, tracert's own wording rather than
+# traceroute(8)'s "!X" annotations. Reverse of netpath/tracer.py's
+# WINDOWS_UNREACHABLE dict: tracer._windows_unreachable_code looks for these
+# phrases (case-insensitively, as a substring) in the hop line, so the exact
+# punctuation and "reports:" framing around it are cosmetic - only the phrase
+# itself has to appear.
+WIN_UNREACHABLE_PHRASE = {
+    "!H": "Destination host unreachable.",
+    "!N": "Destination net unreachable.",
+    "!P": "Destination protocol unreachable.",
+    "!X": "Communication administratively prohibited.",
+}
+
+
+def emit_hop_windows(ttl: int, probe_ms: list[float | None],
+                     address: str | None, code: str | None) -> None:
+    """One tracert.exe hop line.
+
+    Unlike traceroute(8), tracert has no room in its column layout for a hop
+    that answers from more than one address in the same probe burst, so
+    run_windows() below never asks for that - each hop gets exactly one
+    address (or none, for "Request timed out."), never a per-probe switch.
+    """
+    parts = ["*" if value is None else f"{max(1, round(value))} ms"
+             for value in probe_ms]
+    if address is None:
+        tail = "Request timed out."
+    elif code:
+        phrase = WIN_UNREACHABLE_PHRASE.get(code, "Destination unreachable.")
+        # "10.0.0.1  reports: Destination host unreachable." - see
+        # tracer._parse_windows's own comment on why the address comes first.
+        tail = f"{address}  reports: {phrase}"
+    else:
+        tail = address
+    print(f"{ttl:3d}    " + "    ".join(parts) + "  " + tail)
+
+
+def run_windows(host: str, opts: dict) -> None:
+    max_hops = opts["h"]
+    probes = 3            # tracert always sends three probes per hop
+    minute = int(time.time() // 60)
+
+    if _is_ip_literal(host):
+        print(f"Tracing route to {host} over a maximum of {max_hops} hops:")
+    else:
+        # No DNS of our own to resolve a name with; showing the name against
+        # itself is the best this shim can do; -d suppresses this bracket for
+        # a real tracert too, so demo/routes.json (numeric IPs only) never
+        # exercises this branch.
+        print(f"Tracing route to {host} [{host}] over a maximum of "
+              f"{max_hops} hops:")
+    print()
+
+    if host.startswith("127."):
+        if host != "127.0.0.1" and fleet_alive(host) is False:
+            for ttl in range(1, max_hops + 1):
+                emit_hop_windows(ttl, [None] * probes, None, None)
+            print()
+            print("Trace complete.")
+            return
+        times = [rtt(host, 1, probe, 0.048, minute) for probe in range(probes)]
+        emit_hop_windows(1, times, host, None)
+        print()
+        print("Trace complete.")
+        return
+
+    routes = load_routes()
+    route = routes.get(host)
+    if route is None or route.get("kind") == "dead" or not route.get("hops"):
+        for ttl in range(1, max_hops + 1):
+            emit_hop_windows(ttl, [None] * probes, None, None)
+        print()
+        print("Trace complete.")
+        return
+
+    hops = route.get("hops") or []
+    alt_hops = route.get("alt_hops") or {}
+    annotate = route.get("annotate") or {}
+    loss_probes = route.get("loss_probes") or {}
+    stop_after = route.get("stop_after") or len(hops)
+
+    use_alt = False
+    if route.get("kind") == "routechange":
+        # Same counter, same cadence as the Unix path's use_alt - just no
+        # show_both here, since a tracert hop line cannot carry two addresses.
+        count = bump_counter(host)
+        use_alt = (count // 3) % 2 == 1
+
+    last_ttl = min(len(hops), stop_after, max_hops)
+    for ttl in range(1, last_ttl + 1):
+        entry = hops[ttl - 1]
+        addr = entry[0] if entry else None
+        base = entry[1] if entry and len(entry) > 1 else None
+        if addr is None or base is None:
+            emit_hop_windows(ttl, [None] * probes, None, None)
+            continue
+
+        alt = alt_hops.get(str(ttl))
+        if alt and use_alt:
+            addr, base = alt[0], alt[1]
+
+        code = annotate.get(str(ttl)) or None
+        lost = int(loss_probes.get(str(ttl), 0))
+        # Lose the middle probe first - see run()'s matching comment above.
+        lost_index = {1} if lost == 1 else set(range(probes - lost, probes))
+
+        times: list[float | None] = []
+        for probe in range(probes):
+            if probe in lost_index:
+                times.append(None)
+            else:
+                times.append(rtt(host, ttl, probe, base, minute))
+        emit_hop_windows(ttl, times, addr, code)
+
+    print()
+    print("Trace complete.")
+
+
 def main() -> int:
-    host, opts = parse_args(sys.argv[1:])
+    argv = sys.argv[1:]
+    if detect_mode(argv) == "windows":
+        host, opts = parse_args_windows(argv)
+        if not host:
+            sys.stderr.write("Usage: tracert [-d] [-h maximum_hops] "
+                             "[-w timeout] target_name\n")
+            return 1
+        run_windows(host, opts)
+        return 0
+
+    host, opts = parse_args(argv)
     if not host:
         sys.stderr.write("Usage: traceroute [-n] [-q nqueries] [-m max_ttl] "
                          "[-w waittime] host [packetlen]\n")

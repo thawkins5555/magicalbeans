@@ -42,6 +42,14 @@ Scheduled traceroutes to destinations you add, stored in SQLite, with two views:
 
 The interface is in a browser. Two ways to start the service behind it.
 
+A note on the commands below before they start piling up: this document
+writes `python`/`pip`, which is what Linux and macOS give you. A stock
+Windows install has no `python` or `pip` on `PATH` at all — only the `py`
+launcher, installed alongside every python.org release specifically to be
+the one thing that's always there even with several Python versions
+installed side by side. Everywhere this document says `python` or `pip`,
+a Windows reader runs `py` or `py -m pip` instead.
+
 **With the service console** — a window showing whether the server is up and
 who is connected:
 
@@ -50,10 +58,19 @@ pip install -r requirements.txt
 python -m netpath
 ```
 
+```powershell
+py -m pip install -r requirements.txt
+py -m netpath
+```
+
 **Headless**, for a service manager:
 
 ```bash
 python -m netpath --headless --port 8443
+```
+
+```powershell
+py -m netpath --headless --port 8443
 ```
 
 Then open `http://<host>:8443/` and sign in. A fresh install starts with
@@ -110,6 +127,10 @@ The databases live beside each other; override any of them:
 python -m netpath --db ./netpath.db --flow-db ./flows.db --syslog-db ./syslog.db --app-db ./app.db
 ```
 
+```powershell
+py -m netpath --db .\netpath.db --flow-db .\flows.db --syslog-db .\syslog.db --app-db .\app.db
+```
+
 The default folder is `%APPDATA%\netpath-monitor\` on Windows and
 `~/.local/share/netpath-monitor/` elsewhere. That folder name is unchanged so
 existing databases keep working.
@@ -145,8 +166,8 @@ box appears to hide or restore it without stopping the service.
 
 ## The service console
 
-`python -m netpath` opens it. It answers the questions you would otherwise need
-a browser for:
+`python -m netpath` (`py -m netpath` on Windows) opens it. It answers the
+questions you would otherwise need a browser for:
 
 - Is the server running, on what URL, with how many requests and open
   connections.

@@ -595,6 +595,96 @@ def detected_vendor(device_row) -> str:
         return detected
     return (device_row["vendor"] if "vendor" in keys else "") or ""
 
+
+def _upstream_confidence(match_kind: str, present: bool) -> tuple[str, int]:
+    """A sort/filter handle for one upstream-suggestion candidate's
+    evidence quality — never a threshold anything here uses to apply a
+    suggestion by itself, only a hint for which one an operator should
+    look at first. A chassis-MAC match is weighted over a sysName match:
+    _NEIGHBOR_MATCH_SQL's own comment notes sysName can collide (two sites
+    both naming a switch "core-sw-1"), where a MAC address collision is
+    far rarer. A stale row (present=0 — nothing has confirmed this
+    neighbour since an earlier walk) is weighted down regardless of match
+    kind, because the physical link it describes may no longer exist.
+    """
+    if match_kind == "chassis_mac":
+        return ("high", 3) if present else ("medium", 2)
+    return ("medium", 2) if present else ("low", 1)
+
+
+def _group_upstream_candidates(rows) -> dict[int, dict]:
+    """Raw `_UPSTREAM_CANDIDATE_SQL` rows, one per observing device's own
+    matched neighbour row, folded into one entry per device with its
+    distinct matched devices deduplicated — the same shape api.py's own
+    _topology_dedup_key gives the fleet-wide graph, but keyed by matched
+    device alone (a suggestion is "which device", not "which two ports").
+
+    A device whose neighbour rows resolve to two or more DIFFERENT matched
+    devices comes back `ambiguous`, with every candidate listed rather than
+    one chosen — a two-candidate device an operator resolves is useful,
+    a confident wrong pick is the failure alertrules.py's ROLLED_UP_BY
+    comment warns a rollup based on an unconfirmed guess would produce.
+    """
+    by_device: dict[int, dict[int, dict]] = {}
+    for row in rows:
+        device_id = int(row["device_id"])
+        matched_id = int(row["matched_device_id"])
+        # "chassis_mac" whenever the MAC join independently agrees with the
+        # winning id — including when the sysName join also fired for the
+        # SAME device, which is the ordinary case for a device Nodes named
+        # after its own sysName and deserves the stronger tier, not a
+        # downgrade to "sys_name" just because COALESCE happens to read
+        # byname first. Only when the MAC join found nothing for this id
+        # (either it did not fire, or it fired for a DIFFERENT device) does
+        # the sysName join get to name the match kind on its own.
+        mac_id = row["matched_by_mac_id"]
+        mac_agrees = mac_id is not None and int(mac_id) == matched_id
+        if mac_agrees or row["matched_by_name_id"] is None:
+            match_kind = "chassis_mac"
+        else:
+            match_kind = "sys_name"
+        present = bool(row["present"])
+        confidence, rank = _upstream_confidence(match_kind, present)
+        candidates = by_device.setdefault(device_id, {})
+        existing = candidates.get(matched_id)
+        if existing is None:
+            candidates[matched_id] = {
+                "matched_device_id": matched_id,
+                "matched_device_name": row["matched_device_name"],
+                "match_kind": match_kind,
+                "protocols": [row["protocol"]],
+                "if_index": row["if_index"],
+                "present": present,
+                "seen_ts": row["seen_ts"],
+                "first_seen_ts": row["first_seen_ts"],
+                "confidence": confidence,
+                "confidence_rank": rank,
+            }
+            continue
+        if row["protocol"] not in existing["protocols"]:
+            existing["protocols"].append(row["protocol"])
+        # Several rows can name the same candidate (two uplinks to the same
+        # core switch, or LLDP and CDP both reporting it) — keep the single
+        # best-evidenced one: present beats stale, then the higher
+        # confidence tier, then the most recently seen, so a candidate
+        # backed by one fresh port and one long-stale one reads as fresh.
+        if (present, rank, row["seen_ts"]) > (
+                existing["present"], existing["confidence_rank"], existing["seen_ts"]):
+            existing.update({
+                "match_kind": match_kind, "if_index": row["if_index"],
+                "present": present, "seen_ts": row["seen_ts"],
+                "first_seen_ts": row["first_seen_ts"],
+                "confidence": confidence, "confidence_rank": rank,
+            })
+    result = {}
+    for device_id, candidates in by_device.items():
+        ordered = sorted(candidates.values(),
+                         key=lambda c: (-c["confidence_rank"], -c["seen_ts"]))
+        result[device_id] = {"device_id": device_id, "candidates": ordered,
+                             "ambiguous": len(ordered) > 1}
+    return result
+
+
 class NodesDatabase:
     def __init__(self, path: str):
         self.path = path
@@ -1969,11 +2059,23 @@ class NodesDatabase:
     # also walked LLDP/CDP) by comparing (device_id, if_index) endpoint
     # pairs, instead of guessing from device ids alone and drawing a link
     # twice or collapsing two different physical links into one.
+    # matched_by_name_id/matched_by_mac_id (4.49.0): the two joins' own ids,
+    # ungrouped, alongside the COALESCE this always returned — for
+    # upstream_suggestions()'s confidence scoring, which needs to know
+    # whether the chassis-MAC join independently agrees with whichever id
+    # COALESCE picked (COALESCE alone cannot say that once it has made its
+    # choice: byname wins whenever it fires, even on a row where bymac also
+    # matched, possibly to a different device entirely — see
+    # _group_upstream_candidates). Existing callers (neighbours_of,
+    # all_neighbours, and everything in api.py built on them) are unaffected
+    # by two extra selected columns they never asked for.
     _NEIGHBOR_MATCH_SQL = (
         "SELECT n.*,"
         " COALESCE(byname.id, bymac.id) AS matched_device_id,"
         " COALESCE(byname.name, bymac.name) AS matched_device_name,"
-        " iface.if_index AS matched_if_index"
+        " iface.if_index AS matched_if_index,"
+        " byname.id AS matched_by_name_id,"
+        " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
         " LEFT JOIN devices byname"
         "   ON byname.enabled = 1 AND n.sys_name != ''"
@@ -2006,6 +2108,84 @@ class NodesDatabase:
                 self._NEIGHBOR_MATCH_SQL +
                 " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index"
                 ).fetchall()
+
+    # ---------------------------------------------------- upstream suggestions
+    #
+    # alertrules.py's ROLLED_UP_BY comment (~250-266) explains why the L2
+    # neighbour match above is never allowed to drive alert suppression on
+    # its own: it is a best-effort guess, not a fact an operator has
+    # confirmed, and driving suppression off a wrong guess would hide a real
+    # port fault. What that comment leaves as future work is the MEANS for
+    # an operator to turn a guess into devices.upstream_id by hand at fleet
+    # scale — reviewing 2,000 devices one Edit dialog at a time is not a
+    # realistic path. upstream_suggestions() is that means: it surfaces the
+    # same matches _NEIGHBOR_MATCH_SQL already computes, for devices that
+    # have no upstream_id yet, with enough evidence for an operator (or the
+    # UI built on this) to accept or reject each one — never to apply one
+    # automatically, which would recreate exactly the failure mode the
+    # comment warns against.
+
+    _UPSTREAM_CANDIDATE_SQL = (
+        _NEIGHBOR_MATCH_SQL +
+        " JOIN devices self ON self.id = n.device_id AND self.enabled = 1"
+        " WHERE self.upstream_id IS NULL"
+        " AND COALESCE(byname.id, bymac.id) IS NOT NULL"
+        " AND COALESCE(byname.id, bymac.id) != n.device_id"
+        " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index")
+
+    def _upstream_candidate_rows(self) -> list[sqlite3.Row]:
+        """Every matched neighbour row that could suggest an upstream_id:
+        the observing device has none set yet, and the match did not
+        resolve to the device itself (a device cannot be its own upstream,
+        the same rule _clean_upstream_id enforces on a manual edit)."""
+        with self._lock:
+            return self._conn.execute(self._UPSTREAM_CANDIDATE_SQL).fetchall()
+
+    def upstream_suggestions_count(self) -> int:
+        """How many devices have at least one upstream suggestion — the
+        same count/list split devices_count()/devices() already establish,
+        so a paged read can show a total without materialising every
+        candidate first."""
+        return len(_group_upstream_candidates(self._upstream_candidate_rows()))
+
+    def upstream_suggestions(self, limit: int | None = None,
+                             offset: int = 0) -> list[dict]:
+        """One entry per enabled device with no upstream_id whose own
+        LLDP/CDP neighbour rows matched at least one other enabled device,
+        ordered by device id. Each entry is
+        {"device_id", "ambiguous", "candidates": [...]}; a candidate is
+        {"matched_device_id", "matched_device_name", "match_kind"
+         ("chassis_mac"|"sys_name"), "protocols", "if_index", "present",
+         "seen_ts", "first_seen_ts", "confidence", "confidence_rank"}.
+        Two or more distinct matched devices for the same observer come
+        back as one entry with `ambiguous` true and every candidate listed,
+        rather than this method picking one — see the module comment above.
+        `limit`/`offset` page the device list the same way devices()'s do,
+        with the same "no params means everything" default."""
+        grouped = _group_upstream_candidates(self._upstream_candidate_rows())
+        device_ids = sorted(grouped)
+        if limit is not None:
+            device_ids = device_ids[offset:offset + max(0, limit)]
+        return [grouped[device_id] for device_id in device_ids]
+
+    def set_upstream_ids(self, assignments: dict[int, int | None]) -> None:
+        """Apply many (device_id -> upstream_id) pairs in one transaction —
+        the write behind accepting a batch of upstream suggestions (or any
+        other per-device batch edit of the same field). Unlike
+        bulk_update_devices, which broadcasts ONE value to many ids, every
+        device here gets its own value, so this is executemany rather than
+        a single UPDATE ... WHERE id IN (...). Callers are expected to have
+        already validated every value (see api._clean_upstream_id and
+        api._find_upstream_cycle) — this method only writes."""
+        if not assignments:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE devices SET upstream_id = ? WHERE id = ?",
+                [(upstream_id, device_id)
+                 for device_id, upstream_id in assignments.items()])
+            self._conn.commit()
+            self._config_generation += 1
 
     def prune_neighbors(self, older_than_s: float) -> int:
         """Drop neighbour rows nothing has refreshed for this long, present

@@ -30,43 +30,38 @@
      and has no box of its own to focus. -->
 <a class="skip-link" href="#view">Skip to the current view</a>
 
-<!-- .topbar holds the tab strip and the utility group side by side. #tabs
-     is the ONLY thing that scrolls (overflow-x, below): the utility group —
-     who is signed in, the way to the Account dialog, Sign out, and #conn,
-     "the one honest signal during an outage" — sits outside it entirely, so
-     narrowing the window can never scroll it out of reach. Grouping the
-     twelve tabs into four labelled sections (Now/Inventory/Telemetry/Admin)
-     is presentational only: there is exactly one role="tablist" here and
-     twelve role="tab" buttons inside it, wherever they are nested
-     (tests/ui/walk.mjs scopes its counts to #tabs, not the four wrappers). -->
+<!-- .topbar holds the brand, the tab strip and the utility group side by
+     side. #tabs is the ONLY thing that scrolls (overflow-x, below): the
+     utility group — who is signed in, the way to the Account dialog, Sign
+     out, and #conn, "the one honest signal during an outage" — sits outside
+     it entirely, so narrowing the window can never scroll it out of reach.
+     #tabs and #tabs-utility must stay adjacent siblings: the overflow fade
+     (app.css) is drawn on the utility group with a `+` selector against
+     #tabs, not on #tabs itself, so it never scrolls with the strip's own
+     content. The twelve tabs are flat, direct children of #tabs — the one
+     role="tablist" here and its twelve role="tab" buttons — with a hairline
+     before the first tab of each of the three groups after Now (Nodes,
+     Routes, Settings) standing in for the labels a group used to carry. -->
 <div class="topbar">
+<h1 class="brand"><a href="#/dashboard" title="Dashboard"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></a></h1>
 <nav id="tabs" role="tablist" aria-label="Views">
-  <h1 class="brand"><a href="#/dashboard" title="Dashboard"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></a></h1>
-  <div class="tab-group" data-label="Now">
-    <button class="tab" data-tab="dashboard">DASHBOARD</button>
-    <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
-  </div>
-  <div class="tab-group" data-label="Inventory">
-    <button class="tab" data-tab="nodes">NODES</button>
-    <button class="tab" data-tab="ipam">IPAM</button>
-    <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
-         FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than
-         plain WIRELESS, which read as "every wireless estate" and only
-         corrected itself once an Aruba or Ubiquiti shop opened the page and
-         found nothing there. -->
-    <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
-    <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
-  </div>
-  <div class="tab-group" data-label="Telemetry">
-    <button class="tab" data-tab="netpath">ROUTES</button>
-    <button class="tab" data-tab="netflow">NETFLOW</button>
-    <button class="tab" data-tab="syslog">SYSLOG</button>
-    <button class="tab" data-tab="snmp">SNMP TRAP</button>
-  </div>
-  <div class="tab-group" data-label="Admin">
-    <button class="tab" data-tab="settings">SETTINGS</button>
-    <button class="tab" data-tab="debug">DEBUG</button>
-  </div>
+  <button class="tab" data-tab="dashboard">DASHBOARD</button>
+  <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
+  <button class="tab tab--group-start" data-tab="nodes">NODES</button>
+  <button class="tab" data-tab="ipam">IPAM</button>
+  <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
+       FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than
+       plain WIRELESS, which read as "every wireless estate" and only
+       corrected itself once an Aruba or Ubiquiti shop opened the page and
+       found nothing there. -->
+  <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
+  <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
+  <button class="tab tab--group-start" data-tab="netpath">ROUTES</button>
+  <button class="tab" data-tab="netflow">NETFLOW</button>
+  <button class="tab" data-tab="syslog">SYSLOG</button>
+  <button class="tab" data-tab="snmp">SNMP TRAP</button>
+  <button class="tab tab--group-start" data-tab="settings">SETTINGS</button>
+  <button class="tab" data-tab="debug">DEBUG</button>
 </nav>
 <div id="tabs-utility" class="tabs-utility">
   <button id="global-search-btn" class="linkish" title="Search (/)" aria-label="Search">Search</button>

@@ -150,8 +150,7 @@ const App = (() => {
       }
       const kioskTabs = box.querySelector('#am-kiosk-tabs');
       if (kioskTabs) {
-        kioskTabs.innerHTML = [...document.querySelectorAll('.tab[data-tab]')]
-          .filter((t) => !t.hidden)
+        kioskTabs.innerHTML = visibleTabs()
           .map((t) => {
             const name = t.dataset.tab;
             const label = t.textContent.replace(/\d+$/, '').trim();
@@ -286,12 +285,14 @@ const App = (() => {
   function applyPermissions() {
     // 'dashboard' is always shown — it aggregates whatever the user can
     // already read, rather than being its own gated module.
-    for (const tab of document.querySelectorAll('.tab')) {
+    for (const tab of stripTabs()) {
       const module = tab.dataset.tab;
       if (module === 'dashboard') continue;
       tab.hidden = !canRead(module);
     }
     updateTabOverflow();
+    // Hiding a tab shifts which tabs the '1'-'9' shortcuts below reach.
+    updateTabShortcuts();
     /* A control the account may not use is DISABLED and says why, rather
        than being deleted from the page.
 
@@ -325,8 +326,7 @@ const App = (() => {
     // revoked, or its module hidden after a failed init — so move off it
     // rather than leaving an empty page behind a still-highlighted tab.
     if (state.tab && !usableTab(state.tab)) {
-      const next = [...document.querySelectorAll('.tab:not([hidden])')]
-        .map((tab) => tab.dataset.tab).find(usableTab);
+      const next = visibleTabs().map((tab) => tab.dataset.tab).find(usableTab);
       if (next) selectTab(next);
     }
   }
@@ -3730,17 +3730,37 @@ const App = (() => {
     updateTabOverflow();
   }
 
-  /* The tab strip's right-edge fade (app.css's #tabs::after) is only shown
-     while there is actually more to scroll to — Chromium paints no
-     scrollbar of its own until the pointer is over the strip, so without
-     this the strip looked simply truncated at rest below ~1500px. Checked
-     on every resize and once after the twelve tabs first paint; a tab
-     hidden or shown by applyPermissions can change the answer too, so that
-     calls this again as well. */
+  /* The tab strip's right-edge fade (app.css's has-overflow rule, drawn on
+     .tabs-utility so it never scrolls with the strip) is only shown while
+     there is actually more to scroll TO — Chromium paints no scrollbar of
+     its own until the pointer is over the strip, so without this the strip
+     looked simply truncated at rest below ~1500px. Checked on load, on
+     every resize, on every scroll of the strip itself and by the
+     ResizeObserver in start() (below) that watches #tabs for width changes
+     a window resize alone would miss — the alerts badge changing the
+     ALERTS tab's own width being the one that actually happens, twice a
+     second, on a live install; a tab hidden or shown by applyPermissions or
+     brokenPages can change the answer too, so both call this as well.
+     `max` is how much is left to scroll: without comparing scrollLeft
+     against it, the fade stayed lit once scrolled all the way to the real
+     right edge, where there is nothing left for it to warn about. */
   function updateTabOverflow() {
     const tabs = document.getElementById('tabs');
     if (!tabs) return;
-    tabs.classList.toggle('has-overflow', tabs.scrollWidth > tabs.clientWidth + 1);
+    const max = tabs.scrollWidth - tabs.clientWidth;
+    tabs.classList.toggle('has-overflow', max > 1 && tabs.scrollLeft < max - 1);
+  }
+
+  /* aria-keyshortcuts on the first nine VISIBLE tabs, matching exactly what
+     the '1'-'9' handler in start() implements — hiding a tab (applyPermissions,
+     brokenPages) shifts which tabs sit in the first nine, so this is called
+     again whenever either changes the answer, the same precedent as a
+     column header's Alt+Arrow (see the .grip wiring above). */
+  function updateTabShortcuts() {
+    visibleTabs().forEach((tab, index) => {
+      if (index < 9) tab.setAttribute('aria-keyshortcuts', String(index + 1));
+      else tab.removeAttribute('aria-keyshortcuts');
+    });
   }
 
   /* ------------------------------------------------------------- theme
@@ -4042,6 +4062,18 @@ const App = (() => {
 
   /* ------------------------------------------------------------- tabs */
 
+  /* The twelve top-level tabs are flat, direct children of #tabs since the
+     four labelled wrappers went (index.html); `:scope > .tab` is only
+     correct because of that — it would silently return nothing if a
+     wrapper ever came back. Every place in this file that used to walk
+     `document.querySelectorAll('.tab')` goes through one of these two
+     instead, so "every tab" and "every tab worth acting on" each have one
+     definition rather than being re-derived, slightly differently, at each
+     call site. */
+  function tabBar() { return document.getElementById('tabs'); }
+  function stripTabs() { const bar = tabBar(); return bar ? [...bar.querySelectorAll(':scope > .tab')] : []; }
+  function visibleTabs() { return stripTabs().filter((t) => !t.hidden); }
+
   const TAB_KEY = 'sappiwhere.tab';
 
   function selectTab(name, options = {}) {
@@ -4054,18 +4086,32 @@ const App = (() => {
     // the page loaded with, clicking to a different tab would leave both the
     // old data-tab page and the newly .active one visible at once.
     document.documentElement.dataset.tab = name;
-    for (const tab of document.querySelectorAll('.tab')) {
+    for (const tab of stripTabs()) {
       const current = tab.dataset.tab === name;
       tab.classList.toggle('active', current);
       tab.setAttribute('aria-selected', current ? 'true' : 'false');
       // Roving tabindex: only the active tab sits in the page's Tab order,
       // so Tab moves past the strip in one stop instead of twelve. Arrow
       // keys (wired once in start(), below) move both the tabindex and
-      // focus among the rest.
+      // focus among the rest. This is only actually true now that the
+      // brand's own <a> lives outside #tabs (index.html) — while it sat
+      // inside the tablist as its first child, that anchor was a thirteenth,
+      // un-roved stop of its own, and Tab passed the strip in two.
       tab.tabIndex = current ? 0 : -1;
     }
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
+    }
+    // The strip can be scrolled away from the tab that just became current —
+    // a digit shortcut, a hash route, Back/Forward, kiosk rotation, or the
+    // applyPermissions fallback below can all land here with #tabs scrolled
+    // elsewhere. One call here covers every one of those instead of each
+    // caller remembering its own scrollIntoView. A no-op unless the strip
+    // actually overflows, so it does nothing on every ordinary click.
+    const bar = tabBar();
+    if (bar && bar.scrollWidth > bar.clientWidth + 1) {
+      const current = stripTabs().find((tab) => tab.dataset.tab === name);
+      if (current) current.scrollIntoView({ inline: 'nearest', block: 'nearest' });
     }
     // The tab itself is a history entry: Back walks the tabs the operator
     // visited. A selection inside a tab replaces instead (setRoute).
@@ -4303,9 +4349,9 @@ const App = (() => {
   }
 
   async function start() {
-    const tabBar = document.getElementById('tabs');
-    if (tabBar) tabBar.setAttribute('role', 'tablist');
-    for (const tab of document.querySelectorAll('.tab')) {
+    const bar = tabBar();
+    if (bar) bar.setAttribute('role', 'tablist');
+    for (const tab of stripTabs()) {
       tab.onclick = () => selectTab(tab.dataset.tab);
       // Twelve identical unlabelled buttons announced nothing about which
       // one was current; selectTab keeps aria-selected in step below.
@@ -4313,6 +4359,11 @@ const App = (() => {
       tab.setAttribute('aria-controls', `page-${tab.dataset.tab}`);
       tab.setAttribute('aria-selected', 'false');
       tab.id = tab.id || `tab-${tab.dataset.tab}`;
+      // Not a tab stop until selectTab (below) makes one of these current:
+      // without this, every tab was reachable by Tab until the very first
+      // selectTab ran, so the strip was thirteen stops on the very first
+      // paint and dropped to one only after.
+      tab.tabIndex = -1;
       const panel = document.getElementById(`page-${tab.dataset.tab}`);
       if (panel) {
         panel.setAttribute('role', 'tabpanel');
@@ -4321,10 +4372,14 @@ const App = (() => {
     }
     // ArrowRight/Left/Home/End move focus and switch tabs, the contract
     // role="tablist" promises and the strip had not implemented at all.
-    if (tabBar) {
-      wireRovingTabs(tabBar,
-        () => [...document.querySelectorAll('.tab')].filter((t) => !t.hidden),
-        (tab) => selectTab(tab.dataset.tab));
+    if (bar) {
+      wireRovingTabs(bar, visibleTabs, (tab) => selectTab(tab.dataset.tab));
+      bar.addEventListener('scroll', updateTabOverflow, { passive: true });
+      // The strip's scrollWidth can change without a resize of the window —
+      // the alerts badge (loadState, below) grows or shrinks the ALERTS tab
+      // as the open count's digit count changes — so has-overflow is kept
+      // in step by watching #tabs itself, not just window resizes.
+      new ResizeObserver(updateTabOverflow).observe(bar);
     }
     wireSubtabGroups();
     wireSubtabRouting();
@@ -4377,7 +4432,7 @@ const App = (() => {
         return;
       }
       if (event.key < '1' || event.key > '9') return;
-      const tabs = [...document.querySelectorAll('.tab')].filter((t) => !t.hidden);
+      const tabs = visibleTabs();
       const tab = tabs[Number(event.key) - 1];
       if (!tab) return;
       event.preventDefault();
@@ -4429,6 +4484,7 @@ const App = (() => {
     // undefined `dimensions` list and lost the whole app — including the
     // modules it *could* read. Each module now fails alone: its tab is
     // hidden, the rest of the app starts normally.
+    const strip = stripTabs();
     for (const [name, page] of Object.entries(pages)) {
       if (!page.init) continue;
       try {
@@ -4439,11 +4495,15 @@ const App = (() => {
         // experience than not offering it. A reload is the way back, exactly
         // as it is for a permission granted mid-session.
         brokenPages.add(name);
-        const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+        const tab = strip.find((t) => t.dataset.tab === name);
         if (tab) tab.hidden = true;
         console.error(`${name}: module failed to start, tab hidden`, error);
       }
     }
+    // Once for the whole loop, not once per failure: a build with several
+    // modules down at once used to lay out the strip N times in a row.
+    updateTabOverflow();
+    updateTabShortcuts();
     // A link is more specific than a memory: if the address bar names a
     // tab (and a selection in it), that wins over the remembered tab, and
     // over login.js's "land on Dashboard after signing in".
@@ -4464,7 +4524,7 @@ const App = (() => {
       if (!usableTab(initialTab)) {
         // Dashboard is the last resort rather than an error page: it is
         // never permission-gated and has no module state of its own to break.
-        initialTab = [...document.querySelectorAll('.tab:not([hidden])')]
+        initialTab = visibleTabs()
           .map((tab) => tab.dataset.tab).find(usableTab) || 'dashboard';
       }
       selectTab(initialTab);

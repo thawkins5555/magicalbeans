@@ -233,6 +233,13 @@ check(APP_CSS.count("background: var(--panel);\n  border: 1px solid var(--hairli
 check("button.module-settings {" not in APP_CSS, "the Settings gear is an ordinary secondary button")
 check(APP_CSS.count("font: 600 var(--fs-2xs)/1 var(--ui);\n  letter-spacing: var(--track-wide);") == 1,
       "one eyebrow rule")
+# The flattened tab strip (4.49.0) retired the four labelled wrappers, and
+# with them, the .tab-group::before entry the eyebrow selector list carried.
+# The check above counts the shared declaration BLOCK, which .tab-group's
+# retirement never touched (it only ever added a selector to the list this
+# assertion does not count) — so it stays green whether or not the retired
+# selector is still named. This one actually looks for it.
+check(".tab-group::before" not in APP_CSS, "the retired .tab-group eyebrow selector is gone")
 check("table { width: 100%; border-collapse: collapse; font-family: var(--ui);" in APP_CSS
       and "td.mono" in APP_CSS, "tables are proportional with mono opt-in per column")
 space_uses = sum(APP_CSS.count("var(%s)" % name) for name in SPACE_STEPS)

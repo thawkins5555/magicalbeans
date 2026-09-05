@@ -665,11 +665,15 @@
       return;
     }
     target.innerHTML =
-      `<p>Host key: <b style="font-family:var(--mono)">${escape(key.fingerprint)}</b>`
+      `<p>Host key: <b class="mono">${escape(key.fingerprint)}</b>`
       + ` (${escape(key.key_type)}), first seen ${App.when(key.first_seen_ts)}`
       + `${key.trusted_by ? `, trusted by ${escape(key.trusted_by)}` : ''}.</p>`
       + (App.canWrite('configrx')
-        ? '<p><button id="cx-hostkey-forget">Forget</button>'
+        // danger, the same tier every other trust-destroying action in this
+        // product uses: forgetting the key this device is checked against
+        // leaves the next connection with nothing to catch a substituted
+        // host, which is exactly the failure this key exists to catch.
+        ? '<p><button id="cx-hostkey-forget" class="danger">Forget</button>'
           + '<span class="hint"> Forget it only when this device was genuinely'
           + ' rebuilt or replaced: the next connection then stores whatever key'
           + ' it is offered, with nothing to check it against.</span></p>'
@@ -682,8 +686,7 @@
           await App.del(`/api/ssh/devices/${device.id}/hostkey`, {});
         } catch (error) {
           if (!target.isConnected) return;
-          target.innerHTML += `<p class="hint" style="color:var(--fail)">`
-            + `${escape(error.message)}</p>`;
+          target.innerHTML += `<p class="hint err">${escape(error.message)}</p>`;
           return;
         }
         if (!target.isConnected) return;
@@ -731,7 +734,11 @@
     return `<label>Enable secret <input id="cx-enable-secret" type="password"
         placeholder="${device.has_enable_secret ? 'stored — leave blank to keep' : 'most platforms do not need this'}"></label>
       ${device.has_enable_secret && App.canWrite('configrx')
-        ? '<p><button id="cx-enable-secret-clear">Clear stored enable secret</button>'
+        // danger, same as Forget beside the host key above: it acts the
+        // moment it is clicked, with no confirm of its own, so the tier
+        // that usually says "second thought needed" is the only warning
+        // this button gets before the click itself.
+        ? '<p><button id="cx-enable-secret-clear" class="danger">Clear stored enable secret</button>'
           + '<span class="hint"> Leaves the SSH username and password untouched.</span></p>'
         : ''}`;
   }

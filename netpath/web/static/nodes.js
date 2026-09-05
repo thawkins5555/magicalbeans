@@ -376,7 +376,12 @@
     // the one tabbable row is recomputed from the current selection. (It
     // was called twice here; the second walk did nothing but cost.)
     App.wireRowKeyboard(body);
-    App.el('nd-count').textContent = `${view.devices.length} device(s)`;
+    // Server-side paging means this can genuinely be fewer than every
+    // matching device — the pager below already says "1-500 of 4,120", and
+    // this line used to just say "500 device(s)" with nothing to compare it
+    // against, the exact "N shown" the rest of the app moved off of.
+    App.el('nd-count').textContent =
+      App.countLabel(view.devices.length, view.pageTotal);
     drawBulkBar();
   }
 
@@ -2602,7 +2607,7 @@
         <code>display_name_source</code>. An unrecognised column is ignored rather than refused.</p>
       <label>CSV file <input type="file" id="nd-import-file" accept=".csv,text/csv"></label>
       <label>CSV or JSON text<br>
-        <textarea id="nd-import-text" rows="10" style="width:100%;font-family:var(--mono)"
+        <textarea id="nd-import-text" rows="10" class="mono" style="width:100%"
           placeholder="address,name,group&#10;10.20.3.7,core-sw-01,Switches"></textarea>
       </label>
       <p class="hint" id="nd-import-preview"></p>
@@ -2718,7 +2723,14 @@
     const d = view.detail;
     const box = App.modal(`Edit ${displayName(d)}`, deviceForm(d), [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Clear credential', onClick: () => {
+      // Both irreversible, both sat in the same row as Save with no visual
+      // weight of their own — a misclick between "Save" and "Remove" cost
+      // nothing to make and everything to notice. danger is the same tier
+      // confirmDestructive's own confirm button uses, and (see modal() in
+      // app.js) is peeled to the start of the row away from Save, so the
+      // two are no longer indistinguishable at a glance. Each still opens
+      // its own confirm rather than acting immediately.
+      { label: 'Clear credential', danger: true, onClick: () => {
         App.confirmDestructive('Clear credential',
           `<p>Clear the SNMP credential stored on <b>${escape(displayName(d))}</b>?</p>` +
           '<p class="hint">The device falls back to its profile\'s credentials on ' +
@@ -2730,7 +2742,7 @@
       } },
       // Built here rather than declared in index.html, so — like every
       // dynamically built control — it checks the permission itself.
-      ...(App.canWrite('nodes') ? [{ label: 'Remove', onClick: () => removeDevice(d) }] : []),
+      ...(App.canWrite('nodes') ? [{ label: 'Remove', danger: true, onClick: () => removeDevice(d) }] : []),
       { label: 'Test', onClick: () => testDevice(box, d.id) },
       { label: 'Save', primary: true, onClick: async (box) => {
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
@@ -4125,7 +4137,10 @@
          ones you want, or discard the scan and everything it found.`
       : 'Approve the devices to add.';
     const buttons = [
-      cancelled ? { label: 'Discard scan', onClick: discard }
+      // danger only for the discard path: it throws away every device the
+      // scan found, unlike Dismiss on a finished scan, which throws away
+      // nothing that was not already offered for approval.
+      cancelled ? { label: 'Discard scan', danger: true, onClick: discard }
                 : { label: 'Dismiss', onClick: finish },
       { label: 'Add approved', primary: true, onClick: async () => {
         // Every already-added row is unselectable (discSelectable), so
@@ -4360,7 +4375,7 @@
       }
       stop();
       if (job.state === 'error') {
-        status.innerHTML = `<span style="color:var(--fail)">${escape(job.error)}</span>`;
+        status.innerHTML = `<span class="err">${escape(job.error)}</span>`;
       } else {
         status.textContent = `${job.key}: ${job.installed.length} file(s) added, ` +
           `${job.skipped.length} already present — ${job.resolved_count}/` +
@@ -4390,7 +4405,7 @@
         try {
           paint((await App.post(`/api/nodes/mib-catalog/${key}/install`, {})).job);
         } catch (error) {
-          status.innerHTML = `<span style="color:var(--fail)">${escape(error.message)}</span>`;
+          status.innerHTML = `<span class="err">${escape(error.message)}</span>`;
           for (const other of box.querySelectorAll('.cat-install')) other.disabled = false;
           return;
         }
@@ -4714,6 +4729,20 @@
     return (String(mac || '').match(/.{1,2}/g) || []).join(':');
   }
 
+  /* Enough of nodesdb.py's normalize_mac/looks_like_mac_search, mirrored
+     client-side, to tell resolveMacSearch's silent "just a name search" case
+     from an actual MAC attempt the server refused — never used to decide
+     what to search, only what to say. Separators match _MAC_SEPARATORS
+     exactly; the digits-and-dots carve-out matches looks_like_mac_search's
+     own (an IP address's octets are valid hex too, and searching by address
+     is the far more common reason to type digits and dots in this box). */
+  function macAttemptText(raw) {
+    const text = String(raw || '').trim();
+    if (!text || [...text].every((c) => (c >= '0' && c <= '9') || c === '.')) return null;
+    const cleaned = text.replace(/[:\-.\s]/g, '');
+    return cleaned && /^[0-9a-fA-F]+$/.test(cleaned) ? cleaned : null;
+  }
+
   /* What a searched-for MAC address resolved to.
 
      One (device, port) opens that port's dialog outright, which is the
@@ -4728,10 +4757,30 @@
     note.hidden = true;
     note.innerHTML = '';
     if (!text) return;
-    const payload = await App.get('/api/nodes/mac-search', { q: text });
-    if (!payload.mac) return;                 // not a MAC at all: nothing to say
-    const locations = payload.locations || [];
     const show = (html) => { note.hidden = false; note.innerHTML = html; };
+    const payload = await App.get('/api/nodes/mac-search', { q: text });
+    if (!payload.mac) {
+      // This box's Enter always tries a MAC lookup on top of filtering the
+      // table, so most of the time landing here just means a device name or
+      // IP was typed — the common case, and silence is correct for it (the
+      // table above is already filtered by the same text as plain text).
+      // But when the text was plainly an attempt at a MAC — hex characters
+      // the server (looks_like_mac_search, nodesdb.py) still refused
+      // because it was too short a prefix or too long to be one — staying
+      // silent left the operator with no idea why nothing happened. Say so
+      // only in that case, mirroring the same carve-out the server makes
+      // for a plain IP address (digits and dots are an address, not a MAC,
+      // however hex they look).
+      const attempt = macAttemptText(text);
+      if (attempt) {
+        show(`<span class="hint">"${escape(text)}" looks like an attempt at a ` +
+          `MAC address but is too ${attempt.length > 12 ? 'long' : 'short'} to ` +
+          'search on (4-12 hex digits) — the table above is still filtered by ' +
+          'it as plain text.</span>');
+      }
+      return;
+    }
+    const locations = payload.locations || [];
     if (!locations.length) {
       show(payload.enabled_devices
         ? `<span class="hint">No switch has learned ` +

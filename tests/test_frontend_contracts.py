@@ -243,6 +243,45 @@ for name in MODULES:
 check(not plotted, "no module re-implements the histogram range narrower; "
       "that is App.plottedRange (found in: %s)" % (", ".join(plotted) or "none"))
 
+
+# ---------------------------------------------------------------------------
+# 12. The flattened tab strip (4.49.0) is walked through two scoped helpers,
+#     not a bare document-wide query.
+#
+# `document.querySelectorAll('.tab')` used to reach every top-level tab
+# fine on its own, but each call site re-derived "and not hidden" slightly
+# differently, and a document-wide query would silently start matching a
+# wrapper's own class again if one ever came back. stripTabs()/visibleTabs()
+# scope to `:scope > .tab` under #tabs, which is only correct because the
+# four labelled wrappers are gone (index.html) — a bare selector surviving
+# anywhere is the same defect back.
+check("function stripTabs()" in APP and "function visibleTabs()" in APP,
+      "the scoped tab-strip helpers exist")
+check(":scope > .tab" in APP, "stripTabs() scopes to #tabs's direct children")
+# Excludes a backtick-quoted mention of the old pattern inside the helpers'
+# own explanatory comment, not a real call site.
+bare_tab_query = [m for m in re.finditer(r"document\.querySelectorAll\('\.tab[^-]", APP)
+                   if APP[m.start() - 1:m.start()] != "`"]
+check(not bare_tab_query,
+      "no bare document.querySelectorAll('.tab...') survives outside the "
+      "helpers (found %d)" % len(bare_tab_query))
+
+# ---------------------------------------------------------------------------
+# 13. The kiosk bar's title promises exactly the digit range the keydown
+#     handler implements.
+#
+# The '1'-'9' shortcut only ever reaches the first nine tabs — three of the
+# twelve (SNMP Trap, Settings, Debug, by DOM order) are unreachable this
+# way — so index.html's kiosk-bar title has to name the same range the
+# handler actually checks, not a bigger one nobody could act on.
+digit_range = re.search(r"event\.key < '(\d)' \|\| event\.key > '(\d)'", APP)
+check(bool(digit_range), "the digit-shortcut range check is present")
+if digit_range:
+    lo, hi = digit_range.group(1), digit_range.group(2)
+    check('title="Press %s-%s on a connected keyboard' % (lo, hi) in INDEX,
+          "the kiosk-bar title promises the same %s-%s the handler "
+          "implements (found a different range in index.html)" % (lo, hi))
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

@@ -1,24 +1,53 @@
 #!/usr/bin/env python3
-"""A scripted stand-in for iputils ping(8), for the SappiWhere demo.
+"""A scripted stand-in for ping(8)/ping.exe, for the SappiWhere demo.
 
-Two callers in the app run `ping` and both must be satisfied by this shim:
+Four callers in the app run `ping`, two dialects, and all four must be
+satisfied by this one shim:
 
-  netpath/tracer.py:351      ping -n -c 1 -W <seconds> <ip>   (via shutil.which)
-  netpath/ipam_scan.py:111   ping -c 1 -W <seconds> <ip>      (bare "ping", so
-                                                               PATH order wins)
+  netpath/tracer.py:351      ping -n -c 1 -W <seconds> <ip>      (Linux/iputils,
+                                                                  via shutil.which)
+  netpath/ipam_scan.py:111   ping -c 1 -W <seconds> <ip>         (Linux, bare
+                                                                  "ping" so PATH
+                                                                  order wins)
+  netpath/tracer.py:438      ping -n 1 -w <milliseconds> <ip>    (Windows)
+  netpath/ipam_scan.py:123   ping -n 1 -w <milliseconds> <ip>    (Windows)
 
-Both read the RTT out of the output with tracer._UNIX_PING_TIME
-(r"time[=<]\\s*([\\d.]+)\\s*ms") and ipam_scan.ping_once/ping_many additionally
-require exit status 0 for a probe to count as received, so a lost probe here
-must exit 1.
+The Linux side reads the RTT out of the output with tracer._UNIX_PING_TIME
+(r"time[=<]\\s*([\\d.]+)\\s*ms"); the Windows side reads it with
+tracer._WIN_PING_TIME (r"time[=<]\\s*(\\d+)\\s*ms", integer milliseconds only,
+no fraction). ipam_scan.ping_once/ping_many additionally require exit status 0
+for a probe to count as received, so a lost probe here must exit 1 either way.
 
-Behaviour:
-  * 127.x.y.z  -> hand off to the real iputils ping if one is installed, so the
-                  demo never fakes a result it can measure for real.
+Which dialect a given invocation speaks is not simply "which OS is this python
+running under": test 5 of this shim's own verification runs it directly with
+Linux flags on a Windows box (`py demo/bin/ping -c 1 -W 1 127.0.0.1`), and that
+call must still produce iputils-shaped output, because nothing about "-c"/"-W"
+being present makes sense to answer with a Windows reply. So the dialect is
+os.name == "nt" *and* the absence of the unambiguous Linux flags "-c"/"-W" in
+argv (see detect_mode below) — Windows callers never pass those, and a Linux
+caller invoked here for real always does.
+
+Behaviour, in either dialect:
+  * 127.x.y.z  -> on Linux, hand off to the real iputils ping if one is
+                  installed, so the demo never fakes a result it can measure
+                  for real. There is no equivalent handoff on Windows: the
+                  file this shim's own directory publishes for "ping" is
+                  ping.cmd, and the real answer lives at ping.EXE, which is a
+                  different filename this shim was never asked to find - see
+                  ping.cmd's own comment. So the Windows path always emulates,
+                  and it must not reach for os.execv to fake a handoff, because
+                  execv's exit-code passthrough (replace this process, inherit
+                  its exit code) is a POSIX guarantee this shim does not get to
+                  rely on under Windows subprocess semantics.
   * any hop address in demo/routes.json -> emulated replies with plausible RTTs.
     10.0.0.6 drops one probe in three (a per-target invocation counter), which
     is what makes packet_loss_high reachable without making the host look down.
   * anything else -> the 100% loss summary and exit 1.
+
+Either dialect also asks the fleet's control API before answering for a
+127.x.y.z address (see fleet_alive below): a device the fleet has been told is
+"down" must stop answering ICMP too, in Windows phrasing as much as in Linux,
+or the app would (correctly) keep reporting it up on ping alone.
 """
 
 from __future__ import annotations
@@ -36,6 +65,14 @@ STATE = os.path.join(DEMO, "out", "ping_state.json")
 
 VALUE_FLAGS = {"-c", "-W", "-w", "-i", "-s", "-t", "-I", "-M", "-p", "-Q",
                "-S", "-l", "-T", "-m", "-N"}
+
+# ping.exe's own value-taking flags. Only "-n" (count) and "-w" (per-reply
+# timeout in milliseconds - note the lower case, and note it is milliseconds
+# where iputils' "-W" is seconds) are ones either caller above actually
+# passes; the rest (packet size, TTL, source address, ...) are accepted and
+# ignored so an unexpected real-world ping.exe flag never gets mistaken for
+# the destination the way an unrecognised bare switch would.
+WIN_VALUE_FLAGS = {"-n", "-w", "-l", "-i", "-S"}
 
 # Targets that answer but are not hops in routes.json, plus the RTT floor for
 # addresses whose base RTT the routes file does not give.
@@ -74,6 +111,54 @@ def parse_args(argv):
                     except ValueError:
                         pass
                 continue
+            continue
+        positional.append(arg)
+    return (positional[0] if positional else ""), opts
+
+
+def detect_mode(argv: list[str]) -> str:
+    """"linux" or "windows" - see the module docstring for why this is not
+    just `"windows" if os.name == "nt" else "linux"`.
+
+    "-c" and "-W" are iputils-only: real ping.exe has no flag spelled either
+    way (its count flag is "-n", its timeout flag is "-w"), so seeing either
+    one in argv is conclusive that whatever is calling wants iputils'
+    dialect back, regardless of which OS this shim happens to be running on.
+    """
+    if os.name != "nt":
+        return "linux"
+    if "-c" in argv or "-W" in argv:
+        return "linux"
+    return "windows"
+
+
+def parse_args_windows(argv):
+    opts = {"n": 1, "w": 4000.0}
+    positional = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        index += 1
+        if arg.startswith("-") and arg != "-":
+            if arg in WIN_VALUE_FLAGS:
+                if index < len(argv):
+                    value = argv[index]
+                    index += 1
+                else:
+                    continue
+                if arg == "-n":
+                    try:
+                        opts["n"] = max(1, int(value))
+                    except ValueError:
+                        pass
+                elif arg == "-w":
+                    try:
+                        opts["w"] = float(value)
+                    except ValueError:
+                        pass
+                # -l/-i/-S: accepted, value consumed, otherwise ignored.
+                continue
+            # Bare switch (-d, -f, -r, -t, -a, -4, -6, ...): no value.
             continue
         positional.append(arg)
     return (positional[0] if positional else ""), opts
@@ -195,8 +280,82 @@ def emulate(host: str, base: float, count: int) -> int:
     return 0
 
 
+def unreachable_windows(host: str, count: int) -> int:
+    """ping.exe's own 100% loss report. It never prints the "Approximate
+    round trip times" block when nothing came back - there is nothing to
+    average - so that section is simply absent here, not zeroed."""
+    print(f"Pinging {host} with 32 bytes of data:")
+    for _ in range(count):
+        print("Request timed out.")
+    print()
+    print(f"Ping statistics for {host}:")
+    print(f"    Packets: Sent = {count}, Received = 0, Lost = {count} "
+          f"(100% loss),")
+    return 1
+
+
+def emulate_windows(host: str, base: float, count: int) -> int:
+    """The Windows analogue of emulate() above: same jitter and the same
+    LOSSY 1-in-3 drop on 10.0.0.6, but ping.exe's own wording and, critically,
+    integer milliseconds - tracer._WIN_PING_TIME has no fractional part in
+    its pattern, unlike the Linux one, because ping.exe itself never prints
+    one."""
+    print(f"Pinging {host} with 32 bytes of data:")
+    times: list[int] = []
+    every = LOSSY.get(host, 0)
+    for sequence in range(1, count + 1):
+        if every and bump_counter(host) % every == 0:
+            print("Request timed out.")           # this probe is the one lost
+            continue
+        rng = random.Random(f"{host}|{int(time.time() * 1000)}|{sequence}|win")
+        spread = max(0.02, base * 0.10)
+        value = max(0.01, base + rng.uniform(-spread, spread))
+        rounded = round(value)
+        ttl = 128 if host.startswith("127.") else 61
+        time_field = "time<1ms" if rounded < 1 else f"time={rounded}ms"
+        print(f"Reply from {host}: bytes=32 {time_field} TTL={ttl}")
+        times.append(max(1, rounded))
+
+    sent = count
+    received = len(times)
+    lost = sent - received
+    print()
+    print(f"Ping statistics for {host}:")
+    print(f"    Packets: Sent = {sent}, Received = {received}, Lost = {lost} "
+          f"({round(100.0 * lost / sent)}% loss),")
+    if not times:
+        return 1
+    print("Approximate round trip times in milli-seconds:")
+    print(f"    Minimum = {min(times)}ms, Maximum = {max(times)}ms, "
+          f"Average = {round(sum(times) / len(times))}ms")
+    return 0
+
+
+def main_windows(argv: list[str]) -> int:
+    host, opts = parse_args_windows(argv)
+    count = opts["n"]
+    if not host:
+        sys.stderr.write("Usage: ping [-n count] [-w timeout] target_name\n")
+        return 1
+
+    if host.startswith("127."):
+        # Same reasoning as the Linux branch below: a "down" simulated device
+        # must go silent on ICMP too.
+        if host != "127.0.0.1" and fleet_alive(host) is False:
+            return unreachable_windows(host, count)
+        return emulate_windows(host, 0.048, count)
+
+    targets = known_targets()
+    if host in targets:
+        return emulate_windows(host, targets[host], count)
+    return unreachable_windows(host, count)
+
+
 def main() -> int:
     argv = sys.argv[1:]
+    if detect_mode(argv) == "windows":
+        return main_windows(argv)
+
     host, opts = parse_args(argv)
     if not host:
         sys.stderr.write("Usage: ping [-c count] [-W timeout] destination\n")

@@ -268,7 +268,10 @@
       `<label class="check"><input type="checkbox" id="sn-enabled" ${subnet.enabled ? 'checked' : ''}> Enabled</label>`,
       [
         { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove subnet', onClick: () => {
+        // danger for both, the same tier confirmDestructive's own confirm
+        // button uses — these used to sit beside Save with no more weight
+        // than it, in a dialog with no other affordance for either.
+        { label: 'Remove subnet', danger: true, onClick: () => {
           App.confirmDestructive('Remove subnet',
             `<p>Remove <b>${escape(subnet.cidr)}</b>?</p>` +
             '<p class="hint">Every host record and scan history for this subnet ' +
@@ -278,7 +281,7 @@
               await loadSubnets();
             }, (confirmed) => { if (!confirmed) editSubnet(); });
         } },
-        { label: 'Clear stats', onClick: () => {
+        { label: 'Clear stats', danger: true, onClick: () => {
           App.confirmDestructive('Clear subnet stats',
             `<p>Discard every host record and scan record for ` +
             `<b>${escape(subnet.cidr)}</b>?</p>` +
@@ -606,7 +609,11 @@
       `<label class="check"><input type="checkbox" id="dh-enabled" ${server.enabled ? 'checked' : ''}> Enabled</label>`,
       [
         { label: 'Cancel', onClick: App.closeModal },
-        { label: 'Remove server', onClick: () => {
+        // danger for both: the same tier confirmDestructive's own confirm
+        // button uses, so an irreversible action reads as one before the
+        // operator even reaches the confirm — not a plain button sharing
+        // the row with Test connection and Save.
+        { label: 'Remove server', danger: true, onClick: () => {
           App.confirmDestructive('Remove DHCP server',
             `<p>Remove <b>${escape(server.label || server.address)}</b>?</p>` +
             '<p class="hint">Its scopes, leases and usage history are deleted, and ' +
@@ -617,7 +624,7 @@
               await loadDhcpServers();
             }, (confirmed) => { if (!confirmed) editDhcpServer(); });
         } },
-        { label: 'Clear credential', onClick: () => {
+        { label: 'Clear credential', danger: true, onClick: () => {
           App.confirmDestructive('Clear credential',
             `<p>Clear the stored credential for ` +
             `<b>${escape(server.label || server.address)}</b>?</p>` +

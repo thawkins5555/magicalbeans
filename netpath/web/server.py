@@ -338,6 +338,14 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors$", api.get_nodes_device_neighbors, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors/export\.csv$",
      api.get_nodes_device_neighbors_export, ("nodes", R)),
+    # The upstream-suggestions review flow (Tier 1 #5's other UI half): a
+    # candidate devices.upstream_id per device, derived from the neighbour
+    # match above, for an operator to review — reading the list is a plain
+    # "nodes" read, applying an accepted batch needs write.
+    ("GET", r"^/api/nodes/upstream-suggestions$",
+     api.get_nodes_upstream_suggestions, ("nodes", R)),
+    ("POST", r"^/api/nodes/upstream-suggestions/apply$",
+     api.post_nodes_upstream_suggestions_apply, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),

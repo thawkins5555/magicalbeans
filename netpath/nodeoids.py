@@ -271,10 +271,107 @@ RF_METRICS = {
 RF_VENDOR_ARCS = frozenset(RF_METRICS)
 
 
+# ------------------------------------------------------------- UPS-MIB
+#
+# UPS-MIB (RFC 1628), 1.3.6.1.2.1.33. The gap this closes: trapoids.py
+# already decodes upsTrapOnBattery/upsTrapAlarmEntryAdded/etc as UPS
+# *traps* (a UPS can shout), and VENDOR_HEALTH above already names the
+# APC/Eaton/Vertiv enterprise arcs for identification — but nothing has
+# ever polled 1.3.6.1.2.1.33 itself, so nothing has ever ASKED a UPS how
+# it is: no charge, no runtime, no load, no "replace battery".
+#
+# Unlike VENDOR_HEALTH, this table is not keyed by enterprise arc. A UPS's
+# maker varies far more than a switch's does — APC's arc is 318, Eaton's
+# 534, Vertiv/Liebert's 476, and plenty of small UPS brands sit on a
+# rebadged OEM card under yet another arc entirely — and UPS-MIB is the
+# one object tree nearly all of them answer regardless, which is the
+# whole reason it was standardised. Keying it to an arc would mean
+# maintaining a vendor list for every UPS a site might plug in for no
+# benefit: see nodepoll._poll_ups_health for how it is gated instead (a
+# cheap scalar GET first, on every device, and the two table walks only
+# when that GET proves the device worth asking further).
+#
+# (metric key, label, unit, OID, how, scale) — one field longer than
+# VENDOR_HEALTH's tuples. `scale` is the multiplier applied to the raw
+# number the agent returns before it becomes the stored metric value,
+# defaulting to 1.0 for every probe but one: RFC 1628 defines
+# upsBatteryVoltage in tenths of a volt, and storing 240 as "24.0 V" would
+# read as a UPS wired for a mains voltage rather than a 24 V battery
+# string. Nothing else here needs scaling — upsInputVoltage and
+# upsOutputPercentLoad are already whole Volts/percent, and the two enum
+# scalars (battery status, output source) are stored as their raw integer
+# code rather than decoded to text, the same way if_admin_status and
+# if_oper_status are: an alert rule's threshold evaluator only ever
+# compares numbers (see alertsdb._BUILTIN_RULES' ups_battery_low/
+# ups_battery_replace/ups_on_battery for why that matters), and enum_text()
+# below still renders the code as a label wherever the UI wants one.
+UPS_BATTERY_STATUS       = "1.3.6.1.2.1.33.1.2.1.0"
+UPS_SECONDS_ON_BATTERY   = "1.3.6.1.2.1.33.1.2.2.0"
+UPS_ESTIMATED_MINUTES    = "1.3.6.1.2.1.33.1.2.3.0"
+UPS_ESTIMATED_CHARGE_PCT = "1.3.6.1.2.1.33.1.2.4.0"
+UPS_BATTERY_VOLTAGE      = "1.3.6.1.2.1.33.1.2.5.0"   # decivolts -- scaled 0.1
+UPS_BATTERY_TEMPERATURE  = "1.3.6.1.2.1.33.1.2.7.0"
+UPS_INPUT_VOLTAGE        = "1.3.6.1.2.1.33.1.3.3.1.3"   # table: upsInputTable
+UPS_OUTPUT_SOURCE        = "1.3.6.1.2.1.33.1.4.1.0"
+UPS_OUTPUT_PERCENT_LOAD  = "1.3.6.1.2.1.33.1.4.4.1.5"   # table: upsOutputTable
+UPS_ALARMS_PRESENT       = "1.3.6.1.2.1.33.1.6.1.0"
+
+UPS_BATTERY_STATUS_ENUM = {1: "unknown", 2: "batteryNormal", 3: "batteryLow",
+                           4: "batteryDepleted"}
+UPS_OUTPUT_SOURCE_ENUM = {1: "other", 2: "none", 3: "normal", 4: "bypass",
+                          5: "battery", 6: "booster", 7: "reducer"}
+
+UPS_HEALTH = (
+    ("ups_battery_status", "Battery status", "", UPS_BATTERY_STATUS,
+     "scalar", 1.0),
+    ("ups_on_battery_s", "Seconds on battery", "s", UPS_SECONDS_ON_BATTERY,
+     "scalar", 1.0),
+    ("ups_runtime_min", "Estimated runtime remaining", "min",
+     UPS_ESTIMATED_MINUTES, "scalar", 1.0),
+    ("ups_battery_charge_pct", "Battery charge", "%", UPS_ESTIMATED_CHARGE_PCT,
+     "scalar", 1.0),
+    ("ups_battery_voltage", "Battery voltage", "V", UPS_BATTERY_VOLTAGE,
+     "scalar", 0.1),
+    ("ups_battery_temp_c", "Battery temperature", "°C", UPS_BATTERY_TEMPERATURE,
+     "scalar", 1.0),
+    ("ups_output_source", "Output source", "", UPS_OUTPUT_SOURCE,
+     "scalar", 1.0),
+    ("ups_alarms", "Active alarms", "", UPS_ALARMS_PRESENT, "scalar", 1.0),
+    # upsInputTable/upsOutputTable rows, one per input/output line. A
+    # three-phase unit answers one row per phase; the input side takes the
+    # first line as representative (the same call VENDOR_HEALTH's Cisco
+    # probe makes for "a chassis's first routing engine" — correlating a
+    # phase imbalance is not what this rule is for), while the output side
+    # takes the worst (highest-loaded) line, because "is any output
+    # circuit overloaded" is the question an operator actually has.
+    ("ups_input_voltage", "Input voltage", "V", UPS_INPUT_VOLTAGE,
+     "column_first", 1.0),
+    ("ups_output_load_pct", "Output load", "%", UPS_OUTPUT_PERCENT_LOAD,
+     "column_max", 1.0),
+)
+
+# APC PowerNet-MIB's upsAdvBatteryRunTimeRemaining, in TimeTicks (hundredths
+# of a second rather than UPS-MIB's whole minutes). Consulted only when the
+# standard upsEstimatedMinutesRemaining scalar above did not answer, and
+# only on APC's own arc (318) -- the same "ask the vendor's own object only
+# once the standard one has been tried and failed" order GENERIC_HEALTH
+# already follows for CPU. Unlike every other OID in this file, this one
+# is NOT cross-checked against a live APC unit or a bundled MIB in this
+# build: it is the object every apcupsd/check_apc-style monitoring script
+# this author has seen uses for the same reading, which is real but
+# secondhand corroboration, the same standing enterprises.py's CURATED
+# table (rather than VERIFIED) already gives that kind of evidence. Written
+# here rather than added to enterprises.py because it names a MIB object,
+# not a vendor arc.
+APC_BATTERY_RUNTIME_TIMETICKS = "1.3.6.1.4.1.318.1.1.1.2.2.3.0"
+
+
 ENUMS = {
     "if_admin_status": {1: "up", 2: "down", 3: "testing"},
     "if_oper_status": {1: "up", 2: "down", 3: "testing", 4: "unknown",
                        5: "dormant", 6: "notPresent", 7: "lowerLayerDown"},
+    "ups_battery_status": UPS_BATTERY_STATUS_ENUM,
+    "ups_output_source": UPS_OUTPUT_SOURCE_ENUM,
 }
 
 

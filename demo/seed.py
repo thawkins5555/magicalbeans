@@ -763,7 +763,7 @@ def step_configrx(client: Client, log: SeedLog, device_ids: dict,
 
 
 def step_settings(client: Client, log: SeedLog, workers: int,
-                  defaults: bool = False) -> dict:
+                  defaults: bool = False, ping_interval: int | None = None) -> dict:
     """8. Alerts/syslog/nodes settings, the alert engine, and two lowered
     thresholds so the fleet actually trips something.
 
@@ -822,12 +822,25 @@ def step_settings(client: Client, log: SeedLog, workers: int,
             "nodes_settings", {}).get("poll_workers")
         print("[8] --defaults: poll_workers left as shipped (%s)" % got)
         results["poll_workers"] = got
-    elif workers:
+    elif workers or ping_interval is not None:
+        # Both land in the same nodes scope, so they go in one POST rather
+        # than two — a second POST would re-read and rewrite the whole
+        # settings block for no reason.
+        values = {}
+        if workers:
+            values["poll_workers"] = workers
+        if ping_interval is not None:
+            values["ping_interval_s"] = ping_interval
         payload = client.post("/api/settings", {"scope": "nodes",
-                                                "values": {"poll_workers": workers}})
-        got = payload.get("nodes_settings", {}).get("poll_workers")
-        print("[8] nodes settings -> poll_workers=%s" % got)
-        results["poll_workers"] = got
+                                                "values": values})
+        saved_nodes = payload.get("nodes_settings", {})
+        print("[8] nodes settings -> poll_workers=%s ping_interval_s=%s"
+              % (saved_nodes.get("poll_workers"),
+                 saved_nodes.get("ping_interval_s")))
+        if workers:
+            results["poll_workers"] = saved_nodes.get("poll_workers")
+        if ping_interval is not None:
+            results["ping_interval_s"] = saved_nodes.get("ping_interval_s")
 
     status, payload, _ = client.raw("POST", "/api/alerts/engine",
                                     {"action": "start"})
@@ -997,6 +1010,17 @@ def main(argv=None) -> int:
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers to set; 0 leaves the default. "
                              "Ignored with --defaults")
+    parser.add_argument("--ping-interval", type=int, default=None,
+                        help="nodes ping_interval_s to set. The shipped "
+                             "default is 0, meaning every device is pinged on "
+                             "every poll; on Windows there is no ICMP socket "
+                             "fast path (ipam_scan._detect_icmp_socket_kind "
+                             "returns None there), so every one of those probes "
+                             "is a subprocess spawn and at 2,000 devices on a "
+                             "60 s interval that is 100 spawns a second. The "
+                             "scale tiers set this so the measurement is of the "
+                             "poller and not of CreateProcess. Ignored with "
+                             "--defaults, which is the point of --defaults")
     parser.add_argument("--ssh-base-port", type=int, default=2201,
                         help="base port of a running demo/fake_ssh.py (default "
                              "2201, its own default) — used only to walk the "
@@ -1051,7 +1075,7 @@ def main(argv=None) -> int:
         summary["configrx"] = step_configrx(
             client, log, summary["devices"]["ids_by_name"], args.ssh_base_port)
         summary["settings"] = step_settings(client, log, args.workers,
-                                            args.defaults)
+                                            args.defaults, args.ping_interval)
         summary["users"] = step_users(client, log, args.base, creds_path)
         summary["verify"] = step_verify(client, log, args.count)
     finally:

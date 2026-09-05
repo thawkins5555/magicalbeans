@@ -2596,6 +2596,188 @@ def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
     return _csv_response("neighbours", header, csv_rows)
 
 
+# ------------------------------------------------------ upstream suggestions
+#
+# alertrules.py:250-266 explains why the neighbour-match join above is never
+# allowed to drive alert rollup on its own — it is a best-effort guess, and
+# an operator-confirmed devices.upstream_id is the only thing ROLLED_UP_BY's
+# downstream-outage suppression may trust. What that comment leaves open is
+# the MEANS: nothing before 4.49.0 ever offered nodesdb's own matches to an
+# operator to review, so the only path to a working rollup at fleet scale was
+# 2,000 manual Edit-dialog visits. These two routes are that means — a read
+# route listing the suggestions with their evidence, and a write route that
+# applies a batch an operator has reviewed. Nothing here ever applies a
+# suggestion by itself; see post_nodes_upstream_suggestions_apply's own
+# docstring for the one path that writes devices.upstream_id.
+UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT = 500
+UPSTREAM_SUGGESTIONS_MAX_LIMIT = 2000
+
+
+def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
+    device = service.nodes_db.device(suggestion["device_id"])
+    candidates = []
+    for candidate in suggestion["candidates"]:
+        candidates.append({
+            "matched_device_id": candidate["matched_device_id"],
+            "matched_device_name": candidate["matched_device_name"],
+            "match_kind": candidate["match_kind"],
+            "protocols": candidate["protocols"],
+            "local_if_index": candidate["if_index"],
+            "local_port": label(suggestion["device_id"], candidate["if_index"]),
+            "present": candidate["present"],
+            "stale": not candidate["present"],
+            "seen_ts": candidate["seen_ts"],
+            "first_seen_ts": candidate["first_seen_ts"],
+            "confidence": candidate["confidence"],
+            "confidence_rank": candidate["confidence_rank"],
+        })
+    return {
+        "device_id": suggestion["device_id"],
+        "device_name": hostresolve.device_name(device) if device else None,
+        "device_ip": device["ip"] if device else None,
+        "ambiguous": suggestion["ambiguous"],
+        "candidates": candidates,
+    }
+
+
+def get_nodes_upstream_suggestions(service, params, body) -> dict:
+    """Candidate devices.upstream_id assignments for an operator to review
+    and accept — one entry per device with no upstream_id yet whose own
+    LLDP/CDP neighbour rows matched at least one other enabled device (see
+    nodesdb.upstream_suggestions for the evidence and confidence each
+    candidate carries). A device with more than one plausible match comes
+    back with `ambiguous: true` and every candidate listed, rather than
+    this route picking one for the operator.
+
+    Paged the same way get_nodes_devices is: no `limit`/`offset` in the
+    query gets everything (there is nothing yet pinned against a no-params
+    shape here the way get_nodes_devices' docstring worries about, but the
+    two routes are kept symmetric on principle), and `limit`/`offset` page
+    the device list — there can be hundreds of these at fleet scale.
+    """
+    total = service.nodes_db.upstream_suggestions_count()
+    label = _neighbor_local_port_labeler(service)
+    if params.get("limit") is None and params.get("offset") is None:
+        suggestions = service.nodes_db.upstream_suggestions()
+        return {"suggestions": [_upstream_suggestion_json(service, label, s)
+                                for s in suggestions],
+                "total": total}
+    offset = max(0, int(_num(params, "offset", 0, int) or 0))
+    limit = max(1, min(int(_num(params, "limit", UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT, int)
+                        or UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT), UPSTREAM_SUGGESTIONS_MAX_LIMIT))
+    suggestions = service.nodes_db.upstream_suggestions(limit=limit, offset=offset)
+    return {"suggestions": [_upstream_suggestion_json(service, label, s)
+                            for s in suggestions],
+            "total": total, "limit": limit, "offset": offset}
+
+
+UPSTREAM_APPLY_MAX_ASSIGNMENTS = 2000
+
+
+def _upstream_assignment_pairs(body) -> dict:
+    """body["assignments"]: [{"device_id", "upstream_id"}, ...] -> a dict
+    keyed by device_id, values not yet validated. A device_id repeated in
+    the same batch collapses to its LAST entry — the same "last one wins"
+    a form re-submitting the same row would produce — rather than being
+    treated as a conflict the operator has to know to avoid."""
+    raw = body.get("assignments")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("assignments is required")
+    if len(raw) > UPSTREAM_APPLY_MAX_ASSIGNMENTS:
+        raise ValueError(
+            f"at most {UPSTREAM_APPLY_MAX_ASSIGNMENTS} assignments at once")
+    pairs = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or "device_id" not in entry:
+            raise ValueError("each assignment needs a device_id")
+        try:
+            device_id = int(entry["device_id"])
+        except (TypeError, ValueError):
+            raise ValueError("device_id must be a device id") from None
+        pairs[device_id] = entry.get("upstream_id")
+    return pairs
+
+
+def _find_upstream_cycle(service, overrides: dict) -> list | None:
+    """Whether `overrides` (device_id -> new, already-cleaned upstream_id),
+    applied on top of what is on file for every OTHER device, would create
+    a cycle reachable from any device this batch touches. Returns the
+    cycle's device ids, nearest-first, or None.
+
+    _clean_upstream_id already refuses a single device pointed at itself;
+    what it cannot see is a batch where device A's upstream becomes B and,
+    in the SAME batch, B's becomes A — each pair valid alone, only the two
+    together forming a cycle. Walking every touched device's own upstream
+    chain under the proposed values (falling back to the stored value for
+    a device the batch does not mention) catches that. This only runs
+    against an operator-submitted batch, not the alert engine's hot path
+    upstream_chain protects with its own max_depth=8, so it can afford to
+    walk as far as the whole fleet before concluding there is no cycle,
+    rather than risk missing one longer than eight levels the way that
+    cap would.
+    """
+    def upstream_of(device_id):
+        if device_id in overrides:
+            return overrides[device_id]
+        row = service.nodes_db.device(device_id)
+        return int(row["upstream_id"]) if row and row["upstream_id"] is not None else None
+
+    ceiling = service.nodes_db.device_count() + 1
+    for start in overrides:
+        chain = [start]
+        seen = {start}
+        current = start
+        for _ in range(ceiling):
+            parent = upstream_of(current)
+            if parent is None:
+                break
+            if parent in seen:
+                return chain[chain.index(parent):]
+            chain.append(parent)
+            seen.add(parent)
+            current = parent
+    return None
+
+
+def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
+    """The write side of the upstream-suggestions review flow: a batch of
+    {"device_id", "upstream_id"} pairs an operator has looked at and
+    accepted (upstream_id may be null/0/"" to mean "leave unset" — see
+    _clean_upstream_id), applied together in one transaction.
+
+    Nothing here ever chooses a suggestion on its own — there is no
+    "high confidence means apply it for me" path anywhere in this route,
+    on purpose. alertrules.py's ROLLED_UP_BY comment is explicit that
+    driving alert suppression off an unconfirmed neighbour match is the
+    one failure mode this application must not have; the operator's
+    review, not this route, is what turns a guess into something
+    alertrules.py may trust.
+
+    Every pair is validated exactly as a single PUT .../devices/<id> would
+    (_clean_upstream_id: the device and its proposed upstream both exist,
+    neither points a device at itself), and then the WHOLE batch's
+    resulting graph is checked for a cycle no individual pair could show
+    (_find_upstream_cycle) — a batch that would create one is refused
+    outright, naming the devices involved, rather than applying the
+    assignments that happen not to be part of it.
+    """
+    pairs = _upstream_assignment_pairs(body)
+    for device_id in pairs:
+        if not service.nodes_db.device(device_id):
+            raise ValueError(f"No such device {device_id}")
+    cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id)
+              for device_id, upstream_id in pairs.items()}
+    cycle = _find_upstream_cycle(service, cleaned)
+    if cycle:
+        raise ValueError(
+            "This would create an upstream cycle through device(s): "
+            + " -> ".join(str(device_id) for device_id in cycle))
+    service.nodes_db.set_upstream_ids(cleaned)
+    service.log.add(NODES_CATEGORY,
+                    f"Applied {len(cleaned)} upstream suggestion(s)")
+    return {"ok": True, "updated": len(cleaned)}
+
+
 # Item 5's fleet-wide view: an L2 link graph, shaped for the client to draw
 # directly rather than handing over the raw neighbour rows and making every
 # caller re-derive the same graph. Two facts make the shaping worth doing

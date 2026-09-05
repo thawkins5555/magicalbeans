@@ -287,7 +287,11 @@
       </fieldset>
       ${controllerCredentialFields(c)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      ...(c ? [{ label: 'Remove', onClick: () => confirmRemoveController(c) }] : []),
+      // danger, the same tier confirmDestructive's own button uses: this
+      // used to sit beside Save with no more visual weight than it, in the
+      // one dialog on this page where a misclick actually costs a
+      // controller and every AP under it.
+      ...(c ? [{ label: 'Remove', danger: true, onClick: () => confirmRemoveController(c) }] : []),
       { label: c ? 'Save' : 'Add', primary: true, onClick: async (m) => {
         if (!App.requireFields(m, [['#wc-name', 'Name'],
                                    ['#wc-ip', 'IP address']])) return;

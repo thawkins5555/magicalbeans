@@ -18,9 +18,10 @@ even when a step raises:
 
 Around every incident step it takes a metric snapshot — `/api/state`,
 `/api/debug` (node_counters, per-worker elapsed), open alerts grouped by
-rule, the mail sink's message count, the app's CPU% and RSS from
-`/proc/<pid>/stat` and `/proc/<pid>/status`, and the fleet's own `/state` —
-and writes `out/results-<count>.json` plus a readable
+rule, the mail sink's message count, the app's CPU% and RSS (from
+`/proc/<pid>/stat` and `/proc/<pid>/status` on Linux, or `GetProcessTimes`
+and `GetProcessMemoryInfo` via ctypes on Windows), and the fleet's own
+`/state` — and writes `out/results-<count>.json` plus a readable
 `out/results-<count>.md`.
 """
 
@@ -128,32 +129,122 @@ def http_json(url: str, body=None, timeout: float = 20.0):
         return 0, {"error": "%s: %s" % (type(exc).__name__, exc)}
 
 
+if sys.platform == "win32":
+    # No /proc on Windows, so the same two numbers (CPU ticks consumed and
+    # resident memory) come from the Win32 API instead, via ctypes rather
+    # than a new dependency (no psutil). PROCESS_QUERY_LIMITED_INFORMATION
+    # is enough for both GetProcessTimes and GetProcessMemoryInfo and, unlike
+    # PROCESS_QUERY_INFORMATION, is grantable even against a process owned by
+    # another user/session.
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _FILETIME_P = ctypes.POINTER(wintypes.FILETIME)
+    _kernel32.GetProcessTimes.argtypes = (
+        wintypes.HANDLE, _FILETIME_P, _FILETIME_P, _FILETIME_P, _FILETIME_P)
+
+    class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    _psapi.GetProcessMemoryInfo.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), wintypes.DWORD)
+
+    def _filetime_units(ft) -> int:
+        """A FILETIME as a single 100-nanosecond count."""
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    def _read_proc(pid: int) -> dict:
+        out = {}
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
+                                       False, pid)
+        if not handle:
+            return {}
+        try:
+            creation, exit_time, kernel, user = (wintypes.FILETIME(),
+                                                  wintypes.FILETIME(),
+                                                  wintypes.FILETIME(),
+                                                  wintypes.FILETIME())
+            if not _kernel32.GetProcessTimes(
+                    handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                    ctypes.byref(kernel), ctypes.byref(user)):
+                return {}
+            # Kernel+user time, in 100ns units — the same field GetProcessTimes
+            # always reports, so this is the Windows equivalent of the Linux
+            # path's utime+stime jiffies. CLOCK_TICKS below is set to 1e7 (the
+            # number of 100ns units per second) on this platform for exactly
+            # this reason, so cpu_percent()'s ticks/CLOCK_TICKS division comes
+            # out in seconds unchanged, without cpu_percent knowing which OS
+            # produced the numbers.
+            out["ticks"] = _filetime_units(kernel) + _filetime_units(user)
+
+            counters = _PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(_PROCESS_MEMORY_COUNTERS)
+            if _psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters),
+                                           counters.cb):
+                # WorkingSetSize is bytes; VmRSS on Linux is kB, so divide
+                # down to match the unit the rest of this file expects.
+                out["rss_kb"] = counters.WorkingSetSize // 1024
+        except OSError:
+            return {}
+        finally:
+            _kernel32.CloseHandle(handle)
+        out["wall"] = time.time()
+        return out
+
+    # FILETIME units are 100ns, so ticks/CLOCK_TICKS is seconds of CPU time.
+    CLOCK_TICKS = 1e7
+else:
+    def _read_proc(pid: int) -> dict:
+        """utime+stime ticks and VmRSS for a live pid; {} once it is gone."""
+        out = {}
+        try:
+            with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
+                raw = handle.read()
+            tail = raw[raw.rfind(")") + 2:].split()
+            # After the comm field, field 1 is state; utime is field 12,
+            # stime field 13 (0-based) of that remainder.
+            out["ticks"] = int(tail[11]) + int(tail[12])
+            out["threads"] = int(tail[17])
+        except (OSError, ValueError, IndexError):
+            return {}
+        try:
+            with open("/proc/%d/status" % pid, encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        out["rss_kb"] = int(line.split()[1])
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        out["wall"] = time.time()
+        return out
+
+    CLOCK_TICKS = (float(os.sysconf("SC_CLK_TCK"))
+                   if hasattr(os, "sysconf") else 100.0)
+
+
 def read_proc(pid: int) -> dict:
-    """utime+stime ticks and VmRSS for a live pid; {} once it is gone."""
-    out = {}
-    try:
-        with open("/proc/%d/stat" % pid, encoding="utf-8") as handle:
-            raw = handle.read()
-        tail = raw[raw.rfind(")") + 2:].split()
-        # After the comm field, field 1 is state; utime is field 12,
-        # stime field 13 (0-based) of that remainder.
-        out["ticks"] = int(tail[11]) + int(tail[12])
-        out["threads"] = int(tail[17])
-    except (OSError, ValueError, IndexError):
-        return {}
-    try:
-        with open("/proc/%d/status" % pid, encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    out["rss_kb"] = int(line.split()[1])
-                    break
-    except (OSError, ValueError, IndexError):
-        pass
-    out["wall"] = time.time()
-    return out
-
-
-CLOCK_TICKS = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+    """CPU ticks (see CLOCK_TICKS) and RSS in kB for a live pid; {} once it
+    is gone. `/proc` on Linux, the Win32 API via ctypes on Windows."""
+    return _read_proc(pid)
 
 
 def cpu_percent(before: dict, after: dict) -> float | None:
@@ -195,6 +286,10 @@ def terminate(process, name: str, log) -> None:
         return
     log("[stop] %s (pid %d)" % (name, process.pid))
     try:
+        # On Windows, Popen.terminate() and .kill() are the same call
+        # (TerminateProcess) — there is no SIGTERM to ask nicely with first,
+        # so the "try soft, then hard" shape below degrades to trying the
+        # same thing twice there, which is harmless.
         process.terminate()
         process.wait(timeout=10)
     except Exception:                                       # noqa: BLE001
@@ -302,6 +397,14 @@ class Scenario:
         handle = open(log_path, "w", encoding="utf-8")
         self.handles.append(handle)
         self.log("[start] %s: %s" % (name, " ".join(argv)))
+        # start_new_session detaches each child from our process group/
+        # session (POSIX setsid) so a Ctrl+C delivered to the terminal's
+        # foreground group reaches this script but not the children, letting
+        # the finally block above stop them in order instead of everything
+        # dying at once. CPython silently ignores this argument on Windows
+        # (subprocess.Popen), where there is no equivalent notion of a
+        # session leader; terminate()/kill() below still work fine there
+        # since they act on the child's own handle rather than a group.
         process = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT,
                                    env=env, cwd=cwd or REPO,
                                    start_new_session=True)

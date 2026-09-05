@@ -178,6 +178,20 @@ CURATED: dict[int, tuple[str, str]] = {
     # CompactLogix controller answering its own arc reads as "unknown
     # enterprise arc 95".
     95: ("rockwellAutomation", "Rockwell Automation / Allen-Bradley"),
+    # AVTECH Software's Room Alert environmental monitors — the device
+    # class nodepoll's new device-level ENTITY-SENSOR-MIB read (see
+    # nodeoids.UPS_HEALTH's neighbouring comment) exists for. Not cross-
+    # checked against a live unit or a bundled MIB in this build, so
+    # CURATED rather than VERIFIED, same as every other entry here. Named
+    # so the device is at least vendor-identified; this app does NOT
+    # decode any of AVTECH's own scalar OIDs as a fallback for a unit that
+    # lacks ENTITY-SENSOR-MIB, because AVTECH's object layout differs
+    # across the Room Alert line (3E, 4E, 32S, 26W, ...) and nothing here
+    # could pin down which generation's scalars a given sysObjectID
+    # actually answers -- a Room Alert that implements the standard MIB
+    # instead, which most current models do, already gets full
+    # temperature/humidity support without this.
+    20916: ("avtech", "AVTECH Software (Room Alert)"),
 }
 
 # Verified always wins over a curated guess for the same arc.

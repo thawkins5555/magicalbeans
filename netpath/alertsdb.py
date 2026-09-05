@@ -439,7 +439,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 35 built-in rules: 8 device_event + 3 interface_event + 11 threshold +
+# 41 built-in rules: 8 device_event + 3 interface_event + 17 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
@@ -472,6 +472,45 @@ _BUILTIN_RULES = [
     ("if_in_discards_high", "Interface inbound discard rate high", "threshold", "if_in_discard_rate", 4, "threshold_breach", 10.0, 1.0, 2),
     ("if_out_discards_high", "Interface outbound discard rate high", "threshold", "if_out_discard_rate", 4, "threshold_breach", 10.0, 1.0, 2),
     ("disk_high", "Storage utilization high", "threshold", "disk_pct", 4, "threshold_breach", 90.0, 80.0, 2),
+    # UPS-MIB (nodeoids.UPS_HEALTH) and the environmental-sensor poll
+    # (nodepoll._poll_environment) both feed the threshold evaluator, which
+    # only ever asks "is this number at or above X" (see
+    # alertrules.evaluate_threshold) — every rule below is written so that
+    # question is the right one to ask of its metric.
+    #
+    # ups_on_battery reads ups_on_battery_s (upsSecondsOnBattery) rather
+    # than the more obvious-looking ups_output_source (upsOutputSource,
+    # 3 = normal, 5 = battery): the evaluator has no notion of "equals",
+    # only ">=", and >= 5 would also fire on booster(6) and reducer(7) —
+    # real conditions, but not the one this rule is named for.
+    # upsSecondsOnBattery is 0 on mains and a genuine elapsed count the
+    # instant a UPS switches over, so >= 1 means exactly "on battery right
+    # now" with no adjacent enum value to accidentally include. Zero
+    # hysteresis (threshold == clear_threshold) is deliberate, the same
+    # call netpath_unreachable below already makes for a quantised metric
+    # that does not hover near a boundary the way a continuous one does —
+    # a UPS is either running off the mains or it is not.
+    ("ups_on_battery", "UPS running on battery power", "threshold", "ups_on_battery_s", 2, "threshold_breach", 1.0, 1.0, 1),
+    # upsBatteryStatus (2 normal / 3 low / 4 depleted) is an ordered enum
+    # where higher already means worse, so both rules below read it
+    # directly with no inversion needed, at two different floors and two
+    # different severities: batteryLow is worth a prompt look, but
+    # batteryDepleted is the "replace it" alarm the gap analysis named.
+    # Zero hysteresis again — an enum has no meaningful gap to leave.
+    ("ups_battery_low", "UPS battery low", "threshold", "ups_battery_status", 3, "threshold_breach", 3.0, 3.0, 1),
+    ("ups_battery_replace", "UPS battery depleted, replace it", "threshold", "ups_battery_status", 2, "threshold_breach", 4.0, 4.0, 1),
+    ("ups_load_high", "UPS output load high", "threshold", "ups_output_load_pct", 4, "threshold_breach", 90.0, 80.0, 2),
+    # Thresholds a plant equipment room would actually accept, not the
+    # cpu_high/mem_high 90/80 copied onto a different unit: ASHRAE's own
+    # allowable (not merely recommended) range for networking gear tops
+    # out around 35 C, and RH above ~80% starts to risk condensation on
+    # anything metal in the room. Both are a starting point for a site to
+    # tune, not a physical constant — unlike an enum or a UPS's own
+    # judgment of its battery, "how hot is too hot" genuinely varies by
+    # site, which is exactly what threshold/clear_threshold being ordinary
+    # editable columns is for.
+    ("temp_high", "Temperature high", "threshold", "temp_c", 4, "threshold_breach", 35.0, 30.0, 2),
+    ("humidity_high", "Humidity high", "threshold", "humidity_pct", 4, "threshold_breach", 80.0, 70.0, 2),
     ("response_time_high", "Ping response time high", "threshold", "ping_rtt_ms", 5, "threshold_breach", 500.0, 300.0, 2),
     # Live from 4.25, when the poller started sending several probes per
     # poll and recording ping_loss_pct/ping_rtt_ms as real metrics; before

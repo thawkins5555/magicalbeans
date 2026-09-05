@@ -608,6 +608,29 @@
 
   /* ---------------------------------------------------------- settings */
 
+  App.registerHelp({
+    'netflow.settings.sampling': { title: 'Sampling', html: `
+      <p>An exporter under load rarely reports every packet it forwards — it
+      samples, sending only 1 in every N, and expects the collector to
+      multiply what it does receive back up. Every byte, packet and flow
+      figure in NetFlow (the flow table, the top-N charts, the totals on this
+      page) is the raw decoded count times whatever rate applied to that
+      flow — get the rate wrong and every one of those figures is wrong by
+      the same fixed factor, silently.</p>
+      <p><b>Use the rate the exporter reports, when it sends one</b> (on by
+      default) reads the rate from the exporter's own IPFIX/v9 options
+      template rather than guessing — most modern exporters send one.
+      <b>Assumed rate</b> is what is used when it does not (v5 carries no
+      sampling information at all, so this is the only rate v5 ever gets),
+      and is also what every exporter uses if this checkbox is off.</p>
+      <p>An exporter's options template arrives on its own, slower cycle than
+      its flow data — flows decoded before the first one lands are stored at
+      whatever rate was already known (1, the first time this collector has
+      ever seen that exporter) and corrected once it arrives, so a brief
+      under-count right after the collector or exporter restarts is expected,
+      not a sign the rate is wrong.</p>` },
+  });
+
   function settingsDialog() {
     const s = App.state.flowSettings || {};
     const check = (id, label, on) =>
@@ -631,6 +654,8 @@
       <fieldset><legend>SAMPLING</legend>
         ${number('n-sampling', 'Assumed rate (1 in N)', s.default_sampling, 'min=1')}
         ${check('n-trust', 'Use the rate the exporter reports, when it sends one', s.trust_exporter_sampling)}
+        <p class="hint">Every byte and packet figure in NetFlow is this rate,
+          multiplied.${App.helpLink('netflow.settings.sampling')}</p>
       </fieldset>
       <fieldset><legend>EXPORTERS</legend>
         ${check('n-auto', 'Accept flows from any exporter', s.auto_accept_exporters)}
@@ -773,9 +798,14 @@
     parts.push(...extraCounterParts(counters));
     // v9 and IPFIX stay undecodable until a template arrives, and exporters
     // resend them only every few minutes, so this is as useful as packet age.
+    // Used to just say "no template yet" forever, with nothing to tell an
+    // operator watching it not move whether that is normal (wait) or wrong
+    // (go check the exporter) — the same fact this comment already knew.
     parts.push(counters.last_template
       ? `last template ${ago(counters.last_template)}`
-      : 'no template yet');
+      : 'no template yet (v9/IPFIX exporters resend theirs every few ' +
+        'minutes; if this never clears, check the exporter is actually ' +
+        'sending one)');
     if (view.fetchedAt) {
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);

@@ -119,9 +119,22 @@ def normalize_mac(text: str | None) -> str | None:
 
 
 def _ping_command(ip: str, timeout_ms: int) -> list[str]:
+    # Resolved through PATH rather than left as a bare "ping" for
+    # subprocess.run to find on its own: on Windows, CreateProcess appends
+    # only ".exe" to an extensionless name and never consults PATHEXT, so a
+    # bare "ping" always lands on C:\WINDOWS\system32\ping.EXE regardless of
+    # what sits earlier on PATH. tracer.py:436's _ping_command already does
+    # this same shutil.which("ping") for the same reason; this one did not,
+    # so the two callers of the same binary resolved it two different ways -
+    # on Windows only one of them honoured PATH. That is not cosmetic: it is
+    # what let ping_once()/ping_many() below (which is what nodepoll's
+    # reachability check actually calls) reach C:\WINDOWS\system32\ping.EXE
+    # instead of a PATH override such as the demo harness's ICMP substitute,
+    # so a device the harness had taken "down" kept reading as "up" here.
+    exe = shutil.which("ping") or "ping"
     if IS_WINDOWS:
-        return ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-    return ["ping", "-c", "1", "-W", str(max(1, round(timeout_ms / 1000))), ip]
+        return [exe, "-n", "1", "-w", str(timeout_ms), ip]
+    return [exe, "-c", "1", "-W", str(max(1, round(timeout_ms / 1000))), ip]
 
 
 # ---------------------------------------------------------- socket ICMP

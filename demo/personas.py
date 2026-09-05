@@ -23,8 +23,8 @@ Public surface the seed script depends on (keep stable)::
         [{index, ip, name, persona, site, snmp_version, community,
           profile, knobs}, ...]
         index 0 is the core switch, index 1 the wireless controller, and
-        indices 2..13 are the fixed SPECIALS below (13 is the ConfigRX SSH
-        demo device, pinned to 127.0.0.1). Everything from 14 on is a
+        indices 2..15 are the fixed SPECIALS below (13 is the ConfigRX SSH
+        demo device, pinned to 127.0.0.1). Everything from 16 on is a
         deterministic weighted mix.
 
     SPECIALS -> dict[int, dict]
@@ -177,6 +177,11 @@ class DeviceState:
         self.wrap32 = bool(knobs.get("wrap32", False))
         self.chassis_ports = int(knobs.get("chassis_ports", 0)) or None
         self.flapping = set(knobs.get("flapping", ()))
+        # apc_ups and room_alert's SPECIALS entries: mains has failed (the
+        # UPS output source and PowerNet status flip, the charge/runtime
+        # scalars count down), or the room sensor is pinned hot.
+        self.on_battery = bool(knobs.get("on_battery", False))
+        self.temp_hot = bool(knobs.get("temp_hot", False))
         self.v3 = knobs.get("v3")                       # None|"noauth"|"sha"
         self.v3_user = knobs.get("v3_user", "poller")
         self.v3_password = knobs.get("v3_password", "")
@@ -303,6 +308,7 @@ class DeviceState:
                 "chassis_ports": self.chassis_ports or 0,
                 "flapping": sorted(self.flapping), "v3": self.v3,
                 "community": self.community,
+                "on_battery": self.on_battery, "temp_hot": self.temp_hot,
                 "dark_after_s": self.dark_after_s, "dark_for_s": self.dark_for_s,
                 "reboot_every_s": self.reboot_every_s,
                 "uptime_s": int(time.time() - self.boot(time.time())),
@@ -327,6 +333,24 @@ UCD_CPU_IDLE = "1.3.6.1.4.1.2021.11.11.0"
 UCD_MEM_TOTAL = "1.3.6.1.4.1.2021.4.5.0"
 UCD_MEM_AVAIL = "1.3.6.1.4.1.2021.4.6.0"
 UCD_LOAD1 = "1.3.6.1.4.1.2021.10.1.3.1"
+
+# hrStorageTable's type column names what a row IS — nodepoll._host_resources_
+# disk_pct (nodepoll.py:2012-2039) only ever counts a row typed
+# hrStorageFixedDisk as "the disk"; every existing caller of host_resources()
+# below wants a RAM/appdata figure with no disk semantics, so that stays the
+# default and only the new Windows personas pass a type explicitly.
+HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
+HR_STORAGE_VIRTUAL_MEMORY = "1.3.6.1.2.1.25.2.1.3"
+HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
+HR_SYSTEM_UPTIME = "1.3.6.1.2.1.25.1.1.0"
+HR_SW_RUN = "1.3.6.1.2.1.25.4.2.1"
+HR_DEVICE_STATUS = "1.3.6.1.2.1.25.3.2.1.5"
+
+UPS_MIB = "1.3.6.1.2.1.33"                      # RFC 1628 UPS-MIB
+PRT_MARKER_SUPPLIES = "1.3.6.1.2.1.43.11.1.1"   # RFC 3805 Printer-MIB
+PRT_INPUT = "1.3.6.1.2.1.43.8.2.1"
+PRT_ALERT = "1.3.6.1.2.1.43.18.1.1"
+PRT_GENERAL = "1.3.6.1.2.1.43.5.1.1"
 
 
 def system_scalars(descr: str, sys_object_id: str, name=None, contact: str = "",
@@ -436,7 +460,13 @@ def host_resources(cpus: int, storages) -> dict:
     CPU and no memory. The personas answer anyway, so the demo can point
     at real data the app is choosing not to collect.
 
-    storages: [(descr, alloc_units, size_units, used_fraction)]
+    storages: [(descr, alloc_units, size_units, used_fraction)], or with a
+    5th element, [(descr, alloc_units, size_units, used_fraction,
+    storage_type_oid)] — the type OID defaults to HR_STORAGE_RAM, which is
+    what every caller before the Windows personas wanted (a memory or
+    app-data figure with no "disk" semantics); pass HR_STORAGE_FIXED_DISK
+    (or HR_STORAGE_VIRTUAL_MEMORY) explicitly for a row that should count as
+    one of those instead.
     """
     entries: dict = {}
     for cpu in range(1, cpus + 1):
@@ -445,9 +475,11 @@ def host_resources(cpus: int, storages) -> dict:
             lambda st, now, c=cpu: int(max(1, min(99,
                 25 + (h("hrcpu", st.name, c) % 30) +
                 12 * math.sin(now / 43.0 + c)))))
-    for i, (descr, units, size, used) in enumerate(storages, start=1):
+    for i, row in enumerate(storages, start=1):
+        descr, units, size, used = row[:4]
+        storage_type = row[4] if len(row) > 4 else HR_STORAGE_RAM
         entries[f"1.3.6.1.2.1.25.2.3.1.1.{i}"] = (T_INTEGER, i)
-        entries[f"1.3.6.1.2.1.25.2.3.1.2.{i}"] = (T_OID, "1.3.6.1.2.1.25.2.1.2")
+        entries[f"1.3.6.1.2.1.25.2.3.1.2.{i}"] = (T_OID, storage_type)
         entries[f"1.3.6.1.2.1.25.2.3.1.3.{i}"] = (T_OCTET_STRING, descr)
         entries[f"1.3.6.1.2.1.25.2.3.1.4.{i}"] = (T_INTEGER, units)
         entries[f"1.3.6.1.2.1.25.2.3.1.5.{i}"] = (T_INTEGER, size)
@@ -455,6 +487,28 @@ def host_resources(cpus: int, storages) -> dict:
             T_INTEGER,
             lambda st, now, s=size, u=used:
                 int(s * min(0.98, u * (1.0 + 0.06 * math.sin(now / 67.0)))))
+    return entries
+
+
+def hr_sw_run(procs) -> dict:
+    """HOST-RESOURCES-MIB hrSWRunTable — the running-process list a Windows
+    box answers and the personas above never have (they have no processor/
+    storage story worth a process list either).
+
+    procs: [(name, path, run_type, status)]. run_type: 2=operatingSystem,
+    4=application. status: 1=running. hrSWRunID (an OID, "the software's own
+    product ID") is answered as zeroDotZero — nothing in this demo invents a
+    product-ID registry, and a real agent that does not track one answers
+    the same way.
+    """
+    entries: dict = {}
+    for i, (name, path, run_type, status) in enumerate(procs, start=1):
+        entries[f"{HR_SW_RUN}.1.{i}"] = (T_INTEGER, i)
+        entries[f"{HR_SW_RUN}.2.{i}"] = (T_OCTET_STRING, name)
+        entries[f"{HR_SW_RUN}.3.{i}"] = (T_OID, "0.0")
+        entries[f"{HR_SW_RUN}.4.{i}"] = (T_OCTET_STRING, path)
+        entries[f"{HR_SW_RUN}.6.{i}"] = (T_INTEGER, run_type)
+        entries[f"{HR_SW_RUN}.7.{i}"] = (T_INTEGER, status)
     return entries
 
 
@@ -468,6 +522,24 @@ def _mac_arcs(seed: int, n: int) -> list[str]:
                   raw & 0xFF, (i * 7 + 3) & 0xFF)
         out.append(".".join(str(b) for b in octets))
     return out
+
+
+# There is no OUI/MAC-vendor lookup anywhere in netpath/ (a tablet has no
+# SNMP agent of its own, so the only honest way this fleet can represent one
+# is as a leaf MAC in a switch's forwarding table). These are real
+# IEEE-assigned OUIs — not cross-checked against a live registry in this
+# environment, so treat the exact bytes as "commonly cited as Apple/Samsung"
+# rather than freshly verified — used by _switch_fdb_ports' tablet_ports to
+# make a couple of FDB rows look like the phones/tablets they represent
+# instead of every MAC anonymously sharing this file's own made-up prefix.
+APPLE_OUI = (0xAC, 0xDE, 0x48)
+SAMSUNG_OUI = (0x5C, 0x0A, 0x5B)
+
+
+def _oui_mac_arc(oui: tuple[int, int, int], seed) -> str:
+    raw = h("tabletmac", seed)
+    octets = oui + ((raw >> 16) & 0xFF, (raw >> 8) & 0xFF, raw & 0xFF)
+    return ".".join(str(b) for b in octets)
 
 
 def bridge_ports(port_to_if: dict) -> dict:
@@ -505,22 +577,43 @@ def vtp_vlans(vlans) -> dict:
     return entries
 
 
-def entity_sensors(port_sensors: dict) -> dict:
-    """ENTITY-MIB + ENTITY-SENSOR-MIB for a handful of optical ports, the
-    shape nodepoll.read_dom() expects: entAliasMappingIdentifier ties a
-    physical entity to its ifIndex, entPhysicalContainedIn nests each
-    sensor under that entity, and entPhySensor* carries the reading.
+def entity_sensors(port_sensors: dict, parent_label: str | None = None,
+                   link_to_if: bool = True) -> dict:
+    """ENTITY-MIB + ENTITY-SENSOR-MIB for a handful of sensors: entPhysical-
+    ContainedIn nests each sensor under its parent entity and entPhySensor*
+    carries the reading. entAliasMappingIdentifier additionally ties the
+    parent entity to an ifIndex — the mapping nodepoll.read_dom() (the
+    interface dialog's on-demand DOM read) requires to find a transceiver's
+    sensors, but NOT the whole-device ENTITY-SENSOR-MIB walk in
+    nodepoll._poll_environment (nodepoll.py:3081), which was written
+    specifically because a chassis sensor with no port to be "on" — an
+    environmental monitor's temperature/humidity probes — needed a path
+    that does not depend on it.
 
     port_sensors: {if_index: [(label, sensor_type, units, base_value, swing)]}
+    parent_label -- the containing entity's own description. Every existing
+    caller is a switch's optical port, so the default stays the SFP+
+    transceiver text; a chassis-mounted sensor board (Room Alert) passes its
+    own text instead.
+    link_to_if -- publish the entAliasMappingIdentifier row (default True,
+    every switch/PtP caller's real topology). A standalone environmental
+    monitor passes False: its probes are not on any interface, so read_dom()
+    correctly finds nothing for it while _poll_environment still does.
+
+    `base_value` may be a callable ``fn(state, now) -> float`` instead of a
+    number, for a reading a device knob should be able to move (a UPS's
+    input voltage, a Room Alert pinned hot) rather than one that only drifts
+    with the clock; `swing` is ignored when it is.
     """
     entries: dict = {}
     for if_index, sensors in port_sensors.items():
         port_entity = 1000 + if_index
-        entries[f"{ENT_DESCR}.{port_entity}"] = (
-            T_OCTET_STRING, f"SFP+ transceiver, port {if_index}")
+        label = parent_label or f"SFP+ transceiver, port {if_index}"
+        entries[f"{ENT_DESCR}.{port_entity}"] = (T_OCTET_STRING, label)
         entries[f"{ENT_CONTAINED_IN}.{port_entity}"] = (T_INTEGER, 1)
-        entries[f"{ENT_ALIAS_MAPPING}.{port_entity}.0"] = (
-            T_OID, f"1.3.6.1.2.1.2.2.1.1.{if_index}")
+        if link_to_if:
+            entries[f"{ENT_ALIAS_MAPPING}.{port_entity}.0"] = (
+                T_OID, f"1.3.6.1.2.1.2.2.1.1.{if_index}")
         for slot, (label, stype, units, base, swing) in enumerate(sensors, start=1):
             entity = 10000 + if_index * 10 + slot
             entries[f"{ENT_DESCR}.{entity}"] = (T_OCTET_STRING, label)
@@ -528,10 +621,15 @@ def entity_sensors(port_sensors: dict) -> dict:
             entries[f"{ENT_SENSOR}.1.{entity}"] = (T_INTEGER, stype)
             entries[f"{ENT_SENSOR}.2.{entity}"] = (T_INTEGER, 9)     # units (10^0)
             entries[f"{ENT_SENSOR}.3.{entity}"] = (T_INTEGER, 3)     # 3 decimals
-            entries[f"{ENT_SENSOR}.4.{entity}"] = (
-                T_INTEGER,
-                lambda st, now, b=base, s=swing, e=entity:
-                    int(round((b + s * math.sin(now / 29.0 + (h("dom", st.name, e) % 628) / 100.0)) * 1000)))
+            if callable(base):
+                entries[f"{ENT_SENSOR}.4.{entity}"] = (
+                    T_INTEGER,
+                    lambda st, now, fn=base: int(round(fn(st, now) * 1000)))
+            else:
+                entries[f"{ENT_SENSOR}.4.{entity}"] = (
+                    T_INTEGER,
+                    lambda st, now, b=base, s=swing, e=entity:
+                        int(round((b + s * math.sin(now / 29.0 + (h("dom", st.name, e) % 628) / 100.0)) * 1000)))
             entries[f"{ENT_SENSOR}.5.{entity}"] = (T_INTEGER, 1)     # ok
             entries[f"{ENT_SENSOR}.6.{entity}"] = (T_OCTET_STRING, units)
     return entries
@@ -562,16 +660,26 @@ def _gig_ports(count: int, uplinks: int, uplink_kind: str = "TenGigabitEthernet"
     return ports, kinds, rates
 
 
-def _switch_fdb_ports(access_count: int, macs_per_port: int, seed_name: str):
+def _switch_fdb_ports(access_count: int, macs_per_port: int, seed_name: str,
+                      tablet_ports: dict[int, tuple[int, int, int]] | None = None):
     """{bridge port -> [mac arcs]} and {bridge port -> ifIndex}. Bridge port
     numbers deliberately differ from ifIndex — conflating the two is the
-    classic FDB bug, and this makes the app prove it does not."""
+    classic FDB bug, and this makes the app prove it does not.
+
+    tablet_ports: {bridge_port: OUI} swaps that port's last MAC arc for one
+    under a real phone/tablet vendor's OUI (see APPLE_OUI/SAMSUNG_OUI) — a
+    tablet or phone has no SNMP agent, so a leaf MAC on an access port is
+    the only place this fleet can represent one honestly.
+    """
     port_macs = {}
     port_to_if = {}
     for i in range(1, access_count + 1):
         bridge_port = 100 + i
         port_to_if[bridge_port] = i
-        port_macs[bridge_port] = _mac_arcs(h(seed_name, i), macs_per_port)
+        macs = _mac_arcs(h(seed_name, i), macs_per_port)
+        if tablet_ports and bridge_port in tablet_ports:
+            macs[-1] = _oui_mac_arc(tablet_ports[bridge_port], h(seed_name, i))
+        port_macs[bridge_port] = macs
     return port_macs, port_to_if
 
 
@@ -599,7 +707,12 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(if_table(names, kinds, rates, hc=not wrap32, idle_frac=0.22,
                             alias=lambda i, d: (f"uplink to core" if i > access
                                                 else f"access port {i}")))
-    port_macs, port_to_if = _switch_fdb_ports(access, 4, "access")
+    port_macs, port_to_if = _switch_fdb_ports(
+        access, 4, "access",
+        # Two of this access switch's ports have a phone/tablet leaf MAC in
+        # the FDB — see APPLE_OUI/SAMSUNG_OUI's comment: a tablet has no
+        # SNMP agent, so this is the only honest place to represent one.
+        tablet_ports={103: APPLE_OUI, 107: SAMSUNG_OUI})
     entries.update(bridge_ports(port_to_if))
     entries.update(qbridge_fdb(port_macs, vlan=10))
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
@@ -948,6 +1061,295 @@ def _build_linux(wrap32: bool, ports: int, vlan: str | None) -> dict:
     return entries
 
 
+# ------------------------------------------------------ estate device personas
+#
+# The switches, firewalls and PtP bridges above are the network the app
+# already knows how to poll. A plant site is mostly NOT those: UPSs keeping
+# a wiring closet up during a brownout, a Room Alert watching that same
+# closet's temperature, the printer down the hall, and far more servers and
+# PCs than there are switches to plug them into. These five personas are
+# what makes the fleet answer for that estate rather than only its network.
+
+
+def _supply_level(base_pct: float, swing: float, key: str):
+    """A consumable's percent-remaining, drifting slowly downward-and-up
+    like the DOM/CPU readings above — the same "graphs actually move"
+    reasoning, applied to a toner cartridge instead of a link's optics."""
+    def value(st, now):
+        drift = swing * math.sin(now / 131.0 + (h(key, st.name) % 628) / 100.0)
+        return int(max(0, min(100, base_pct + drift)))
+    return value
+
+
+def printer_supplies(supplies, trays) -> dict:
+    """RFC 3805 Printer-MIB prtMarkerSuppliesTable and prtInputTable — the
+    two tables a print-management tool actually watches (toner/waste level,
+    a tray running out of paper). Both tables index on
+    (hrDeviceIndex, tableOwnIndex); this fleet only ever answers as
+    hrDeviceIndex 1, so every row's first index arc is fixed at 1.
+
+    supplies: [(descr, prtMarkerSuppliesType, max_capacity, level)] — level
+    may be a callable, the same convention as if_table's octet counters.
+    trays: [(descr, max_capacity, level)]
+    """
+    entries: dict = {}
+    for i, (descr, kind, cap, level) in enumerate(supplies, start=1):
+        entries[f"{PRT_MARKER_SUPPLIES}.5.1.{i}"] = (T_INTEGER, kind)
+        entries[f"{PRT_MARKER_SUPPLIES}.6.1.{i}"] = (T_OCTET_STRING, descr)
+        entries[f"{PRT_MARKER_SUPPLIES}.7.1.{i}"] = (T_INTEGER, 19)  # percent
+        entries[f"{PRT_MARKER_SUPPLIES}.8.1.{i}"] = (T_INTEGER, cap)
+        entries[f"{PRT_MARKER_SUPPLIES}.9.1.{i}"] = (T_INTEGER, level)
+    for i, (descr, cap, level) in enumerate(trays, start=1):
+        entries[f"{PRT_INPUT}.8.1.{i}"] = (T_INTEGER, cap)
+        entries[f"{PRT_INPUT}.9.1.{i}"] = (T_INTEGER, level)
+        entries[f"{PRT_INPUT}.13.1.{i}"] = (T_OCTET_STRING, descr)
+    return entries
+
+
+def _build_apc_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # RFC 1628 UPS-MIB (1.3.6.1.2.1.33) is small and precisely specified, so
+    # every upsMIB OID below is real. The PowerNet-MIB objects further down
+    # (APC's own enterprise arc, 318 — VERIFIED as "apc" in
+    # netpath/enterprises.py) are reconstructed from public monitoring-tool
+    # templates rather than a MIB file this tree carries a copy of, so their
+    # exact sub-arc numbering is plausible, not cross-checked against the
+    # vendor MIB itself the way the RFC objects are.
+    entries = system_scalars(
+        "APC Web/SNMP Management Card (AP9631) *PMDU: SMTe, Firmware "
+        "v3.9.2, hardware rev 05 — Smart-UPS SMT3000RM2U",
+        "1.3.6.1.4.1.318.1.3.2.11")
+    entries.update(if_table(["eth0"], 6, 100_000_000, hc=not wrap32,
+                            alias=lambda i, d: "management"))
+
+    def seconds_on_battery(st, now):
+        return int(now - st.start_ts) % 3600 if st.on_battery else 0
+
+    def charge_remaining(st, now):
+        if not st.on_battery:
+            return 100
+        # Drains to a full "replace the battery" arc within a few minutes —
+        # fast enough that on_battery (SPECIALS index 14) can walk an
+        # operator through ups_on_battery -> ups_battery_low ->
+        # ups_battery_replace inside one demo run.
+        drained = min(85.0, seconds_on_battery(st, now) / 3.0)
+        return max(15, int(100 - drained))
+
+    def minutes_remaining(st, now):
+        if not st.on_battery:
+            return 87
+        return max(2, int(42 * charge_remaining(st, now) / 100.0))
+
+    def battery_status(st, now):
+        if not st.on_battery:
+            return 2                                   # batteryNormal
+        charge = charge_remaining(st, now)
+        if charge <= 15:
+            return 4                                   # batteryDepleted
+        if charge < 25:
+            return 3                                   # batteryLow
+        return 2
+
+    def input_voltage(st, now):
+        return 0 if st.on_battery else 118 + (h("upsvin", st.name) % 5)
+
+    def output_voltage(st, now):
+        return 118 + (h("upsvout", st.name) % 5)
+
+    def output_load(st, now):
+        return 28 + (h("upsload", st.name) % 15)
+
+    entries.update({
+        # upsIdent
+        f"{UPS_MIB}.1.1.1.0": (T_OCTET_STRING, "American Power Conversion"),
+        f"{UPS_MIB}.1.1.2.0": (T_OCTET_STRING, "Smart-UPS SMT3000RM2U"),
+        f"{UPS_MIB}.1.1.3.0": (T_OCTET_STRING, "UPS 09.3 / ID=1005"),
+        f"{UPS_MIB}.1.1.4.0": (T_OCTET_STRING, "AP9631 v3.9.2"),
+        # upsBattery — no .1.2.3.0 (upsEstimatedMinutesRemaining); see the
+        # function docstring above.
+        f"{UPS_MIB}.1.2.1.0": (T_INTEGER, battery_status),
+        f"{UPS_MIB}.1.2.2.0": (T_INTEGER, seconds_on_battery),
+        f"{UPS_MIB}.1.2.4.0": (T_INTEGER, charge_remaining),
+        f"{UPS_MIB}.1.2.5.0": (T_INTEGER, 1920),                    # 192.0 VDC
+        f"{UPS_MIB}.1.2.7.0": (
+            T_INTEGER, lambda st, now: 26 + (h("upstemp", st.name) % 6)),
+        # upsInput — one incoming line
+        f"{UPS_MIB}.1.3.2.0": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.3.3.1.1.1": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.3.3.1.2.1": (T_INTEGER, 600),                 # 60.0 Hz
+        f"{UPS_MIB}.1.3.3.1.3.1": (T_INTEGER, input_voltage),
+        # upsOutput — one outgoing line
+        f"{UPS_MIB}.1.4.1.0": (
+            T_INTEGER, lambda st, now: 5 if st.on_battery else 3),  # battery(5)/normal(3)
+        f"{UPS_MIB}.1.4.2.0": (T_INTEGER, 600),
+        f"{UPS_MIB}.1.4.3.0": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.4.4.1.1.1": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.4.4.1.2.1": (T_INTEGER, output_voltage),
+        f"{UPS_MIB}.1.4.4.1.5.1": (T_INTEGER, output_load),
+        # upsAlarm
+        f"{UPS_MIB}.1.6.1.0": (
+            T_INTEGER, lambda st, now: 1 if st.on_battery else 0),
+        # PowerNet-MIB — the same readings a real APC card also answers
+        # under its own arc, which is the one its own management software
+        # actually polls.
+        "1.3.6.1.4.1.318.1.1.1.2.1.1.0": (T_INTEGER, battery_status),
+        "1.3.6.1.4.1.318.1.1.1.2.2.1.0": (T_INTEGER, charge_remaining),
+        "1.3.6.1.4.1.318.1.1.1.2.2.3.0": (
+            T_TIMETICKS, lambda st, now: minutes_remaining(st, now) * 6000),
+        "1.3.6.1.4.1.318.1.1.1.2.2.4.0": (T_INTEGER, 1),      # no replace needed
+        "1.3.6.1.4.1.318.1.1.1.3.2.1.0": (T_INTEGER, input_voltage),
+        "1.3.6.1.4.1.318.1.1.1.4.1.1.0": (
+            T_INTEGER, lambda st, now: 3 if st.on_battery else 2),  # onBattery(3)/onLine(2)
+        "1.3.6.1.4.1.318.1.1.1.4.2.3.0": (T_INTEGER, output_load),
+    })
+    return entries
+
+
+def _room_temp_c(st, now):
+    if st.temp_hot:
+        return 42.0 + 1.2 * math.sin(now / 29.0 + (h("roomhot", st.name) % 628) / 100.0)
+    return 22.0 + 3.5 * math.sin(now / 29.0 + (h("room", st.name) % 628) / 100.0)
+
+
+def _build_room_alert(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # ENTITY-SENSOR-MIB (RFC 3433) is the standards-based half of this
+    # persona, and the half nodepoll.read_dom() actually decodes — see its
+    # _SENSOR_TYPE_UNITS/_SENSOR_STATUS maps (nodepoll.py:2822-2825): type 8
+    # is temperature in °C, type 9 is %RH, exactly the two readings an
+    # AVTECH Room Alert exposes. read_dom() finds sensors by walking from a
+    # device's own ifIndex, so entity_sensors() below ties both readings to
+    # this device's one management interface, same as it ties a DOM sensor
+    # to the SFP+ port it lives on.
+    #
+    # AVTECH's own enterprise arc (20916, CURATED — medium confidence, see
+    # enterprises.py's own docstring — as "avtech" in netpath/enterprises.py)
+    # is what identifies this persona; its Device MIB is not bundled in this
+    # tree and is far less documented than an RFC MIB, so the scalars under
+    # it below are representative, not cross-checked column numbers the way
+    # the ENTITY-SENSOR-MIB ones above are.
+    entries = system_scalars(
+        "AVTECH Room Alert 32E, firmware 4.42",
+        "1.3.6.1.4.1.20916.1.8.2", services=64)
+    entries.update(if_table(["eth0"], 6, 100_000_000, hc=not wrap32,
+                            alias=lambda i, d: "management"))
+    entries.update(entity_sensors(
+        {1: [("Room temperature", 8, "°C", _room_temp_c, 0),
+             ("Room humidity", 9, "%RH", 45.0, 8.0)]},
+        parent_label="Room Alert sensor bank"))
+    entries.update(arc_objects(20916, {
+        # Native tenths-of-a-unit scalars mirroring the two ENTITY-SENSOR
+        # readings above, plus a couple of dry-contact digital inputs (a
+        # door switch, a water-leak rope) — a Room Alert's other headline
+        # feature, alongside temperature and humidity.
+        "1.3.6.1.4.1.20916.1.6.1.1.1.3.1": (
+            T_INTEGER, lambda st, now: int(round(_room_temp_c(st, now) * 10))),
+        "1.3.6.1.4.1.20916.1.6.1.2.1.3.1": (
+            T_INTEGER, lambda st, now: 450 + (h("roomrh", st.name) % 80)),
+        "1.3.6.1.4.1.20916.1.5.1.1.1.3.1": (T_INTEGER, 0),    # door: closed
+        "1.3.6.1.4.1.20916.1.5.1.1.1.3.2": (T_INTEGER, 0),    # water: dry
+    }))
+    return entries
+
+
+def _build_printer_mfp(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # HP's real enterprise arc (11, VERIFIED as "hp" in enterprises.py) so
+    # this persona identifies the way the rest of the fleet does; the model
+    # suffix under it is a plausible LaserJet Enterprise MFP sysObjectID,
+    # not one read off a real device.
+    entries = system_scalars(
+        "HP LaserJet Enterprise MFP M528, firmware 2411240_000005",
+        "1.3.6.1.4.1.11.2.3.9.1")
+    entries.update(if_table(["network"], 6, 1_000_000_000, hc=not wrap32,
+                            alias=lambda i, d: "management"))
+    entries.update(printer_supplies(
+        [("Black Toner Cartridge HP W1470X", 3, 100,
+          _supply_level(58, 6, "toner")),
+         ("Waste Toner Container", 4, 100,
+          _supply_level(22, 5, "waste"))],
+        [("Tray 1", 250, _supply_level(70, 10, "tray1")),
+         ("Tray 2", 550, _supply_level(35, 12, "tray2"))]))
+    entries[f"{PRT_GENERAL}.16.1"] = (T_OCTET_STRING, "3rd-Floor-MFP")
+    entries[f"{HR_DEVICE_STATUS}.1"] = (T_INTEGER, 2)             # running
+    # prtMarkerLifeCount (RFC 3805 prtMarkerTable) — the page counter every
+    # print-management tool bills usage off of.
+    entries["1.3.6.1.2.1.43.10.2.1.4.1.1"] = (
+        T_COUNTER32,
+        lambda st, now: int(max(0.0, now - st.boot(now)) * 0.9) % (2 ** 32))
+    # prtAlertTable: two standing alerts, so the demo has something to open
+    # rather than an empty table. Only the columns this file can vouch for
+    # against RFC 3805 are populated — prtAlertGroup/prtAlertCode are large
+    # enumerations this tree does not carry a copy of, so they are left out
+    # rather than guessed at.
+    entries.update({
+        f"{PRT_ALERT}.2.1.1": (T_INTEGER, 4),                     # warning
+        f"{PRT_ALERT}.8.1.1": (T_OCTET_STRING, "Toner Low"),
+        f"{PRT_ALERT}.2.1.2": (T_INTEGER, 3),                     # critical
+        f"{PRT_ALERT}.8.1.2": (T_OCTET_STRING, "Tray 2 Empty"),
+    })
+    return entries
+
+
+def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # HOST-RESOURCES-MIB, answered in full. nodeoids.HOST_RESOURCES
+    # (nodeoids.py:71-74) already names hrProcessorLoad and hrStorageTable
+    # as "poll if the vendor OID resolves" and nothing in the app polls
+    # them (host_resources()'s own docstring above) — this persona adds
+    # hrSystemUptime and hrSWRunTable on top, so the demo can show a
+    # Windows box answering the whole group next to the vendor-specific
+    # health objects the network personas answer under their own arcs.
+    entries = system_scalars(
+        "Hardware: AMD64 Family 25 Model 1 Stepping 1 AT/AT COMPATIBLE - "
+        "Software: Windows Version 10.0 (Build 20348 Multiprocessor Free)",
+        "1.3.6.1.4.1.311.1.1.3.1.3", services=76)
+    entries.update(if_table(
+        ["Intel(R) I350 Gigabit Network Connection",
+         "Microsoft Network Adapter Multiplexor Driver"],
+        6, 1_000_000_000, hc=not wrap32,
+        alias=lambda i, d: "nic" if i == 1 else "team"))
+    entries[HR_SYSTEM_UPTIME] = (T_TIMETICKS, lambda st, now: st.uptime_ticks(now))
+    entries.update(host_resources(4, [
+        ("C:\\  Label:    Serial Number 4a3d9f21", 4096, 122_070_312, 0.58,
+         HR_STORAGE_FIXED_DISK),
+        ("Physical Memory", 1024, 33_554_432, 0.61, HR_STORAGE_RAM),
+        ("Virtual Memory", 4096, 8_388_608, 0.24, HR_STORAGE_VIRTUAL_MEMORY),
+    ]))
+    entries.update(hr_sw_run([
+        ("System", "", 2, 1),
+        ("services.exe", r"C:\Windows\System32\services.exe", 4, 1),
+        ("lsass.exe", r"C:\Windows\System32\lsass.exe", 4, 1),
+        ("w3wp.exe", r"C:\Windows\System32\inetsrv\w3wp.exe", 4, 1),
+        ("sqlservr.exe",
+         r"C:\Program Files\Microsoft SQL Server\MSSQL15.MSSQLSERVER\MSSQL\Binn\sqlservr.exe",
+         4, 1),
+    ]))
+    return entries
+
+
+def _build_windows_endpoint(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # The same HOST-RESOURCES shape as windows_server, cut down to what a
+    # PC or tablet actually is: one adapter — wireless-looking, since the
+    # fleet's tablets and laptop-class PCs both go over Wi-Fi, hence
+    # ifType 71 (ieee80211) rather than 6 — one small disk, and a process
+    # table short enough that the many devices of this persona the fleet
+    # holds cost almost nothing beyond the one shared, memoised table.
+    entries = system_scalars(
+        "Hardware: AMD64 Family 25 Model 1 Stepping 1 AT/AT COMPATIBLE - "
+        "Software: Windows Version 10.0 (Build 19045 Multiprocessor Free)",
+        "1.3.6.1.4.1.311.1.1.3.1.1", services=76)
+    entries.update(if_table(["Intel(R) Wi-Fi 6 AX201 160MHz"], 71, 866_000_000,
+                            hc=not wrap32, alias=lambda i, d: "wifi"))
+    entries[HR_SYSTEM_UPTIME] = (T_TIMETICKS, lambda st, now: st.uptime_ticks(now))
+    entries.update(host_resources(2, [
+        ("C:\\  Label:    Serial Number 7c21ab90", 4096, 30_517_578, 0.71,
+         HR_STORAGE_FIXED_DISK),
+        ("Physical Memory", 1024, 8_388_608, 0.66, HR_STORAGE_RAM),
+    ]))
+    entries.update(hr_sw_run([
+        ("System", "", 2, 1),
+        ("explorer.exe", r"C:\Windows\explorer.exe", 4, 1),
+    ]))
+    return entries
+
+
 PERSONAS: dict[str, Persona] = {
     "cisco_access": Persona("cisco_access", _build_cisco_access, 50,
                             "Cisco 2960X access switch"),
@@ -972,6 +1374,15 @@ PERSONAS: dict[str, Persona] = {
     "siemens_s7_plc": Persona("siemens_s7_plc", _build_s7_plc, 2,
                               "Siemens S7-1500"),
     "linux_host": Persona("linux_host", _build_linux, 2, "Linux host"),
+    "apc_ups": Persona("apc_ups", _build_apc_ups, 1, "APC Smart-UPS SMT3000"),
+    "room_alert": Persona("room_alert", _build_room_alert, 1,
+                          "AVTECH Room Alert 32E"),
+    "printer_mfp": Persona("printer_mfp", _build_printer_mfp, 1,
+                           "HP LaserJet Enterprise MFP"),
+    "windows_server": Persona("windows_server", _build_windows_server, 2,
+                              "Windows Server 2022"),
+    "windows_endpoint": Persona("windows_endpoint", _build_windows_endpoint, 1,
+                                "Windows PC/tablet"),
 }
 
 
@@ -1035,19 +1446,41 @@ SPECIALS: dict[int, dict] = {
          "name": "configrx-ssh-01", "ip": "127.0.0.1",
          "note": "the ConfigRX SSH demo device — normal SNMP, but its IP is "
                  "demo/fake_ssh.py's only bind address"},
+    14: {"persona": "apc_ups", "profile": "v2c-public", "knob": "on_battery",
+         "note": "mains has failed; upsOutputSource and PowerNet's "
+                 "upsBasicOutputStatus both flip to onBattery, and the "
+                 "charge/runtime-remaining scalars count down"},
+    15: {"persona": "room_alert", "profile": "v2c-public", "knob": "temp_hot",
+         "note": "the room sensor is pinned above a safe running "
+                 "temperature; nodepoll.read_dom decodes entPhySensorValue "
+                 "the same way it decodes a transceiver's DOM temperature"},
 }
 
 # The last index SPECIALS occupies; the weighted mix starts one past it.
 _FIXED_INDEX_MAX = max(SPECIALS)
 
 # One 100-slot cycle of the weighted mix used from index _FIXED_INDEX_MAX+1 on.
+# A plant site is mostly access switches, but printers, UPSs, Room Alerts,
+# servers and (mostly) PCs/tablets outnumber the network gear in a real
+# building; windows_endpoint's 15 reflects that without letting it swamp the
+# switches that are still the majority of what this demo polls.
 _MIX_WEIGHTS = (
-    ("cisco_access", 55), ("aruba_switch", 8), ("fortigate", 5),
-    ("paloalto", 3), ("juniper", 3), ("ubiquiti_airfiber", 5),
-    ("cambium_ptp", 3), ("mikrotik", 4), ("siemens_scalance", 4),
-    ("moxa", 3), ("rockwell_plc", 3), ("siemens_s7_plc", 2),
+    ("cisco_access", 40), ("aruba_switch", 6), ("fortigate", 4),
+    ("paloalto", 2), ("juniper", 2), ("ubiquiti_airfiber", 4),
+    ("cambium_ptp", 2), ("mikrotik", 3), ("siemens_scalance", 3),
+    ("moxa", 2), ("rockwell_plc", 2), ("siemens_s7_plc", 1),
     ("linux_host", 2),
+    ("windows_server", 3), ("windows_endpoint", 15),
+    ("apc_ups", 4), ("room_alert", 2), ("printer_mfp", 3),
 )
+
+# The five personas above are rare enough (2-15 slots out of 100) that a
+# small --count can draw the weighted cycle's first few slots and miss one
+# entirely by shuffle luck alone — and "at least one of each even at 25
+# devices" is the whole point of adding them. _mix_cycle() below guarantees
+# it structurally instead of hoping the seed cooperates.
+_MUST_APPEAR_EARLY = ("apc_ups", "room_alert", "printer_mfp",
+                      "windows_server", "windows_endpoint")
 
 _NAME_PREFIX = {
     "cisco_access": "acc-sw", "cisco_core": "core-sw", "aruba_switch": "aru-sw",
@@ -1055,19 +1488,32 @@ _NAME_PREFIX = {
     "ubiquiti_airfiber": "ptp", "cambium_ptp": "cmb", "mikrotik": "mt-rtr",
     "siemens_scalance": "scal-sw", "moxa": "moxa-sw", "rockwell_plc": "plc-ab",
     "siemens_s7_plc": "plc-s7", "linux_host": "srv", "fortigate_wlc": "wlc",
+    "apc_ups": "ups", "room_alert": "ra", "printer_mfp": "prn",
+    "windows_server": "winsrv", "windows_endpoint": "pc",
 }
 
 
 def _mix_cycle() -> list[str]:
     """The 100-slot persona cycle, spread rather than blocked so a fleet of
     any size gets a representative mix. Deterministic: a fixed shuffle
-    seed, so run N twice and every device keeps its identity."""
+    seed, so run N twice and every device keeps its identity.
+
+    One instance of each _MUST_APPEAR_EARLY persona is pulled out of the
+    shuffled pool and placed at the front (itself shuffled, so it is not
+    alphabetical) — the remaining 95 slots stay in their post-shuffle order,
+    so the mix still looks organic past the first few devices."""
     import random
     slots: list[str] = []
     for key, weight in _MIX_WEIGHTS:
         slots.extend([key] * weight)
-    random.Random(20260902).shuffle(slots)
-    return slots
+    rng = random.Random(20260902)
+    rng.shuffle(slots)
+    head = []
+    for key in _MUST_APPEAR_EARLY:
+        slots.remove(key)
+        head.append(key)
+    rng.shuffle(head)
+    return head + slots
 
 
 _CYCLE = _mix_cycle()
@@ -1100,7 +1546,7 @@ def fleet_plan(count: int) -> list[dict]:
     `community` is what the DEVICE accepts, which is not always what the
     profile configures — index 3 exists precisely to show the difference.
     Index 0 is the core switch, index 1 the wireless controller, indices
-    2..13 are SPECIALS (13 is the ConfigRX SSH demo device), and everything
+    2..15 are SPECIALS (13 is the ConfigRX SSH demo device), and everything
     after is the weighted mix.
     """
     count = max(1, int(count))
@@ -1162,6 +1608,10 @@ def fleet_plan(count: int) -> list[dict]:
                 knobs["dark_every_s"] = 300
             elif knob.startswith("reboot_every_s="):
                 knobs["reboot_every_s"] = 240
+            elif knob == "on_battery":
+                knobs["on_battery"] = True
+            elif knob == "temp_hot":
+                knobs["temp_hot"] = True
 
         if version == 3:
             knobs.setdefault("v3", "sha" if profile == "v3-sha" else "noauth")
@@ -1201,7 +1651,7 @@ if __name__ == "__main__":
     for row in plan:
         counts[row["persona"]] = counts.get(row["persona"], 0) + 1
     print(f"{len(plan)} devices, {len(counts)} personas")
-    for row in plan[:14]:
+    for row in plan[:16]:
         print(f"  {row['index']:>3} {row['ip']:<12} {row['name']:<12} "
               f"{row['persona']:<18} {row['profile']:<11} {row['site']}")
     for key, persona in PERSONAS.items():

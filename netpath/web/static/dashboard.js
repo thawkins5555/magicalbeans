@@ -84,9 +84,16 @@
   function alertsTile(alerts) {
     const bySeverity = alerts.by_severity || {};
     const keys = Object.keys(bySeverity).map(Number).sort((a, b) => a - b);
+    // by_severity is counted from state="unresolved" rows (api.py's
+    // dashboard route: open + acknowledged), the same figure "N open"
+    // above already links to with its own state=open. A row here used to
+    // link with no state at all, which lands on Alerts still carrying
+    // whatever State the operator left filtered on last — "3 critical"
+    // opening to zero rows because the list was last left on "resolved".
+    // The link now asks for exactly what was counted.
     const rows = keys.map((severity) => {
       const n = bySeverity[String(severity)];
-      return `<a class="dash-sev-row" href="#/alerts?severity=${severity}">` +
+      return `<a class="dash-sev-row" href="#/alerts?severity=${severity}&state=unresolved">` +
         `<span class="${severityClass(severity)}">${escape(severityName(severity))}</span>` +
         `<span class="dash-sev-count">${n.toLocaleString()}</span></a>`;
     }).join('');

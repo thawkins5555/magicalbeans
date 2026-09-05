@@ -260,6 +260,14 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         panels: document.querySelectorAll('.page[role="tabpanel"]').length,
         connLive: (document.getElementById('conn') || {}).getAttribute
           ? document.getElementById('conn').getAttribute('role') : null,
+        // The four labelled wrappers (.tab-group) are gone: the twelve tabs
+        // are direct children of #tabs, and #tabs, being adjacent to the
+        // wrapper the brand used to nest inside, no longer contains it.
+        tabGroups: document.querySelectorAll('.tab-group').length,
+        strayChildren: [...document.querySelectorAll('#tabs > *')]
+          .filter((el) => !el.classList.contains('tab')).length,
+        brandInside: Boolean(document.querySelector('#tabs .brand')),
+        tabStops: document.querySelectorAll('#tabs .tab[tabindex="0"]').length,
       }));
       assert(shell.h1 >= 1, 'no <h1> in the document');
       assert(shell.skip, 'no skip link');
@@ -272,8 +280,39 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
              `expected ${TABS.length} tabpanels, found ${shell.panels}`);
       assert(shell.connLive === 'status',
              `#conn should be role="status", is ${shell.connLive}`);
+      assert(shell.tabGroups === 0, `expected zero .tab-group wrappers, found ${shell.tabGroups}`);
+      assert(shell.strayChildren === 0,
+             `expected #tabs to hold only .tab children, found ${shell.strayChildren} other(s)`);
+      assert(!shell.brandInside, 'the brand is nested inside #tabs');
+      assert(shell.tabStops === 1,
+             `expected exactly one tabindex="0" tab, found ${shell.tabStops}`);
       return `h1 ${shell.h1}, tabs ${shell.tabs}, panels ${shell.panels}`;
     });
+
+  await check('Tab passes the strip in one stop', async () => {
+    // With the brand moved out of #tabs (index.html), the tablist itself
+    // should hold exactly one stop in the page's Tab order: only the
+    // active tab (roving tabindex), not the twelve buttons plus the brand's
+    // own <a>. Focus the skip link, then Tab twice: once onto the brand's
+    // link (the topbar's first real stop), once onto the active tab —
+    // never a second tab.
+    await page.focus('.skip-link');
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Tab');
+    const onActiveTab = await page.evaluate(() => {
+      const el = document.activeElement;
+      return Boolean(el && el.classList.contains('tab')
+        && el.getAttribute('aria-selected') === 'true');
+    });
+    assert(onActiveTab, 'the second Tab after the skip link did not land on the active tab');
+    await page.keyboard.press('Tab');
+    const leftTheStrip = await page.evaluate(() => {
+      const el = document.activeElement;
+      return !(el && el.classList.contains('tab'));
+    });
+    assert(leftTheStrip, 'a third Tab is still inside the tab strip');
+    return 'one stop';
+  });
 
   await check('the .subtabs groups are their own nested tablists, keyboard and all',
     async () => {
@@ -1027,26 +1066,80 @@ async function checkMisc(page) {
   await check('the tab bar can be scrolled to its end at 900 px (E8)', async () => {
     await page.setViewportSize({ width: 900, height: 900 });
     await sleep(600);
+    // At rest (scrollLeft 0) with more to scroll to, has-overflow must be
+    // set — the fade (app.css, drawn on .tabs-utility now) is the only
+    // thing that tells an operator there is more without them first
+    // finding the scrollbar.
+    const atRest = await page.evaluate(() => {
+      const nav = document.getElementById('tabs');
+      nav.scrollLeft = 0;
+      return { hasOverflow: nav.classList.contains('has-overflow'),
+               scrollLeft: nav.scrollLeft };
+    });
+    assert(atRest.scrollLeft === 0, 'the strip did not start at scrollLeft 0');
+    assert(atRest.hasOverflow, 'has-overflow is not set at scrollLeft 0, though the strip overflows');
+    await page.evaluate(() => {
+      const last = [...document.querySelectorAll('.tab')].pop();
+      last.scrollIntoView({ inline: 'end' });
+    });
+    // The 'scroll' event that re-checks has-overflow (app.js) fires
+    // asynchronously, not inside the same tick as the scroll it is
+    // reacting to — reading the class in the same page.evaluate() as the
+    // scrollIntoView() call above would race it.
+    await sleep(200);
     const bar = await page.evaluate(() => {
       const nav = document.getElementById('tabs');
       const last = [...document.querySelectorAll('.tab')].pop();
-      last.scrollIntoView({ inline: 'end' });
       const navBox = nav.getBoundingClientRect();
       const lastBox = last.getBoundingClientRect();
       return { overflowX: getComputedStyle(nav).overflowX,
                reachable: lastBox.right <= navBox.right + 1
                  && lastBox.left >= navBox.left - 1,
                bodyWidth: document.body.scrollWidth,
-               viewport: window.innerWidth };
+               viewport: window.innerWidth,
+               hasOverflowAtEnd: nav.classList.contains('has-overflow') };
     });
     assert(bar.overflowX === 'auto' || bar.overflowX === 'scroll',
            `#tabs overflow-x is ${bar.overflowX}`);
     assert(bar.reachable, 'the last tab cannot be scrolled into view');
     assert(bar.bodyWidth <= bar.viewport,
            'the page itself scrolls sideways');
+    // The combined regression guard for the fade and its scroll listener:
+    // scrolled all the way to the real right edge, there is nothing left to
+    // warn about, and has-overflow (and the fade with it) must clear.
+    assert(!bar.hasOverflowAtEnd,
+           'has-overflow is still set once the strip is scrolled to its right end');
     await page.setViewportSize({ width: 1600, height: 1000 });
     await sleep(400);
     return `overflow-x: ${bar.overflowX}`;
+  });
+
+  await check('a digit shortcut scrolls its tab into view at 900 px', async () => {
+    await page.setViewportSize({ width: 900, height: 900 });
+    await sleep(400);
+    await page.evaluate(() => {
+      document.getElementById('tabs').scrollLeft = 0;
+      if (document.activeElement) document.activeElement.blur();
+    });
+    await sleep(150);
+    await page.keyboard.press('9'); // the ninth DOM-order tab, SYSLOG — off screen at rest at this width
+    await sleep(400);
+    const result = await page.evaluate(() => {
+      const tabs = [...document.getElementById('tabs').querySelectorAll(':scope > .tab')]
+        .filter((t) => !t.hidden);
+      const tab = tabs[8];
+      if (!tab) return { ok: false, reason: 'no ninth visible tab' };
+      const navBox = document.getElementById('tabs').getBoundingClientRect();
+      const tabBox = tab.getBoundingClientRect();
+      return { ok: tabBox.right <= navBox.right + 1 && tabBox.left >= navBox.left - 1,
+               name: tab.dataset.tab };
+    });
+    assert(result.ok,
+           `pressing "9" (${result.name || 'unknown tab'}) did not scroll it into view` +
+           (result.reason ? ` (${result.reason})` : ''));
+    await page.setViewportSize({ width: 1600, height: 1000 });
+    await sleep(400);
+    return `9 -> ${result.name}, scrolled into view`;
   });
 }
 
@@ -1077,6 +1170,21 @@ async function checkReadOnly(browser, base, creds, dir, tag) {
     await shoot(page, dir, `viewer-${tag}`);
     assert(seen.length > 0, 'the viewer could not open a single tab');
     return `${seen.length} tab(s): ${seen.join(', ')}`;
+  });
+
+  /* Before the tab strip was flattened (4.49.0), a group whose every tab
+     was hidden by applyPermissions left its own label (the four .tab-group
+     wrappers' generated content) behind with nothing under it — an orphan
+     no account, viewer included, was ever meant to see. Flattening the
+     strip deletes the defect at the root (there is no longer a label to
+     orphan), so this is a regression guard: whatever this account can and
+     cannot read, none of the four retired words should ever render as text
+     in the strip again. */
+  await check('a permission-hidden group leaves no stray label text in the strip', async () => {
+    const strip = await page.evaluate(() => document.getElementById('tabs').textContent);
+    const stray = ['NOW', 'INVENTORY', 'TELEMETRY', 'ADMIN'].filter((word) => strip.includes(word));
+    assert(stray.length === 0, `stray group label text in the strip: ${stray.join(', ')}`);
+    return 'no stray label text';
   });
 
   /* Until 4.41.0 this asserted that a read-only account could see no

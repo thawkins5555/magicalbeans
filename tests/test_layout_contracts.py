@@ -122,6 +122,40 @@ check("body.kiosk" in css and "App.state.kiosk" in read("nodes.js") and "App.sta
 login = read("login.js")
 check("window.location.search" in login, "login.js hands the query string (kiosk) back after sign-in")
 
+# --------------------------------------------------------------------------
+# 5. The tab strip is flat, and its overflow fade is drawn where it cannot
+#    scroll away from the edge it is meant to mark.
+#
+# The four labelled wrappers (.tab-group, data-label) used to sit between
+# #tabs and its twelve buttons: a group whose every tab was hidden by
+# applyPermissions orphaned its own label, and the buttons' posinset/setsize
+# were wrong for being nested two deep instead of one. Flattened, the twelve
+# buttons are direct children of #tabs and a hairline (.tab--group-start)
+# stands in for the label.
+check(".tab-group" not in css and ".tab-group" not in index, "no .tab-group remains")
+check("data-label" not in index, "no data-label wrapper remains")
+tablist = index.split('<nav id="tabs"')[1].split("</nav>")[0]
+check("<div" not in tablist, "no wrapper <div> inside the #tabs tablist")
+check('class="brand"' not in tablist, "the brand is not nested inside #tabs")
+check(".tab--group-start" in css, "a hairline marks the start of a tab group")
+# The fade used to be #tabs::after, an absolutely positioned child of the
+# scroll container: it scrolled WITH scrollLeft, so it sat at the visible
+# right edge only at rest and drifted into the strip once scrolled. Drawn on
+# .tabs-utility instead — #tabs's un-scrolling next sibling — it stays over
+# the strip's real right edge regardless of scrollLeft.
+check("#tabs::after {" not in css, "the overflow fade is no longer drawn on #tabs itself")
+check("#tabs.has-overflow + .tabs-utility::before" in css,
+      "the overflow fade is drawn on #tabs's sibling instead")
+check("scroll-padding-inline" in css,
+      "a tab scrolled into view cannot land underneath the fade")
+check("bar.addEventListener('scroll', updateTabOverflow" in app,
+      "the strip's own scroll re-checks the fade")
+check("new ResizeObserver(updateTabOverflow)" in app,
+      "a width change of #tabs itself (the alerts badge, not just the window) re-checks the fade")
+narrow360 = css.split("@media (max-width: 360px)")[1]
+check("#whoami { display: none; }" in narrow360,
+      "#whoami is hidden, not just truncated, below 360px")
+
 print()
 if failures:
     print("FAILED %d check(s):" % len(failures))

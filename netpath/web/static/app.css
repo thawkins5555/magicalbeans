@@ -167,15 +167,21 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 
 /* ----------------------------------------------------------------- brand
    The wordmark: favicon.svg's route, drawn inline with classes so the theme
-   colours it, and the name in the tab face. An <h1> in the strip on the
-   application page, centred above the form on sign-in, the mark alone in
-   the SSH window's bar. */
+   colours it, and the name in the tab face. An <h1>, a sibling of #tabs
+   directly inside .topbar (not one of its tabs) on the application page,
+   centred above the form on sign-in, the mark alone in the SSH window's bar.
+   flex: none so it never competes with #tabs's flex: 1 1 auto for the
+   strip's width; the border-right now runs the full height of .topbar
+   (align-items: stretch) rather than just the tab row's, which is the point
+   — it reads as a divider between the identity and the views, not a rule
+   drawn mid-row. */
 .brand {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  margin: 0 10px 0 0;
-  padding: 0 var(--space-md) 0 0;
+  flex: none;
+  margin: 0;
+  padding: 0 var(--space-md);
   border-right: 1px solid var(--hairline);
   font: 600 var(--fs-sm)/1 var(--ui);
   letter-spacing: var(--track-tab);
@@ -215,7 +221,7 @@ body.tiny .brand span { display: none; }
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 0 var(--space-xs) 0 var(--space-md);
+  padding: 0 var(--space-xs) 0 0;
   flex: 1 1 auto;
   min-width: 0;
   position: relative;
@@ -227,41 +233,28 @@ body.tiny .brand span { display: none; }
   overflow-y: hidden;
   flex-wrap: nowrap;
   scrollbar-width: thin;
+  /* The fade below sits over the strip's real right edge, outside the
+     scrolling box (see .tabs-utility::before). A tab scrolled into view —
+     a digit shortcut, a hash route — must not stop right underneath it. */
+  scroll-padding-inline: 0 26px;
 }
 #tabs > * { flex: none; }
-/* Shown only while #tabs actually has more to scroll to (app.js toggles
-   this on load and on resize by comparing scrollWidth to clientWidth), so
-   "there is more" is visible at rest rather than only once a pointer finds
-   the scrollbar. Sits over the last ~24px of the scrolling content, not
-   over .tabs-utility, which is a separate, unscrolled element. */
-#tabs::after {
-  content: '';
-  position: absolute;
-  top: 0; bottom: 0; right: 0;
-  width: 26px;
-  background: linear-gradient(to right, transparent, var(--panel));
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-}
-#tabs.has-overflow::after { opacity: 1; }
-/* The twelve tabs are grouped into four labelled sections, in the order an
-   operator reaches for them — Now, Inventory, Telemetry, Admin — so the
-   strip reads as a handful of chunks instead of twelve equally-weighted
-   words. Purely presentational: there is exactly one role="tablist" (#tabs)
-   and twelve role="tab" buttons, wherever they are nested
-   (tests/ui/walk.mjs scopes its counts to #tabs). */
-.tab-group { display: flex; align-items: center; flex: none; }
-/* Colour, weight, tracking and case come from the shared eyebrow rule
-   below (.eyebrow, .section, …), the same label style a card's title and
-   a fieldset's legend already use. */
-.tab-group::before {
-  content: attr(data-label);
-  padding: 0 var(--space-sm) 0 var(--space-md);
+/* The twelve tabs are flat, direct children of #tabs — one role="tablist"
+   and twelve role="tab" buttons, no wrapper between them (tests/ui/walk.mjs
+   asserts exactly that). .tab--group-start marks the first tab of each
+   group after the first (Nodes, Routes, Settings): a hairline stands in for
+   the label a wrapping <div data-label> used to draw with generated
+   content, without introducing another layer for a hidden tab to orphan.
+   Written as .tab.tab--group-start (specificity 0,2,0,0), not the bare
+   class alone, so the padding-left survives the two breakpoints below that
+   redeclare .tab's own padding as a shorthand (1500px, 360px) — a bare
+   class here would lose that fight by source order and the divider gap
+   would vanish under 1500px. */
+.tab.tab--group-start {
   border-left: 1px solid var(--hairline);
-  white-space: nowrap;
+  margin-left: var(--space-xs);
+  padding-left: calc(var(--space-lg) + var(--space-xs));
 }
-.tab-group:first-of-type::before { border-left: none; padding-left: 0; }
 .tabs-utility {
   display: flex;
   align-items: center;
@@ -269,6 +262,30 @@ body.tiny .brand span { display: none; }
   flex: none;
   padding: 0 var(--space-md);
   border-left: 1px solid var(--hairline);
+  position: relative;
+}
+/* The overflow fade, moved off #tabs itself (app.css used to draw it as
+   #tabs::after, an absolutely positioned child of the scroll container —
+   which meant it scrolled WITH scrollLeft, sitting at the visible right
+   edge only while the strip was at rest. Scroll it and the fade drifted
+   into the middle of the strip, washing out whichever tab sat under it,
+   while the real right edge went un-faded.
+   Drawn here instead, on the utility group that never scrolls: `right:
+   100%` of .tabs-utility is #tabs's real right edge, whatever #tabs's own
+   scrollLeft is. Shown only while #tabs actually has more to scroll to
+   (app.js toggles #tabs.has-overflow on load, on resize, and on scroll, by
+   comparing scrollWidth to clientWidth at both ends), so "there is more" is
+   visible at rest rather than only once a pointer finds the scrollbar.
+   No z-index needed: .tabs-utility is #tabs's next sibling, so its ::before
+   paints after #tabs's own tabs in source order and sits on top of them at
+   the shared stacking level, exactly like #tabs::after used to. */
+#tabs.has-overflow + .tabs-utility::before {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; right: 100%;
+  width: 26px;
+  background: linear-gradient(to right, transparent, var(--panel));
+  pointer-events: none;
 }
 .tab {
   background: none;
@@ -745,7 +762,7 @@ body.tiny .terms { display: none; }
    catches the two page headings that were rendering at the user agent's
    1.5em default because nothing in the system had reached them. */
 .eyebrow, .section, .card h3, .sidebar h2, legend,
-.login-box label, .ssh-panel label, .tab-group::before {
+.login-box label, .ssh-panel label {
   color: var(--muted);
   font: 600 var(--fs-2xs)/1 var(--ui);
   letter-spacing: var(--track-wide);
@@ -1684,18 +1701,24 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    absorb its own overflow rather than pushing the body wider, whatever a
    page underneath it does. #tabs already scrolls its own content at every
    width (min-width: 0 keeps the flex item from being forced to its
-   content's full size); this only tightens the utility group beside it,
-   whose plain text (a username, "connecting…") has no scroll of its own to
-   fall back on. Nodes/Alerts/NetFlow's own filter bars and the Add device
-   dialog need the same "shrink or scroll, never push" treatment where their
-   markup lives (nodes.js, alerts.js, netflow.js), which is outside this
-   file. */
+   content's full size); .tabs-utility gets the same min-width: 0 here — a
+   flex: none item is still a flex ITEM, and without it .tabs-utility's own
+   content (a username, "connecting…", three buttons) refused to shrink
+   below its natural width and starved #tabs of the room .tabs-utility's own
+   flex: none was supposed to leave it. The brand's wordmark text and the
+   username go entirely rather than truncating, which between them reclaim
+   roughly 140px — real estate #conn ("the one honest signal during an
+   outage") needs more than a name already visible after Sign out does.
+   Nodes/Alerts/NetFlow's own filter bars and the Add device dialog need the
+   same "shrink or scroll, never push" treatment where their markup lives
+   (nodes.js, alerts.js, netflow.js), which is outside this file. */
 @media (max-width: 360px) {
-  .tab-group::before { padding: 0 var(--space-xs) 0 var(--space-sm); }
   .tab { padding: var(--space-sm) 10px; }
-  .tabs-utility { gap: 6px; padding: 0 var(--space-sm); }
+  .tabs-utility { gap: 6px; padding: 0 var(--space-sm); min-width: 0; }
   .tabs-utility .linkish { padding: var(--space-xs) 6px; }
-  #whoami, #conn {
+  .brand span { display: none; }
+  #whoami { display: none; }
+  #conn {
     display: inline-block;
     max-width: 68px;
     overflow: hidden;
