@@ -311,6 +311,7 @@ const App = (() => {
     updateTabOverflow();
     // Hiding a tab shifts which tabs the '1'-'9' shortcuts below reach.
     updateTabShortcuts();
+    updateTabGroups();
     /* A control the account may not use is DISABLED and says why, rather
        than being deleted from the page.
 
@@ -443,6 +444,7 @@ const App = (() => {
         console.error(`${name}: module failed to load, tab hidden`, error);
         updateTabOverflow();
         updateTabShortcuts();
+        updateTabGroups();
         if (state.tab === name) {
           const next = visibleTabs().map((t) => t.dataset.tab).find(usableTab);
           if (next) selectTab(next);
@@ -3975,12 +3977,16 @@ const App = (() => {
      there is actually more to scroll TO — Chromium paints no scrollbar of
      its own until the pointer is over the strip, so without this the strip
      looked simply truncated at rest below ~1500px. Checked on load, on
-     every resize, on every scroll of the strip itself and by the
-     ResizeObserver in start() (below) that watches #tabs for width changes
-     a window resize alone would miss — the alerts badge changing the
-     ALERTS tab's own width being the one that actually happens, twice a
-     second, on a live install; a tab hidden or shown by applyPermissions or
-     brokenPages can change the answer too, so both call this as well.
+     every resize, on every scroll of the strip itself, and by the
+     ResizeObserver in start() (below) that watches #tabs for a width change
+     a window resize alone would miss. That observer does NOT catch the
+     ALERTS tab growing or shrinking as the open count's digit count
+     changes: a child growing inside a flex item with overflow-x:auto moves
+     #tabs's scrollWidth without moving #tabs's own allocated box, and a
+     ResizeObserver only fires on the latter. loadState() (below) calls this
+     directly, right after it writes the badge, to cover that case; a tab
+     hidden or shown by applyPermissions or brokenPages can change the
+     answer too, so both call this as well.
      `max` is how much is left to scroll: without comparing scrollLeft
      against it, the fade stayed lit once scrolled all the way to the real
      right edge, where there is nothing left for it to warn about. */
@@ -4001,6 +4007,31 @@ const App = (() => {
       if (index < 9) tab.setAttribute('aria-keyshortcuts', String(index + 1));
       else tab.removeAttribute('aria-keyshortcuts');
     });
+  }
+
+  /* index.html marks the first tab of each group after Now (Nodes, Routes,
+     Settings) with data-group-start — a fixed fact about the twelve tabs,
+     never written here. Which tab actually carries the .tab--group-start
+     hairline is not fixed: applyPermissions or brokenPages can hide the
+     marked tab itself (an account with ipam but not nodes read, say), and a
+     hairline owned by one now-hidden button used to vanish along with it,
+     leaving its group flush against the one before with no separator at
+     all — the same orphaned-group-label defect the 4.49.0 flattening was
+     meant to retire, back in a smaller form.
+     So the hairline belongs to the group, not to one member: this walks the
+     strip in order, and whenever a data-group-start tab is passed, hands
+     the class to the next tab that is actually visible, wherever that ends
+     up being. A group hidden in full simply passes its pending boundary on
+     to the next one, rather than drawing two hairlines or none. Called
+     everywhere updateTabShortcuts is, for the same reason. */
+  function updateTabGroups() {
+    let pending = false;
+    for (const tab of stripTabs()) {
+      if (tab.dataset.groupStart !== undefined) pending = true;
+      const starts = pending && !tab.hidden;
+      tab.classList.toggle('tab--group-start', starts);
+      if (starts) pending = false;
+    }
   }
 
   /* ------------------------------------------------------------- theme
@@ -4423,6 +4454,13 @@ const App = (() => {
     if (alertsBadge) {
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
+      // The badge is part of the ALERTS tab's own box, so growing or
+      // shrinking it can newly overflow (or un-overflow) the strip without
+      // #tabs's own allocated box changing — the one thing the
+      // ResizeObserver above watches. Recomputed here, at the one place the
+      // badge's width actually changes, rather than adding a second
+      // observer.
+      updateTabOverflow();
       // The badge's digits are folded into the tab's own aria-label below,
       // so a screen reader is not also handed the bare number as a second,
       // separate piece of the button's text content ("ALERTS" + "76").
@@ -4634,10 +4672,12 @@ const App = (() => {
     if (bar) {
       wireRovingTabs(bar, visibleTabs, (tab) => selectTab(tab.dataset.tab));
       bar.addEventListener('scroll', updateTabOverflow, { passive: true });
-      // The strip's scrollWidth can change without a resize of the window —
-      // the alerts badge (loadState, below) grows or shrinks the ALERTS tab
-      // as the open count's digit count changes — so has-overflow is kept
-      // in step by watching #tabs itself, not just window resizes.
+      // Catches #tabs's own allocated box changing for a reason other than
+      // a window 'resize' event (applyDensity, above, already covers that
+      // one). It does NOT catch the alerts badge growing or shrinking the
+      // ALERTS tab: that moves #tabs's scrollWidth without moving #tabs's
+      // own box, which is all a ResizeObserver watches — loadState (below)
+      // calls updateTabOverflow directly right after it writes the badge.
       new ResizeObserver(updateTabOverflow).observe(bar);
     }
     wireSubtabGroups();
@@ -4771,6 +4811,7 @@ const App = (() => {
     // modules down at once used to lay out the strip N times in a row.
     updateTabOverflow();
     updateTabShortcuts();
+    updateTabGroups();
     // A link is more specific than a memory: if the address bar names a
     // tab (and a selection in it), that wins over the remembered tab, and
     // over login.js's "land on Dashboard after signing in".
@@ -4850,7 +4891,7 @@ const App = (() => {
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub,
-    grid, a11yTable, sortRows, canRead, canWrite, accountModal, wireRowKeyboard,
+    grid, a11yTable, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
     statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,

@@ -341,6 +341,44 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return `h1 ${shell.h1}, tabs ${shell.tabs}, panels ${shell.panels}`;
     });
 
+  /* .tab--group-start (app.css) draws the hairline before the first tab of
+     a group (Nodes, Routes, Settings). Until now it was a static class on
+     that one button, so an account with read on some but not all of a
+     group's modules (ipam without nodes, say) had applyPermissions hide
+     the very button the hairline lived on, and the whole group ran flush
+     against the one before it with no separator — a smaller re-appearance
+     of the orphaned-group-label defect the four .tab-group wrappers above
+     were removed to fix. app.js's updateTabGroups() now derives the class
+     from index.html's fixed data-group-start marker, moving it to whichever
+     tab of the group is actually visible. This drives applyPermissions
+     directly (exposed on App for exactly this) rather than reimplementing
+     the check, so it exercises the real production code path. */
+  await check('a permission-hidden group tab does not take the group\'s hairline with it',
+    async () => {
+      const result = await page.evaluate(() => {
+        const nodes = document.querySelector('.tab[data-tab="nodes"]');
+        const ipam = document.querySelector('.tab[data-tab="ipam"]');
+        const had = Object.prototype.hasOwnProperty.call(App.state.permissions, 'nodes');
+        const original = App.state.permissions.nodes;
+        delete App.state.permissions.nodes;
+        App.applyPermissions();
+        const hidden = { nodesHidden: nodes.hidden,
+          nodesStarts: nodes.classList.contains('tab--group-start'),
+          ipamStarts: ipam.classList.contains('tab--group-start') };
+        if (had) App.state.permissions.nodes = original;
+        App.applyPermissions();
+        const restored = { nodesStarts: nodes.classList.contains('tab--group-start'),
+          ipamStarts: ipam.classList.contains('tab--group-start') };
+        return { hidden, restored };
+      });
+      assert(result.hidden.nodesHidden, 'simulated permission change did not hide NODES');
+      assert(!result.hidden.nodesStarts, 'a hidden tab still carries the group hairline');
+      assert(result.hidden.ipamStarts, 'the hairline did not move to IPAM, the group\'s new first visible tab');
+      assert(result.restored.nodesStarts, 'restoring the permission did not move the hairline back to NODES');
+      assert(!result.restored.ipamStarts, 'IPAM kept the hairline after NODES became visible again');
+      return 'hairline followed the group off NODES and back';
+    });
+
   await check('Tab passes the strip in one stop', async () => {
     // With the brand moved out of #tabs (index.html), the tablist itself
     // should hold exactly one stop in the page's Tab order: only the

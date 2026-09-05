@@ -241,10 +241,20 @@ body.tiny .brand span { display: none; }
 #tabs > * { flex: none; }
 /* The twelve tabs are flat, direct children of #tabs — one role="tablist"
    and twelve role="tab" buttons, no wrapper between them (tests/ui/walk.mjs
-   asserts exactly that). .tab--group-start marks the first tab of each
-   group after the first (Nodes, Routes, Settings): a hairline stands in for
+   asserts exactly that). .tab--group-start draws a hairline standing in for
    the label a wrapping <div data-label> used to draw with generated
    content, without introducing another layer for a hidden tab to orphan.
+   index.html marks the group boundaries themselves with the fixed
+   data-group-start attribute (Nodes, Routes, Settings) and also carries
+   this class on the same three buttons, as the correct answer for an
+   account that can read everything — so the strip is not briefly
+   hairline-less on the very first paint, before app.js has run. app.js's
+   updateTabGroups() is the one place that changes the answer after that:
+   it recomputes this class from data-group-start on every tab whenever a
+   permission or a broken module can have hidden the marked tab, and hands
+   the hairline to whichever tab of the group is actually first VISIBLE —
+   so hiding the marked tab moves the hairline along with its group
+   instead of deleting it.
    Written as .tab.tab--group-start (specificity 0,2,0,0), not the bare
    class alone, so the padding-left survives the two breakpoints below that
    redeclare .tab's own padding as a shorthand (1500px, 360px) — a bare

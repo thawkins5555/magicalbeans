@@ -47,7 +47,7 @@
 <nav id="tabs" role="tablist" aria-label="Views">
   <button class="tab" data-tab="dashboard">DASHBOARD</button>
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
-  <button class="tab tab--group-start" data-tab="nodes">NODES</button>
+  <button class="tab tab--group-start" data-tab="nodes" data-group-start>NODES</button>
   <button class="tab" data-tab="ipam">IPAM</button>
   <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
        FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than
@@ -56,11 +56,11 @@
        found nothing there. -->
   <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
   <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
-  <button class="tab tab--group-start" data-tab="netpath">ROUTES</button>
+  <button class="tab tab--group-start" data-tab="netpath" data-group-start>ROUTES</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
   <button class="tab" data-tab="snmp">SNMP TRAP</button>
-  <button class="tab tab--group-start" data-tab="settings">SETTINGS</button>
+  <button class="tab tab--group-start" data-tab="settings" data-group-start>SETTINGS</button>
   <button class="tab" data-tab="debug">DEBUG</button>
 </nav>
 <!-- Each of these three carries an icon AND a text label (.label): below
@@ -145,6 +145,7 @@
     <button class="subtab" data-subtab="topology">TOPOLOGY</button>
     <button class="subtab" data-subtab="discovery">DISCOVERY</button>
     <button class="subtab" data-subtab="profiles">PROFILES &amp; MIBS</button>
+    <button class="subtab" data-subtab="reports">REPORTS</button>
   </nav>
 
   <div id="nodes-sub-devices" class="subpage active">
@@ -355,6 +356,75 @@
           <button id="nd-upload-mib" data-requires-write="nodes" class="primary">Upload MIB</button></div>
         <div class="table-wrap"><table id="nd-mibs-table"></table></div>
       </div>
+    </div>
+  </div>
+
+  <!-- netpath/report.py answers "what was our uptime last month" and "which
+       links came closest to saturation" from history the fleet already
+       stores (400 days of every metric); before this, nothing in the
+       shipped JS ever called either route. Two reports, one subtab: an
+       operator picking a period and, for Availability, a device group, gets
+       the SLA-review number and its worst offenders without scrolling
+       through 2,000 rows in server order; Top-N answers "which N" for
+       whatever metric a review needs. Both are read-only (nodes:read),
+       so a viewer account can use this in full. -->
+  <div id="nodes-sub-reports" class="subpage">
+    <nav class="subtabs nested">
+      <button class="subtab active" data-subtab="availability">AVAILABILITY</button>
+      <button class="subtab" data-subtab="topmetrics">TOP-N BY METRIC</button>
+    </nav>
+
+    <div id="nd-rep-sub-availability" class="subpage active">
+      <div class="bar wrap">
+        <span class="section">AVAILABILITY</span>
+        <span class="hint">Uptime, outage count, downtime, longest outage and MTTR per device over a chosen period.</span>
+      </div>
+      <div class="bar wrap">
+        <label>From <input type="date" id="nd-rep-avail-t0"></label>
+        <label>To <input type="date" id="nd-rep-avail-t1"></label>
+        <button id="nd-rep-avail-7d" type="button">7 days</button>
+        <button id="nd-rep-avail-30d" type="button">30 days</button>
+        <button id="nd-rep-avail-90d" type="button">90 days</button>
+        <button id="nd-rep-avail-lastmonth" type="button">Last month</button>
+        <label>Group <select id="nd-rep-avail-devgroup"></select></label>
+        <button id="nd-rep-avail-run" class="primary">Run report</button>
+        <button id="nd-rep-avail-export-csv">Export CSV</button>
+      </div>
+      <div class="bar wrap">
+        <span id="nd-rep-avail-summary" class="hint"></span>
+      </div>
+      <div class="bar wrap" id="nd-rep-avail-caveats" hidden></div>
+      <div class="table-wrap"><table id="nd-rep-avail-table"></table></div>
+    </div>
+
+    <div id="nd-rep-sub-topmetrics" class="subpage">
+      <div class="bar wrap">
+        <span class="section">TOP-N BY METRIC</span>
+        <span class="hint">The N worst (or, ticked below, least busy) devices or interfaces by one metric over a chosen period.</span>
+      </div>
+      <div class="bar wrap">
+        <label>Metric key <input id="nd-rep-topn-key" size="22" placeholder="cpu_pct, or if_in_util_pct.% with Wildcard"></label>
+        <label class="check"><input type="checkbox" id="nd-rep-topn-like"> Wildcard (%)</label>
+        <label>Rank by <select id="nd-rep-topn-rankby">
+          <option value="peak">Peak</option><option value="mean">Mean</option>
+        </select></label>
+        <label class="check"><input type="checkbox" id="nd-rep-topn-ascending"> Ascending (least first)</label>
+        <label>Show <input type="number" id="nd-rep-topn-n" value="20" min="1" max="500" size="4"></label>
+      </div>
+      <div class="bar wrap">
+        <label>From <input type="date" id="nd-rep-topn-t0"></label>
+        <label>To <input type="date" id="nd-rep-topn-t1"></label>
+        <button id="nd-rep-topn-7d" type="button">7 days</button>
+        <button id="nd-rep-topn-30d" type="button">30 days</button>
+        <button id="nd-rep-topn-90d" type="button">90 days</button>
+        <label>Group <select id="nd-rep-topn-devgroup"></select></label>
+        <button id="nd-rep-topn-run" class="primary">Run report</button>
+        <button id="nd-rep-topn-export-csv">Export CSV</button>
+      </div>
+      <div class="bar wrap">
+        <span id="nd-rep-topn-summary" class="hint"></span>
+      </div>
+      <div class="table-wrap"><table id="nd-rep-topn-table"></table></div>
     </div>
   </div>
 </section>
@@ -900,6 +970,13 @@
     <button id="cx-settings" class="module-settings" data-requires-write="configrx">Settings</button>
   </div>
 
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="devices">DEVICES</button>
+    <button class="subtab" data-subtab="search">SEARCH</button>
+    <button class="subtab" data-subtab="compliance">COMPLIANCE</button>
+  </nav>
+
+  <div id="configrx-sub-devices" class="subpage active">
   <div class="bar wrap">
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
     <label>Vendor <select id="cx-filter-vendor"></select></label>
@@ -967,6 +1044,7 @@
       <span class="grow"></span>
       <button id="cx-diff-close" hidden>Close diff</button>
     </header>
+    <div id="cx-device-compliance" class="hint"></div>
     <pre id="cx-viewer" class="detail" data-empty="Select a device to see its stored backups."></pre>
     <!-- Replaces the plain viewer above while a diff is open (see
          showDiff/closeDiff): a unified diff, coloured line-by-line with the
@@ -975,6 +1053,79 @@
     <div id="cx-diff-wrap" hidden>
       <p id="cx-diff-meta" class="hint"></p>
       <pre id="cx-diff" class="detail"></pre>
+    </div>
+   </div>
+  </div>
+  </div>
+
+  <!-- Cross-device search (netpath/configrx_search.py): a query nothing
+       else in ConfigRX can answer, over every device's latest stored
+       (always redacted, regardless of that device's own store_secrets
+       setting) capture. Read-only end to end — see configrx_search.py's
+       own module docstring for why a search index built only from redacted
+       text is what makes that safe. -->
+  <div id="configrx-sub-search" class="subpage">
+   <div class="bar wrap">
+    <label>Query <input id="cxse-q" size="30" placeholder="e.g. snmp-server community public"></label>
+    <label>Mode <select id="cxse-mode">
+      <option value="text">Plain text</option>
+      <option value="regex">Regular expression</option>
+    </select></label>
+    <button id="cxse-run">Search</button>
+    <button id="cxse-clear">Clear</button>
+    <span class="grow"></span>
+    <span id="cxse-count" class="hint"></span>
+   </div>
+   <p class="hint">Searches every device's latest stored configuration capture — always the
+     redacted text, even for a device that keeps secrets in its own backups, so this can never
+     become a way to read one. A regular expression is bounded: a pattern shaped to run away is
+     refused before it is ever tried against a device's capture.</p>
+   <p id="cxse-truncated" class="hint" hidden>This search ran out of time before checking every
+     device — the result above may be incomplete. Narrow the query and try again.</p>
+   <div id="cxse-empty" class="empty">Search across every device's latest stored configuration to
+     find it here — which switches still have a given community string, who is running an old NTP
+     server, every port configured for a given VLAN.</div>
+   <div id="cxse-wrap" class="table-wrap" hidden><table id="cxse-results"></table></div>
+  </div>
+
+  <!-- Compliance rule sets (netpath/configrx_compliance.py): named must-
+       match/must-not-match rules scoped to a device group, evaluated after
+       every capture and on the hourly sweep, with one pass/fail result per
+       device stored rather than recomputed on every view. -->
+  <div id="configrx-sub-compliance" class="subpage">
+   <div class="cols" data-splitter="configrx-compliance-body">
+    <div class="pane pad-x pad-b" data-grow="1">
+     <header class="bar">
+      <span class="section">RULE SETS</span>
+      <span class="grow"></span>
+      <button id="cxrs-new" data-requires-write="configrx">New rule set</button>
+     </header>
+     <div class="table-wrap"><table id="cxrs-table"></table></div>
+    </div>
+    <div class="divider"></div>
+    <div class="pane pad-x pad-b" data-grow="2">
+     <header class="bar wrap">
+      <span id="cxrs-detail-header" class="section">RULE SET</span>
+      <span class="grow"></span>
+      <button id="cxrs-evaluate" data-requires-write="configrx" hidden>Evaluate now</button>
+      <button id="cxrs-edit" data-requires-write="configrx" hidden>Edit</button>
+      <button id="cxrs-delete" data-requires-write="configrx" hidden>Delete</button>
+     </header>
+     <div id="cxrs-empty" class="empty">Select a rule set on the left, or create one.</div>
+     <div id="cxrs-detail" hidden>
+      <p id="cxrs-scope" class="hint"></p>
+      <header class="bar">
+       <span class="section">RULES</span>
+       <span class="grow"></span>
+       <button id="cxrs-add-rule" data-requires-write="configrx">Add rule</button>
+      </header>
+      <div id="cxrs-rules-empty" class="empty">No rules yet.</div>
+      <div id="cxrs-rules-wrap" class="table-wrap" hidden><table id="cxrs-rules-table"></table></div>
+      <header class="bar"><span class="section">RESULTS</span></header>
+      <div id="cxrs-results-empty" class="empty">No results yet — evaluate this rule set to see
+        per-device status.</div>
+      <div id="cxrs-results-wrap" class="table-wrap" hidden><table id="cxrs-results-table"></table></div>
+     </div>
     </div>
    </div>
   </div>

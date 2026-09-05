@@ -18,6 +18,39 @@
     // The last /api/configrx/diff response, or null while the plain
     // single-backup viewer is showing instead — see showDiff/closeDiff.
     diff: null,
+    // Which of the three subtabs (devices/search/compliance) is on screen —
+    // read by activate() to decide whether a route needs to force the
+    // devices subtab open (see gotoDevice) rather than assumed from the DOM
+    // on every check.
+    activeSub: 'devices',
+    // The last /api/configrx/search response, plus the query/mode that
+    // produced it (drawSearchResults reads both — an empty result before
+    // any search has run reads differently from an empty result the search
+    // itself returned).
+    search: { query: '', mode: 'text', results: [], truncated: false, ran: false },
+    // Bumped on every runSearch()/clearSearch() — drawSearchResults awaits
+    // a fetch of its own (searchCoverageNote) only for the empty-result
+    // case, so a search fired while an older one's empty state is still
+    // being drawn needs a way to tell "am I still the current one" apart
+    // from merely comparing view.search.ran (true for any two searches).
+    searchGen: 0,
+    // Rule sets (netpath/configrx_compliance.py). null (not []) means "not
+    // fetched yet" — refreshRuleSets() is only ever called once up front,
+    // the first time either the Compliance subtab or a device's own
+    // compliance summary needs the list, rather than on every refresh().
+    ruleSets: null,
+    ruleSetsById: new Map(),
+    selectedRuleSetId: null,
+    selectedRuleSet: null,
+    ruleSetRules: [],
+    ruleSetResults: [],
+    // Nodes' device groups (a rule set's own scope) — null (not []) means
+    // "not fetched yet", same convention as ruleSets above.
+    deviceGroups: null,
+    // The selected device's own per-rule-set results, surfaced on the
+    // Devices subtab's CONFIG pane. null while unknown/unreadable, distinct
+    // from an empty array (no rule set applies to this device).
+    deviceCompliance: null,
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -57,6 +90,31 @@
     return App.statusMark(STATUS_TONE[key] || 'none', '', status || 'not backed up yet');
   }
 
+  /* Compliance results (configrx_compliance.py) map onto the same
+     App.statusMark vocabulary the backups above use. "not_yet_assessed" —
+     distinct from "not_assessed" — takes the warn tone rather than none:
+     it means a device DOES have a capture and some of its rules were
+     checked, just not all of them before the sweep's own wall-clock budget
+     ran out, which is worth a second look rather than reading as "nothing
+     to report" the way "no capture at all yet" does. */
+  const RESULT_TONE = { pass: 'ok', fail: 'fail', not_assessed: 'none', not_yet_assessed: 'warn' };
+  const RESULT_LABEL = { pass: 'Pass', fail: 'Fail', not_assessed: 'Not assessed',
+    not_yet_assessed: 'Not yet assessed' };
+
+  /* A control the account cannot use is disabled and says why — never
+     hidden (see app.js's applyWriteGate) — but a button built into a table
+     row string here is drawn long before applyPermissions() would ever
+     walk back over it (that only reruns on a config_version change, not on
+     every redraw of a row this page rebuilds on its own), so the same
+     decision is made by hand at render time instead. Kept in one place so
+     the sentence stays byte-for-byte the one app.js's own writeDeniedReason
+     already shows for this module, rather than a second copy that could
+     drift from it. */
+  function gateAttr() {
+    return App.canWrite('configrx') ? '' :
+      ' disabled title="Your account can read ConfigRX but not change it."';
+  }
+
   /* ------------------------------------------------------------ status */
 
   function drawStatus() {
@@ -78,6 +136,56 @@
       else if (ssh.legacy_offered === false) parts.push('legacy SSH off');
     }
     App.el('cx-counters').textContent = parts.join(' · ');
+  }
+
+  /* --------------------------------------------------------------- subtabs
+
+     DEVICES/SEARCH/COMPLIANCE, wired the way every other module's subtabs
+     are (Nodes' own selectSub is the pattern this follows): app.js's
+     wireSubtabGroups/wireSubtabRouting own the generic tablist semantics
+     and the URL hash once a button carries the right markup — this module
+     still owns the click handler that actually toggles `.active` and calls
+     App.rememberSub, and whatever else switching panes needs to kick off. */
+
+  function selectSub(name) {
+    for (const btn of document.querySelectorAll('#page-configrx > .subtabs > .subtab')) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const page of document.querySelectorAll('#page-configrx > .subpage')) {
+      page.classList.toggle('active', page.id === `configrx-sub-${name}`);
+    }
+    view.activeSub = name;
+    // Fetched once, lazily — a rule set list a device's own compliance
+    // summary might already have pulled in (loadDeviceCompliance) is not
+    // re-fetched just because this subtab was opened after it.
+    if (name === 'compliance' && view.ruleSets === null) {
+      refreshRuleSets().catch((error) =>
+        App.toast(`Could not load rule sets: ${error.message}`, 'fail'));
+    }
+  }
+
+  /* The other half of "a way to get from a result to that device's config"
+     (search results, compliance results, and the device compliance summary
+     all land here): switch to the Devices subtab if it is not already
+     showing, select the device, and — since what a searcher or a
+     compliance reader actually wants is the config itself, not an empty
+     viewer with a device selected — open its latest stored backup too. */
+  async function gotoDevice(deviceId) {
+    App.rememberSub('configrx', 'devices');
+    selectSub('devices');
+    await selectDevice(deviceId).catch((error) => {
+      App.toast(`Could not open that device: ${error.message}`, 'fail');
+      throw error;
+    });
+    if (view.selectedDeviceId === deviceId && view.backups.length) {
+      await selectBackup(view.backups[0].id).catch(() => { /* nothing stored, or a race */ });
+    }
+  }
+
+  function gotoRuleSet(ruleSetId) {
+    App.rememberSub('configrx', 'compliance');
+    selectSub('compliance');
+    selectRuleSet(ruleSetId);
   }
 
   /* ------------------------------------------------------------- devices */
@@ -359,13 +467,16 @@
     view.selectedDeviceId = deviceId;
     view.selectedBackupId = null;
     view.backupContent = '';
+    view.deviceCompliance = null;
     closeDiff();
     App.setRoute(deviceId != null ? ['device', deviceId] : []);
     drawDevices();
     drawViewer();
+    drawDeviceCompliance();
     const result = await App.get(`/api/configrx/devices/${deviceId}/backups`, {});
     view.backups = result.backups;
     drawBackups();
+    if (deviceId != null) loadDeviceCompliance(deviceId).catch(() => {});
   }
 
   /* ------------------------------------------------------------- backups */
@@ -947,6 +1058,512 @@
     App.wireColumnPickers(settingsBox);
   }
 
+  /* ------------------------------------------------------------- search
+
+     GET /api/configrx/search: one query against every device's latest
+     stored capture — always the redacted text (configrx_search.py's own
+     module docstring), regardless of that device's store_secrets setting,
+     which is what makes this safe to expose as a read rather than a write.
+     Run on demand (a button/Enter, not the page's own refresh tick) —
+     unlike the devices list, there is no "current" search to keep live. */
+
+  const SEARCH_COLUMNS = [
+    { key: 'device', label: 'Device',
+      cell: (r) => `${escape(r.device_name || r.device_ip || `#${r.device_id}`)}` +
+        (r.device_name && r.device_ip ? `<div class="hint">${escape(r.device_ip)}</div>` : '') },
+    { key: 'line_no', label: 'Line', numeric: true,
+      cell: (r) => escape(String(r.line_no)) },
+    { key: 'line', label: 'Config line', cell: (r) => `<span class="mono">${escape(r.line)}</span>` },
+  ];
+
+  /* How many devices on the whole fleet have ever completed a capture at
+     all — fetched unfiltered (no q/vendor/enabled_only), independent of
+     whatever the Devices subtab's own filters currently hold, because this
+     exists to answer one question honestly: "is a 0-match result actually
+     evidence of a clean estate, or is there simply nothing here to search
+     yet?" A search only ever reaches a device's LATEST stored capture
+     (configrx_search.py's own module docstring), so a device that has
+     never backed up successfully is invisible to it no matter what the
+     query is — and that is a fact about coverage, not about the query,
+     which is exactly what a bare "No matches" cannot say on its own. Only
+     fetched when a search actually comes back empty, not on every
+     keystroke. */
+  async function searchCoverageNote() {
+    let devices;
+    try {
+      devices = (await App.get('/api/configrx/devices', {})).devices || [];
+    } catch (error) {
+      return '';
+    }
+    if (!devices.length) return '';
+    const captured = devices.filter((d) => d.last_backup_ts).length;
+    if (!captured) {
+      return ` No device on the fleet has completed a capture yet — there is nothing ` +
+        `stored for this search to reach.`;
+    }
+    return ` ${captured} of ${devices.length} device(s) have completed at least one ` +
+      `capture and are reachable by search; a device with none is not, whatever this ` +
+      `query is.`;
+  }
+
+  async function drawSearchResults() {
+    const generation = view.searchGen;
+    const { results, truncated, indexed, mode, ran } = view.search;
+    const empty = App.el('cxse-empty');
+    const wrap = App.el('cxse-wrap');
+    App.setHidden(App.el('cxse-truncated'), !truncated);
+    // `indexed` (server) says which of the two code paths answered this
+    // query — the FTS index, or a full scan of every device's stored
+    // lines (regex mode always scans; so does a text query under the
+    // trigram floor, or with no FTS5 on this build). Said here rather than
+    // left silent: a caller reading "0 matches" with no other context has
+    // no way to tell "the index looked and found nothing" apart from "this
+    // build has no index at all and scanned instead" otherwise.
+    const via = ran ? (indexed ? ' (via the search index)'
+      : mode === 'regex' ? ' (full scan — a regex always scans)' : ' (full scan)') : '';
+    App.setText(App.el('cxse-count'), ran
+      ? `${results.length} match(es)${truncated ? ' — search stopped early' : ''}${via}` : '');
+    if (!results.length) {
+      if (ran) {
+        // A 0-match result is never, on its own, proof of a clean estate —
+        // only proof that nothing CURRENTLY REACHABLE by search matched.
+        // Said plainly rather than left to read as "verified clean", with
+        // the fleet's own actual capture coverage right beside it so an
+        // operator has something concrete to judge that against.
+        empty.textContent = 'No matches. This does not mean these devices are clean — '
+          + 'only a device with a stored capture is ever searched, and each one reflects '
+          + 'that capture as of when it was last indexed.' + (await searchCoverageNote());
+      } else {
+        empty.textContent = 'Search across every device’s latest stored configuration to find '
+          + 'it here — which switches still have a given community string, who is running an '
+          + 'old NTP server, every port configured for a given VLAN.';
+      }
+      if (view.searchGen !== generation) return;   // a newer search already redrew this
+      App.setHidden(empty, false);
+      App.setHidden(wrap, true);
+      return;
+    }
+    App.setHidden(empty, true);
+    App.setHidden(wrap, false);
+    // Rows have no id of their own (a config line is not an entity with
+    // one) — synthesised so App.drawRows can still key its row cache.
+    const rows = results.map((r, i) => ({ ...r, id: `${r.device_id}:${r.line_no}:${i}` }));
+    const table = App.el('cxse-results');
+    table.innerHTML = '<caption class="sr-only">ConfigRX search results</caption>'
+      + '<thead><tr><th scope="col">Device</th><th scope="col">Line</th>'
+      + '<th scope="col">Config line</th></tr></thead>';
+    const body = document.createElement('tbody');
+    App.drawRows(body, rows, SEARCH_COLUMNS, (tr, row) => {
+      tr.className = 'clickable';
+      tr.onclick = () => gotoDevice(row.device_id);
+    });
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  async function runSearch() {
+    const query = App.el('cxse-q').value.trim();
+    const mode = App.el('cxse-mode').value;
+    if (!query) {
+      App.el('cxse-q').focus();
+      return;
+    }
+    App.setText(App.el('cxse-count'), 'Searching…');
+    let result;
+    try {
+      result = await App.get('/api/configrx/search', { query, mode });
+    } catch (error) {
+      App.setText(App.el('cxse-count'), '');
+      App.toast(`Search failed: ${error.message}`, 'fail');
+      return;
+    }
+    view.search = { query, mode, results: result.matches, truncated: result.truncated,
+      indexed: result.indexed, ran: true };
+    view.searchGen += 1;
+    await drawSearchResults();
+  }
+
+  async function clearSearch() {
+    App.el('cxse-q').value = '';
+    App.el('cxse-mode').value = 'text';
+    view.search = { query: '', mode: 'text', results: [], truncated: false, indexed: false, ran: false };
+    view.searchGen += 1;
+    await drawSearchResults();
+    App.el('cxse-q').focus();
+  }
+
+  /* ---------------------------------------------------------- compliance
+
+     Rule sets (netpath/configrx_compliance.py): named must-match/must-not-
+     match rules scoped to a device group, evaluated after every capture and
+     on the hourly sweep, with one pass/fail result per device stored rather
+     than recomputed on every view. This module owns the CRUD and the manual
+     "evaluate now"; the schedule itself is configrx.ConfigRxWorker's, not
+     this page's to trigger. */
+
+  /* Nodes' device groups (a rule set's own scope) — fetched once and
+     cached, the same "null means not fetched yet, [] means fetched and
+     empty" convention view.ruleSets uses. Read-gated on Nodes, not
+     ConfigRX, on the server, so a ConfigRX-only account (no Nodes grant at
+     all) degrades to "All devices" as the only choice rather than an error
+     — the same defensive shape App.deviceIndex() already uses for exactly
+     this account shape. */
+  async function ensureDeviceGroups() {
+    if (view.deviceGroups !== null) return view.deviceGroups;
+    try {
+      const payload = await App.get('/api/nodes/device-groups', {});
+      view.deviceGroups = payload.groups || [];
+    } catch (error) {
+      view.deviceGroups = [];
+    }
+    return view.deviceGroups;
+  }
+
+  function deviceGroupName(id) {
+    const group = (view.deviceGroups || []).find((g) => g.id === id);
+    // A group this account cannot see (or one since removed) still has to
+    // read as *something* rather than blank — the id says which one.
+    return group ? group.name : `Group #${id}`;
+  }
+
+  function deviceGroupOptionsHtml(selectedId) {
+    const options = (view.deviceGroups || []).map((g) =>
+      `<option value="${g.id}"${g.id === selectedId ? ' selected' : ''}>${escape(g.name)}</option>`
+    ).join('');
+    return `<option value=""${!selectedId ? ' selected' : ''}>All devices</option>${options}`;
+  }
+
+  const RULESET_COLUMNS = [
+    { key: 'name', label: 'Name', cell: (r) => escape(r.name) },
+    { key: 'scope', label: 'Scope', sortable: false,
+      cell: (r) => escape(r.device_group_id ? deviceGroupName(r.device_group_id) : 'All devices') },
+    { key: 'enabled', label: 'State', cell: (r) => (r.enabled ? 'Enabled' : 'Disabled') },
+  ];
+
+  const RULE_COLUMNS = [
+    { key: 'kind', label: 'Kind', cell: (r) => (r.kind === 'must_match' ? 'Must match' : 'Must not match') },
+    { key: 'pattern', label: 'Pattern', cell: (r) => `<span class="mono">${escape(r.pattern)}</span>` },
+    { key: 'description', label: 'Description', cell: (r) => escape(r.description) },
+    { key: 'delete', label: '', sortable: false, cell: (r) =>
+      `<button type="button" class="cxrs-rule-delete" data-requires-write="configrx"${gateAttr()}>`
+      + 'Delete</button>' },
+  ];
+
+  const RESULT_COLUMNS = [
+    { key: 'device', label: 'Device',
+      cell: (r) => escape(r._device ? (r._device.name || r._device.ip) : `#${r.device_id}`) },
+    // A pass or fail evaluated against a SUSPECT capture (configrx.py's own
+    // SUSPECT_SHRINK_RATIO — stored because refusing it outright is worse,
+    // but under a fifth of the device's previous backup) is real against
+    // what is actually stored, but what is stored may not be the device's
+    // real configuration. Said plainly rather than left to read as an
+    // ordinary pass or fail — see the device-status lookup in drawResults.
+    { key: 'status', label: 'Status',
+      cell: (r) => App.statusMark(RESULT_TONE[r.status] || 'none', RESULT_LABEL[r.status] || r.status)
+        + (r._suspect
+          ? ' <span class="hint">(from a suspect, likely truncated capture — see Devices)</span>'
+          : '') },
+    { key: 'failed_rules', label: 'Failed rules', sortable: false,
+      cell: (r) => ((r.failed_rules || []).map((f) => escape(f.description)).join('; ') || '—') },
+    { key: 'evaluated_ts', label: 'Evaluated', numeric: true, cell: (r) => App.agoCell(r.evaluated_ts) },
+  ];
+
+  function drawRuleSets() {
+    const rows = view.ruleSets || [];
+    const table = App.el('cxrs-table');
+    table.innerHTML = '<caption class="sr-only">ConfigRX compliance rule sets</caption>'
+      + '<thead><tr><th scope="col">Name</th><th scope="col">Scope</th>'
+      + '<th scope="col">State</th></tr></thead>';
+    const body = document.createElement('tbody');
+    App.drawRows(body, rows, RULESET_COLUMNS, (tr, row) => {
+      tr.className = 'clickable' + (view.selectedRuleSetId === row.id ? ' selected' : '');
+      tr.onclick = () => selectRuleSet(row.id);
+    }, 'No rule sets yet. Create one to start checking devices against a baseline.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  async function refreshRuleSets() {
+    // Fetched alongside, not after: the list's own Scope column needs group
+    // names too, and drawing it once both have landed beats drawing it once
+    // with every scoped row reading "Group #3" and again a moment later.
+    const [result] = await Promise.all([App.get('/api/configrx/rule-sets', {}), ensureDeviceGroups()]);
+    view.ruleSets = result.rule_sets || [];
+    view.ruleSetsById = new Map(view.ruleSets.map((r) => [r.id, r]));
+    drawRuleSets();
+  }
+
+  function drawRules() {
+    const rows = view.ruleSetRules;
+    const empty = App.el('cxrs-rules-empty');
+    const wrap = App.el('cxrs-rules-wrap');
+    if (!rows.length) {
+      App.setHidden(empty, false);
+      App.setHidden(wrap, true);
+      return;
+    }
+    App.setHidden(empty, true);
+    App.setHidden(wrap, false);
+    const table = App.el('cxrs-rules-table');
+    table.innerHTML = '<caption class="sr-only">Rules in this set</caption>'
+      + '<thead><tr><th scope="col">Kind</th><th scope="col">Pattern</th>'
+      + '<th scope="col">Description</th><th scope="col"></th></tr></thead>';
+    const body = document.createElement('tbody');
+    App.drawRows(body, rows, RULE_COLUMNS, (tr, row) => {
+      const button = tr.querySelector('.cxrs-rule-delete');
+      // Reassigned on every redraw (drawRows may reuse this <tr>), which is
+      // fine — onclick, unlike addEventListener, replaces rather than
+      // stacking a second listener on the same row.
+      if (button) button.onclick = () => deleteRuleConfirm(row.id, row.description);
+    });
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  async function drawResults() {
+    const empty = App.el('cxrs-results-empty');
+    const wrap = App.el('cxrs-results-wrap');
+    const rows = view.ruleSetResults;
+    if (!rows.length) {
+      App.setHidden(empty, false);
+      App.setHidden(wrap, true);
+      return;
+    }
+    App.setHidden(empty, true);
+    App.setHidden(wrap, false);
+    const { byId } = await App.deviceIndex();
+    // Best-effort suspect flag: view.devices is ConfigRX's OWN device list
+    // (the only place last_backup_status lives), but it is filtered by
+    // whatever the Devices subtab's search/vendor/enabled-only controls
+    // currently hold — a device outside those filters is simply absent
+    // from it, which reads as "not confirmed suspect" here rather than a
+    // wrong "confirmed clean". Never fetched fresh just for this: an
+    // unfiltered re-fetch of the whole device list on every rule-set
+    // selection is the 2.86 MB-at-2,000-devices cost this page's own
+    // server-side paging (4.47.0) exists to avoid paying again.
+    const cxById = new Map(view.devices.map((d) => [d.id, d]));
+    const enriched = rows.map((r) => {
+      const cxDevice = cxById.get(r.device_id);
+      const suspect = !!cxDevice
+        && (cxDevice.last_backup_status || '').split(' ')[0] === 'suspect';
+      return { ...r, id: r.device_id, _device: byId.get(r.device_id), _suspect: suspect };
+    });
+    const table = App.el('cxrs-results-table');
+    table.innerHTML = '<caption class="sr-only">Per-device compliance results</caption>'
+      + '<thead><tr><th scope="col">Device</th><th scope="col">Status</th>'
+      + '<th scope="col">Failed rules</th><th scope="col">Evaluated</th></tr></thead>';
+    const body = document.createElement('tbody');
+    App.drawRows(body, enriched, RESULT_COLUMNS, (tr, row) => {
+      tr.className = 'clickable';
+      tr.onclick = () => gotoDevice(row.device_id);
+    });
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  async function drawRuleSetDetail() {
+    const rs = view.selectedRuleSet;
+    const empty = App.el('cxrs-empty');
+    const detail = App.el('cxrs-detail');
+    if (!rs) {
+      App.setHidden(empty, false);
+      App.setHidden(detail, true);
+      App.setHidden(App.el('cxrs-evaluate'), true);
+      App.setHidden(App.el('cxrs-edit'), true);
+      App.setHidden(App.el('cxrs-delete'), true);
+      App.setText(App.el('cxrs-detail-header'), 'RULE SET');
+      return;
+    }
+    App.setHidden(empty, true);
+    App.setHidden(detail, false);
+    App.setText(App.el('cxrs-detail-header'), rs.name);
+    App.setHidden(App.el('cxrs-evaluate'), false);
+    App.setHidden(App.el('cxrs-edit'), false);
+    App.setHidden(App.el('cxrs-delete'), false);
+    await ensureDeviceGroups();
+    App.setText(App.el('cxrs-scope'),
+      (rs.device_group_id ? `Scope: ${deviceGroupName(rs.device_group_id)}` : 'Scope: all devices')
+      + (rs.enabled ? '' : ' — disabled, not evaluated by the schedule'));
+    drawRules();
+    await drawResults();
+  }
+
+  async function loadRuleSetDetail(ruleSetId) {
+    let ruleSetResp, rulesResp, resultsResp;
+    try {
+      [ruleSetResp, rulesResp, resultsResp] = await Promise.all([
+        App.get(`/api/configrx/rule-sets/${ruleSetId}`, {}),
+        App.get(`/api/configrx/rule-sets/${ruleSetId}/rules`, {}),
+        App.get(`/api/configrx/rule-sets/${ruleSetId}/results`, {}),
+      ]);
+    } catch (error) {
+      if (view.selectedRuleSetId !== ruleSetId) return;   // superseded already
+      App.toast(`Could not load that rule set: ${error.message}`, 'fail');
+      return;
+    }
+    if (view.selectedRuleSetId !== ruleSetId) return;   // a later selection won this race
+    view.selectedRuleSet = ruleSetResp.rule_set;
+    view.ruleSetRules = rulesResp.rules || [];
+    view.ruleSetResults = resultsResp.results || [];
+    await drawRuleSetDetail();
+  }
+
+  function selectRuleSet(ruleSetId) {
+    view.selectedRuleSetId = ruleSetId;
+    App.setRoute(['compliance', ruleSetId]);
+    drawRuleSets();
+    loadRuleSetDetail(ruleSetId);
+  }
+
+  async function ruleSetDialog(existing) {
+    await ensureDeviceGroups();
+    App.modal(existing ? `Edit rule set: ${existing.name}` : 'New rule set', `
+      <label>Name <input id="cxrs-f-name" value="${existing ? escape(existing.name) : ''}"></label>
+      <label>Scope <select id="cxrs-f-group">${deviceGroupOptionsHtml(existing ? existing.device_group_id : null)}</select></label>
+      <p class="hint">Rules in this set are checked only against devices in the chosen group —
+        leave it on <b>All devices</b> to check the whole fleet.</p>
+      ${existing ? `<label class="check"><input type="checkbox" id="cxrs-f-enabled"${existing.enabled ? ' checked' : ''}>
+        Enabled — evaluated after every capture and on the hourly sweep</label>` : ''}
+    `, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async (m) => {
+        if (!App.requireFields(m, [['#cxrs-f-name', 'Name']])) return;
+        const name = m.querySelector('#cxrs-f-name').value.trim();
+        const groupValue = m.querySelector('#cxrs-f-group').value;
+        const device_group_id = groupValue ? Number(groupValue) : null;
+        if (existing) {
+          await App.put(`/api/configrx/rule-sets/${existing.id}`, {
+            name, device_group_id, enabled: m.querySelector('#cxrs-f-enabled').checked,
+          });
+          App.closeModal();
+          await refreshRuleSets();
+          await loadRuleSetDetail(existing.id);
+        } else {
+          const result = await App.post('/api/configrx/rule-sets', { name, device_group_id });
+          App.closeModal();
+          await refreshRuleSets();
+          selectRuleSet(result.id);
+        }
+      } },
+    ]);
+  }
+
+  function deleteRuleSetConfirm(ruleSet) {
+    App.confirmDestructive('Delete rule set',
+      `<p>Permanently delete <b>${escape(ruleSet.name)}</b>? Its rules and every stored `
+      + 'compliance result for it go with it.</p>',
+      'Delete',
+      async () => {
+        await App.del(`/api/configrx/rule-sets/${ruleSet.id}`, {});
+        if (view.selectedRuleSetId === ruleSet.id) {
+          view.selectedRuleSetId = null;
+          view.selectedRuleSet = null;
+        }
+        await refreshRuleSets();
+        await drawRuleSetDetail();
+      });
+  }
+
+  function addRuleDialog(ruleSetId) {
+    App.modal('Add rule', `
+      <label>Kind <select id="cxrs-f-kind">
+        <option value="must_match">Must match</option>
+        <option value="must_not_match">Must not match</option>
+      </select></label>
+      <label>Pattern <input id="cxrs-f-pattern" placeholder="plain text or a regular expression"></label>
+      <label>Description <input id="cxrs-f-desc"
+        placeholder="what an operator reading a failure should be told"></label>
+      <p class="hint">Checked one line at a time against the device's own stored capture — never
+        the always-redacted search index — so a rule can check a secret's actual value. A pattern
+        shaped to run away on adversarial input is refused here, before it is ever saved.</p>
+    `, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (m) => {
+        if (!App.requireFields(m, [['#cxrs-f-pattern', 'Pattern'], ['#cxrs-f-desc', 'Description']])) return;
+        await App.post(`/api/configrx/rule-sets/${ruleSetId}/rules`, {
+          kind: m.querySelector('#cxrs-f-kind').value,
+          pattern: m.querySelector('#cxrs-f-pattern').value.trim(),
+          description: m.querySelector('#cxrs-f-desc').value.trim(),
+        });
+        App.closeModal();
+        await loadRuleSetDetail(ruleSetId);
+      } },
+    ]);
+  }
+
+  function deleteRuleConfirm(ruleId, description) {
+    App.confirmDestructive('Delete rule',
+      `<p>Delete the rule <b>${escape(description)}</b>?</p>`,
+      'Delete',
+      async () => {
+        await App.del(`/api/configrx/rule-sets/${view.selectedRuleSetId}/rules/${ruleId}`, {});
+        await loadRuleSetDetail(view.selectedRuleSetId);
+      });
+  }
+
+  /* The Devices subtab's own compliance summary — every rule set's latest
+     result for whichever device is selected there, so an operator looking
+     at a device's backups does not also have to go check the Compliance
+     subtab to learn it is failing one. Read-only: clicking a result jumps
+     to that rule set (gotoRuleSet) rather than acting on it from here. */
+  async function loadDeviceCompliance(deviceId) {
+    let results;
+    try {
+      results = (await App.get(`/api/configrx/devices/${deviceId}/compliance`, {})).results || [];
+    } catch (error) {
+      if (view.selectedDeviceId !== deviceId) return;
+      view.deviceCompliance = null;
+      drawDeviceCompliance();
+      return;
+    }
+    if (view.selectedDeviceId !== deviceId) return;   // a later selection won this race
+    // Rule set NAMES are needed to say anything useful, and results carry
+    // only rule_set_id — fetched once, lazily, the same convention as
+    // ensureDeviceGroups, rather than assuming the Compliance subtab has
+    // already been opened this session.
+    if (view.ruleSets === null) await refreshRuleSets().catch(() => { view.ruleSets = []; });
+    view.deviceCompliance = results;
+    drawDeviceCompliance();
+  }
+
+  function drawDeviceCompliance() {
+    const el = App.el('cx-device-compliance');
+    if (!el) return;
+    if (view.deviceCompliance === null) {
+      el.innerHTML = '';
+      return;
+    }
+    if (!view.deviceCompliance.length) {
+      el.innerHTML = '<span class="hint">No compliance rule sets apply to this device.</span>';
+      return;
+    }
+    // A pass or fail below is real against what this device's latest
+    // capture actually holds — but when that capture is itself suspect
+    // (configrx.py's SUSPECT_SHRINK_RATIO: stored because refusing it
+    // outright is worse, but under a fifth of the previous backup's size)
+    // "what it actually holds" may not be the device's real configuration.
+    // Said once, up front, rather than left for each rule set's own result
+    // to be misread as an ordinary pass or fail.
+    const device = view.devices.find((d) => d.id === view.selectedDeviceId);
+    const suspect = !!device && (device.last_backup_status || '').split(' ')[0] === 'suspect';
+    const suspectNote = suspect
+      ? '<p class="hint">The latest capture for this device is <b>suspect</b> — the results '
+        + 'below reflect what was actually stored, which may not be its real configuration.</p>'
+      : '';
+    el.innerHTML = suspectNote + 'Compliance: ' + view.deviceCompliance.map((r) => {
+      const ruleSet = view.ruleSetsById.get(r.rule_set_id);
+      const name = ruleSet ? ruleSet.name : `#${r.rule_set_id}`;
+      const tone = RESULT_TONE[r.status] || 'none';
+      const label = RESULT_LABEL[r.status] || r.status;
+      return `<button type="button" class="linkish inline cx-compliance-jump"
+        data-rule-set-id="${r.rule_set_id}">${App.statusMark(tone, '', label)} `
+        + `${escape(name)}: ${escape(label)}</button>`;
+    }).join(' · ');
+    for (const button of el.querySelectorAll('.cx-compliance-jump')) {
+      button.onclick = () => gotoRuleSet(Number(button.dataset.ruleSetId));
+    }
+  }
+
   /* ----------------------------------------------------------- refresh */
 
   async function refresh() {
@@ -1146,26 +1763,79 @@
       App.refreshNow('configrx');
     };
 
+    for (const btn of document.querySelectorAll('#page-configrx > .subtabs > .subtab')) {
+      btn.onclick = () => {
+        App.rememberSub('configrx', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
+    }
+
+    App.el('cxse-run').onclick = () => runSearch();
+    App.el('cxse-clear').onclick = clearSearch;
+    App.el('cxse-q').onkeydown = (event) => {
+      if (event.key === 'Enter') runSearch();
+    };
+
+    App.el('cxrs-new').onclick = () => ruleSetDialog(null);
+    App.el('cxrs-edit').onclick = () => {
+      if (view.selectedRuleSet) ruleSetDialog(view.selectedRuleSet);
+    };
+    App.el('cxrs-delete').onclick = () => {
+      if (view.selectedRuleSet) deleteRuleSetConfirm(view.selectedRuleSet);
+    };
+    App.el('cxrs-add-rule').onclick = () => {
+      if (view.selectedRuleSetId != null) addRuleDialog(view.selectedRuleSetId);
+    };
+    App.el('cxrs-evaluate').onclick = () => {
+      if (view.selectedRuleSetId == null) return;
+      const ruleSetId = view.selectedRuleSetId;
+      App.runJob(App.el('cxrs-evaluate'),
+        { queued: 'Evaluating…', done: (r) => `Evaluated ${r.evaluated} device(s)` },
+        App.post(`/api/configrx/rule-sets/${ruleSetId}/evaluate`, {}).then(async (result) => {
+          if (view.selectedRuleSetId === ruleSetId) await loadRuleSetDetail(ruleSetId);
+          return result;
+        }));
+    };
+
     // Last thing in init(): refresh() reads the search and the tickbox
     // straight off the DOM, so the first search already carries them. The
     // vendor list is late-filled — see drawVendorFilter.
     App.restoreControls('configrx', CONTROLS);
+    selectSub(App.recallSub('configrx', 'devices'));
   }
 
-  /* #/configrx/device/<id> and .../backup/<bid>. Runs after refresh(), so
-     the device list is populated; selectDevice fetches that device's backups
-     before the backup half is applied. */
+  /* #/configrx/device/<id>, .../backup/<bid>, and .../compliance/<rule set
+     id>. Runs after refresh(), so the device list is populated; selectDevice
+     fetches that device's backups before the backup half is applied. */
   async function activate(opts) {
-    if (!opts || !opts.parts || opts.parts[0] !== 'device') return;
-    const deviceId = Number(opts.parts[1]);
-    if (!Number.isFinite(deviceId)) return;
-    if (view.selectedDeviceId !== deviceId) {
-      await selectDevice(deviceId).catch(() => { /* a link to a gone device */ });
+    if (!opts || !opts.parts) return;
+    if (opts.parts[0] === 'device') {
+      // 'device' (singular) names no subtab of its own, so
+      // applySubtabFromRoute (app.js) never switches here on its own —
+      // unlike 'compliance' below, which IS a subtab name and is already
+      // showing by the time this runs. A link straight to a device must
+      // still land on the pane that actually shows one.
+      if (view.activeSub !== 'devices') {
+        App.rememberSub('configrx', 'devices');
+        selectSub('devices');
+      }
+      const deviceId = Number(opts.parts[1]);
+      if (!Number.isFinite(deviceId)) return;
+      if (view.selectedDeviceId !== deviceId) {
+        await selectDevice(deviceId).catch(() => { /* a link to a gone device */ });
+      }
+      if (opts.parts[2] !== 'backup' || opts.parts[3] === undefined) return;
+      const backupId = Number(opts.parts[3]);
+      if (!Number.isFinite(backupId)) return;
+      await selectBackup(backupId).catch(() => { /* pruned backup */ });
+      return;
     }
-    if (opts.parts[2] !== 'backup' || opts.parts[3] === undefined) return;
-    const backupId = Number(opts.parts[3]);
-    if (!Number.isFinite(backupId)) return;
-    await selectBackup(backupId).catch(() => { /* pruned backup */ });
+    if (opts.parts[0] === 'compliance' && opts.parts[1] !== undefined) {
+      const ruleSetId = Number(opts.parts[1]);
+      if (Number.isFinite(ruleSetId) && view.selectedRuleSetId !== ruleSetId) {
+        selectRuleSet(ruleSetId);
+      }
+    }
   }
 
   App.pages.configrx = { init, refresh, activate, fastTick: drawStatus };

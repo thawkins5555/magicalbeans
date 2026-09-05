@@ -62,6 +62,16 @@
     pageLimit: 500,
     pageTotal: 0,
     pageFilterSig: null,
+    // Fleet-wide reports (netpath/report.py via /api/nodes/reports/*):
+    // fetched only on "Run report", never on the poll tick — the top-N
+    // route can cost real seconds at fleet scale (report.py's own
+    // docstring), and re-running it every 2s would be its own outage.
+    // null until the first run; the table then says so rather than
+    // showing an empty grid indistinguishable from "nothing matched".
+    repAvail: null,
+    repAvailSort: App.recallSort('nodes-rep-avail', { key: 'availability_pct', descending: false }),
+    repTopn: null,
+    repTopnSort: App.recallSort('nodes-rep-topn', { key: 'peak', descending: true }),
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -2644,6 +2654,361 @@
     App.exportCsv(`/api/nodes/devices/${view.selected}/interfaces/export.csv`, {});
   }
 
+  /* --------------------------------------------------------- reports
+
+     /api/nodes/reports/availability and /api/nodes/reports/top-metrics
+     (netpath/report.py) answer in one JSON response, unpaged — a report
+     over the whole fleet is exactly the shape a caller wants sorted and
+     scanned as a whole, not paged five hundred rows at a time. Sorting
+     is client-side (App.sortRows/App.grid, same as every other table
+     here) over whatever the last "Run report" fetched. */
+
+  /* [t0-date, t1-date] input values -> a {t0, t1} unix-second window, or
+     null when either is unset or the range is empty. `t1` is read as
+     THROUGH the end of that local day (new Date(y, m, d+1) rolls over
+     correctly at month/year boundaries on its own), then capped at now —
+     a "To" date of today must not ask the server for a future window. */
+  function dateInputToTs(value, endOfDay) {
+    if (!value) return null;
+    const [y, m, d] = value.split('-').map(Number);
+    if (!y || !m || !d) return null;
+    return new Date(y, m - 1, d + (endOfDay ? 1 : 0)).getTime() / 1000;
+  }
+
+  function periodFromInputs(prefix) {
+    const t0 = dateInputToTs(App.el(`${prefix}-t0`).value, false);
+    const t1Raw = dateInputToTs(App.el(`${prefix}-t1`).value, true);
+    if (t0 == null || t1Raw == null) return null;
+    const t1 = Math.min(t1Raw, Date.now() / 1000);
+    return t1 > t0 ? { t0, t1 } : null;
+  }
+
+  function fmtDateInput(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` +
+      `-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /* `days - 1`, not `days`: "To" is always capped at now (periodFromInputs),
+     so a "7 days" button naively spanning [today-7, today] actually asks
+     for 7*86400s PLUS however far into today "now" already is — anywhere
+     from a few seconds to just under 24 hours over. For Top-N's whole-
+     fleet cap (REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S, api.py), that
+     is exactly enough to make the "safe" 7-day preset itself trip the
+     refusal it exists to stay clear of — caught live against the demo
+     fleet, where clicking 7 days then Run got the very 400 this button is
+     supposed to make hard to hit by accident. Seven CALENDAR days
+     (today plus the six before it) is what "last 7 days" means to an
+     operator anyway, and its total span can never reach 7*86400s. */
+  function setPeriodDays(prefix, days) {
+    const now = new Date();
+    App.el(`${prefix}-t1`).value = fmtDateInput(now);
+    App.el(`${prefix}-t0`).value = fmtDateInput(
+      new Date(now.getFullYear(), now.getMonth(), now.getDate() - (days - 1)));
+  }
+
+  function setPeriodLastMonth(prefix) {
+    const now = new Date();
+    const firstThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    App.el(`${prefix}-t0`).value =
+      fmtDateInput(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+    App.el(`${prefix}-t1`).value =
+      fmtDateInput(new Date(firstThisMonth.getTime() - 86400000));
+  }
+
+  /* "Group" filter -> device_ids for the report call, or null for the
+     whole fleet (both routes already treat "no device_ids" that way).
+     Goes through App.deviceIndex() rather than a fetch of its own — the
+     one shared device cache every other module already reads through. */
+  async function reportDeviceIds(selectId) {
+    const groupId = App.el(selectId).value;
+    if (!groupId) return null;
+    const { byId } = await App.deviceIndex();
+    const ids = [];
+    for (const d of byId.values()) {
+      if (String(d.device_group_id || '') === groupId) ids.push(d.id);
+    }
+    return ids;
+  }
+
+  /* "(none)" (ungrouped devices) is a real, useful choice on the Devices
+     filter; a report asking "which group" wants "every group" as its
+     default instead, so this is its own small fill rather than a second
+     call to deviceGroupOptionsHtml. */
+  function reportDevGroupOptionsHtml() {
+    return '<option value="">any group</option>' + (view.deviceGroups || [])
+      .map((g) => `<option value="${g.id}">${escape(g.name)}</option>`).join('');
+  }
+
+  function fillReportDevGroupSelects() {
+    for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup']) {
+      const select = App.el(id);
+      const current = select.value;
+      select.innerHTML = reportDevGroupOptionsHtml();
+      if ([...select.options].some((o) => o.value === current)) select.value = current;
+    }
+  }
+
+  function drawReportCaveats(elId, caveats) {
+    const el = App.el(elId);
+    if (!caveats || !caveats.length) { App.setHidden(el, true); return; }
+    App.setHidden(el, false);
+    App.setHtml(el, caveats.map((c) => `<span class="hint">⚠ ${escape(c)}</span>`).join(''));
+  }
+
+  /* A raw comma-separated value quoted only when it needs to be — RFC
+     4180 minimal quoting, the same rule _csv_text (api.py) applies
+     server-side for every OTHER export in this app. These two reports
+     have no server-side export.csv route (report.py answers JSON only),
+     so the CSV is built from the very rows already on screen rather than
+     asking the server a second time for the same numbers in another
+     shape. */
+  function csvField(value) {
+    const s = value === null || value === undefined ? '' : String(value);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }
+
+  function saveReportCsv(filename, header, rows) {
+    const csv = [header, ...rows].map((row) => row.map(csvField).join(',')).join('\r\n') + '\r\n';
+    App.saveCsv({ csv, filename });
+    App.toast(`Exported ${rows.length} row(s) to ${filename}`, 'ok');
+  }
+
+  const AVAIL_COLUMNS = [
+    { key: 'name', label: 'Device', width: 200,
+      value: (r) => r.name || r.ip || `#${r.device_id}`,
+      cell: (r) => `${escape(r.name || r.ip || `#${r.device_id}`)}` +
+        (r.name && r.ip ? `<div class="ip-line">${escape(r.ip)}</div>` : '') },
+    { key: 'devgroup', label: 'Group', width: 120,
+      value: (r) => r._devGroupName || '',
+      cell: (r) => escape(r._devGroupName || '—') },
+    { key: 'availability_pct', label: 'Availability', width: 100, numeric: true,
+      value: (r) => r.availability_pct,
+      cell: (r) => (r.availability_pct == null ? '—' : `${r.availability_pct.toFixed(3)}%`) },
+    { key: 'down_s', label: 'Downtime', width: 100, numeric: true,
+      cell: (r) => (r.down_s > 0 ? App.duration(r.down_s) : '0 s') },
+    { key: 'outage_count', label: 'Outages', width: 80, numeric: true,
+      cell: (r) => String(r.outage_count) },
+    { key: 'longest_outage_s', label: 'Longest outage', width: 110, numeric: true,
+      cell: (r) => (r.longest_outage_s > 0 ? App.duration(r.longest_outage_s) : '—') },
+    { key: 'mttr_s', label: 'MTTR', width: 90, numeric: true,
+      value: (r) => r.mttr_s,
+      cell: (r) => (r.mttr_s == null ? '—' : App.duration(r.mttr_s)) },
+    { key: 'status', label: 'Status', width: 100, numeric: true,
+      value: (r) => (r.still_down ? 2 : r.currently_disabled ? 1 : 0),
+      cell: (r) => (r.still_down ? App.statusMark('fail', 'Still down')
+        : r.currently_disabled ? App.statusMark('warn', 'Disabled') : '') },
+    { key: 'caveats', label: 'Notes', width: 80, sortable: false,
+      cell: (r) => ((r.caveats || []).length
+        ? `<span class="warn-text" title="${escape(r.caveats.join('\n'))}">${
+            r.caveats.length} note${r.caveats.length > 1 ? 's' : ''}</span>` : '') },
+  ];
+
+  function onAvailSort(key, descending) {
+    view.repAvailSort = { key, descending };
+    drawAvailReportTable();
+  }
+
+  function drawAvailReportTable() {
+    const report = view.repAvail;
+    const rows = report ? report.devices : [];
+    const table = App.grid(App.el('nd-rep-avail-table'), {
+      name: 'nodes-rep-avail', caption: 'Availability report', columns: AVAIL_COLUMNS,
+      sort: view.repAvailSort, onSort: onAvailSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, view.repAvailSort.key,
+      view.repAvailSort.descending, AVAIL_COLUMNS);
+    App.drawRows(body, sorted, AVAIL_COLUMNS, (tr, r) => {
+      if (!r._known) { tr.className = ''; tr.onclick = null; return; }
+      tr.className = 'clickable';
+      tr.title = 'Open this device on the Devices subtab';
+      tr.onclick = () => {
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(r.device_id);
+      };
+    }, report ? 'No devices matched this report.'
+      : 'Pick a period and click Run report.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  /* The button is disabled by App.runJob the moment it is called, which is
+     why the whole request — including the group-filter lookup, itself
+     async — runs INSIDE the promise passed to it rather than before: a
+     device-group lookup ahead of that call leaves the button clickable
+     for the length of that await, and a second click during it would fire
+     a second fetch to the same URL, aborting the first as "superseded"
+     (app.js's own inFlight-by-path rule) and reporting it as a failure
+     that never was one. */
+  function runAvailabilityReport() {
+    const button = App.el('nd-rep-avail-run');
+    const period = periodFromInputs('nd-rep-avail');
+    if (!period) { App.toast('Pick a valid From/To period.', 'fail'); return undefined; }
+    return App.runJob(button, {
+      queued: 'Running…',
+      done: (result) => (result ? `${result.devices.length} device(s)` : 'No matching devices'),
+    }, (async () => {
+      const device_ids = await reportDeviceIds('nd-rep-avail-devgroup');
+      if (device_ids && !device_ids.length) {
+        view.repAvail = null;
+        drawAvailReportTable();
+        App.setText(App.el('nd-rep-avail-summary'), 'No devices in that group.');
+        drawReportCaveats('nd-rep-avail-caveats', null);
+        return null;
+      }
+      const params = { t0: period.t0, t1: period.t1 };
+      if (device_ids) params.device_ids = device_ids.join(',');
+      const result = await App.get('/api/nodes/reports/availability', params);
+      const { byId } = await App.deviceIndex();
+      const devGroupsById = {};
+      for (const g of view.deviceGroups) devGroupsById[g.id] = g.name;
+      for (const row of result.devices) {
+        const dev = byId.get(row.device_id);
+        row.id = row.device_id;
+        row._known = !!dev;
+        row._devGroupName = dev ? (devGroupsById[dev.device_group_id] || '') : '';
+      }
+      view.repAvail = result;
+      drawAvailReportTable();
+      App.setText(App.el('nd-rep-avail-summary'),
+        `${result.devices.length} device(s) · ${App.when(result.requested_start)} ` +
+        `– ${App.when(result.requested_end)}`);
+      drawReportCaveats('nd-rep-avail-caveats', result.global_caveats);
+      return result;
+    })());
+  }
+
+  function exportAvailReportCsv() {
+    const report = view.repAvail;
+    if (!report || !report.devices.length) {
+      App.toast('Run the report first.', 'warn');
+      return;
+    }
+    const header = ['device_id', 'name', 'ip', 'group', 'availability_pct', 'up_s', 'down_s',
+      'outage_count', 'longest_outage_s', 'mttr_s', 'still_down', 'currently_disabled',
+      'excluded_before_created_s', 'maintenance_excluded_s', 'mute_excluded_s', 'caveats'];
+    const rows = report.devices.map((r) => [r.device_id, r.name, r.ip, r._devGroupName || '',
+      r.availability_pct, r.up_s, r.down_s, r.outage_count, r.longest_outage_s, r.mttr_s,
+      r.still_down ? 1 : 0, r.currently_disabled ? 1 : 0, r.excluded_before_created_s,
+      r.maintenance_excluded_s, r.mute_excluded_s, (r.caveats || []).join('; ')]);
+    const from = App.isoLocal(report.requested_start).slice(0, 10);
+    const to = App.isoLocal(report.requested_end).slice(0, 10);
+    saveReportCsv(`availability-${from}-to-${to}.csv`, header, rows);
+  }
+
+  const TOPN_COLUMNS = [
+    { key: 'device_name', label: 'Device', width: 180,
+      value: (r) => r.device_name || r.device_ip || '',
+      cell: (r) => `${escape(r.device_name || r.device_ip || `#${r.device_id}`)}` +
+        (r.device_name && r.device_ip ? `<div class="ip-line">${escape(r.device_ip)}</div>` : '') },
+    { key: 'label', label: 'Metric', width: 170,
+      value: (r) => r.label || r.key || '',
+      cell: (r) => `${escape(r.label || r.key)}${r.if_index != null ? ` #${r.if_index}` : ''}` +
+        `<div class="ip-line">${escape(r.key)}</div>` },
+    { key: 'peak', label: 'Peak', width: 100, numeric: true,
+      cell: (r) => (r.peak == null ? '—' : formatMetricValue(r.unit, r.peak)) },
+    { key: 'mean', label: 'Mean', width: 100, numeric: true,
+      cell: (r) => (r.mean == null ? '—' : formatMetricValue(r.unit, r.mean)) },
+    { key: 'n_hours', label: 'Hours of data', width: 110, numeric: true,
+      cell: (r) => String(r.n_hours) },
+  ];
+
+  function onTopnSort(key, descending) {
+    view.repTopnSort = { key, descending };
+    drawTopnReportTable();
+  }
+
+  function drawTopnReportTable() {
+    const report = view.repTopn;
+    const rows = report ? report.rows : [];
+    const table = App.grid(App.el('nd-rep-topn-table'), {
+      name: 'nodes-rep-topn', caption: 'Top-N by metric report', columns: TOPN_COLUMNS,
+      sort: view.repTopnSort, onSort: onTopnSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, view.repTopnSort.key,
+      view.repTopnSort.descending, TOPN_COLUMNS);
+    App.drawRows(body, sorted, TOPN_COLUMNS, (tr, r) => {
+      if (!r._known) { tr.className = ''; tr.onclick = null; return; }
+      tr.className = 'clickable';
+      tr.title = 'Open this device on the Devices subtab';
+      tr.onclick = () => {
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(r.device_id);
+      };
+    }, report ? 'No series matched this report.'
+      : 'Pick a metric key and period, then click Run report.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  /* Same reason as runAvailabilityReport: the device-group lookup runs
+     inside the job promise, not before it, so the button is disabled for
+     the whole request rather than leaving a gap a second click could
+     race through. */
+  function runTopMetricsReport() {
+    const button = App.el('nd-rep-topn-run');
+    const key = App.el('nd-rep-topn-key').value.trim();
+    if (!key) { App.toast('A metric key is required.', 'fail'); return undefined; }
+    const period = periodFromInputs('nd-rep-topn');
+    if (!period) { App.toast('Pick a valid From/To period.', 'fail'); return undefined; }
+    return App.runJob(button, {
+      queued: 'Running…',
+      done: (result) => (result ? `${result.rows.length} row(s)` : 'No matching devices'),
+    }, (async () => {
+      const device_ids = await reportDeviceIds('nd-rep-topn-devgroup');
+      if (device_ids && !device_ids.length) {
+        view.repTopn = null;
+        drawTopnReportTable();
+        App.setText(App.el('nd-rep-topn-summary'), 'No devices in that group.');
+        return null;
+      }
+      const params = {
+        key, t0: period.t0, t1: period.t1,
+        rank_by: App.el('nd-rep-topn-rankby').value,
+        ascending: App.el('nd-rep-topn-ascending').checked ? '1' : undefined,
+        like: App.el('nd-rep-topn-like').checked ? '1' : undefined,
+        n: App.el('nd-rep-topn-n').value || undefined,
+      };
+      if (device_ids) params.device_ids = device_ids.join(',');
+      const result = await App.get('/api/nodes/reports/top-metrics', params);
+      const { byId } = await App.deviceIndex();
+      for (const row of result.rows) { row.id = row.metric_id; row._known = byId.has(row.device_id); }
+      view.repTopn = result;
+      view.repTopnSort = { key: result.rank_by, descending: !result.ascending };
+      drawTopnReportTable();
+      App.setText(App.el('nd-rep-topn-summary'),
+        `${result.rows.length} row(s) · ${App.when(result.t0)} – ${App.when(result.t1)} ` +
+        `· computed in ${result.query_ms.toFixed(0)} ms`);
+      return result;
+    })());
+  }
+
+  function exportTopnReportCsv() {
+    const report = view.repTopn;
+    if (!report || !report.rows.length) {
+      App.toast('Run the report first.', 'warn');
+      return;
+    }
+    const header = ['device_id', 'device_name', 'device_ip', 'metric_key', 'label',
+      'if_index', 'peak', 'mean', 'unit', 'n_hours'];
+    const rows = report.rows.map((r) => [r.device_id, r.device_name, r.device_ip, r.key,
+      r.label, r.if_index, r.peak, r.mean, r.unit, r.n_hours]);
+    const from = App.isoLocal(report.t0).slice(0, 10);
+    const to = App.isoLocal(report.t1).slice(0, 10);
+    saveReportCsv(`top-metrics-${report.key.replace(/[^\w.-]/g, '_')}-${from}-to-${to}.csv`,
+      header, rows);
+  }
+
+  function selectReportsSub(name) {
+    for (const btn of document.querySelectorAll('#nodes-sub-reports > .subtabs > .subtab')) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const page of document.querySelectorAll('#nodes-sub-reports > .subpage')) {
+      page.classList.toggle('active', page.id === `nd-rep-sub-${name}`);
+    }
+  }
+
   /* ---------------------------------------------------------- bulk import
 
      Onboarding 2,000 devices one POST at a time measured 16.6/s. This
@@ -4816,6 +5181,7 @@
     fillGroupFilter();
     fillDevGroupFilter();
     fillDiscGroups();
+    fillReportDevGroupSelects();
     drawTable();
     drawProfilesTable();
     drawMibsTable();
@@ -5219,6 +5585,28 @@
     App.el('disc-start').onclick = startDiscovery;
     App.el('disc-promote').onclick = promoteSelected;
 
+    for (const btn of document.querySelectorAll('#nodes-sub-reports > .subtabs > .subtab')) {
+      btn.onclick = () => {
+        App.rememberSub('nodes.reports', btn.dataset.subtab);
+        selectReportsSub(btn.dataset.subtab);
+      };
+    }
+    setPeriodDays('nd-rep-avail', 30);
+    setPeriodDays('nd-rep-topn', 7);
+    App.el('nd-rep-avail-7d').onclick = () => setPeriodDays('nd-rep-avail', 7);
+    App.el('nd-rep-avail-30d').onclick = () => setPeriodDays('nd-rep-avail', 30);
+    App.el('nd-rep-avail-90d').onclick = () => setPeriodDays('nd-rep-avail', 90);
+    App.el('nd-rep-avail-lastmonth').onclick = () => setPeriodLastMonth('nd-rep-avail');
+    App.el('nd-rep-avail-run').onclick = runAvailabilityReport;
+    App.el('nd-rep-avail-export-csv').onclick = exportAvailReportCsv;
+    App.el('nd-rep-topn-7d').onclick = () => setPeriodDays('nd-rep-topn', 7);
+    App.el('nd-rep-topn-30d').onclick = () => setPeriodDays('nd-rep-topn', 30);
+    App.el('nd-rep-topn-90d').onclick = () => setPeriodDays('nd-rep-topn', 90);
+    App.el('nd-rep-topn-run').onclick = runTopMetricsReport;
+    App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv;
+    drawAvailReportTable();
+    drawTopnReportTable();
+
     // The timeline is drawn into a viewBox sized from its box, so a
     // resize needs a redraw from the data already loaded — no refetch.
     // The device table's own redraw is here too: narrowDevicePane() reads
@@ -5244,6 +5632,8 @@
     // name against the detail nav) matches a button in the wrong one.
     selectDetailSub(App.recallSub('nodes.detail', 'interfaces',
                                   App.el('nd-detail')));
+    selectReportsSub(App.recallSub('nodes.reports', 'availability',
+                                   App.el('nodes-sub-reports')));
   }
 
   function selectSub(name) {

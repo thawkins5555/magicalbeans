@@ -151,7 +151,40 @@ check("scroll-padding-inline" in css,
 check("bar.addEventListener('scroll', updateTabOverflow" in app,
       "the strip's own scroll re-checks the fade")
 check("new ResizeObserver(updateTabOverflow)" in app,
-      "a width change of #tabs itself (the alerts badge, not just the window) re-checks the fade")
+      "a width change of #tabs's own box (not just a window resize) re-checks the fade")
+# A ResizeObserver fires on the OBSERVED element's own box changing, not on
+# its scrollWidth: the alerts badge (loadState, below) growing or shrinking
+# the ALERTS tab moves #tabs's scrollWidth without moving #tabs's own box,
+# so the observer above never sees it. Before this, the badge crossing a
+# digit boundary (0->1, 9->10) could leave the strip newly overflowing with
+# no fade until an unrelated resize/scroll/permission change happened to
+# recompute it. loadState must call updateTabOverflow itself, right where
+# the badge is actually written.
+loadstate_badge = app.split("alertsBadge.textContent = openCount;")[1].split("alertsChanged(openCount);")[0]
+check("updateTabOverflow();" in loadstate_badge,
+      "loadState recomputes the overflow fade when the alerts badge changes the ALERTS tab's width")
+# --------------------------------------------------------------------------
+# 5b. A group's hairline (.tab--group-start) belongs to the group, not to
+#     whichever tab happens to lead it — applyPermissions hides tabs one
+#     module at a time, and a hairline that was a static class on one
+#     button used to vanish along with it, leaving that whole group flush
+#     against the one before with no separator: a smaller re-appearance of
+#     the orphaned-group-label defect the four wrappers above were removed
+#     to fix. The boundary itself is a fixed fact (data-group-start, marked
+#     once in index.html); updateTabGroups() is the one place that turns it
+#     into the .tab--group-start class, on whichever tab of the group is
+#     actually visible, and it is called everywhere updateTabShortcuts is
+#     for the same reason (hiding a tab shifts the answer).
+check(index.count("data-group-start") == 3,
+      "exactly three tabs (Nodes, Routes, Settings) mark a group boundary")
+check("function updateTabGroups()" in app, "updateTabGroups exists")
+shortcut_calls = app.count("updateTabShortcuts();")
+group_calls = app.count("updateTabGroups();")
+check(shortcut_calls >= 3, "updateTabShortcuts is called at its usual three sites")
+check(group_calls == shortcut_calls,
+      "updateTabGroups is called at exactly the same sites as updateTabShortcuts "
+      "(applyPermissions, a failed module load, and start()) rather than a second, "
+      "independently-maintained list falling out of step")
 narrow360 = css.split("@media (max-width: 360px)")[1]
 check("#whoami { display: none; }" in narrow360,
       "#whoami is hidden, not just truncated, below 360px")
