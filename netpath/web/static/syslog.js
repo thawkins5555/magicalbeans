@@ -27,6 +27,45 @@
   function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
   function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
 
+  /* This module's own key (a source IP) renders the device it belongs to,
+     when it belongs to one — there is no App.deviceLink in app.js, so this
+     is the local lookup FINDINGS' Phase 6 cross-links call for: a small
+     ip -> device cache built from the one unpaged fetch Nodes' own device
+     list already is. Refetched at most once every 30s. */
+  let deviceByIp = null;
+  let deviceByIpAt = 0;
+  async function loadDeviceByIp() {
+    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
+    const map = new Map();
+    try {
+      const payload = await App.get('/api/nodes/devices');
+      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
+    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
+    deviceByIp = map;
+    deviceByIpAt = Date.now();
+    return map;
+  }
+
+  /* Upgrades the plain address a placeholder span carries into either a
+     link to the matching Nodes device, or an "Add as a device" link that
+     opens Nodes with the address already in the Add form — turning "no
+     device has this source" into one click instead of a copy-paste across
+     two tabs. Enhanced after the pane is already on screen, so opening a
+     message never waits on a Nodes fetch; `stillCurrent` guards against a
+     slow lookup landing after the operator moved to a different message. */
+  async function linkSourceIp(spanId, ip, stillCurrent) {
+    if (!ip) return;
+    const map = await loadDeviceByIp();
+    if (!stillCurrent()) return;
+    const span = document.getElementById(spanId);
+    if (!span) return;
+    const device = map.get(ip);
+    span.outerHTML = device
+      ? `<a class="linkish inline" href="${App.buildRoute('nodes', ['device', device.id])}">${escape(ip)}</a>`
+      : `${escape(ip)} — <a class="linkish inline" href="${
+          App.buildRoute('nodes', [], { add: ip })}">Add as a device</a>`;
+  }
+
   /* Long messages need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
     const out = [];
@@ -152,6 +191,14 @@
     drawTable();
   }
 
+  // Names the window, since widening it is usually the answer — a bare
+  // "no messages" said nothing about why, over a header with nothing
+  // under it.
+  function noMessagesText() {
+    return `No messages between ${App.when(view.t0)} and ${App.when(view.t1)}. ` +
+      'Widen the time window or clear a filter.';
+  }
+
   function drawTable() {
     const columns = messageColumns();
     const table = App.grid(App.el('syslog-table'),
@@ -168,29 +215,31 @@
         showDetail(row);
         drawTable();
       };
-    });
+    }, noMessagesText());
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
 
   function showDetail(row) {
     const lines = [
-      App.when(row.ts),
+      escape(App.when(row.ts)),
       '',
-      `severity   ${row.severity_name} (${row.severity})`,
-      `facility   ${row.facility_name} (${row.facility})`,
-      `source     ${row.source}${row.source_name ? `  (${row.source_name})` : ''}`,
-      `host       ${row.host || '—'}`,
-      `app        ${row.app || '—'}`,
-      `pid        ${row.procid || '—'}`,
-      `msgid      ${row.msgid || '—'}`,
+      `severity   ${escape(row.severity_name)} (${row.severity})`,
+      `facility   ${escape(row.facility_name)} (${row.facility})`,
+      `source     <span id="sl-d-source">${escape(row.source)}</span>` +
+        (row.source_name ? `  (${escape(row.source_name)})` : ''),
+      `host       ${escape(row.host || '—')}`,
+      `app        ${escape(row.app || '—')}`,
+      `pid        ${escape(String(row.procid || '—'))}`,
+      `msgid      ${escape(String(row.msgid || '—'))}`,
       '',
-      row.message,
+      escape(row.message),
     ];
     if (row.raw && row.raw !== row.message) {
-      lines.push('', '-'.repeat(52), 'raw line as it arrived:', row.raw);
+      lines.push('', '-'.repeat(52), 'raw line as it arrived:', escape(row.raw));
     }
-    App.el('sl-detail').textContent = lines.join('\n');
+    App.el('sl-detail').innerHTML = lines.join('\n');
+    linkSourceIp('sl-d-source', row.source, () => view.selected === row.id);
   }
 
   /* ---------------------------------------------------------- settings */
@@ -241,7 +290,8 @@
       ${App.columnPickerFieldset('MESSAGE LIST COLUMNS', 'syslog', COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -263,7 +313,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('syslog');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
 
@@ -477,10 +527,26 @@
      filled the list it lives in. A row that is not in the current
      window is simply not selected — these three tables are live
      tails, and silently widening the window to find one row would
-     change what the operator asked to see. */
-  function activate(opts) {
-    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
-    const id = Number(opts.parts[0]);
+     change what the operator asked to see.
+
+     #/syslog?source=<ip> (Alerts' "Syslog for this device", and any
+     other cross-module link naming an address) sets the filter and
+     re-searches, the same way a typed address and Apply would. */
+  async function activate(opts) {
+    if (!opts) return;
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['sl-source', 'source'], ['sl-host', 'host']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (filtered) await App.refreshNow('syslog');
+    const parts = opts.parts || [];
+    if (parts[0] === undefined) return;
+    const id = Number(parts[0]);
     if (!Number.isFinite(id)) return;
     const row = (view.messages || []).find((r) => r.id === id);
     if (!row) return;

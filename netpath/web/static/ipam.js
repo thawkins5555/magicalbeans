@@ -35,6 +35,25 @@
   function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
   function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
 
+  /* A conflict's ip -> the matching Nodes device, when it has one — there
+     is no App.deviceLink in app.js, so this is the local ip -> device cache
+     FINDINGS' Phase 6 cross-links call for, built from the one unpaged
+     fetch Nodes' own device list already is. Refetched at most once every
+     30s; drawConflicts redraws far less often than that. */
+  let deviceByIp = null;
+  let deviceByIpAt = 0;
+  async function loadDeviceByIp() {
+    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
+    const map = new Map();
+    try {
+      const payload = await App.get('/api/nodes/devices');
+      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
+    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
+    deviceByIp = map;
+    deviceByIpAt = Date.now();
+    return map;
+  }
+
   /* A small utilization donut, drawn with the standard stroke-dasharray
      trick — one circle per slice, each dashed to show only its own arc —
      rather than computing SVG arc paths by hand for three fixed slices.
@@ -404,6 +423,15 @@
 
   /* ----------------------------------------------------------- conflicts */
 
+  // A MAC search needs no lookup to be worth linking — Nodes runs it
+  // live and says "not learned" itself when nothing matches — but the IP
+  // is only worth linking when it actually IS a Nodes device, so that
+  // cell starts as plain text and is upgraded once loadDeviceByIp resolves.
+  function macSearchLinkHtml(mac) {
+    return `<a class="linkish inline" href="${
+      App.buildRoute('nodes', [], { q: mac })}">${escape(mac)}</a>`;
+  }
+
   function drawConflicts() {
     const table = App.el('ipam-conflicts-table');
     table.innerHTML = '<caption class="sr-only">Address conflicts</caption><thead><tr>' +
@@ -416,7 +444,8 @@
       const sourceText = c.source === 'scan_dhcp'
         ? 'wire vs. DHCP lease' : 'wire, two scans';
       tr.innerHTML =
-        `<td class="mono">${escape(c.ip)}</td><td class="mono">${escape(c.mac_a)}</td><td class="mono">${escape(c.mac_b)}</td>` +
+        `<td class="mono"><span class="ipam-conflict-ip" data-ip="${escape(c.ip)}">${escape(c.ip)}</span></td>` +
+        `<td class="mono">${macSearchLinkHtml(c.mac_a)}</td><td class="mono">${macSearchLinkHtml(c.mac_b)}</td>` +
         `<td>${sourceText}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
       if (!c.resolved) {
         const button = document.createElement('button');
@@ -435,6 +464,24 @@
     App.wireRowKeyboard(body);
     App.el('ipam-conflicts-count').textContent =
       `${view.conflicts.length} ${App.el('ipam-show-resolved').checked ? '' : 'open '}conflict(s)`;
+    linkConflictIps();
+  }
+
+  /* Upgrades each IP cell into a link to its Nodes device, once the ip ->
+     device lookup resolves — done after the table is already on screen so
+     drawing it never waits on a Nodes fetch. Re-queries the DOM by class
+     rather than keeping element references, since a redraw before this
+     resolves replaces every row wholesale. */
+  async function linkConflictIps() {
+    const map = await loadDeviceByIp();
+    for (const span of document.querySelectorAll('#ipam-conflicts-table .ipam-conflict-ip')) {
+      const ip = span.dataset.ip;
+      const device = map.get(ip);
+      if (device) {
+        span.outerHTML = `<a class="linkish inline" href="${
+          App.buildRoute('nodes', ['device', device.id])}">${escape(ip)}</a>`;
+      }
+    }
   }
 
   async function loadConflicts() {
@@ -1082,7 +1129,8 @@
       ${App.columnPickerFieldset('DHCP LEASE COLUMNS', 'ipamleases',
                                  LEASE_COLUMNS, s.table_columns_leases)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         await App.post('/api/settings', { scope: 'ipam', values: {
@@ -1105,7 +1153,7 @@
         } });
         await App.loadState();
         App.closeModal();
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -1168,7 +1216,7 @@
       `<td>${escape(r.subnet || '—')}</td>` +
       `<td class="hint">${escape(r.sources.join(', '))}</td>` +
       `</tr>`).join('');
-    return `<div class="table-wrap" style="max-height:50vh">
+    return `<div class="table-wrap scrollbox large">
       <table><caption class="sr-only">Search results</caption><thead><tr><th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">MAC</th>
       <th scope="col">Status</th><th scope="col">Subnet</th><th scope="col">Source</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;

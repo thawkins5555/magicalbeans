@@ -393,7 +393,8 @@
           destinations alone.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (b) => {
+      { label: 'Save', primary: true, onClick: (b, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const n = (id) => Number(b.querySelector(id).value);
         await App.post('/api/settings', { scope: 'netpath', values: {
           trace_workers: n('#s-workers'),
@@ -408,7 +409,7 @@
         } });
         await App.loadState();
         App.closeModal();
-      } },
+        })()) },
     ]);
     return box;
   }
@@ -1386,8 +1387,10 @@
     App.el('target-add').onclick = addTarget;
     App.el('target-edit').onclick = editTarget;
     App.el('target-remove').onclick = removeTarget;
-    App.el('target-trace').onclick = async () => {
-      if (view.targetId) await App.post(`/api/netpath/targets/${view.targetId}/trace`, {});
+    App.el('target-trace').onclick = () => {
+      if (!view.targetId) return;
+      return App.runJob(App.el('target-trace'), { queued: 'Tracing…', done: 'Trace queued' },
+        App.post(`/api/netpath/targets/${view.targetId}/trace`, {}));
     };
 
     // Dragging a divider changes the drawing area, so the SVG has to be

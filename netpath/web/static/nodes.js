@@ -234,8 +234,26 @@
       cell: (r) => escape(r.sys_object_id || '\u2014') },
   ];
 
-  const deviceColumns = () => App.visibleColumns(
-    COLUMNS, (App.state.nodesSettings || {}).table_columns);
+  // The default colgroup (check+status+name+group+devgroup+vendor+response+
+  // last_poll_ts) asks 884px, which the 3/2 pane split still falls short of
+  // below ~1500px wide (~798px at 1366, ~753px at 1280) — the last column
+  // was always cut there before anyone had touched a column checkbox.
+  // Response and Vendor are the two dropped from the DEFAULT to fit; an
+  // explicit column choice (Settings → Columns) is always honoured
+  // regardless of width, since that is a deliberate choice, not a fallback.
+  function narrowDevicePane() {
+    const table = App.el('nodes-table');
+    const pane = table && table.closest('.pane');
+    return !!pane && pane.clientWidth > 0 && pane.clientWidth < 900;
+  }
+
+  const deviceColumns = () => {
+    const stored = (App.state.nodesSettings || {}).table_columns;
+    const all = stored || !narrowDevicePane() ? COLUMNS
+      : COLUMNS.map((c) => (c.key === 'response' || c.key === 'vendor')
+        ? { ...c, on: false } : c);
+    return App.visibleColumns(all, stored);
+  };
 
   function onDeviceSort(key, descending) {
     view.deviceSort = { key, descending };
@@ -566,11 +584,12 @@
     loadDetail();
   }
 
-  /* A route into this tab: #/nodes, #/nodes?status=down,
-     #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>. Called after
-     refresh() has run, so view.devices is populated and the "select the
-     first device if none is selected" rule below has already happened —
-     which is exactly why the selection is applied here and not before. */
+  /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
+     #/nodes?add=<ip>, #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>.
+     Called after refresh() has run, so view.devices is populated and the
+     "select the first device if none is selected" rule below has already
+     happened — which is exactly why the selection is applied here and not
+     before. */
   async function activate(opts) {
     if (!opts) return;
     const parts = opts.parts || [];
@@ -583,6 +602,10 @@
       if (!field) continue;
       field.value = query[key];
       filtered = true;
+      // A link that names a MAC address (IPAM's conflicts, for one) means
+      // the same thing pressing Enter in this field does: run the MAC
+      // search once the filtered device list is in, not just narrow it.
+      if (key === 'q') view.macSearchPending = true;
     }
     if (query.offline !== undefined) {
       App.el('nd-filter-offline').checked = query.offline === '1'
@@ -593,6 +616,9 @@
       view.selected = null;
       await App.refreshNow('nodes');
     }
+    // A Syslog/SNMP source with no device: land here with the address
+    // already in the form rather than making the operator retype it.
+    if (query.add !== undefined && App.canWrite('nodes')) addDevice({ ip: query.add });
     if (parts[0] !== 'device' || parts[1] === undefined) return;
     const deviceId = Number(parts[1]);
     if (!Number.isFinite(deviceId)) return;
@@ -1103,11 +1129,16 @@
      than reading view.ifaces and #nd-if-table directly, because the device
      dialog shows a device that need not be the selected one — the pane and
      the dialog share this renderer instead of growing a second copy that
-     drifts. `onOpen`, when given, replaces what clicking a row does. */
-  function drawIfaceTable(el, rows, deviceId, onOpen) {
+     drifts. `onOpen`, when given, replaces what clicking a row does.
+     `snmpError` names why the list is empty when it is one: a device that
+     has never answered SNMP shows headers over nothing exactly like one
+     with genuinely zero interfaces, and the two used to be indistinguishable. */
+  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError) {
     const target = el || App.el('nd-if-table');
     const list = rows || view.ifaces;
     const id = deviceId != null ? deviceId : view.selected;
+    const error = snmpError !== undefined ? snmpError
+      : (view.detail || {}).snmp_error;
     const columns = ifaceColumns();
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
@@ -1121,7 +1152,9 @@
     App.drawRows(body, sorted, columns, (tr, r) => {
       tr.className = 'clickable';
       tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
-    });
+    }, error
+      ? `No interfaces read — SNMP failed: ${error}. Fix the credential and poll again.`
+      : 'No interfaces on this device.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -1160,9 +1193,9 @@
       <p class="section">VENDOR IDENTIFICATION</p>
       <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">INTERFACES</p>
-      <div class="table-wrap" style="max-height:34vh"><table id="ndd-if-table"></table></div>
+      <div class="table-wrap scrollbox large"><table id="ndd-if-table"></table></div>
       <p class="section">EVENT LOG</p>
-      <div class="table-wrap" style="max-height:26vh"><table id="ndd-ev-table"></table></div>`, [
+      <div class="table-wrap scrollbox small"><table id="ndd-ev-table"></table></div>`, [
       { label: 'Close', onClick: App.closeModal },
     ], { buttonsTop: true });
     // Stamped by App.modal above; every paint below checks it first.
@@ -1266,7 +1299,8 @@
       // #modal-box — so the port dialog gets a way back to this one.
       drawIfaceTable(box.querySelector('#ndd-if-table'),
         ifaces.interfaces || [], deviceId,
-        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)));
+        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
+        device.snmp_error);
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {
       if (!current()) return;
@@ -1424,11 +1458,21 @@
 
   /* ------------------------------------------- interface drill-down */
 
+  /* A term/value grid, not a table: a plain two-column <table> sizes its
+     first column to fit CONTENT plus whatever slack auto-layout hands it,
+     which on this dialog's own width put up to ~200px of dead air between
+     a short term ("Speed") and its value — a gap wide enough that the eye
+     could not bind the two together. grid-template-columns: max-content 1fr
+     gives the term column exactly the width its widest row needs and no
+     more, with a small fixed gap on top of that. <dl>/<dt>/<dd> is the
+     semantic element for exactly this term/value pairing — no wrapper
+     needed, since dt and dd are already direct children a grid can place. */
   function ifaceStatsHtml(r) {
     const row = (label, val) =>
-      `<tr><td class="hint" style="padding-right:14px">${label}</td><td>${val}</td></tr>`;
+      `<dt class="hint">${label}</dt><dd style="margin:0">${val}</dd>`;
     const num = (v) => v != null ? Number(v).toLocaleString() : '—';
-    return `<table><caption class="sr-only">Interface facts</caption>${[
+    return `<dl style="display:grid;grid-template-columns:max-content 1fr;` +
+      `column-gap:14px;row-gap:4px;margin:0" aria-label="Interface facts">${[
       row('Admin / Oper', `${escape(r.admin_status || '—')} / ${escape(r.oper_status || '—')}`),
       row('Speed', r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'),
       row('MAC address', escape(r.phys_addr || '—')),
@@ -1438,14 +1482,14 @@
       row('Errors in / out (total)', `${num(r.last_in_errors)} / ${num(r.last_out_errors)}`),
       row('Octets in / out (counter)', `${num(r.last_in_octets)} / ${num(r.last_out_octets)}`),
       row('Last seen', ago(r.last_seen_ts)),
-    ].join('')}</table>`;
+    ].join('')}</dl>`;
   }
 
   function ifaceEventsHtml(ifIndex, payload) {
     const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
-    return `<div class="table-wrap" style="max-height:120px"><table><caption class="sr-only">Recent events on this port</caption>` +
+    return `<div class="table-wrap scrollbox small"><table><caption class="sr-only">Recent events on this port</caption>` +
       events.map((e) => `<tr><td>${App.timeCell(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
       '</table></div>';
@@ -1500,7 +1544,7 @@
         from the MIBs uploaded under Profiles &amp; MIBs — an OID no MIB
         describes is shown as its number rather than guessed at.</p>
       <div id="oid-status" class="hint"></div>
-      <div class="table-wrap" style="max-height:52vh"><table id="oid-table"></table></div>`, [
+      <div class="table-wrap scrollbox large"><table id="oid-table"></table></div>`, [
       { label: 'Close', onClick: App.closeModal },
     ], { buttonsTop: true });
     // Stamped by App.modal above; every paint below checks it first.
@@ -1804,7 +1848,7 @@
       <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
       <p class="section">RUNNING CONFIGURATION</p>
       <p class="hint">Stored configurations live in
-        <button type="button" class="linkish" id="ifd-configrx">ConfigRX</button>,
+        <button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button>,
         which backs up this device over SSH and keeps every version it has
         seen. There is no per-port view of a configuration — a config is a
         whole-device thing.</p>
@@ -2600,18 +2644,25 @@
     box.querySelector('#nd-import-text').oninput = () => updateImportPreview(box);
   }
 
-  function addDevice() {
-    const box = App.modal('Add device', deviceForm({}), [
+  /* `preset` prefills the form without making it read-only — unlike
+     editDevice's, this id-less form never locks the IP field. Used both by
+     the toolbar button (no preset) and by a #/nodes?add=<ip> route, the way
+     Syslog and SNMP Trap turn "nobody has this address" into one click
+     instead of a copy-paste across two tabs. */
+  function addDevice(preset) {
+    const box = App.modal('Add device', deviceForm(preset || {}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Test', onClick: () => testDevice(box, null) },
-      { label: 'Add', primary: true, onClick: async (box) => {
+      { label: 'Add', primary: true, onClick: (box, button) => {
         // Both halves of this used to be silent: a blank address returned
         // without a word, and a refusal from the server (a duplicate, or an
         // address that is not one) rejected into nothing, so the dialog just
         // sat there and the button looked broken. requireFields announces
         // and marks the blank field; a server refusal now propagates
-        // instead of being caught here, so runModalAction (App.modal) is
-        // the one place that renders it, in .modal-error.
+        // instead of being caught here, so App.runJob is the one place
+        // that renders it, in .modal-error, and reports the success that
+        // used to go unsaid — the dialog closed and a new row simply
+        // appeared, with nothing naming which one it was.
         if (!App.requireFields(box, [['#nd-f-ip', 'IP address']])) return;
         const ip = box.querySelector('#nd-f-ip').value.trim();
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
@@ -2620,20 +2671,24 @@
         const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
-        const result = await App.post('/api/nodes/devices',
-          { ip, name, group_id, device_group_id, display_name_source, ...overrides });
-        if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
-          await App.post(`/api/nodes/devices/${result.id}/credential`,
-            { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
-              v3_auth_pass: authPass }).catch(() => {});
-        }
-        // Poll it now rather than waiting for the next scheduled tick, and
-        // only after any v3 credential override above has been saved so
-        // the first poll already uses the device's final configuration.
-        await App.post(`/api/nodes/devices/${result.id}/poll`, {}).catch(() => {});
-        App.closeModal();
-        selectDevice(result.id);
-        App.refreshNow('nodes');
+        return App.runJob(button, { queued: 'Adding…', done: `Added ${name || ip}` },
+          (async () => {
+          const result = await App.post('/api/nodes/devices',
+            { ip, name, group_id, device_group_id, display_name_source, ...overrides });
+          if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
+            await App.post(`/api/nodes/devices/${result.id}/credential`,
+              { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
+                v3_auth_pass: authPass }).catch(() => {});
+          }
+          // Poll it now rather than waiting for the next scheduled tick, and
+          // only after any v3 credential override above has been saved so
+          // the first poll already uses the device's final configuration.
+          await App.post(`/api/nodes/devices/${result.id}/poll`, {}).catch(() => {});
+          App.closeModal();
+          selectDevice(result.id);
+          App.refreshNow('nodes');
+          return result;
+        })());
       } },
     ]);
     wireInheritHints(box, {});
@@ -4078,7 +4133,7 @@
       <p class="hint">${lead} ${job.allow_ping_only
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
-      <div class="table-wrap" style="max-height:50vh">
+      <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
       </div>`, buttons);
@@ -4261,7 +4316,7 @@
         network, download the files yourself and use Upload MIB, which accepts a
         zip.</p>
       <p id="nd-cat-status" class="hint"></p>
-      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
+      <div class="table-wrap scrollbox large"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
         <thead><tr><th scope="col">Bundle</th><th scope="col">State</th><th scope="col"></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`, [
       { label: 'Close', onClick: App.closeModal },
@@ -4522,7 +4577,8 @@
           which at the default interval is roughly a week.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         await App.post('/api/settings', { scope: 'nodes', values: {
@@ -4559,7 +4615,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('nodes');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -4987,10 +5043,14 @@
 
     // The timeline is drawn into a viewBox sized from its box, so a
     // resize needs a redraw from the data already loaded — no refetch.
+    // The device table's own redraw is here too: narrowDevicePane() reads
+    // live layout, so crossing the width where Response/Vendor default off
+    // only takes effect once something asks the table to redraw.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
         if (App.state.tab !== 'nodes') return;
         drawStatusTimeline();
+        drawTable();
       });
     }
 

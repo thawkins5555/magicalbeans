@@ -38,6 +38,13 @@
                      ['GRE', 47], ['ESP', 50], ['OSPF', 89]];
   const PAD = { left: 62, right: 12, top: 14, bottom: 26 };
 
+  // One sentence for "nothing matched the window/filters" — the chart, the
+  // top-talker bars and the record table used to each say this their own
+  // way (an SVG text node, a bare <p class="hint">, and a table silently
+  // rendering its header over an empty tbody with no word said at all).
+  const NO_FLOWS_TEXT = 'No flows match this window and filters. Widen the ' +
+    'time window or clear a filter.';
+
   const view = {
     t0: Date.now() / 1000 - 3600,
     t1: Date.now() / 1000,
@@ -177,7 +184,7 @@
   function showFocusTip(container) {
     if (document.activeElement !== container) return;
     const box = container.getBoundingClientRect();
-    App.tooltip(App.el('nf-totals').textContent || 'No flows in this window',
+    App.tooltip(App.el('nf-totals').textContent || NO_FLOWS_TEXT,
       { clientX: box.left + box.width / 2, clientY: box.top + 24 });
   }
 
@@ -190,7 +197,7 @@
     container.tabIndex = 0;
     container.setAttribute('role', 'img');
     container.setAttribute('aria-label', `Traffic over time chart. ` +
-      `${App.el('nf-totals').textContent || 'No flows in this window'}. Focus and use ` +
+      `${App.el('nf-totals').textContent || NO_FLOWS_TEXT}. Focus and use ` +
       `left/right to pan, plus/minus to zoom, Home to reset.`);
     if (!container.dataset.keyboardWired) {
       container.dataset.keyboardWired = '1';
@@ -224,10 +231,7 @@
     };
 
     if (!data || !data.times.length || !data.series.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-xs)',
-      }, 'No flows in this window'));
+      App.emptyText(svg, width, height, NO_FLOWS_TEXT);
       showFocusTip(container);
       return;
     }
@@ -405,7 +409,7 @@
     wrap.innerHTML = '';
     const rows = view.data ? view.data.top : [];
     if (!rows.length) {
-      wrap.innerHTML = '<p class="hint">No flows in this window</p>';
+      wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
       return;
     }
     const peak = Math.max(...rows.map((r) => r.bytes), 1);
@@ -603,7 +607,7 @@
         App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
       tr.addEventListener('blur', App.hideTooltip);
-    });
+    }, NO_FLOWS_TEXT);
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -656,7 +660,8 @@
       ${App.columnPickerFieldset('FLOW LIST COLUMNS', 'netflow', COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -676,10 +681,9 @@
             box.querySelector('#cols-netflow'), COLUMNS),
         } });
         await App.loadState();
-        App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
         App.closeModal();
         App.refreshNow('netflow');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -940,14 +944,19 @@
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
     App.el('nf-export-csv').onclick = exportFlowsCsv;
-    App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
-    App.el('nf-resolve').onchange = async (event) => {
-      await App.post('/api/settings', {
-        scope: 'netflow', values: { resolve_addresses: event.target.checked },
-      });
-      await App.loadState();
-      App.refreshNow('netflow');
-    };
+    // "Resolve names" used to sit here, in the filter bar beside per-view
+    // controls (source/dest/port), silently writing a server-wide setting
+    // — one operator ticking it changed every operator's flow table. The
+    // same setting (resolve_addresses) already has a correctly-scoped
+    // control in Settings ("Reverse-resolve addresses in the flow table"),
+    // so this hides the redundant filter-bar one rather than wiring it a
+    // second time. index.html still carries its <label> (~nf-resolve) —
+    // safe to delete outright the next time that region is touched.
+    const legacyResolve = App.el('nf-resolve');
+    if (legacyResolve) {
+      const label = legacyResolve.closest('label') || legacyResolve;
+      label.hidden = true;
+    }
     App.el('nf-settings').onclick = settingsDialog;
     App.el('nf-test').onclick = sendTestPacket;
     App.el('nf-toggle').onclick = async () => {

@@ -866,7 +866,8 @@
       ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
                                  s.table_columns_backups)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (m) => {
+      { label: 'Save', primary: true, onClick: (m, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         await App.post('/api/settings', { scope: 'configrx', values: {
           enabled: m.querySelector('#cxs-enabled').checked,
           backup_interval_hours: Number(m.querySelector('#cxs-interval').value),
@@ -882,7 +883,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('configrx');
-      } },
+        })()) },
     ]);
     App.wireColumnPickers(settingsBox);
   }

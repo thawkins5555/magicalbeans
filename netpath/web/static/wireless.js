@@ -27,6 +27,28 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
+  /* A controller is its own entity here (its own credential, polled
+     independently), not a Nodes device — but the same FortiGate is often
+     ALSO monitored as one, by the same IP. There is no App.deviceLink in
+     app.js, so this is the local lookup FINDINGS' Phase 6 cross-links call
+     for: a small ip -> device cache, built from the one unpaged fetch
+     Nodes' own device list is (see nodes.js's addDevice route). Refetched
+     at most once every 30s — the AP detail pane can redraw on every poll,
+     and a controller's own IP essentially never changes. */
+  let deviceByIp = null;
+  let deviceByIpAt = 0;
+  async function loadDeviceByIp() {
+    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
+    const map = new Map();
+    try {
+      const payload = await App.get('/api/nodes/devices');
+      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
+    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
+    deviceByIp = map;
+    deviceByIpAt = Date.now();
+    return map;
+  }
+
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
@@ -200,25 +222,29 @@
 
   function showDetail(row) {
     const lines = [
-      row.name || row.wtp_id, '',
-      `controller  ${controllerName(row.controller_id)}`,
-      `wtp id      ${row.wtp_id}`,
-      `vdom        ${row.vdom || '—'}`,
-      `status      ${row.status}${row.out_of_service ? ' (marked out of service)' : ''}`,
-      `model       ${row.model || '—'}`,
-      `MAC         ${row.mac_address || '—'}`,
+      escape(row.name || row.wtp_id), '',
+      // The name goes in a span rather than straight into the line: the
+      // controller is its own entity here, but the same FortiGate is often
+      // ALSO a Nodes device at the same IP, and linkController() below
+      // upgrades this into a link to it once that lookup resolves.
+      `controller  <span id="wl-d-controller">${escape(controllerName(row.controller_id))}</span>`,
+      `wtp id      ${escape(row.wtp_id)}`,
+      `vdom        ${escape(row.vdom || '—')}`,
+      `status      ${escape(row.status)}${row.out_of_service ? ' (marked out of service)' : ''}`,
+      `model       ${escape(row.model || '—')}`,
+      `MAC         ${escape(row.mac_address || '—')}`,
       `clients     ${row.station_count ?? '—'}`,
-      `last seen   ${App.when(row.last_seen_ts)}`,
+      `last seen   ${escape(App.when(row.last_seen_ts))}`,
       '', `radios (${row.radios.length})`, '-'.repeat(40),
     ];
     for (const radio of row.radios) {
       const raw = radio.operating_power_dbm;
-      lines.push(`radio ${radio.radio_id}`,
-        `  mode         ${radio.mode || '—'}`,
+      lines.push(`radio ${escape(String(radio.radio_id))}`,
+        `  mode         ${escape(radio.mode || '—')}`,
         `  channel      ${radio.channel ?? '—'}`,
         // Both the reading and the number it was read from, so an operator
         // can check the guess against the controller's own display.
-        `  tx power     ${powerText(raw, row.power_unit, radio.is_scan)}` +
+        `  tx power     ${escape(powerText(raw, row.power_unit, radio.is_scan))}` +
           (raw != null ? `  (raw ${raw})` : ''),
         `  clients      ${radio.station_count ?? '—'}`, '');
     }
@@ -229,7 +255,26 @@
                  'a transmit power. It is left out of this AP\'s tx power',
                  'and out of the dBm-or-percent decision for the others.', '');
     }
-    App.el('wl-detail').textContent = lines.join('\n');
+    App.el('wl-detail').innerHTML = lines.join('\n');
+    linkController(row.controller_id, row.id);
+  }
+
+  /* Upgrades the plain controller name above into a link to the matching
+     Nodes device, once the ip -> device lookup resolves — done after the
+     pane is already on screen rather than before, so opening an AP never
+     waits on a Nodes fetch. Guarded by the AP id still being the one
+     selected: a slow lookup landing after the operator moved to another AP
+     (or another tab) must not rewrite a pane that has moved on. */
+  async function linkController(controllerId, apId) {
+    const controller = view.controllers.find((x) => x.id === controllerId);
+    if (!controller || !controller.ip) return;
+    const map = await loadDeviceByIp();
+    if (view.selected !== apId) return;
+    const device = map.get(controller.ip);
+    const span = document.getElementById('wl-d-controller');
+    if (!device || !span) return;
+    span.outerHTML = `<a class="linkish inline" href="${
+      App.buildRoute('nodes', ['device', device.id])}">${escape(controller.name)}</a>`;
   }
 
   /* -------------------------------------------------------- controllers */
@@ -394,7 +439,8 @@
       ${App.columnPickerFieldset('ACCESS POINT COLUMNS', 'wireless', ALL_COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (m) => {
+      { label: 'Save', primary: true, onClick: (m, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
@@ -405,7 +451,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('wireless');
-      } },
+        })()) },
     ]);
     App.wireColumnPickers(box);
     return box;
