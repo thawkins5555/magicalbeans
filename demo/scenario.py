@@ -52,6 +52,7 @@ except Exception as exc:                                    # noqa: BLE001
 APP_PORT = 8443
 FLEET_CONTROL_PORT = 8099
 SMTP_PORT = 1025
+SSH_BASE_PORT = 2201                    # demo/fake_ssh.py's own default
 
 # DebuggingServer prints this before every message body; counting it counts
 # delivered mail. The fallback sink below prints the same line on purpose.
@@ -232,9 +233,12 @@ class Scenario:
         self.mail_log = os.path.join(self.out, "mail-%d.log" % self.count)
         self.app_log = os.path.join(self.out, "app-%d.log" % self.count)
         self.fleet_log = os.path.join(self.out, "fleet-%d.log" % self.count)
+        self.ssh_log = os.path.join(self.out, "fake-ssh-%d.log" % self.count)
         self.run_log = os.path.join(self.out, "scenario-%d.log" % self.count)
         self.base = "http://127.0.0.1:%d" % args.port
         self.fleet_base = "http://127.0.0.1:%d" % args.control_port
+        self.ssh_base_port = args.ssh_base_port
+        self.ssh_started = False
         self.procs: list[tuple[str, subprocess.Popen]] = []
         self.handles: list = []
         self.client: Client | None = None
@@ -336,6 +340,34 @@ class Scenario:
         self.log("[ok] fleet listening on control port %d" % self.args.control_port)
         return True
 
+    def start_fake_ssh(self) -> bool:
+        """The SSH personas ConfigRX's platform sweep (configrx_platforms())
+        and seed.py's own live ASA walk connect to. If a base port is
+        already bound (another instance is running there), fake_ssh.py still
+        prints 'listening' — each persona's own bind failure only reaches its
+        own thread's stderr — so this only reports "did not start at all";
+        a partial bind failure surfaces later as a connect error on that one
+        persona's port instead.
+        """
+        script = os.path.join(HERE, "fake_ssh.py")
+        if not os.path.exists(script):
+            self.notes.append("demo/fake_ssh.py is missing — the ConfigRX "
+                              "platform sweep was skipped")
+            self.log("[warn] demo/fake_ssh.py not found; continuing without it")
+            return False
+        process = self.spawn("fake-ssh", [sys.executable, "-u", script,
+                                          "--base-port", str(self.ssh_base_port)],
+                             self.ssh_log)
+        if not wait_for_line(self.ssh_log, "listening", 30, process):
+            self.notes.append("demo/fake_ssh.py never printed 'listening' on "
+                              "base port %d" % self.ssh_base_port)
+            self.log("[warn] fake SSH did not report listening; see %s"
+                     % os.path.basename(self.ssh_log))
+            return False
+        self.log("[ok] fake SSH personas listening from port %d"
+                 % self.ssh_base_port)
+        return True
+
     def start_app(self) -> None:
         os.makedirs(self.data_dir, exist_ok=True)
         env = dict(os.environ)
@@ -364,7 +396,8 @@ class Scenario:
         seed = os.path.join(HERE, "seed.py")
         argv = [sys.executable, "-u", seed, "--base", self.base,
                 "--count", str(self.count), "--out", self.out,
-                "--workers", str(self.args.workers)]
+                "--workers", str(self.args.workers),
+                "--ssh-base-port", str(self.ssh_base_port)]
         if getattr(self.args, "topology", False):
             argv.append("--topology")
         if getattr(self.args, "defaults", False):
@@ -437,6 +470,100 @@ class Scenario:
                           % (best, budget))
         self.log("[warn] gave up waiting for 95%% up (best %d)" % best)
         return {"reached_95pct": False, "seconds": elapsed, "up": best}
+
+    # -- ConfigRX platform sweep -------------------------------------------
+
+    # demo/fake_ssh.py binds only 127.0.0.1, and Nodes needs a unique IP per
+    # device, so the single device it exists for (personas.py's
+    # "configrx-ssh-01", pinned to that address) is re-pointed by ssh_port
+    # and vendor_override across these personas rather than one device per
+    # persona. (label, --base-port offset, configrx_vendors.py key, whether
+    # the vendor needs the enable secret.) demo/configrx_probe.py exercises
+    # the full 12-persona matrix directly against the capture functions,
+    # without this one-device-at-a-time constraint.
+    CONFIGRX_SWEEP = (
+        ("cisco-nxos", 7, "cisco-nxos", False,
+         "a large capture — the baseline the next persona's shrinks against"),
+        ("cisco-asa", 10, "cisco-asa", True,
+         "enable-mode escalation: login lands at user EXEC, needs the "
+         "stored enable secret to reach privileged EXEC before show "
+         "running-config is even accepted"),
+        ("mikrotik", 4, "mikrotik", False,
+         "a small but complete capture right after a large one — under a "
+         "fifth of it, so it should land as 'suspect' rather than 'changed'"),
+    )
+
+    def _configrx_wait(self, device_id: int, timeout: float = 20.0) -> dict:
+        """Poll GET /api/configrx/devices/<id> until the backup in flight
+        finishes, or `timeout` runs out."""
+        deadline = time.time() + timeout
+        device: dict = {}
+        while time.time() < deadline:
+            try:
+                device = self.client.get(
+                    "/api/configrx/devices/%d" % device_id)["device"]
+            except ApiError:
+                time.sleep(1)
+                continue
+            if not device.get("backing_up") and not device.get("backup_queued"):
+                return device
+            time.sleep(1)
+        return device
+
+    def configrx_platforms(self) -> dict:
+        """Walks ConfigRX's SSH platforms end to end against demo/fake_ssh.py:
+        a real backup on a platform that needs enable mode (cisco-asa), and a
+        genuine shrink landing as 'suspect' rather than 'changed'."""
+        self.log("")
+        self.log("=== ConfigRX platform sweep ===")
+        result: dict = {"device": "configrx-ssh-01", "runs": []}
+        if not self.ssh_started:
+            self.notes.append("ConfigRX platform sweep skipped: "
+                              "demo/fake_ssh.py did not start")
+            return result
+        try:
+            devices = self.client.get("/api/nodes/devices")["devices"]
+        except ApiError as exc:
+            self.notes.append("ConfigRX platform sweep skipped: could not "
+                              "list devices (%s)" % exc)
+            return result
+        device_id = next((d["id"] for d in devices
+                          if d.get("name") == "configrx-ssh-01"), None)
+        if device_id is None:
+            self.notes.append(
+                "ConfigRX platform sweep skipped: no 'configrx-ssh-01' "
+                "device (personas.fleet_plan needs --count >= 14; this run "
+                "used --count %d)" % self.count)
+            return result
+
+        for label, offset, vendor, needs_enable, why in self.CONFIGRX_SWEEP:
+            port = self.ssh_base_port + offset
+            self.client.post("/api/configrx/devices/%d/config" % device_id, {
+                "backup_enabled": True, "vendor_override": vendor,
+                "ssh_port": port, "ssh_username": "demo"})
+            cred = {"ssh_username": "demo", "ssh_password": "demo"}
+            if needs_enable:
+                cred["enable_secret"] = "demo"
+            self.client.post(
+                "/api/configrx/devices/%d/credential" % device_id, cred)
+            status, payload, _ = self.client.raw(
+                "POST", "/api/configrx/devices/%d/backup" % device_id, {})
+            run = {"persona": label, "vendor": vendor, "port": port,
+                  "why": why, "queue_status": status}
+            if status >= 400:
+                run["queue_error"] = error_text(payload)
+                self.log("       configrx %-12s -> queue failed: %s"
+                         % (label, run["queue_error"]))
+            else:
+                device = self._configrx_wait(device_id)
+                run["last_backup_status"] = device.get("last_backup_status")
+                run["last_backup_error"] = device.get("last_backup_error")
+                self.log("       configrx %-12s (127.0.0.1:%d) -> %s%s"
+                         % (label, port, device.get("last_backup_status"),
+                            (": " + device["last_backup_error"])
+                            if device.get("last_backup_error") else ""))
+            result["runs"].append(run)
+        return result
 
     # -- fleet control ----------------------------------------------------
 
@@ -826,6 +953,32 @@ class Scenario:
                              % (refusal.get("endpoint"), refusal.get("status"),
                                 refusal.get("error")))
             lines.append("")
+        sweep = extra.get("configrx_platforms") or {}
+        runs = sweep.get("runs") or []
+        if runs:
+            lines.extend([
+                "## ConfigRX platform sweep",
+                "",
+                "One live device (`%s`) re-pointed across demo/fake_ssh.py's "
+                "personas — the fake server binds only 127.0.0.1, and Nodes "
+                "requires a unique IP per device, so one device stands in "
+                "for all of them in turn. `demo/configrx_probe.py` covers "
+                "every persona directly against the capture functions, "
+                "without that constraint." % sweep.get("device"),
+                "",
+                "| Persona (127.0.0.1:port) | Vendor | What it proves | Result |",
+                "| --- | --- | --- | --- |",
+            ])
+            for run in runs:
+                outcome = run.get("last_backup_status") or run.get(
+                    "queue_error") or "?"
+                if run.get("last_backup_error"):
+                    outcome += " — " + run["last_backup_error"]
+                lines.append(
+                    "| %s (%s) | %s | %s | %s |"
+                    % (run["persona"], run["port"], run["vendor"],
+                       run.get("why", ""), outcome))
+            lines.append("")
         ui_metrics = (extra.get("ui") or {}).get("metrics") or {}
         if ui_metrics:
             lines.extend([
@@ -878,10 +1031,12 @@ class Scenario:
         try:
             self.start_smtp_sink()
             extra["fleet_started"] = self.start_fleet()
+            self.ssh_started = self.start_fake_ssh()
             self.start_app()
             extra["seed"] = self.run_seed()
             self.connect()
             extra["first_cycle"] = self.wait_for_first_cycle()
+            extra["configrx_platforms"] = self.configrx_platforms()
             self.incidents()
             if not self.args.skip_ui:
                 extra["ui"] = self.run_ui()
@@ -908,6 +1063,9 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=os.path.join(HERE, "out"))
     parser.add_argument("--port", type=int, default=APP_PORT)
     parser.add_argument("--control-port", type=int, default=FLEET_CONTROL_PORT)
+    parser.add_argument("--ssh-base-port", type=int, default=SSH_BASE_PORT,
+                        help="base port for the demo/fake_ssh.py personas "
+                             "this run starts (default 2201)")
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers seed.py should set")
     parser.add_argument("--skip-ui", action="store_true",

@@ -46,6 +46,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # back to a plan of the same shape so this script is developable and testable
 # on its own.
 
+# demo/fake_ssh.py binds only 127.0.0.1 with the fixed password "demo"; the
+# device personas.py (and the fallback plan below) pin there so ConfigRX's
+# new platforms can be walked against a real SSH session rather than only
+# configured. See step_configrx.
+SSH_DEMO_HOST = "127.0.0.1"
+SSH_DEMO_PASSWORD = "demo"
+SSH_DEMO_DEVICE_NAME = "configrx-ssh-01"
+
 FALLBACK_SITES = ("Site-A", "Site-B", "Site-C")
 
 # index -> (persona, name, profile, knobs) for the scripted special devices.
@@ -64,7 +72,13 @@ FALLBACK_SPECIALS = {
     10: ("cisco_access", "sw-v3sha-01", "v3-sha", {}),
     11: ("cisco_access", "sw-dark-01", "v2c-public", {"scheduled_dark": True}),
     12: ("cisco_access", "sw-reboot-01", "v2c-public", {"periodic_reboot": True}),
+    13: ("cisco_access", SSH_DEMO_DEVICE_NAME, "v2c-public", {}),
 }
+
+# personas.fleet_plan() pins index 13 to 127.0.0.1 (demo/fake_ssh.py's only
+# bind address); mirrored here so the fallback plan can still seed the live
+# ConfigRX SSH walk when personas.py itself is unavailable.
+FALLBACK_IP_OVERRIDES = {13: SSH_DEMO_HOST}
 
 
 def loopback_ip(index: int) -> str:
@@ -90,7 +104,9 @@ def fallback_fleet_plan(count: int) -> list[dict]:
         community = knobs.get("device_community") or (
             "public" if snmp_version in (0, 1) else "")
         plan.append({
-            "index": index, "ip": loopback_ip(index), "name": name,
+            "index": index,
+            "ip": FALLBACK_IP_OVERRIDES.get(index, loopback_ip(index)),
+            "name": name,
             "persona": persona, "site": site, "snmp_version": snmp_version,
             "community": community, "profile": profile, "knobs": dict(knobs),
         })
@@ -620,9 +636,54 @@ def step_wireless(client: Client, log: SeedLog) -> dict:
     return {"controller_id": controller_id, "poll_status": status}
 
 
-def step_configrx(client: Client, log: SeedLog, device_ids: dict) -> dict:
-    """7. Enable config backup on two devices, then try to store an SSH
-    password — which DPAPI refuses off Windows."""
+# demo/fake_ssh.py's PERSONAS dict, in its insertion order, mapped to a
+# --base-port offset and the netpath/configrx_vendors.py key each one backs
+# up as. Kept here rather than imported: fake_ssh.py needs paramiko and this
+# script is stdlib-only so it can seed a fleet on a host that has none.
+SSH_DEMO_PERSONAS = {
+    "cisco":                     (0, "cisco"),
+    "cisco-pager":               (1, "cisco"),
+    "cisco-truncate":            (2, "cisco"),
+    "fortinet":                  (3, "fortinet"),
+    "mikrotik":                  (4, "mikrotik"),
+    "menu":                      (5, "cisco"),
+    "unprivileged":              (6, "cisco"),
+    "cisco-nxos":                (7, "cisco-nxos"),
+    "cisco-iosxr":               (8, "cisco-iosxr"),
+    "cisco-sb-reject-then-page": (9, "cisco-sb"),
+    "cisco-asa":                 (10, "cisco-asa"),
+    "cisco-wlc":                 (11, "cisco-wlc"),
+}
+
+
+def wait_configrx_backup(client: Client, device_id: int,
+                         timeout: float = 20.0) -> dict:
+    """Poll GET /api/configrx/devices/<id> until the backup in flight
+    finishes (or `timeout` runs out) and hand back the device row."""
+    deadline = time.time() + timeout
+    device: dict = {}
+    while time.time() < deadline:
+        try:
+            device = client.get("/api/configrx/devices/%d" % device_id)["device"]
+        except ApiError:
+            time.sleep(1)
+            continue
+        if not device.get("backing_up") and not device.get("backup_queued"):
+            return device
+        time.sleep(1)
+    return device
+
+
+def step_configrx(client: Client, log: SeedLog, device_ids: dict,
+                  ssh_base_port: int = 2201) -> dict:
+    """7. Enable config backup on two devices with a vendor override (proof
+    of configuration only — nothing answers SSH at their IPs), try to store
+    an SSH password on the first one — which DPAPI refuses off Windows — and
+    then, on the one device whose IP (127.0.0.1) is demo/fake_ssh.py's own
+    bind address, actually walk a live backup as a Cisco ASA: store both
+    secrets ConfigRX now supports (the SSH password and the enable secret)
+    and confirm the escalation happens rather than only configuring it.
+    """
     client.step = "7-configrx"
     targets = []
     core = device_ids.get("core-sw-01")
@@ -654,7 +715,51 @@ def step_configrx(client: Client, log: SeedLog, device_ids: dict) -> dict:
         print("[7] store SSH password -> HTTP %d: %s" % (status, refusal))
         if status >= 400:
             log.refusal("7-configrx", endpoint, status, refusal)
-    return {"devices": configured, "credential_refusal": refusal}
+
+    # The live walk. personas.SPECIALS[13] ("configrx-ssh-01") is missing
+    # whenever --count < 14 — skip cleanly, same as any other absent entry.
+    ssh_demo: dict = {"device": SSH_DEMO_DEVICE_NAME, "attempted": False}
+    ssh_id = device_ids.get(SSH_DEMO_DEVICE_NAME)
+    if ssh_id is None:
+        print("[7] %s not in this fleet (--count < 14); the live ASA "
+              "enable-mode walk was skipped" % SSH_DEMO_DEVICE_NAME)
+    else:
+        offset, vendor = SSH_DEMO_PERSONAS["cisco-asa"]
+        port = ssh_base_port + offset
+        client.post("/api/configrx/devices/%d/config" % ssh_id, {
+            "backup_enabled": True, "ssh_port": port,
+            "ssh_username": "demo", "vendor_override": vendor})
+        endpoint = "/api/configrx/devices/%d/credential" % ssh_id
+        status, payload, _ = client.raw("POST", endpoint, {
+            "ssh_username": "demo", "ssh_password": SSH_DEMO_PASSWORD,
+            "enable_secret": SSH_DEMO_PASSWORD})
+        cred_error = error_text(payload)
+        print("[7] %s credential + ASA enable secret -> HTTP %d: %s"
+              % (SSH_DEMO_DEVICE_NAME, status, cred_error or "stored"))
+        if status >= 400:
+            log.refusal("7-configrx", endpoint, status, cred_error)
+        ssh_demo.update(attempted=True, port=port, vendor=vendor,
+                        credential_status=status)
+        status, payload, _ = client.raw(
+            "POST", "/api/configrx/devices/%d/backup" % ssh_id, {})
+        ssh_demo["queue_status"] = status
+        if status >= 400:
+            ssh_demo["queue_error"] = error_text(payload)
+            print("[7] %s backup now -> HTTP %d: %s"
+                 % (SSH_DEMO_DEVICE_NAME, status, ssh_demo["queue_error"]))
+        else:
+            device = wait_configrx_backup(client, ssh_id)
+            ssh_demo["last_backup_status"] = device.get("last_backup_status")
+            ssh_demo["last_backup_error"] = device.get("last_backup_error")
+            print("[7] %s (cisco-asa, 127.0.0.1:%d) backup -> %s%s"
+                 % (SSH_DEMO_DEVICE_NAME, port, device.get("last_backup_status"),
+                    (": " + device["last_backup_error"])
+                    if device.get("last_backup_error") else ""))
+            log.note("7-configrx", "ASA enable-mode backup walked live",
+                     status=device.get("last_backup_status"),
+                     error=device.get("last_backup_error"))
+    return {"devices": configured, "credential_refusal": refusal,
+            "ssh_demo": ssh_demo}
 
 
 def step_settings(client: Client, log: SeedLog, workers: int,
@@ -892,6 +997,10 @@ def main(argv=None) -> int:
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers to set; 0 leaves the default. "
                              "Ignored with --defaults")
+    parser.add_argument("--ssh-base-port", type=int, default=2201,
+                        help="base port of a running demo/fake_ssh.py (default "
+                             "2201, its own default) — used only to walk the "
+                             "configrx-ssh-01 device's live ASA backup")
     parser.add_argument("--topology", action="store_true",
                         help="point every Site-A device at the core switch "
                              "(upstream_id), so a site outage rolls up into "
@@ -940,7 +1049,7 @@ def main(argv=None) -> int:
         summary["ipam"] = step_ipam(client, log)
         summary["wireless"] = step_wireless(client, log)
         summary["configrx"] = step_configrx(
-            client, log, summary["devices"]["ids_by_name"])
+            client, log, summary["devices"]["ids_by_name"], args.ssh_base_port)
         summary["settings"] = step_settings(client, log, args.workers,
                                             args.defaults)
         summary["users"] = step_users(client, log, args.base, creds_path)
