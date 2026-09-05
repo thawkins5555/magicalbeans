@@ -128,6 +128,18 @@ class StaticCache:
         with open(full, "rb") as handle:
             body = handle.read()
         content_type = content_type_for(full)
+        # The markup asks for its assets as `/app.js?v=__SW_VERSION__`, and the
+        # version is put in here rather than written into the file, because a
+        # hand-maintained copy of it is a copy that drifts — and this one has
+        # teeth: an asset URL is served immutable for a year, so a static file
+        # that changed while the version did not would go on being served from
+        # every warm cache until the next release. Substituting at load time
+        # means bumping __version__ re-versions every URL and nothing else has
+        # to remember. Done before the ETag and the gzip, so both describe the
+        # bytes that actually go out.
+        if content_type.startswith("text/html"):
+            from .. import __version__
+            body = body.replace(b"__SW_VERSION__", __version__.encode("ascii"))
         gzipped = (gzip.compress(body, GZIP_LEVEL)
                    if is_compressible(content_type) and len(body) >= GZIP_MIN_BYTES
                    else None)

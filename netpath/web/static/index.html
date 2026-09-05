@@ -7,8 +7,8 @@
 <!-- Every load used to 404 on /favicon.ico. SVG so one file covers
      every size a browser or a pinned tab asks for. -->
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/tokens.css">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/tokens.css?v=__SW_VERSION__">
+<link rel="stylesheet" href="/app.css?v=__SW_VERSION__">
 <!-- Marks which tab should paint first, before <body> has a single byte of
      content to render — see app.css's html[data-tab] rules and boot.js.
      A plain <script src> (no defer, no module) so it still blocks parsing
@@ -16,7 +16,7 @@
      It is a separate file rather than an inline block because the server
      sends `default-src 'self'`, under which an inline <script> is refused
      outright and this never ran at all. -->
-<script src="/boot.js"></script>
+<script src="/boot.js?v=__SW_VERSION__"></script>
 </head>
 <body>
 
@@ -1338,18 +1338,18 @@
      order, and all finish before DOMContentLoaded — which is also what
      makes app.js's start-up ordering sound (see the end of app.js).
      boot.js must keep blocking: its whole job is to run before <body>. -->
-<script src="/app.js" defer></script>
-<script src="/dashboard.js" defer></script>
-<script src="/nodes.js" defer></script>
-<script src="/alerts.js" defer></script>
-<script src="/netpath.js" defer></script>
-<script src="/netflow.js" defer></script>
-<script src="/snmp.js" defer></script>
-<script src="/syslog.js" defer></script>
-<script src="/ipam.js" defer></script>
-<script src="/wireless.js" defer></script>
-<script src="/configrx.js" defer></script>
-<script src="/debug.js" defer></script>
-<script src="/settings.js" defer></script>
+<script src="/app.js?v=__SW_VERSION__" defer></script>
+<script src="/dashboard.js?v=__SW_VERSION__" defer></script>
+<script src="/nodes.js?v=__SW_VERSION__" defer></script>
+<script src="/alerts.js?v=__SW_VERSION__" defer></script>
+<script src="/netpath.js?v=__SW_VERSION__" defer></script>
+<script src="/netflow.js?v=__SW_VERSION__" defer></script>
+<script src="/snmp.js?v=__SW_VERSION__" defer></script>
+<script src="/syslog.js?v=__SW_VERSION__" defer></script>
+<script src="/ipam.js?v=__SW_VERSION__" defer></script>
+<script src="/wireless.js?v=__SW_VERSION__" defer></script>
+<script src="/configrx.js?v=__SW_VERSION__" defer></script>
+<script src="/debug.js?v=__SW_VERSION__" defer></script>
+<script src="/settings.js?v=__SW_VERSION__" defer></script>
 </body>
 </html>
