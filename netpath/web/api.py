@@ -36,6 +36,7 @@ from .. import trapoids
 from .. import nodeoids
 from .. import configrx
 from .. import configrx_redact
+from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
@@ -148,7 +149,7 @@ _CONFIG_MODULE_KEYS = {
     "nodes": ("nodes_settings",),
     "alerts": ("alerts_settings",),
     "wireless": ("wireless_settings",),
-    "configrx": ("configrx_settings",),
+    "configrx": ("configrx_settings", "configrx_vendors"),
 }
 _STATE_MODULE_KEYS = {
     "netflow": ("collector",),
@@ -231,6 +232,12 @@ def get_config(service, params, body) -> dict:
         "alerts_settings": service.alerts_settings,
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
+        # The vendor override <select> is built from this, not a JS copy of
+        # configrx_vendors.VENDORS — label and key only, nothing a client
+        # could use to influence what a backup sends over SSH. Order matches
+        # the table's own (Python dicts keep insertion order).
+        "configrx_vendors": [{"key": key, "label": vendor.label}
+                             for key, vendor in configrx_vendors.VENDORS.items()],
     }
     _drop_unreadable(result, granted, _CONFIG_MODULE_KEYS)
     # "settings" itself stays present even without Settings access — every
@@ -5509,6 +5516,22 @@ def delete_configrx_device_credential(service, params, body, device_id) -> dict:
     service.configrx_db.clear_credential(device_id)
     service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored SSH credential for {row['ip']}")
     _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}")
+    return {"ok": True}
+
+
+def delete_configrx_device_enable_secret(service, params, body, device_id) -> dict:
+    """The SSH username/password are untouched — only ConfigRxDatabase.
+    clear_enable_secret runs, for the device that turned out not to need
+    one. Clearing the whole credential (above) still clears both, per this
+    release's security review; this is the narrower operation that was
+    missing beside it."""
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    service.configrx_db.clear_enable_secret(device_id)
+    service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored enable secret for {row['ip']}")
+    _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}",
+           detail="enable secret only")
     return {"ok": True}
 
 

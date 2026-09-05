@@ -692,31 +692,28 @@
     }
   }
 
-  /* The keys configrx_vendors.VENDORS knows, label copied verbatim from
-     there, for the select below — plus free text (the "Other" option and
-     its own box) for anything not in that table, which is exactly what
-     vendor_override is documented as being for (e.g. HP/Aruba has no SNMP
-     enterprise root registered in nodeoids.vendor_for() to auto-detect
-     from, and a platform this build has not shipped a Vendor entry for
-     yet still needs somewhere to type its key). Kept as a small literal
-     here — this page owns no route that could read configrx_vendors.py's
-     table for it — rather than a new API endpoint; it only changes when a
-     vendor entry ships, which is a code change either way. */
-  const VENDOR_CHOICES = [
-    ['cisco', 'Cisco IOS/IOS-XE'], ['cisco-nxos', 'Cisco NX-OS'],
-    ['cisco-iosxr', 'Cisco IOS-XR'], ['cisco-sb', 'Cisco Small Business SG/CBS'],
-    ['cisco-asa', 'Cisco ASA'], ['cisco-wlc', 'Cisco WLC AireOS'],
-    ['fortinet', 'Fortinet FortiOS'], ['juniper', 'Juniper Junos'],
-    ['mikrotik', 'MikroTik RouterOS'], ['hp', 'HP/Aruba'], ['aruba', 'HP/Aruba'],
-  ];
+  /* The keys configrx_vendors.VENDORS knows, served by /api/config as
+     configrx_vendors — label and key only, nothing that lets this page
+     influence what a backup sends — plus free text (the "Other" option
+     and its own box) for anything not in that table, which is exactly
+     what vendor_override is documented as being for (e.g. HP/Aruba has
+     no SNMP enterprise root registered in nodeoids.vendor_for() to
+     auto-detect from, and a platform this build has not shipped a Vendor
+     entry for yet still needs somewhere to type its key). */
   const VENDOR_OTHER = '__other__';
 
+  function vendorChoices() {
+    return ((App.state.config || {}).configrx_vendors || [])
+      .map((v) => [v.key, v.label]);
+  }
+
   function vendorFieldHtml(current) {
-    const known = VENDOR_CHOICES.some(([key]) => key === current);
+    const choices = vendorChoices();
+    const known = choices.some(([key]) => key === current);
     const selected = !current ? '' : (known ? current : VENDOR_OTHER);
     return `<label>Vendor override <select id="cx-vendor">
         <option value=""${selected === '' ? ' selected' : ''}>Auto-detected from Nodes</option>
-        ${VENDOR_CHOICES.map(([key, label]) => `<option value="${escape(key)}"${
+        ${choices.map(([key, label]) => `<option value="${escape(key)}"${
           selected === key ? ' selected' : ''}>${escape(label)} (${escape(key)})</option>`).join('')}
         <option value="${VENDOR_OTHER}"${selected === VENDOR_OTHER ? ' selected' : ''}
           >Other (type a vendor key)…</option>
@@ -724,6 +721,39 @@
       <label id="cx-vendor-other-wrap"${selected === VENDOR_OTHER ? '' : ' hidden'}>Vendor key
         <input id="cx-vendor-other" value="${escape(known ? '' : current)}"
           placeholder="e.g. hpe-comware"></label>`;
+  }
+
+  /* The enable secret's own state (stored / not) and, when it is stored,
+     a way to drop just it — DELETE .../credential/enable-secret, which
+     touches nothing else — so a device that turns out not to need one is
+     not stuck clearing the SSH password too just to get rid of it. */
+  function enableSecretFieldHtml(device) {
+    return `<label>Enable secret <input id="cx-enable-secret" type="password"
+        placeholder="${device.has_enable_secret ? 'stored — leave blank to keep' : 'most platforms do not need this'}"></label>
+      ${device.has_enable_secret && App.canWrite('configrx')
+        ? '<p><button id="cx-enable-secret-clear">Clear stored enable secret</button>'
+          + '<span class="hint"> Leaves the SSH username and password untouched.</span></p>'
+        : ''}`;
+  }
+
+  function wireEnableSecretClear(box, device) {
+    const wrap = box.querySelector('#cx-enable-secret-wrap');
+    const clearBtn = wrap.querySelector('#cx-enable-secret-clear');
+    if (!clearBtn) return;
+    clearBtn.onclick = async () => {
+      clearBtn.disabled = true;
+      try {
+        await App.del(`/api/configrx/devices/${device.id}/credential/enable-secret`, {});
+      } catch (error) {
+        clearBtn.disabled = false;
+        App.toast(`Could not clear the enable secret: ${error.message}`, 'fail');
+        return;
+      }
+      device.has_enable_secret = false;
+      wrap.innerHTML = enableSecretFieldHtml(device);
+      wireEnableSecretClear(box, device);
+      App.announce('Enable secret cleared.');
+    };
   }
 
   function deviceSettingsModal() {
@@ -746,8 +776,7 @@
         ${App.canStoreSecrets()
           ? `<label>Password <input id="cx-password" type="password"
               placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>
-            <label>Enable secret <input id="cx-enable-secret" type="password"
-              placeholder="${device.has_enable_secret ? 'stored — leave blank to keep' : 'most platforms do not need this'}"></label>`
+            <div id="cx-enable-secret-wrap">${enableSecretFieldHtml(device)}</div>`
           : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
@@ -790,6 +819,7 @@
     vendorSelect.onchange = () => {
       vendorOtherWrap.hidden = vendorSelect.value !== VENDOR_OTHER;
     };
+    if (App.canStoreSecrets()) wireEnableSecretClear(box, device);
     drawHostKey(box, device);
   }
 

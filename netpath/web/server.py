@@ -434,6 +434,13 @@ ROUTES = [
     ("POST", r"^/api/configrx/devices/(\d+)/config$", api.post_configrx_device_config, ("configrx", W)),
     ("POST", r"^/api/configrx/devices/(\d+)/credential$", api.post_configrx_device_credential, ("configrx", W)),
     ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
+    # Clears only the enable secret, leaving the SSH password (and username)
+    # exactly as stored — set_credential's own three-way contract already
+    # lets an empty enable_secret clear it there, but that route requires
+    # re-supplying the SSH password too. A device that turns out not to need
+    # an enable secret needs a way to drop it alone; this is that way.
+    ("DELETE", r"^/api/configrx/devices/(\d+)/credential/enable-secret$",
+     api.delete_configrx_device_enable_secret, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
     # The backup's CONTENT, not its metadata: reading a stored config is a
