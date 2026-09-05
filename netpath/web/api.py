@@ -5133,7 +5133,17 @@ def post_alerts_rule(service, params, body) -> dict:
               "auto_resolve_after_s", "notify")}
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
+    _audit(service, params, "alert_rule.create", target=key,
+          detail=f"kind={kind}, severity={fields.get('severity', '')}")
     return {"id": rule_id}
+
+
+# threshold/clear_threshold/enabled first in an update's audit detail — the
+# literal "changed the threshold from 90 to 99" case a post-mortem asks
+# for — so that if the combined diff still overflows the 512-char clip
+# appdb.audit applies, these three are the ones that survive it rather
+# than whatever happened to be last in the request body.
+_ALERT_RULE_AUDIT_PRIORITY = ("threshold", "clear_threshold", "enabled")
 
 
 def put_alerts_rule(service, params, body, rule_id) -> dict:
@@ -5148,6 +5158,15 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
         allowed_keys = allowed_keys + ("kind", "source_kind")
     fields = {k: v for k, v in body.items() if k in allowed_keys}
     service.alerts_db.update_rule(rule_id, **fields)
+    if fields:
+        ordered = dict(sorted(
+            fields.items(),
+            key=lambda kv: (_ALERT_RULE_AUDIT_PRIORITY.index(kv[0])
+                            if kv[0] in _ALERT_RULE_AUDIT_PRIORITY
+                            else len(_ALERT_RULE_AUDIT_PRIORITY))))
+        detail = _audit_diff(row, ordered)
+        if detail:
+            _audit(service, params, "alert_rule.update", target=row["name"], detail=detail)
     return {"ok": True}
 
 
@@ -5159,6 +5178,7 @@ def delete_alerts_rule(service, params, body, rule_id) -> dict:
         raise ValueError("A built-in rule cannot be deleted — disable it instead")
     service.alerts_db.remove_rule(rule_id)
     service.log.add(ALERTS_CATEGORY, f"Removed alert rule {row['name']}")
+    _audit(service, params, "alert_rule.delete", target=row["name"])
     return {"ok": True}
 
 
@@ -5767,6 +5787,16 @@ def delete_configrx_backup(service, params, body, backup_id) -> dict:
     if removed:
         service.log.add(CONFIGRX_CATEGORY,
                         f"Deleted a stored config backup for device {row['device_id']}")
+        # "Who destroyed the evidence" — this product has no restore-to-
+        # device capability at all (configrx_redact.py says so explicitly),
+        # so a deleted backup's config content is gone for good, not just
+        # rolled back. device.ip preferred over the bare id, matching every
+        # other device-scoped audit target; falls back to the id itself on
+        # the rare row whose device has since been removed.
+        device = service.nodes_db.device(row["device_id"])
+        target = f"device:{device['ip']}" if device else f"device:{row['device_id']}"
+        _audit(service, params, "configrx.backup_delete", target=target,
+              detail=f"backup #{backup_id}")
     return {"ok": True, "removed": 1 if removed else 0}
 
 
@@ -5776,6 +5806,7 @@ def post_configrx_backups_bulk_delete(service, params, body) -> dict:
         raise ValueError("backup_ids is required")
     removed = service.configrx_db.delete_backups([int(i) for i in ids])
     service.log.add(CONFIGRX_CATEGORY, f"Deleted {removed} stored config backup(s)")
+    _audit(service, params, "configrx.backup_bulk_delete", target=f"{removed} backups")
     return {"ok": True, "removed": removed}
 
 
@@ -5825,7 +5856,8 @@ def get_configrx_device(service, params, body, device_id) -> dict:
 
 
 def post_configrx_device_config(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
+    device = service.nodes_db.device(device_id)
+    if not device:
         raise ValueError("No such device")
     fields = {k: v for k, v in body.items()
              if k in ("backup_enabled", "ssh_port", "ssh_username",
@@ -5840,8 +5872,11 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
         fields["ssh_port"] = port
     if "store_secrets" in fields:
         fields["store_secrets"] = 1 if fields["store_secrets"] else 0
+        # device:{ip}, not a bare device_id — the same target shape every
+        # other device-scoped audit line in this file uses (normalized
+        # 4.49.0; this was the one inconsistent site).
         _audit(service, params,
-               "configrx.store_secrets", target=str(device_id),
+               "configrx.store_secrets", target=f"device:{device['ip']}",
                detail="on — captures will be stored verbatim"
                       if fields["store_secrets"] else "off")
     service.configrx_db.update_device_config(device_id, **fields)
