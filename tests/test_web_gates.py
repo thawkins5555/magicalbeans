@@ -554,13 +554,15 @@ try:
     print("FAILED: " + ", ".join(failures) if failures else "ALL WEB GATE ASSERTIONS PASSED")
 finally:
     server.stop()
-    # Adding a device queues a first poll, and shutting the service down
-    # under an in-flight one closes the database out from beneath the
-    # worker. Wait it out rather than printing a traceback that looks like
-    # a failure of the thing this suite is actually testing.
-    deadline = time.time() + 20
-    while time.time() < deadline and service.node_poller.worker_state():
-        time.sleep(0.1)
+    # Adding a device queues a first poll, and NodePoller.shutdown() (not
+    # the plain stop() a hot restart uses) now waits for one already
+    # running to land before the database underneath it closes, sized to
+    # that device's own worst-case poll duration — see
+    # NodePoller._inflight_budget_s in netpath/nodepoll.py. This suite used
+    # to wait it out here instead, polling worker_state() for up to 20s
+    # before calling shutdown() at all; that was a workaround for the
+    # dispatch service.shutdown() itself now does, so it is gone rather
+    # than left standing beside the fix as an unexplained no-op.
     service.shutdown()
 
 sys.exit(1 if failures else 0)

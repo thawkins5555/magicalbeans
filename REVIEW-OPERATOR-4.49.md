@@ -624,6 +624,15 @@ is not rich enough to use.
 
 ### 5.4 The ten minutes that matter most
 
+> **Fixed in this pass.** The device summary header now carries Alerts · ConfigRX ·
+> Syslog · SNMP traps, each landing pre-filtered on that device, each gated on the
+> account's read grant, and each using a route the target module already understood — so
+> nothing in those four modules had to change. `nodes.js` went from one `App.buildRoute`
+> call to five. Building it surfaced a defect of its own: the Alerts list had no
+> `emptyMessage` at all, so a device-filtered view with no matches would have shown a bare
+> header over nothing. No count is shown on any link, deliberately — the header redraws on
+> every refresh tick, so a count would be a request per device per refresh.
+
 **O-32 — every module links into Nodes. Nodes links back to nothing. CONFIRMED
 (exhaustive).** `alerts.js`, `syslog.js`, `snmp.js`, `ipam.js` and `wireless.js` each
 link a device address back to its Nodes page. Across the whole of `nodes.js` —
@@ -706,6 +715,19 @@ device yet either.
 
 ### 5.6 Finding things
 
+> **O-1 and O-2 are both fixed in this pass.** Every group now carries its own
+> `try`/`catch`, each commented *"this group's own failure, not every group after it"* —
+> so the comment that described the intended behaviour is finally true. And the search
+> reaches **eight** groups rather than four: MAC addresses, devices, alerts, NetPath
+> destinations, IPAM hosts, IPAM subnets, syslog messages and wireless access points, all
+> through endpoints that already existed. ConfigRX is left as an explicitly marked,
+> deliberately unwired gap rather than a guessed call, pending its own search endpoint.
+> Two queries remain unbuilt and are specified rather than invented: widening the device
+> filter to include `sys_location`, which is free because the Devices group already calls
+> that endpoint, and a cross-device interface search on `alias`/`descr`, which needs a
+> query that does not exist yet. That second one is still the most valuable and the
+> cheapest, and it is why the paragraph below stays in the report.
+
 **O-1 — global search drops every group after the first failure. CONFIRMED (source,
 exhaustive).** `netpath/web/static/app.js:1876-1932`. One `try` wraps all four lookups
 — MAC, devices, alerts, NetPath destinations — and the single `catch` at the end
@@ -738,6 +760,23 @@ What is genuinely absent from the schema, as opposed to merely unsearched, is a
 free-text note per device (`nodesdb.py:84-123` has no `notes`, no serial, no asset
 tag, no criticality). On a plant the note an operator most wants to attach is "do not
 reboot during a run" and there is nowhere to put it.
+
+> **Built in this pass, and not yet reachable — state it precisely rather than as either
+> "missing" or "fixed".** `netpath/configrx_search.py` and `netpath/configrx_compliance.py`
+> now exist and implement close to exactly what this finding recommends: a per-line search
+> index built **only from redacted text, unconditionally**, so there is no permission check
+> in the search path to loosen because there is no unredacted copy to gate; a bounded
+> regular-expression analyser that refuses catastrophic patterns before they run; and named
+> must-match / must-not-match rule sets, scoped to a device group, evaluated after each
+> capture and on an hourly sweep, storing pass/fail per device rather than re-running
+> patterns on every page view.
+>
+> **Neither is wired to a route or a screen.** So the operator-facing conclusion below —
+> that the question cannot be asked — remains true today, and section 6's ranking stands.
+> What has changed is that the work behind it is done rather than absent, and the
+> evidentiary claim in the paragraph below ("grepping `netpath/` returns nothing") is now
+> stale: it describes the product as found at the start of this pass, which is what a
+> finding should do, but a reader running that grep today will get two files.
 
 **O-5 — ConfigRX stores two thousand configurations and gives you no way to ask a
 question of them. CONFIRMED (exhaustive search of `configrx*.py` and the API).**
@@ -914,6 +953,43 @@ in this product**, and it costs a multiplication.
 Everything else in this section is downstream of it. The rollup, the notification digest
 and the topology work can do nothing about an alert that has not been raised yet.
 
+**And `device_down` is not the only rule with a floor nobody multiplies out.** Every rule
+with a persistence requirement was checked against its own cadence:
+
+| Rule family | Persistence | Cadence | Floor |
+| --- | --- | ---: | ---: |
+| `device_down` | 3 consecutive failed polls | 120 s | **6 min** |
+| Ten SNMP/ping thresholds — CPU, memory, disk, the four interface rates, discards, response time | `for_polls` 2 | 120 s | **4 min** |
+| The five new UPS/environmental thresholds — load, ambient, chassis, optic, humidity | `for_polls` 2 | 120 s | **4 min** |
+| `ups_on_battery`, `ups_battery_low`, `ups_battery_replace` | `for_polls` 1 | 120 s | up to **2 min** |
+| **`packet_loss_high`** | `for_seconds` 60 — *not* its `for_polls` 2 | 120 s | **~2 min** |
+| `netpath_unreachable`, `netpath_latency_high` | `for_polls` 3 | 300 s | **15 min** |
+| `netpath_path_unstable` | 5 traces inside a one-hour lookback | 300 s | **25 min** before it can evaluate at all |
+| `dhcp_scope_exhaustion` | `for_polls` 1 | 15 min | up to **15 min** |
+| `interface_flapping` | 3 transitions in a rolling 600 s window | every 5 s tick | **no floor** — three flaps in ten seconds alert in ten seconds |
+| Every event rule — device up, reboot, traps, syslog, wireless | none | — | **no floor** |
+
+Two things in that table are worth an operator's attention beyond the arithmetic.
+
+**`packet_loss_high` is faster than the rules beside it, and you cannot tell from the rules
+table.** Its tuple carries `for_polls = 2` like its neighbours, but it also sets
+`for_seconds = 60`, and `evaluate_threshold` uses only one of the two — so `for_polls` is
+dead code for this rule. Its real floor is one poll interval, about two minutes, not four.
+Reading the tuple alone gets this wrong.
+
+**And `interface_flapping` is not part of this problem at all.** Despite having its own
+window and transition-count settings, it is evaluated every five-second engine tick against
+a rolling lookback of transitions already recorded — so its floor is however long three
+real flaps take, not a fixed delay. Folding it into the same "N × interval" framing would
+be wrong.
+
+The NetPath rules being 15 to 25 minutes is deliberate and the code says so at length: a
+path monitor that cries wolf gets turned off. That is a good decision made explicitly.
+It is still a number an operator should be told rather than left to derive.
+
+One settings-page line per family — each stating what the current configuration means in
+minutes — would close all of this in a single change rather than one per rule.
+
 **O-17 — removing a custom alert rule silently destroys every alert it ever raised,
 including the resolved ones that are the record of past incidents. CONFIRMED.**
 `netpath/alertsdb.py:86` declares `rule_id INTEGER NOT NULL REFERENCES rules(id) ON
@@ -932,6 +1008,20 @@ Either fix is acceptable: refuse to delete a rule that has alerts and offer `ena
 denormalise the rule's name onto the alert and change the constraint to `ON DELETE SET
 NULL`, so the history outlives its rule. At the very least the confirmation must say
 how many alerts will go with it.
+
+> **Fixed in this pass.** Temperature is now three metric keys with three rules:
+> `temp_optic_c` (80/70 °C) where the sensor maps to a port, `temp_ambient_c` (30/25 °C)
+> where it maps to no port *and* the device answers a humidity sensor anywhere — the
+> signal that it is a dedicated environmental monitor, which generalises past one vendor —
+> and `temp_chassis_c` (75/65 °C) for everything else. The default is the safe one: a
+> sensor that cannot be positively identified as environmental stays chassis and never
+> silently becomes ambient, since ambient-by-default is what produced the ten false alarms.
+> Juniper's `jnxOperatingTable` reading lands in `temp_chassis_c` too, guarded so a device
+> answering both mechanisms reports one figure rather than two. And a named migration
+> retires the superseded `temp_high` rule on upgrade — resolving its open alerts with an
+> explanatory note, then disabling and *relabelling* rather than deleting, because the
+> rule row is the alerts table's `ON DELETE CASCADE` parent and deleting it would destroy
+> the history the note exists to preserve.
 
 **O-18 — `temp_high` fired ten times on a twenty-five device fleet, because one metric
 key now means three different things. CONFIRMED (live instance).**
@@ -1214,20 +1304,6 @@ tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previou
 review declined minification (PERF-004) with reasons; this is a different and larger
 lever, and it makes the source no harder to read.
 
-**O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
-Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
-`<script defer>` tags load `app.js` and every module unconditionally. Measured:
-`nodes.js` 264 KB, `app.js` 220 KB, `alerts.js` 90 KB, `app.css` 79 KB, `index.html`
-76 KB, `ipam.js` 61 KB, `netpath.js` 60 KB, `configrx.js` 55 KB — **1.17 MB
-uncompressed**, roughly 324 KB gzipped, on every load.
-
-`defer` means this is not a rendering stall; it is bandwidth, parse time and memory,
-for eleven modules the operator may never open, and it is most visible where it is
-least affordable — a tablet on plant Wi-Fi. The fix is contained because the structure
-is already right: `selectTab` exists, each module has its own `init()`, and the assets
-are already versioned and immutably cached. Load a module's script the first time its
-tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previous
-review declined minification (PERF-004) with reasons; this is a different and larger
 lever, and it makes the source no harder to read.
 
 ### 5.11 Security and permissions
@@ -1487,6 +1563,14 @@ competitor's brochure lists it. Several things a brochure would make much of —
 NETCONF, RESTCONF — sit near the bottom, because a plant with 2,000 endpoints and one
 network engineer does not use them.
 
+**Before any of it: two settings to change on day one.** Not an absence and not a defect,
+which is why it sits above the list rather than in it. `poll_interval_s` at 120 seconds
+and `down_after_failures` at 3 multiply to a six-minute detection floor, and an outage
+shorter than three poll cycles is never reported at all. Nothing in the product states
+that product. Whatever else is decided, an operator adopting this should set those two
+deliberately, in the knowledge of what they multiply to, on the first day — and section
+5.7 argues the product should tell them rather than making them work it out.
+
 **Would stop me adopting it**
 
 1. **No reporting.** Section 5.7 / O-12. I am asked for availability and utilisation
@@ -1505,8 +1589,11 @@ network engineer does not use them.
    than it needs to be because of it.
 6. **Discovery cannot follow the topology it has already collected, and never runs on
    a schedule.** O-14. New equipment is invisible until somebody remembers to sweep.
-7. **Search reaches four of twelve modules, and not interface aliases or stored
-   configurations.** O-1, O-2, O-3.
+7. **Search still cannot reach an interface alias or a stored configuration.** O-3, and
+   the unbuilt half of O-2. The rest of O-1 and O-2 is fixed in this pass — the search now
+   covers eight groups rather than four and no longer drops every group after a failure —
+   but `ifAlias`, the description an engineer typed on the port itself, remains polled,
+   stored and unsearchable, and that is the one this operator would use daily.
 8. **The audit trail cannot be read and does not cover engineering changes.** O-10,
    O-11 — and on a site under an ISO or food-safety regime this moves up two
    categories.

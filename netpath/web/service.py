@@ -342,8 +342,8 @@ class Service:
             self.ipam.shutdown()
             # Alerts reads Nodes' own data, so stop the reader before the writer.
             self.alert_engine.stop()
-            self.node_poller.stop()
-            self.wireless.stop()
+            self.node_poller.shutdown()   # waits briefly for running polls to land
+            self.wireless.shutdown()      # waits briefly for a running poll to land
             self.configrx.stop()
             self.db.close()
             self.flow_db.close()

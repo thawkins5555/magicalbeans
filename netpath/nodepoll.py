@@ -1305,11 +1305,36 @@ class NodePoller:
             config = self.db.effective_config(device)
             self._bump("polls")
             self._poll_device(device, config)
-        except Exception:
+        except Exception as exc:
             self._bump("errors")
-            self.log.add(ERROR, f"Node poll worker error for device #{device_id}",
-                         detail=traceback.format_exc())
-            traceback.print_exc()
+            # Same two non-bug shapes as Monitor._run_one (netpath/
+            # monitor.py), the poller's own worst case rather than a
+            # trace's: "Cannot operate on a closed database" while _stop is
+            # set means this poll ran past shutdown()'s drain window
+            # (bounded by _inflight_budget_s, not unlimited) and the
+            # database closed under it. A foreign key failure with the
+            # device now gone means it was deleted mid-poll — an ordinary
+            # operator action, not a bug. Neither gets the traceback below,
+            # which would read exactly like a crash in a log an operator
+            # checks right after a stop or a delete. The same exceptions
+            # for any OTHER reason are still a real bug and still get the
+            # full treatment.
+            device_gone = False
+            if isinstance(exc, sqlite3.IntegrityError):
+                try:
+                    device_gone = self.db.device(device_id) is None
+                except Exception:
+                    pass  # can't tell any more; falls through to the loud path
+            if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
+                self.log.add(NODES, f"Poll of device #{device_id} finished after "
+                                    f"the poller stopped; its result was not saved")
+            elif device_gone:
+                self.log.add(NODES, f"Device #{device_id} was deleted while its "
+                                    f"poll was running; the result was not saved")
+            else:
+                self.log.add(ERROR, f"Node poll worker error for device #{device_id}",
+                             detail=traceback.format_exc())
+                traceback.print_exc()
         finally:
             with self._lock:
                 self._started.pop(device_id, None)

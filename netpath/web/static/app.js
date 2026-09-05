@@ -1107,14 +1107,29 @@ const App = (() => {
     return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
+  // Built once, reused for every call rather than reconstructed by each one:
+  // `date.toLocaleDateString(locale, options)` builds a fresh Intl.DateTimeFormat
+  // internally every time it runs, options object and all, which a formatter
+  // called once per row across a few thousand rows turns into a few thousand
+  // formatter builds for what is, every time, one of exactly two formats.
+  // Found profiling the Debug page's event log (up to 2,000 rows, uncapped
+  // on its first render): dateShort was the single hottest JS-level function
+  // in that page's 200ms-plus long task, ahead of the row-building code that
+  // calls it, because timeCell()'s tooltip title (via when(), below) calls it
+  // for every row regardless of whether the row's own visible text needs a
+  // date at all. Same output either way — .format() is what
+  // toLocaleDateString already calls, just without rebuilding the formatter
+  // first.
+  const DATE_SHORT_FMT = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+  const DATE_SHORT_FMT_YEAR = new Intl.DateTimeFormat(undefined,
+    { month: 'short', day: 'numeric', year: 'numeric' });
+
   function stamp(ts, span) {
     const d = new Date(ts * 1000);
     const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
     if (span !== undefined && span < 3600) return `${time}:${pad(d.getSeconds())}`;
-    if (span !== undefined && span > 604800) {
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    }
-    return `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`;
+    if (span !== undefined && span > 604800) return DATE_SHORT_FMT.format(d);
+    return `${DATE_SHORT_FMT.format(d)} ${time}`;
   }
 
   function span(seconds) {
@@ -1154,9 +1169,7 @@ const App = (() => {
   }
 
   function dateShort(d, now = new Date()) {
-    const options = { month: 'short', day: 'numeric' };
-    if (d.getFullYear() !== now.getFullYear()) options.year = 'numeric';
-    return d.toLocaleDateString(undefined, options);
+    return (d.getFullYear() !== now.getFullYear() ? DATE_SHORT_FMT_YEAR : DATE_SHORT_FMT).format(d);
   }
 
   function when(ts, empty = 'never') {

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import random
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -81,12 +82,55 @@ class WirelessPoller:
         self._thread.start()
 
     def stop(self) -> None:
+        """Fast: cancels queued work and returns without waiting for a poll
+        already running to finish. Used for a hot restart (start() calls
+        this first) and for an operator disabling wireless polling from
+        Settings on an HTTP thread — shutdown() below is the version that
+        waits, the same split netpath/nodepoll.py's NodePoller makes."""
         self._stop.set()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
+
+    def _inflight_ids(self) -> set[int]:
+        with self._lock:
+            return set(self._queued)
+
+    def drain(self, timeout_s: float) -> bool:
+        """Wait for in-flight polls to finish. True if they all did."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if not self._inflight_ids():
+                return True
+            time.sleep(0.05)
+        return not self._inflight_ids()
+
+    # _poll_controller's own bound is PING_BUDGET_S for the per-AP sweep
+    # (unconditional) plus one worst-case SNMP failure: a controller that
+    # is not answering fails its very first GETNEXT and _poll_controller
+    # returns right there (the walks all share one outer try/except), so a
+    # dead controller costs one timeout×(retries+1), not ten. What this
+    # does NOT model is a large, healthy controller's successful walk time
+    # across many APs — that is not bounded by a timeout at all, since
+    # nothing is failing, and _run_one's guard below is the backstop for
+    # whatever this approximation misses, the same as it is for a very-
+    # high-port-count device in netpath/nodepoll.py.
+    _SNMP_FAILURE_BUDGET_S = 3.0 * (2 + 1)   # matches _walk_column's _Session(..., 3.0, 2)
+
+    def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
+        if not self._inflight_ids():
+            return 0.0
+        return min(PING_BUDGET_S + self._SNMP_FAILURE_BUDGET_S, ceiling_s)
+
+    def shutdown(self, drain_s: float = 0.0) -> None:
+        """Same as stop(), but waits for whatever was already running to
+        finish (or hit its own worst-case budget) before returning, so the
+        database Service.shutdown() closes right after this is not closed
+        under a poll still writing its result."""
+        self.stop()
+        self.drain(max(drain_s, self._inflight_budget_s()))
 
     def status_text(self) -> str:
         if self.error:
@@ -136,11 +180,37 @@ class WirelessPoller:
             self._bump("polls")
             self._poll_controller(controller)
             self._bump("ok")
-        except Exception:
+        except Exception as exc:
             self._bump("errors")
-            traceback.print_exc()
-            self.log.add(ERROR, f"Wireless poll of controller {controller_id} failed",
-                        detail=traceback.format_exc())
+            # Same two non-bug shapes as NodePoller._run_one (netpath/
+            # nodepoll.py) and Monitor._run_one (netpath/monitor.py):
+            # "Cannot operate on a closed database" while _stop is set
+            # means this poll ran past shutdown()'s drain window (bounded
+            # by _inflight_budget_s, not unlimited); a foreign key failure
+            # with the controller now gone means it was deleted mid-poll,
+            # an ordinary operator action. Neither is a bug, so neither
+            # gets the traceback below, which would read exactly like a
+            # crash in a log an operator checks right after a stop or a
+            # delete. The same exceptions for any OTHER reason still get
+            # the full treatment.
+            controller_gone = False
+            if isinstance(exc, sqlite3.IntegrityError):
+                try:
+                    controller_gone = self.db.controller(controller_id) is None
+                except Exception:
+                    pass  # can't tell any more; falls through to the loud path
+            if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
+                self.log.add(WIRELESS, f"Poll of controller {controller_id} finished "
+                                       f"after the poller stopped; its result was "
+                                       f"not saved")
+            elif controller_gone:
+                self.log.add(WIRELESS, f"Controller {controller_id} was deleted "
+                                       f"while its poll was running; the result "
+                                       f"was not saved")
+            else:
+                traceback.print_exc()
+                self.log.add(ERROR, f"Wireless poll of controller {controller_id} failed",
+                            detail=traceback.format_exc())
         finally:
             with self._lock:
                 self._queued.discard(controller_id)
