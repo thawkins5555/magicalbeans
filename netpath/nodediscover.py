@@ -126,15 +126,35 @@ class DiscoveryJob:
             # unwind, just record why.
             self.db.update_discovery_job(self.job_id, state="error",
                                          error=str(exc), finished_ts=time.time())
-        except Exception:
+        except Exception as exc:
+            # "Cannot operate on a closed database" while _stop is set (job
+            # was cancel()led by NodePoller.stop()/shutdown()) means this
+            # job ran past shutdown()'s drain window (bounded by
+            # NodePoller._discovery_budget_s, not unlimited) and the
+            # database closed under it -- an accepted, bounded consequence
+            # of stopping promptly, not a bug. It does not get the
+            # traceback below, which would read exactly like a crash in a
+            # log an operator checks right after a service stop, and it
+            # does not attempt the update_discovery_job call below either,
+            # which would raise the identical way. The same exception for
+            # any OTHER reason, or NOT during a stop, is still a real bug
+            # and still gets the full treatment.
+            if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
+                self.log.add(NODES, f"Discovery job #{self.job_id} stopped "
+                                    f"when the service shut down; its state "
+                                    f"was not saved")
+                return
             # A discovery thread must never die quietly, mirroring the
             # same discipline NodePoller._run_one uses for poll workers.
             self.log.add(ERROR, f"Discovery job #{self.job_id} failed",
                          detail=traceback.format_exc())
             traceback.print_exc()
-            self.db.update_discovery_job(
-                self.job_id, state="error",
-                error="internal error — see the event log", finished_ts=time.time())
+            try:
+                self.db.update_discovery_job(
+                    self.job_id, state="error",
+                    error="internal error — see the event log", finished_ts=time.time())
+            except Exception:
+                pass  # best-effort; the failure itself is already logged above
 
     def _run(self) -> None:
         max_addresses = int(self.settings.get("max_scan_addresses", 1024))

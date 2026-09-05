@@ -366,6 +366,37 @@ def _first_address(text: str) -> str | None:
     return None
 
 
+# A second instance of the shape a downstream review's poll_interval_s x
+# down_after_failures finding already named: three fields, each bounded and
+# each individually justified against its OWN mechanism --
+# db.py's MAX_MAX_HOPS (255, the physical TTL byte), MAX_PROBES (20, just
+# above Linux traceroute's own 16-way parallelism cap) and MAX_TIMEOUT_S
+# (30s, a sane per-probe ceiling) -- multiply together below with nothing
+# ever checking the PRODUCT. On Windows (parallel=1, since
+# _SUPPORTS_PARALLEL is Linux-only) the three individually-sane maxima
+# compute 255 * 20 * 30 + 15 = 153,015s: 42.5 hours a single target, set to
+# nothing an attacker needed to choose deliberately -- a fat-fingered "make
+# it thorough" reaches the same three fields -- can occupy one of, at most,
+# trace_workers (bounded to 64) worker slots for. That defeats the reason
+# interval_s itself is bounded (db.py's MIN_INTERVAL_S/MAX_INTERVAL_S): a
+# target does not need to reschedule constantly if one run of it can hold
+# a worker for a day and a half.
+#
+# Capped here, on the computed value, rather than by retightening any one
+# of the three inputs: db.py's MIN_*/MAX_* constants are imported directly
+# by the API route's own validation now, so tightening one is a two-file,
+# coordinated decision -- and a ceiling on the product survives a fourth
+# field joining this formula later the same way max_hops/probes/timeout_s
+# joined it without anyone computing what they multiply to. 600s (10
+# minutes) is well past what a trace against a real, live network ever
+# needs: the ordinary case (30 hops, 3 probes, a 2s timeout) computes to
+# under 200s on Windows and under 30s on Linux, so the ceiling only ever
+# binds a combination nobody is actually waiting on the result of, and it
+# keeps a stuck worker's damage bounded to about two default scheduling
+# intervals (300s each) rather than days.
+MAX_EXPECTED_BUDGET_S = 600.0
+
+
 def expected_budget(max_hops: int, probes: int, timeout_s: float = 2.0,
                     parallel: int | None = None) -> float:
     """Worst-case run time for a trace, used to kill it and to flag a slow one.
@@ -379,11 +410,14 @@ def expected_budget(max_hops: int, probes: int, timeout_s: float = 2.0,
     the arithmetic claimed. Being 16x too generous is not harmless — a
     genuinely hung binary held a worker for the whole of it — and it made the
     documented remedy, lowering the hop count, buy far less than stated.
+
+    Capped at MAX_EXPECTED_BUDGET_S — see the comment above this function for
+    why a per-field bound was not enough on its own.
     """
     if parallel is None:
         parallel = PROBE_PARALLELISM if _SUPPORTS_PARALLEL else 1
     rounds = math.ceil(max_hops / max(1, parallel))
-    return rounds * probes * timeout_s + 15
+    return min(rounds * probes * timeout_s + 15, MAX_EXPECTED_BUDGET_S)
 
 
 def _run(command: list[str], budget: float):

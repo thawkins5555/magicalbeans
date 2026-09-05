@@ -1286,6 +1286,38 @@ of times a second, comfortably inside one batch. **So the feature whose entire p
 to stop a storm becoming N rows is weakest at exactly the storm rate that matters, and
 strongest at the slow repetition that would not have hurt anyway.**
 
+#### What configuring the topology is actually worth
+
+The same scripted incident — one core switch plus the Site-A access layer, 108 devices —
+run three times at 250 devices:
+
+| Run | Configuration | Alerts opened | Emails |
+| --- | --- | ---: | ---: |
+| Tier A | un-chained, no `upstream_id` set anywhere | 228 | 11 |
+| Tier T | chained, pre-fix code | 124 | 11 |
+| Tier T2 | chained, current code | 139 | 14 |
+
+**Configuring the topology roughly halves the alert count.** That is real and worth
+having, and it is nothing like the single alert the mechanism is designed to produce.
+
+Two things to read out of it. The 124-versus-139 spread between two runs of *identical*
+code and configuration is poll-cycle timing noise — so at this fleet size a single run's
+alert count is not reproducible to better than about ten per cent, and no figure in this
+section should be quoted to three digits.
+
+And the reason it is not one alert is **O-52, not the rollup.** Suppression can only act
+on a child alert raised *while its parent's alert is open*, and the six-minute detection
+floor means most downstream devices are not noticed down until the outage is already over
+— at which point there is no parent left to roll into. Measured directly on the first run:
+81 of 83 non-core alerts opened at the instant the core's own alert *resolved*, within
+0.1 seconds of it.
+
+**The rollup works. It is starved of anything to work on.** So the honest statement of
+what the topology feature is worth is: it halves the noise today, and it would collapse a
+site outage to one alert if devices were detected down promptly. The upstream-suggestion
+work built in this pass makes the topology reachable at all; the detection floor decides
+how much good that does.
+
 ⏳ Tier B (1,000) and Tier C (2,000) land here.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
