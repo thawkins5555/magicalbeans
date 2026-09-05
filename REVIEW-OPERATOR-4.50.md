@@ -3013,3 +3013,57 @@ added, at the end of section 7.
 collector counters, the API response times and payload sizes, the per-device metric
 tables that establish what a UPS, a Room Alert, a printer and a Windows host actually
 report, and the 108-of-108 measurement of child alerts opening before their parent.
+
+---
+
+## 10. The review that refused this branch
+
+Everything above was measured against a build that a final read-only review then
+declared **not fit to merge**. It is recorded here because a document whose value rests
+on being candid about its own mistakes does not get to stop at the flattering ones — and
+because the most important finding is one that no test in this repository could have
+caught, which is itself the lesson.
+
+**A size-cap trim was deleting traces inside the retention window. CONFIRMED, measured.**
+Making the age prune automatic — a fix made *in this pass*, to close the finding that
+retention in days had never been enforced at all — put `prune()` and `trim_to_size()` on
+the same maintenance pass. `prune()` shared one 30-second deadline between deleting and
+reclaiming, so when the deletes spent the budget nothing was reclaimed and the freed
+pages stayed on the freelist; `trim_to_size()` then sized the database from the *file*,
+counting those free pages and the WAL as though they were rows, and deleted before it
+reclaimed. On a synthetic 1.1 GB database: after two prune passes the file was 508 MB
+with 93,051 free pages, and the trim removed **98,999 of 449,996 in-retention traces**,
+22% of exactly the data the retention setting exists to protect. Fully reclaimed, the
+live data was 99 MB against a 406 MB cap — the correct number to delete was zero. It
+logged as the ordinary "Trace database over its cap: removed N oldest traces."
+
+That is worth dwelling on. The fix for a real finding created a worse one, in the same
+file, on the same pass, and every gate stayed green: 79 of 79 suites and 59 of 59 browser
+checks. **No test in this repository builds a gigabyte-scale database with an unreclaimed
+freelist**, so nothing in it could see the defect. Neither could the operator, until the
+traces were gone.
+
+Two smaller findings came with it. Saving any global setting could block the request for
+thirty seconds, because maintenance runs synchronously on the thread that saved it — new
+in this pass for the same reason. And a read-only account could read compliance rule
+patterns while being refused unredacted backup content, which matters because the
+Add-rule dialog explicitly invites a pattern to carry a secret's real value: a viewer who
+could not read a community string from a backup could read it from the rule written to
+find it.
+
+**And the fix for that third finding introduced a 500 of its own** — a new
+`_rule_json(row, reveal)` shadowing the alert-rule `_rule_json(row)` further up the same
+module, so `/api/alerts/rules` raised a TypeError and a fresh install could not seed. The
+unit suite was green. What caught it was restarting and re-seeding a real instance.
+
+All three findings and the regression are fixed, and the gates were re-run from a clean
+restart: **80 of 80 suites, 59 of 59 browser checks with no console error, page error or
+refused request on either account, 27 of 27 navigation-bar combinations, and the
+pristine-install password prompt.** What the review also found clean is worth stating
+because it was the part most likely to be wrong: all fourteen newly-reachable routes gate
+correctly, every write control renders disabled with its reason for a read-only account
+rather than hidden, the widened device search introduced no index that could go stale,
+and the search index's redacted-only invariant survived being moved.
+
+The honest summary of section 10 is that this release's own fixes produced its two worst
+defects, and that reading the diff at scale found what running the tests could not.
