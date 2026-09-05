@@ -2599,6 +2599,18 @@ const App = (() => {
      table, and a stale value is discarded by the guards at the point of use. */
   let pendingRowFocus = -1;
 
+  /* drawRows' own row cache, one Map per distinct column set (see below).
+     Module-level rather than per-call: every caller hands drawRows a fresh,
+     empty <tbody> each time it draws (the existing one is already gone by
+     then — grid() above removes it as soon as the head is unchanged), so
+     there is no prior DOM state in that argument for drawRows to diff
+     against. The column-key set is the closest thing to a stable table
+     identity drawRows ever sees, and in practice one table's columns are
+     never another table's — the app's dozen column lists share no key set
+     with each other, not even the two shaped alike (SNMP traps and Syslog
+     both start ts/severity/source and diverge from there). */
+  const rowDrawCaches = new Map();
+
   const COLUMN_KEY = 'sappiwhere.columns';
 
   function loadColumns() {
@@ -3329,25 +3341,64 @@ const App = (() => {
      rows when there are none (see emptyRow) — every table gets the plumbing
      for free; the sentence is still the caller's to write. */
   function drawRows(tbody, rows, columns, onRow, emptyMessage) {
+    const columnsKey = columns.map((c) => c.key).join(',');
     if (!rows.length && emptyMessage) {
+      // Nothing left to key against; drop the bucket rather than hold rows
+      // that no longer exist until the same column set happens to return.
+      rowDrawCaches.delete(columnsKey);
       emptyRow(tbody, columns, emptyMessage);
       return tbody;
     }
-    // Built into a fragment and attached once: a tbody that is already in
-    // the document would otherwise lay out after each of 300 appends.
+    // A Nodes-sized refresh (61 rows) measured 154ms median of main thread
+    // here, on a full teardown and rebuild every poll whether or not
+    // anything had changed — the cost is building each cell's HTML fresh
+    // and throwing the old <tr> away, not the DOM insertion itself (a
+    // reorder-only redraw, as a column sort is, cost 23ms for the same
+    // table). Rows are now keyed by id: an unchanged row's <tr> is reused
+    // outright, and a changed row only has the cells whose text actually
+    // differs touched. The caller's own <tbody> is still built fresh every
+    // call — that part of the contract has not changed, and is what keeps
+    // this a drop-in replacement for the nine call sites elsewhere that a
+    // different worker owns this pass.
+    let cache = rowDrawCaches.get(columnsKey);
+    if (!cache) rowDrawCaches.set(columnsKey, cache = new Map());
+    const seen = new Set();
     const fragment = document.createDocumentFragment();
     for (const row of rows) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = columns.map((c) => {
-        if (c.cell) return `<td class="${cellClass(c)}">${c.cell(row)}</td>`;
+      const id = row.id;
+      const cellHtml = columns.map((c) => {
+        if (c.cell) return c.cell(row);
         const raw = row[c.key];
         const blank = raw === null || raw === undefined || raw === '';
-        return `<td class="${cellClass(c)}">` +
-          `${blank ? '\u2014' : escapeHtml(raw)}</td>`;
-      }).join('');
+        return blank ? '—' : escapeHtml(raw);
+      });
+      const cached = id !== undefined && cache.get(id);
+      let tr;
+      if (cached) {
+        tr = cached.tr;
+        for (let i = 0; i < cellHtml.length; i++) {
+          if (cached.cells[i] !== cellHtml[i]) {
+            tr.children[i].innerHTML = cellHtml[i];
+            cached.cells[i] = cellHtml[i];
+          }
+        }
+      } else {
+        tr = document.createElement('tr');
+        tr.innerHTML = columns.map((c, i) =>
+          `<td class="${cellClass(c)}">${cellHtml[i]}</td>`).join('');
+        if (id !== undefined) cache.set(id, { tr, cells: cellHtml });
+      }
+      // Re-run on every row regardless of whether its cells changed: this is
+      // where a caller sets the row's class (selection, bulk-check), its
+      // click handlers and anything else closed over the current view state,
+      // none of which drawRows itself can know is still correct.
       if (onRow) onRow(tr, row);
+      if (id !== undefined) seen.add(id);
       fragment.appendChild(tr);
     }
+    // Rows dropped from the list (filtered out, deleted) stop being cached,
+    // or the cache would grow by one entry per id this table has ever shown.
+    if (seen.size) for (const id of cache.keys()) if (!seen.has(id)) cache.delete(id);
     tbody.appendChild(fragment);
     wireRowKeyboard(tbody);
     return tbody;

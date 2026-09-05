@@ -198,12 +198,32 @@
   --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
 
+  /* ------------------------------------------------------------- spacing
+     Four steps, each a multiple of 4. Measured over every rendered element
+     there were 20 distinct padding/margin values and 8 distinct gaps with
+     no relationship between them — a control's padding, a dialog's margin
+     and a row's gap each picked their own number. Not everything in the
+     interface is one of these four: a hairline offset, an icon's own
+     dimensions and a handful of genuinely different gaps stay their own
+     numbers, but a control now reaches for one of these first. */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+
   /* --------------------------------------------------------- shape, depth
      Three radii: a control, a panel, a dialog. One shadow, for the things
      that float — a dialog, a toast, the sign-in card. */
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
+  /* A fully rounded end whatever the element's own height — the badge, a
+     meter's fill, a divider's cap, the scrollbar thumb. Each of those used
+     to tune its own radius to half its own height by hand and the four
+     shapes had drifted to four different pixel values (2, 3, 5, 9px); a
+     radius past half the box's shorter side is capped there by the
+     browser, so one large value is a pill on all of them. */
+  --radius-pill: 999px;
   /* Two shadows and one scrim. --shadow-pop lifts a dialog or the sign-in
      card off the page; --shadow-float is the lighter lift for a toast, a
      banner or a tooltip. The scrim is what dims the page behind a dialog.

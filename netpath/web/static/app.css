@@ -57,7 +57,7 @@ body {
   background: var(--raised);
   color: var(--text);
   border: 1px solid var(--accent);
-  padding: 8px 14px;
+  padding: var(--space-sm) 14px;
   font: 600 var(--fs-xs)/1 var(--ui);
   text-decoration: none;
 }
@@ -100,7 +100,7 @@ body {
    are made of them, and in kiosk mode the Nodes and Alerts strips render
    their counters as a row of them (App.figures). One component, so a wall
    display and the Dashboard are not two designs of the same thing. */
-.figures { display: flex; flex-wrap: wrap; gap: 16px; }
+.figures { display: flex; flex-wrap: wrap; gap: var(--space-lg); }
 .figure {
   display: flex;
   flex-direction: column;
@@ -132,9 +132,9 @@ a.figure:focus-visible .figure-value { text-decoration: underline; }
      every Storage headroom row with a bar showed a size and no name. */
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 2px 8px;
-  padding: 3px 4px;
-  border-radius: 3px;
+  gap: 2px var(--space-sm);
+  padding: 3px var(--space-xs);
+  border-radius: var(--radius-sm);
   text-decoration: none;
   color: var(--text);
 }
@@ -155,7 +155,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
      the same invisible track the Settings meter had, rebuilt here while
      that one was being fixed. */
   background: var(--data-neutral);
-  border-radius: 2px;
+  border-radius: var(--radius-pill);
   overflow: hidden;
 }
 .dash-bar-fill { display: block; height: 100%; background: var(--ok); }
@@ -170,9 +170,9 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-sm);
   margin: 0 10px 0 0;
-  padding: 0 12px 0 0;
+  padding: 0 var(--space-md) 0 0;
   border-right: 1px solid var(--hairline);
   font: 600 var(--fs-sm)/1 var(--ui);
   letter-spacing: var(--track-tab);
@@ -180,7 +180,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   text-transform: none;
   white-space: nowrap;
 }
-.brand a { display: inline-flex; align-items: center; gap: 8px; color: inherit; text-decoration: none; }
+.brand a { display: inline-flex; align-items: center; gap: var(--space-sm); color: inherit; text-decoration: none; }
 .brand .mark { width: 18px; height: 18px; flex: none; }
 .brand .mark-route { fill: none; stroke: var(--accent); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
 .brand .mark-start { fill: var(--accent); }
@@ -212,7 +212,7 @@ body.tiny .brand span { display: none; }
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 0 4px 0 12px;
+  padding: 0 var(--space-xs) 0 var(--space-md);
   flex: 1 1 auto;
   min-width: 0;
   position: relative;
@@ -254,7 +254,7 @@ body.tiny .brand span { display: none; }
    a fieldset's legend already use. */
 .tab-group::before {
   content: attr(data-label);
-  padding: 0 8px 0 12px;
+  padding: 0 var(--space-sm) 0 var(--space-md);
   border-left: 1px solid var(--hairline);
   white-space: nowrap;
 }
@@ -264,7 +264,7 @@ body.tiny .brand span { display: none; }
   align-items: center;
   gap: 10px;
   flex: none;
-  padding: 0 12px;
+  padding: 0 var(--space-md);
   border-left: 1px solid var(--hairline);
 }
 .tab {
@@ -272,7 +272,7 @@ body.tiny .brand span { display: none; }
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--muted);
-  padding: 10px 22px;
+  padding: 10px var(--space-lg);
   font: 600 var(--fs-xs)/1 var(--ui);
   letter-spacing: var(--track-tab);
   cursor: pointer;
@@ -290,7 +290,7 @@ body.tiny .brand span { display: none; }
 /* 44px of padding per tab across twelve tabs is 528px on its own. Below
    1500px there is no longer room to spend that freely. */
 @media (max-width: 1500px) {
-  .tab { padding: 10px 12px; }
+  .tab { padding: 10px var(--space-md); }
 }
 
 /* Sub-navigation inside a single tab (IPAM's Subnets / Conflicts / DHCP),
@@ -301,7 +301,7 @@ body.tiny .brand span { display: none; }
   gap: 2px;
   background: var(--raised);
   border-bottom: 1px solid var(--hairline);
-  padding: 0 12px;
+  padding: 0 var(--space-md);
   flex: none;
 }
 .subtab {
@@ -309,7 +309,7 @@ body.tiny .brand span { display: none; }
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--muted);
-  padding: 8px 16px;
+  padding: var(--space-sm) var(--space-lg);
   font: 600 var(--fs-2xs)/1 var(--ui);
   letter-spacing: var(--track-tab);
   cursor: pointer;
@@ -337,7 +337,7 @@ body.tiny .brand span { display: none; }
   width: fit-content;
 }
 .subtabs.nested .subtab {
-  padding: 5px 12px;
+  padding: var(--space-xs) var(--space-md);
   border: none;
   border-radius: calc(var(--radius-sm) - 1px);
 }
@@ -391,8 +391,8 @@ body.tiny .brand span { display: none; }
 .badge {
   background: var(--warn);
   color: var(--bg);
-  border-radius: 9px;
-  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  padding: 1px var(--space-sm);
   font: 700 var(--fs-2xs)/1.4 var(--ui);
 }
 /* A count on its own only ever said "there are some". These say how bad the
@@ -405,7 +405,7 @@ body.tiny .brand span { display: none; }
 .badge.sev-fail { background: var(--fail); color: var(--bg); }
 .badge.sev-warn { background: var(--warn); color: var(--bg); }
 .badge.sev-info { background: var(--accent); color: var(--bg); }
-.conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: 4px; }
+.conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
 /* WEB, beside SSH on the device pane, is a real link — it opens the device's
    own web interface in a tab — so it is an <a>, and this rule has to reach it
@@ -415,7 +415,7 @@ button.linkish, a.linkish {
   border: none;
   color: var(--muted);
   font-size: var(--fs-xs);
-  padding: 2px 8px;
+  padding: 2px var(--space-sm);
   cursor: pointer;
   text-decoration: none;
 }
@@ -443,7 +443,7 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
   border: 1px solid var(--fail);
   border-left: 4px solid var(--fail);
   color: var(--text);
-  padding: 9px 16px;
+  padding: var(--space-sm) var(--space-lg);
   font: 600 var(--fs-xs)/1.4 var(--ui);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-float);
@@ -476,12 +476,15 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
 html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }
 
 /* --------------------------------------------------------------- widgets */
+/* Vertical padding matches input/select/textarea's below (--space-xs) —
+   it was 5px, a pixel more than theirs, which put a button a pixel taller
+   than the field beside it in every bar that mixes the two. */
 button {
   background: var(--raised);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   color: var(--text);
-  padding: 5px 12px;
+  padding: var(--space-xs) var(--space-md);
   font: var(--fs-sm) var(--ui);
   cursor: pointer;
 }
@@ -536,9 +539,9 @@ button.danger:disabled:hover { background: var(--grid); filter: none; }
    gutter a .bar has. Settings' notes land inside .scroll instead, which
    already insets everything else there 16px; matching that padding on top
    would double the indent, so they get none of their own. */
-.write-denied-why { margin: 6px 0 0; padding: 0 12px; }
+.write-denied-why { margin: 6px 0 0; padding: 0 var(--space-md); }
 #page-settings .scroll > .write-denied-why { padding: 0; }
-button.icon { width: 32px; padding: 5px 0; text-align: center; }
+button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
 /* A module's Settings button is an ordinary secondary button. It used to
    be an accent outline that inverted to a solid accent fill on hover — the
    resting appearance of an outline primary — sitting at the far end of the
@@ -551,7 +554,7 @@ input, select, textarea {
   border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   color: var(--text);
-  padding: 4px 8px;
+  padding: var(--space-xs) var(--space-sm);
   font: var(--fs-sm) var(--ui);
 }
 /* Focus you can see. This rule used to say `outline: none` and replace the
@@ -571,6 +574,24 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
    and on a full-bleed pane it would fall outside the scroll box entirely. */
 tr:focus-visible, td:focus-visible, .table-wrap:focus-visible { outline-offset: -2px; }
 
+/* Buttons, tabs, subtabs and rows changed background, border and text
+   colour with no transition at all. This waited on the redraw-churn fixes
+   elsewhere in this pass: a value reassigned mid-flight cancels a
+   transition partway through, and these elements used to be rewritten far
+   more often than their own state actually changed. Colour properties
+   only, never a layout property, and only for a viewer who has not asked
+   to avoid motion. */
+@media (prefers-reduced-motion: no-preference) {
+  button, .tab, .subtab, th.sortable, .target-list li, a.dash-row, a.dash-sev-row,
+  a.figure, button.linkish, a.linkish, .help-link, .gsearch-hit, td {
+    transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  }
+}
+
+/* An unstyled <code> brings a third font family into the interface at the
+   user agent's default size — every column name, OID and URL quoted in a
+   Settings hint did this. Same treatment ssh.css already gives kbd. */
+code { font: inherit; font-family: var(--mono); color: var(--text); }
 input[readonly] { color: var(--muted); }
 label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
 label.check { cursor: pointer; }
@@ -589,8 +610,8 @@ p.hint, .help-body p { max-width: 68ch; }
    from a hint, so it is not carried along by whatever .hint becomes next. */
 .ip-line { color: var(--muted); font-size: var(--fs-xs); font-family: var(--mono); }
 .ip-line .muted-tag { font-family: var(--ui); }
-.hint.pad { padding: 2px 12px 6px; margin: 0; }
-.terms { font-family: var(--mono); padding: 0 12px 6px; }
+.hint.pad { padding: 2px var(--space-md) 6px; margin: 0; }
+.terms { font-family: var(--mono); padding: 0 var(--space-md) 6px; }
 .terms b { color: var(--muted); font-weight: 600; }
 body.tiny .terms { display: none; }
 .stat { font-family: var(--mono); font-size: var(--fs-xs); white-space: pre; }
@@ -600,8 +621,8 @@ body.tiny .terms { display: none; }
 .bar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
   flex: none;
 }
 .bar.wrap { flex-wrap: wrap; }
@@ -663,12 +684,12 @@ body.tiny .terms { display: none; }
 .panel.tone-warn, .tone-warn { border-color: var(--warn); }
 .panel.tone-fail, .tone-fail, .tone-bad { border-color: var(--fail); }
 
-.card { padding: 10px 12px; }
+.card { padding: 10px var(--space-md); }
 .card.strip {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 10px 12px 4px;
+  gap: var(--space-md);
+  margin: 10px var(--space-md) var(--space-xs);
   flex: none;
 }
 /* A flex item's default min-width is auto, and .stat sets white-space: pre, so
@@ -708,7 +729,7 @@ body.tiny .terms { display: none; }
   color: var(--text);
   letter-spacing: 0;
   text-transform: none;   /* #nd-d-name also carries .section; a device name is not an eyebrow */
-  margin: 0 0 8px;
+  margin: 0 0 var(--space-sm);
 }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
 
@@ -735,17 +756,17 @@ body.tiny .terms { display: none; }
 .sidebar {
   width: 290px;
   flex: none;
-  padding: 12px;
+  padding: var(--space-md);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-sm);
   overflow: auto;
 }
 .sidebar h2 { margin: 0; }
 .target-list {
   list-style: none;
   margin: 0;
-  padding: 4px;
+  padding: var(--space-xs);
   /* Was flex: 1, which stretched an empty or short list to fill the whole
      sidebar, pushing Add/Edit/Remove ~400px below the destinations they
      act on. flex-basis: auto sizes the list to its own rows instead; a
@@ -759,8 +780,8 @@ body.tiny .terms { display: none; }
 .target-list li {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
+  gap: var(--space-sm);
+  padding: 6px var(--space-sm);
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   cursor: pointer;
@@ -797,12 +818,12 @@ body.tiny .terms { display: none; }
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 12px 14px;
+  padding: var(--space-md) 14px;
   margin-bottom: 10px;
   flex: none;
 }
 .subnet-detail-title { margin-bottom: 6px; }
-.subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-xs); margin-bottom: 4px; }
+.subnet-detail-rows { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-xs); margin-bottom: var(--space-xs); }
 .legend-dot {
   display: inline-block;
   width: 9px;
@@ -826,7 +847,7 @@ body.tiny .terms { display: none; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-xs);
 }
 .scope-trend-toggle { display: flex; gap: 2px; }
 .scope-trend-toggle button.linkish { padding: 1px 6px; }
@@ -834,7 +855,7 @@ body.tiny .terms { display: none; }
 .scope-trend-chart { width: 100%; height: 40px; }
 .scope-trend-chart svg { display: block; }
 
-.content { flex: 1; display: flex; flex-direction: column; min-width: 0; padding-right: 12px; }
+.content { flex: 1; display: flex; flex-direction: column; min-width: 0; padding-right: var(--space-md); }
 .canvas {
   flex: 1;
   min-height: 150px;
@@ -868,21 +889,21 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 /* Thinner still: a single lane of discrete state over time, sized to match
    NetPath's own status lane (STATUS_H = 26 in netpath.js) rather than
    reading as a chart panel. Used by the Nodes device up/down timeline. */
-.canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: 8px; }
+.canvas.strip { flex: none; height: 28px; min-height: 28px; margin-bottom: var(--space-sm); }
 .timeline { flex: 1; min-height: 130px; }
 .timeline svg { width: 100%; height: 100%; display: block; }
 
 /* -------------------------------------------------------------- netflow */
-#page-netflow .canvas.chart { flex: 1; min-height: 120px; margin: 0 12px; }
-.split { display: flex; gap: 12px; padding: 0 12px 12px; flex: 1; min-height: 0; }
-.split.events { padding: 0 12px 12px; }
-.pad-x { padding: 0 12px; }
+#page-netflow .canvas.chart { flex: 1; min-height: 120px; margin: 0 var(--space-md); }
+.split { display: flex; gap: var(--space-md); padding: 0 var(--space-md) var(--space-md); flex: 1; min-height: 0; }
+.split.events { padding: 0 var(--space-md) var(--space-md); }
+.pad-x { padding: 0 var(--space-md); }
 .pad-b { padding-bottom: 10px; }
 .pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pane.grow-pane { flex: 2; }
 .bars { flex: 1; overflow: auto; padding: 6px; }
 .bar-row { position: relative; height: 24px; margin-bottom: 2px; }
-.bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: 3px; opacity: 0.55; }
+.bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: var(--radius-sm); opacity: 0.55; }
 .bar-label, .bar-value {
   position: absolute; top: 0; line-height: 24px;
   font-family: var(--mono); font-size: var(--fs-xs);
@@ -895,8 +916,8 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
   overflow: auto;
   min-height: 0;
 }
-.table-wrap.workers { flex: 1; min-height: 80px; margin: 0 12px; }
-.table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 12px 10px; }
+.table-wrap.workers { flex: 1; min-height: 80px; margin: 0 var(--space-md); }
+.table-wrap.workers-small { flex: none; min-height: 34px; max-height: 150px; margin: 0 var(--space-md) 10px; }
 /* A bounded scrolling panel — five call sites each picked their own
    max-height (120px/140px/220px, 26vh-52vh) for what is the same two
    shapes: a short preview list and a full sub-table inside a dialog. Combine
@@ -917,12 +938,12 @@ th {
   background: var(--raised);
   color: var(--muted);
   text-align: left;
-  padding: 6px 8px;
+  padding: 6px var(--space-sm);
   border-bottom: 1px solid var(--hairline);
   font-weight: 600;
   user-select: none;
 }
-td { padding: 4px 8px; border-bottom: 1px solid var(--grid); color: var(--text); }
+td { padding: var(--space-xs) var(--space-sm); border-bottom: 1px solid var(--grid); color: var(--text); }
 tr:nth-child(even) td { background: var(--raised); }
 tr.clickable { cursor: pointer; }
 /* --selected, not --hairline: on the one row the operator is actually
@@ -1046,7 +1067,7 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
 .empty {
   color: var(--muted);
   font: var(--fs-xs)/1.5 var(--ui);
-  padding: 12px 14px;
+  padding: var(--space-md) 14px;
 }
 
 /* ------------------------------------------------------- ConfigRX diff
@@ -1088,12 +1109,12 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
 .cat-error { color: var(--fail); }
 
 /* ------------------------------------------------------------- settings */
-#page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px 16px; min-height: 0; }
+#page-settings .scroll { flex: 1; overflow-y: scroll; padding: 14px var(--space-lg); min-height: 0; }
 fieldset {
   margin: 0 0 14px;
   padding: 10px 14px 14px;
 }
-legend { padding: 0 4px; }
+legend { padding: 0 var(--space-xs); }
 /* A shared control column, instead of each label's own text width deciding
    where its control starts — control left edges used to spread 42px within
    one fieldset. label.check leads with its box, not a text column, so it
@@ -1110,14 +1131,14 @@ fieldset label {
   display: grid;
   grid-template-columns: minmax(140px, max-content) 1fr;
   grid-auto-flow: column;
-  column-gap: 8px;
-  margin: 8px 0;
+  column-gap: var(--space-sm);
+  margin: var(--space-sm) 0;
   align-items: center;
 }
-fieldset label.check { display: flex; gap: 8px; }
+fieldset label.check { display: flex; gap: var(--space-sm); }
 fieldset label input:not([type=checkbox]) { width: 220px; }
 fieldset label input[readonly] { width: 420px; font-family: var(--mono); font-size: var(--fs-xs); }
-fieldset .hint { margin: 8px 0 0; }
+fieldset .hint { margin: var(--space-sm) 0 0; }
 .usage {
   font-family: var(--mono);
   font-size: var(--fs-xs);
@@ -1136,7 +1157,7 @@ fieldset .hint { margin: 8px 0 0; }
   display: inline-block;
   width: 90px;
   height: 6px;
-  border-radius: 3px;
+  border-radius: var(--radius-pill);
   background: var(--data-neutral);   /* the track has to be visible to read */
   margin: 0 6px;
   vertical-align: middle;
@@ -1153,7 +1174,7 @@ fieldset .hint { margin: 8px 0 0; }
   background: var(--panel); border-left: 1px solid var(--hairline);
 }
 #page-settings .scroll::-webkit-scrollbar-thumb {
-  background: var(--line); border-radius: 5px; border: 2px solid var(--panel);
+  background: var(--line); border-radius: var(--radius-pill); border: 2px solid var(--panel);
 }
 #page-settings .scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 #page-settings .scroll { scrollbar-color: var(--line) var(--panel); scrollbar-width: auto; }
@@ -1194,7 +1215,7 @@ fieldset .hint { margin: 8px 0 0; }
   content: '';
   position: absolute;
   background: var(--line);
-  border-radius: 2px;
+  border-radius: var(--radius-pill);
   transition: background 120ms;
 }
 .rows > .divider::after { left: 12px; right: 12px; top: 3px; height: 2px; }
@@ -1231,7 +1252,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   color: var(--bg);
   border: none;
   border-radius: var(--radius-sm);
-  padding: 5px 10px;
+  padding: var(--space-xs) 10px;
   font-size: var(--fs-xs);
   font-weight: 600;
   cursor: pointer;
@@ -1247,7 +1268,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   flex: 0 0 auto;
   width: 9px;
   height: 9px;
-  border-radius: 2px;
+  border-radius: var(--radius-sm);
 }
 .tip-row-plain { padding-left: 15px; }
 
@@ -1258,7 +1279,7 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   background: var(--raised);
   border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
-  padding: 7px 9px;
+  padding: var(--space-sm);
   color: var(--text);
   font-family: var(--mono);
   font-size: var(--fs-xs);
@@ -1272,24 +1293,24 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
 /* Everything below keeps a laptop usable: the panes are resizable, but the
    defaults should already fit rather than needing to be dragged first. */
 body.compact { font-size: var(--fs-xs); }
-body.compact .bar { padding: 5px 10px; }
-body.compact .tab { padding: 7px 16px; }
-body.compact .card { padding: 7px 10px; }
+body.compact .bar { padding: var(--space-xs) 10px; }
+body.compact .tab { padding: var(--space-sm) var(--space-lg); }
+body.compact .card { padding: var(--space-sm) 10px; }
 body.compact .card.strip { margin: 6px 10px 2px; }
-body.compact th { padding: 4px 7px; }
-body.compact td { padding: 3px 7px; }
+body.compact th { padding: var(--space-xs) var(--space-sm); }
+body.compact td { padding: 3px var(--space-sm); }
 body.compact .canvas { min-height: 120px; }
 /* .strip is a fixed-height status lane, not a chart panel: without this,
    the density rules' higher specificity (body.compact .canvas beats
    .canvas.strip) and min-height-beats-height would balloon the 28px lane
    to 120px on exactly the small screens compact mode exists for. */
 body.compact .canvas.strip { min-height: 28px; }
-body.compact .sidebar { width: 240px; padding: 8px; }
-body.compact fieldset { padding: 8px 10px 10px; }
-body.compact fieldset label { margin: 5px 0; }
+body.compact .sidebar { width: 240px; padding: var(--space-sm); }
+body.compact fieldset { padding: var(--space-sm) 10px 10px; }
+body.compact fieldset label { margin: var(--space-xs) 0; }
 
-body.tiny .tab { padding: 5px 12px; }
-body.tiny .bar { padding: 4px 8px; gap: 6px; }
+body.tiny .tab { padding: var(--space-xs) var(--space-md); }
+body.tiny .bar { padding: var(--space-xs) var(--space-sm); gap: 6px; }
 body.tiny .canvas { min-height: 90px; }
 body.tiny .canvas.strip { min-height: 28px; }
 body.tiny .sidebar { width: 210px; }
@@ -1303,21 +1324,21 @@ body.login-page {
 }
 .login-box {
   width: 340px;
-  padding: 26px 28px 22px;
+  padding: 26px 28px var(--space-lg);
 }
 .login-box .brand {
   justify-content: center;
-  margin: 0 0 18px;
+  margin: 0 0 var(--space-lg);
   padding: 0;
   border: none;
   font-size: var(--fs-xl);
 }
 .login-box .brand .mark { width: 26px; height: 26px; }
-.login-box form { display: flex; flex-direction: column; gap: 4px; }
+.login-box form { display: flex; flex-direction: column; gap: var(--space-xs); }
 .login-box label { margin-top: 10px; }
-.login-box input { padding: 8px 10px; font-size: var(--fs-md); }
-.login-box button { margin-top: 18px; padding: 9px; font-size: var(--fs-md); }
-.login-box .err { margin: 12px 0 0; font-size: var(--fs-xs); }
+.login-box input { padding: var(--space-sm) 10px; font-size: var(--fs-md); }
+.login-box button { margin-top: var(--space-lg); padding: var(--space-sm); font-size: var(--fs-md); }
+.login-box .err { margin: var(--space-md) 0 0; font-size: var(--fs-xs); }
 .login-box .hint { margin: 14px 0 0; line-height: 1.5; }
 
 /* ---------------------------------------------------------------- modal */
@@ -1332,7 +1353,7 @@ body.login-page {
    floated over — with no shadow: the one surface that most needs to read
    as lifted was the one recessed into the scrim. */
 .modal-box {
-  padding: 18px 20px;
+  padding: var(--space-lg) 20px;
   min-width: 420px;
   max-width: 760px;
   max-height: 86vh;
@@ -1353,7 +1374,7 @@ body.login-page {
    because it is a paragraph or two to read rather than a form to fill. */
 .help-link {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 16px; height: 16px; padding: 0; margin-left: 4px;
+  width: 16px; height: 16px; padding: 0; margin-left: var(--space-xs);
   border-radius: 50%; border: 1px solid var(--hairline);
   background: transparent; color: var(--muted);
   font-size: var(--fs-2xs); font-weight: 700; line-height: 1;
@@ -1363,8 +1384,8 @@ body.login-page {
 .modal.help { z-index: var(--z-help); }
 .modal.help .modal-box { min-width: 360px; max-width: 600px; }
 .help-body p { margin: 0 0 10px; line-height: 1.45; }
-.help-body ul { margin: 0 0 10px 18px; padding: 0; }
-.help-body li { margin: 4px 0; line-height: 1.4; }
+.help-body ul { margin: 0 0 10px var(--space-lg); padding: 0; }
+.help-body li { margin: var(--space-xs) 0; line-height: 1.4; }
 /* The body of every dialog is wrapped in <form class="modal-form"> so that
    Enter submits it (see App.modal), which put one element between
    .modal-box and the labels this rule reaches. Same shared control column
@@ -1374,19 +1395,22 @@ body.login-page {
   display: grid;
   grid-template-columns: minmax(140px, max-content) 1fr;
   grid-auto-flow: column;
-  column-gap: 8px;
+  column-gap: var(--space-sm);
   align-items: center;
 }
-.modal-form > label.check { display: flex; gap: 8px; }
-.modal-box h2 { margin: 0 0 12px; }
+.modal-form > label.check { display: flex; gap: var(--space-sm); }
+/* --fs-lg is documented in tokens.css as a dialog's heading; this and
+   .ssh-panel h2 below are the only two dialogs the shell has, and until
+   now both fell through to the pane-title rule's --fs-md instead. */
+.modal-box h2 { margin: 0 0 var(--space-md); font-size: var(--fs-lg); }
 /* The interface dialog's parent device name: its own line above the port
    name and inside the same h2, so it is the same size rather than dropping
    to hint text. Dimmer only so the port stays the subject of the dialog. */
 .modal-box h2 .ifd-parent { color: var(--muted); font-weight: 600; }
 .modal-box .row { justify-content: flex-end; margin-top: 14px; }
 .modal-box .row.top {
-  margin: 0 0 12px;
-  padding-bottom: 12px;
+  margin: 0 0 var(--space-md);
+  padding-bottom: var(--space-md);
   border-bottom: 1px solid var(--hairline);
   position: sticky;
   top: 0;
@@ -1406,8 +1430,8 @@ body.login-page {
    looking. Hidden until there is something to say; App.modal clears it on
    every press, so a retry does not read as a second failure. */
 .modal-error {
-  margin: 12px 0 0;
-  padding: 8px 10px;
+  margin: var(--space-md) 0 0;
+  padding: var(--space-sm) 10px;
   border: 1px solid var(--fail);
   border-left-width: 3px;
   border-radius: var(--radius-sm);
@@ -1415,7 +1439,7 @@ body.login-page {
   color: var(--text);
   font-size: var(--fs-xs);
 }
-.modal-box .row.top + .modal-error { margin: 0 0 12px; }
+.modal-box .row.top + .modal-error { margin: 0 0 var(--space-md); }
 /* A field App.requireFields found empty. The border alone would be colour
    on its own; the sentence in .modal-error names the field as well, and
    focus lands on the first one, so this mark is the third signal rather
@@ -1430,7 +1454,7 @@ body.login-page {
    the dialog rather than another field in it. */
 .discard-prompt {
   margin-top: 14px;
-  padding-top: 12px;
+  padding-top: var(--space-md);
   border-top: 1px solid var(--hairline);
 }
 .discard-prompt p { margin: 0 0 10px; font-size: var(--fs-xs); }
@@ -1452,7 +1476,7 @@ body.login-page {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 8px;
+  gap: var(--space-sm);
   pointer-events: none;
 }
 .toast {
@@ -1504,7 +1528,7 @@ body.login-page {
   border: none;
   border-bottom: 1px solid var(--hairline);
   border-radius: 0;
-  padding: 14px 16px;
+  padding: 14px var(--space-lg);
   font-size: var(--fs-md);
   background: transparent;
   color: var(--text);
@@ -1518,7 +1542,7 @@ body.login-page {
   gap: 1px;
   width: 100%;
   text-align: left;
-  padding: 7px 10px;
+  padding: var(--space-sm) 10px;
   border-radius: var(--radius-sm);
   border: none;
   background: none;
@@ -1528,9 +1552,9 @@ body.login-page {
 .gsearch-hit .name { font-weight: 600; }
 .gsearch-hit .meta { color: var(--muted); font-size: var(--fs-xs); }
 .gsearch-hit:hover, .gsearch-hit.active { background: var(--raised); }
-.gsearch-empty { padding: 16px; color: var(--muted); font-size: var(--fs-xs); }
+.gsearch-empty { padding: var(--space-lg); color: var(--muted); font-size: var(--fs-xs); }
 .gsearch-hint {
-  padding: 8px 16px;
+  padding: var(--space-sm) var(--space-lg);
   border-top: 1px solid var(--hairline);
   color: var(--muted);
   font-size: var(--fs-2xs);
@@ -1618,10 +1642,10 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    markup lives (nodes.js, alerts.js, netflow.js), which is outside this
    file. */
 @media (max-width: 360px) {
-  .tab-group::before { padding: 0 5px 0 8px; }
-  .tab { padding: 8px 10px; }
-  .tabs-utility { gap: 6px; padding: 0 8px; }
-  .tabs-utility .linkish { padding: 4px 6px; }
+  .tab-group::before { padding: 0 var(--space-xs) 0 var(--space-sm); }
+  .tab { padding: var(--space-sm) 10px; }
+  .tabs-utility { gap: 6px; padding: 0 var(--space-sm); }
+  .tabs-utility .linkish { padding: var(--space-xs) 6px; }
   #whoami, #conn {
     display: inline-block;
     max-width: 68px;

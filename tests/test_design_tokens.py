@@ -64,6 +64,17 @@ for theme_name, body_text in BLOCKS:
         BASE = values
 TOKENS = BASE
 check(len(TOKENS) > 40, "tokens.css parsed (%d tokens)" % len(TOKENS))
+# The spacing scale: four steps, each a multiple of 4px and each bigger
+# than the last, so a control's padding stops being a number picked by eye.
+SPACE_STEPS = ["--space-xs", "--space-sm", "--space-md", "--space-lg"]
+check(all(name in TOKENS for name in SPACE_STEPS),
+      "tokens.css defines the spacing scale (%s)" % SPACE_STEPS)
+if all(name in TOKENS for name in SPACE_STEPS):
+    space_px = [int(TOKENS[name].strip().rstrip("px")) for name in SPACE_STEPS]
+    check(space_px == sorted(space_px) and len(set(space_px)) == 4,
+          "the spacing scale is four distinct, ascending steps (%s)" % space_px)
+    check(all(value % 4 == 0 for value in space_px),
+          "every spacing step is a multiple of 4px (%s)" % space_px)
 THEMES = {"dark": dict(BASE)}
 for theme_name, values in OVERRIDES.items():
     THEMES[theme_name] = dict(BASE, **values)
@@ -201,6 +212,14 @@ for sheet in SHEETS:
     # shadows and scrims are tokens too: five hand-written rgba shadows and
     # two scrims used to sit beside the token that existed for them
     check("rgba(" not in body, "%s: no literal rgba (shadows and scrims are tokens)" % sheet)
+    # radii are tokens too: seven hand-tuned pixel values (2, 3, 5, 9px)
+    # used to sit beside the three the contract named, one per shape,
+    # before --radius-pill gave the half-height ones a single home. A
+    # radius still allowed to use a token in a calc() (the nested subtab's
+    # `calc(var(--radius-sm) - 1px)`) is not a literal of its own.
+    radii = [value for value in re.findall(r"border-radius:\s*([^;]+);", body)
+             if "px" in value and "var(" not in value]
+    check(not radii, "%s: no pixel border-radius (found %s)" % (sheet, radii[:3] or "none"))
 check(read(STATIC, "app.css").count(".sr-only {") == 1, "app.css defines .sr-only once")
 APP_CSS = read(STATIC, "app.css")
 check(APP_CSS.count("background: var(--panel);\n  border: 1px solid var(--hairline);") == 1,
@@ -210,6 +229,9 @@ check(APP_CSS.count("font: 600 var(--fs-2xs)/1 var(--ui);\n  letter-spacing: var
       "one eyebrow rule")
 check("table { width: 100%; border-collapse: collapse; font-family: var(--ui);" in APP_CSS
       and "td.mono" in APP_CSS, "tables are proportional with mono opt-in per column")
+space_uses = sum(APP_CSS.count("var(%s)" % name) for name in SPACE_STEPS)
+check(space_uses > 50, "app.css actually uses the spacing scale (%d references)" % space_uses)
+check("var(--radius-pill)" in APP_CSS, "app.css uses --radius-pill for the half-height shapes")
 
 for name in sorted(os.listdir(STATIC)):
     if name.endswith((".js", ".html")):
@@ -226,6 +248,14 @@ for name in sorted(os.listdir(STATIC)):
             numeric = re.findall(r"'font-size':\s*\d+\b(?![\d.]*\s*[*+])", body)
             check(not numeric, "%s: SVG text sizes are tokens (found %d numeric)"
                   % (name, len(numeric)))
+            # A script setting a CSS radius directly (rather than through
+            # app.css) is the same drift a hard-coded hex colour would be.
+            # SVG rx/ry (netpath's and netflow's node boxes and legend
+            # swatches) are a diagram's own geometry, not this contract, and
+            # are exempt on purpose.
+            radius = re.findall(r"(?:borderRadius\s*[:=]|'border-radius':)\s*['\"]?[\d.]+px", body)
+            check(not radius, "%s: no pixel border-radius set from script (found %s)"
+                  % (name, radius[:3] or "none"))
 
 # --------------------------------------------------------------------------
 # 4. tokens.css is where it has to be: first on every page, and public.
