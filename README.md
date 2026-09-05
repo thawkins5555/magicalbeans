@@ -29,7 +29,7 @@ first device polled, `BACKUP-RESTORE.md` covers the ten database files, and
 - [Layout](#layout)
 - [Notes and limits](#notes-and-limits)
 
-Tabs at the top of the window, in order: **Dashboard**; **Nodes**, an SNMP poller and device inventory; **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows); **NetFlow**, a flow collector; **SNMP Trap**, a trap and inform receiver; **Syslog**, a message collector; **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility; **FortiWireless**, a Fortinet access-point dashboard; **ConfigRX**, SSH configuration backups; **Debug**, a live view of what the background threads are doing; and **Settings**.
+Twelve tabs at the top of the window, in four labelled groups: **Now** — **Dashboard** and **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Inventory** — **Nodes**, an SNMP poller and device inventory, **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility, **FortiWireless**, a Fortinet access-point dashboard, and **ConfigRX**, SSH configuration backups; **Telemetry** — **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows), **NetFlow**, a flow collector, **Syslog**, a message collector, and **SNMP Trap**, a trap and inform receiver; **Admin** — **Settings** and **Debug**, a live view of what the background threads are doing. Who is signed in, the **Account** control — which also holds the version number and the per-browser Appearance settings — and **Sign out** sit beside the tabs rather than inside the scrolling strip, so narrowing the window never hides them.
 
 ## NetPath
 
@@ -167,7 +167,7 @@ under NSSM or a scheduled task on Windows, or a systemd unit on Linux.
 
 ### Concurrency and timeouts
 
-**Settings**, top right of the NetPath tab, holds how many traces run at once (4 by default), how long traces are kept, and the defaults a new destination starts with.
+**Settings**, top right of the Routes tab, holds how many traces run at once (4 by default), how long traces are kept, and the defaults a new destination starts with.
 
 The number that matters is the worst case per destination, `max hops × probes × probe timeout + 15s`. At the defaults that is 195 seconds. A healthy destination finishes in a few seconds because the trace stops when it arrives; an unreachable one walks every hop to its timeout and pays the full price, holding a worker the entire time. Two or three dead destinations can therefore starve the pool and leave healthy ones sitting in **queued** on the Debug page.
 
@@ -275,11 +275,11 @@ Route changes are recorded as a path signature per trace and drawn as ticks, but
 ## Display: themes, small screens, the wall
 
 Three themes — Dark, Light, High contrast — under **Appearance · this
-browser** on Settings, stored per browser so a shared workstation keeps its
-choice across sign-ins. The layout works down to a 768 px tablet; every drag
-works from a finger or a pen, and pane splitters and column widths can be
-changed from the keyboard (arrow keys on a splitter, Alt+Arrow on a column
-header).
+browser**, in the **Account** dialog reachable from the top bar, stored per
+browser so a shared workstation keeps its choice across sign-ins. The layout
+works down to a 768 px tablet; every drag works from a finger or a pen, and
+pane splitters and column widths can be changed from the keyboard (arrow keys
+on a splitter, Alt+Arrow on a column header).
 
 For a wall display open `/?kiosk=1#/dashboard`: no tab strip, a quarter
 larger, and a thin bar with the view, the clock and the session's remaining
@@ -513,7 +513,7 @@ Configuration sits at whichever level it actually belongs to.
 | Where | What |
 | --- | --- |
 | **Settings** tab | Reverse DNS, view refresh interval, data file locations, maintenance |
-| **Settings** button, top right of the NetPath tab | Concurrent traces, trace retention, defaults for new destinations |
+| **Settings** button, top right of the Routes tab | Concurrent traces, trace retention, defaults for new destinations |
 | **Settings** button, top right of the NetFlow tab | Listener, sampling, exporters, flow storage and display |
 | **Settings** button, top right of the IPAM tab | Scan interval and limits, DHCP poll interval, retention |
 | **Add** / **Edit** on a destination | That destination's interval, hops, probes, timeout and thresholds |
@@ -636,8 +636,8 @@ worked or the browser cached the old page:
 Invoke-RestMethod http://mill-mon-01:8443/api/state | Select-Object version
 ```
 
-The version also shows in the top right of the browser interface and in the
-service console's title bar.
+The version also shows in the browser interface's **Account** dialog and in
+the service console's title bar.
 
 Note what that version actually tells you: it comes from the server, so it
 changes the moment the service restarts, whether or not the open page has
@@ -767,7 +767,7 @@ netpath/
       app.css      shared styling for the whole interface, on the tokens
       app.js       shared plumbing: server calls, tab switching, the
                    refresh loop, modals
-      netpath.js   NetPath tab: route graph, timeline, destinations
+      netpath.js   Routes tab: route graph, timeline, destinations
       netflow.js   NetFlow tab: traffic chart, top-N, flow table, filters
       syslog.js    Syslog tab: message table, filters, collector settings
       ipam.js      IPAM tab: subnets & hosts, conflicts, DHCP
