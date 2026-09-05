@@ -846,15 +846,15 @@ def test_topology_consistency() -> None:
     check(core_claim_re_acc1 is not None
           and core_claim_re_acc1 == real_mac.get("acc-sw-001", {}).get(49),
           "core-sw-01's chassis-MAC claim about acc-sw-001 matches "
-          "acc-sw-001's own real ifPhysAddress on its uplink port",
-          (core_claim_re_acc1, real_mac.get("acc-sw-001", {}).get(49)))
+          f"acc-sw-001's own real ifPhysAddress on its uplink port: "
+          f"{core_claim_re_acc1!r} vs {real_mac.get('acc-sw-001', {}).get(49)!r}")
     acc1_claim_re_core = chassis_claim.get(
         ("acc-sw-001", "1.0.8802.1.1.2.1.4.1.1.5.0.49.1"))
     check(acc1_claim_re_core is not None
           and acc1_claim_re_core == real_mac.get("core-sw-01", {}).get(1),
           "acc-sw-001's chassis-MAC claim about core-sw-01 matches "
-          "core-sw-01's own real ifPhysAddress on port 1",
-          (acc1_claim_re_core, real_mac.get("core-sw-01", {}).get(1)))
+          f"core-sw-01's own real ifPhysAddress on port 1: "
+          f"{acc1_claim_re_core!r} vs {real_mac.get('core-sw-01', {}).get(1)!r}")
 
 
 # ------------------------------------------------------------------- main

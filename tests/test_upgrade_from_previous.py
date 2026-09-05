@@ -30,8 +30,35 @@ DB_NAMES = ("netpath.db", "flows.db", "syslog.db", "app.db", "ipam.db",
 FAILS = []
 
 
+def _safe_print(text: str) -> None:
+    """print(), but never raises on a character this console's encoding
+    cannot hold. Several check() calls below print a captured subprocess's
+    stderr/stdout straight into the failure detail (`seed.stderr[-400:]`,
+    `started.stdout[-200:]`, and the plain f-string a few lines further
+    down) — that subprocess is the *previous release*, running under
+    whatever its own environment defaulted its stdout encoding to (cp1252,
+    same as this one, whenever neither end is a real terminal), so its
+    output can contain anything, including a byte sequence this console
+    cannot draw. tests/run_all.py hit exactly this printing a captured
+    suite's own tail back out and was fixed the same way; this file needs
+    its own copy of the fix because it runs as its own process with its own
+    console encoding, not through that reconfigure.
+
+    check() itself is made safe, rather than only reconfiguring this file's
+    streams once at the top, because check() -- like every suite's own copy
+    of it -- is exactly the kind of small helper that gets copied wholesale
+    into the next test file rather than imported; a fix that only lives in
+    a separate top-of-file block would not travel with it.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="backslashreplace").decode(encoding))
+
+
 def check(name, ok, detail=""):
-    print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
+    _safe_print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
     if not ok:
         FAILS.append(name)
 
@@ -149,7 +176,7 @@ except (OSError, subprocess.SubprocessError):
     exported = False
 
 if not exported:
-    print(f"SKIP  git could not export {PREVIOUS_RELEASE}; the previous-release start is not run here")
+    _safe_print(f"SKIP  git could not export {PREVIOUS_RELEASE}; the previous-release start is not run here")
 else:
     dbdir = os.path.join(work, "prev")
     os.makedirs(dbdir)
@@ -168,7 +195,7 @@ print(netpath.__version__)
     check("the previous release created its databases",
           seed.returncode == 0 and seed.stdout.strip(), seed.stderr[-400:])
     if seed.returncode == 0:
-        print(f"      previous release: {seed.stdout.strip().splitlines()[-1]}")
+        _safe_print(f"      previous release: {seed.stdout.strip().splitlines()[-1]}")
         started = subprocess.run([sys.executable, "-c", f"""
 import sys; sys.path.insert(0, {REPO_ROOT!r})
 from netpath.web import Service

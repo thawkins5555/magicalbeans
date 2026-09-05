@@ -180,6 +180,24 @@ The point of saying this in the report is not modesty. It is that a review which
 only what it found, and never what it got wrong, gives an operator no way to calibrate
 the rest.
 
+**Two more things about the conditions this was run in, since they affected results.**
+
+A finding was nearly published against the wrong code. The 250-device campaign's process
+started at 00:03:39; a fix to the alert engine was saved at 00:35:09; Python does not
+hot-reload. The agent whose own fix would have been credited caught it by checking a file
+timestamp against a process start, then went further and read the run's database to
+establish that the code path in question could not have fired regardless. Attributing a
+measurement to the wrong code is the error that makes a whole report untrustworthy, and
+the only defence is checking rather than assuming.
+
+And the campaign broke its own tests. A timing assertion written on an idle machine
+measured 3.03 s and 5.81 s against a 3.0 s bound while a dozen agents did CPU-bound work
+on the same host — a real failure, in a real test, caused by the review itself. The
+bounds were widened to this codebase's own stated standard, and, more usefully, the file's
+header now records that they were widened once, why, and what the flake actually measured.
+A comment claiming a generous margin without the episode that tested it is aspirational;
+one with the numbers is evidence.
+
 ---
 
 ## 3. What had to change before the product could be evaluated on Windows
@@ -1021,6 +1039,30 @@ thousand times a minute, that gap becomes enormous and looks exactly like loss. 
 number is already computed — `insert()` has `bumps` — so exposing a `collapsed` counter
 beside `stored` closes the arithmetic and makes a real shortfall mean something again.
 
+Verified independently, and the verification settled it: across 50 batches and 715 fed
+messages, `SUM(repeat_count)` over every row equals **715 exactly**, while `insert()`
+returned 557. Nothing is lost. The instrument counts rows.
+
+**O-41 — and the deduplication does not fire for a storm that arrives inside one flush
+cycle, which is the case it exists for. CONFIRMED (constructed, both directions).**
+Found while verifying the above. `syslogdb._collapse()` compares each entry only against
+`self._last_row`, which is set either mid-loop when a bump occurs against an
+*already-committed* row, or once per `insert()` **after** the write completes. It is
+never updated for a fresh entry mid-loop.
+
+So a run of brand-new identical messages beginning and ending inside one batch does not
+collapse against itself at all: 50 identical never-before-seen messages fed in one
+`insert()` produced **50 separate rows**, each with `repeat_count = 1`. The control in
+the other direction confirms the mechanism does work — seeding one such message in a
+prior call and feeding nine more in the next batch collapsed all nine into zero fresh
+rows. Collapsing takes effect from the *second* batch a message appears in, onward.
+
+A flush window is a few hundred milliseconds to a second. A switch with a failing optic,
+a spanning-tree reconvergence, an authentication loop — each fires the same line hundreds
+of times a second, comfortably inside one batch. **So the feature whose entire purpose is
+to stop a storm becoming N rows is weakest at exactly the storm rate that matters, and
+strongest at the slow repetition that would not have hurt anyway.**
+
 ⏳ Tier B (1,000) and Tier C (2,000) land here.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
@@ -1145,6 +1187,27 @@ upload.
 Recorded because the general lesson is now twice-proved in this one file: **a budget
 checked between units of work cannot bound a unit of work**, and "unit" includes the
 invisible interior of a generator.
+
+**O-36 — a NetPath destination with a non-positive interval turns the traceroute
+scheduler into a subprocess spawn storm against its own host. CONFIRMED (fixed).**
+`netpath/db.py`'s `add_target`/`update_target` accepted any numeric value and wrote it
+through. `monitor.py`'s scheduler computes `next_run = last_run + interval_s`, so at zero
+or below a destination is **perpetually due**: the scheduler launches a traceroute
+subprocess against it as fast as the worker pool turns them over, forever. That is the
+same spawn-storm shape `ipam_scan.py`'s own docstring names for an unpaced ping sweep,
+except self-inflicted through an ordinary API field.
+
+Its siblings had the same gap and all reach a real mechanism: `max_hops` is a literal
+subprocess argument and a term in the worst-case runtime arithmetic; `probes` is packets
+sent at *every* router on the path; `timeout_s` is `-w`; `trace_workers` goes straight
+into `ThreadPoolExecutor(max_workers=…)`. All are now clamped at the storage layer as a
+backstop — 1–255 hops, 1–20 probes (just above Linux traceroute's own parallelism cap of
+16), 0.1–30 s timeout, 5 s to 30 days interval, 1–64 workers — each bound justified by
+the mechanism it guards rather than picked, with API-side rejection specified separately.
+
+Two fields were deliberately clamped only to *sane* rather than to a mechanism ceiling:
+`warn_rtt_ms` and `warn_loss` reach nothing but a comparison. Drawing that distinction is
+what makes this a sweep rather than a habit.
 
 **PLAUSIBLE, deliberately not changed: SNMPv3 trap key-derivation amplification.**
 `netpath/trapdecode.py:328`'s `localized_key` hashes a 1 MiB buffer per cache miss,
