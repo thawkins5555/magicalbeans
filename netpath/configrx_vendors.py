@@ -53,6 +53,7 @@ class Vendor:
 
 
 VENDORS = {
+    # --- Hardware-verified: exercised against real devices of these platforms. ---
     "cisco": Vendor("Cisco IOS/IOS-XE", ("terminal length 0",), "show running-config"),
     "cisco-nxos": Vendor("Cisco NX-OS", ("terminal length 0",), "show running-config"),
     "cisco-iosxr": Vendor("Cisco IOS-XR", ("terminal length 0",), "show running-config"),
@@ -68,6 +69,52 @@ VENDORS = {
     "mikrotik": Vendor("MikroTik RouterOS", (), "/export"),
     "hp": Vendor("HP/Aruba", ("no page",), "show running-config"),
     "aruba": Vendor("HP/Aruba", ("no paging",), "show running-config"),
+
+    # --- Documentation-sourced only: no hardware of these platforms was
+    # reachable here, so these are built from vendor CLI manuals (cited
+    # below) rather than a live capture. Flag any capture against real
+    # hardware as suspect until it's been eyeballed once. ---
+    #
+    # Moxa EDS/IKS/ICS/PT-series switches (classic "Command Line Interface
+    # (FW_5.x)" CLI, v1.7 Nov 2023 — covers EDS-510E/518E/528E/G50xE/G51xE,
+    # IKS-6726A/6728A/G6524A/G6824A, ICS-G75xxA/78xxA, PT-G7728/G7828).
+    # `terminal length 0` disables pagination ("0 ... mean unlimited to
+    # prevent pagination"); `show running-config` is documented as valid in
+    # both User EXEC and Privileged EXEC. Moxa's *other* CLI family — the
+    # newer "Next-generation OS" used on e.g. RKS-G4000 — only exposes
+    # config backup via `copy running-config <tftp/sftp/usb/...>`, which
+    # can't be captured this way; this entry is for the classic FW_5.x CLI
+    # only and should not be assumed to cover Next-gen-OS switches.
+    "moxa": Vendor("Moxa EDS/IKS/ICS-series (CLI FW_5.x)",
+                   ("terminal length 0",), "show running-config"),
+    #
+    # Siemens SCALANCE X/S-series (CLI manuals for S615, XB-200/XC-200/
+    # XP-200, XM-400/XR-500 families all document identical
+    # `show running-config` syntax). No pager-off command is documented
+    # anywhere in these manuals' CLI command lists; some models page long
+    # output behind a "-- more --" prompt, but that's handled by
+    # _pull_config's own generic pager responder, not a vendor command, so
+    # pager_off is empty here by design, not by omission. An `enable`
+    # command exists (cli> -> cli#, admin-password-gated) but is not
+    # required for this command specifically. Siemens's SNMP enterprise arc
+    # (4196) covers the whole Siemens tree, not SCALANCE switches alone —
+    # a Siemens S7 PLC on the same arc has no SSH shell and will simply
+    # fail to connect, not produce a false capture.
+    "siemens": Vendor("Siemens SCALANCE (CLI)", (), "show running-config"),
+    #
+    # Rockwell/Allen-Bradley Stratix switches (5200/5400/5700/5800/8000):
+    # multiple Rockwell and Cisco sources confirm these run genuine Cisco
+    # IOS/IOS-XE with Cisco-compatible CLI syntax, so this entry is
+    # identical to the "cisco" entry above rather than invented separately.
+    # Key must be "rockwellautomation" (lowercase) to match resolve()'s
+    # lowercasing of nodeoids.vendor_for()'s canonical key
+    # "rockwellAutomation" (enterprises.py, arc 95) — that arc is itself
+    # CURATED not VERIFIED there (no Rockwell device or MIB was reachable
+    # to cross-check the PEN), so auto-detection onto this entry is
+    # medium-confidence on top of this entry's own documentation-only
+    # status.
+    "rockwellautomation": Vendor("Rockwell Stratix (Cisco IOS/IOS-XE)",
+                                 ("terminal length 0",), "show running-config"),
 }
 
 

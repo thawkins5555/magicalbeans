@@ -121,6 +121,54 @@ ACC_LEGACY_CONFIG = "\n".join(
     + [f"interface FastEthernet0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}"
        for i in range(1, 25)]
     + ["!", "line vty 0 4", " transport input telnet", "!", "end"])
+# Moxa EDS/IKS/ICS-series (classic "Command Line Interface (FW_5.x)" CLI).
+# Lifted close to the manual's own `show running-config` example (hostname,
+# hashed passwords and IP swapped for plant-plausible fakes) rather than
+# invented, since that's the one piece of real Moxa output this research
+# turned up — see netpath/configrx_vendors.py's "moxa" entry for the source.
+MOXA_CONFIG = "\n".join(
+    ["Building configuration ...", "!",
+     "login mode cli", "auto-import", "no auto-backup",
+     "hostname Plant1-EDS-G516E-12",
+     "snmp-server description EDS-G516E",
+     "username admin password 810448e13d53513dddd17d6c045025ab9118407 privilege 1",
+     "username user password 810448e13d53513dddd17d6c045025ab9118408 privilege 2",
+     "!", "authentication radius login auth-type pap", "!",
+     "ip auto-logout 5", "!",
+     "interface mgmt", " ip address static 10.40.12.16 255.255.255.0", "!",
+     "snmp-server version v1-v2c", "snmp-server community PlantRO2026 ro",
+     "snmp-server trap-mode trap", "!", "lldp enable", "lldp timer 5", "!"]
+    + [f"interface ethernet 1/{i}\n no shutdown\n switchport access vlan {100 + i % 4}"
+       for i in range(1, 17)]
+    + ["!", "redundancy", " mrp ring", "!", "end"])
+# Siemens SCALANCE X/S-series CLI (cli>/cli# prompts, `show running-config`
+# with the sub-keyword families confirmed in the SCALANCE S615/XC-200 CLI
+# manuals: vlan, interface, ip, snmp, sntp, ntp, http, auto-save, events).
+# The exact per-line syntax within those sections is this research's
+# reconstruction, not a transcribed vendor sample — no full sample output
+# was found — so treat this persona as a capture-mechanics double, not a
+# syntax reference the way MOXA_CONFIG above is.
+SIEMENS_CONFIG = "\n".join(
+    ["!", "! SCALANCE running configuration", "hostname Plant1-XC208-04", "!",
+     "vlan 1", "vlan 100", "vlan 200", "!",
+     "interface vlan 1", " ip address 10.40.14.4 255.255.255.0", "!",
+     "snmp community PlantRO2026 ro", "sntp server 10.40.0.1", "ntp server 10.40.0.1",
+     "auto-save enable", "http disable", "!"]
+    + [f"interface gigabitethernet 0/{i}\n no shutdown\n switchport access vlan {100 + i % 3}"
+       for i in range(1, 9)]
+    + ["!", "end"])
+# Rockwell/Allen-Bradley Stratix — genuinely runs Cisco IOS/IOS-XE (see the
+# "rockwellautomation" entry in configrx_vendors.py for sourcing), so this
+# reuses Cisco IOS config shape rather than inventing a distinct syntax —
+# that reuse is itself the honest choice here, not a shortcut.
+STRATIX_CONFIG = "\n".join(
+    ["!", "! Last configuration change at 08:41:07 UTC", "version 15.2",
+     "hostname Plant1-Stratix5700-07", "!",
+     "username admin privilege 15 secret 5 $1$stx$AAAAAAAAAAAAAAAAAAAAAA",
+     "snmp-server community PlantRO2026 RO", "!"]
+    + [f"interface GigabitEthernet1/{i}\n switchport mode access\n switchport access vlan {100 + i % 4}\n spanning-tree portfast"
+       for i in range(1, 21)]
+    + ["!", "line vty 0 4", " transport input ssh", "!", "end"])
 ACC_DEFAULT_SNMP_CONFIG = "\n".join(
     ["!", "! Last configuration change at 09:10:00 UTC", "version 15.2",
      "hostname acc-sw-104", "!",
@@ -197,6 +245,22 @@ PERSONAS = {
     "acc-default-snmp": {"banner": "acc-sw-104#", "prompt": "acc-sw-104#",
                       "pager_off": ["terminal length 0"], "show": "show running-config",
                       "config": ACC_DEFAULT_SNMP_CONFIG, "mode": "normal"},
+    # New industrial vendors below — appended, not interspersed, so a
+    # restart doesn't shuffle the ports already assigned to the personas
+    # above.
+    "moxa":          {"banner": "Plant1-EDS-G516E-12#", "prompt": "Plant1-EDS-G516E-12#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": MOXA_CONFIG, "mode": "normal"},
+    # No pager_off command exists for this platform (see the "siemens"
+    # entry in configrx_vendors.py); this persona never sends --More--
+    # either, so it isn't exercising the generic pager fallback — that
+    # path is already covered by "cisco-pager" above.
+    "siemens-scalance": {"banner": "cli# ", "prompt": "cli#",
+                      "pager_off": [], "show": "show running-config",
+                      "config": SIEMENS_CONFIG, "mode": "normal"},
+    "rockwell-stratix": {"banner": "Plant1-Stratix5700-07#", "prompt": "Plant1-Stratix5700-07#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": STRATIX_CONFIG, "mode": "normal"},
 }
 
 DEFAULT_HOST_KEY_PATH = pathlib.Path(__file__).with_name("fake_ssh_host_key")
