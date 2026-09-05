@@ -792,31 +792,27 @@ class SshSession:
     def _watch_tick(self, ticks: int) -> bool:
         """One beat of the watchdog. True when the session is over and the
         loop should end."""
-        # Read the module globals each time: the tests shorten them, and
-        # operator-facing constants are worth being able to change.
-        if not self._open_seen:
-            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
-                return False
-            self._status("closed", f"No terminal was opened within "
-                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
-            self.ws.close(CLOSE_IDLE, "Handshake timeout")
-            self.stop()
-            return True
-        # Checked before the sign-out/permission checks below: at a default
-        # install the web session's own idle timeout is shorter than
-        # IDLE_TIMEOUT_S, so "no keystrokes for the effective window" and
-        # "the web session has expired" become true within the same tick.
-        # When they do, the more specific, more informative reason — the
-        # terminal itself timed out, not "you were signed out" — is the one
-        # that should reach the operator, since it is the one actually true
-        # of what they did (or didn't do) in this shell.
-        effective_idle_s = self._effective_idle_s()
-        if time.time() - self._last_input >= effective_idle_s:
-            minutes = max(1, round(effective_idle_s / 60))
-            self._status("closed", f"Closed after {minutes} minute(s) idle")
-            self.ws.close(CLOSE_IDLE, f"Idle timeout ({minutes}m)")
-            self.stop()
-            return True
+        # Checked ahead of the sign-out/permission checks below, but only
+        # once a shell exists: at a default install the web session's own
+        # idle timeout is shorter than IDLE_TIMEOUT_S, so "no keystrokes for
+        # the effective window" and "the web session has expired" become
+        # true within the same tick. When they do, the more specific, more
+        # informative reason — the terminal itself timed out, not "you were
+        # signed out" — is the one that should reach the operator, since it
+        # is the one actually true of what they did (or didn't do) in this
+        # shell. Before `open`, this says nothing about idleness — see the
+        # handshake timeout below instead — so it stays out of the way of
+        # the sign-out check for a socket parked waiting on `open` (that
+        # window is covered by the sign-out/permission checks below on
+        # every tick, exactly as before).
+        if self._open_seen:
+            effective_idle_s = self._effective_idle_s()
+            if time.time() - self._last_input >= effective_idle_s:
+                minutes = max(1, round(effective_idle_s / 60))
+                self._status("closed", f"Closed after {minutes} minute(s) idle")
+                self.ws.close(CLOSE_IDLE, f"Idle timeout ({minutes}m)")
+                self.stop()
+                return True
         if self.token and self.service.sessions.get(self.token) is None:
             self._end_unauthorized(
                 "You were signed out",
@@ -827,6 +823,16 @@ class SshSession:
                 "SSH access was revoked",
                 f"SSH session closed: {self.app_user} no longer holds "
                 f"SSH write access")
+            return True
+        # Read the module globals each time: the tests shorten them, and
+        # operator-facing constants are worth being able to change.
+        if not self._open_seen:
+            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
+                return False
+            self._status("closed", f"No terminal was opened within "
+                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
+            self.ws.close(CLOSE_IDLE, "Handshake timeout")
+            self.stop()
             return True
         return False
 

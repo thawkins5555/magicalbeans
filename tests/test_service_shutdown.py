@@ -21,6 +21,7 @@ import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
+from netpath.syslogdb import SyslogDatabase
 from netpath.web import Service
 
 TMPDIR = _paths.tmpdir("service_shutdown_")
@@ -372,6 +373,138 @@ check("...and says so plainly in the event log instead",
 
 service4.shutdown()
 shutil.rmtree(os.path.join(TMPDIR, "t4"), ignore_errors=True)
+
+
+# --------------------------------------- 5. the syslog index backfill, a
+# --------------------------------------- different kind of bug in the same family
+# Sections 1-4 are all "closing a database under work still in flight raises
+# a traceback that reads like a crash". This one, found while auditing
+# Service.start()/shutdown() for the same asymmetry, is quieter and worse:
+# SyslogDatabase.start_index_backfill() (netpath/syslogdb.py) span a thread
+# whose local handle was discarded immediately, so nothing could ever wait
+# for it, and its own `except sqlite3.Error` already caught a closed-
+# database mid-backfill silently -- no traceback, but `finally` still
+# unconditionally marked the index complete and disabled full-text search
+# outright, regardless of whether the backfill had actually finished or was
+# only cut short. An operator restarting during a large backfill (exactly
+# when a big backlog means one is most likely running) got syslog search
+# silently downgraded to table-scanning for the rest of that run, with no
+# message anywhere, self-correcting only because self.fts is redetermined
+# fresh on the next restart -- except the backfill never got a chance to
+# resume either, since the schema already looked current by then.
+TMPDIR5 = os.path.join(TMPDIR, "t5")
+os.makedirs(TMPDIR5, exist_ok=True)
+SYSLOG5 = os.path.join(TMPDIR5, "syslog.db")
+
+
+class _LogSpy:
+    """A minimal stand-in for EventLog: keeps every entry's message text so
+    a check below can read exactly what was logged, without a whole
+    Service's much larger log to search through."""
+
+    def __init__(self):
+        self.entries = []
+
+    def add(self, category, message, target="", detail=""):
+        self.entries.append(message)
+
+
+class _Entry:
+    def __init__(self, i):
+        self.source = f"10.0.0.{i % 5}"
+        self.host = self.source
+        self.facility = 1
+        self.severity = 6
+        self.app = "test"
+        self.procid = ""
+        self.msgid = ""
+        self.message = f"hello world message number {i}"
+        self.raw = self.message
+        self.ts = time.time()
+
+
+N_MESSAGES = 500
+log5a = _LogSpy()
+syslog5a = SyslogDatabase(SYSLOG5, log=log5a)
+syslog5a.insert([_Entry(i) for i in range(N_MESSAGES)])
+syslog5a.close()
+
+# Force an old-shape index (as an upgrade from before the trigram tokenizer
+# would find on disk), so the next open decides a backfill is needed.
+_conn = sqlite3.connect(SYSLOG5)
+_conn.execute("DROP TABLE IF EXISTS logs_fts")
+_conn.execute("CREATE VIRTUAL TABLE logs_fts USING fts5(message, app, host,"
+             " content='logs', content_rowid='id', tokenize='unicode61')")
+_conn.commit()
+_conn.close()
+
+log5b = _LogSpy()
+syslog5b = SyslogDatabase(SYSLOG5, log=log5b)
+check("the old-shaped index is recognised as needing a backfill",
+     syslog5b._backfill_wanted)
+syslog5b.BACKFILL_CHUNK = 50   # small enough to interrupt deterministically
+syslog5b.start_index_backfill()
+check("the backfill actually started", syslog5b._backfill_thread is not None)
+time.sleep(0.05)   # let it land a couple of chunks
+syslog5b.close()    # simulate shutdown mid-backfill
+
+check("closing mid-backfill did not mark the index falsely complete",
+     syslog5b.index_ready is False)
+check("...and did not disable full-text search either",
+     syslog5b.fts is True)
+check("...and said so in the event log rather than nowhere",
+     any("paused for shutdown" in m for m in log5b.entries), log5b.entries)
+
+_conn = sqlite3.connect(SYSLOG5)
+_conn.row_factory = sqlite3.Row
+_row = _conn.execute(
+    "SELECT value FROM settings WHERE key = '_fts_backfill_cursor'").fetchone()
+_conn.close()
+resume_cursor = int(_row["value"]) if _row else None
+check("a resume point was persisted, partway through, not at the start or the end",
+     resume_cursor is not None and 0 < resume_cursor < N_MESSAGES, resume_cursor)
+
+log5c = _LogSpy()
+syslog5c = SyslogDatabase(SYSLOG5, log=log5c)
+check("reopening re-arms the backfill from the persisted point rather than "
+     "believing the (already-created) table means it is done",
+     syslog5c._backfill_wanted and syslog5c._backfill_start_cursor == resume_cursor,
+     (syslog5c._backfill_wanted, syslog5c._backfill_start_cursor, resume_cursor))
+syslog5c.start_index_backfill()
+_deadline = time.time() + 10
+while time.time() < _deadline and not syslog5c.index_ready:
+    time.sleep(0.05)
+check("the resumed backfill runs to completion", syslog5c.index_ready)
+check("...without having disabled search along the way", syslog5c.fts)
+
+_conn = sqlite3.connect(SYSLOG5)
+_conn.row_factory = sqlite3.Row
+_cleared = _conn.execute(
+    "SELECT value FROM settings WHERE key = '_fts_backfill_cursor'").fetchone()
+_indexed = _conn.execute("SELECT COUNT(*) AS n FROM logs_fts").fetchone()["n"]
+_conn.close()
+check("the resume marker is cleared once the backfill genuinely finishes",
+     _cleared is None, _cleared)
+check("every message landed in the index exactly once -- resuming from a "
+     "persisted cursor neither skipped rows nor re-indexed them",
+     _indexed == N_MESSAGES, _indexed)
+syslog5c.close()
+
+# A genuine failure (not a stop) still disables search and says so -- the
+# guard above must not have gone the other way and swallowed a real one.
+log5d = _LogSpy()
+syslog5d = SyslogDatabase(SYSLOG5, log=log5d)
+syslog5d._conn.execute("DROP TABLE logs_fts")   # the table _backfill expects
+syslog5d._conn.commit()
+syslog5d._backfill_stop.clear()
+syslog5d._backfill(0, N_MESSAGES, N_MESSAGES)
+check("a genuine (non-shutdown) failure still disables full-text search",
+     syslog5d.fts is False)
+check("...and still says so in the event log",
+     any("Full-text search unavailable" in m for m in log5d.entries), log5d.entries)
+syslog5d.close()
+
+shutil.rmtree(TMPDIR5, ignore_errors=True)
 
 shutil.rmtree(TMPDIR, ignore_errors=True)
 

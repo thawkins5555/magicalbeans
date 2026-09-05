@@ -305,7 +305,11 @@ switches both called "core-sw-1"; a MAC collision is far rarer), a stale
 neighbour row ranked down regardless of match kind, each shown beside which
 protocol saw it and which of the device's own ports it rode in on — and a
 device with more than one plausible match is shown with every candidate
-rather than one silently chosen for it. Accepting one, or a batch of them,
+rather than one silently chosen for it. The demo fleet's personas gained
+real LLDP neighbours and a topology to match this same pass, and the first
+live run of the offline conformance check against them found exactly the
+shape this was built for: `core-sw-01 <-> acc-sw-001`, a chassis-MAC match
+at high confidence. Accepting one, or a batch of them,
 applies them in one transaction, after checking the *whole proposed graph*
 for a cycle no single pair could show on its own — two assignments in the
 same batch, each valid alone, that together point two devices at each

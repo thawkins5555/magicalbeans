@@ -484,6 +484,35 @@ check(not re.search(r"redacted[\s\S]{0,200}(old value|new value|previous value|b
                     _diff_render, re.I),
       "the redacted-diff message does not hint at the old or new value")
 
+# ---------------------------------------------------------------------------
+# 21. The SSH terminal's onclose prefers the server's own explanation over
+#     the fixed CLOSE_WORDS table.
+#
+# sshterm.py closes an idle terminal with code 4408 and a message naming the
+# timeout actually in force ("Closed after 10 minute(s) idle" — the lesser
+# of IDLE_TIMEOUT_S and the live web-session setting), sent first as a
+# status:closed control frame. It arrived, and briefly set #ssh-status
+# correctly — then ws.onclose fired a moment later and overwrote it with
+# CLOSE_WORDS[4408], a fixed, duration-less phrase, because event.reason
+# was never read and the control frame's own message was never kept
+# anywhere onclose could see it. Fixed by stashing the message on the
+# socket itself (ws.__closeMessage, set only when the frame carried one) —
+# not a module-level variable, so a later, unrelated close on a different
+# socket cannot see a previous session's explanation, since a fresh
+# WebSocket object starts with no such property at all. CLOSE_WORDS stays
+# the fallback for the (majority) of closes that carry no message.
+SSH = read("ssh.js")
+check("__closeMessage" in SSH,
+      "ssh.js stashes the server's close message somewhere onclose can read it")
+_onclose = SSH[SSH.index("ws.onclose = (event)"):SSH.index("function closeSocket(")]
+check("ws.__closeMessage" in _onclose,
+      "onclose reads the stashed message")
+check(_onclose.index("ws.__closeMessage") < _onclose.index("CLOSE_WORDS[event.code]"),
+      "onclose checks the stashed message BEFORE falling back to CLOSE_WORDS, not after")
+_handle_control = SSH[SSH.index("function handleControl("):SSH.index("function firstLine(")]
+check("ws.__closeMessage = message.message" in _handle_control,
+      "the status:closed frame's own message is what gets stashed, on the socket that received it")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

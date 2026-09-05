@@ -56,7 +56,9 @@ layer is demonstrably right: a 108-device site outage in this campaign opened 22
 and sent **11 emails**, where the same shape of event at 4.35.0 produced 1,355. The
 collectors decode rather than approximate — 107,000 NetFlow flows and 36,000 syslog
 messages across a deliberate burst, with nothing dropped, rejected or errored. And the
-permission model held under an exhaustive mechanical check of all 213 routes.
+permission model held under an exhaustive mechanical check of all 213 routes at the time
+it was audited — 227 now, the fourteen added later by the ConfigRX and reporting work
+passing the identical standing check with no new exemption needed.
 
 **Where it falls short is not in what it measures but in what it lets you do with what it
 measured.** It keeps 400 days of every metric and cannot produce a report. It holds two
@@ -90,12 +92,25 @@ seeded database whose password had already been changed. That is the class of re
 that appears in neither the performance review nor the security review, because it belongs
 to neither.
 
-**Three of this review's own findings were withdrawn** after evidence contradicted them,
-including one where the database said the opposite of what I had claimed. They are
+**Four of this review's own findings were withdrawn** after evidence contradicted them,
+including two where the database said the opposite of what had been claimed. They are
 recorded in section 2.4 with what replaced them, because a review that reports only what
 it found gives an operator no way to calibrate the rest.
 
-⏳ The 1,000 and 2,000-device tier numbers land in section 5.10 and may change this.
+**The 1,000- and 2,000-device tier numbers (section 5.10) sharpen this rather than change
+it.** Onboarding is quadratic in the number of devices already present — 250 devices at
+2.64 ms each, 2,000 at 23.2 ms each, a tenfold per-device slowdown across an eightfold
+fleet — through the per-device API path the demo harness uses; the bulk-import route that
+has existed since 4.47.0 was not measured, so this is a finding about the slow path, not
+about onboarding as a whole. Polling is the more consequential shape: near-linear to a
+thousand devices, the behaviour an operator would plan around, and then a cliff between
+one and two thousand — a 4.7× slowdown in poll-cycle time for CPU that rose only 15%,
+which rules out "buy a bigger box" and points at something serialising rather than
+computing. The leading candidate — the single SQLite writer every poll result queues
+behind — is a hypothesis the numbers are consistent with, not a measurement; nothing in
+the product records write-lock wait time, which is itself a finding. A further run
+isolating the ping-interval hypothesis was still in progress as this was finished; its
+result would narrow the cause further but would not change the shape already measured.
 
 ## 2. How this was run
 
@@ -191,7 +206,7 @@ constructed independently, that a "before" state was really as described (read o
 `git log -p`, because half the claims in any review are about a state nobody can see any
 more) — and, twice, that a claim was wrong.
 
-**Three findings were withdrawn.** One of mine: I read two HTTP 403s in a console log
+**Four findings were withdrawn, all mine.** O-21: I read two HTTP 403s in a console log
 and concluded the interface was offering controls the server then refused. It was not —
 they were the test harness deliberately probing the permission boundary, a write
 attempted as a read-only account (must fail) and the same write as an operator account
@@ -199,11 +214,56 @@ attempted as a read-only account (must fail) and the same write as an operator a
 could not reproduce it, and declined — which was correct, and is why it is withdrawn
 rather than "fixed" by a change that would have done nothing. **A console log records
 what happened, not what was offered.** Two more were withdrawn as already fixed since the
-last review, and are recorded in section 5.9.
+last review, and are recorded in section 5.9. The fourth, O-59, is recorded in full where
+it was made (section 5.10, "What configuring the topology is actually worth"): I read a
+timestamp adjacency between a rollup's own alert closing and a set of downstream alerts
+opening one tick later, and wrote up a mechanism I had not checked — that the rollup
+missed those alerts and the feature therefore cost more email than not configuring it at
+all. A teammate traced every one of the 86 alerts through both databases; none of it was
+true. What survived the trace (O-59b, O-59c) is narrower and real, and is not what I
+originally reported.
 
 The point of saying this in the report is not modesty. It is that a review which reports
 only what it found, and never what it got wrong, gives an operator no way to calibrate
 the rest.
+
+**And the review was wrong about its own instrumentation twice, which is a different
+failure from being wrong about the product.** A stale figure or a withdrawn causal story
+is a claim that turned out false; an instrument that is not measuring what it claims to
+is a claim that was never checkable in the first place, and this campaign found two.
+`demo/out/tierA/ui/buttons-*-250.json` — the button-census files section 9 cites as
+"every control enumerated... activated against which were not" — were produced by a walk
+that measured activation through a mechanism a later fix changed: navigation had been
+bypassing a real click, so a control could read as never-activated while the page it
+opens had, in fact, been reached. Any coverage figure sourced from those particular files
+undercounts what was actually exercised, and is superseded by the rehearsal run that
+followed the fix (25 devices, no fleet behind them: 94 of 130 controls driven, 9 skipped
+by deliberate policy, 25 not reached with a named list) and, later, by an authoritative
+fleet-backed run at the full tier. As ui-walk put it: **a coverage number is only as
+honest as its instrumentation.** Separately, a permission-gate test for ConfigRX was
+found still asserting a boundary the product had already moved past — the test was
+green, and it was green because it was checking the wrong thing, not because the gate
+was right. Both read as verified. Neither was measuring what it claimed to.
+
+A third, smaller version of the same thing: the 213-route permission audit (section
+5.11) was described in conversation, more than once, as having been checked by
+*mutation testing* — deliberately introducing a mismatch and confirming the check catches
+it. No such harness exists. What is actually in `tests/test_web_gates.py` is an AST-based
+cross-reference with exact-set and exact-count assertions — `PUBLIC_PATHS`,
+`UNGATED_EXPECTED`, a per-module tier count for every one of thirteen modules — which is a
+genuinely strong check and is why the audit could name seven false positives rather than
+zero findings meaning nothing was looked at. But it is not mutation testing, and the
+phrase was caught before it reached this document rather than after, which is the reason
+it is recorded here as a correction rather than silently dropped.
+
+**What the seven corrections and this near-miss have in common is the same failure at
+different depths.** Six were stale prose describing real work that had since moved. The
+seventh, O-59, was a mechanism inferred from a timestamp and written up as measured fact.
+The eighth was a technique named that was never actually run. Each looked like evidence
+and was not, for a different reason — an update that never landed, a story never checked
+against the data that could have settled it, a name for a check stronger than the one that
+existed. A report's credibility does not rest on having been right the first time; it
+rests on being willing to say, in the same document, exactly where it was not.
 
 **Two more things about the conditions this was run in, since they affected results.**
 
@@ -256,8 +316,6 @@ in this same review — Windows console encoding, met from two directions in one
 
 ## 3. What had to change before the product could be evaluated on Windows
 
-⏳ In progress. Established so far:
-
 **W-1 — `netpath/ipam_scan.py` resolves `ping` differently from `netpath/tracer.py`,
 and only one of them honours PATH. CONFIRMED.** `tracer.py:436` calls
 `shutil.which("ping")`; `ipam_scan.py:121-124` returns a bare `["ping", "-n", "1",
@@ -304,9 +362,9 @@ CONFIRMED.** `demo/scenario.py:135-145` reads `/proc/<pid>/stat` and `/status`,
 catches `OSError`, returns `{}`; every CPU% and RSS column in the results is blank —
 which are precisely the numbers a scale campaign exists to produce.
 
-**W-7 — the harness told the application a downed device was reachable, and nothing
-failed. CONFIRMED (measured, then fixed).** Found while analysing the rehearsal run,
-and worth recording because of the *shape* of it rather than the incident.
+**W-7 / O-19 — the harness told the application a downed device was reachable, and
+nothing failed. CONFIRMED (measured, then fixed).** Found while analysing the rehearsal
+run, and worth recording because of the *shape* of it rather than the incident.
 
 `demo/scenario.py`'s `start_app` built the application's environment with `PATH` (so
 the ICMP substitute is found) and `NETPATH_PING_MODE=subprocess` (so the socket path
@@ -348,13 +406,14 @@ All of these are now fixed, and verified independently of the person who fixed t
 - `read_proc` returns a real RSS (21.5 MB for a fresh interpreter) and `cpu_percent`
   reads **100.0** across a one-second busy loop and **0.0** across a one-second sleep.
 
-**W-6 — a Windows deployment finding that came out of fixing W-1, and is about the
-product rather than the harness. CONFIRMED (measured).**
+**W-6 / O-15 / O-22 — a Windows deployment finding that came out of fixing W-1, and is
+about the product rather than the harness. CONFIRMED (measured).**
 `netpath/ipam_scan._icmp_socket_kind()` returns `None` on Windows — verified by
-calling it — so `ping_many()` always takes the subprocess path. The shipped defaults
-are `ping_enabled = 1`, `ping_interval_s = 0` (ping on *every* poll,
-`nodesdb.py:423`) and `ping_count = 3`. At 2,000 devices on a 60-second interval that
-is **6,000 process creations a minute, 100 a second, sustained**.
+calling it — so `ping_many()` always takes the subprocess path, and there is no ICMP
+fast path at all on this platform. The shipped defaults are `ping_enabled = 1`,
+`ping_interval_s = 0` (ping on *every* poll, `nodesdb.py:423`) and `ping_count = 3`. At
+2,000 devices on a 60-second interval that is **6,000 process creations a minute, 100 a
+second, sustained** — which does not fit inside the interval it is meant to serve (below).
 
 Measured properly, eight runs of `ping_many(ip, 3, 1000)` each:
 
@@ -453,7 +512,7 @@ usually turn out to be a regex over the first eighty characters.
 
 ### 5.1 The estate it cannot see
 
-⏳ In progress. Established by exhaustive search of `netpath/`:
+Established by exhaustive search of `netpath/`:
 
 | Device class | What the poller reads | What the operator gets |
 | --- | --- | --- |
@@ -486,11 +545,20 @@ so the question is exactly answerable.
 | Rockwell | **nothing** | unchanged — structurally unreachable, see O-44 |
 | HP | printers: Printer-MIB only | unchanged |
 
-**The Cisco temperature gap was the largest single hole in the product.** 862 of the
-2,000-device estate are Cisco access switches — the switch in an un-air-conditioned
-closet with a UPS under it — and not one of them could report that it was cooking, by any
-route. No vendor entry for the environmental objects, and the platform does not answer
-ENTITY-SENSOR-MIB.
+**O-45 — the Cisco temperature gap was the largest single hole in the product, and it is
+now fixed.** 862 of the 2,000-device estate are Cisco access switches — the switch in an
+un-air-conditioned closet with a UPS under it — and not one of them could report that it
+was cooking, by any route: no vendor entry for the environmental objects, and the
+platform did not answer ENTITY-SENSOR-MIB. Closed with CISCO-ENVMON-MIB's
+`ciscoEnvMonTemperatureStatusValue`, taken as a column maximum so the hottest sensor is
+the one reported — a MIB that predates the CISCO-PROCESS-MIB and CISCO-MEMORY-POOL-MIB
+entries already in use, and among the most widely implemented Cisco MIBs there is.
+Juniper gained `mem_pct` from `jnxOperatingBuffer` in the same pass, off the table its
+existing CPU and temperature columns already come from — worth recording how that one
+was decided: only moderately confident of the OID from memory, the agent found the demo
+Juniper persona, written independently by a different agent, already answering exactly
+that OID with a naming comment. Two independent sources agreeing is why it shipped, and
+why MikroTik's and Aruba's temperature did not (below).
 
 **Aruba was deliberately left alone, and the reasoning is worth quoting.** A CPU-shaped
 OID exists under that arc, but every source places it in ArubaOS's *wireless controller*
@@ -790,6 +858,30 @@ free-text note per device (`nodesdb.py:84-123` has no `notes`, no serial, no ass
 tag, no criticality). On a plant the note an operator most wants to attach is "do not
 reboot during a run" and there is nowhere to put it.
 
+**O-42 — an empty search opens a blocking dialog to say "type at least two characters".
+CONFIRMED (found because it broke an automated walk).** `netpath/web/static/ipam.js:1186`'s
+`searchHosts()` calls `App.modal(...)` unconditionally, so pressing Find with an empty
+box opens a modal whose entire content is a validation message — where every other
+filter control in the product validates inline or simply does nothing. Small on its own,
+but it had a large effect: an automated walk clicked the button, the modal opened, and
+every subsequent click for the rest of that account's pass hit the backdrop and timed
+out — 49 cascading failures from one dialog. An operator does not cascade, but they do
+get a dialog they must dismiss to tell them something the field could have said next to
+itself, at the moment they were in a hurry. A modal is the heaviest instrument in the
+interface and should be reserved for a question, a confirmation, or content that needs
+the page's whole attention; "you typed too little" is none of those.
+
+**O-43 — ten interactive controls have no id and cannot be addressed at all.
+CONFIRMED.** NetFlow's "top ports" list renders ten `<div role="button">` rows carrying
+no id, so nothing can name them — not a test, not a keyboard shortcut, not a deep link,
+not a support instruction ("click the third one" is not one). The same census found a
+bare "Help" button and two per-row Users-grid actions ("Permissions", "Remove") in the
+same state: twelve to fourteen unaddressable controls depending on the account. Minor on
+its own, and worth recording as a class, because it is the difference between a coverage
+claim that can be substantiated and one that cannot — a campaign can honestly say "129
+controls enumerated, 73 activated, here are the other 56 and why" only for controls that
+can be named.
+
 > **Built in this pass, and not yet reachable — state it precisely rather than as either
 > "missing" or "fixed".** `netpath/configrx_search.py` and `netpath/configrx_compliance.py`
 > now exist and implement close to exactly what this finding recommends: a per-line search
@@ -840,37 +932,61 @@ and an alert rule for a device that falls out of compliance. This is the differe
 between a backup tool and a configuration management tool, and it is the most common
 reason an operator keeps paying for a second product.
 
-**O-56 / O-57 — redaction is correct, and it silently removes the tool's ability to
-answer the question a security-conscious operator is asking. One half fixed, one half
-inherent.** Surfaced building the compliance sweep above, against real rule sets on real
-captures, by two different people not looking for either.
+**O-56 / O-57 — redaction is correct and it still costs you an answer. One half
+inherent, one half fixed.** ConfigRX redacts recognised secrets before they leave storage
+in two separate places — the cross-device search index (always, regardless of a device's
+own `store_secrets` setting) and the diff view (unconditionally, even for a device whose
+raw backups are kept verbatim) — because a search box and a comparison view are both
+places a secret must never leak to a reader who has not earned the single-backup download
+permission. That design is not in question. What it costs is a specific, narrow and
+easy-to-miss capability: the tool's ability to tell an operator that a secret's *value*
+changed, as opposed to whether a secret-bearing *directive* is present at all. Found
+independently, hours apart, by two different people looking at two different features —
+worth a sentence on its own, since that is what makes it a design consequence rather than
+a bug somebody happened to notice twice.
 
-O-56: a compliance rule that checks a secret's *value* — "is this SNMP community
-`public`" — cannot fire on a device whose captures are redacted, because redaction
-replaces the value with the literal token `<redacted>` regardless of what it actually
-was: `public` and a good community become the same six characters. A rule checking
-whether a risky *directive* exists at all — Telnet enabled, a plaintext `password 0`
-line — is unaffected, since redaction preserves a directive's shape and removes only its
-content. Demonstrated both ways on the same real capture: the SNMP-default rule fires
-against the verbatim text and silently does not fire against the same text redacted,
-while the plaintext-password rule fires either way. Not a bug and not fixable by
-changing the redaction — it is the direct cost of storing less — but it is exactly the
-shape of a confusing support call ("why didn't this catch our default community?") whose
-answer is a setting on a different page, and it belongs in the rule editor itself,
-where a value-dependent rule could say so.
+**O-56 (compliance).** A rule can ask "does this device have an SNMP community
+configured" and get a correct answer regardless of that device's `store_secrets` setting,
+because the directive's shape survives redaction. But a rule that asks "is the SNMP
+community still the vendor default (`public`/`private`)" is checking the community's
+actual *value* — and `configrx_redact.redact()` maps every recognised secret onto the
+identical literal `<redacted>` token. On a device that stores redacted captures, `public`
+and a properly rotated strong community both collapse to that same token, so the rule
+cannot fire either way: not a false pass, not a false fail, just silently unable to tell
+the two apart. Demonstrated directly, both directions on one real capture: the same
+SNMP-default rule fires correctly against the device's actual capture (`store_secrets`
+on) and cannot fire at all against the identical capture redacted the way a
+`store_secrets`-off device would have stored it.
 
-O-57 is the same defeat in the diff view, and this half **is fixed**. `get_configrx_diff`
-redacts both sides of a comparison unconditionally — the right call, since a comparison
-view must not hand out a secret the single-backup route would withhold — but the old
-response then contradicted itself: it carried `from.sha256`/`to.sha256` that visibly
-differed, alongside `diff: ""`, `additions: 0`, `removals: 0`. An operator asking "did a
-changed enable secret or a rotated community show up" got a clean, reassuring, empty
-diff — the one case where the truth mattered most. Fixed by adding a
-`redacted_only_change` field the route can compute from hashes and redacted text it
-already has, with no new read; `configrx.js` now renders it as a line saying the
-configurations differ only in values that were redacted, rather than staying silent.
-Pinned by `tests/test_security_fixes.py`'s D11 block so a regression here is a visible
-test failure, not a silent one.
+**O-57 (diff), and this half is fixed.** The same collapse has a sharper edge on the diff
+view, because there redaction is applied unconditionally on *both* sides regardless of
+either backup's own storage setting. Two backups whose stored bytes provably differ —
+different SHA-256, computed over the unredacted content before either row is ever
+touched — could still render as a completely empty diff, because the entire difference
+between them lived inside text that maps onto the same `<redacted>` token both times. An
+empty diff is the honest answer for "nothing changed" and for "only a secret's value
+changed," and those are not the same thing to tell an operator who is looking at a diff
+specifically because they suspect a credential was rotated. Fixed: `get_configrx_diff`
+now sets `redacted_only_change` whenever the visible diff is empty but the two backups'
+SHA-256 values differ, so the interface has what it needs to say "something changed here
+that redaction is hiding from you" instead of a bare, reassuring blank — `configrx.js`
+renders it, and `tests/test_security_fixes.py`'s D11 block pins it so a regression here
+is a visible test failure, not a silent one.
+
+The shared point is not "fix the redaction" — weakening it defeats the reason it exists.
+It is that storing less than the full capture is a real, ongoing cost, not a one-time
+tradeoff paid at the point a setting is chosen, and neither compliance nor search
+currently has O-57's equivalent signal: a rule like O-56's stays silently unable to
+answer the one question it was written to ask, with nothing in its result that says so.
+Two places worth it going, beyond documentation: a rule that checks a secret-shaped
+pattern (a community string, a password literal) could be flagged at `add_rule` time —
+not refused, just annotated — as "this rule can only ever fire against a device with
+`store_secrets` on," so an operator writing it learns the limit before trusting a clean
+result across the whole fleet; and `evaluate_device` already knows which lines
+`redact()` would have touched, so a compliance result could carry the same kind of
+"redaction may be hiding something here" signal O-57 now gives the diff view, rather
+than an operator finding out only when O-56 bites them on the day a password actually
+changed.
 
 **O-58 — the retention prune for `netpath.db` is the one place that did not learn the
 lesson its own sibling function is named for, and it runs synchronously off an unrelated
@@ -1029,7 +1145,9 @@ brings us to a caveat that applies to every number in section 5.9.
 against the run's own database, **zero devices had `upstream_id` set**. That is realistic
 for a fresh installation and unrealistic for a site that has done the work. A separate
 run with the topology configured is what establishes what a well-configured site
-actually sees, and it is reported separately. ⏳
+actually sees, and it is reported in section 5.10, "What configuring the topology is
+actually worth" — including O-59's withdrawal, which is itself a product of taking that
+separate run seriously enough to trace rather than eyeball.
 
 **O-52 — half a site's outage alerts arrive at about the moment the site comes back, and
 it is arithmetic rather than a defect. CONFIRMED (direct query, then traced to the two
@@ -1342,7 +1460,7 @@ and sent **11 emails**. The 4.35.0 campaign measured the equivalent event produc
 1,355. That is the difference between a mailbox somebody reads and one they filter away,
 and it is the most valuable thing 4.47.0 shipped.
 
-**Memory is a high-water mark, not a leak.** RSS more than doubled during the flap storm
+**O-28 — memory is a high-water mark, not a leak.** RSS more than doubled during the flap storm
 — 109 MB to 237 MB in 120 seconds, for a storm against *three* devices — and was back to
 103 MB by step 5. Sampling the process directly a minute into that step confirmed
 101.9 MB. So the allocator returns it. What is not established is the scaling factor: a
@@ -1375,6 +1493,20 @@ that is comfortable; the fan-out across ten databases is what Tier C tests.
 The device list is 423 KB for 250 devices — about 1.7 KB each — which at a 500-row page
 is around 845 KB per page on a 2,000-device fleet. It is server-side paged, so that is
 the ceiling rather than the total, but it is a large page for a tablet.
+
+**O-46 — forty long tasks in one browser walk, the longest 228 ms, at a quarter of the
+operator's fleet size. CONFIRMED (Tier A metrics).** The Nodes table filled 250 of 250
+rows in 108 ms and `/api/nodes/devices` returned 422,667 bytes in 18 ms — both good — but
+the same session recorded **40 long tasks, the longest 228 ms**. A long task is the main
+thread blocked past 50 ms: the page is not responding to anything, including a click the
+operator has already made. 228 ms is perceptible, and forty of them across one session is
+not a single bad moment, on a machine with 28 cores and no network in the way. Not
+diagnosed here — the metric records that they happened, not what caused them — but the
+candidates are enumerable: table rendering, the two-second `/api/state` poll, chart
+redraws, the sort. A previous review measured and fixed a Debug-tab case of exactly this
+shape (8,042 DOM mutations per ten idle seconds), so the class is known to occur here and
+known to be fixable. Worth measuring again at the 2,000 tier, where the table is eight
+times the size.
 
 #### What the collectors did, at the end of Tier A
 
@@ -1496,35 +1628,210 @@ site outage to one alert if devices were detected down promptly. The upstream-su
 work built in this pass makes the topology reachable at all; the detection floor decides
 how much good that does.
 
-**O-59 — and on the chained run's own numbers, "halves the noise" is generous: it also
-sent more emails than the un-chained one, in the exact scenario the feature exists for.
-CONFIRMED (direct query against `alerts.db`, not the scenario log).** Half the alert count
-is not half the operator's inbox. Tier T2's own row above — 139 alerts, **14 emails** —
-sent *three more* emails than Tier A's un-chained 228-alert, 11-email run. Fewer incidents
-opened, and more notifications went out. That is not what "the rollup halved the noise"
-predicts, and it does not show up by reading the alert count alone.
+**O-59 — WITHDRAWN AS WRITTEN. The rollup did not miss anything; I connected two true
+numbers with a causal story that was not checked.** I had written this up as "the rollup
+missed 86 of 96 `device_down` alerts, and the chained run sent more email than the
+un-chained one, in the exact scenario the feature exists for" — read from timestamp
+adjacency: 86 downstream alerts opening one tick after the core's own alert had closed.
+Both halves are false, traced all 86 through `device_events` and `alerts` rather than
+taken from the adjacency alone.
 
-The mechanism, from the alert timestamps rather than inference: 96 `device_down` alerts
-opened on the chained run. Nine were rolled up into the core's alert (id 614) and their
-`rollup_note` shows the sweep working exactly as designed. Of the remaining 87, one is the
-core's own alert and **86 are downstream devices that opened with `rolled_up_into IS
-NULL`** — never absorbed at all. The core's own alert opened at T+0 and resolved at
-T+119.6 s; all 86 stragglers opened at T+119.7 s, one tick after the ancestor's alert had
-already closed. There was no open ancestor left to roll them into, so each of the 86 sent
-its own notification instead of being caught by the digest that already covers the parent
-— which is where the extra emails come from.
+The 86 real "down" events landed at T+0 to T+1.5 s alongside the core's, and every one of
+them was **correctly suppressed for the whole outage** — no alert row exists for any of
+them during the outage window. The rollup did exactly what it was built to do. The rows I
+saw at T+119.7 s are not those originals reopening; they are new occurrences deliberately
+raised by `_replay_downstream_outages` (`alertengine.py:775`), which fires once an
+ancestor recovers and re-checks whether each child is genuinely *still* down — so a device
+that is really still broken does not fall silent the moment its upstream clears. Working
+as designed, not a defect. And none of the 86 sent an email: all were held under
+`notify_rollup_delay_s` and cancelled as cleared within the window. The 14-versus-11 email
+difference is real as a count and is not attributable to this mechanism at all — the
+messages in that window are unrelated UPS/NetPath/SNMP notices.
 
-So the rollup itself is not broken twice over — it correctly suppressed the nine it saw in
-time — but its window only ever asks "is an ancestor down *right now*", where the question
-it needs to answer is "was an ancestor down *during the span this child was failing in*".
-[[O-52]]'s six-minute detection floor is why the window closes before most descendants are
-even confirmed down; this is the sharper consequence of that same floor, stated in the
-currency that actually reaches an operator's inbox rather than in alert rows. It gets
-*worse*, not better, as the core recovers faster: the faster the outage clears, the more
-descendants miss the window entirely. A brief outage — the ordinary case, not the
-worst one — is the one this suppresses least.
+What went wrong is specific and worth naming rather than smoothing over: a timestamp
+adjacency was read as a mechanism and the mechanism was written up as measured fact,
+when the database could have answered which it was in one query. It is the same shape of
+error as O-25 — a snapshot inside a short window read as a permanent condition — the
+fourth finding this campaign has had to overturn with evidence rather than three, and
+recorded as such in section 2.4.
 
-⏳ Tier B (1,000) and Tier C (2,000) land here.
+Two narrower findings survive the trace, and are real:
+
+**O-59b — ten of the replayed devices were told they were down after they had already
+recovered. CONFIRMED (10 of 86 traced against their own metric sample nearest the
+alert's `opened_ts`).** `_replay_downstream_outages` decides whom to re-raise by reading
+the live `devices.status` column, which lags that device's own metric sample by a few
+seconds at 165 devices behind one core spread across 32 poll workers. Ten devices had
+already returned to zero loss at the instant an alert opened saying they were down. The
+obvious one-line fix does not work, and was checked rather than assumed: swapping the
+live column read for `_still_true` changes nothing, because `_still_true`'s own `"down"`
+branch (`alertengine.py:656-657`) reads the identical column — same race, same source. A
+real fix is a grace delay before replaying, which changes when an operator is told about a
+genuinely-broken device, so it is not a same-night change.
+
+**O-59c — seventy-six true alerts arrive as seventy-six separate incidents rather than
+one coalesced notice. CONFIRMED (76 of 86 were genuinely still down when re-raised,
+resolving nine to ten seconds later).** These are not wrong: the product is correctly
+asking "this device is still down nine seconds after the site came back — do you want to
+know?" The question is whether that belongs as one alert per device or one notice per
+ancestor. The notification path already protects the operator from the consequence — all
+76 were held and cancelled inside the roll-up window, so no email went out — so the cost
+is in the alert list, not the inbox: 76 rows opening and closing within ten seconds during
+the exact minutes an operator is reading what happened. Coalescing everything a single
+ancestor's replay raises into one notice is the fix, and it is a real change to how that
+path opens alerts. Specified here, not built.
+
+#### Tier B — 1,000 devices, the same nine incidents
+
+**1,000 devices seeded in 10.67 s** (94 a second — an order of magnitude slower per
+device than Tier A's 378 a second, which is O-63 below) and the **first full poll cycle
+finished 50.9 s later.**
+
+| Step | Alerts opened | Cleared | Emails | CPU | RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 · baseline | 383 | 0 | 0 | 123.1 % | 125.4 MB |
+| 2 · core + Site-A down | 1,021 | 956 | 29 | 39.7 % | 132.4 MB |
+| 3 · outage recovery | 1,119 | 379 | 19 | 132.4 % | 136.4 MB |
+| 4 · interface flap storm | 84 | 18 | 6 | 121.3 % | 136.0 MB |
+| 5 · reboot 20 devices | 118 | 47 | 17 | 124.6 % | 137.3 MB |
+| 6 · SNMP auth failure | 78 | 27 | 12 | 124.9 % | 137.3 MB |
+| 7 · trap + syslog burst | 44 | 23 | 8 | 120.6 % | 136.4 MB |
+| 8 · NetFlow burst | 63 | 12 | 11 | 128.6 % | 143.5 MB |
+| 9 · final recovery | 46 | 62 | **49** | 130.6 % | 145.2 MB |
+
+**151 emails across the run, against Tier A's 84** — a run with four times the devices did
+not produce four times the email, which on its own would read as the rollup scaling well.
+It does not survive step 9: see O-64 below.
+
+**CPU at Tier B sits far above Tier A's 11–38 % band — 121–133 % throughout, more than a
+full core.** That is the expected shape of four times the fleet on the same machine, not
+a new finding on its own; what it rules out is covered in O-66's addendum.
+
+**O-63 — adding devices one at a time is quadratic in the number of devices already
+present. CONFIRMED (three points on the curve, measured by the harness itself).**
+
+| devices | seed time | per device |
+| ---: | ---: | ---: |
+| 250 | 0.661 s | 2.64 ms |
+| 1,000 | 10.67 s | 10.67 ms |
+| 2,000 | 46.35 s | 23.2 ms |
+
+Four times the devices cost 16.1× the time; twice the devices cost 4.3×. Both are the
+n² signature to within measurement noise, and the per-device figure — the number that
+would stay flat if this were linear — quadruples across the range. Each device added
+costs more because of the devices already there. Extrapolating the same curve, a
+5,000-device estate takes roughly five minutes to load and a 10,000-device one roughly
+twenty, for what is conceptually 10,000 inserts.
+
+The measured path is `POST /api/nodes/devices` once per device, which is what the harness
+uses. **`POST /api/nodes/devices/bulk-import` has existed since 4.47.0 and was not
+measured**, so the honest statement is that the per-device path is quadratic and the bulk
+path is unknown, not that onboarding itself is quadratic. That distinction matters: an
+operator loading a plant inventory from a CSV may never touch the slow path, while one
+adding devices from a discovery scan or a script certainly does. Not a crisis on its own
+— nobody rebuilds an estate often — but it is the shape that matters: a per-request cost
+that grows with table size is the same defect class this campaign has now found five
+times in decoders and delete paths, appearing in the write path instead.
+
+**O-64 — alert opens are digested. Recoveries are not. So the product is loudest at the
+moment things get better. CONFIRMED (code path read, and the step-9 mail breakdown
+matches exactly).** `_notify_clear` (`alertengine.py:2621`) calls `_notify` directly with
+no digest branch of any kind; only opens ever reach `_sweep_notify_rollup`'s
+`DIGEST_THRESHOLD` and `_send_digest`. A clear is always sent individually, uncapped.
+
+Tier B's step 9 — an ordinary recovery, flaps stopping and SNMP auth being restored —
+produced **49 emails, more than the 29 the site outage itself produced two steps
+earlier.** The breakdown is exactly what the code predicts: six digests covering that
+step's own alert opens, then a wall of individual "X has recovered" and "X /
+GigabitEthernetY has recovered" messages, one per interface that stopped flapping and one
+per auth failure that cleared. An operator resolving a hundred flapping ports gets a
+hundred emails for doing the right thing — the mechanism that would prevent it already
+exists and is simply not wired to this side. The consequence is worse than the volume:
+this trains an operator to ignore recovery mail, which is the category that contains
+"and this one did not come back." Specified in full and deliberately not built this pass
+(section 8).
+
+**O-65 — detection time does not degrade much with fleet size, but its spread does, and
+the spread is what an operator actually experiences. CONFIRMED (measured per device from
+the first sample recording ≥99% ping loss).**
+
+| | devices measured | min | max | mean | median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 250 | 108 | 125.3 s | 126.8 s | 125.7 s | 125.6 s |
+| 1,000 | 395 | 133.5 s | 197.2 s | 153.7 s | 150.0 s |
+
+The mean moved 22%. **The range went from 1.5 seconds to 64 seconds.** At 250 devices
+every device is detected at essentially the same moment; at 1,000 a tail takes up to
+197 s. This is what quiet degradation looks like: the average barely moves, so nothing
+looks wrong on a dashboard that only shows the mean, while some fraction of a large
+fleet is noticed materially later, and which devices fall in that tail changes run to
+run. Method note worth keeping for whoever repeats this: `device_events`' own "down"
+timestamp is useless for this measurement — it is copied straight into the alert's
+`opened_ts` by construction, so the gap is trivially 0.0 s at every scale and measures
+nothing. The ping-loss sample is the only honest proxy available.
+
+#### Tier C1 — 2,000 devices, first two numbers
+
+**2,000 devices seeded in 46.35 s, first full poll cycle 238.7 s, baseline CPU 141.0%,
+RSS 156.8 MB.** C1 is still running as this section is written; the full nine-incident
+table is not yet in hand and will not be guessed at here.
+
+**O-66 — the first full poll cycle scales acceptably to 1,000 devices and then falls off
+a cliff. CONFIRMED (three tiers, same frozen commit, same machine).**
+
+| devices | seed | per device | first full poll cycle | per device |
+| ---: | ---: | ---: | ---: | ---: |
+| 250 | 0.661 s | 2.64 ms | 10.0 s | 40.0 ms |
+| 1,000 | 10.67 s | 10.67 ms | 50.9 s | 50.9 ms |
+| 2,000 | 46.35 s | 23.18 ms | 238.7 s | 119.3 ms |
+
+Fitting time ~ nᵏ between adjacent tiers separates two different problems a single ratio
+would have hidden:
+
+| | seed k | poll k |
+| --- | ---: | ---: |
+| 250 → 1,000 | 2.01 | 1.17 |
+| 1,000 → 2,000 | 2.12 | 2.23 |
+
+**Seeding is quadratic across the whole range** — uniform, predictable, and the subject
+of O-63 above. **Polling is a different shape entirely.** It is near-linear up to a
+thousand devices, which is the behaviour an operator would expect and plan around, and
+then degrades sharply between one and two thousand. That is not an algorithm that was
+always quadratic; that is a resource ceiling being reached somewhere between the two
+tiers. The per-device cost is flat-ish from 250 to 1,000 (40.0 → 50.9 ms) and then more
+than doubles (→ 119.3 ms). Why the distinction decides what to do about it: a uniformly
+quadratic algorithm has to be rewritten, while a cliff means something specific
+saturates — a worker pool, a subprocess spawn rate, a socket budget — and raising that
+one limit may move the cliff without touching the design.
+
+The most likely candidate is measurable rather than arguable: at the shipped
+`ping_interval_s = 0` every device is pinged on every poll, and on Windows that is three
+sequential `ping.exe` subprocesses per device (O-15/O-22), measured at ~15.6 ms per probe
+on a live device and about 3.0 s on a dead one. **Tier C2 runs the identical 2,000-device
+scenario with `--ping-interval 300` and nothing else changed**, which isolates that
+hypothesis: if C2's first full poll cycle comes back near the linear projection of
+~100 s, ping is the cliff and the fix is a default, not a rewrite. If C2 lands near C1's
+238.7 s, the ceiling is somewhere else and this stays open. ⏳ C2's own number lands here
+once it completes.
+
+**O-66, addendum — the cliff is not CPU, and that narrows it usefully.** Baseline-step
+CPU across the three tiers: 23.8% at 250, 123.1% at 1,000, 141.0% at 2,000. Between the
+last two the poll cycle took 4.7 times longer while CPU rose by only 15%. On a 28-core
+machine 141% is 1.4 cores — the process is not compute-bound and is nowhere near the
+hardware's limit. So the cliff is something serialising, not something computing. That
+rules out the explanation people reach for first ("it needs a bigger box") and points
+instead at a resource only one thing can hold at a time. The architecture names an
+obvious candidate: one SQLite writer behind one lock, with every polled device's results
+going through it, while thirty-two poll workers can gather concurrently and then queue to
+write.
+
+This is worth stating carefully rather than asserted, because it is a hypothesis
+consistent with the numbers, not a measurement: what would settle it is the write-lock
+wait time per poll cycle, which nothing currently records. That absence is itself worth
+noting — an operator asking "why is my 2,000-device poll cycle four minutes" has no
+instrument in the product that can answer, and neither did this campaign. Tier C2 still
+discriminates the ping hypothesis first; if C2 comes back near C1, ping is not the cliff
+and the serialisation explanation gains weight.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
 Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
@@ -1616,7 +1923,8 @@ the first two being fixed — the macro-clause `::=` scan and the IMPORTS symbol
 scan. All three are "scan forward for a terminator that may not be there". The class was
 fixed twice by patching instances.
 
-**And a fourth phase has the same exposure, bounded. CONFIRMED by independent check.**
+**O-34 — and a fourth phase has the same exposure, bounded. CONFIRMED by independent
+check.**
 The agent who fixed the above reported that `_strip_comments_and_strings` was the *only*
 phase called without internal checkpointing. Verification refuted that:
 `_iter_macro_clauses` is a generator whose per-header work is invisible to the caller's
@@ -1680,15 +1988,23 @@ and 500,000 unbounded `::= {}` assignments.
 
 #### The permission model, checked mechanically and found sound
 
-**No route's gate disagrees with its handler, across all 213 routes. CONFIRMED
-(exhaustive, mechanical).** The route table in `netpath/web/server.py` was AST-parsed
-into 213 `(method, pattern, handler, requirement)` tuples, and every handler's body
-AST-walked — recursing four levels into other handlers it calls — for write evidence:
+**No route's gate disagrees with its handler, across all 213 routes at the time this was
+audited — 227 now. CONFIRMED (exhaustive, mechanical).** The route table in
+`netpath/web/server.py` was AST-parsed into 213 `(method, pattern, handler, requirement)`
+tuples, and every handler's body AST-walked — recursing four levels into other handlers it
+calls — for write evidence:
 `execute`/`executemany` with INSERT / UPDATE / DELETE / REPLACE, or any call whose
 attribute name carries a write verb. Seven routes were flagged and all seven are false
 positives on reading: `post_login`'s pre-authentication credential bookkeeping, five
 routes matching `hostresolve.resolve_name` (a pure lookup), and `get_nodes_device`
 matching `alerts_db.mute_row` (a SELECT for the active mute).
+
+That cross-reference now runs at test time against the same seven-entry allow-list,
+rather than being a one-off — the difference between "we checked once" and "it cannot
+regress" — and it is the reason the fourteen routes the ConfigRX search, compliance and
+reporting work added later in this same pass could pass the identical check with no new
+allow-list entry needed, rather than requiring a second by-hand audit. The table stands
+at 227 routes now; the check, not a repeated count, is what kept that difference honest.
 
 The two routes whose gate is a function of the request body were read by hand and are
 correct. `_settings_requirement` is worth quoting as evidence of how this codebase
@@ -1804,11 +2120,11 @@ network engineer does not use them.
 **The one thing to take from this review if you take nothing else.** Twice in one night,
 from opposite directions, this campaign found a number that nobody had multiplied out:
 
-- `down_after_failures` **3** × `poll_interval_s` **120 s** = a **six-minute** detection
-  floor, and an outage shorter than three poll cycles never reported at all.
-- `max_hops` **255** × `probes` **20** × `timeout_s` **30 s** = a **42.5-hour** ceiling on
-  a single hung traceroute on Windows — in bounds this campaign had itself added a few
-  hours earlier, each one justified against its own mechanism.
+- O-52: `down_after_failures` **3** × `poll_interval_s` **120 s** = a **six-minute**
+  detection floor, and an outage shorter than three poll cycles never reported at all.
+- O-55: `max_hops` **255** × `probes` **20** × `timeout_s` **30 s** = a **42.5-hour**
+  ceiling on a single hung traceroute on Windows — in bounds this campaign had itself
+  added a few hours earlier, each one justified against its own mechanism.
 
 Every individual value in both is defensible and documented. Both products are
 indefensible and undocumented. Neither is visible from reading either setting, and
@@ -1839,12 +2155,9 @@ deliberately, in the knowledge of what they multiply to, on the first day — an
    `configrx.js` catches up with the work already sitting behind it.
 3. **Alert routing is one mailing list.** O-6, O-7. Every recipient gets everything,
    so within a month nobody reads any of it.
-4. **The rollup needs two thousand manual edits before it works — and even configured,
-   it currently sends more email for a fast outage than an unconfigured install does.**
-   O-4, O-52, O-59. Until the upstream field is set a site outage is a mailbox full of
-   alerts; once it is set, the six-minute detection floor means most descendants miss
-   the ancestor's window entirely and notify on their own, which is the same problem
-   in a more expensive shape.
+4. **The rollup needs two thousand manual edits before it works.** O-4, O-52. Until the
+   upstream field is set a site outage is a mailbox full of alerts, which is the same as
+   no alerts.
 
 **Would cost me real time every week**
 
@@ -1885,8 +2198,6 @@ deliberately, in the knowledge of what they multiply to, on the first day — an
 ---
 
 ## 7. What was fixed in this pass
-
-⏳ Assembled as the work lands. Confirmed so far:
 
 ### The one this review broke itself
 
@@ -2228,6 +2539,20 @@ Right call; the evaluator change is real work with real blast radius across ever
 existing rule, and it belongs in its own pass. It is the highest-ranked item in the
 backlog.
 
+**A digest for recovery mail, and coalescing for a rollup's own replay.** Two email-volume
+fixes, both specified in full and both declined this pass because each is a real change to
+when and how an alert opens or sends, not a one-line patch. O-64: `_notify_clear`
+(`alertengine.py:2621`) calls `_notify` directly with no digest branch, where an alert open
+already has one (`_sweep_notify_rollup`'s `DIGEST_THRESHOLD`/`_send_digest`) — measured at
+49 recovery emails against the 29 the outage itself produced two steps earlier (section
+5.10, Tier B). O-61: two rules describing one condition on one device — `ups_battery_low`
+and `ups_battery_replace` — send two independent "has recovered" emails rather than one
+alert whose severity moved. Both are specified rather than built because wiring a digest
+onto the clear path changes the notification contract for every existing rule, and
+coalescing two rules' notifications on one device needs a notion of "these two describe
+the same fact" that does not exist in the schema yet — real work with real blast radius,
+the same standard applied to the threshold-direction item above.
+
 **Per-device bulk-action attribution in the audit trail.** A bulk update, delete or
 import cannot carry a filterable per-device target without either overflowing the
 256-character target field on any real-sized batch, or a join table. So "was device N
@@ -2282,9 +2607,10 @@ independent re-measurement that confirmed time-per-element stays flat once the c
 disabled.
 
 **The route-gate cross-reference**, now a permanent check in `tests/test_web_gates.py`
-rather than a one-off: 213 routes parsed from the table, every handler walked for write
-evidence, seven named false positives, and exact expected sets for the ungated routes and
-the public paths.
+rather than a one-off: 213 routes parsed from the table at audit time (227 now — the
+fourteen added since all pass the identical standing check), every handler walked for
+write evidence, seven named false positives, and exact expected sets for the ungated
+routes and the public paths.
 
 **The test suites.** Baseline before the campaign: 53 of 53 green. ⏳ Final count lands
 here. Every new suite added by this work is listed in section 7.

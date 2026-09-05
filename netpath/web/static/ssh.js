@@ -362,7 +362,7 @@
         } catch (error) {
           return;
         }
-        handleControl(message);
+        handleControl(message, ws);
         return;
       }
       const bytes = new Uint8Array(event.data);
@@ -381,6 +381,22 @@
       socket = null;
       if (event.code === 4401) {
         window.location.href = '/login';
+        return;
+      }
+      // The server's own status:closed control frame (handleControl, below)
+      // already said something specific when it had something specific to
+      // say — "Closed after 10 minute(s) idle" for an idle timeout capped
+      // by the operator's own live web-session setting, which
+      // CLOSE_WORDS[4408]'s fixed phrase cannot express since it has no
+      // idea what that setting currently is. Read off the socket itself
+      // (ws.__closeMessage, set only when that frame carried a real
+      // message), never a module-level variable, so it can only ever be
+      // the explanation THIS close accompanied — a later, unrelated close
+      // on a different socket starts with nothing stashed and falls
+      // through to CLOSE_WORDS exactly as before.
+      if (ws.__closeMessage) {
+        setStatus('closed', ws.__closeMessage);
+        setNotice(`${ws.__closeMessage}.`, event.code >= 4400 ? 'warn' : '');
         return;
       }
       const words = CLOSE_WORDS[event.code];
@@ -403,7 +419,7 @@
     } catch (error) { /* already gone; nothing to be done about it */ }
   }
 
-  function handleControl(message) {
+  function handleControl(message, ws) {
     switch (message.type) {
       case 'status':
         if (message.state === 'connected') {
@@ -414,6 +430,12 @@
         } else if (message.state === 'connecting') {
           setStatus('connecting', message.message || 'Connecting…');
         } else {
+          // Stashed on the socket itself, not overwritten with a blank
+          // one when this frame carries no message of its own — ws.onclose
+          // reads this before falling back to CLOSE_WORDS, and only when
+          // there is something worth preferring over that table's fixed
+          // phrase for the code the close actually arrives with.
+          if (ws && message.message) ws.__closeMessage = message.message;
           setStatus('closed', message.message || 'Disconnected');
         }
         break;
