@@ -84,6 +84,53 @@ WLC_CONFIG = "\n".join(
        for i in range(1, 65)]
     + ["Number of Access Point.................... 48", "Configuration saved..."])
 
+# Four access-switch configs for demo/configrx_compliance_fixture.py — real
+# capture text with deliberate, isolated compliance differences, not four
+# variations on one theme. acc-compliant passes every rule; the other three
+# each fail a DIFFERENT one (or, acc-legacy, several at once, the way a
+# genuinely neglected switch does), so the fixture's rule set has both
+# something to catch and a control that proves it is not just failing
+# everything. See that script for the rule set these lines are written
+# against.
+ACC_COMPLIANT_CONFIG = "\n".join(
+    ["!", "! Last configuration change at 09:00:00 UTC", "version 15.2",
+     "hostname acc-sw-101", "!",
+     "ntp server 10.10.0.1",
+     "snmp-server community PlantRO2026 RO",
+     "enable secret 5 $1$abc$AAAAAAAAAAAAAAAAAAAAAA",
+     "username admin privilege 15 secret 5 $1$def$BBBBBBBBBBBBBBBBBBBBBB"]
+    + [f"interface GigabitEthernet1/0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}\n switchport port-security\n spanning-tree portfast"
+       for i in range(1, 25)]
+    + ["!", "line vty 0 4", " transport input ssh", "!", "end"])
+ACC_NO_NTP_CONFIG = "\n".join(
+    ["!", "! Last configuration change at 09:05:00 UTC", "version 15.2",
+     "hostname acc-sw-102", "!",
+     "snmp-server community PlantRO2026 RO",
+     "enable secret 5 $1$abc$AAAAAAAAAAAAAAAAAAAAAA",
+     "username admin privilege 15 secret 5 $1$def$BBBBBBBBBBBBBBBBBBBBBB"]
+    + [f"interface GigabitEthernet1/0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}\n switchport port-security\n spanning-tree portfast"
+       for i in range(1, 25)]
+    + ["!", "line vty 0 4", " transport input ssh", "!", "end"])
+ACC_LEGACY_CONFIG = "\n".join(
+    ["!", "! Last configuration change at 02:14:00 UTC", "version 12.2",
+     "hostname acc-sw-103", "!",
+     "ntp server 10.10.0.1",
+     "snmp-server community PlantRO2026 RO",
+     "username tempadmin password 0 letmein123",
+     "enable password 7 06075218021C0E1D"]
+    + [f"interface FastEthernet0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}"
+       for i in range(1, 25)]
+    + ["!", "line vty 0 4", " transport input telnet", "!", "end"])
+ACC_DEFAULT_SNMP_CONFIG = "\n".join(
+    ["!", "! Last configuration change at 09:10:00 UTC", "version 15.2",
+     "hostname acc-sw-104", "!",
+     "ntp server 10.10.0.1",
+     "snmp-server community public RO",
+     "enable secret 5 $1$ghi$CCCCCCCCCCCCCCCCCCCCCC"]
+    + [f"interface GigabitEthernet1/0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}\n switchport port-security\n spanning-tree portfast"
+       for i in range(1, 25)]
+    + ["!", "line vty 0 4", " transport input ssh", "!", "end"])
+
 PERSONAS = {
     "cisco":         {"banner": "acc-sw-001 line 2\n\nacc-sw-001#", "prompt": "acc-sw-001#",
                       "pager_off": ["terminal length 0"], "show": "show running-config",
@@ -134,6 +181,22 @@ PERSONAS = {
     "cisco-wlc":     {"banner": "(Cisco Controller) > ", "prompt": "(Cisco Controller) >",
                       "pager_off": ["config paging disable"], "show": "show run-config",
                       "config": WLC_CONFIG, "mode": "normal"},
+    # demo/configrx_compliance_fixture.py's four access switches — same
+    # commands as "cisco" above, real captures with deliberately different
+    # compliance-relevant content rather than a fifth capture-mechanics
+    # edge case.
+    "acc-compliant": {"banner": "acc-sw-101#", "prompt": "acc-sw-101#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": ACC_COMPLIANT_CONFIG, "mode": "normal"},
+    "acc-no-ntp":    {"banner": "acc-sw-102#", "prompt": "acc-sw-102#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": ACC_NO_NTP_CONFIG, "mode": "normal"},
+    "acc-legacy":    {"banner": "acc-sw-103#", "prompt": "acc-sw-103#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": ACC_LEGACY_CONFIG, "mode": "normal"},
+    "acc-default-snmp": {"banner": "acc-sw-104#", "prompt": "acc-sw-104#",
+                      "pager_off": ["terminal length 0"], "show": "show running-config",
+                      "config": ACC_DEFAULT_SNMP_CONFIG, "mode": "normal"},
 }
 
 DEFAULT_HOST_KEY_PATH = pathlib.Path(__file__).with_name("fake_ssh_host_key")
