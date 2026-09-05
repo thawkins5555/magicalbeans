@@ -192,7 +192,7 @@ def instant_run_trace(host, **kwargs):
 service3.db.record_trace = closed_db_record_trace
 # 3a/3b call _run_one directly rather than through a real trace, so they do
 # not depend on this host actually having a working tracert/traceroute —
-# see REVIEW-OPERATOR-4.49.md's W-1/W-2 on how little that can be assumed.
+# see REVIEW-OPERATOR-4.50.md's W-1/W-2 on how little that can be assumed.
 monitor_mod.run_trace = instant_run_trace
 
 # 3a. Forced directly rather than by racing a real shutdown against a real

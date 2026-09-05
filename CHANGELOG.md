@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.50.0 — The last mile, walked](#4500--the-last-mile-walked)
 - [4.49.0 — The estate it couldn't see](#4490--the-estate-it-couldnt-see)
 - [4.48.0 — The interface, reviewed](#4480--the-interface-reviewed)
 - [4.47.0 — A fleet operator's list, answered](#4470--a-fleet-operators-list-answered)
@@ -117,16 +118,91 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.50.0 — The last mile, walked
+
+An overnight evaluation campaign for 4.49.0 was cut off mid-run when a Windows
+update closed the terminal. This release finishes it, and what finishing it
+found was that three complete features had been built, routed, tested — and
+left with no way to reach them.
+
+**Reporting, config search and compliance had no screens.** `netpath/report.py`
+is 603 lines behind three test suites and answers availability and top-N over
+the 400 days of metrics this product keeps; the evaluation's own verdict says
+in as many words that the product "keeps 400 days of every metric and cannot
+produce a report". It could. Nobody could ask it. Twelve ConfigRX routes for
+cross-device configuration search and compliance rule sets were in the same
+state, and the audit trail was the same defect inverted: a complete Settings
+screen with filters, paging and route-driven prefill, sitting on a handler that
+still answered the old cursor shape, so every filter an administrator touched
+returned an apology the frontend had been written in advance to print. All four
+are reachable now.
+
+**Config search would have shipped almost entirely empty.** The index was
+written only from inside the branch taken when a capture *differs* from the
+stored one, with one caller, no sweep and no backfill — so a device captured
+`unchanged`, which is the steady state of a well-run network, was invisible to
+search permanently. That is exactly backwards: you search for
+`snmp-server community public` to find the boxes nobody has touched. Found by
+running the feature rather than reading it — a fresh backup returned
+`unchanged`, the line table stayed at zero rows, and the query returned nothing
+while reporting that it was indexed. Compliance had the rescue that search
+lacked, an hourly sweep. Every successful capture indexes now, and a bounded
+backfill means an existing install is not blind until its devices happen to
+change.
+
+**Trace retention in days had never once been enforced.** The maintenance pass
+trimmed that database to a size cap and never called the age prune, so a
+configured retention period did nothing unless somebody clicked a button.
+Wiring it in exposed something worse: the setting had no server-side floor, and
+a prune of zero days computes a cutoff of *now*. Harmless while it needed a
+click; with an automatic pass every fifteen minutes it would have deleted every
+trace, silently, for ever. The Settings input has said `min="1"` all along.
+
+**You could not find a device by anything you knew about it.** Search matched
+address, name and sysName. Location, model, description and vendor are all
+stored on the row and returned in every payload, and none of them were
+searched — so in a plant of two thousand endpoints, "the Moxa in Site-B" was
+unfindable unless you already knew the name you were looking for.
+
+**A silent fallback was costing 105 seconds a poll cycle.** The poller prefers
+an ICMP socket and falls back to spawning `ping` per probe when it cannot open
+one. Windows has no unprivileged ICMP socket, so a Windows install takes the
+fallback — roughly a hundred process spawns a second at two thousand devices —
+and nothing anywhere said so. Measured: a first full poll cycle of 238.7 s at
+2,000 devices against 133.7 s with the ping interval widened, and baseline CPU
+of 141% against 103%. Which path is chosen has not changed. Whether you can
+find out has.
+
+**The tab strip stopped losing its own boundaries.** The overflow fade never
+recomputed when the alerts badge changed width — the observer the comment
+credited with covering that case cannot see a child grow inside a scrolling
+flex item — and a group's hairline was owned by a single tab, so hiding that
+one tab by permission deleted the divider for the whole group while its other
+tabs still rendered. The boundary belongs to the group now. An operator
+reported still seeing the retired NOW/INVENTORY/TELEMETRY/ADMIN labels; they
+were looking at 4.48.0, and a 27-combination sweep across three accounts,
+three themes and three viewports now proves their absence rather than asserting
+it once.
+
+ConfigRX also learns industrial platforms, because roughly one device in five
+in a plant estate could be monitored and not backed up. The forced
+password-change check on a pristine install — the guard for the worst defect
+the 4.49 campaign found — ran only by hand and now runs in CI.
+
+79 test suites, all passing, up from 53 two releases ago.
+`REVIEW-OPERATOR-4.50.md` is the operator's own record, including what it got
+wrong and corrected.
+
 ### 4.49.0 — The estate it couldn't see
 
 A network engineer evaluated the product from the seat of a real plant: one
-site, roughly 2,000 endpoints, one person to run it. `REVIEW-OPERATOR-4.49.md`
+site, roughly 2,000 endpoints, one person to run it. `REVIEW-OPERATOR-4.50.md`
 is the record, run against a simulated estate rebuilt to match — access
 switches, industrial switches, PLCs, wireless bridges, and, new this pass,
 UPSs, an environmental monitor, printers and Windows hosts, because a plant is
 mostly things plugged *into* the network rather than things with a routing
-table of their own. The campaign is still running; this is what has landed
-from it so far, not its conclusion.
+table of their own. That campaign was interrupted before it finished; 4.50.0
+below is its conclusion.
 
 **The product could not see a UPS, and now it can.** Nothing before this
 release ever polled `1.3.6.1.2.1.33` (UPS-MIB, RFC 1628) — a UPS's own traps

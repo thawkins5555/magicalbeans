@@ -1,16 +1,25 @@
-# SappiWhere 4.49.0 — a plant network engineer's evaluation
+# SappiWhere 4.50.0 — a plant network engineer's evaluation
 
-*This document is being written as the campaign runs. Sections marked ⏳ are not
-finished. Nothing below is a placeholder for a number that was never measured — a
-figure appears here only once something produced it.*
+*This document was written as the campaign ran, and is now closed. Nothing below is
+a placeholder for a number that was never measured — a figure appears here only
+once something produced it. Where an earlier section of this same document turned
+out to be wrong, or was overtaken by a fix made later the same night, that is said
+in place rather than quietly edited away — section 2.4 collects why that matters.*
 
-Reviewed from commit `51ebbe8` (4.48.0) on 2026-09-04, on the branch
-`claude/operator-demo-4-49-0`, from the seat of the person who would have to live
-with this software: a network engineer responsible for one large plant site of
-roughly 2,000 endpoints — access switches, industrial switches, access points,
-point-to-point wireless bridges, PLCs and UOCs, PCs, printers, tablets, servers,
-UPSs and Room Alert environmental units — who already runs an enterprise monitoring
-platform and is deciding whether this one would replace it.
+Reviewed from commit `51ebbe8` (4.48.0) on 2026-09-04, starting on the branch
+`claude/operator-demo-4-49-0`. The overnight campaign that branch was named for was
+cut off by a Windows update at 02:11 with one tier still running; the work it left —
+closing the last two open questions, fixing what driving the finished features
+turned up, and a second pass across everything this document called out as
+unreachable through the interface — is folded into this same document rather than a
+sequel, and the release it produced ships as **4.50.0**. From the seat of the person
+who would have to live with this software: a network engineer responsible for one
+large plant site of roughly 2,000 endpoints — access switches, industrial switches,
+access points, point-to-point wireless bridges, PLCs and UOCs, PCs, printers,
+tablets, servers, UPSs and Room Alert environmental units — who already runs an
+enterprise monitoring platform (compared here against SolarWinds NPM, LibreNMS/
+Zabbix and Auvik/Domotz — section 6) and is deciding whether this one would replace
+it.
 
 The question throughout is not "is the code correct". It is: **would this make my
 job faster, does it survive my site, and what would make me choose it?**
@@ -61,12 +70,17 @@ it was audited — 227 now, the fourteen added later by the ConfigRX and reporti
 passing the identical standing check with no new exemption needed.
 
 **Where it falls short is not in what it measures but in what it lets you do with what it
-measured.** It keeps 400 days of every metric and cannot produce a report. It holds two
-thousand device configurations and, until this pass, could not answer a question about
-them. It collects the topology and would not let you use it. It writes an audit trail
-nobody can read. In each case the data is already on disk and the last mile is missing,
-which is good news for a roadmap and bad news for the operator who needs the answer this
-month.
+measured — and that gap closed further, twice, before this document was done.** It kept
+400 days of every metric and could not produce a report; it now can, from a screen, with
+CSV export (section 5.9). It held two thousand device configurations and could not answer
+a question about them; search and compliance now have screens too (section 5.6). It wrote
+an audit trail nobody could read; the screen had existed since checkpoint 13 and the route
+that was supposed to feed it did not — that is fixed now as well (section 5.8). What is
+still true after all three: it collects the topology and would not let you use it, and the
+audit trail that can finally be read still does not cover the engineering changes an
+outage post-mortem actually asks about. In each of the four, the pattern is the same —
+the data was already on disk and the last mile was missing — which is good news for a
+roadmap and was bad news for the operator who needed the answer that month.
 
 **The single most important thing this review found is not a bug.** With shipped defaults
 — `down_after_failures = 3` and `poll_interval_s = 120` — **a dead device is reported
@@ -106,11 +120,20 @@ about onboarding as a whole. Polling is the more consequential shape: near-linea
 thousand devices, the behaviour an operator would plan around, and then a cliff between
 one and two thousand — a 4.7× slowdown in poll-cycle time for CPU that rose only 15%,
 which rules out "buy a bigger box" and points at something serialising rather than
-computing. The leading candidate — the single SQLite writer every poll result queues
-behind — is a hypothesis the numbers are consistent with, not a measurement; nothing in
-the product records write-lock wait time, which is itself a finding. A further run
-isolating the ping-interval hypothesis was still in progress as this was finished; its
-result would narrow the cause further but would not change the shape already measured.
+computing. The run that isolated the ping-interval hypothesis (Tier C2, O-66) landed
+before this document closed: widening `ping_interval_s` to 300 cut the first cycle by
+44% and baseline CPU by 27%, so ping is most of the cliff — but only about three
+quarters of the excess over a linear projection, not all of it. **A residual ~32
+seconds at 2,000 devices is not explained by ping and this campaign did not find what
+is.** The single SQLite writer every poll result queues behind remains the leading
+candidate for that residual — still a hypothesis the numbers are consistent with, not a
+measurement; nothing in the product records write-lock wait time, which is itself a
+finding. Separately, and worth its own sentence: the measurement was taken on the code
+path the product does not prefer. The shipped default is an ICMP socket, and only
+Windows's own inability to open one unprivileged forces the subprocess fallback this
+campaign measured — so the cliff is real for this operator, on this platform, and
+substantially smaller on Linux. The product did not say which path it was using until
+this pass added it to the Debug page.
 
 ## 2. How this was run
 
@@ -214,7 +237,7 @@ attempted as a read-only account (must fail) and the same write as an operator a
 could not reproduce it, and declined — which was correct, and is why it is withdrawn
 rather than "fixed" by a change that would have done nothing. **A console log records
 what happened, not what was offered.** Two more were withdrawn as already fixed since the
-last review, and are recorded in section 5.9. The fourth, O-59, is recorded in full where
+last review, and are recorded in section 5.11. The fourth, O-59, is recorded in full where
 it was made (section 5.10, "What configuring the topology is actually worth"): I read a
 timestamp adjacency between a rollup's own alert closing and a set of downstream alerts
 opening one tick later, and wrote up a mechanism I had not checked — that the rollup
@@ -690,6 +713,45 @@ shortening the names and re-grouping are both off the table — and shortening w
 table deliberately, because FORTIWIRELESS was renamed to be honest about being
 FortiGate-only.
 
+**Closed this pass: the operator's own complaint, proven gone rather than asserted
+gone.** `tests/ui/check_group_labels_matrix.mjs` drove the live build across 27
+combinations — three accounts (admin, viewer, noc) x three themes (dark, light,
+contrast) x three viewports (1600x1000, 850x900, 350x700) — and found NOW,
+INVENTORY, TELEMETRY and ADMIN nowhere in the strip in any of them. The descriptors
+the operator reported were real, but from the 4.48.0 build: `<div class="tab-group"
+data-label="Now">` with `content: attr(data-label)` at that version's `app.css:259`.
+4.49.0 removed both, and this matrix is the wider proof the four existing tests that
+already guarded their absence had not produced.
+
+**Two further nav defects surfaced while proving that, and both are fixed — neither
+had a test before, and one of them corrects something this same document said
+earlier.** First: the overflow fade did not recompute when the ALERTS badge changed
+width. The comment on `updateTabOverflow` in the code as this campaign shipped it
+claimed the `ResizeObserver` watching `#tabs` already covered exactly that case,
+"twice a second, on a live install." **It does not, and the comment was wrong**:
+`#tabs` is a flex item with `overflow-x:auto`, so a child growing inside it moves
+`scrollWidth` without moving the observed element's own box, which is all a
+`ResizeObserver` watches. `loadState()` wrote the badge every two seconds and
+recomputed nothing, so crossing a digit boundary could newly overflow the strip with
+no fade until an unrelated resize happened along. Fixed at the one place the width
+actually changes — `loadState()` now calls `updateTabOverflow()` itself, right after
+it writes the badge.
+
+Second, and older: `.tab--group-start` had sat as a static class on `nodes`,
+`netpath` and `settings` in `index.html` since 4.46.0, before the group-flattening
+work this section opens with even existed. `applyPermissions` hides tabs
+independently of that markup, and `[hidden]` removes a border along with its button,
+so an account with IPAM but not Nodes lost the divider for the *whole* group while
+its other tabs kept rendering — flush against the group before, with nothing marking
+where one ended and the next began. That is the orphaned-group-label defect this
+section opens with, surviving the 4.49.0 rewrite in a smaller, permission-gated form
+nobody had driven far enough to see. Fixed by moving ownership from the tab to the
+group: `index.html` now marks group starts with a fixed, permission-blind
+`data-group-start` attribute, and `updateTabGroups()` walks the visible strip in
+order, handing the `.tab--group-start` hairline to the first tab of each group that
+is actually on screen — a group hidden in full passes its pending boundary on to the
+next one, rather than drawing two hairlines or none.
+
 ### 5.3 The shape of the estate
 
 **O-8 — a device can be in exactly one group, and there is no site, no location, no
@@ -858,6 +920,21 @@ free-text note per device (`nodesdb.py:84-123` has no `notes`, no serial, no ass
 tag, no criticality). On a plant the note an operator most wants to attach is "do not
 reboot during a run" and there is nowhere to put it.
 
+**O-3 is fixed, and measured at the scale that mattered before shipping it.**
+`nodesdb.py`'s device search now matches seven columns — `ip`, `name`, `sys_name`,
+`sys_location`, `sys_descr`, `sys_contact` and `vendor` — rather than three, and the
+MAC subquery is unchanged. Before choosing between widening the `LIKE` and building
+an FTS index, it was measured against the real 2,000-device `nodes.db` from Tier C1:
+a full-table-scan `LIKE` over all seven columns runs **~13 ms mean**, against ~9 ms
+for the three it replaces — still far under anything an operator would notice, so no
+index was warranted at this scale. Verified live against the 30-device demo instance:
+`Site-A` (a `sys_location`) now finds 27 devices, `apc`/`avtech`/`paloAlto` (vendor)
+find 1/1/2, `FortiGate` (a `sys_descr`) finds 3, and `Room Alert` — a multi-word
+`sys_descr` — finds 1. Every one of those returned 0 before this pass. `Site-B` and a
+bare `Moxa` still return 0 on this 30-device instance, checked before reporting: a
+30-device fleet contains neither a `Site-B` location nor a Moxa persona, so that is
+the fixture's limits showing, not a regression.
+
 **O-42 — an empty search opens a blocking dialog to say "type at least two characters".
 CONFIRMED (found because it broke an automated walk).** `netpath/web/static/ipam.js:1186`'s
 `searchHosts()` calls `App.modal(...)` unconditionally, so pressing Find with an empty
@@ -914,6 +991,13 @@ can be named.
 > over now: it describes the product as found at the start of this pass, which is what a
 > finding should do, but a reader running that grep today gets two substantial files and
 > a working API behind them.
+>
+> **Closed the same night this document finishes: `configrx.js` now has both.** Nodes
+> gains Search and Compliance subtabs over exactly the routes above, so the paragraph
+> that follows — "there is no search across the stored corpus... it cannot be asked" —
+> is no longer true through the interface either, not just through a token. Section 6's
+> ranking is updated to match; what replaces it there is a narrower and more specific
+> gap, in *which* vendors ConfigRX can back up at all, below.
 
 **O-5 — ConfigRX stores two thousand configurations and gives you no way to ask a
 question of them. CONFIRMED (exhaustive search of `configrx*.py` and the API).**
@@ -931,6 +1015,93 @@ must-match and must-not-match patterns, with a pass/fail column on the ConfigRX 
 and an alert rule for a device that falls out of compliance. This is the difference
 between a backup tool and a configuration management tool, and it is the most common
 reason an operator keeps paying for a second product.
+
+**O-67 — ConfigRX could not back up any device this operator would call industrial,
+and about one device in five on this estate could not have its configuration backed
+up at all. CONFIRMED, and partly fixed this pass. Established by reading
+`configrx_vendors.py`, `nodeoids.py`, `enterprises.py`, `vendorid.py` and
+`trapoids.py`, not inferred.** Before this pass, `configrx_vendors.VENDORS` held
+exactly eleven keys, all enterprise IT gear: the six Cisco platforms, Fortinet,
+Juniper, MikroTik, HP and Aruba. Checked against the shape of this operator's own
+2,000-device simulated estate (`personas.fleet_plan(2000)`, the fleet Tier C1 and C2
+actually polled):
+
+| Estate segment | Identified? | Polled? | Config backup? |
+| --- | --- | --- | --- |
+| Cisco IOS/XE/NX-OS/XR/SB/ASA/WLC | yes, deepest | yes | yes, 6 platforms proven |
+| Fortinet FortiOS / FortiAP | yes | yes, incl. wireless | yes |
+| Aruba (`hp`/`aruba` vendor keys) | yes | yes | yes |
+| Siemens SCALANCE, Moxa, Rockwell/Stratix, Siemens S7 | yes | yes | **no** |
+| Ubiquiti airFiber, Cambium PTP | yes | yes | **no** |
+| Cisco Meraki | enterprise 29671 only | shallow | **no** |
+
+Industrial switches and PLC-network gear — 78 Siemens SCALANCE, 60 Rockwell PLCs, 59
+Moxa, 40 Siemens S7 — came to **237 devices, 11.9% of the estate**, with no vendor
+entry at all; point-to-point wireless bridges (79 Ubiquiti airFiber, 40 Cambium PTP)
+added another **119, 6.0%**. Together, roughly **one device in five in a plant-shaped
+estate was monitored but could not have its configuration backed up** — and the
+industrial ring switches and PLC-network gear are precisely the boxes an engineer
+most wants a saved configuration for after a failure. This is a vendor-table gap
+rather than an architectural one: `configrx.py`'s capture chain is generic, and each
+vendor entry is three fields — a label, the pager-off commands, and the show command.
+
+**Fixed this pass for three of the four industrial classes: Moxa, Siemens SCALANCE
+and Rockwell Stratix now have vendor entries**, built from vendor CLI manuals cited
+in `configrx_vendors.py` itself (Moxa's classic FW_5.x CLI; SCALANCE's `show
+running-config`, common across the S615/XB/XC/XP/XM/XR families; Stratix, which
+Rockwell and Cisco sources agree runs genuine Cisco IOS/IOS-XE, so its entry reuses
+the Cisco one rather than being invented separately). **State this precisely rather
+than as simply "fixed": none of the three is hardware-verified.** `configrx_vendors.py`
+marks them explicitly as "documentation-sourced only" and says to flag any real
+capture against real hardware as suspect until eyeballed once — the same "suspect"
+mechanism this campaign watched fire correctly, for an unrelated reason, against a
+`mikrotik` capture during the Tier C2 run ("captured 170 bytes, under a fifth of the
+previous backup's 7205 bytes"). `tests/test_configrx_industrial.py` proves the
+documented command set round-trips through ConfigRX's real capture chain against a
+scripted double of each CLI — it does not and cannot claim a real Moxa, SCALANCE or
+Stratix device answers the same way. That is CONFIRMED-in-simulation, not
+CONFIRMED-on-hardware, and an operator adopting this for those three platforms should
+treat the first real capture of each as the thing that actually settles it.
+
+**Two gaps remain, both worth stating plainly rather than leaving a buyer to
+discover them.** Siemens S7 PLCs have no SSH shell to capture from at all — the
+Siemens enterprise arc covers the whole vendor tree, not SCALANCE switches alone, so
+a Siemens S7 PLC on the same arc simply has nothing for ConfigRX to connect to, not
+a false capture. And **Cisco Meraki is recognised but not supported**: one
+enterprise-number entry and nothing else, no OID set, no config backup, no cloud-API
+integration. Meraki is cloud-managed and SNMP-shallow by design, so this is not a
+small gap to close later; it is a different integration model, and it is absent
+entirely from the simulated estate, so no performance or coverage claim here rests
+on a live Meraki poll.
+
+**O-68 — the config search index this pass gave ConfigRX a screen for indexed
+almost nothing, and the tests could not have caught it. CONFIRMED, found by driving
+the feature rather than by reading its tests, fixed.** `configrx.py:997` called
+`self.db.replace_search_lines(...)` from inside `if backup_id is not None:` — the
+branch taken only when a capture *differs* from the device's last stored one.
+`replace_search_lines` had exactly one caller in the whole codebase: no sweep, no
+backfill, no rebuild path. So the cross-device search index contained only devices
+whose configuration had changed since the feature shipped — a device captured
+`unchanged`, the normal steady state of a well-run network, was invisible to search
+**permanently**. That is exactly backwards: the operator searches
+`snmp-server community public` to find the switches nobody has touched, and those
+are precisely the ones missing from the index. Every existing test passed regardless,
+because every one of them captures a *new* configuration and then searches for it —
+none exercised the steady state.
+
+Reproduced on the live instance before fixing, not inferred: a device with a stored
+backup and `config_lines` at 0 rows; `POST /api/configrx/devices/31/backup` returned
+`unchanged`; `config_lines` stayed at 0; `GET /api/configrx/search?query=interface`
+returned zero matches with `indexed: true` — silent, total, and permanent. The design
+intent was visible in the contrast: compliance has exactly this rescue, an hourly
+`evaluate_all` sweep whose own comment at `configrx.py:629-637` says it "exists only
+to catch up a rule set," and search did not. A search that silently returns nothing
+is worse than no search — the operator concludes the estate is clean. Fixed by
+indexing on every successful capture rather than only a changed one, plus a bounded
+one-time backfill so an upgrading install is not blind until every device happens to
+change next. Verified live, restarted build: before, `config_lines` held 0 rows and
+every query returned 0 matches; after, **344 rows**, and `search?query=interface`
+returns 8 matches.
 
 **O-56 / O-57 — redaction is correct and it still costs you an answer. One half
 inherent, one half fixed.** ConfigRX redacts recognised secrets before they leave storage
@@ -1009,6 +1180,40 @@ unbatched one, and the browser waits for it. At 2,000 endpoints with months of p
 rows against the shipped 512 MB cap, that is a multi-second freeze of the whole
 application produced by saving a setting on an unrelated page. The fix is to batch it the
 way `trim_to_size` already does, in the same file, with the same constant.
+
+**O-58 is fixed — `db.py`'s `prune()` now deletes in the same adaptive, lock-releasing
+chunks `trim_to_size()` uses, reclaiming space the same way afterward — and fixing it
+surfaced a second, worse defect in the same function, worth its own number.**
+
+**O-69 — the trace retention an operator configures in days was never actually
+enforced by the automatic maintenance sweep, and wiring it in exposed a setting that
+could delete every trace on the system every fifteen minutes. CONFIRMED (a real
+`Service` and its real periodic sweep entry point, not `db.prune()` called directly),
+fixed.** `_run_maintenance_body` (`netpath/web/service.py`) calls `.prune(...)` on
+every other database it owns — flow, syslog, SNMP, IPAM, nodes, alerts, ConfigRX —
+passing each its own `*_retention_days` setting. For `self.db`, the trace store, it
+called only `trim_to_size(cap)`, a *size* cap, and never `self.db.prune(days)`, the
+*age*-based retention the Settings screen's own "Keep traces for N days" field and
+the `trace_retention_days` setting promise. The only caller of `db.prune()` was the
+manual `POST /api/maintenance {"action": "prune_traces"}` action — so a configured
+retention period did nothing at all unless an administrator clicked a button, on a
+site that may have set that number specifically to avoid needing to.
+
+Wiring the automatic call in exposed why it had been left out: `trace_retention_days`
+had no server-side range check at all, only the Settings page's own `min="1"` input,
+which an API client can skip. That was close to harmless while `prune()` only ran on
+a manual click; it is not harmless once it runs on every maintenance interval, because
+`prune(0)` computes `cutoff = time.time() - 0`, which is *now* — a `0` posted straight
+to the API would delete every trace, silently, every fifteen minutes, forever.
+`_GLOBAL_SETTINGS_RANGES` in `api.py` now carries `"trace_retention_days": (1, 3650)`,
+and `tests/test_trace_retention.py` proves both halves against a real running service:
+section 3 posts `0` and `-5` over HTTP and confirms each is refused with the setting
+left unchanged, and a valid `45` is still accepted; section 4 runs the automatic sweep
+at its shipped 90-day default and confirms it prunes only what has actually aged out
+and nothing still inside the window. The larger point survives the fix: a setting an
+operator can see and set in the interface, that quietly does nothing, is a worse
+failure mode than an error — the site believes its retention policy is enforced right
+up until an audit or an incident asks for a trace from four months ago and it is gone.
 
 ### 5.7 Being told about it
 
@@ -1340,14 +1545,25 @@ part of this finding.)
 
 ### 5.8 Answering for it afterwards
 
-**O-10 — the audit trail is written, is served, and cannot be seen. CONFIRMED
-(exhaustive).** `netpath/appdb.py:107-116` defines the `audit` table, whose own comment
-says it exists "for answering 'who changed that' a month later".
-`netpath/web/api.py:1366` serves it as `get_audit`, wired at `server.py:492` to
-`GET /api/audit` behind `admin: read`. Grepping `netpath/web/static/*.js` for "audit"
-returns nothing — no page, no tab, no dialog, no link. The one feature whose entire
-purpose is to be read by a person is the one feature no person can reach. A Settings
-subtab over a route that already exists is a small piece of work.
+**O-10 — the audit trail is written, is served, and could not be seen. CONFIRMED
+(exhaustive), and this finding is stale in exactly the way section 2.4 warns about:
+it describes a state the product had already moved past. A full AUDIT subtab —
+range, user, action, target and free-text filters, a paginated table, route-driven
+prefill — has existed in `settings.js` since checkpoint 13, and "grepping
+`netpath/web/static/*.js` for 'audit' returns nothing" was never true after that
+point. What was still true, and is the actual finding underneath the stale one: the
+screen had nothing behind it. `netpath/appdb.py:107-116` defines the `audit` table,
+whose own comment says it exists "for answering 'who changed that' a month later",
+and `appdb.audit_query` — written and tested to answer exactly the screen's filters,
+with three indexes added for it — had no HTTP handler that ever called it.
+`get_audit` still answered only the older `since`/`limit` cursor shape a few tests
+use directly, so every filter interaction on a shipped, admin-reachable screen
+degraded to an apology the frontend had been written to print: "the server has not
+been updated to answer this search yet." **Fixed this pass**: `get_audit` now
+branches on whether `t0`/`t1` is present and, when it is, calls `audit_query()`,
+keyset-paginated, with the old shape kept for the callers that still use it. The
+browser walk now reads "100 rows shown, more below" where it used to read the
+apology.
 
 **O-11 — the audit trail records the administration of the product and almost none of
 the engineering done with it. CONFIRMED.** Fifty-two `_audit(...)` call sites,
@@ -1384,7 +1600,15 @@ saturation". Both are a `GROUP BY` away from data already on disk. This is the c
 large win in the product.
 
 Both were built in this pass, and building them produced three findings that are worth
-more than the feature.
+more than the feature. **They then sat unreachable for the rest of that same campaign
+— built, routed and tested against three suites, with nothing in the shipped
+JavaScript calling either — until the pass that closes this document gave them a
+screen.** Nodes now has a REPORTS subtab: availability per device over a chosen
+period, top-N by metric, both exporting CSV, sitting under Nodes rather than becoming
+a thirteenth top-level tab (the strip already overflows at 1366 px, section 5.2, and
+both routes are nodes-gated already). The screen surfaces the report's own caveats
+rather than hiding them — the point of O-38 below — showing the global caveats above
+the table and each device's own in a Notes column.
 
 **O-38 — a maintenance window is remembered forever; a mute is deleted the moment it
 lapses. CONFIRMED.** `alertsdb.windows()` retains every window — past, active and
@@ -1770,11 +1994,39 @@ timestamp is useless for this measurement — it is copied straight into the ale
 `opened_ts` by construction, so the gap is trivially 0.0 s at every scale and measures
 nothing. The ping-loss sample is the only honest proxy available.
 
-#### Tier C1 — 2,000 devices, first two numbers
+#### Tier C1 — 2,000 devices, all nine incidents
 
 **2,000 devices seeded in 46.35 s, first full poll cycle 238.7 s, baseline CPU 141.0%,
-RSS 156.8 MB.** C1 is still running as this section is written; the full nine-incident
-table is not yet in hand and will not be guessed at here.
+RSS 156.8 MB, 95% up (1,948/2,000) rather than the full 100%** — `full_cycle: False`,
+which is itself worth carrying forward rather than rounding away.
+
+| Step | Alerts opened | CPU | RSS |
+| --- | ---: | ---: | ---: |
+| 1 · baseline | 228 | 141.0% | 156.8 MB |
+| 2 · core outage + Site-A access layer down | 320 | 89.3% | 162.4 MB |
+| 3 · outage recovery | 6 | 143.7% | 161.2 MB |
+| 4 · interface flap storm (7 interfaces on 100 switches) | 18 | 141.6% | 162.7 MB |
+| 5 · reboot 20 devices | 15 | 141.6% | 175.6 MB |
+| 6 · SNMP auth failure on 5 devices | 24 | 144.7% | 176.6 MB |
+| 7 · trap + syslog burst (TCP octet framing) | 48 | 137.3% | 175.9 MB |
+| 8 · NetFlow burst (mixed v5/v9, 200 flows/s) | 22 | 141.5% | 176.4 MB |
+| 9 · recovery (flaps stop, auth restored) | 19 | 145.5% | 176.1 MB |
+
+**One column is deliberately not in that table, and the reason is worth stating
+plainly rather than leaving a gap unexplained.** Every step of this run carries
+`alerts_truncated: true` in the harness's own output, and `open_alerts_after` pins at
+exactly 2,000 in all nine — the harness was comparing truncated snapshots against
+each other, not the real alert count, so a naive "cleared" column would read 0
+everywhere. **That would be a measurement artifact of `demo/scenario.py`, not the
+product failing to clear alerts at fleet scale, and reporting it as the latter would
+be the single worst error this document could make.** Tier A, at 250 devices, is
+never truncated and clears normally through all nine steps (292, 109, 6, 45, 18, 19,
+8, 61 — section 5.10 above); Tier B truncates from step 2 onward, so its own clear
+counts past step 1 carry the same caveat. The product side of this is already
+handled, separately from the harness bug: `alerts.js` has a `truncated()` helper that
+relabels select-all as "Select the N shown" specifically for this fleet-scale case,
+so an operator looking at a truncated list is told so. No product finding follows
+from the missing column — only a methodology note for whoever re-runs this at scale.
 
 **O-66 — the first full poll cycle scales acceptably to 1,000 devices and then falls off
 a cliff. CONFIRMED (three tiers, same frozen commit, same machine).**
@@ -1804,36 +2056,83 @@ quadratic algorithm has to be rewritten, while a cliff means something specific
 saturates — a worker pool, a subprocess spawn rate, a socket budget — and raising that
 one limit may move the cliff without touching the design.
 
-The most likely candidate is measurable rather than arguable: at the shipped
+The most likely candidate was measurable rather than arguable: at the shipped
 `ping_interval_s = 0` every device is pinged on every poll, and on Windows that is three
 sequential `ping.exe` subprocesses per device (O-15/O-22), measured at ~15.6 ms per probe
 on a live device and about 3.0 s on a dead one. **Tier C2 runs the identical 2,000-device
 scenario with `--ping-interval 300` and nothing else changed**, which isolates that
-hypothesis: if C2's first full poll cycle comes back near the linear projection of
-~100 s, ping is the cliff and the fix is a default, not a rewrite. If C2 lands near C1's
-238.7 s, the ceiling is somewhere else. That run had not been carried out as this document
-was finished, so the hypothesis is reported as one the numbers are consistent with rather
-than one confirmed — the honest state of an open question is stated once, here, rather
-than left as a mark implying an answer is still being assembled.
+hypothesis — and it landed before this document closed, with an answer that is more
+interesting than the hypothesis it was testing.
 
-**O-66, addendum — the cliff is not CPU, and that narrows it usefully.** Baseline-step
-CPU across the three tiers: 23.8% at 250, 123.1% at 1,000, 141.0% at 2,000. Between the
-last two the poll cycle took 4.7 times longer while CPU rose by only 15%. On a 28-core
-machine 141% is 1.4 cores — the process is not compute-bound and is nowhere near the
-hardware's limit. So the cliff is something serialising, not something computing. That
-rules out the explanation people reach for first ("it needs a bigger box") and points
-instead at a resource only one thing can hold at a time. The architecture names an
-obvious candidate: one SQLite writer behind one lock, with every polled device's results
-going through it, while thirty-two poll workers can gather concurrently and then queue to
-write.
+| Tier | Devices | Ping interval | First full poll cycle | Up | Baseline CPU |
+| --- | ---: | --- | ---: | ---: | ---: |
+| A | 250 | default | 10.0 s | 249/250 | — |
+| B | 1,000 | default | 50.9 s | 992/1,000 | — |
+| C1 | 2,000 | default | **238.7 s** | 1,948/2,000 | 141.0% |
+| C2 | 2,000 | 300 s | **133.7 s** | 1,912/2,000 | 103.0% |
 
-This is worth stating carefully rather than asserted, because it is a hypothesis
-consistent with the numbers, not a measurement: what would settle it is the write-lock
-wait time per poll cycle, which nothing currently records. That absence is itself worth
-noting — an operator asking "why is my 2,000-device poll cycle four minutes" has no
-instrument in the product that can answer, and neither did this campaign. Tier C2 still
-discriminates the ping hypothesis first; if C2 comes back near C1, ping is not the cliff
-and the serialisation explanation gains weight.
+Widening the ping interval cut the first cycle by **44%** (238.7 → 133.7 s) and
+baseline CPU by **27%** (141.0% → 103.0%); CPU fell at every one of the nine steps,
+and average node-worker elapsed time at baseline fell 2.457 s → 1.528 s. C2 also
+reached only 1,912/2,000 up against C1's 1,948/2,000 — expected, not concerning: a
+300-second ping interval means the up/down decision leans on SNMP for longer, so it
+is noted rather than hidden.
+
+**So ping dominates the cliff — but not all of it, and claiming it explains the whole
+thing would be the wrong lesson to take from a right-looking number.** The linear
+projection from Tier B is 2 × 50.9 s ≈ 102 s at 2,000 devices. C1 overshoots that by
+137 s; C2 overshoots it by only 32 s. Ping accounts for roughly **77% of the excess
+over linear** — the great majority, and the reason it is worth a default recommendation
+below — but **an unexplained residual of about 32 seconds remains at 2,000 devices,
+and this campaign did not find what it is.** The single-SQLite-writer hypothesis below
+is the leading candidate for that residual specifically, not for the whole cliff.
+
+**And the measurement itself was taken on the path the product does not prefer.**
+`demo/scenario.py:508` sets `NETPATH_PING_MODE=subprocess`, forcing the slow path so
+the harness's own scripted `demo/bin/ping` stays in control of which simulated devices
+answer. The product's real default is to detect an ICMP socket
+(`ipam_scan._detect_icmp_socket_kind`: a `SOCK_DGRAM` ping socket on Linux, `SOCK_RAW`
+under `CAP_NET_RAW`) and fall back to spawning `ping` only when it cannot get one —
+`nodepoll.py` imports `ping_many` from that same module, so the live poller takes
+whichever path detection finds. Run directly on this host, unelevated, with
+`NETPATH_PING_MODE` unset: `platform: win32`, `ICMP socket kind detected: None`,
+`product would use: ping SUBPROCESS per probe`. **Windows genuinely has no
+unprivileged ICMP socket** — `SOCK_RAW` needs elevation this product does not require
+for anything else — so the fallback this campaign measured is not a harness artefact
+for a Windows deployment: it is exactly what an unelevated Windows install gets, about
+a hundred `ping.exe` spawns a second sustained at 2,000 devices × 3 probes inside a
+60-second interval. The cliff is real for this operator, on this platform, and this
+campaign has no basis to claim it on Linux, where the socket path would apply instead.
+
+**And until this pass, the product never said which path it was on.** Grepping
+`api.py`, every `static/*.js` file, `nodepoll.py` and `service.py` found the detected
+ICMP kind logged nowhere — not at startup, not in `/api/debug`, not in Settings. An
+operator whose poll cycle is 79% slower than it needs to be had nothing telling them
+why, and no reason to suspect a setting would fix it. **Fixed**: the choice is now
+logged once at startup and carried on the Debug page's `summary` block —
+`ping_path`, `ping_kind` and `ping_mode_env` — verified live on this Windows host as
+`"subprocess"` / `null` / `null`, matching the direct capability check above exactly.
+**The recommendation to this operator, given all of the above: run on Linux, run
+elevated on Windows, or set `ping_interval_s` to 300 or higher at fleet scale — any
+one of the three, and now there is a place in the product to confirm which path is
+actually in effect before and after making that choice.**
+
+**O-66, addendum — the cliff is not CPU, and that narrows the unexplained residual
+usefully.** Baseline-step CPU across the three tiers: 23.8% at 250, 123.1% at 1,000,
+141.0% at 2,000. Between the last two the poll cycle took 4.7 times longer while CPU
+rose by only 15%. On a 28-core machine 141% is 1.4 cores — the process is not
+compute-bound and is nowhere near the hardware's limit. So whatever produces the
+residual 32 seconds is something serialising, not something computing. That rules out
+the explanation people reach for first ("it needs a bigger box") and points instead at
+a resource only one thing can hold at a time. The architecture names an obvious
+candidate: one SQLite writer behind one lock, with every polled device's results going
+through it, while thirty-two poll workers can gather concurrently and then queue to
+write. This remains a hypothesis the numbers are consistent with, not a measurement:
+what would settle it is the write-lock wait time per poll cycle, which nothing
+currently records, on either tier. That absence is itself worth noting — an operator
+asking "why did widening my ping interval only get me to 133.7 s and not the 102 s
+I calculated" has no instrument in the product that can answer, and neither did this
+campaign.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
 Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
@@ -1849,8 +2148,6 @@ is already right: `selectTab` exists, each module has its own `init()`, and the 
 are already versioned and immutably cached. Load a module's script the first time its
 tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previous
 review declined minification (PERF-004) with reasons; this is a different and larger
-lever, and it makes the source no harder to read.
-
 lever, and it makes the source no harder to read.
 
 ### 5.11 Security and permissions
@@ -2144,50 +2441,112 @@ that product. Whatever else is decided, an operator adopting this should set tho
 deliberately, in the knowledge of what they multiply to, on the first day — and section
 5.7 argues the product should tell them rather than making them work it out.
 
+**Against the three I was actually asked to weigh it against, named rather than
+gestured at.**
+
+*SolarWinds NPM.* The honest comparison is not features, it is depth versus reach.
+NPM's Orion platform has a far larger prebuilt MIB and report-template library than
+this product will have for years, scheduled and emailed reporting out of the box, and
+NCM (a separately licensed module) backs up a wider vendor list than ConfigRX's
+fourteen keys — though NCM is no better positioned for Moxa or SCALANCE than this
+product is now; industrial gear is a gap the whole IT-monitoring category shares, not
+one specific to this tool (O-67). What NPM does not do at this operator's scale is
+cheap: per-node licensing on a 2,000-endpoint estate is real money every year, SQL
+Server is another thing to operate, and the 2020 supply-chain compromise is precisely
+the class of risk section 8 declined to touch in this product's own self-update path
+without at least naming it. A one-process, on-premises tool with no license server to
+compromise is a real answer to that history, not a marketing line.
+
+*LibreNMS/Zabbix.* The open-source pair covers more vendors out of the box through
+community-contributed device definitions than this product's hand-written
+`VENDOR_HEALTH` table ever will unassisted, and Zabbix in particular has had a
+built-in, schedulable SLA-reporting feature since 6.4 — exactly the report this
+product only just grew a screen for tonight (O-12, section 5.9), and Zabbix's has had
+years to mature. What neither gives you is this product's specific honesty about what
+its own report cannot account for: `report.py` excludes time before a device existed
+and time inside a maintenance window, and states outright, as a standing caveat, that
+a mute which already expired before the report ran leaves no history to exclude
+retroactively (O-38). A number with its own blind spots labelled is worth more in an
+SLA review than a bare percentage, and that is a real, specific advantage over a
+DIY Zabbix dashboard built by whoever had time that quarter — it is also the reason
+O-38's real fix, not deleting the mute row, still matters. Set against that: LibreNMS
+and Zabbix are free to license and this product is not, and both have a decade-plus
+head start on community-built templates for exactly the industrial gear O-67 found
+missing here.
+
+*Auvik/Domotz.* These are the wrong comparison for a single 2,000-endpoint plant and
+the right one for the gap this review keeps returning to: both are built
+multi-tenant, multi-site from the ground up, because their buyer is an MSP managing
+many small networks, not one engineer running one large one. Item 9 below — no
+per-site RBAC, permissions per module rather than per site — is the exact axis Auvik
+and Domotz are strongest on and this product has not built at all. Both also do
+automated network config backup for their supported vendor lists, with the same
+practical limit O-67 describes here: mainstream switches and firewalls, not Moxa,
+SCALANCE or Stratix. Neither, on its own marketing, goes as deep on SNMP-collector
+internals as section 5.11's mechanically-checked 227-route permission audit or the
+collector hardening in section 7 — a cloud RMM tool's job is breadth across many
+customers' ordinary networks, not surviving a fuzzed SNMP trap against one plant's.
+
 **Would stop me adopting it**
 
-1. **No reporting.** Section 5.7 / O-12. I am asked for availability and utilisation
-   figures every month by people who do not log in. Today I would have to write the
-   SQL myself.
-2. **No configuration compliance and no search across stored configurations, from the
-   interface.** O-5. The backend and the API are built and tested against real
-   captures as of tonight — an administrator with a token could already ask this
-   question — but there is no screen, so through the actual web application it is
-   still unaskable. This is the second product I would have to keep paying for, until
-   `configrx.js` catches up with the work already sitting behind it.
-3. **Alert routing is one mailing list.** O-6, O-7. Every recipient gets everything,
+1. **ConfigRX cannot back up any device on this estate an engineer would call
+   industrial, and about one device in five here is monitored but not
+   config-protected.** O-67. Moxa, Siemens SCALANCE and Rockwell Stratix gained
+   vendor entries this pass — documentation-sourced, proven only against a scripted
+   double of each CLI, not yet against real hardware — which is real progress and not
+   yet a closed gap: Siemens S7 PLCs have no SSH shell to capture from at all, and
+   Cisco Meraki is recognised by enterprise number and nothing else. On a plant, the
+   ring switches and PLC-network gear behind that 11.9% figure are exactly the boxes
+   an engineer most wants a saved configuration for after a failure.
+2. **Alert routing is one mailing list.** O-6, O-7. Every recipient gets everything,
    so within a month nobody reads any of it.
-4. **The rollup needs two thousand manual edits before it works.** O-4, O-52. Until the
+3. **The rollup needs two thousand manual edits before it works.** O-4, O-52. Until the
    upstream field is set a site outage is a mailbox full of alerts, which is the same as
    no alerts.
 
 **Would cost me real time every week**
 
-5. **One group per device, no site, no tag.** O-8. Everything downstream is narrower
-   than it needs to be because of it.
-6. **Discovery cannot follow the topology it has already collected, and never runs on
+4. **One group per device, no site, no tag.** O-8. Everything downstream is narrower
+   than it needs to be because of it — and it is the same axis Auvik and Domotz are
+   built around, above.
+5. **Discovery cannot follow the topology it has already collected, and never runs on
    a schedule.** O-14. New equipment is invisible until somebody remembers to sweep.
-7. **Search still cannot reach an interface alias or a stored configuration.** O-3, and
-   the unbuilt half of O-2. The rest of O-1 and O-2 is fixed in this pass — the search now
-   covers eight groups rather than four and no longer drops every group after a failure —
-   but `ifAlias`, the description an engineer typed on the port itself, remains polled,
-   stored and unsearchable, and that is the one this operator would use daily.
-8. **The audit trail cannot be read and does not cover engineering changes.** O-10,
-   O-11 — and on a site under an ISO or food-safety regime this moves up two
-   categories.
+6. **Global search still cannot reach an interface alias, and does not reach ConfigRX
+   even now that ConfigRX can search itself.** The unbuilt half of O-2. The rest of
+   O-1 and O-2 is fixed — the global search bar now covers eight groups rather than
+   four and no longer drops every group after a failure — and O-3, device search, is
+   separately fixed this pass (`sys_location`, `sys_descr`, `sys_contact` and
+   `vendor` are all searchable now, measured at 2,000 devices before shipping). What
+   remains: `ifAlias`, the description an engineer typed on the port itself, is still
+   polled, stored and unsearchable from anywhere, and ConfigRX's new Search subtab
+   (O-5) is its own screen, not a group the global search bar queries — an operator
+   who does not already know to look in ConfigRX will not find a config match from
+   the one search box the rest of the product trained them to use.
+7. **Reporting exists now and still cannot be scheduled or emailed.** O-12. The
+   screen answers "what was the availability of these thirty devices" the moment
+   somebody is looking at it; it does not answer it automatically on the first of the
+   month for the people who never log in, which both SolarWinds and Zabbix do above.
+8. **The audit trail can finally be read and still does not cover engineering
+   changes.** O-10 is closed this pass — the screen has existed since checkpoint 13
+   and now has a backend behind it — but O-11 stands: "who muted that alert" is
+   answerable and "who changed the CPU threshold from 90 to 99 last March" is not,
+   and on a site under an ISO or food-safety regime that is still a compliance
+   blocker, just a narrower one than an unreadable trail.
 
 **Would notice, could live with**
 
 9. **No per-site RBAC.** Permissions are per module across thirteen modules, including
    `ssh` and `admin` — which is a genuinely good model, just not divisible by site. A
-   contractor working on Building 4 gets Nodes write everywhere or nowhere.
+   contractor working on Building 4 gets Nodes write everywhere or nowhere. This is
+   precisely where Auvik and Domotz, above, are strongest.
 10. **Wireless is FortiGate-only.** The tab is honestly named FORTIWIRELESS, which is
     more than most products would do, but a mixed AP estate is only half seen.
 11. **No syslog rule conditions beyond severity and a substring.** No regular
     expressions, no "N occurrences in M minutes".
 12. **One process, one host.** No remote pollers, no sharding, no high availability.
-    At one site with 2,000 endpoints that is arguably right; it is a ceiling rather
-    than a fault.
+    At one site with 2,000 endpoints that is arguably right, and it is also the
+    inverse of Auvik/Domotz's cloud-collector model above; it is a ceiling rather
+    than a fault either way.
 
 **Would not miss**
 
@@ -2515,6 +2874,34 @@ running it, not by reading it: an earlier read of the same file correctly conclu
 idle timer is keyed only to keystrokes and ignores resize traffic — both true, and both
 missing the interaction that made the specific timer moot.
 
+### Every suite this work added
+
+Named in the order added, established by walking the tree at each named commit rather
+than by memory. Twenty from the 4.49.0 campaign proper:
+
+`test_alert_rollup_topology_sweep`, `test_alert_rule_delete_refusal`,
+`test_alertmail_severity_subject`, `test_alertsdb_rollup_and_rules`,
+`test_audit_trail`, `test_configrx_search_compliance`,
+`test_configrx_search_routes`, `test_host_resources_mem`,
+`test_report_availability`, `test_report_routes`, `test_report_topn`,
+`test_syslog_mib_dos_fixes`, `test_syslog_tcp_framer`, `test_target_validation`,
+`test_template_preview_draft`, `test_trace_budget_ceiling`,
+`test_ups_environment`, `test_upstream_suggestions`, `test_vendor_arc`,
+`test_vendor_health_coverage`.
+
+Six more from the pass that closes this document — the audit backend, the reports and
+ConfigRX-search screens, device search, trace retention, the industrial vendor
+entries, and the nav-bar matrix, each covered above where its finding is:
+`test_configrx_search_backfill`, `test_configrx_search_compliance_ui`,
+`test_device_search_fields`, `test_reports_ui`, `test_trace_retention`,
+`test_configrx_industrial`, plus one browser suite outside the plain-script count,
+`tests/ui/check_group_labels_matrix.mjs` (section 5.2's 27-combination proof).
+`tests/ui/pristine_login.mjs` itself was written during the campaign proper
+(checkpoint 22, for O-48 above) and is counted there; what this pass added for it was
+wiring it into CI, not the suite itself (section 9).
+
+53 (baseline) + 20 + 6 = **79**, matching section 9's final count exactly.
+
 ## 8. What was deliberately not built
 
 Named, with the reason, so that nothing here reads as an oversight.
@@ -2587,8 +2974,9 @@ reconstructed after the fact.
 generator logs, and `ui/` holding the browser walk's screenshots, console capture,
 metrics and per-step results. `rehearsal/` holds the 25-device proving run that found the
 `FLEET_CONTROL_PORT` defect. `tierB/` for the 1,000-device run and `tierC1/` for the
-2,000-device run sit beside it, in the same shape; `tierC2/` (the ping-interval
-discriminator for O-66) was created for the run isolating that hypothesis.
+2,000-device run sit beside it, in the same shape; `tierC2/` holds the completed
+ping-interval discriminator for O-66 — the run that isolated ping as most, not all,
+of the cliff.
 
 **The button census**, `demo/out/*/ui/buttons-<account>-<tag>.json` — per account, every
 control enumerated with its label, disabled state and disabled reason, and the
@@ -2616,8 +3004,10 @@ fourteen added since all pass the identical standing check), every handler walke
 write evidence, seven named false positives, and exact expected sets for the ungated
 routes and the public paths.
 
-**The test suites.** Baseline before the campaign: 53 of 53 green. ⏳ Final count lands
-here. Every new suite added by this work is listed in section 7.
+**The test suites.** Baseline before the campaign: 53 of 53 green. **Final count: 79
+suites, all passing** — 20 added over the course of the 4.49.0 campaign and 6 more by
+the pass that closed this document. Every new suite is named, in the order it was
+added, at the end of section 7.
 
 **The live instances themselves**, queried directly for the alert composition, the
 collector counters, the API response times and payload sizes, the per-device metric
