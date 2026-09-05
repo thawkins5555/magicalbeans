@@ -6156,6 +6156,20 @@ def get_configrx_diff(service, params, body) -> dict:
     change": this diff can say a secret-bearing line is still there, not
     what it became. See configrx_redact's module docstring for the pattern
     list's own scope and limits.
+
+    That same property (secret changes are invisible to the redacted diff)
+    means an empty `diff` is ambiguous on its own: it is the honest answer
+    both for "nothing changed" and for "only a secret's value changed" —
+    and those are very different things for an operator to be told. Both
+    backups' own `sha256` (of the stored bytes, never redacted) still
+    tells the two apart even when their redacted bodies render identically,
+    so `redacted_only_change` (O-57) is set whenever the visible diff is
+    empty but the underlying backups are not actually the same — a rotated
+    enable secret or a changed SNMP community are exactly this case, and
+    without this flag they render as a clean, reassuring empty diff, which
+    is the one place this feature must not be silent. `identical` means
+    what it says now: the two backups genuinely are the same, not merely
+    "nothing visible differs".
     """
     device_id = _num(params, "device", None, int)
     if not device_id or not service.nodes_db.device(device_id):
