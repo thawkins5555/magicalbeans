@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.48.0 — The interface, reviewed](#4480--the-interface-reviewed)
 - [4.47.0 — A fleet operator's list, answered](#4470--a-fleet-operators-list-answered)
 - [4.46.4 — Full code review: fifteen defects](#4464--full-code-review-fifteen-defects)
 - [4.46.3 — One SNMPv3 test, two ways to fail on Windows](#4463--one-snmpv3-test-two-ways-to-fail-on-windows)
@@ -114,6 +115,138 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.48.0 — The interface, reviewed
+
+Two specialist reviews of 4.47.0 — one graphic and typographic, one on
+interaction and information architecture — with supporting passes for
+accessibility, the operator's own list of five changes, and a disposition of
+every finding from the 4.36.1 review. They ran against a live instance rather
+than the source: thirty simulated SNMP devices, twelve fake SSH switches, three
+themes, three viewports and three accounts. What they found is below, along
+with three defects they did not find and the fix work did, and two things
+declined on purpose. `UI-UX-REVIEW-4.48.md` is the record, and is candid about
+the reviewers' own reports being lost with the machine that produced them, and
+reconstructed from the findings list and these commits.
+
+**One click could lock the whole application, and did.** `accountModal` takes a
+flag for the must-change-password prompt, which hides Cancel, sets
+`modalLocked` and makes the page inert; it was wired as
+`accountBtn.onclick = accountModal`, so the DOM handed it the click event as
+that flag. Every ordinary press of Account opened the locked dialog: Escape
+dead, backdrop dead, `closeModal()` dead, the page inert behind it, and the
+only ways out signing you out. `closeModal` now un-inerts the page before the
+lock check as well, so no later caller can strand it the same way.
+
+**ConfigRX reaches five more platforms, and one of them found a real defect.**
+NX-OS, IOS-XR, a small-business switch, an ASA and a WLC, with enable-mode
+escalation and a per-device enable secret stored exactly as the SSH password
+is. Chasing an intermittent failure in the new suite turned up something no
+review saw: `_pull_config`'s `finally: channel.close()` could raise out of the
+function and discard the capture it had already made. Closing a channel sends a
+message, and when the device has already hung up — the exact case
+`_capture_problem` exists to describe — that raises `EOFError` into a dead
+socket. So the one situation the code was careful to report as "the device
+closed the connection before the config finished" instead crashed the attempt.
+A capture under a fifth of the previous size is now stored as `suspect` rather
+than `changed`, since a truncated one otherwise presents an entire
+configuration as deleted in the next diff.
+
+**A refused WebSocket lost the reason it was refused, on Windows.** `close()`
+writes a close frame carrying the code and its sentence — "There are already 16
+SSH sessions" among them — then shuts the socket down both ways to release a
+parked reader. Windows resets a connection closed with unread data, and a reset
+discards what was last written in the other direction, so the frame was thrown
+away by the reset that followed it and the peer read a connection error where
+the explanation should have been. Linux sends a FIN and the frame survives,
+which is why every previous run of that suite was green. The close drains
+first now, bounded and non-blocking, and three tests hold it there.
+
+**Everything a chart, map or terminal knew was mouse-only.** Eight charts, the
+route graph, the timeline and the topology view were unreachable from a
+keyboard and unlabelled, and every tooltip across six modules answered only
+`mousemove` — several figures existed nowhere else. The tab strip declared
+`role="tablist"` and implemented none of the keyboard contract that promises,
+and the eleven subtab groups below it carried no roles at all. The SSH terminal
+exposed nothing to assistive technology and trapped Tab with no published way
+out; that way out is Ctrl+F6, chosen over Escape because Escape is a real
+keystroke to a switch console and this window exists to reach one.
+
+**The light theme was where the token discipline stopped.** Dark and high
+contrast measured one text element below AA out of 934 rendered, and zero.
+Light had five, and the cause was the pair list rather than the palette: a
+semantic tone was only ever checked against the page, never against `--raised`,
+which is every alternate row of every table and where those tones actually
+live. Its elevation was inverted too — with the page pure white there was no
+headroom, so every card and dialog read as a recess cut into it instead of
+something lifted off it. The page is tinted now and the surfaces climb to
+white. High contrast, the theme an operator picks when things are hard to tell
+apart, had the weakest surface separation of the three.
+
+**Idle repainting, measured.** The 100 ms beat was rebuilding what had not
+changed: per tab, per ten idle seconds, nodes 515→118, ipam 500→0, alerts
+767→60, and the collectors 500→10 apiece. Debug was the worst in the product at
+8,042, and the cause was not the table rebuild everyone assumed — `drawEvents`
+called `wireRowKeyboard` on every poll, and that stamps `tabindex` across up to
+2,000 rows: 5,472 writes per thirty seconds on a live table, now none. NetPath
+is recorded honestly rather than claimed: the review reported its timeline
+rebuilding a hundred times a second, and it had no `fastTick` registered at
+all, so that rebuild was not happening and could not be reproduced.
+
+**The tab bar stopped hiding what you need when something is wrong.** It needed
+1,747 px, and below that shed the connection indicator — described in its own
+markup as "the one honest signal during an outage" — and Sign out; at 1366, the
+commonest NOC laptop width, an operator on the Settings tab could not see that
+Settings was the active tab. The twelve tabs now sit in four labelled groups
+with the utility controls pinned outside the scrolling region. Settings, eleven
+fieldsets over 3,760 px with no navigation, has subtabs and a Modules pane;
+subtabs are in the URL; a global search opens on `/`; and kiosk mode can be
+entered and rotated from the interface rather than only from a URL somebody has
+to already know.
+
+**The operator's five requests.** Discovery marks an address that is already a
+device, keeps it out of the checkboxes and the select-all, and reports how many
+of a promotion were genuinely new — a sweep of a monitored range had been
+offering 56 already-monitored addresses as finds, with nothing on the rows to
+say so. A WEB button beside SSH opens the device's own web interface. The tabs
+read ConfigRX and FORTIWIRELESS, and NETPATH became ROUTES so the product stops
+answering to three names. ConfigRX is proven against the Cisco platforms above.
+
+**Silent writes.** ConfigRX stored an SSH port of 0, −5 or 99999 on both sides
+and closed as though saved; Settings stored a value outside its own `min`/`max`,
+reported "Applied", and Revert did not revert; NetPath created
+`999.999.999.999` as a destination that would fail forever — and, found by a
+test written for exactly that bypass, the edit route went on accepting the host
+the add route had just started refusing.
+
+**Declined, on purpose.** Minification: the application is stdlib-only with no
+build step, gzip already carried a cold load at 285 KB when the decision was
+made, and the caching work was the better use of the same budget. That figure
+is 324 KB now, because this release's own work grew those files, and both are
+recorded so the next person argues from the current one. And one contrast
+exception is written into `tokens.css` rather than quietly held: forcing every
+tone to clear AA on the strongest selection tint collapses all three tints into
+one shade, or inverts their order, and an unmistakable "ticked and open" is
+worth more than the last tenth of a ratio on the rarest surface in the product.
+
+A security review of the whole branch ran before any of it merged. It found the
+loosened ConfigRX gate mechanically sound — reading a stored capture is a
+ConfigRX read now, redacted for anyone without write — but declined to call
+what a read-only account sees non-sensitive, since a redacted capture still
+carries addressing, ACLs and VPN peers. That decision is recorded beside the
+route rather than left implicit. It also found an enable secret surviving a
+credential delete, and a drain that could borrow another thread's send timeout.
+All three are fixed.
+
+Test and release plumbing: `run_all.py` died on Windows rather than reporting a
+result, three suites only passed on the machine they were written on, one
+crashed on its own tick mark, and the screenshot collector the previous review
+was run through had no theme pass and no viewport pass — which is one reason a
+light-theme contrast failure and a tab bar that clips its own connection
+indicator both survived it. Every asset URL now carries the version,
+substituted as the file is read rather than maintained by hand, because an
+immutable year-long cache turns a forgotten version bump into a release that
+ships invisibly.
 
 ### 4.47.0 — A fleet operator's list, answered
 
