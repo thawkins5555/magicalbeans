@@ -72,13 +72,6 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
-  // drawStatus runs on every fastTick — ten times a second whether or not
-  // anything changed — and a write to textContent/innerHTML/style still
-  // queues a real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--line)' };
   /* This module's vocabulary mapped onto the five tones App.statusMark
@@ -110,9 +103,9 @@
     const server = App.state.serverState || {};
     const nodes = server.nodes || { counters: {} };
     const text = nodes.status || 'Poller stopped';
-    setText(App.el('nd-status'), text);
-    setBg(App.el('nd-dot'), nodes.running ? 'var(--ok)' : 'var(--line)');
-    setText(App.el('nd-toggle'), nodes.running ? 'Stop poller' : 'Start poller');
+    App.setText(App.el('nd-status'), text);
+    App.setBg(App.el('nd-dot'), nodes.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('nd-toggle'), nodes.running ? 'Stop poller' : 'Start poller');
     const counts = nodes.device_counts || {};
     const c = nodes.counters || {};
     const parts = [`${counts.total || 0} device(s)`, `${counts.up || 0} up`,
@@ -122,14 +115,14 @@
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
     // On a wall the counts are the point: figures, not a line of prose.
     if (App.state.kiosk) {
-      setHtml(App.el('nd-counters'), App.figures([
+      App.setHtml(App.el('nd-counters'), App.figures([
         { value: counts.total || 0, label: 'devices' },
         { value: counts.up || 0, label: 'up', className: 'ok' },
         { value: counts.down || 0, label: 'down', className: counts.down ? 'fail' : '' },
       ]));
       return;
     }
-    setText(App.el('nd-counters'), parts.join(' · '));
+    App.setText(App.el('nd-counters'), parts.join(' · '));
   }
 
   /* ----------------------------------------------------------- devices */

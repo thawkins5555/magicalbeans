@@ -21,32 +21,6 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  // drawStatus runs on every fastTick — ten times a second whether or not
-  // anything changed — and a write to textContent/className/style still
-  // queues a real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
-  /* This module's own key (a source IP) renders the device it belongs to,
-     when it belongs to one — there is no App.deviceLink in app.js, so this
-     is the local lookup FINDINGS' Phase 6 cross-links call for: a small
-     ip -> device cache built from the one unpaged fetch Nodes' own device
-     list already is. Refetched at most once every 30s. Identical to
-     syslog.js's copy — one lookup shape, two independent modules. */
-  let deviceByIp = null;
-  let deviceByIpAt = 0;
-  async function loadDeviceByIp() {
-    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
-    const map = new Map();
-    try {
-      const payload = await App.get('/api/nodes/devices');
-      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
-    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
-    deviceByIp = map;
-    deviceByIpAt = Date.now();
-    return map;
-  }
-
   /* Upgrades the plain address a placeholder span carries into either a
      link to the matching Nodes device, or an "Add as a device" link that
      opens Nodes with the address already in the Add form — turning "no
@@ -56,7 +30,7 @@
      slow lookup landing after the operator moved to a different trap. */
   async function linkSourceIp(spanId, ip, stillCurrent) {
     if (!ip) return;
-    const map = await loadDeviceByIp();
+    const { byIp: map } = await App.deviceIndex();
     if (!stillCurrent()) return;
     const span = document.getElementById(spanId);
     if (!span) return;
@@ -104,21 +78,6 @@
   }
 
   /* ---------------------------------------------------------- histogram */
-
-  /* See syslog.js's plottedRange: same fix, same reasoning — a handful of
-     traps inside a day-long window plotted as a sliver at the far right of
-     an empty chart. Narrows only what gets drawn, never the request. */
-  function plottedRange(buckets, bucketWidth, t0, t1) {
-    const span = t1 - t0;
-    const first = buckets.findIndex((b) => b.total);
-    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
-    let last = buckets.length - 1;
-    while (last > first && !buckets[last].total) last -= 1;
-    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
-    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
-    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
-             span: pt1 - pt0, narrowed: true };
-  }
 
   function drawHistogram() {
     const plot = view.histPlot || { buckets: (view.hist || {}).buckets || [], span: view.t1 - view.t0 };
@@ -440,7 +399,7 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sn-status');
-    setText(status, text);
+    App.setText(status, text);
     if (status.title !== text) status.title = text;
     if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
@@ -456,9 +415,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    setBg(App.el('sn-dot'), snmp.running
+    App.setBg(App.el('sn-dot'), snmp.running
       ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
-    setText(App.el('sn-toggle'), snmp.running ? 'Stop receiver' : 'Start receiver');
+    App.setText(App.el('sn-toggle'), snmp.running ? 'Stop receiver' : 'Start receiver');
 
     const c = snmp.counters || {};
     const d = snmp.decoder || {};
@@ -472,7 +431,7 @@
     if (d.v3_encrypted) parts.push(`${d.v3_encrypted} authPriv (not decoded)`);
     if (d.v3_auth_failed) parts.push(`${d.v3_auth_failed} failed authentication`);
     parts.push(...extraCounterParts(c));
-    setText(App.el('sn-counters'), parts.join(' · '));
+    App.setText(App.el('sn-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -492,7 +451,7 @@
     view.hist = overview;
     view.traps = search.traps;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
-    view.histPlot = plottedRange(overview.buckets, bucket, t0, t1);
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
     const p = view.histPlot;
     App.el('sn-hist-summary').textContent =
       `${total.toLocaleString()} traps · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +

@@ -514,6 +514,59 @@ const App = (() => {
     }
   }
 
+  /* ip -> device, id -> device: ipam.js, snmp.js, syslog.js and wireless.js
+     each fetched the whole unpaged /api/nodes/devices list on their own
+     30-second clock to answer "which device is this address", and
+     alerts.js kept a third, differently-shaped cache (device id -> ip) for
+     the same underlying question asked in the other direction. One fetch,
+     one cache, both directions.
+
+     Callers must not assume the Maps stay valid across an await — a slow
+     caller should call deviceIndex() again (cheap: it is cached) rather
+     than hold a reference across a long pause, since a fresh fetch replaces
+     both Maps wholesale rather than mutating them. Nodes being unreadable
+     to this account (403) resolves to an empty index, not a rejected
+     promise: "no links" beats a crash. */
+  let deviceIndexCache = null;
+  let deviceIndexAt = 0;
+  async function deviceIndex() {
+    if (deviceIndexCache && Date.now() - deviceIndexAt < 30000) return deviceIndexCache;
+    const byIp = new Map();
+    const byId = new Map();
+    try {
+      const payload = await get('/api/nodes/devices');
+      for (const d of payload.devices || []) {
+        if (d.ip) byIp.set(d.ip, d);
+        byId.set(d.id, d);
+      }
+    } catch (error) { /* Nodes unreadable to this account: empty index, not fatal */ }
+    deviceIndexCache = { byIp, byId };
+    deviceIndexAt = Date.now();
+    return deviceIndexCache;
+  }
+
+  /* Upgrades a plain IP address into a link to its Nodes device
+     (`#/nodes/device/<id>`), or leaves it as escaped plain text when no
+     device on the fleet has that address. Async, because the index may
+     need a fetch — callers enhance a placeholder already on screen (the
+     pattern snmp.js/syslog.js/ipam.js/wireless.js all use) rather than
+     block a render on it.
+
+     This is the plain two-state case only: a caller that wants a
+     different link label than the address itself (wireless.js links a
+     controller's *name* to its device), an "add this address as a device"
+     fallback when nothing matches (snmp.js, syslog.js), or the device
+     object for some other purpose (alerts.js reads a device's ip back out
+     by id) needs the object deviceIndex() resolves to, not this. */
+  async function deviceLink(ip) {
+    if (!ip) return '';
+    const { byIp } = await deviceIndex();
+    const device = byIp.get(ip);
+    return device
+      ? `<a class="linkish inline" href="${buildRoute('nodes', ['device', device.id])}">${escapeHtml(ip)}</a>`
+      : escapeHtml(ip);
+  }
+
   /* The dangerous failure this replaces: a wall display that has lost its
      server looked exactly like a healthy fleet, distinguished only by the
      raw Chromium string "Failed to fetch" in low-contrast grey while two
@@ -2131,6 +2184,27 @@ const App = (() => {
     });
   }
 
+  /* stackedHistogram's only consumers (alerts.js, snmp.js, syslog.js) each
+     carried an identical copy of this: a handful of events inside a
+     day-long window used to plot as one sliver of bars at the far right of
+     an otherwise-empty chart. When whatever buckets have anything in them
+     span less than a fifth of the requested window, plot just that
+     populated stretch instead — the request itself (t0/t1, the filters) is
+     untouched, only what stackedHistogram draws narrows. Buckets are drawn
+     one per equal-width slot regardless of their timestamps, so a
+     contiguous slice of the array is all it needs. */
+  function plottedRange(buckets, bucketWidth, t0, t1) {
+    const span = t1 - t0;
+    const first = buckets.findIndex((b) => b.total);
+    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
+    let last = buckets.length - 1;
+    while (last > first && !buckets[last].total) last -= 1;
+    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
+    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
+    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
+             span: pt1 - pt0, narrowed: true };
+  }
+
   /* The chart's tabular alternative: everything the bars draw, in one pass
      over the same `buckets` array, since a screen-reader user gets no
      equivalent of glancing at the shape of a histogram. Visually hidden
@@ -2270,6 +2344,19 @@ const App = (() => {
   }
 
   function el(id) { return document.getElementById(id); }
+
+  /* Write-only-if-changed. drawStatus-style redraws run on every fastTick —
+     ten times a second whether or not anything actually changed — and an
+     unconditional write to textContent/innerHTML/style still queues a real
+     DOM mutation (and, for style, can cancel a CSS transition already in
+     flight) even when the new value equals the old one. Seven modules each
+     grew an identical copy of these three guards; this is the one copy.
+     `el` may be null (the caller's own element lookup, not looked up
+     again here) — all three are no-ops in that case. */
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+  function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
 
   /* ------------------------------------------------- status patterns
 
@@ -2919,11 +3006,15 @@ const App = (() => {
      written twice. ArrowRight/Left wrap through the tabs `tabsFn` returns,
      Home/End jump to the ends; `activate` both moves focus and performs
      the selection (selectTab for the main strip, a real click for a
-     subtab group, whose module already owns an onclick for it). */
+     subtab group, whose module already owns an onclick for it). A disabled
+     tab (IPAM disables its DHCP subtab off Windows) is dropped from the
+     rotation here rather than trusted to `tabsFn` — `focus()` on a disabled
+     button is a silent no-op, so without this, arrowing toward one just
+     stopped moving, in either direction and from Home/End alike. */
   function wireRovingTabs(list, tabsFn, activate) {
     list.addEventListener('keydown', (event) => {
       if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
-      const tabs = tabsFn();
+      const tabs = tabsFn().filter((t) => !t.disabled);
       const current = tabs.indexOf(document.activeElement);
       if (current === -1) return;
       let next;
@@ -4408,13 +4499,14 @@ const App = (() => {
   const api = {
     state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
     parseRoute, buildRoute, setRoute, applyRoute,
-    get, post, put, del, saveCsv, exportCsv,
+    get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
-    SEV_COLOR, emptyText, stackedHistogram, filterBar, isMono,
+    SEV_COLOR, emptyText, stackedHistogram, plottedRange, filterBar, isMono,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
+    setText, setHtml, setBg, setHidden,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
     runJob, emptyRow,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,

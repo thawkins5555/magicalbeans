@@ -65,40 +65,18 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = (ts) => App.ago(ts, '\u2014');
 
-  // drawStatus runs on every fastTick \u2014 ten times a second whether or not
-  // anything changed \u2014 and a write to textContent/innerHTML/style still
-  // queues a real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
-  /* device_id -> ip, for the two links beside the detail pane's object
-     line ("Syslog for this device", "Recent traps") \u2014 the object itself
-     links straight to #/nodes/device/<id> without needing this, but
-     Syslog and SNMP Trap filter by address, not device id. There is no
-     App.deviceLink in app.js, so this is the local per-device lookup
-     FINDINGS' Phase 6 cross-links call for; a single small fetch rather
-     than the whole fleet, since the id is already known exactly. */
-  const deviceIpCache = new Map();
-  async function deviceIp(id) {
-    if (deviceIpCache.has(id)) return deviceIpCache.get(id);
-    let ip = null;
-    try {
-      const payload = await App.get(`/api/nodes/devices/${id}`);
-      ip = (payload.device && payload.device.ip) || null;
-    } catch (error) { /* deleted, or unreadable to this account */ }
-    deviceIpCache.set(id, ip);
-    return ip;
-  }
-
   /* Fills in the two device-address links beside the object line once the
      ip lookup resolves \u2014 done after the pane is already on screen so
      opening an alert never waits on a Nodes fetch. Guarded by the alert
      still being the one on screen: a slow lookup landing after the
      operator moved to another alert must not rewrite a pane that has
-     moved on. */
+     moved on. deviceId arrives as the String() showDetail's signature
+     needs; App.deviceIndex's byId is keyed by the device row's own
+     (numeric) id, so it is looked up back as a number. */
   async function loadDeviceLinks(deviceId, alertId) {
-    const ip = await deviceIp(deviceId);
+    const { byId } = await App.deviceIndex();
+    const device = byId.get(Number(deviceId));
+    const ip = device ? device.ip : null;
     if (view.selected !== alertId || !ip) return;
     const box = document.getElementById('alerts-d-links');
     if (!box) return;
@@ -134,18 +112,18 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const alerts = server.alerts || { counters: {} };
-    setText(App.el('alerts-status'), alerts.status || 'Alert engine stopped');
-    setBg(App.el('alerts-dot'), alerts.running ? 'var(--ok)' : 'var(--line)');
-    setText(App.el('alerts-toggle'), alerts.running ? 'Stop alert engine' : 'Start alert engine');
+    App.setText(App.el('alerts-status'), alerts.status || 'Alert engine stopped');
+    App.setBg(App.el('alerts-dot'), alerts.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('alerts-toggle'), alerts.running ? 'Stop alert engine' : 'Start alert engine');
     const c = alerts.counters || {};
     if (App.state.kiosk) {
-      setHtml(App.el('alerts-counters'), App.figures([
+      App.setHtml(App.el('alerts-counters'), App.figures([
         { value: alerts.open_count || 0, label: 'open',
           className: alerts.open_count ? 'warn' : '' },
         { value: c.opened || 0, label: 'opened' },
         { value: c.resolved || 0, label: 'resolved' },
       ]));
-    } else setText(App.el('alerts-counters'),
+    } else App.setText(App.el('alerts-counters'),
       `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
@@ -166,7 +144,7 @@
     if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
     const badge = App.el('alerts-open-badge');
     const openCount = alerts.open_count || 0;
-    setText(badge, String(openCount));
+    App.setText(badge, String(openCount));
     if (badge.hidden !== (openCount === 0)) badge.hidden = openCount === 0;
     // Both injected in init() (see its own comment on why) rather than
     // declared with data-requires-write, so this is what keeps them honest
@@ -182,23 +160,6 @@
   }
 
   /* --------------------------------------------------------- histogram */
-
-  /* See syslog.js's plottedRange (same fix independently in each owned
-     module rather than a shared one in app.js): a burst of alerts inside a
-     day-long window used to plot as a sliver at the far right of an
-     otherwise-empty chart. Narrows only what gets drawn, never the
-     request. */
-  function plottedRange(buckets, bucketWidth, t0, t1) {
-    const span = t1 - t0;
-    const first = buckets.findIndex((b) => b.total);
-    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
-    let last = buckets.length - 1;
-    while (last > first && !buckets[last].total) last -= 1;
-    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
-    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
-    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
-             span: pt1 - pt0, narrowed: true };
-  }
 
   function drawHistogram() {
     // No click here: Alerts has no pinned-window mode, so the bars carry no
@@ -1413,7 +1374,7 @@
       App.get('/api/alerts/mutes'),
     ]);
     view.hist = overview.buckets;
-    view.histPlot = plottedRange(overview.buckets, bucket, t0, t1);
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
     // No dedicated summary line exists for this histogram yet (unlike
     // Syslog/SNMP's #sl-hist-summary / #sn-hist-summary) — guarded until
     // index.html grows an #alerts-hist-summary span beside "ALERTS PER

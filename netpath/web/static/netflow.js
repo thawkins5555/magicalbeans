@@ -67,12 +67,6 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
-  // drawStatus runs on every fastTick — ten times a second whether or not
-  // anything changed — and a write to textContent/className/style still
-  // queues a real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
   // How many flow records the table asks the server for. The select's three
   // labels and its title are written from this in init(), so the number
   // lives in one place instead of four copies of "250" in the markup.
@@ -747,7 +741,7 @@
     const text = collector.status || 'Collector stopped';
     const failed = /^Could not bind/.test(text);
     const status = App.el('nf-status');
-    setText(status, text);
+    App.setText(status, text);
     if (status.title !== text) status.title = text;
     if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
@@ -763,9 +757,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    setBg(App.el('nf-dot'), collector.running
+    App.setBg(App.el('nf-dot'), collector.running
       ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
-    setText(App.el('nf-toggle'), collector.running ? 'Stop collector' : 'Start collector');
+    App.setText(App.el('nf-toggle'), collector.running ? 'Stop collector' : 'Start collector');
 
     const counters = collector.counters || {};
     const decoder = collector.decoder || {};
@@ -786,7 +780,7 @@
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);
     }
-    setText(App.el('nf-counters'), parts.join(' · '));
+    App.setText(App.el('nf-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -947,16 +941,9 @@
     // "Resolve names" used to sit here, in the filter bar beside per-view
     // controls (source/dest/port), silently writing a server-wide setting
     // — one operator ticking it changed every operator's flow table. The
-    // same setting (resolve_addresses) already has a correctly-scoped
-    // control in Settings ("Reverse-resolve addresses in the flow table"),
-    // so this hides the redundant filter-bar one rather than wiring it a
-    // second time. index.html still carries its <label> (~nf-resolve) —
-    // safe to delete outright the next time that region is touched.
-    const legacyResolve = App.el('nf-resolve');
-    if (legacyResolve) {
-      const label = legacyResolve.closest('label') || legacyResolve;
-      label.hidden = true;
-    }
+    // same setting (resolve_addresses) now lives only in its
+    // correctly-scoped control in Settings ("Reverse-resolve addresses in
+    // the flow table").
     App.el('nf-settings').onclick = settingsDialog;
     App.el('nf-test').onclick = sendTestPacket;
     App.el('nf-toggle').onclick = async () => {

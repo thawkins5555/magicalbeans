@@ -21,31 +21,6 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  // drawStatus runs on every fastTick — ten times a second whether or not
-  // anything changed — and a write to textContent/className/style still
-  // queues a real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
-  /* This module's own key (a source IP) renders the device it belongs to,
-     when it belongs to one — there is no App.deviceLink in app.js, so this
-     is the local lookup FINDINGS' Phase 6 cross-links call for: a small
-     ip -> device cache built from the one unpaged fetch Nodes' own device
-     list already is. Refetched at most once every 30s. */
-  let deviceByIp = null;
-  let deviceByIpAt = 0;
-  async function loadDeviceByIp() {
-    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
-    const map = new Map();
-    try {
-      const payload = await App.get('/api/nodes/devices');
-      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
-    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
-    deviceByIp = map;
-    deviceByIpAt = Date.now();
-    return map;
-  }
-
   /* Upgrades the plain address a placeholder span carries into either a
      link to the matching Nodes device, or an "Add as a device" link that
      opens Nodes with the address already in the Add form — turning "no
@@ -55,7 +30,7 @@
      slow lookup landing after the operator moved to a different message. */
   async function linkSourceIp(spanId, ip, stillCurrent) {
     if (!ip) return;
-    const map = await loadDeviceByIp();
+    const { byIp: map } = await App.deviceIndex();
     if (!stillCurrent()) return;
     const span = document.getElementById(spanId);
     if (!span) return;
@@ -103,25 +78,6 @@
   }
 
   /* ---------------------------------------------------------- histogram */
-
-  /* Five messages inside a 24 h window used to draw as one sliver of bars
-     at the far right of an otherwise-empty chart. When whatever buckets
-     have anything in them span less than a fifth of the requested window,
-     plot just that populated stretch instead — the request itself (t0/t1,
-     the filters) is untouched, only what gets drawn narrows. Buckets are
-     drawn one per equal-width slot regardless of their timestamps, so a
-     contiguous slice of the array is all stackedHistogram needs. */
-  function plottedRange(buckets, bucketWidth, t0, t1) {
-    const span = t1 - t0;
-    const first = buckets.findIndex((b) => b.total);
-    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
-    let last = buckets.length - 1;
-    while (last > first && !buckets[last].total) last -= 1;
-    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
-    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
-    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
-             span: pt1 - pt0, narrowed: true };
-  }
 
   function drawHistogram() {
     // The stacked histogram is App.stackedHistogram: this page, SNMP and
@@ -383,7 +339,7 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sl-status');
-    setText(status, text);
+    App.setText(status, text);
     // The line is ellipsized so it can never push the buttons out of the card,
     // so the full text has to be reachable some other way.
     if (status.title !== text) status.title = text;
@@ -401,9 +357,9 @@
       status.onblur = App.hideTooltip;
     }
 
-    setBg(App.el('sl-dot'), syslog.running
+    App.setBg(App.el('sl-dot'), syslog.running
       ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
-    setText(App.el('sl-toggle'), syslog.running ? 'Stop collector' : 'Start collector');
+    App.setText(App.el('sl-toggle'), syslog.running ? 'Stop collector' : 'Start collector');
     const c = syslog.counters || {};
     const parts = [`${c.messages || 0} received`, `${c.stored || 0} stored`];
     if (c.filtered) parts.push(`${c.filtered} filtered by severity`);
@@ -420,7 +376,7 @@
     } else {
       parts.push('indexed search, matches anywhere in a word');
     }
-    setText(App.el('sl-counters'), parts.join(' · '));
+    App.setText(App.el('sl-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -440,7 +396,7 @@
     view.hist = overview;
     view.messages = search.messages;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
-    view.histPlot = plottedRange(overview.buckets, bucket, t0, t1);
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
     const p = view.histPlot;
     App.el('sl-hist-summary').textContent =
       `${total.toLocaleString()} messages · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +

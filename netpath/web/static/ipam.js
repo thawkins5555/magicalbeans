@@ -27,33 +27,6 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
-  // drawStatus runs on every fastTick — ten times a second, whether or not
-  // anything actually changed — and a write to textContent/hidden/style
-  // still queues a real DOM mutation even when the new value equals the
-  // old one. These three guard the assignment instead of always making it.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
-  /* A conflict's ip -> the matching Nodes device, when it has one — there
-     is no App.deviceLink in app.js, so this is the local ip -> device cache
-     FINDINGS' Phase 6 cross-links call for, built from the one unpaged
-     fetch Nodes' own device list already is. Refetched at most once every
-     30s; drawConflicts redraws far less often than that. */
-  let deviceByIp = null;
-  let deviceByIpAt = 0;
-  async function loadDeviceByIp() {
-    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
-    const map = new Map();
-    try {
-      const payload = await App.get('/api/nodes/devices');
-      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
-    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
-    deviceByIp = map;
-    deviceByIpAt = Date.now();
-    return map;
-  }
-
   /* A small utilization donut, drawn with the standard stroke-dasharray
      trick — one circle per slice, each dashed to show only its own arc —
      rather than computing SVG arc paths by hand for three fixed slices.
@@ -198,19 +171,19 @@
 
   function drawStatus() {
     const ipam = (App.state.serverState || {}).ipam || {};
-    setBg(App.el('ipam-dot'), ipam.running ? 'var(--ok)' : 'var(--line)');
-    setText(App.el('ipam-status'), ipam.running ? 'Worker running' : 'Worker stopped');
+    App.setBg(App.el('ipam-dot'), ipam.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('ipam-status'), ipam.running ? 'Worker running' : 'Worker stopped');
     const toggle = App.el('ipam-toggle');
-    if (toggle) setText(toggle, ipam.running ? 'Stop worker' : 'Start worker');
+    if (toggle) App.setText(toggle, ipam.running ? 'Stop worker' : 'Start worker');
     const parts = [];
     if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
     if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
-    setText(App.el('ipam-counters'), parts.join(' · '));
+    App.setText(App.el('ipam-counters'), parts.join(' · '));
 
     const badge = App.el('ipam-conflict-badge');
     const count = ipam.open_conflicts || 0;
-    setText(badge, String(count));
-    setHidden(badge, count === 0);
+    App.setText(badge, String(count));
+    App.setHidden(badge, count === 0);
   }
 
   /* -------------------------------------------------------------- subnets */
@@ -426,7 +399,7 @@
   // A MAC search needs no lookup to be worth linking — Nodes runs it
   // live and says "not learned" itself when nothing matches — but the IP
   // is only worth linking when it actually IS a Nodes device, so that
-  // cell starts as plain text and is upgraded once loadDeviceByIp resolves.
+  // cell starts as plain text and is upgraded once App.deviceIndex resolves.
   function macSearchLinkHtml(mac) {
     return `<a class="linkish inline" href="${
       App.buildRoute('nodes', [], { q: mac })}">${escape(mac)}</a>`;
@@ -473,7 +446,7 @@
      rather than keeping element references, since a redraw before this
      resolves replaces every row wholesale. */
   async function linkConflictIps() {
-    const map = await loadDeviceByIp();
+    const { byIp: map } = await App.deviceIndex();
     for (const span of document.querySelectorAll('#ipam-conflicts-table .ipam-conflict-ip')) {
       const ip = span.dataset.ip;
       const device = map.get(ip);

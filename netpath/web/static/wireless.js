@@ -27,28 +27,6 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
-  /* A controller is its own entity here (its own credential, polled
-     independently), not a Nodes device — but the same FortiGate is often
-     ALSO monitored as one, by the same IP. There is no App.deviceLink in
-     app.js, so this is the local lookup FINDINGS' Phase 6 cross-links call
-     for: a small ip -> device cache, built from the one unpaged fetch
-     Nodes' own device list is (see nodes.js's addDevice route). Refetched
-     at most once every 30s — the AP detail pane can redraw on every poll,
-     and a controller's own IP essentially never changes. */
-  let deviceByIp = null;
-  let deviceByIpAt = 0;
-  async function loadDeviceByIp() {
-    if (deviceByIp && Date.now() - deviceByIpAt < 30000) return deviceByIp;
-    const map = new Map();
-    try {
-      const payload = await App.get('/api/nodes/devices');
-      for (const d of payload.devices || []) if (d.ip) map.set(d.ip, d);
-    } catch (error) { /* Nodes unreadable to this account: no links, not fatal */ }
-    deviceByIp = map;
-    deviceByIpAt = Date.now();
-    return map;
-  }
-
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
@@ -64,20 +42,14 @@
     return App.statusMark(STATUS_TONE[status] || 'none', label, title);
   }
 
-  // drawStatus runs on every fastTick — ten times a second whether or not
-  // anything changed — and a write to textContent/style still queues a
-  // real DOM mutation even when the new value equals the old one.
-  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
-  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
-
   /* ------------------------------------------------------------ status */
 
   function drawStatus() {
     const server = App.state.serverState || {};
     const wireless = server.wireless || { counters: {} };
-    setText(App.el('wl-status'), wireless.status || 'Poller stopped');
-    setBg(App.el('wl-dot'), wireless.running ? 'var(--ok)' : 'var(--line)');
-    setText(App.el('wl-toggle'), wireless.running ? 'Stop poller' : 'Start poller');
+    App.setText(App.el('wl-status'), wireless.status || 'Poller stopped');
+    App.setBg(App.el('wl-dot'), wireless.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('wl-toggle'), wireless.running ? 'Stop poller' : 'Start poller');
     const counts = wireless.ap_counts || {};
     const c = wireless.counters || {};
     const parts = [`${wireless.controller_count || 0} controller(s)`,
@@ -85,8 +57,8 @@
       `${counts.offline || 0} offline`];
     if (counts.out_of_service) parts.push(`${counts.out_of_service} out of service`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
-    setText(App.el('wl-counters'), parts.join(' · '));
-    setText(App.el('wl-last-reported'), view.lastReportedTs
+    App.setText(App.el('wl-counters'), parts.join(' · '));
+    App.setText(App.el('wl-last-reported'), view.lastReportedTs
       ? `last reported ${ago(view.lastReportedTs)}` : 'never reported');
   }
 
@@ -268,7 +240,7 @@
   async function linkController(controllerId, apId) {
     const controller = view.controllers.find((x) => x.id === controllerId);
     if (!controller || !controller.ip) return;
-    const map = await loadDeviceByIp();
+    const { byIp: map } = await App.deviceIndex();
     if (view.selected !== apId) return;
     const device = map.get(controller.ip);
     const span = document.getElementById('wl-d-controller');
