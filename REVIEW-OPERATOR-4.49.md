@@ -845,6 +845,50 @@ for a fresh installation and unrealistic for a site that has done the work. A se
 run with the topology configured is what establishes what a well-configured site
 actually sees, and it is reported separately. ⏳
 
+**O-52 — half a site's outage alerts arrive at about the moment the site comes back, and
+it is arithmetic rather than a defect. CONFIRMED (direct query, then traced to the two
+settings that cause it).**
+
+The topology run's alert database, queried against the campaign log's absolute step times
+rather than by counting rows, says this about a 240-second outage of a core switch and the
+108 devices behind it:
+
+- the **core** opened its own `device_down` at outage + 162.8 s;
+- **2** of the 83 non-core rows behaved exactly as designed — opened seconds after the
+  core's, absorbed by it, then correctly *re-opened* at recovery because those two were
+  genuinely still down on their own account;
+- **81** opened at essentially the same instant the core's alert **resolved** — within
+  0.1 s of each other, both at recovery + 42.6 s — and resolved themselves ten seconds
+  later.
+
+So the 81 were never a rollup failure. **By the time the poller recorded them as down, the
+outage was already over**, and there was nothing left to roll them into. No version of the
+suppression mechanism, however written, could have caught them.
+
+**The cause is a multiplication nobody states.** `down_after_failures` defaults to **3**
+(`nodesdb.py:408`). `poll_interval_s` defaults to **120** (`nodesdb.py:37`). Three
+consecutive failed polls at two minutes each is **six minutes** before a device is
+declared down — and that is the floor, before the cycle stretches under an outage, which
+it does, because a failed poll costs its timeout and its retries where a healthy one costs
+milliseconds. The campaign ran at 60 seconds, which is why the core took 162.8 s rather
+than six minutes and why devices deeper in the sweep took longer still.
+
+Each half is individually defensible. Three failures is sane anti-flap; two minutes is
+reasonable for a large fleet. **What nobody says out loud is their product**: on shipped
+defaults this system reports a dead device about six minutes after it dies, and **an
+outage shorter than three poll cycles is invisible entirely** — a switch that reboots in
+four minutes was, as far as this product is concerned, never down.
+
+That is not a request to change the poller. It is that the two settings which determine an
+operator's detection floor live in different places, neither states the product of the
+other, and nothing in the interface says what the current configuration means in minutes.
+**A line on the Nodes settings page reading "with these settings a device is reported down
+about six minutes after it stops answering" would be worth more than most of the metrics
+in this product**, and it costs a multiplication.
+
+Everything else in this section is downstream of it. The rollup, the notification digest
+and the topology work can do nothing about an alert that has not been raised yet.
+
 **O-17 — removing a custom alert rule silently destroys every alert it ever raised,
 including the resolved ones that are the record of past incidents. CONFIRMED.**
 `netpath/alertsdb.py:86` declares `rule_id INTEGER NOT NULL REFERENCES rules(id) ON
