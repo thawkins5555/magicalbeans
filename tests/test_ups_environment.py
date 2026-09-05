@@ -16,7 +16,13 @@ Four sections, matching the four things asked for:
      scale/precision combinations, including a negative exponent.
   3. A sensor with no ifIndex mapping now visible at DEVICE level
      (_poll_environment) while read_dom()'s own, unchanged, port-only view
-     still sees only what it always saw.
+     still sees only what it always saw -- AND that a temperature reading
+     lands in temp_optic_c/temp_ambient_c/temp_chassis_c correctly, the fix
+     for a real false-positive incident this shipped with for about a day
+     (one "temp_c" key covering a room, a chassis and an SFP's DOM at once
+     read as ten false "Temperature high" alerts on a healthy fleet). The
+     "cannot be determined" case (no humidity sensor anywhere on the
+     device) must default to chassis, never ambient.
   4. Each new built-in alert rule (alertsdb._BUILTIN_RULES) opening and
      clearing against synthetic metric samples, through a real AlertEngine
      tick -- not evaluate_threshold alone.
@@ -207,12 +213,27 @@ try:
     now = time.time()
     poller._poll_environment(did, device, config, set(), now)
     dev_metrics = {m["key"]: m for m in db.metrics(did)}
-    check("the device-level scan reports the hottest OK sensor (52, not the "
-          "excluded 99 nonoperational reading, and not the port-mapped "
-          "45.1 alone)",
-          "temp_c" in dev_metrics and dev_metrics["temp_c"]["last_value"] == 52.0,
-          dev_metrics.get("temp_c"))
-    check("...and the humidity reading, decoded through a negative scale exponent",
+    # Entity 1 maps to ifIndex 1 -> temp_optic_c. Entity 3 (99, nonoperational)
+    # is excluded. Entity 4 (52, unmapped) has no port, but this device DOES
+    # answer a humidity sensor (entity 2), which is the positive evidence
+    # that promotes an unmapped reading to temp_ambient_c rather than the
+    # temp_chassis_c default -- see the "sensors_no_humidity" section below
+    # for the opposite case.
+    check("a port-mapped sensor becomes temp_optic_c (45.1, entity 1)",
+          "temp_optic_c" in dev_metrics
+          and dev_metrics["temp_optic_c"]["last_value"] == 45.1,
+          dev_metrics.get("temp_optic_c"))
+    check("an unmapped sensor on a device with a humidity sensor becomes "
+          "temp_ambient_c (52, entity 4 -- not the excluded 99 nonoperational "
+          "reading from entity 3)",
+          "temp_ambient_c" in dev_metrics
+          and dev_metrics["temp_ambient_c"]["last_value"] == 52.0,
+          dev_metrics.get("temp_ambient_c"))
+    check("no temp_chassis_c is produced here (nothing unmapped and "
+          "'chassis-only' on this device)",
+          "temp_chassis_c" not in dev_metrics, dev_metrics)
+    check("...and the humidity reading itself, decoded through a negative "
+          "scale exponent",
           "humidity_pct" in dev_metrics
           and dev_metrics["humidity_pct"]["last_value"] == 65.0,
           dev_metrics.get("humidity_pct"))
@@ -232,6 +253,37 @@ try:
         did, device, config, set(), now + NodePoller._SENSOR_REFRESH_S + 1.0)
     check("...but one past the cadence window does",
           request_count(port) >= 1, request_count(port))
+    db.close()
+finally:
+    stub.kill()
+
+# ---------------------------- no humidity sensor: default is chassis, not ambient
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "sensors_no_humidity")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("sensors_no_humidity")
+    did = device_against(db, "switch-with-a-sensor")
+    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    poller._poll_environment(did, device, config, set(), time.time())
+    dev_metrics = {m["key"]: m for m in db.metrics(did)}
+    check("a device whose sensor kind cannot be positively identified as "
+          "ambient (no humidity sensor anywhere on it) defaults to "
+          "temp_chassis_c, never temp_ambient_c",
+          "temp_chassis_c" in dev_metrics
+          and dev_metrics["temp_chassis_c"]["last_value"] == 52.0
+          and "temp_ambient_c" not in dev_metrics,
+          dev_metrics)
+    check("the port-mapped entity is still temp_optic_c regardless",
+          "temp_optic_c" in dev_metrics
+          and dev_metrics["temp_optic_c"]["last_value"] == 45.1,
+          dev_metrics.get("temp_optic_c"))
+    check("no humidity_pct at all when nothing on the device reports one",
+          "humidity_pct" not in dev_metrics, dev_metrics)
     db.close()
 finally:
     stub.kill()
@@ -271,7 +323,9 @@ CASES = [
     ("ups_battery_low", "ups_battery_status", "Battery status", "", 3.0, 2.0),
     ("ups_battery_replace", "ups_battery_status", "Battery status", "", 4.0, 2.0),
     ("ups_load_high", "ups_output_load_pct", "Output load", "%", 95.0, 40.0),
-    ("temp_high", "temp_c", "Temperature", "°C", 40.0, 25.0),
+    ("temp_ambient_high", "temp_ambient_c", "Ambient temperature", "°C", 40.0, 20.0),
+    ("temp_chassis_high", "temp_chassis_c", "Chassis temperature", "°C", 90.0, 60.0),
+    ("temp_optic_high", "temp_optic_c", "Optic temperature", "°C", 95.0, 60.0),
     ("humidity_high", "humidity_pct", "Humidity", "%RH", 90.0, 50.0),
 ]
 

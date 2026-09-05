@@ -471,26 +471,31 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
     Reads samples_hourly, never samples: three days of raw samples is not
     a month, and a raw scan at fleet scale would not finish (see the module
     docstring's sibling reasoning in analysis.py's own MAX_BUCKETS comment
-    for the same "bound it here, don't trust the caller" instinct). Costs,
-    in order:
+    for the same "bound it here, don't trust the caller" instinct). One
+    query, structured as a CTE rather than resolving candidate ids in
+    Python first and passing them back as a giant `IN (...)` list — at
+    fleet scale (2,000 devices x 48 ports is 96,000 candidate metrics for
+    one interface-metric family) that list blows past SQLite's own bound
+    parameter ceiling (`sqlite3.OperationalError: too many SQL variables`,
+    hit while writing this against a 2,000-device benchmark — see
+    tests/test_report_topn.py) well before it becomes a performance
+    problem:
 
-    1. Resolve candidate metrics from `metrics` (small — one row per
-       series, not one per hour) filtered by key/like and, optionally,
-       `device_ids`. `metrics.key` has no index of its own (only
-       `UNIQUE(device_id, key)`), so an unfiltered `like=True` scan across
-       every device is a full scan of this table — still small relative to
-       samples_hourly, but see this function's own measured cost in
-       tests/test_report_topn.py if that stops being true at real scale.
-    2. Aggregate `samples_hourly` filtered to exactly those metric ids and
+    1. `candidates`: `metrics` joined to `devices`, filtered by key/like
+       and, optionally, `device_ids`. Small — one row per series, not one
+       per hour — so `metrics.key` having no index of its own (only
+       `UNIQUE(device_id, key)`, so this is a full scan of `metrics`) costs
+       nothing next to step 2.
+    2. `candidates` joined to `samples_hourly` on `metric_id`, filtered to
        the hour range, GROUP BY metric_id. `samples_hourly`'s primary key
-       leads on metric_id, so this is one index range scan per candidate
-       metric rather than a scan of the whole rollup table — the
-       difference this function exists to make, per the task's own
-       instruction to read rollups, not raw samples, for a wide window.
+       leads on metric_id, so SQLite can satisfy this as one index range
+       scan per candidate metric rather than a scan of the whole rollup
+       table — the difference this function exists to make, per the
+       task's own instruction to read rollups, not raw samples, for a
+       wide window.
 
-    `query_ms` on the returned report is the wall-clock cost of step 2
-    alone (the part that scales with window width and fleet size), so a
-    caller or a test can watch it rather than guess at it.
+    `query_ms` on the returned report is the wall-clock cost of the whole
+    query, so a caller or a test can watch it rather than guess at it.
     """
     t0, t1 = clamp_window(t0, t1)
     h0 = int(t0 // 3600) * 3600
@@ -504,38 +509,36 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
         marks = ",".join("?" * len(device_ids))
         device_clause = f" AND m.device_id IN ({marks})"
         params.extend(device_ids)
-    candidates = conn.execute(
-        f"SELECT m.id AS metric_id, m.device_id, m.key, m.label, m.unit,"
-        f" d.name AS device_name, d.ip AS device_ip"
-        f" FROM metrics m JOIN devices d ON d.id = m.device_id"
-        f" WHERE {key_clause}{device_clause}",
-        params).fetchall()
-    if not candidates:
-        return TopMetricReport(key=key, like=like, t0=t0, t1=t1, rank_by=rank_by,
-                               ascending=ascending, generated_ts=time.time(),
-                               query_ms=0.0, rows=[])
-    by_id = {row["metric_id"]: row for row in candidates}
-    metric_ids = list(by_id)
+    params.extend([h0, h1])
 
     started = time.perf_counter()
-    marks = ",".join("?" * len(metric_ids))
     agg_rows = conn.execute(
-        f"SELECT metric_id, MAX(vmax) AS peak, SUM(vavg * n) AS sum_avg_n,"
-        f" SUM(n) AS total_n, COUNT(*) AS n_hours FROM samples_hourly"
-        f" WHERE metric_id IN ({marks}) AND hour >= ? AND hour <= ?"
-        f" GROUP BY metric_id",
-        (*metric_ids, h0, h1)).fetchall()
+        f"WITH candidates AS ("
+        f" SELECT m.id AS metric_id, m.device_id, m.key, m.label, m.unit,"
+        f" d.name AS device_name, d.ip AS device_ip"
+        f" FROM metrics m JOIN devices d ON d.id = m.device_id"
+        f" WHERE {key_clause}{device_clause})"
+        f" SELECT c.metric_id, c.device_id, c.key, c.label, c.unit,"
+        f" c.device_name, c.device_ip, MAX(sh.vmax) AS peak,"
+        f" SUM(sh.vavg * sh.n) AS sum_avg_n, SUM(sh.n) AS total_n,"
+        f" COUNT(*) AS n_hours"
+        f" FROM candidates c JOIN samples_hourly sh ON sh.metric_id = c.metric_id"
+        f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
+        params).fetchall()
     query_ms = (time.perf_counter() - started) * 1000.0
+    if not agg_rows:
+        return TopMetricReport(key=key, like=like, t0=t0, t1=t1, rank_by=rank_by,
+                               ascending=ascending, generated_ts=time.time(),
+                               query_ms=query_ms, rows=[])
 
     rows: list[MetricRank] = []
     for arow in agg_rows:
-        meta = by_id[arow["metric_id"]]
         total_n = arow["total_n"] or 0
         mean = (arow["sum_avg_n"] / total_n) if total_n else None
         rows.append(MetricRank(
-            device_id=meta["device_id"], device_name=meta["device_name"] or meta["device_ip"],
-            device_ip=meta["device_ip"], metric_id=arow["metric_id"], key=meta["key"],
-            label=meta["label"], unit=meta["unit"], if_index=_if_index(meta["key"]),
+            device_id=arow["device_id"], device_name=arow["device_name"] or arow["device_ip"],
+            device_ip=arow["device_ip"], metric_id=arow["metric_id"], key=arow["key"],
+            label=arow["label"], unit=arow["unit"], if_index=_if_index(arow["key"]),
             peak=arow["peak"], mean=mean, n_hours=arow["n_hours"]))
 
     # A metric with nothing in the window (an interface that came up after

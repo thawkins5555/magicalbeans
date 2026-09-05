@@ -25,13 +25,21 @@ Modes:
              in TimeTicks -- the fallback path.
   sensors    ENTITY-SENSOR-MIB, four entities: one (#1) mapped to ifIndex 1
              through entAliasMappingIdentifier, a fractional-precision
-             temperature (45.1 C) -- the read_dom()-reachable case; three
-             (#2-#4) mapped to nothing, all invisible to read_dom() and all
-             visible to the device-level scan: #2 a humidity reading with a
-             NEGATIVE scale exponent (milli, scale=8), #3 a temperature
-             marked nonoperational (status=3, must be excluded), #4 a
-             plain-ok temperature hotter than #1 (must win the device's
-             worst-of reading).
+             temperature (45.1 C) -- the read_dom()-reachable case AND the
+             temp_optic_c case, since it maps to a port; three (#2-#4)
+             mapped to nothing, all invisible to read_dom() and all visible
+             to the device-level scan: #2 a humidity reading with a
+             NEGATIVE scale exponent (milli, scale=8) -- also the signal
+             that promotes #4 to temp_ambient_c rather than temp_chassis_c,
+             #3 a temperature marked nonoperational (status=3, must be
+             excluded), #4 a plain-ok temperature hotter than #1 (must win
+             the device's worst-of-kind reading).
+  sensors_no_humidity
+             The same entities 1/3/4 as `sensors`, with entity 2 (the
+             humidity sensor) removed: #4 now has no positive evidence this
+             is a dedicated environmental monitor, so it must land in
+             temp_chassis_c, never temp_ambient_c -- the "cannot be
+             determined must not silently become ambient" case.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -118,6 +126,27 @@ SENSOR_TABLE = {
     "1.3.6.1.2.1.47.1.3.2.1.2.1.1": ("str", "1.3.6.1.2.1.2.2.1.1.1"),
 }
 
+# The same entities 1/3/4 as SENSOR_TABLE (entity 1 port-mapped, entity 3
+# excluded by status, entity 4 an unmapped ok reading) with entity 2 (the
+# humidity sensor, and its descr) removed entirely -- a chassis with NO
+# humidity sensor at all, so entity 4's reading has no positive "this is a
+# room monitor" evidence and must default to temp_chassis_c, never
+# temp_ambient_c. This is the "sensor kind cannot be determined" case
+# nodepoll._poll_environment's docstring says must not silently become
+# ambient. Entity 1's own alias-mapping row (base OID
+# "1.3.6.1.2.1.47.1.3.2.1.2", entity 2's happens to share no arc with it)
+# is kept.
+_DROP_ENTITY_2 = (
+    "1.3.6.1.2.1.47.1.1.1.1.2.2",     # descr
+    "1.3.6.1.2.1.99.1.1.1.1.2",       # type
+    "1.3.6.1.2.1.99.1.1.1.2.2",       # scale
+    "1.3.6.1.2.1.99.1.1.1.3.2",       # precision
+    "1.3.6.1.2.1.99.1.1.1.4.2",       # value
+    "1.3.6.1.2.1.99.1.1.1.5.2",       # status
+)
+SENSOR_TABLE_NO_HUMIDITY = {oid: value for oid, value in SENSOR_TABLE.items()
+                           if oid not in _DROP_ENTITY_2}
+
 MODE = "ups"
 
 
@@ -130,6 +159,8 @@ def table_for():
         return {**APC_SCALARS, **APC_UPS_TABLE, **APC_RUNTIME_TABLE}
     if MODE == "sensors":
         return {**GENERIC_SCALARS, **SENSOR_TABLE}
+    if MODE == "sensors_no_humidity":
+        return {**GENERIC_SCALARS, **SENSOR_TABLE_NO_HUMIDITY}
     return dict(GENERIC_SCALARS)
 
 

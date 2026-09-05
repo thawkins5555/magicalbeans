@@ -3072,7 +3072,7 @@ class NodePoller:
     # Kept safely under alertengine's threshold_stale_s (900s shipped
     # default): a metric older than that reads as "absent" to a threshold
     # rule (see alertengine._evaluate_thresholds), and a sensor cadence
-    # equal to or slower than that would make temp_high/humidity_high
+    # equal to or slower than that would make the temperature/humidity rules
     # flicker in and out of "no data" between refreshes instead of holding
     # a value. Five minutes leaves three refreshes of margin inside that
     # 900-second window.

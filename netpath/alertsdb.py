@@ -439,7 +439,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 41 built-in rules: 8 device_event + 3 interface_event + 17 threshold +
+# 43 built-in rules: 8 device_event + 3 interface_event + 19 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
@@ -500,16 +500,44 @@ _BUILTIN_RULES = [
     ("ups_battery_low", "UPS battery low", "threshold", "ups_battery_status", 3, "threshold_breach", 3.0, 3.0, 1),
     ("ups_battery_replace", "UPS battery depleted, replace it", "threshold", "ups_battery_status", 2, "threshold_breach", 4.0, 4.0, 1),
     ("ups_load_high", "UPS output load high", "threshold", "ups_output_load_pct", 4, "threshold_breach", 90.0, 80.0, 2),
-    # Thresholds a plant equipment room would actually accept, not the
-    # cpu_high/mem_high 90/80 copied onto a different unit: ASHRAE's own
-    # allowable (not merely recommended) range for networking gear tops
-    # out around 35 C, and RH above ~80% starts to risk condensation on
-    # anything metal in the room. Both are a starting point for a site to
-    # tune, not a physical constant — unlike an enum or a UPS's own
-    # judgment of its battery, "how hot is too hot" genuinely varies by
-    # site, which is exactly what threshold/clear_threshold being ordinary
-    # editable columns is for.
-    ("temp_high", "Temperature high", "threshold", "temp_c", 4, "threshold_breach", 35.0, 30.0, 2),
+    # Temperature shipped as ONE rule over ONE metric key (temp_c) for
+    # about a day of this campaign, and it was wrong: nodepoll writes a
+    # room's ambient reading, a switch's own internal chassis reading and
+    # an SFP's DOM reading through completely different normal ranges — a
+    # comms closet alarms around 30 C, a switch chassis is fine at 45,
+    # and an optic's DOM commonly runs 40-55 C by design (that spread is
+    # the entire reason DOM exists). One threshold over all three read as
+    # ten false "Temperature high" alerts on a 25-device fleet with
+    # healthy switches and exactly one or two Room Alerts in it — the
+    # same mib_missing email-storm shape a prior review of this product
+    # already burned an operator's trust on once (see _BUILTIN_NOTIFY_OFF
+    # above). nodepoll._poll_environment now classifies every temperature
+    # reading into one of three metric keys before it is ever stored
+    # (using the same ENTITY-SENSOR containment walk read_dom already
+    # does, plus "does this device also have a humidity sensor" as the
+    # room-vs-chassis signal — see that function's docstring for the
+    # full reasoning), so each of the three rules below only ever sees
+    # readings of its own kind and can carry a threshold that kind
+    # actually means something at. All three are a starting point for a
+    # site to tune, not a physical constant.
+    #
+    # Ambient: ASHRAE's own allowable (not merely recommended) range for
+    # networking gear tops out around 35 C; 30/25 gives an operator
+    # warning before a room reaches that ceiling rather than after.
+    ("temp_ambient_high", "Ambient temperature high", "threshold", "temp_ambient_c", 4, "threshold_breach", 30.0, 25.0, 2),
+    # Chassis: comfortably above the "45 C is fine" a healthy switch runs
+    # at, in line with the internal-board alarm thresholds vendors
+    # themselves ship (Cisco/Juniper environmental major-alarm levels
+    # commonly sit in the 75-85 C range for this kind of sensor).
+    ("temp_chassis_high", "Chassis temperature high", "threshold", "temp_chassis_c", 4, "threshold_breach", 75.0, 65.0, 2),
+    # Optic: comfortably above the "40-55 C is normal DOM" range, in line
+    # with SFF-8472's own typical vendor-set high-warning/high-alarm
+    # thresholds for a commercial-temperature transceiver.
+    ("temp_optic_high", "Optic temperature high", "threshold", "temp_optic_c", 4, "threshold_breach", 80.0, 70.0, 2),
+    # RH above ~80% starts to risk condensation on anything metal in the
+    # room — unambiguous on its own: nothing but a dedicated environmental
+    # monitor answers a humidity sensor at all, so this one metric key
+    # never needed splitting.
     ("humidity_high", "Humidity high", "threshold", "humidity_pct", 4, "threshold_breach", 80.0, 70.0, 2),
     ("response_time_high", "Ping response time high", "threshold", "ping_rtt_ms", 5, "threshold_breach", 500.0, 300.0, 2),
     # Live from 4.25, when the poller started sending several probes per
@@ -810,6 +838,7 @@ class AlertsDatabase:
             ("rekey_trap_syslog_alerts_1", self._rekey_trap_syslog_alerts),
             ("seed_auto_resolve_1", self._seed_auto_resolve),
             ("rebind_event_notice_1", self._rebind_event_notice),
+            ("retire_temp_high_1", self._retire_temp_high),
         )
 
     def _run_named_migrations(self) -> None:
@@ -878,6 +907,57 @@ class AlertsDatabase:
                     "UPDATE rules SET template_id = ? WHERE key = ?"
                     " AND is_builtin = 1 AND template_id = ?",
                     (target, key, previous))
+            self._conn.commit()
+
+    def _retire_temp_high(self) -> None:
+        """Retire the single "Temperature high" rule over one "temp_c"
+        metric key that this same feature briefly shipped, before
+        nodepoll._poll_environment was corrected to classify a temperature
+        reading into temp_ambient_c/temp_chassis_c/temp_optic_c instead —
+        see _BUILTIN_RULES' comment above temp_ambient_high for why one
+        key over a room, a chassis and an SFP's DOM read as false alerts
+        on a healthy fleet. Nothing produces "temp_c" any more, so an
+        installation that already seeded the old rule would otherwise keep
+        a built-in that can never fire and never clear again.
+
+        Retired only if it still looks exactly like what shipped —
+        is_builtin, unmodified source_kind/threshold/clear_threshold — the
+        same "an operator's edit is not ours to touch" test
+        _rebind_event_notice already applies to a template binding. A
+        customized copy is left alone; it will simply never fire, same as
+        any other rule pointed at a metric key nothing produces."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM rules WHERE key = 'temp_high' AND is_builtin = 1"
+                " AND source_kind = 'temp_c' AND threshold = 35.0"
+                " AND clear_threshold = 30.0").fetchone()
+            if row is None:
+                return
+            rule_id = row["id"]
+            now = time.time()
+            for alert in self._conn.execute(
+                    "SELECT id FROM alerts WHERE rule_id = ?"
+                    " AND state IN ('open','acked')", (rule_id,)).fetchall():
+                self._conn.execute(
+                    "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                    " resolved_by='' WHERE id=?", (now, alert["id"]))
+                self._note(alert["id"],
+                          "Resolved on upgrade: temp_high was split into "
+                          "temp_ambient_high/temp_chassis_high/"
+                          "temp_optic_high, each reading its own metric")
+            # Disabled and renamed rather than deleted: rules.id is the
+            # alerts table's own foreign key (ON DELETE CASCADE), so
+            # deleting the row would take every alert this rule ever
+            # raised down with it — exactly the history the resolve-with-
+            # a-note step above exists to keep. A disabled, clearly
+            # labelled row an operator can remove by hand from the rules
+            # page is the reversible choice; a cascade a migration
+            # silently triggered underneath them is not.
+            self._conn.execute(
+                "UPDATE rules SET enabled = 0, notify = 0,"
+                " name = 'Temperature high (retired -- see"
+                " temp_ambient_high / temp_chassis_high / temp_optic_high)'"
+                " WHERE id = ?", (rule_id,))
             self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:

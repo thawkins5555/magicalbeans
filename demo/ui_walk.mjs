@@ -214,6 +214,82 @@ const LOOPBACK_TESTS = [
 const THEMES = ['dark', 'light', 'contrast'];
 const VIEWPORTS = [[1920, 1080], [1366, 768], [1280, 720]];
 
+/**
+ * Controls this walk deliberately does NOT drive, and why — so the census
+ * can say "skipped, unsafe" instead of leaving these silently mixed in with
+ * "the walk never reached this one", which is a different (and worse)
+ * finding. Every one of these either destroys seeded data the walk cannot
+ * put back, changes a credential/session, or creates a real account.
+ */
+const DESTRUCTIVE_SKIP = new Map([
+  ['target-remove', 'destructive: removes a netpath destination the seed created'],
+  ['nd-bulk-delete', 'destructive: deletes devices'],
+  ['cx-backup-delete', 'destructive: deletes a stored config backup'],
+  ['alerts-remove-rule', 'destructive: removes an alert rule'],
+  ['ipam-remove', 'destructive: removes IPAM data'],
+  ['cx-clear', 'left alone per campaign policy (see team lead guidance)'],
+  ['cx-bulk-clear', 'left alone per campaign policy (see team lead guidance)'],
+  ['dbg-clear', 'left alone per campaign policy (see team lead guidance)'],
+  ['add-user', 'destructive: creates a real account'],
+  ['gen-password', 'left alone per campaign policy (see team lead guidance)'],
+  ['copy-password', 'left alone per campaign policy (see team lead guidance)'],
+  ['signout', "would end this account's session mid-walk"],
+  ['nd-import-devices', 'destructive unless fed a file this walk would then have to remove'],
+  ['update-now', 'destructive: installs an update and restarts the app'],
+]);
+
+/**
+ * Safe, reversible controls this walk was not otherwise driving — filter
+ * apply/clear, pagination, zoom/pan, category toggles — each as
+ * [tab, subtab-or-null, id]. None of these delete or remove anything; a
+ * couple (page next/prev, zoom in/out) are driven forward then back so
+ * they leave the page as they found it.
+ */
+const SAFE_CLICKS = [
+  ['nodes', 'devices', 'nd-apply'], ['nodes', 'devices', 'nd-clear'],
+  ['nodes', 'devices', 'nd-page-next'], ['nodes', 'devices', 'nd-page-prev'],
+  ['nodes', 'devices', 'nd-poll-now'],
+  ['alerts', 'current', 'alerts-apply'], ['alerts', 'current', 'alerts-clear'],
+  ['alerts', 'current', 'alerts-page-next'], ['alerts', 'current', 'alerts-page-prev'],
+  ['netpath', null, 'route-zoom-in'], ['netpath', null, 'route-zoom-out'],
+  ['netpath', null, 'route-expand'], ['netpath', null, 'route-fit'],
+  ['netpath', null, 'tl-in'], ['netpath', null, 'tl-out'],
+  ['netpath', null, 'tl-back'], ['netpath', null, 'tl-fwd'], ['netpath', null, 'tl-reset'],
+  ['netflow', null, 'nf-apply'], ['netflow', null, 'nf-clear'],
+  ['netflow', null, 'nf-in'], ['netflow', null, 'nf-out'],
+  ['netflow', null, 'nf-back'], ['netflow', null, 'nf-fwd'], ['netflow', null, 'nf-reset'],
+  ['snmp', null, 'sn-apply'], ['snmp', null, 'sn-clear'],
+  ['syslog', null, 'sl-apply'], ['syslog', null, 'sl-clear'],
+  ['ipam', 'subnets', 'ipam-search-btn'],
+  ['wireless', null, 'wl-apply'], ['wireless', null, 'wl-clear'],
+  ['configrx', null, 'cx-apply'],
+  ['debug', null, 'dbg-cats-all'], ['debug', null, 'dbg-cats-none'],
+];
+
+// Export-CSV buttons: read-only, client-side Blob downloads — safe to click,
+// nothing to revert.
+const SAFE_EXPORTS = [
+  ['nodes', 'devices', 'nd-export-csv'],
+  ['alerts', 'current', 'alerts-export-csv'],
+  ['netflow', null, 'nf-export-csv'],
+  ['snmp', null, 'sn-export-csv'],
+  ['syslog', null, 'sl-export-csv'],
+  ['ipam', 'subnets', 'ipam-hosts-export-csv'],
+  ['wireless', null, 'wl-export-csv'],
+];
+
+// Collector start/stop toggles: clicked once, then clicked again to put the
+// collector back the way it was found — genuinely reversible, but only
+// where this account has write on that module (checked via gateState, same
+// as every other write-gated control in this file).
+const SAFE_TOGGLES = [
+  ['nodes', null, 'nd-toggle'], ['alerts', null, 'alerts-toggle'],
+  ['netflow', null, 'nf-toggle'], ['snmp', null, 'sn-toggle'],
+  ['syslog', null, 'sl-toggle'], ['ipam', null, 'ipam-toggle'],
+  ['wireless', null, 'wl-toggle'], ['configrx', null, 'cx-toggle'],
+  ['debug', null, 'dbg-pause'],
+];
+
 class Recorder {
   constructor() {
     this.console = [];
@@ -286,8 +362,27 @@ async function guarded(recorder, name, fn) {
  * LEXICAL binding, so it is reachable as a bare identifier but is NOT a
  * property of `window`. Everything below therefore says `App.…`, never
  * `window.App`, which is undefined.
+ *
+ * This used to select tabs with a page.evaluate call only — no real click
+ * ever reached the tab strip, so installActivationTracker's real-click
+ * listener (which every other control in this file relies on for its
+ * activation count) never saw a `tab-*` id, no matter how many times a walk
+ * visited that tab. All twelve were permanently `not_activated` in every
+ * census this file ever produced, which is a real under-count, not a
+ * quirk to document around. app.js:4355 wires `tab.onclick = () =>
+ * selectTab(tab.dataset.tab)` on the real button, so a genuine click does
+ * the exact same thing the JS call did — it is now tried FIRST, at a short
+ * timeout, so the census reflects what actually got driven. The JS call
+ * still runs unconditionally afterwards, both because it is idempotent
+ * (same state either way) and because it is the only one of the two that
+ * awaits refreshNow's own promise — nothing a raw click event triggers can
+ * be awaited from here. Kiosk mode hides the tab strip entirely (by
+ * design — see walkKiosk below) so the click there simply fails fast and
+ * falls through to the JS call, exactly as before; this is not special-
+ * cased, it falls out of the short timeout on its own.
  */
 async function selectTab(page, tab) {
+  await page.click(`.tab[data-tab="${tab}"]`, { timeout: 1500 }).catch(() => {});
   await page.evaluate(async (name) => {
     App.selectTab(name);
     // refreshNow(name) returns the page's own refresh promise (app.js:1089).
@@ -470,6 +565,31 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       await shoot(page, dir, shot('sub', `device-${sub}`));
     }
     return 'opened';
+  });
+
+  // ---- SSH terminal (data-requires-write="ssh" — a separate module from
+  // "nodes"; seed.py's grants tuple never mentions it, so viewer and noc are
+  // both refused here regardless of their nodes grant, and only admin can
+  // open it). nodes.js:2900 opens it as a real popup window
+  // (`window.open('/ssh.html?...')`), not a modal, so this is the one dialog
+  // in the whole walk that needs Playwright's 'popup' event rather than
+  // #modal. It is not destructive — nothing about opening a terminal changes
+  // stored state — and it is a substantial, otherwise entirely unexercised
+  // piece of the product, so it is worth the special handling.
+  await guarded(recorder, step('dlg:ssh-device'), async () => {
+    const gate = await gateState(page, '#nd-ssh-device');
+    if (!gate.present || !gate.visible) return 'absent — #nd-ssh-device not visible';
+    if (gate.disabled && gate.denied) return `refused — ${gate.reason}`;
+    const [popup] = await Promise.all([
+      page.waitForEvent('popup', { timeout: 8000 }),
+      page.click('#nd-ssh-device', { timeout: 5000 }),
+    ]);
+    await popup.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    await sleep(1500);   // let the terminal connect (or show its credential prompt)
+    const title = await popup.title().catch(() => '');
+    await shoot(popup, dir, shot('dlg', 'ssh-device'));
+    await popup.close().catch(() => {});
+    return `opened popup "${title}"`;
   });
 
   // ---- MAC search: resolveMacSearch (nodes.js) only runs on a deliberate
@@ -836,9 +956,15 @@ async function recordAccountOverview(page, recorder, account, metrics) {
  * `scopeSelector`, deduplicated by id (or, failing that, tag+class+label —
  * an unlabelled, id-less control cannot be told apart from an identical
  * sibling, so it collapses to one entry; that is a labelling gap worth
- * surfacing on its own). */
-async function harvestControls(page, scopeSelector) {
-  return page.evaluate((scope) => {
+ * surfacing on its own). `tabLabel` is stamped onto every entry (`'chrome'`
+ * for the tab strip / account bar) purely so a later reader can tell where
+ * an id-less control was found without re-deriving it from which array it
+ * landed in. Labels are capped at 160 chars: a write-gated <fieldset>
+ * wrapping a whole settings section has no id or short label of its own —
+ * `textContent` on it is the entire section's rendered text — and a
+ * multi-kilobyte "label" is not useful to a reader either way. */
+async function harvestControls(page, scopeSelector, tabLabel) {
+  return page.evaluate(({ scope, tabLabel }) => {
     const root = document.querySelector(scope);
     if (!root) return [];
     const nodes = [...root.querySelectorAll(
@@ -850,20 +976,23 @@ async function harvestControls(page, scopeSelector) {
       const key = el.id || `${el.tagName}|${el.className}|${el.textContent.trim()}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      const rawLabel = el.getAttribute('aria-label') || el.textContent.trim()
+        || el.title || el.id || '(unlabelled)';
       out.push({
         id: el.id || null,
+        tab: tabLabel,
         tag: el.tagName.toLowerCase(),
         role: el.getAttribute('role') || null,
         subtab: el.classList.contains('subtab'),
-        label: el.getAttribute('aria-label') || el.textContent.trim()
-          || el.title || el.id || '(unlabelled)',
+        label: rawLabel.length > 160 ? `${rawLabel.slice(0, 160)}…` : rawLabel,
+        labelTruncated: rawLabel.length > 160,
         writeModule: (el.dataset && el.dataset.requiresWrite) || null,
         disabled: 'disabled' in el ? Boolean(el.disabled) : Boolean(el.inert),
         disabledReason: el.title || null,
       });
     }
     return out;
-  }, scopeSelector).catch(() => []);
+  }, { scope: scopeSelector, tabLabel }).catch(() => []);
 }
 
 /**
@@ -872,12 +1001,10 @@ async function harvestControls(page, scopeSelector) {
  * button, a subtab, a dialog trigger, a row — is recorded by the id of the
  * element (or its nearest ancestor with one) that received it. Deliberately
  * NOT wired into every individual page.click() call site: those are
- * scattered across walkTabs/walkDialogs/writeBoundaryActions, and a real
- * DOM click event is the one signal that reaches all of them for free.
- * Note this means App.selectTab(name) (selectTab() above, a JS call, not a
- * click) never marks a top-level tab button as activated — which is
- * accurate: this walk never actually clicks the tab strip, it calls the
- * app's own selection function directly, and the census says so.
+ * scattered across walkTabs/walkDialogs/writeBoundaryActions/
+ * driveSafeControls, and a real DOM click event is the one signal that
+ * reaches all of them for free — including selectTab()'s own click on the
+ * tab strip (see its comment above for why that used to be the one gap).
  */
 async function installActivationTracker(context) {
   await context.addInitScript(() => {
@@ -893,6 +1020,79 @@ async function installActivationTracker(context) {
 }
 
 /**
+ * Drives every control in SAFE_CLICKS/SAFE_EXPORTS/SAFE_TOGGLES for
+ * `account`, each gated through gateState exactly like a write-gated dialog
+ * trigger — `absent` (not on the page), `refused` (visible, disabled by the
+ * write gate — expected for `viewer` on anything but a read action), or
+ * driven. Everything here is read-only, a filter that gets cleared right
+ * back, a page turned and turned back, or a toggle flipped and flipped
+ * back — see the constants above for the reasoning per group. Nothing here
+ * deletes or removes anything; DESTRUCTIVE_SKIP is recorded separately, as
+ * `skipped` with its reason, so the census can tell "unsafe to click" apart
+ * from "the walk never got there" the way team-lead asked.
+ */
+async function driveSafeControls(page, dir, tag, recorder, account) {
+  const visit = async (tab, subtab) => {
+    await selectTab(page, tab);
+    await settle(page, 300);
+    if (subtab) {
+      await page.click(`#page-${tab} .subtab[data-subtab="${subtab}"]`).catch(() => {});
+      await settle(page, 300);
+    }
+  };
+
+  for (const [tab, subtab, id] of SAFE_CLICKS) {
+    await guarded(recorder, `${account}:safe:${id}`, async () => {
+      await visit(tab, subtab);
+      const gate = await gateState(page, `#${id}`);
+      if (!gate.present || !gate.visible) return `absent — #${id} not visible`;
+      if (gate.disabled && gate.denied) return `refused — ${gate.reason}`;
+      if (gate.disabled) return 'absent — disabled (no data to act on)';
+      await page.click(`#${id}`, { timeout: 5000 });
+      await settle(page, 400);
+      return 'clicked';
+    });
+  }
+
+  for (const [tab, subtab, id] of SAFE_EXPORTS) {
+    await guarded(recorder, `${account}:safe:${id}`, async () => {
+      await visit(tab, subtab);
+      const gate = await gateState(page, `#${id}`);
+      if (!gate.present || !gate.visible) return `absent — #${id} not visible`;
+      // Blob+anchor download (app.js saveCsv) — clicking it never navigates
+      // and Playwright does not need to catch the download to prove the
+      // button ran; a thrown error here would mean the click itself failed.
+      await page.click(`#${id}`, { timeout: 5000 }).catch((error) => {
+        throw new Error(`click failed: ${error.message}`);
+      });
+      await settle(page, 300);
+      return 'clicked';
+    });
+  }
+
+  for (const [tab, , id] of SAFE_TOGGLES) {
+    await guarded(recorder, `${account}:safe-toggle:${id}`, async () => {
+      await visit(tab, null);
+      const gate = await gateState(page, `#${id}`);
+      if (!gate.present || !gate.visible) return `absent — #${id} not visible`;
+      if (gate.disabled && gate.denied) return `refused — ${gate.reason}`;
+      const before = await page.locator(`#${id}`).textContent().catch(() => '');
+      await page.click(`#${id}`, { timeout: 5000 });
+      await settle(page, 700);
+      await page.click(`#${id}`, { timeout: 5000 });
+      await settle(page, 700);
+      const after = await page.locator(`#${id}`).textContent().catch(() => '');
+      const restored = before.trim() === after.trim();
+      return `toggled twice, label ${restored ? 'restored' : `changed: "${before.trim()}" -> "${after.trim()}"`}`;
+    });
+  }
+
+  for (const [id, reason] of DESTRUCTIVE_SKIP) {
+    recorder.step(`${account}:skip:${id}`, 'skipped', reason);
+  }
+}
+
+/**
  * Enumerate every visible control per tab for `account`, cross-referenced
  * against everything this walk's own clicks (tracked by
  * installActivationTracker) actually activated, and write
@@ -900,10 +1100,25 @@ async function installActivationTracker(context) {
  * controls (poll/edit/ssh, device-settings/backup/diff) behind a selected
  * row, so this selects a first row on those two tabs before harvesting —
  * otherwise the census would only ever see each page's landing state. This
- * runs after the account's own walk (so the activation set it reads is
- * complete) and never counts against pass/fail: one summary step is
- * recorded, and the census itself is wrapped so a DOM surprise here cannot
- * take down the run.
+ * runs after the account's own walk, including driveSafeControls (so the
+ * activation set it reads is complete), and never counts against pass/fail:
+ * one summary step is recorded, and the census itself is wrapped so a DOM
+ * surprise here cannot take down the run.
+ *
+ * cross_reference reconciles two populations that used to be conflated:
+ * `total_harvested` is every visible control this scan found, id or no id;
+ * `enumerated_with_id` (chrome + every tab's own count, which is why both
+ * are reported) is the subset an id can address at all, and is the
+ * denominator activated/not_activated are measured against — a control
+ * with no id cannot be correlated against a real click event, so it cannot
+ * honestly be called either. `no_id_controls` lists them individually
+ * (tab, tag, label) rather than just a count, per team-lead's request:
+ * a control nobody can address is itself worth knowing about.
+ * `not_activated_detail` splits not_activated_ids into `skipped` (this
+ * account's write grant refused it, or the seed left no data to act on —
+ * recorded by the very steps that tried) and `not_reached` (nothing in
+ * this walk, including driveSafeControls, ever clicked it) — the first is
+ * the permission boundary working, the second is an actual coverage gap.
  */
 async function censusAccount(page, dir, tag, recorder, account) {
   try {
@@ -925,35 +1140,69 @@ async function censusAccount(page, dir, tag, recorder, account) {
         await page.click('#cx-devices tbody tr:first-child').catch(() => {});
         await settle(page, 400);
       }
-      buttonsByTab[tab] = await harvestControls(page, `#page-${tab}`);
+      buttonsByTab[tab] = await harvestControls(page, `#page-${tab}`, tab);
     }
     const chrome = [
-      ...(await harvestControls(page, '#tabs')),
-      ...(await harvestControls(page, '#tabs-utility')),
+      ...(await harvestControls(page, '#tabs', 'chrome')),
+      ...(await harvestControls(page, '#tabs-utility', 'chrome')),
     ];
     const activatedIds = new Set(
       await page.evaluate(() => [...(window.__activated || [])]).catch(() => []));
+    const perTabCounts = Object.fromEntries(
+      Object.entries(buttonsByTab).map(([t, arr]) => [t, arr.length]));
     const all = [...chrome, ...Object.values(buttonsByTab).flat()];
     const withId = all.filter((c) => c.id);
+    const noId = all.filter((c) => !c.id)
+      .map(({ tab, tag, role, label, writeModule }) => ({ tab, tag, role, label, writeModule }));
     const uniqueIds = [...new Set(withId.map((c) => c.id))];
     const activatedIdList = uniqueIds.filter((id) => activatedIds.has(id));
     const notActivatedIdList = uniqueIds.filter((id) => !activatedIds.has(id));
 
+    // Every recorded step this account's own run produced, so
+    // not_activated can be split into "the walk decided not to click this"
+    // (skipped/refused/absent — a step exists and says why) versus
+    // "nothing ever tried" (no matching step at all).
+    const stepById = new Map();
+    for (const s of recorder.steps) {
+      const m = s.name.match(/^(?:[a-z]+:)?(?:safe(?:-toggle)?|skip|dlg|feature):(.+)$/);
+      if (m) stepById.set(m[1], s);
+    }
+    const skipped = [];
+    const notReached = [];
+    for (const id of notActivatedIdList) {
+      const s = stepById.get(id);
+      if (s && (s.state === 'skipped' || /^(absent|refused) —/.test(s.detail))) {
+        skipped.push({ id, reason: s.detail || s.state });
+      } else {
+        notReached.push(id);
+      }
+    }
+
     const payload = {
       account, tag, chrome, tabs: buttonsByTab,
       cross_reference: {
+        total_harvested: all.length,
+        chrome_count: chrome.length,
+        per_tab_counts: perTabCounts,
+        controls_without_id: noId.length,
+        no_id_controls: noId,
         enumerated_with_id: uniqueIds.length,
         activated: activatedIdList.length,
         not_activated: notActivatedIdList.length,
         activated_ids: activatedIdList.sort(),
         not_activated_ids: notActivatedIdList.sort(),
+        not_activated_detail: {
+          skipped_or_refused: skipped.sort((a, b) => a.id.localeCompare(b.id)),
+          not_reached: notReached.sort(),
+        },
       },
     };
     fs.writeFileSync(path.join(dir, `buttons-${account}-${tag}.json`),
                      JSON.stringify(payload, null, 1));
     recorder.step(`${account}:census`, 'ok',
-      `${uniqueIds.length} controls enumerated, ${activatedIdList.length} activated, ` +
-      `${notActivatedIdList.length} not activated`);
+      `${uniqueIds.length} controls enumerated (${noId.length} more with no id), ` +
+      `${activatedIdList.length} activated, ${notActivatedIdList.length} not activated ` +
+      `(${skipped.length} skipped/refused, ${notReached.length} never reached)`);
     return { enumerated: uniqueIds.length, activated: activatedIdList.length,
              notActivated: notActivatedIdList.length };
   } catch (error) {

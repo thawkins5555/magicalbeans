@@ -39,6 +39,13 @@ MAX_PRI = 191
 # `ts < cutoff` can never remove them.
 CLOCK_SKEW_S = 3600.0
 
+# RFC 5424 places no limit on how many SD-ELEMENTs one message carries, but no
+# real device sends more than a handful — a relayed line chaining several
+# rsyslog hops through is the heaviest case seen in practice, at two or three.
+# A message claiming thousands is not describing a bigger event, only costing
+# more to parse; see _strip_structured_data for what it costs without a cap.
+MAX_SD_ELEMENTS = 64
+
 
 def facility_name(number) -> str:
     try:
@@ -198,24 +205,58 @@ def _strip_structured_data(rest: str) -> str:
     `[timeQuality tzKnown="1"][origin ip="10.1.1.1" software="rsyslogd"]`.
     Returning after the first one left the rest of the metadata blob in the
     message column and in the trigram index, so searches matched SD noise.
+
+    Walks the string with an index rather than reassigning `rest` to a slice
+    of itself each time round the loop: `rest = rest[end:]` copies everything
+    from `end` to the end of the string, so a message carrying thousands of
+    tiny elements — nothing RFC 5424 forbids, and free for a device or an
+    attacker on 514/udp or /tcp to send — cost O(elements^2) rather than
+    O(length). `_end_of_element` still only scans one element per call, so
+    the whole walk is linear in the string once no fresh slice is taken.
+
+    MAX_SD_ELEMENTS bounds the *count* of elements this function will parse,
+    independent of that fix: a message is still free to be large (a single
+    SD-ELEMENT's value can legitimately run to a few KB), so capping total
+    length would either truncate a real one or need to be generous enough to
+    let this run anyway. Capping the element count instead bounds the work
+    directly, since each one costs the same regardless of how small it is.
+    Past the cap, whatever is left — genuine elements this device actually
+    sent, or the attacker's padding — is kept verbatim as message text rather
+    than parsed further or silently dropped; a message is stored either way,
+    just with unusually many brackets sitting in its message column instead
+    of behind the structured-data label, which is what every message already
+    looked like before this function existed.
     """
     rest = rest.lstrip()
     if not rest.startswith("["):
         return rest[2:] if rest.startswith("- ") else (
             "" if rest == "-" else rest)
-    while rest.startswith("["):
-        end = _end_of_element(rest)
-        if end is None:
-            return rest              # unterminated: keep it rather than guess
-        rest = rest[end:].lstrip()
-    return rest
+    pos = 0
+    end_of_string = len(rest)
+    elements = 0
+    while pos < end_of_string and rest[pos] == "[":
+        if elements >= MAX_SD_ELEMENTS:
+            break
+        stop = _end_of_element(rest, pos)
+        if stop is None:
+            return rest[pos:]        # unterminated: keep it rather than guess
+        pos = stop
+        while pos < end_of_string and rest[pos].isspace():
+            pos += 1
+        elements += 1
+    return rest[pos:]
 
 
-def _end_of_element(rest: str) -> int | None:
-    """Index just past the first balanced `[...]`, or None if unterminated."""
+def _end_of_element(rest: str, start: int = 0) -> int | None:
+    """Index just past the first balanced `[...]` starting at `start`, or
+    None if unterminated. Takes a start offset instead of always scanning
+    from position 0 so a caller walking several elements in one string (see
+    _strip_structured_data) can do it in one left-to-right pass rather than
+    re-scanning a fresh copy of the tail for each one."""
     depth = 0
     escaped = False
-    for index, char in enumerate(rest):
+    for index in range(start, len(rest)):
+        char = rest[index]
         if escaped:
             escaped = False
             continue

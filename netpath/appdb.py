@@ -114,6 +114,12 @@ CREATE TABLE IF NOT EXISTS audit (
     detail   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit(ts);
+-- Added alongside audit_query() below: a Settings subtab a person browses
+-- filters by who and by what, where audit_events()'s existing "since a
+-- cursor" feed never filters at all, so these two turn "who changed the CPU
+-- threshold" from a full scan into an index lookup.
+CREATE INDEX IF NOT EXISTS ix_audit_username ON audit(username);
+CREATE INDEX IF NOT EXISTS ix_audit_action ON audit(action);
 
 -- API tokens (Tier 1 #10): service-account credentials that authenticate an
 -- HTTP request the same way a session cookie does, but never expire from
@@ -730,6 +736,75 @@ class AppDatabase:
             row = self._conn.execute(
                 "SELECT MAX(id) AS n FROM audit").fetchone()
         return int(row["n"] or 0)
+
+    def audit_query(self, t0: float, t1: float, *, username: str = "",
+                    action: str = "", q: str = "",
+                    before_id: int | None = None,
+                    limit: int = 200) -> list[sqlite3.Row]:
+        """Rows in [t0, t1], newest first, capped at `limit` + 1.
+
+        This is the opposite access pattern from audit_events() above:
+        that one is a live cursor a page tails forward from wherever it
+        last stopped, with no filters, because a live feed shows you
+        everything as it happens. This one is for a person who already
+        knows something happened and is looking for it - "who changed
+        that" - so it goes backward from `t1`, and it filters.
+
+        `username` and `action` are exact matches: both come from a short,
+        known set (the accounts that exist, the handful of `action`
+        strings this file's callers use), so the caller is expected to
+        offer a dropdown built from audit_usernames()/audit_action_names()
+        below rather than free text. `q` is the free-text half - a LIKE
+        search across `target` and `detail`, which is where "which device"
+        or a threshold's old-and-new value actually live.
+
+        `before_id` pages backward in time: pass the smallest id from the
+        page you already have to ask for the next one older than it,
+        the same way a person scrolling a log expects "older" to mean
+        "further down". One extra row is fetched over `limit` so the
+        caller can tell "more below" from "that was all of it" without a
+        second COUNT(*) query - the same trick api.py's syslog search
+        already uses.
+        """
+        limit = max(1, min(int(limit or 200), AUDIT_MAX_LIMIT))
+        clauses = ["ts >= ?", "ts <= ?"]
+        args: list = [t0, t1]
+        if username:
+            clauses.append("username = ?")
+            args.append(username)
+        if action:
+            clauses.append("action = ?")
+            args.append(action)
+        if q:
+            clauses.append("(target LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')")
+            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            args.extend([like, like])
+        if before_id is not None:
+            clauses.append("id < ?")
+            args.append(int(before_id))
+        sql = ("SELECT * FROM audit WHERE " + " AND ".join(clauses) +
+               " ORDER BY id DESC LIMIT ?")
+        args.append(limit + 1)
+        with self._lock:
+            return self._conn.execute(sql, args).fetchall()
+
+    def audit_usernames(self) -> list[str]:
+        """Every username with at least one audit row, for the filter
+        dropdown - the accounts that have actually done something
+        auditable, which is a shorter and more useful list than every
+        account that has ever existed."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT username FROM audit ORDER BY username").fetchall()
+        return [row["username"] for row in rows]
+
+    def audit_action_names(self) -> list[str]:
+        """Every distinct action string ever recorded, for the same
+        dropdown's other half."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT action FROM audit ORDER BY action").fetchall()
+        return [row["action"] for row in rows]
 
     # ------------------------------------------------------------- hostnames
 

@@ -609,7 +609,133 @@ lever, and it makes the source no harder to read.
 
 ### 5.9 Security and permissions
 
-⏳
+#### Two ways to stop the monitoring system with one packet
+
+Both found by fuzzing the decoders directly, both with a measured curve, both with a
+control case isolating the mechanism, and both fixed in this pass.
+
+**O-23 — a syslog message can be made to cost quadratic time, on an unauthenticated
+port. CONFIRMED (measured).** `netpath/syslogparse.py:206-210`, in
+`_strip_structured_data`:
+
+```python
+while rest.startswith("["):
+    end = _end_of_element(rest)
+    if end is None:
+        return rest
+    rest = rest[end:].lstrip()      # copies the whole remaining string, every time
+```
+
+`_end_of_element` is cheap per element. The reslice is not: it copies everything that
+remains, once per element. An RFC 5424 message carrying many small SD-ELEMENTs is
+therefore O(n²) in their count:
+
+| SD-ELEMENTs | message size | time |
+| ---: | ---: | ---: |
+| 20,000 | ~60 KB | 0.038 s |
+| 80,000 | ~240 KB | 0.192 s |
+| 160,000 | ~480 KB | 0.652 s |
+| 240,000 | ~720 KB | **2.34 s** |
+| 500,000 | ~1.5 MB | **timeout, > 8 s** |
+
+The control matters as much as the curve: an *unterminated* bracket and a 250,000-level
+*balanced* nesting of the same field both stayed linear to 500 KB, because each enters
+`_end_of_element` once and never re-enters the reslicing loop. So it is that loop, not
+a regular expression.
+
+Syslog listens on **514/udp and 514/tcp** and is unauthenticated by design. Anyone who
+can send a datagram to the host can stall syslog ingestion for seconds, or indefinitely.
+On a plant network that is anyone who can reach the management VLAN, including a
+compromised device the monitoring system exists to watch.
+
+**O-24 — a MIB file can be made to cost quadratic time inside the very call the
+five-second budget was meant to bound. CONFIRMED (measured).**
+`netpath/mibparse.py:152`, in `_strip_comments_and_strings`, calls
+`text.find("\n", start + 2)` on every `--` comment marker. Where there is no newline
+ahead — one long logical line, which is what a minified, pasted or half-downloaded MIB
+looks like — each call scans to end of file for a newline that is not there.
+
+| markers | file size | time |
+| ---: | ---: | ---: |
+| 100,000 | 300 KB | 0.166 s |
+| 400,000 | 1.2 MB | 2.36 s |
+| 600,000 | 1.8 MB | **5.25 s** |
+| 700,000 | 2.1 MB | **7.21 s** |
+
+The same content with a newline after each unit is flatly linear — 0.057 s, 0.115 s,
+0.233 s — which isolates the newline scan as the mechanism.
+
+The important half is not the timing. `parse()` (`mibparse.py:340-372`) calls
+`_strip_comments_and_strings` at line 371 and checks its own `PARSE_BUDGET_S = 5.0`
+only at line 372, **after** that call returns. The 1.8 MB reproducer above already
+exceeds the budget *inside* the unguarded call, so the ceiling that exists to cap how
+long a hostile upload can hold the interpreter never gets the chance to fire.
+Extrapolated to the shipped 8 MB upload cap, a full-size file is on the order of one to
+two minutes of held GIL. **A wall-clock ceiling checked only between phases cannot
+bound a phase.**
+
+This is also the third instance of one bug class in a file whose own docstring records
+the first two being fixed — the macro-clause `::=` scan and the IMPORTS symbol-list
+scan. All three are "scan forward for a terminator that may not be there". The class was
+fixed twice by patching instances.
+
+**PLAUSIBLE, deliberately not changed: SNMPv3 trap key-derivation amplification.**
+`netpath/trapdecode.py:328`'s `localized_key` hashes a 1 MiB buffer per cache miss,
+bounded by a 256-entry LRU. `_verify_v3` (line 666) reaches it only when the
+wire-supplied `msgUserName` matches a *configured* user — so this needs an attacker who
+already knows a valid v3 username, who can then forge a fresh `engine_id` per packet to
+defeat the cache and force a full 1 MiB hash per trap. Left unmodified: two verified
+fixes in decoders that handle unauthenticated input are worth more than three with one
+speculative.
+
+**What was fuzzed and found clean**, because negative evidence is what tells an
+operator which decoders have been beaten on: `trapdecode` against 1 KB–1 MB of random
+input, OIDs of 1,000 / 10,000 / 100,000 arcs (linear), and truncation at *every one* of
+the 84 byte boundaries of a valid v2c trap, with no unhandled exception anywhere;
+`nfdecode` against v9-tagged garbage to 1 MB, a zero-field template, a zero-length
+field, a template that redefines itself mid-packet, and a template declaring a
+60,000-byte field in a 10-byte record — each rejected or handled with no over-read;
+`syslogparse`'s two regular expressions fed pathological input to 1 MB with no
+backtracking; and `mibparse` against unterminated quoted strings, unterminated
+`OBJECT-TYPE` headers (the exact shape of the two previously-fixed bugs — still
+linear, so those fixes hold), 80,000-pair enum tables, an unterminated `IMPORTS` block,
+and 500,000 unbounded `::= {}` assignments.
+
+#### The permission model, checked mechanically and found sound
+
+**No route's gate disagrees with its handler, across all 213 routes. CONFIRMED
+(exhaustive, mechanical).** The route table in `netpath/web/server.py` was AST-parsed
+into 213 `(method, pattern, handler, requirement)` tuples, and every handler's body
+AST-walked — recursing four levels into other handlers it calls — for write evidence:
+`execute`/`executemany` with INSERT / UPDATE / DELETE / REPLACE, or any call whose
+attribute name carries a write verb. Seven routes were flagged and all seven are false
+positives on reading: `post_login`'s pre-authentication credential bookkeeping, five
+routes matching `hostresolve.resolve_name` (a pure lookup), and `get_nodes_device`
+matching `alerts_db.mute_row` (a SELECT for the active mute).
+
+The two routes whose gate is a function of the request body were read by hand and are
+correct. `_settings_requirement` is worth quoting as evidence of how this codebase
+handles a permission bug once it finds one: it derives the gate from the same
+`SETTINGS_SCOPES` table the handler dispatches on, specifically so the two cannot drift
+— the fix for a real defect in which a `debug: write` account could rewrite global
+settings, including the LDAP configuration and the self-update toggle, through the
+fall-through path.
+
+The three ways in agree. Session cookie, Bearer API token and LDAP-provisioned account
+all converge on one check in `server.py`'s `_route`, and `permissions_for` is keyed only
+on username, so a token really does carry exactly its account's grants with no second
+model to drift — established by reading the code, not the comment that claims it. The
+eight ungated routes are pre-authentication or session-lifecycle, or do their own
+per-module filtering inside the handler. `PUBLIC_PATHS` contains the sign-in page's own
+assets and nothing else.
+
+**One property of the model worth stating rather than fixing.**
+`GET /api/configrx/backups/(\d+)` is gated `configrx: read`, and returns a device's
+stored configuration — secrets redacted, but interface addressing, ACLs, routes and VPN
+peers intact. That is materially wider than "read" carries anywhere else in the table.
+The downgrade from write to read was deliberate, was raised in the previous release's
+security review, and the decision was to keep it; it is recorded here so that whoever
+hands out that grant knows what they are handing out.
 
 **The self-update path, reported and deliberately not changed.** By the operator's own
 instruction this pass documents rather than alters it. ⏳ The exact description, and
