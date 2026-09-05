@@ -179,6 +179,13 @@
     list.setAttribute('role', 'listbox');
     list.setAttribute('aria-label', 'Destinations');
     list.innerHTML = '';
+    if (!view.targets.length) {
+      const empty = document.createElement('li');
+      empty.className = 'empty';
+      empty.textContent = 'No destinations added yet. Use Add below to add one.';
+      list.appendChild(empty);
+      return;
+    }
     const hadFocus = document.activeElement && document.activeElement.tagName === 'LI'
       && list.contains(document.activeElement);
     const rows = [];

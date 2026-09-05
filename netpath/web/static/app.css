@@ -707,6 +707,11 @@ body.tiny .terms { display: none; }
 .row.wrap button { flex: 0 1 auto; white-space: nowrap; }
 .row button { flex: 1; }
 .row button.half { flex: 0 1 50%; }
+/* A horizontal group of checkboxes (nodes.js, netflow.js, syslog.js,
+   snmp.js each carried this as an identical inline style) wants left-packed
+   content and more air between items than .row's own 6px, which is sized
+   for a row of equal-width buttons, not a run of short labels. */
+.row.start { justify-content: flex-start; gap: 14px; }
 
 /* ------------------------------------------------------------ the panel
 
@@ -1572,6 +1577,23 @@ body.login-page {
 .toast.info { border-left-color: var(--accent); }
 .err { color: var(--fail); }
 .warn-text { color: var(--warn); }
+/* A status word or phrase coloured by what it says — nodes.js's oper-status
+   ("up"/"down") and STP-state text, debug.js's worker-status text — each of
+   which carried its own three-to-six-branch inline `style="color:${…}"`
+   lookup. One class per tone, the same base+modifier shape .dash-bar-fill
+   already uses (.bad/.warn there too), so the branch lives in the markup
+   (which class a value maps to) rather than being re-typed as a ternary or
+   an object literal in every module that shows a status. Not every tone
+   here applies to every caller — STP's "disabled" wants .muted, a worker
+   that has never run wants .line — so this is the full token vocabulary a
+   status can use, not a fixed enum of the states any one caller has. */
+.status-fg { color: var(--ok); }
+.status-fg.warn { color: var(--warn); }
+.status-fg.bad { color: var(--fail); }
+.status-fg.blocked { color: var(--blocked); }
+.status-fg.err { color: var(--error); }
+.status-fg.muted { color: var(--muted); }
+.status-fg.line { color: var(--line); }
 
 /* ------------------------------------------------------------- search
    The global search opened with "/" (App.initGlobalSearch): nine

@@ -464,11 +464,14 @@ def ucd_cpu_mem(idle_pct: float, avail_kb: int, total_kb: int) -> dict:
 def host_resources(cpus: int, storages) -> dict:
     """HOST-RESOURCES-MIB hrProcessorLoad and hrStorageTable.
 
-    nodeoids.HOST_RESOURCES (nodeoids.py:64-66) names both of these as
-    "poll if the vendor OID resolves" scalars — but nothing in the app
-    ever reads that constant, so a device answering them today shows no
-    CPU and no memory. The personas answer anyway, so the demo can point
-    at real data the app is choosing not to collect.
+    nodepoll._poll_vendor_health falls back to nodeoids.GENERIC_HEALTH's
+    hrProcessorLoad column_avg for cpu_pct, and disk_pct always comes from
+    _host_resources_disk_pct's hrStorageFixedDisk-filtered read of
+    hrStorageTable — both real, live paths (see windows_server/
+    windows_endpoint below for the persona that demonstrates them on
+    purpose, including the asymmetry that mem_pct has no such
+    HOST-RESOURCES fallback at all). Every OTHER persona answering this
+    table answers it as incidental realism, not to demonstrate anything.
 
     storages: [(descr, alloc_units, size_units, used_fraction)], or with a
     5th element, [(descr, alloc_units, size_units, used_fraction,
@@ -1631,7 +1634,8 @@ def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # in this fleet reports CPU and disk but never memory, confirmed by
     # exhaustive search of nodepoll.py for every mem_pct producer rather
     # than inferred. hrSystemUptime and hrSWRunTable are answered too, on
-    # top of what nodeoids.HOST_RESOURCES (nodeoids.py:71-74) names.
+    # top of hrProcessorLoad/hrStorageTable's own GENERIC_HEALTH/
+    # HR_STORAGE_* paths above.
     entries = system_scalars(
         "Hardware: AMD64 Family 25 Model 1 Stepping 1 AT/AT COMPATIBLE - "
         "Software: Windows Version 10.0 (Build 20348 Multiprocessor Free)",

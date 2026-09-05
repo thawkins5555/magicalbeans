@@ -40,6 +40,7 @@ from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
+from .. import db as netpathdb
 from .. import report as reportmod
 from .. import permissions as _permissions
 from .. import appdb as _appdb
@@ -451,22 +452,70 @@ def get_targets(service, params, body) -> dict:
                         for row in rows]}
 
 
+# Bounds a NetPath target's own numeric fields (or the matching default_*
+# global settings, see _GLOBAL_SETTINGS_RANGES below) may not exceed —
+# db.py's own MIN_*/MAX_* constants, referenced rather than re-typed, so the
+# two enforcement points (this 400 and db.py's _clamp_target_fields backstop
+# for any OTHER caller — a test, a migration, a future internal path) can
+# never quietly disagree about what "in range" means. See db.py's own
+# comment above those constants for the mechanism each field reaches
+# (a subprocess argument, expected_budget's runtime math, or monitor.py's
+# scheduler — interval_s at or below zero is a self-inflicted spawn storm
+# against one destination).
+_TARGET_FIELD_RANGES = {
+    "interval_s": (int, netpathdb.MIN_INTERVAL_S, netpathdb.MAX_INTERVAL_S),
+    "max_hops": (int, netpathdb.MIN_MAX_HOPS, netpathdb.MAX_MAX_HOPS),
+    "probes": (int, netpathdb.MIN_PROBES, netpathdb.MAX_PROBES),
+    "timeout_s": (float, netpathdb.MIN_TIMEOUT_S, netpathdb.MAX_TIMEOUT_S),
+    # These two reach neither a subprocess nor a loop bound, only a
+    # comparison in monitor.classify() — bounded to what is merely sane
+    # (non-negative; a percentage), not a mechanism-driven ceiling.
+    "warn_rtt_ms": (float, 0.0, None),
+    "warn_loss": (float, 0.0, 100.0),
+}
+
+
+def _validate_target_fields(fields: dict) -> dict:
+    """Casts and range-checks whichever of _TARGET_FIELD_RANGES' keys are
+    present in `fields`, returning a new dict (everything else passed
+    through unchanged). Rejects with a clear 400 naming the field and both
+    bounds — the visible half of the same check db.py's _clamp_target_fields
+    makes silently as a backstop for any other caller; a client submitting
+    interval_s=0 should be told why, not have it quietly rewritten to 5 with
+    no explanation anywhere in the response.
+    """
+    out = dict(fields)
+    for key, (kind, low, high) in _TARGET_FIELD_RANGES.items():
+        if key not in out:
+            continue
+        try:
+            value = kind(out[key])
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number") from None
+        if value < low or (high is not None and value > high):
+            range_text = (f"between {low} and {high}" if high is not None
+                         else f"at least {low}")
+            raise ValueError(f"{key} must be {range_text}")
+        out[key] = value
+    return out
+
+
 def post_target(service, params, body) -> dict:
     defaults = service.settings
     host = str(body.get("host", "")).strip()
     if not host:
         raise ValueError("A destination host or address is required")
     host = _validate_target_host(host)
+    fields = _validate_target_fields({
+        "interval_s": body.get("interval_s", defaults["default_interval_s"]),
+        "max_hops": body.get("max_hops", defaults["default_max_hops"]),
+        "probes": body.get("probes", defaults["default_probes"]),
+        "warn_rtt_ms": body.get("warn_rtt_ms", defaults["default_warn_rtt_ms"]),
+        "warn_loss": body.get("warn_loss", defaults["default_warn_loss"]),
+        "timeout_s": body.get("timeout_s", defaults["default_timeout_s"]),
+    })
     target_id = service.db.add_target(
-        host=host,
-        label=str(body.get("label") or host).strip(),
-        interval_s=int(body.get("interval_s", defaults["default_interval_s"])),
-        max_hops=int(body.get("max_hops", defaults["default_max_hops"])),
-        probes=int(body.get("probes", defaults["default_probes"])),
-        warn_rtt_ms=float(body.get("warn_rtt_ms", defaults["default_warn_rtt_ms"])),
-        warn_loss=float(body.get("warn_loss", defaults["default_warn_loss"])),
-        timeout_s=float(body.get("timeout_s", defaults["default_timeout_s"])),
-    )
+        host=host, label=str(body.get("label") or host).strip(), **fields)
     service.monitor.trace_now(target_id)
     return {"id": target_id}
 
@@ -486,6 +535,7 @@ def put_target(service, params, body, target_id: int) -> dict:
         # 0.0.0.123, and a null would raise AttributeError as a 500 rather
         # than a refusal.
         fields["host"] = _validate_target_host(str(fields["host"] or "").strip())
+    fields = _validate_target_fields(fields)
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
@@ -598,6 +648,12 @@ def _topology_json(service, topo, refusal, target_id: int | None = None,
         "silent_runs": topo.silent_runs(),
         "total_traces": topo.total_traces,
         "distinct_paths": topo.distinct_paths,
+        # Which TTLs hit MAX_HOP_FANOUT and had a trace's own edge-pairing
+        # bounded there — see analysis.py's own comment above that constant.
+        # Sorted so the wire shape is stable regardless of set iteration
+        # order; empty (not omitted) when nothing was truncated, so a caller
+        # can check "is this list non-empty" without a .get() default.
+        "truncated_ttls": sorted(topo.truncated_ttls),
         "refusal": {"code": code, "from": address,
                     "text": unreachable_text(code) if code else ""},
     }
@@ -1237,6 +1293,21 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_alerts_db_mb": (16, None),
     "session_idle_minutes": (1, 1440),
     "session_max_hours": (1, 168),
+    # These five are netpath-scope, not global, but land in this same flat
+    # dict because _check_settings_ranges only cares whether a key is
+    # PRESENT in the submitted values, never which scope it came from — see
+    # _validate_target_fields/_TARGET_FIELD_RANGES above for what each one
+    # actually reaches (trace_workers -> a ThreadPoolExecutor size; the
+    # rest are what a new target is created from when the caller does not
+    # specify its own). Referencing db.py's own MIN_*/MAX_* constants
+    # rather than repeating the numbers, unlike every other entry above,
+    # so this can never quietly drift from the bounds add_target/
+    # update_target enforce for a target's own fields.
+    "trace_workers": (netpathdb.MIN_TRACE_WORKERS, netpathdb.MAX_TRACE_WORKERS),
+    "default_interval_s": (netpathdb.MIN_INTERVAL_S, netpathdb.MAX_INTERVAL_S),
+    "default_max_hops": (netpathdb.MIN_MAX_HOPS, netpathdb.MAX_MAX_HOPS),
+    "default_probes": (netpathdb.MIN_PROBES, netpathdb.MAX_PROBES),
+    "default_timeout_s": (netpathdb.MIN_TIMEOUT_S, netpathdb.MAX_TIMEOUT_S),
 }
 
 

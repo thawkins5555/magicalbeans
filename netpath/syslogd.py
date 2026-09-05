@@ -28,6 +28,25 @@ FLUSH_S = 1.0
 MAX_SEEN_SOURCES = 4096
 MAX_RATE_SOURCES = 4096
 
+# The most one TCP-framed message may be, either framing. RFC 6587 octet
+# counting reads a length prefix of up to ten digits -- up to 9,999,999,999 --
+# and the newline framing below it has no length prefix at all, so nothing
+# ahead of this constant bounds how large a single message can grow to before
+# it is even looked at. Measured directly, before this existed: a connection
+# declaring a 2 GB octet count and trickling 1 MB/s toward it held the
+# collector's own traced memory at 42 MB after 50 MB sent (peak 82.5 MB --
+# `buffer += chunk` briefly holds both the old and new buffer at once) with
+# every counter -- messages, errors, rejected, dropped -- still at zero: the
+# connection just sits there, unauthenticated, on 514/tcp, accumulating.
+# `_max_tcp_clients` (default 64) bounds how many connections can each be
+# doing this at once, but nothing bounded any one of them on its own.
+#
+# 1 MB is already the ceiling the newline-framing path used for its own
+# "no newline yet, and this has gone on too long" cutoff before this fix
+# unified the two; no real syslog message -- even one carrying a sizeable
+# RFC 5424 structured-data block -- comes close to it.
+MAX_TCP_MESSAGE_BYTES = 1_000_000
+
 
 def _ago(ts: float) -> str:
     if not ts:
@@ -58,7 +77,8 @@ class SyslogCollector:
         self.counters = {"messages": 0, "stored": 0, "collapsed": 0,
                          "dropped": 0, "rejected": 0, "filtered": 0,
                          "errors": 0, "throttled": 0, "tcp_refused": 0,
-                         "tcp_clients": 0, "last_message": 0.0}
+                         "tcp_oversized": 0, "tcp_clients": 0,
+                         "last_message": 0.0}
         # A receive thread must never die on message content; failures are
         # counted here and _crash records a thread that ended anyway so the
         # status strip does not read like a deliberate stop.
@@ -79,6 +99,7 @@ class SyslogCollector:
         self._buckets: collections.OrderedDict = collections.OrderedDict()
         self._rate = 0.0
         self._last_throttle_log = 0.0
+        self._last_oversized_log = 0.0
         self._max_tcp_clients = 64
         self._clients: list[threading.Thread] = []
 
@@ -391,11 +412,44 @@ class SyslogCollector:
             self.counters["tcp_clients"] = len(self._clients)
             thread.start()
 
+    def _note_oversized(self, source: str, declared: int | None = None) -> None:
+        """Count a TCP message that hit MAX_TCP_MESSAGE_BYTES, and log at most
+        one line a minute so a sender doing this repeatedly cannot fill the
+        event log the same way a flood of anything else here could."""
+        self.counters["tcp_oversized"] += 1
+        now = time.time()
+        if now - self._last_oversized_log >= 60:
+            self._last_oversized_log = now
+            what = (f"a declared length of {declared:,} bytes" if declared is not None
+                    else f"no newline within {MAX_TCP_MESSAGE_BYTES:,} bytes")
+            self.log.add(ERROR,
+                         f"Oversized TCP syslog message from {source} refused "
+                         f"({what})",
+                         target=source,
+                         detail="No real syslog message approaches "
+                                f"{MAX_TCP_MESSAGE_BYTES:,} bytes. Without this "
+                                "cap the sender's own claimed size (octet "
+                                "counting) or an unterminated line (newline "
+                                "framing) would grow this connection's buffer "
+                                "without limit.")
+
     def _read_stream(self, client: socket.socket, source: str) -> None:
         """A TCP stream is a byte stream, so messages must be reassembled.
 
         Both framings are handled: RFC 6587 octet counting (`123 <13>...`) and
-        the far more common newline separation.
+        the far more common newline separation. Neither may grow the buffer
+        past MAX_TCP_MESSAGE_BYTES.
+
+        The two framings are refused differently because they can be
+        recovered from differently. Octet counting is refused the moment the
+        *declared* length is read, before a single byte of the body is
+        buffered toward it -- and the connection is then closed outright,
+        because there is no honest way to resynchronise past a bad length:
+        the only way to find where the next frame starts is to read past
+        `length` bytes of this one, which is exactly the commitment being
+        refused. Newline framing keeps the connection open and simply
+        resumes from the next `\\n` it finds, since finding one costs nothing
+        extra and does not depend on trusting anything the sender claimed.
         """
         client.settimeout(30)
         buffer = b""
@@ -415,6 +469,9 @@ class SyslogCollector:
                     if (0 < space <= 10 and buffer[:space].isdigit()
                             and buffer[space + 1:space + 2] == b"<"):
                         length = int(buffer[:space])
+                        if length > MAX_TCP_MESSAGE_BYTES:
+                            self._note_oversized(source, declared=length)
+                            return
                         if len(buffer) < space + 1 + length:
                             break
                         self._enqueue(buffer[space + 1:space + 1 + length], source)
@@ -422,7 +479,8 @@ class SyslogCollector:
                         continue
                     newline = buffer.find(b"\n")
                     if newline < 0:
-                        if len(buffer) > 1_000_000:      # runaway, drop it
+                        if len(buffer) > MAX_TCP_MESSAGE_BYTES:
+                            self._note_oversized(source)
                             buffer = b""
                         break
                     self._enqueue(buffer[:newline], source)
@@ -495,4 +553,6 @@ class SyslogCollector:
             parts.append(f"{self.counters['throttled']} throttled")
         if self.counters["tcp_clients"]:
             parts.append(f"{self.counters['tcp_clients']} TCP clients")
+        if self.counters["tcp_oversized"]:
+            parts.append(f"{self.counters['tcp_oversized']} oversized TCP messages refused")
         return " \u00b7 ".join(parts)

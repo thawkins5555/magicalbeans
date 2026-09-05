@@ -28,6 +28,7 @@ import os
 import random
 import socket
 import sys
+import tempfile
 import threading
 import time
 
@@ -36,7 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from demo import fleet as fleetmod                          # noqa: E402
 from demo import personas                                   # noqa: E402
 from netpath import nodeoids                                # noqa: E402
-from netpath.nodepoll import _Session                       # noqa: E402
+from netpath.nodepoll import NodePoller, _Session            # noqa: E402
+from netpath.nodesdb import NodesDatabase                   # noqa: E402
 from netpath.snmppoll import (                              # noqa: E402
     PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, build_request,
     build_v3_request, decode_response, discovery_probe, find_auth_span,

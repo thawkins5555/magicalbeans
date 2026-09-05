@@ -3935,7 +3935,7 @@
       ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : 'no devices';
     App.el('nd-topo-count').textContent = topo ? countText : '';
     if (!topo || !topo.nodes.length) {
-      topologyEmptyState(svg, wrap, 'No devices yet.');
+      topologyEmptyState(svg, wrap, 'No devices yet. Add one on the Devices subtab to see it here.');
       return;
     }
     if (!topo.edges.length) {

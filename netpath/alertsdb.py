@@ -806,6 +806,36 @@ class AlertsDatabase:
             # overwrites every time the same alert recurs.
             self._conn.execute(
                 "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
+        if "rolled_up_into" not in alerts:
+            # The id of the alert THIS one was absorbed into, or NULL. A
+            # child a rollup resolves (alertengine._absorb_subordinates/
+            # _absorb_downstream) writes resolved_by='' — deliberately the
+            # same value a genuine auto-clear writes, since a non-empty
+            # resolved_by means "an operator resolved this" to
+            # operator_resolved_since, and a rollup absorption must not
+            # block the child from reopening once it is still breaching
+            # after the outage that swallowed it ends. That leaves nothing
+            # on the CHILD's own row saying why it cleared — only a
+            # freeform note on the PARENT's rollup_note said so, unreadable
+            # from the child's side. A foreign key rather than a boolean:
+            # it does everything IS NOT NULL already would, plus lets a
+            # screen fold the child under its actual parent by id, and
+            # survives the parent itself later being resolved (alerts are
+            # never deleted, only resolved, so the id stays valid).
+            # ON DELETE SET NULL rather than CASCADE: a parent row being
+            # deleted (should that ever happen by some future path) must
+            # not take every alert it once absorbed down with it.
+            self._conn.execute(
+                "ALTER TABLE alerts ADD COLUMN rolled_up_into INTEGER"
+                " REFERENCES alerts(id) ON DELETE SET NULL")
+        # ix_alerts_rolled_up_into backs alerts_rolled_up_into(parent_id), a
+        # parent's own detail view asking "what did I absorb" as a real
+        # query instead of parsing rollup_note's freeform text. In _migrate
+        # rather than SCHEMA for the same reason ix_alerts_state_resolved
+        # is, just below — see that index's own comment.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_alerts_rolled_up_into"
+            " ON alerts(rolled_up_into)")
         # Backs operator_resolved_since, which the engine runs once per tick:
         # state = 'resolved' AND resolved_ts >= ?, grouped by dedup_key. That
         # is a range scan, and a range scan needs the equality column first
@@ -1196,10 +1226,33 @@ class AlertsDatabase:
                 (*allowed.values(), rule_id))
             self._conn.commit()
 
+    def alert_count_for_rule(self, rule_id: int) -> int:
+        """Every alert this rule ever raised, in any state — not just the
+        open ones. What DELETE FROM rules would cascade-destroy along with
+        the rule itself (rules.id is alerts.rule_id's ON DELETE CASCADE
+        parent), so the caller can refuse a deletion that would take real
+        history with it and offer disabling the rule instead. api.py reads
+        this to say "N alerts" in that refusal; the count itself belongs
+        here, next to the table it counts."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE rule_id = ?",
+                (rule_id,)).fetchone()[0]
+
     def remove_rule(self, rule_id: int) -> bool:
+        """False for a rule that does not exist, is built-in, OR has ever
+        raised an alert — the last one is defense in depth, not the primary
+        guard. alert_count_for_rule is what the API is expected to check
+        FIRST, so an operator sees "12 alerts reference this rule" rather
+        than a delete that silently no-ops; this WHERE clause exists so a
+        future caller that skips that check still cannot cascade-delete a
+        custom rule's alert history by mistake (rules.id is alerts.rule_id's
+        ON DELETE CASCADE parent)."""
         with self._lock:
             cursor = self._conn.execute(
-                "DELETE FROM rules WHERE id = ? AND is_builtin = 0", (rule_id,))
+                "DELETE FROM rules WHERE id = ? AND is_builtin = 0"
+                " AND id NOT IN (SELECT DISTINCT rule_id FROM alerts)",
+                (rule_id,))
             self._conn.commit()
             return (cursor.rowcount or 0) > 0
 
@@ -1897,7 +1950,18 @@ class AlertsDatabase:
             self._conn.commit()
             return cursor.rowcount or 0
 
-    def resolve_by_dedup(self, dedup_key: str, by: str = "") -> sqlite3.Row | None:
+    def resolve_by_dedup(self, dedup_key: str, by: str = "",
+                        rolled_up_into: int | None = None) -> sqlite3.Row | None:
+        """Resolves the one open/acked alert at `dedup_key`, if any.
+
+        `rolled_up_into`, when given, additionally records the id of the
+        alert this one was absorbed into — see the schema comment on
+        alerts.rolled_up_into in _migrate for why that is a separate fact
+        from `by`/`resolved_by`, which stays '' for a rollup absorption
+        exactly as it always has. Every existing caller omits it and gets
+        today's behaviour unchanged; only alertengine's rollup absorption
+        (_absorb_subordinates/_absorb_downstream) passes it.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT id FROM alerts WHERE dedup_key = ? AND state IN ('open','acked')",
@@ -1905,11 +1969,21 @@ class AlertsDatabase:
             if row is None:
                 return None
             self._conn.execute(
-                "UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?"
-                " WHERE id=?", (time.time(), by, row["id"]))
+                "UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?,"
+                " rolled_up_into=? WHERE id=?",
+                (time.time(), by, rolled_up_into, row["id"]))
             self._conn.commit()
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+
+    def alerts_rolled_up_into(self, parent_id: int) -> list[sqlite3.Row]:
+        """Every alert absorbed into `parent_id`'s rollup, oldest first —
+        the structured form of what rollup_note already says in prose, for
+        a parent's own detail view. Backed by ix_alerts_rolled_up_into."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM alerts WHERE rolled_up_into = ?"
+                " ORDER BY opened_ts", (parent_id,)).fetchall()
 
     # An alert the engine resolved on its own -- a CLEARS pair, a threshold
     # dropping back below clear_threshold, a rollup absorbing a child, a
