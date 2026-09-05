@@ -439,6 +439,13 @@ def put_target(service, params, body, target_id: int) -> dict:
     fields = {k: v for k, v in body.items()
               if k in {"host", "label", "interval_s", "max_hops", "probes",
                        "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
+    # The same check the add route makes. Without it the validation there was
+    # worth nothing: add a destination with a host that resolves, then edit it
+    # to anything at all, and the traceroute thread spends every interval
+    # failing against a name that cannot exist — which is the state this
+    # release added that validation to stop.
+    if "host" in fields:
+        fields["host"] = _validate_target_host(fields["host"])
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))

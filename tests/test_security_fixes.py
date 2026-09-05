@@ -1398,6 +1398,145 @@ end
     check("D15 …and the headless banner says what is actually true",
           "must change its" in open(main_mod.__file__, encoding="utf-8").read())
 
+    # ------------------------------------------ D16 ConfigRX SSH port range
+    # 0, -5 and 99999 were all previously stored as a device's ssh_port,
+    # after which every backup attempt failed with a bare socket error and
+    # nothing pointed at the port being the reason. The route now refuses
+    # anything outside 1-65535 with a 400, before it ever reaches the
+    # database or a socket.
+    print("configrx SSH port range")
+    for bad_port in (0, -5, 99999):
+        status, _h, payload = req(
+            "POST", f"/api/configrx/devices/{backup_device}/config",
+            {"ssh_port": bad_port}, cookie=admin_cookie)
+        check(f"D16 ssh_port {bad_port} is refused", status == 400,
+              f"{status} {payload}")
+    stored_port = SERVICE.configrx_db.device_config(backup_device)["ssh_port"]
+    check("D16 …and none of them were stored", stored_port not in (0, -5, 99999),
+          stored_port)
+
+    for good_port in (1, 65535):
+        status, _h, payload = req(
+            "POST", f"/api/configrx/devices/{backup_device}/config",
+            {"ssh_port": good_port}, cookie=admin_cookie)
+        check(f"D16 ssh_port {good_port} (boundary) is accepted",
+              status == 200, f"{status} {payload}")
+        check(f"D16 …and stored",
+              SERVICE.configrx_db.device_config(backup_device)["ssh_port"] == good_port,
+              SERVICE.configrx_db.device_config(backup_device)["ssh_port"])
+    SERVICE.configrx_db.update_device_config(backup_device, ssh_port=22)
+
+    # --------------------------- D17 the enable secret's three-way contract
+    # POST .../credential: the key absent from the body leaves a stored
+    # enable secret alone, present-and-empty clears it, present-and-non-empty
+    # (re)encrypts and replaces it. clear_credential (the DELETE route) was
+    # fixed this release to clear both secrets, not just the SSH password —
+    # a device's decommission or a post-exposure credential wipe otherwise
+    # left the enable secret sitting in configrx.db, unreachable but still
+    # reported as present by has_enable_secret.
+    print("configrx enable secret three-way contract")
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass1"}, cookie=admin_cookie)
+    check("D17 a credential with no enable_secret key is accepted", status == 200,
+          f"{status} {payload}")
+    check("D17 …and the response never carries a secret",
+          "ssh_password" not in payload and "enable_secret" not in payload
+          and "ssh_password_enc" not in payload and "enable_secret_enc" not in payload,
+          payload)
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …absent enable_secret leaves none stored (still none to begin with)",
+          config["enable_secret_enc"] is None)
+
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass2",
+         "enable_secret": "en4ble-1"}, cookie=admin_cookie)
+    check("D17 a non-empty enable_secret is accepted", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …and stored encrypted, decrypting back to the plaintext",
+          config["enable_secret_enc"] is not None
+          and dpapi_mod.unprotect(config["enable_secret_enc"]) == b"en4ble-1")
+
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    device_json = payload["device"]
+    check("D17 has_enable_secret reports existence only",
+          device_json.get("has_enable_secret") is True, device_json)
+    check("D17 …never the secret itself, in this or any other field",
+          "en4ble-1" not in json.dumps(device_json), device_json)
+
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass3", "enable_secret": ""},
+        cookie=admin_cookie)
+    check("D17 an empty (present) enable_secret is accepted", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …and clears the stored enable secret",
+          config["enable_secret_enc"] is None)
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    check("D17 …has_enable_secret now says so",
+          payload["device"].get("has_enable_secret") is False, payload["device"])
+
+    # Set both secrets again, then DELETE the credential and confirm BOTH
+    # are gone — the actual fix this release made after the security review.
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass4",
+         "enable_secret": "en4ble-2"}, cookie=admin_cookie)
+    check("D17 setup: both secrets stored ahead of the clear", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 setup: enable_secret_enc is present before the clear",
+          config["enable_secret_enc"] is not None)
+    check("D17 setup: ssh_password_enc is present before the clear",
+          config["ssh_password_enc"] is not None)
+
+    status, _h, payload = req(
+        "DELETE", f"/api/configrx/devices/{backup_device}/credential",
+        {}, cookie=admin_cookie)
+    check("D17 the clear-credential route succeeds", status == 200, f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 clear_credential clears the SSH password",
+          config["ssh_password_enc"] is None)
+    check("D17 …AND the enable secret, which used to survive it",
+          config["enable_secret_enc"] is None)
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    check("D17 …has_credential and has_enable_secret both go false",
+          payload["device"].get("has_credential") is False
+          and payload["device"].get("has_enable_secret") is False,
+          payload["device"])
+
+    # ------------------------------------------------- D18 /api/session version
+    # The version now goes to the sign-in page (the unauthenticated branch)
+    # as well as to a signed-in one, because the page that most needs to
+    # show a build number is the one nobody has signed in to yet.
+    print("/api/session version on both branches")
+    from netpath import __version__ as app_version
+    conn_anon = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    conn_anon.request("GET", "/api/session")
+    resp = conn_anon.getresponse()
+    anon_payload = json.loads(resp.read().decode("utf-8"))
+    conn_anon.close()
+    check("D18 an unauthenticated /api/session says so",
+          anon_payload.get("authenticated") is False, anon_payload)
+    check("D18 …and carries the running version",
+          anon_payload.get("version") == app_version, anon_payload)
+    check("D18 …and nothing else beyond authenticated/first_run/version",
+          set(anon_payload) <= {"authenticated", "first_run", "version"},
+          sorted(anon_payload))
+
+    status, _h, auth_payload = req("GET", "/api/session", cookie=admin_cookie)
+    check("D18 an authenticated /api/session also carries the version",
+          status == 200 and auth_payload.get("version") == app_version,
+          auth_payload)
+    check("D18 …and is still authenticated", auth_payload.get("authenticated") is True,
+          auth_payload)
+
     return 0
 
 

@@ -336,6 +336,84 @@ def main() -> int:
                                    cookie=admin_cookie)
         check("HTTP dns_workers at its upper bound (32) -> 200",
               status == 200, f"{status} {payload}")
+
+        # The low end of the same field, not just the high end above.
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_workers": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_workers below its floor (0) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_workers": 1}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_workers at its lower bound (1) -> 200",
+              status == 200, f"{status} {payload}")
+
+        # A member of the *_refresh_s family other than the ones already
+        # exercised above, both ends: these keys share the same range check
+        # but are a distinct block in _GLOBAL_SETTINGS_RANGES.
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"netpath_refresh_s": 301}},
+                                   cookie=admin_cookie)
+        check("HTTP netpath_refresh_s above its ceiling (301) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"netpath_refresh_s": 300}},
+                                   cookie=admin_cookie)
+        check("HTTP netpath_refresh_s at its ceiling (300) -> 200",
+              status == 200, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"netpath_refresh_s": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP netpath_refresh_s below its floor (0) -> 400",
+              status == 400, f"{status} {payload}")
+
+        # session_max_hours: the session-lifetime sibling of session_idle_
+        # minutes above, untested there — both ends of its own range (1-168).
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"session_max_hours": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP session_max_hours below its floor (0) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"session_max_hours": 169}},
+                                   cookie=admin_cookie)
+        check("HTTP session_max_hours above its ceiling (169) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"session_max_hours": 168}},
+                                   cookie=admin_cookie)
+        check("HTTP session_max_hours at its ceiling (168) -> 200",
+              status == 200, f"{status} {payload}")
+
+        # dns_timeout_s: a float-typed member of the range table, both ends
+        # (0.5-30) — every other range check above is on an integer field.
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_timeout_s": 0.4}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_timeout_s below its floor (0.4) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_timeout_s": 30.1}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_timeout_s above its ceiling (30.1) -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"dns_timeout_s": 30}},
+                                   cookie=admin_cookie)
+        check("HTTP dns_timeout_s at its ceiling (30) -> 200",
+              status == 200, f"{status} {payload}")
     finally:
         try:
             server.stop()
