@@ -346,6 +346,45 @@ check("brokenPages.add(name)" in APP.split("function ensureModuleReady(")[1].spl
 check('section.setAttribute(\'aria-busy\', \'true\')' in APP,
       "a loading module shows the same in-flight signal an ordinary slow refresh already does")
 
+# ---------------------------------------------------------------------------
+# 16. The audit trail (appdb.py's audit table, served at GET /api/audit) has
+#     a page that reads it: a Settings subtab, read-only throughout.
+SETTINGS = read("settings.js")
+check('data-subtab="audit"' in INDEX and 'id="settings-sub-audit"' in INDEX,
+      "the Audit subtab and its subpage exist")
+check('id="audit-table"' in INDEX and 'id="audit-range"' in INDEX
+      and 'id="audit-user"' in INDEX and 'id="audit-action"' in INDEX
+      and 'id="audit-target"' in INDEX and 'id="audit-q"' in INDEX
+      and 'id="audit-more"' in INDEX,
+      "the audit filter bar and table markup exist")
+# Read-only end to end: no button in the audit subpage may write anything —
+# matched on the subpage's own markup slice, not the whole file, since
+# Settings elsewhere is full of legitimate data-requires-write buttons.
+audit_markup = INDEX.split('id="settings-sub-audit"')[1].split('<div class="bar footer">')[0]
+audit_buttons = re.findall(r'<button[^>]*\bid="([\w-]+)"', audit_markup)
+check("data-requires-write" not in audit_markup,
+      "the audit subpage has no data-requires-write control (nothing here writes)")
+check(bool(audit_buttons) and set(audit_buttons) <= {"audit-apply", "audit-clear", "audit-more"},
+      "the audit subpage has no button beyond Search/Clear/Load older (found: %s)"
+      % (", ".join(audit_buttons) or "none"))
+check("function auditVisible()" in SETTINGS and "App.canRead('admin')" in SETTINGS,
+      "the audit subtab is gated on admin READ, matching GET /api/audit's own grant")
+check("function auditFetchPage(" in SETTINGS and "'/api/audit'" in SETTINGS,
+      "the audit subtab calls the existing /api/audit route rather than inventing a new one")
+check("before_id" in SETTINGS and "auditGeneration" in SETTINGS,
+      "keyset paging (before_id) exists and a stale in-flight page cannot be appended "
+      "after the filters changed (auditGeneration)")
+check("payload.rows === undefined && payload.events !== undefined" in SETTINGS,
+      "the still-unwired server response is told apart from a genuinely empty result, "
+      "not shown as an empty table with no explanation")
+check("function auditTargetHtml(" in SETTINGS
+      and "kind !== 'device' && kind !== 'configrx'" in SETTINGS,
+      "target is parsed as <kind>:<value> and linked for the kinds that already have a page")
+check("?target=" in SETTINGS or "opts.query.target" in SETTINGS,
+      "the audit subtab reads a target= query param so another page can link back here pre-filtered")
+check("function auditIsRoutine(" in SETTINGS and ".audit-row-routine" in read("app.css"),
+      "routine actions are visually de-emphasised, not hidden, in the default view")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

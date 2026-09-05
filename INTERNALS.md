@@ -2179,21 +2179,39 @@ set.
 The means a *different*, cross-device rollup was missing — not the
 same-device metric rollup the previous section documents (a device's own
 CPU/disk/interface alerts folding under that same device's `device_down`),
-but `alertengine._upstream_outage` (called from the `device_down` occurrence
-path), which walks `nodesdb.upstream_chain(device_id)` looking for an
-ancestor with its own already-open `device_down` alert and, if found,
-absorbs the child occurrence into that same alert row rather than opening a
-new one. That mechanism has existed since `upstream_id` shipped in 4.37.0
-and works correctly; what was missing is that `upstream_id` is a plain
-operator-typed field with no assistance populating it, so at fleet scale
-nobody sets it and the walk has nothing to climb. `alertrules.py` is
-explicit that this may only ever be driven by an operator-confirmed
-`devices.upstream_id`, never directly by an LLDP/CDP neighbour match — a
-neighbour row is a best-effort guess that can go stale between walks or
-collide on a non-unique sysName, and suppressing a real fault on a wrong
-guess is the one failure this feature must not have. What nothing offered,
-before this release, was a way to turn that guess into a confirmed value
-faster than one Edit dialog per device.
+but the topology rollup `_rollup_parent`'s third and fourth answers cover:
+case 3 asks `alertengine._upstream_outage`, which walks
+`nodesdb.upstream_chain(device_id)` looking for an ancestor with its own
+already-open `device_down` alert and, if found, treats the child occurrence
+as already covered rather than opening a new alert for it; case 4 asks the
+same question on behalf of a *child rule* (`packet_loss_high`, `cpu_high`,
+…) whose own device's `device_down` is never going to open one to check
+against, for the identical reason case 3 exists. That mechanism has existed
+since `upstream_id` shipped in 4.37.0 and works correctly; what was missing
+is that `upstream_id` is a plain operator-typed field with no assistance
+populating it, so at fleet scale nobody sets it and the walk has nothing to
+climb. `alertrules.py` is explicit that this may only ever be driven by an
+operator-confirmed `devices.upstream_id`, never directly by an LLDP/CDP
+neighbour match — a neighbour row is a best-effort guess that can go stale
+between walks or collide on a non-unique sysName, and suppressing a real
+fault on a wrong guess is the one failure this feature must not have. What
+nothing offered, before this release, was a way to turn that guess into a
+confirmed value faster than one Edit dialog per device.
+
+A companion fix landed the same pass, on the *absorb* side rather than the
+*suppress* side above: a device fully covered by an ancestor's outage — by
+either of the two routes above, or by `_absorb_downstream` resolving a
+downstream device's own `device_down` into the ancestor whose alert got
+there first — never itself opens a `device_down` alert, and the ordinary
+absorption of a device's *other* rolled-up children (`_absorb_subordinates`)
+only ever triggers off that alert opening. So a `packet_loss_high` or
+`cpu_high` alert already open on a device before an outage reached it had
+nothing left to trigger its own absorption once the device was covered, and
+stayed on the Alerts page indefinitely. `_absorb_children_of` closes this —
+called from both `_absorb_downstream` and `_rollup_parent`'s case 4 — by
+resolving a covered device's own already-open children directly, bounded to
+one indexed `resolve_by_dedup` per name in `ROLLS_UP["device_down"]` (a
+short, fixed list) rather than a scan of the alerts table.
 
 `nodesdb._upstream_confidence(match_kind, present)` scores one candidate into
 one of four tiers: `chassis_mac` + `present` is **high** (rank 3);

@@ -949,13 +949,16 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
         slice_macs = {port: macs[(int(vlan) // 10) % len(macs):][:2]
                       for port, macs in port_macs.items()}
         entries.update(dot1d_fdb(slice_macs))
-    # L2 topology: only the DEFAULT-sized core (core-sw-01, `ports` falsy)
-    # gets a downlink neighbour table — the 500-port chassis SPECIALS
-    # variant (chassis_ports=500, a different device entirely) exists to
+    # L2 topology: only the DEFAULT-sized core (core-sw-01, access == 88 —
+    # Persona.table() always resolves `ports` to a real int, never None:
+    # it falls back to the persona's own declared 96 when no override is
+    # given, so `ports` itself is never falsy here) gets a downlink
+    # neighbour table. The 500-port chassis SPECIALS variant
+    # (chassis_ports=500, a different device entirely) exists to
     # demonstrate the interface cap, not this device's own place in the
     # topology, and claiming the same ten access switches would make two
     # different "core" devices both report being their upstream.
-    if not ports:
+    if access == 88:
         for n in range(1, 11):
             name = f"acc-sw-{n:03d}"
             entries.update(lldp_neighbor(

@@ -246,6 +246,18 @@ class Monitor:
                 timeout_s=timeout_s,
             )
             status = classify(result, target["warn_rtt_ms"], target["warn_loss"])
+            # A trace can run for a real number of seconds against the
+            # network, and an operator deleting its target mid-run is an
+            # ordinary action, not a bug — record_trace's INSERT would fail
+            # its foreign key against a target row already gone, and the
+            # except clause below already treats that shape of failure the
+            # same quiet way it treats a closed database, but checking here
+            # avoids raising at all for what is easily the common case of
+            # the two.
+            if self.db.target(target_id) is None:
+                self.log.add(SYSTEM, f"{label}: deleted while its trace was "
+                                     f"running; the result was not saved")
+                return
             trace_id = self.db.record_trace(target_id, result, status)
 
             rtt = result.dest_rtt()
@@ -282,19 +294,38 @@ class Monitor:
             if self.on_complete:
                 self.on_complete(target_id)
         except Exception as exc:  # a scheduler thread must never die quietly
-            # ...with one exception to that rule: "Cannot operate on a
-            # closed database" while _stop is set means this trace ran past
-            # shutdown()'s drain window (bounded by _inflight_budget_s, not
-            # unlimited) and the database closed under it. That is an
-            # accepted, bounded consequence of stopping promptly rather than
-            # waiting on the network forever, not a bug — so it does not get
-            # the traceback below, which would read exactly like a crash in
-            # a log an operator checks right after a service stop. The same
-            # exception NOT during a stop is still a real bug and still gets
-            # the full treatment.
+            # ...with two exceptions to that rule, both an in-flight trace
+            # losing the row it was about to write to, for a reason that is
+            # not a bug:
+            #
+            # "Cannot operate on a closed database" while _stop is set means
+            # this trace ran past shutdown()'s drain window (bounded by
+            # _inflight_budget_s, not unlimited) and the database closed
+            # under it — an accepted, bounded consequence of stopping
+            # promptly rather than waiting on the network forever.
+            #
+            # A foreign key failure on record_trace's INSERT, with the
+            # target now gone, means it was deleted mid-trace — an ordinary
+            # operator action the check right before record_trace above
+            # already catches; this is only the residual window between
+            # that check and the INSERT itself.
+            #
+            # Neither gets the traceback below, which would read exactly
+            # like a crash in a log an operator checks right after a stop or
+            # a delete. The same exceptions for any OTHER reason are still a
+            # real bug and still get the full treatment.
+            target_gone = False
+            if isinstance(exc, sqlite3.IntegrityError):
+                try:
+                    target_gone = self.db.target(target_id) is None
+                except Exception:
+                    pass  # can't tell any more; falls through to the loud path
             if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
                 self.log.add(SYSTEM, f"Trace for {label} finished after the "
                                     f"scheduler stopped; its result was not saved")
+            elif target_gone:
+                self.log.add(SYSTEM, f"{label}: deleted while its trace was "
+                                     f"running; the result was not saved")
             else:
                 import traceback
                 self.log.add(ERROR, f"Worker raised {type(exc).__name__}: {exc}",

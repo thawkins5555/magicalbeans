@@ -949,7 +949,7 @@ async function checkOfflineBanner(context, page) {
   });
 }
 
-async function checkMisc(page) {
+async function checkMisc(page, watcher) {
   section('The rest of the front-end work (E5, E6, E7, E9, E15)');
 
   await check('window.App exists (E9)', async () => {
@@ -1193,6 +1193,33 @@ async function checkMisc(page) {
     await sleep(400);
     return `9 -> ${result.name}, scrolled into view`;
   });
+
+  await check('the Settings Audit subtab opens without a page or console error',
+    async () => {
+      const before = watcher.pageErrors.length + watcher.consoleErrors.length;
+      await selectTab(page, 'settings');
+      await page.evaluate(() => {
+        const btn = document.querySelector('.subtab[data-subtab="audit"]');
+        if (btn) btn.click();
+      });
+      await settle(page, 1000);
+      const state = await page.evaluate(() => ({
+        denied: !document.getElementById('audit-denied').hidden,
+        bodyShown: !document.getElementById('audit-body').hidden,
+        status: (document.getElementById('audit-status') || {}).textContent || '',
+      }));
+      const after = watcher.pageErrors.length + watcher.consoleErrors.length;
+      assert(after === before,
+             `${after - before} error(s) opening the Audit subtab: ` +
+             JSON.stringify([...watcher.pageErrors, ...watcher.consoleErrors]
+               .slice(before).map((e) => e.message || e.text)));
+      // Exactly one of "denied" or "shown" — never neither (a silent blank
+      // subtab) and never both (a stale denied message left over the real
+      // content once permission is confirmed).
+      assert(state.denied !== state.bodyShown,
+             `expected exactly one of denied/shown, got denied=${state.denied} bodyShown=${state.bodyShown}`);
+      return state.denied ? 'denied (no admin read)' : `shown: "${state.status}"`;
+    });
 }
 
 async function checkReadOnly(browser, base, creds, dir, tag) {
@@ -1351,7 +1378,7 @@ async function main() {
     await checkDialog(page, dir, args.tag);
     await checkDashboard(page, dir, args.tag);
     await checkRouting(page, args.base, dir, args.tag);
-    await checkMisc(page);
+    await checkMisc(page, adminWatcher);
     await checkOfflineBanner(context, page);
 
     section('Nothing threw, anywhere, across the whole walk');

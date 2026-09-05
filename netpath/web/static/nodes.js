@@ -5351,19 +5351,37 @@
     const suggestions = payload.suggestions || [];
     const writable = App.canWrite('nodes');
     if (!suggestions.length) {
-      // lldp_walks (node_poller's own counters, already on App.state from
-      // every poll) is what tells "nothing has run yet" from "it ran and
-      // there is genuinely nothing to suggest" — the same fleet with zero
-      // suggestions reads very differently depending on which one is true,
-      // and a blank list cannot say which.
+      // total: 0 alone covers three different situations an operator reads
+      // very differently — LLDP/CDP has never walked; it walked and nothing
+      // reported resolved to a known device; or it resolved plenty, but
+      // every one of those devices already has an upstream set, and this
+      // is a finished job, not an empty one. lldp_walks (node_poller's own
+      // counter, already on App.state from every poll) tells the first
+      // apart from the other two for free. Telling THOSE two apart needs a
+      // second look: the fleet-wide topology graph draws a line for every
+      // matched neighbour regardless of upstream_id, so edges with no
+      // suggestions left is "done", and no edges at all is "found nothing".
+      // One extra fetch, only on the empty path, never on every poll.
       const walks = ((App.state.serverState || {}).nodes || {}).counters || {};
-      const lead = walks.lldp_walks
-        ? 'No upstream suggestions right now — every device either already ' +
-          'has an upstream set, or none of its LLDP/CDP neighbours matched ' +
-          'another device in this fleet.'
-        : 'No suggestions yet. Neighbour discovery (LLDP/CDP) runs as part ' +
-          'of the regular poll cycle and has not completed a walk yet — ' +
-          'check back once devices have been polled a few times.';
+      let lead;
+      if (!walks.lldp_walks) {
+        lead = 'No suggestions yet. Neighbour discovery (LLDP/CDP) runs as ' +
+          'part of the regular poll cycle and has not completed a walk yet ' +
+          '— check back once devices have been polled a few times.';
+      } else {
+        let hasLinks = false;
+        try {
+          const topo = await App.get('/api/nodes/topology');
+          hasLinks = (topo.edges || []).length > 0;
+        } catch (error) { /* best effort: falls back to the generic sentence */ }
+        lead = hasLinks
+          ? 'No upstream suggestions right now — every device with a ' +
+            'matched neighbour already has an upstream set. Nothing left ' +
+            'to review.'
+          : 'No upstream suggestions right now — neighbour discovery has ' +
+            'run, but none of the reported neighbours matched another ' +
+            'device in this fleet.';
+      }
       App.modal('Upstream suggestions', `<p class="hint">${lead}</p>`,
         [{ label: 'Close', onClick: App.closeModal }]);
       return;

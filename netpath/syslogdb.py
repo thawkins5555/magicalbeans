@@ -287,46 +287,108 @@ class SyslogDatabase:
 
     # ------------------------------------------------------------------ write
 
-    def _collapse(self, entries) -> tuple[list, list[int]]:
+    def _collapse(self, entries) -> tuple[list[tuple], list[int]]:
         """Split a batch into rows to insert and rows to fold into a repeat.
 
         A device in a debug loop sends the same line thousands of times; one
         row per line buries every other message and inflates the index for no
         information. A consecutive identical line from the same source within
-        the window bumps the previous row's repeat_count instead. Both halves
-        are O(1) per message: the previous row per source is remembered in a
-        bounded LRU rather than looked up.
+        the window bumps the previous row's repeat_count instead — the
+        *immediately preceding* row remembered for that source, so two
+        different messages interleaving (A, B, A, B, ...) never fold into
+        each other; only a genuinely unbroken run of the same message does.
+
+        Returns (to_insert, bumps): to_insert is a list of (entry,
+        repeat_count_holder) pairs for rows that must be freshly written —
+        repeat_count_holder is a one-element list, `[n]`, not a plain int,
+        for the reason below; bumps is the ids of rows already on disk (from
+        an EARLIER call to insert()) whose repeat_count needs incrementing.
+
+        `_last_row` (a bounded per-source LRU) used to be updated only for a
+        bump, mid-loop, or once per insert() call via `_remember` — using
+        the row's real database id, which only exists after the write. A
+        fresh (non-repeat) row was therefore invisible to this method until
+        the NEXT call to insert(): a repeat of it later in the very SAME
+        batch found nothing to bump against and was written as a row of its
+        own too. A batch drains the collector's queue every FLUSH_S seconds
+        or BATCH messages, whichever comes first (syslogd.py) — a few
+        hundred milliseconds to a second — and a storm (a flapping optic, an
+        STP reconvergence, an auth retry loop) routinely fires the identical
+        line far faster than that, so an entire storm typically arrives
+        inside ONE call to insert(): 500 identical lines in a single flush
+        used to become 500 rows, not one row with repeat_count=500 — this
+        was weakest at exactly the burst rate it exists for, and only ever
+        earned its keep against a slow, steady trickle that would not have
+        hurt anyway.
+
+        Fixed by giving every not-yet-written row a mutable one-element
+        `repeat_count` holder, referenced directly from `_last_row` in place
+        of a row id. A later repeat within the SAME batch bumps that holder
+        in place — the row is not written yet, so there is nothing in the
+        database to UPDATE — while a repeat that lands in a LATER batch,
+        after `_remember` (below) has replaced the holder with the row's
+        real id once it exists, becomes an ordinary bump against the
+        database, exactly as before.
         """
         window = self.collapse_repeats_s
         if window <= 0:
-            return list(entries), []
-        fresh, bumps = [], []
+            return [(entry, [1]) for entry in entries], []
+        to_insert: list[tuple] = []
+        bumps: list[int] = []
         for entry in entries:
             key = entry.source
             previous = self._last_row.get(key)
             if (previous is not None and previous[1] == entry.message
                     and entry.ts - previous[2] <= window):
-                bumps.append(previous[0])
+                ref = previous[0]
+                if isinstance(ref, list):
+                    # Still sitting in `to_insert` from earlier in this same
+                    # batch — nothing to UPDATE yet, so fold it in directly.
+                    ref[0] += 1
+                else:
+                    # Already a real row from an earlier call to insert().
+                    bumps.append(ref)
                 # The run's row keeps the first occurrence's timestamp — when
                 # it started is the useful figure — but the window walks
                 # forward so a steady repeat stays one row.
-                self._last_row[key] = (previous[0], previous[1], entry.ts)
+                self._last_row[key] = (ref, previous[1], entry.ts)
                 self._last_row.move_to_end(key)
                 continue
-            fresh.append(entry)
-        return fresh, bumps
+            holder = [1]
+            to_insert.append((entry, holder))
+            self._last_row[key] = (holder, entry.message, entry.ts)
+            self._last_row.move_to_end(key)
+        return to_insert, bumps
 
-    def _remember(self, first_id: int, entries) -> None:
-        for index, entry in enumerate(entries):
-            self._last_row[entry.source] = (first_id + index, entry.message,
-                                            entry.ts)
-            self._last_row.move_to_end(entry.source)
+    def _remember(self, first_id: int, to_insert) -> None:
+        """Replaces each freshly-written row's pending holder (see
+        _collapse) with its real database id, so a repeat arriving in a
+        LATER call to insert() bumps the row itself rather than a holder
+        that stops existing once this call returns. Only touches a source
+        whose `_last_row` entry is STILL this exact holder — a source that
+        moved on to a different message later in the same batch already
+        points at that message's own holder, fixed up on its own turn of
+        this same loop."""
+        for index, (entry, holder) in enumerate(to_insert):
+            current = self._last_row.get(entry.source)
+            if current is not None and current[0] is holder:
+                self._last_row[entry.source] = (first_id + index, current[1],
+                                                current[2])
+                self._last_row.move_to_end(entry.source)
         while len(self._last_row) > 4096:
             self._last_row.popitem(last=False)
 
-    def insert(self, entries) -> int:
+    def insert(self, entries) -> tuple[int, int]:
+        """Stores `entries`, returning (stored, collapsed): `stored` is the
+        number of NEW rows written, `collapsed` is how many of the incoming
+        entries did not get a row of their own — folded into another row's
+        repeat_count instead, same-batch or against an earlier one.
+        `stored + collapsed == len(entries)` always, so a caller's own
+        "messages received" counter can be reconciled against the two
+        without a fresh row for every collapsed repeat."""
         if not entries:
-            return 0
+            return 0, 0
+        total_in = len(entries)
         counts: dict[tuple[int, int], int] = {}
         for entry in entries:
             key = (int(entry.ts // 3600) * 3600, int(entry.severity))
@@ -335,9 +397,10 @@ class SyslogDatabase:
         with self._lock:
             # Collapsing is decided under the lock so two writers cannot bump
             # the same row concurrently.
-            entries, bumps = self._collapse(entries)
+            to_insert, bumps = self._collapse(entries)
             rows = [(e.ts, e.source, e.host, e.facility, e.severity, e.app,
-                     e.procid, e.msgid, e.message, e.raw) for e in entries]
+                     e.procid, e.msgid, e.message, e.raw, holder[0])
+                    for e, holder in to_insert]
             if bumps:
                 self._conn.executemany(
                     "UPDATE logs SET repeat_count = repeat_count + 1"
@@ -350,10 +413,11 @@ class SyslogDatabase:
                     " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
                     [(hour, severity, n) for (hour, severity), n in counts.items()])
                 self._conn.commit()
-                return 0
+                return 0, total_in
             self._conn.executemany(
                 "INSERT INTO logs(ts, source, host, facility, severity, app,"
-                " procid, msgid, message, raw) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " procid, msgid, message, raw, repeat_count)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 rows)
             if self.fts:
                 # executemany leaves cursor.lastrowid unset, so ask SQLite
@@ -366,18 +430,18 @@ class SyslogDatabase:
                     " VALUES (?,?,?,?,?)",
                     [(first_id + index, entry.message, entry.app, entry.host,
                       entry.source)
-                     for index, entry in enumerate(entries)])
+                     for index, (entry, _holder) in enumerate(to_insert)])
             else:
                 last_id = self._conn.execute(
                     "SELECT last_insert_rowid()").fetchone()[0]
                 first_id = last_id - len(rows) + 1
-            self._remember(first_id, entries)
+            self._remember(first_id, to_insert)
             self._conn.executemany(
                 "INSERT INTO log_counts(hour, severity, n) VALUES (?,?,?)"
                 " ON CONFLICT(hour, severity) DO UPDATE SET n = n + excluded.n",
                 [(hour, severity, n) for (hour, severity), n in counts.items()])
             self._conn.commit()
-        return len(rows)
+        return len(rows), total_in - len(rows)
 
     # ------------------------------------------------------------------ query
 

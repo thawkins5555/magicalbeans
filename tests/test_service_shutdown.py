@@ -230,6 +230,37 @@ check("the same error NOT during a stop still prints -- the guard did not "
 
 service3.db.record_trace = real_record_trace
 
+# 3d. A different race in the same function, found as a byproduct of
+# testing 3a/3b rather than reported: an operator deleting a NetPath target
+# while it happens to be mid-trace is an ordinary action, not a bug, and
+# record_trace's INSERT hitting a foreign key that no longer resolves used
+# to reach the same "must never die quietly" handler as a genuine crash.
+# Simulated deterministically by having the (stubbed) trace delete its own
+# target as a side effect before returning, rather than racing two real
+# threads against the clock.
+def delete_then_return(host, **kwargs):
+    service3.db.remove_target(target_id)
+    return TraceResult(host=host, dest_ip=host, hops=[], reached=True,
+                       started_ts=time.time(), duration_s=0.0)
+
+
+monitor_mod.run_trace = delete_then_return
+sys.stderr = captured_del = io.StringIO()
+try:
+    service3.monitor._run_one(target_id)
+finally:
+    sys.stderr = old_stderr
+    monitor_mod.run_trace = instant_run_trace
+
+check("a target deleted mid-trace prints no traceback",
+     "Traceback" not in captured_del.getvalue(), captured_del.getvalue())
+last_message = service3.log.all()[-1].message if service3.log.all() else ""
+check("...and says so plainly in the event log instead",
+     "deleted while its trace was running" in last_message, last_message)
+
+# Put the target back for 3c, which needs one that still exists.
+target_id = service3.db.add_target("10.0.0.9", max_hops=2, probes=1, timeout_s=1.0)
+
 # 3c. End to end, through the real scheduler thread and a real (slowed)
 # trace: shutdown()'s drain window is sized to the in-flight target's own
 # settings (expected_budget), not a flat guess, so a trace that is merely

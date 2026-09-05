@@ -391,6 +391,59 @@ usually turn out to be a regex over the first eighty characters.
 | Windows PC / server | `hrProcessorLoad` averaged, `hrStorageFixedDisk` rows | CPU yes, disk yes, **memory no** — `mem_pct` comes only from UCD-SNMP, a Fortinet scalar or the Cisco memory pool. |
 | Tablet | — | a tablet runs no SNMP agent; it is only ever a MAC in a forwarding table or a DHCP lease, and there is **no OUI or MAC-vendor lookup anywhere in `netpath/`**, so it is anonymous. |
 
+#### What this product can tell you about each vendor on this estate
+
+Nobody had ever written this down, and it is the first thing an operator deciding
+whether to adopt it should be able to read. `VENDOR_HEALTH` is keyed by enterprise arc,
+which is the right design — a device is only asked for objects its own maker defines —
+so the question is exactly answerable.
+
+| Vendor | Before this pass | After |
+| --- | --- | --- |
+| Cisco | CPU, memory | **+ temperature** (CISCO-ENVMON-MIB) |
+| Juniper | CPU, temperature | **+ memory** (`jnxOperatingBuffer`) |
+| Microsoft (Windows) | CPU, disk | **+ memory** (`hrStorageRam`) |
+| Palo Alto | nothing from the vendor table | CPU, memory, disk — reached free through the generic HOST-RESOURCES fallback |
+| Fortinet | CPU, memory, session count | already complete |
+| APC, Eaton | — | full UPS-MIB (this pass) |
+| AVTECH | — | full ENTITY-SENSOR-MIB (this pass) |
+| MikroTik | CPU, memory (UCD-SNMP) | unchanged |
+| Aruba | **nothing** | unchanged — see below |
+| Siemens, Moxa | **nothing** | unchanged — no confident health MIB for either industrial line |
+| Ubiquiti, Cambium | RF metrics (RSSI, SNR, capacity) | unchanged — the real health signal for a radio link |
+| Rockwell | **nothing** | unchanged — structurally unreachable, see O-44 |
+| HP | printers: Printer-MIB only | unchanged |
+
+**The Cisco temperature gap was the largest single hole in the product.** 862 of the
+2,000-device estate are Cisco access switches — the switch in an un-air-conditioned
+closet with a UPS under it — and not one of them could report that it was cooking, by any
+route. No vendor entry for the environmental objects, and the platform does not answer
+ENTITY-SENSOR-MIB.
+
+**Aruba was deliberately left alone, and the reasoning is worth quoting.** A CPU-shaped
+OID exists under that arc, but every source places it in ArubaOS's *wireless controller*
+MIB rather than the ArubaOS-Switch line a 2930F actually runs — and **asking the wrong
+device family for the wrong object is worse than asking nothing**, because a number that
+looks plausible is one nobody checks. MikroTik's temperature was left out on the same
+grounds. Juniper's memory shipped because a second, independent source agreed: the demo
+persona, written by a different agent, already answered exactly that OID with a naming
+comment.
+
+**O-44 — a device identified by its description can never receive vendor health,
+whatever MIB exists. CONFIRMED (structural).** `vendorid.decide()` returns
+`vendor_arc = None` for a device recognised from `sysDescr` text rather than from
+`sysObjectID`'s arc — which is exactly a PLC running a generic net-snmp agent. Since
+`VENDOR_HEALTH` is keyed by arc, the lookup can never fire for that entire class, and
+**no amount of MIB work would help**: a perfect Allen-Bradley health table would sit
+unreachable because nothing would look it up.
+
+On this estate that is 100 PLCs, which on a plant are the devices whose downtime costs
+the most. It is invisible from the coverage table above unless somebody reads the
+identification path, and it is a different kind of gap from "we do not have that MIB" —
+which is why the honest interim answer may be to make the emptiness *explain itself*.
+A device pane reading "no health metrics — this vendor was identified by description and
+has no health table" is worth more than a blank pane an operator reads as a fault.
+
 Two of those five were built during this pass and are now live; the table above
 describes the product as it was found. What the same instance reports today, queried
 device by device:
@@ -657,6 +710,58 @@ rule-scoped setting takes here.
 escalation when nobody acknowledges, no on-call rota, no ticket or runbook link on a
 rule, no per-recipient digest. `renotify_minutes` exists, so the product already
 understands "still happening" — it simply has nowhere else to send it.
+
+**O-25 — a finding of mine, withdrawn, and the better one that replaced it.**
+
+I claimed the rollup could not retract a child alert that was already open when its
+parent arrived. The evidence looked strong: during the 108-device outage the alert list
+held 108 `device_down` and 108 `packet_loss_high` rows for the same devices, and on
+**108 of 108** the child had opened first, by 58 to 118 seconds.
+
+The database says otherwise. Every pair in that run was cross-referenced afterwards:
+
+```
+devices with both rows                                          108
+packet_loss_high resolved within 10 s of device_down OPENING    108
+packet_loss_high resolved within 10 s of device_down RESOLVING    0
+```
+
+Every child resolved about **three seconds** after its parent opened — not at recovery
+two minutes later. `_absorb_subordinates`, the method immediately after the one I cited,
+already does precisely the retroactive resolve I said was missing, and a passing test
+covers it. My snapshot landed inside that three-second window. The ordering measurement
+stands; the conclusion I drew from it does not.
+
+**O-25b — the real defect, found while disproving mine, and fixed. CONFIRMED
+(reproduced before and after).** A device whose *own* `device_down` never opens — because
+an ancestor's outage already rolled it up through the topology path — never gets its
+other children swept. `_absorb_subordinates` runs only off a device's own `device_down`
+opening, and a topology-covered device's `device_down` structurally never does that, in
+either arrival order:
+
+```
+B's packet_loss_high, open before the outage       open
+device_down opened for A, the core                     1   (expected 1)
+device_down opened for B, rolled into A                0   (expected 0)
+packet_loss_high STILL open for B afterwards           1   ← the defect
+```
+
+This matters more than the case I imagined, and for a specific reason: **it is exactly
+the shape a real site outage takes once `upstream_id` is actually set** — the state the
+entire upstream-suggestion feature exists to make reachable. So the better a site's
+topology, the worse this bug would have been. A plant that had done the work and earned
+one alert instead of three hundred would have been rewarded with an orphaned
+`packet_loss_high` on every downstream device.
+
+And my own 108-device measurement could never have caught it, because that outage
+produced 108 independent `device_down` rows with nothing chained to anything — which
+brings us to a caveat that applies to every number in section 5.9.
+
+**Caveat: the campaign measured the un-chained case throughout.** Checked directly
+against the run's own database, **zero devices had `upstream_id` set**. That is realistic
+for a fresh installation and unrealistic for a site that has done the work. A separate
+run with the topology configured is what establishes what a well-configured site
+actually sees, and it is reported separately. ⏳
 
 **O-17 — removing a custom alert rule silently destroys every alert it ever raised,
 including the resolved ones that are the record of past incidents. CONFIRMED.**

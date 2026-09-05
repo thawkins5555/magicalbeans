@@ -301,10 +301,28 @@ assignments in the same batch, each valid alone, that together point two
 devices at each other — and refuses the batch outright, naming the devices
 involved, rather than applying whatever isn't part of it. Nothing here ever
 picks a suggestion for an operator; the review is still what turns a guess
-into something the rollup may trust. The rollup itself, unchanged since
-4.47.0, held up at this campaign's scale: a scripted site outage — a core
-switch and 108 devices behind it — opened 228 alerts and sent 11 emails,
-where the same shape of event measured against 4.35.0 produced 1,355.
+into something the rollup may trust. The topology rollup this feeds
+(`upstream_id`, shipped in 4.37.0) held up at this campaign's scale: a
+scripted site outage — a core switch and 108 devices behind it — opened 228
+alerts and sent 11 emails, where the same shape of event measured against
+4.35.0 produced 1,355.
+
+**A gap in that same topology rollup, found and closed this pass: a device
+fully covered by an ancestor's outage still showed its *other* alerts.**
+`device_down` rolling up under an upstream device's own outage was already
+correct — but a device that never opens its own `device_down` alert (because
+an ancestor's already covers it) also never fires the event that ordinarily
+triggers sweeping its other already-open alerts along with it, so a
+`packet_loss_high` or `cpu_high` alert that started climbing before the
+outage reached the device stayed on the Alerts page, fully covered in every
+way except this one, for the outage's whole duration. Fixed with a new,
+bounded helper (`_absorb_children_of`) called from both directions this can
+happen — a downstream device absorbed into an ancestor's alert, and a
+device whose own outage arrives after the ancestor's alert is already open
+— each costing one indexed lookup per rule `device_down` rolls up, a short
+fixed list, never a scan of the alerts table. Exercising it needs
+`upstream_id` actually set on real devices, which is exactly what the
+suggestions API above supplies.
 
 **Over a dozen interface defects, one of them a real functional break every
 time it was used.** Bulk mute failed for every selection, loudly rather than
@@ -443,10 +461,17 @@ the mechanism it guards rather than picked round.
 
 Still open, and part of why this campaign keeps running rather than closing
 here: a printer, identified correctly, that still answers with nothing but
-an interface counter and a ping time; and an audit trail that still cannot
-be read from the interface and does not yet cover adding a device, editing
-an alert rule or pushing a ConfigRX backup. Two things are further along
-than "open" but not yet reachable: search and named compliance rule sets
+an interface counter and a ping time; and an audit trail that still does not
+cover adding a device, editing an alert rule (with its threshold's old and
+new value) or deleting a ConfigRX backup — ConfigRX only ever pulls a
+read-only capture, never pushes one, so "restore" was never the missing
+half of that pair. The audit table itself gained the filtered, paged query
+and the dropdown sources a browsing page would need (`audit_query()`,
+`audit_usernames()`, `audit_action_names()`, all in `appdb.py`) this pass;
+what's still missing is the roughly two dozen new call sites across the
+actions above and the Settings subtab to read any of it from, both
+specified but not yet written. Two more things are further along than
+"open" but not yet reachable: search and named compliance rule sets
 across stored ConfigRX backups are built and tested against the database
 directly — redacted text only, ever — and device availability and top-N
 utilisation reporting (`netpath/report.py`) are likewise built and tested
