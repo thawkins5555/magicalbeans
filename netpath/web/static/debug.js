@@ -445,6 +445,11 @@
         (summary.dns_pending ? `, ${summary.dns_pending} looking up now` : ''),
       `DNS cache ${dns.named || 0}/${dns.cached || 0} named` +
         (dns.pending ? `, ${dns.pending} pending` : ', nothing pending'),
+      summary.ping_path === 'socket'
+        ? `ICMP ping via a ${summary.ping_kind} socket`
+        : `ICMP ping via one \`ping\` subprocess per probe` +
+          (summary.ping_mode_env === 'subprocess' ? ' (forced by NETPATH_PING_MODE)'
+            : ' — slower at fleet scale; widen ping_interval_s to reduce it'),
       `collector ${summary.collector ? 'listening' : 'stopped'}`,
       `${summary.packets} flow packets`,
       `IPAM ${summary.ipam ? 'running' : 'stopped'}` +

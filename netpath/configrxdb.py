@@ -38,7 +38,7 @@ import threading
 import time
 import zlib
 
-from . import dbmaint, dbopen, settingsutil
+from . import configrx_redact, dbmaint, dbopen, settingsutil
 
 # RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
 # possible — see _delete_search_lines below, the same reasoning
@@ -47,6 +47,24 @@ from . import dbmaint, dbopen, settingsutil
 # more surgical delete is available.
 HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
 _REBUILD_INTERVAL_S = 3600.0
+
+# One-time backfill for the cross-device search index (config_lines /
+# config_lines_fts) on an install that already has a backup history:
+# ConfigRxWorker._backup_device only ever calls replace_search_lines on a
+# changed or suspect capture, so a device whose configuration has not
+# moved since before search shipped — or since it last actually backed up
+# at all — has empty search rows that no ordinary poll would ever fill
+# (see that method's `unchanged` branch, which checks has_search_lines on
+# every poll for exactly this reason but only for devices still being
+# polled). Chunked by device_id and resumable, the same shape as
+# syslogdb.SyslogDatabase's own FTS backfill and for the identical
+# reasons: holding _lock for the whole fleet would stall every other
+# reader/writer of this database for as long as it takes, and an install
+# with thousands of devices must not have its ConfigRX worker startup
+# blocked on it.
+SEARCH_BACKFILL_CHUNK_DEVICES = 200
+SEARCH_BACKFILL_STOP_TIMEOUT_S = 5.0
+_SEARCH_BACKFILL_CURSOR_KEY = "_search_backfill_cursor"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS device_config (
@@ -250,6 +268,8 @@ class ConfigRxDatabase:
         self._conn.row_factory = sqlite3.Row
         self.search_fts = False
         self._last_search_rebuild: float | None = None
+        self._search_backfill_stop = threading.Event()
+        self._search_backfill_thread: threading.Thread | None = None
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -298,6 +318,15 @@ class ConfigRxDatabase:
             self.search_fts = False
 
     def close(self) -> None:
+        # Same shutdown shape as syslogdb.SyslogDatabase.close(): signal
+        # first, then give the backfill thread a bounded window to notice
+        # and land on a chunk boundary (it persists the cursor as it goes,
+        # so a thread that does not make the window within the timeout
+        # just resumes from wherever it last got to, next start).
+        self._search_backfill_stop.set()
+        thread = self._search_backfill_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=SEARCH_BACKFILL_STOP_TIMEOUT_S)
         with self._lock:
             self._conn.close()
 
@@ -642,6 +671,20 @@ class ConfigRxDatabase:
                         [(first_id + i, line) for i, line in enumerate(lines)])
             self._conn.commit()
 
+    def has_search_lines(self, device_id: int) -> bool:
+        """True when device_id already has at least one row in the search
+        index — served entirely by ix_config_lines_device, so this is cheap
+        enough for ConfigRxWorker._backup_device's `unchanged` branch to
+        call on every poll. That is exactly what it is for: it is what
+        lets a device whose configuration has not moved skip paying for
+        redact()+replace_search_lines again once it has been indexed
+        once, whether that happened through an earlier changed/suspect
+        capture or through backfill_one_device below."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM config_lines WHERE device_id = ? LIMIT 1",
+                (device_id,)).fetchone() is not None
+
     def _delete_search_lines(self, device_id: int) -> None:
         """Must be called with the lock held (replace_search_lines and
         forget_device both already hold it). Same RETURNING-based targeted
@@ -710,6 +753,151 @@ class ConfigRxDatabase:
             return self._conn.execute(
                 "SELECT device_id, line_no, line FROM config_lines"
                 f"{where} ORDER BY device_id, line_no", params).fetchall()
+
+    # ------------------------------------------------ search index backfill
+
+    def _read_search_backfill_cursor(self) -> int:
+        """The device_id an earlier, interrupted backfill run (see close())
+        had reached, or 0 to start from the beginning — a fresh install has
+        no marker at all, and 0 is a safe "before every real device_id"
+        floor the same way start_index_backfill's own cursor=0 is."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (_SEARCH_BACKFILL_CURSOR_KEY,)).fetchone()
+        if row is None or row["value"] is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_search_backfill_cursor(self, cursor: int) -> None:
+        """Persists `cursor` as a permanent high-water mark, never cleared
+        back to "nothing to resume": unlike syslogdb's row-id cursor
+        (where every new row above the watermark genuinely needs
+        indexing), a device_id once walked here never needs walking
+        again. Its first-ever capture always calls replace_search_lines
+        itself (add_backup's hash comparison can never call a brand new
+        device's first backup "unchanged" — there is nothing yet to
+        compare it to), and _backup_device's own `unchanged` branch keeps
+        it indexed forever after that via has_search_lines. So the ONLY
+        device_ids this backfill will ever need to look at are ones that
+        already had backups before this cursor existed. Clearing the
+        marker on completion (the way syslogdb does, where completion is
+        provisional — the table can grow again at any time) would make
+        every later start_search_backfill call re-scan the entire
+        `backups` table from device_id 0 forever, for a fleet that will
+        never again have anything for it to find. Caller holds the lock
+        and commits."""
+        self._conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SEARCH_BACKFILL_CURSOR_KEY, str(cursor)))
+
+    def start_search_backfill(self) -> None:
+        """Kicks off the one-time search-index backfill on a background
+        thread, called from ConfigRxWorker.start() (configrx.py) — the
+        same point service.py already starts syslogdb's own index
+        backfill from, not from every backup.
+
+        A no-op, cheaply, in the case that matters most: a fleet that has
+        already been fully walked (by a previous run, or because it never
+        needed backfilling — every device backed up at least once after
+        this feature shipped) has no device_id left above the persisted
+        cursor, checked with one bounded query rather than assumed, so
+        starting and stopping the worker from the UI does not keep
+        re-spawning a thread that would immediately find nothing to do.
+        """
+        if self._search_backfill_thread and self._search_backfill_thread.is_alive():
+            return
+        cursor = self._read_search_backfill_cursor()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM backups WHERE device_id > ? LIMIT 1",
+                (cursor,)).fetchone()
+        if row is None:
+            return
+        self._search_backfill_stop.clear()
+        self._search_backfill_thread = threading.Thread(
+            target=self._search_backfill, args=(cursor,),
+            name="configrx-search-backfill", daemon=True)
+        self._search_backfill_thread.start()
+
+    def _search_backfill(self, cursor: int) -> None:
+        """Walks the device_ids present in `backups`, strictly increasing
+        from `cursor`, SEARCH_BACKFILL_CHUNK_DEVICES at a time, indexing
+        whichever of them has no search rows yet (backfill_one_device
+        already skips one that does, whether from a previous partial run
+        or a real capture landing for it while this was in progress).
+
+        Each chunk's cursor is persisted and committed before the next
+        chunk starts and _lock is only ever held for one chunk's read or
+        one device's write at a time, never across the whole fleet — a
+        shutdown (see close()) loses at most one in-flight chunk, not the
+        whole backfill, and the next start resumes exactly after the last
+        one that completed.
+        """
+        try:
+            while not self._search_backfill_stop.is_set():
+                with self._lock:
+                    chunk = [r["device_id"] for r in self._conn.execute(
+                        "SELECT DISTINCT device_id FROM backups WHERE device_id > ?"
+                        " ORDER BY device_id LIMIT ?",
+                        (cursor, SEARCH_BACKFILL_CHUNK_DEVICES)).fetchall()]
+                if not chunk:
+                    break
+                for device_id in chunk:
+                    if self._search_backfill_stop.is_set():
+                        break
+                    self.backfill_one_device(device_id)
+                cursor = chunk[-1]
+                with self._lock:
+                    self._write_search_backfill_cursor(cursor)
+                    self._conn.commit()
+                # Same courtesy pause syslogdb._backfill makes between
+                # chunks, so a fleet-wide backfill never monopolizes this
+                # connection against a backup landing or a search running
+                # concurrently on the worker's or the API's own threads.
+                time.sleep(0.02)
+        except sqlite3.Error:
+            # The connection closing under this chunk is close()'s own
+            # doing (shutdown mid-fleet), not a genuine failure — the same
+            # non-bug shape as syslogdb._backfill's identical catch. The
+            # cursor persisted after the last completed chunk is where the
+            # next start resumes from either way.
+            return
+        # Nothing left with device_id > cursor: the cursor already sits at
+        # the highest device_id `backups` had when the last chunk was
+        # written, which is exactly the permanent high-water mark this
+        # method's own docstring describes — left as is, not cleared.
+
+    def backfill_one_device(self, device_id: int) -> None:
+        """Indexes device_id from its latest stored backup, unless it is
+        already indexed. Mirrors exactly what ConfigRxWorker._backup_device
+        computes for the search index at capture time: the `redacted` flag
+        stored on that backups row says whether the content is already
+        secrets-free (store_secrets was off when it was captured) or still
+        needs a redaction pass now (store_secrets was on) — the same
+        unconditional "search is always redacted, regardless of
+        store_secrets" rule from configrx_search.py's module docstring,
+        just applied after the fact instead of at capture time.
+
+        Public (not prefixed) because it is also exactly the tool a
+        forgotten/never-run backfill's test double needs to call directly,
+        one device at a time, without spinning up the background thread.
+        """
+        if self.has_search_lines(device_id):
+            return
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content_gz, redacted FROM backups WHERE device_id = ?"
+                " ORDER BY ts DESC LIMIT 1", (device_id,)).fetchone()
+        if row is None:
+            return
+        content = zlib.decompress(row["content_gz"]).decode("utf-8", "replace")
+        search_text = content if row["redacted"] else configrx_redact.redact(content)[0]
+        self.replace_search_lines(device_id, search_text)
 
     # ------------------------------------------------------------- compliance
 

@@ -660,6 +660,14 @@ class ConfigRxWorker:
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
         self._thread.start()
+        # One-time catch-up for an install that already has a backup
+        # history predating (or never yet reindexed under) the `unchanged`
+        # branch's has_search_lines check in _backup_device below — see
+        # ConfigRxDatabase.start_search_backfill's own docstring. Runs on
+        # its own background thread and is a cheap no-op once the fleet is
+        # fully indexed, so calling it on every Start (not just process
+        # startup) is safe.
+        self.db.start_search_backfill()
 
     def stop(self) -> None:
         self._stop.set()
@@ -993,6 +1001,13 @@ class ConfigRxWorker:
             # treatment — the same one get_configrx_diff already gives a
             # comparison view — rather than the single-backup route's
             # permission-gated one.
+            #
+            # This branch always replaces the index, unconditionally: a
+            # changed or suspect capture means `cleaned` (and so
+            # search_text) is genuinely new content, never what is already
+            # indexed. The `unchanged` branch below is the opposite case —
+            # see its own comment for why it does NOT call this on every
+            # poll.
             search_text = cleaned if not store_secrets else configrx_redact.redact(cleaned)[0]
             self.db.replace_search_lines(device_id, search_text)
             # Compliance re-evaluates right away too, so a rule set someone
@@ -1020,3 +1035,29 @@ class ConfigRxWorker:
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)
+            # `cleaned` here is byte-identical to the content already sitting
+            # in `backups` (that is what "unchanged" means — add_backup's own
+            # hash comparison is what set backup_id to None), so the
+            # redacted text this device's search rows SHOULD hold is
+            # identical to what they already hold, if they were ever
+            # populated. Re-deriving and re-storing it on every poll would
+            # be pure waste at fleet scale: replace_search_lines deletes and
+            # re-inserts every line of this capture, in the FTS shadow
+            # table too, and this branch is the steady state for a
+            # well-run network — most devices, most polls, forever.
+            #
+            # has_search_lines is one indexed lookup (ix_config_lines_device)
+            # that tells us whether that cost was already paid. It has NOT
+            # been for a device whose configuration has never changed since
+            # this feature shipped — that device has always taken this
+            # branch and so has never once reached the indexing call in the
+            # `if` above — or for one a not-yet-run or still-in-progress
+            # backfill (start_search_backfill, called from start() below)
+            # has not reached yet. In either of those cases, and only then,
+            # this pays for redact()+replace_search_lines once; every
+            # following unchanged poll for that device finds the rows
+            # already there and skips it again.
+            if not self.db.has_search_lines(device_id):
+                search_text = (cleaned if not store_secrets
+                              else configrx_redact.redact(cleaned)[0])
+                self.db.replace_search_lines(device_id, search_text)

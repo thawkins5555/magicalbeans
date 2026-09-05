@@ -1234,6 +1234,9 @@ def get_debug(service, params, body) -> dict:
         })
     discovery_scans.sort(key=lambda row: row["elapsed"], reverse=True)
 
+    from ..ipam_scan import ping_mode_summary
+    ping_mode = ping_mode_summary()
+
     return {
         "workers": workers,
         "dns_workers": dns_workers,
@@ -1262,6 +1265,11 @@ def get_debug(service, params, body) -> dict:
             "nodes_active": len(node_workers),
             "discovery_active": len(discovery_scans),
             "buffered": len(service.log.all()),
+            # Same fact the startup log line states once, here so it stays
+            # visible without hunting back through the event log for it.
+            "ping_path": ping_mode["path"],
+            "ping_kind": ping_mode["kind"],
+            "ping_mode_env": ping_mode["mode_env"],
         },
     }
 
@@ -1337,6 +1345,13 @@ _GLOBAL_SETTINGS_RANGES = {
     "dashboard_refresh_s": (1, 3600),
     "debug_refresh_s": (1, 60),
     "max_trace_db_mb": (16, None),
+    # The age cap beside the size cap. It had no entry here at all, which
+    # only survived because prune() used to run solely from the manual
+    # maintenance action; now that the maintenance pass calls it every
+    # interval, a 0 posted straight to the API (the Settings page's own
+    # input says min="1", but a client can skip the browser) computes a
+    # cutoff of "now" and deletes every trace, again and again, silently.
+    "trace_retention_days": (1, 3650),
     "max_flow_db_mb": (16, None),
     "max_snmp_db_mb": (16, None),
     "max_syslog_db_mb": (16, None),
@@ -1519,10 +1534,15 @@ def get_audit(service, params, body) -> dict:
     """The on-disk audit trail. Administrator-only, and read-only: there is
     no endpoint anywhere that deletes from this table.
 
-    `since` is the last id already seen (the same cursor shape the Debug
-    page's event feed uses), `limit` how many rows to return at most,
-    capped server-side.
+    Two shapes behind one route, told apart by whether `t0`/`t1` is
+    present. Settings > Audit always sends both (see auditFetchPage() in
+    settings.js), so that means the filtered, keyset-paginated search
+    below via audit_query(). Neither present means the older "since a
+    cursor" poll a few tests still use directly — `since` the last id
+    already seen, `limit` how many rows at most — via audit_events().
     """
+    if "t0" in params or "t1" in params:
+        return _get_audit_search(service, params)
     since = int(_num(params, "since", 0, int) or 0)
     limit = int(_num(params, "limit", 500, int) or 500)
     rows = service.app_db.audit_events(since, limit)
@@ -1534,6 +1554,39 @@ def get_audit(service, params, body) -> dict:
         "last_id": rows[-1]["id"] if rows else since,
         "max_id": service.app_db.audit_last_id(),
         "limit": min(max(1, limit), _appdb.AUDIT_MAX_LIMIT),
+    }
+
+
+def _get_audit_search(service, params) -> dict:
+    """audit_query(), filtered and paged for the Settings > Audit subtab.
+    One row past `limit` is fetched (audit_query's own contract) so
+    `truncated` can be told from "that was all of it" without a second
+    query, the same trick the syslog search route uses.
+
+    usernames/actions are the filter dropdowns' options, rebuilt from this
+    same request rather than a separate one — cheap (DISTINCT over an
+    indexed column, see ix_audit_username/ix_audit_action) next to the
+    query this already ran, and it means the dropdowns can never disagree
+    with the rows just returned.
+    """
+    t1 = _num(params, "t1", time.time())
+    t0 = _num(params, "t0", t1 - 2592000)
+    limit = int(_num(params, "limit", 200, int) or 200)
+    before_id = _num(params, "before_id", None, int)
+    rows = service.app_db.audit_query(
+        t0, t1, username=params.get("username") or "",
+        action=params.get("action") or "", target=params.get("target") or "",
+        q=params.get("q") or "", before_id=before_id, limit=limit)
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "rows": [{"id": row["id"], "ts": row["ts"], "username": row["username"],
+                  "client": row["client"], "action": row["action"],
+                  "target": row["target"], "detail": row["detail"]}
+                 for row in rows],
+        "truncated": truncated,
+        "usernames": service.app_db.audit_usernames(),
+        "actions": service.app_db.audit_action_names(),
     }
 
 

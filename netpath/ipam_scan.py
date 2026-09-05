@@ -279,6 +279,30 @@ def _icmp_socket_kind() -> str | None:
     return kind
 
 
+def ping_mode_summary() -> dict:
+    """What ping_once()/ping_many() actually do right now, for a startup
+    log line and the Debug page — the operator-facing version of
+    _icmp_socket_kind()'s raw "dgram"/"raw"/None, read from that same
+    cache rather than probed again here.
+
+    `path` is "socket" or "subprocess" — the fact that matters at fleet
+    scale, since the subprocess path is one fork/exec per probe (three
+    per device per poll) where the socket path is none. `mode_env` is
+    NETPATH_PING_MODE as this process actually read it, so a caller can
+    tell "no socket available" apart from "the demo forced this".
+    """
+    mode = os.environ.get(_PING_MODE_ENV, "").strip().lower()
+    kind = None
+    error = None
+    if mode != "subprocess":
+        try:
+            kind = _icmp_socket_kind()
+        except OSError as exc:
+            error = str(exc)
+    return {"path": "socket" if kind is not None else "subprocess",
+            "kind": kind, "mode_env": mode or None, "error": error}
+
+
 def _ping_many_socket(ip: str, count: int, timeout_ms: int,
                       kind: str) -> tuple[int, int, float | None]:
     """(sent, received, average RTT in ms) for `count` echo probes to `ip`,

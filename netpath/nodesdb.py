@@ -1294,21 +1294,33 @@ class NodesDatabase:
             # two are meant to be layerable rather than redundant.
             clauses.append("status != 'up'")
         if text:
+            # Also searched: sys_location, sys_descr (model/description),
+            # sys_contact and vendor — an operator hunting "the Moxa in
+            # Site-B" knows those facts about a device, not necessarily its
+            # name or IP. Measured at 2000 devices (demo/out/tierC1/data-2000):
+            # a full-table-scan LIKE over all seven columns runs ~13ms mean
+            # vs ~9ms for the three it replaces — still far under anything
+            # an operator would notice, so no index/FTS table is warranted
+            # at this scale.
+            #
             # A MAC search matches the stored forwarding tables as well as
             # the device's own fields, so typing an address a switch has
             # learned filters the list down to the switches that see it.
             # Only from four hex digits: fewer would match half the estate
             # and turn a search into a shuffle.
+            text_cols = ("ip", "name", "sys_name", "sys_location",
+                         "sys_descr", "sys_contact", "vendor")
+            text_sql = " OR ".join(f"{col} LIKE ?" for col in text_cols)
             mac = looks_like_mac_search(text)
             if len(mac) >= 4:
                 clauses.append(
-                    "(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?"
+                    f"({text_sql}"
                     " OR id IN (SELECT device_id FROM mac_entries"
                     "           WHERE mac LIKE ?))")
-                params.extend([f"%{text}%"] * 3 + [f"{mac}%"])
+                params.extend([f"%{text}%"] * len(text_cols) + [f"{mac}%"])
             else:
-                clauses.append("(ip LIKE ? OR name LIKE ? OR sys_name LIKE ?)")
-                params.extend([f"%{text}%"] * 3)
+                clauses.append(f"({text_sql})")
+                params.extend([f"%{text}%"] * len(text_cols))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 

@@ -35,6 +35,7 @@ import http.client
 import json
 import os
 import time
+import urllib.parse
 
 import _paths  # noqa: F401
 
@@ -376,6 +377,87 @@ END
     check("200", status == 200, (status, payload))
     row = last_audit("configrx.backup_bulk_delete", "2 backups")
     check("configrx.backup_bulk_delete audited", row is not None, row)
+
+    # -------------------------------------------------- GET /api/audit route
+    # Everything above wrote real rows through the running server; this
+    # section is the route settings.js actually calls (auditFetchPage()) —
+    # t0/t1 plus the filters, answering {rows, truncated, usernames,
+    # actions} — not the old since/limit cursor shape covered separately
+    # in test_api_tokens.py / test_ldap_auth.py / test_security_fixes.py.
+    print("GET /api/audit: filtered, paginated search")
+    now = time.time()
+
+    def audit_get(token=admin, **params):
+        qs = urllib.parse.urlencode(params)
+        return call("GET", f"/api/audit?{qs}", token=token)
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500)
+    check("200", status == 200, (status, payload))
+    check("answers rows/truncated/usernames/actions, not the old events/last_id/max_id shape",
+          "rows" in payload and "events" not in payload, payload)
+    check("rows non-empty (this run alone wrote dozens)", len(payload.get("rows", [])) > 0)
+    check("usernames dropdown includes the account that did all this",
+          DEFAULT_USER in payload.get("usernames", []), payload.get("usernames"))
+    check("actions dropdown includes an action actually seen this run",
+          "device.create" in payload.get("actions", []), payload.get("actions"))
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, username=DEFAULT_USER)
+    check("username filter: matches, and only matches, that user",
+          status == 200 and payload["rows"]
+          and all(r["username"] == DEFAULT_USER for r in payload["rows"]), payload)
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, username="nobody-used-this-name")
+    check("username filter: an unused username returns nothing",
+          status == 200 and payload["rows"] == [], payload)
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, action="device.create")
+    check("action filter: matches, and only matches, that action",
+          status == 200 and len(payload["rows"]) >= 2
+          and all(r["action"] == "device.create" for r in payload["rows"]), payload)
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, target="device:10.70.1.1")
+    check("target filter: exact match, every action recorded against that device",
+          status == 200 and len(payload["rows"]) >= 2
+          and all(r["target"] == "device:10.70.1.1" for r in payload["rows"]), payload)
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, q="10.70.2.1")
+    check("q filter: substring match across target/detail",
+          status == 200 and payload["rows"]
+          and all("10.70.2.1" in r["target"] or "10.70.2.1" in r["detail"]
+                  for r in payload["rows"]), payload)
+    status, payload = audit_get(t0=0, t1=now + 60, limit=500, q="no-such-substring-anywhere")
+    check("q filter: no match returns nothing",
+          status == 200 and payload["rows"] == [], payload)
+
+    status, payload = audit_get(t0=now + 3600, t1=now + 7200, limit=500)
+    check("a window entirely in the future matches nothing",
+          status == 200 and payload["rows"] == [], payload)
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=3)
+    check("truncated is set, and exactly `limit` rows come back, when more exist",
+          status == 200 and payload["truncated"] is True and len(payload["rows"]) == 3, payload)
+    page1_ids = [row["id"] for row in payload["rows"]]
+    status, payload2 = audit_get(t0=0, t1=now + 60, limit=3, before_id=page1_ids[-1])
+    check("before_id pages strictly older than the previous page's oldest row",
+          status == 200 and payload2["rows"]
+          and all(row["id"] < page1_ids[-1] for row in payload2["rows"]),
+          (page1_ids, payload2))
+    check("paging never repeats a row",
+          not ({row["id"] for row in payload2["rows"]} & set(page1_ids)),
+          (page1_ids, [row["id"] for row in payload2["rows"]]))
+
+    status, payload = audit_get(t0=0, t1=now + 60, limit=100000)
+    check("truncated is false once the page holds everything",
+          status == 200 and payload["truncated"] is False, payload)
+
+    print("GET /api/audit: permission gate")
+    status, payload = call("POST", "/api/users",
+                           {"username": "audit-no-admin", "password": "Corr3ct-Horse-Battery",
+                            "grants": {"debug": "write"}}, token=admin)
+    check("200", status == 200, (status, payload))
+    limited = login("audit-no-admin", "Corr3ct-Horse-Battery")
+    status, payload = audit_get(token=limited, t0=0, t1=now + 60, limit=10)
+    check("an account without the admin grant is refused, not shown an empty trail",
+          status == 403, (status, payload))
 
     print()
     print("FAILURES:", FAILS if FAILS else "none")

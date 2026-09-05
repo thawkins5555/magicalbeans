@@ -24,6 +24,7 @@ from ..db import Database
 from ..eventlog import NODES, SYSTEM, EventLog
 from ..flowdb import FlowDatabase
 from ..fortipoll import WirelessPoller
+from .. import ipam_scan
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
 from ..mibparse import known_oids_for, load_into, resolve_all
@@ -311,6 +312,33 @@ class Service:
 
         self._apply_interface_names()
         self._apply_port_names()
+
+        # Nodes and Wireless polling both call into ipam_scan.ping_many();
+        # on a host with no ICMP socket available (Windows, or Linux without
+        # CAP_NET_RAW or a ping_group_range grant) that silently falls back
+        # to one `ping` subprocess per probe, which is real fork/exec cost
+        # a fleet-sized poll cycle pays for on every run — measured turning
+        # a 2,000-device cycle from under a minute into minutes, with
+        # nothing anywhere telling the operator why. Said once here, at the
+        # volume level a wrong choice deserves.
+        ping_mode = ipam_scan.ping_mode_summary()
+        if ping_mode["path"] == "socket":
+            self.log.add(SYSTEM, f"ICMP ping using an unprivileged {ping_mode['kind']} "
+                                 f"socket — no subprocess spawned per probe.")
+        elif ping_mode["mode_env"] == "subprocess":
+            self.log.add(SYSTEM, "ICMP ping: subprocess path forced by "
+                                 "NETPATH_PING_MODE=subprocess.")
+        elif ping_mode["error"]:
+            self.log.add(SYSTEM, f"ICMP ping: {ping_mode['error']}")
+        else:
+            self.log.add(SYSTEM, "ICMP ping: no ICMP socket available here "
+                                 "(Windows, or Linux without CAP_NET_RAW or a "
+                                 "ping_group_range grant) — falling back to one "
+                                 "`ping` subprocess per probe. That cost scales with "
+                                 "fleet size; widening ping_interval_s on Nodes/"
+                                 "Wireless polling profiles reduces how often it "
+                                 "is paid.")
+
         self._stop.clear()
         self._maintenance_thread = threading.Thread(
             target=self._maintenance_loop, name="netpath-maintenance", daemon=True)
@@ -812,6 +840,7 @@ class Service:
             self._maintenance_lock.release()
 
     def _run_maintenance_body(self) -> None:
+        self.db.prune(float(self.settings.get("trace_retention_days", 90)))
         cap = int(self.settings.get("max_trace_db_mb", 0)) * 1024 * 1024
         if cap:
             removed = self.db.trim_to_size(cap)
