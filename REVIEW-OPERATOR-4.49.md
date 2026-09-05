@@ -1563,6 +1563,23 @@ competitor's brochure lists it. Several things a brochure would make much of —
 NETCONF, RESTCONF — sit near the bottom, because a plant with 2,000 endpoints and one
 network engineer does not use them.
 
+**The one thing to take from this review if you take nothing else.** Twice in one night,
+from opposite directions, this campaign found a number that nobody had multiplied out:
+
+- `down_after_failures` **3** × `poll_interval_s` **120 s** = a **six-minute** detection
+  floor, and an outage shorter than three poll cycles never reported at all.
+- `max_hops` **255** × `probes` **20** × `timeout_s` **30 s** = a **42.5-hour** ceiling on
+  a single hung traceroute on Windows — in bounds this campaign had itself added a few
+  hours earlier, each one justified against its own mechanism.
+
+Every individual value in both is defensible and documented. Both products are
+indefensible and undocumented. Neither is visible from reading either setting, and
+nothing in the interface states them. **A bound justified against its own mechanism is not
+a bound on the system** — and wherever two or more operator-settable numbers multiply into
+a real cost, a wait, a timeout, a thread's lifetime, it is the product that should be
+bounded and the product that should be displayed. Neither the code nor the interface
+currently does either.
+
 **Before any of it: two settings to change on day one.** Not an absence and not a defect,
 which is why it sits above the list rather than in it. `poll_interval_s` at 120 seconds
 and `down_after_failures` at 3 multiply to a six-minute detection floor, and an outage

@@ -1093,9 +1093,20 @@ ok(f"with upstream_id set, the same 121 outages give {opened} alert and "
 
 
 # ---- the device form field the topology needs, validated at the boundary
+class _FakeAppDb:
+    """put_nodes_device (4.49.0) now writes an audit line on every field it
+    changes — service.app_db.audit(...) — so this stub needs an app_db that
+    accepts and discards it, the same way _FakeService accepts and discards
+    everything else a real Service would carry that this test does not
+    exercise."""
+    def audit(self, *args, **kwargs) -> None:
+        pass
+
+
 class _FakeService:
     def __init__(self, nodes_db):
         self.nodes_db = nodes_db
+        self.app_db = _FakeAppDb()
 
 
 from netpath.web.api import put_nodes_device   # noqa: E402

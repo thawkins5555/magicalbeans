@@ -3975,22 +3975,35 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
     hottest" is `key=cpu_pct&rank_by=mean`. See report.top_metric_ranking
     for the query itself and the measured cost at fleet scale.
 
-    Ranking the WHOLE fleet (no `device_ids`) over more than 7 days is
-    refused outright rather than left to block the request thread for the
-    ~100s report.py's own docstring measured at that shape — narrow
-    `device_ids` or ask for a shorter window instead.
+    A whole-fleet-equivalent ask over more than 7 days is refused outright
+    rather than left to block the request thread for the ~100s report.py's
+    own docstring measured at that shape — narrow `device_ids` or ask for a
+    shorter window instead. "Whole-fleet-equivalent" is measured by how
+    many devices this request actually resolves to (`device_ids` omitted
+    ends up covering every device on file, same as `device_ids` naming
+    every device explicitly — the two must refuse identically, since they
+    produce the identical query), scaled against the window: half the
+    fleet over 14 days costs the same as the whole fleet over 7, so the
+    cap applies to that scaled figure rather than to a literal device_ids-
+    was-omitted check, which a caller who happens to enumerate every id
+    would otherwise walk straight past.
     """
     key = str(params.get("key", "")).strip()
     if not key:
         raise ValueError("key is required")
     t0, t1 = _window(params, default_span_s=7 * 86400.0)
     device_ids = _id_list(params.get("device_ids"))
-    if not device_ids and (t1 - t0) > REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S:
-        raise ValueError(
-            "ranking the whole fleet over more than 7 days is too slow for "
-            "a live request (measured ~100s at 2,000 devices for a month "
-            "in report.top_metric_ranking's own benchmark) — narrow "
-            "device_ids or request a shorter window")
+    total_devices = service.nodes_db.device_count()
+    covered = min(len(set(device_ids)), total_devices) if device_ids else total_devices
+    if total_devices and covered:
+        scaled_window_s = (t1 - t0) * (covered / total_devices)
+        if scaled_window_s > REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S:
+            raise ValueError(
+                f"this would rank {covered} of {total_devices} device(s) over "
+                f"{(t1 - t0) / 86400:.1f} day(s) — too slow for a live request "
+                f"(measured ~100s at 2,000 devices for a month in "
+                f"report.top_metric_ranking's own benchmark) — narrow "
+                f"device_ids further or request a shorter window")
     rank_by = str(params.get("rank_by") or "peak")
     if rank_by not in ("peak", "mean"):
         raise ValueError("rank_by must be 'peak' or 'mean'")

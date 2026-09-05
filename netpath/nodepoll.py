@@ -828,16 +828,44 @@ class NodePoller:
         with self._lock:
             return set(self._queued) | set(self._started)
 
+    def _running_discovery_jobs(self) -> list:
+        """stop() already calls job.cancel() on each of these; a running
+        job's own per-address loop notices _stop and lands within about
+        one address's worth of work (see _discovery_budget_s) rather than
+        finishing its whole sweep, which can be a subnet's worth of
+        addresses and far too long to wait out here."""
+        return [job for job in list(self._discovery_jobs.values()) if job.running]
+
     def drain(self, timeout_s: float) -> bool:
-        """Wait for in-flight polls to finish. True if they all did. The
-        same shape as Monitor.drain (netpath/monitor.py) for the trace
-        scheduler this class was copied from."""
+        """Wait for in-flight polls and discovery jobs to finish. True if
+        they all did. The same shape as Monitor.drain (netpath/monitor.py)
+        for the trace scheduler this class was copied from."""
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if not self._inflight_ids():
+            if not self._inflight_ids() and not self._running_discovery_jobs():
                 return True
             time.sleep(0.05)
-        return not self._inflight_ids()
+        return not self._inflight_ids() and not self._running_discovery_jobs()
+
+    def _discovery_budget_s(self, job) -> float:
+        """One address's worst case for a running discovery job, from its
+        own settings dict -- not a model of the whole sweep (see
+        _running_discovery_jobs). Two SNMP versions tried, a handful of
+        community guesses each, plus the vendor arc hop
+        (hop_enterprise_arcs: "typically three to eight" GETNEXTs, no
+        retry of its own) are approximated as ten SNMP round trips rather
+        than counted exactly -- a generous approximation, the same shape
+        as a per-device poll's own budget below; DiscoveryJob._run_safe's
+        guard (netpath/nodediscover.py) is the backstop for whatever this
+        misses."""
+        settings = job.settings
+        default_timeout = float(settings.get("default_snmp_timeout_s", 3.0))
+        snmp_timeout_s = float(settings.get("discovery_snmp_timeout_s") or default_timeout)
+        ping_timeout_s = float(settings.get("discovery_ping_timeout_s") or default_timeout)
+        snmp_retries = max(0, int(settings.get("discovery_snmp_retries") or 0))
+        ping_retries = max(0, int(settings.get("discovery_ping_retries") or 0))
+        return (ping_timeout_s * (1 + ping_retries)
+               + snmp_timeout_s * (1 + snmp_retries) * 10)
 
     # A full poll's fixed part: the ping sweep (if enabled) plus a handful
     # of SNMP round trips that always happen (scalars, ifTable, ifXTable) —
@@ -876,6 +904,11 @@ class NodePoller:
             except Exception:
                 pass
             worst = max(worst, budget)
+        for job in self._running_discovery_jobs():
+            try:
+                worst = max(worst, self._discovery_budget_s(job))
+            except Exception:
+                continue
         return min(worst, ceiling_s)
 
     def shutdown(self, drain_s: float = 0.0) -> None:

@@ -762,6 +762,71 @@ def step_configrx(client: Client, log: SeedLog, device_ids: dict,
             "ssh_demo": ssh_demo}
 
 
+# The plant baseline's four FLEET-WIDE rules — see
+# demo/configrx_compliance_fixture.py's own module docstring for the full
+# demonstration (real SSH captures, a genuine pass/fail spread, the
+# redaction-boundary proof) this is the cut-down, HTTP-driven version of.
+# Only the fleet-wide half is seeded here, not the port-security rule
+# scoped to an "Access Switches" device group: this app's seeded device
+# groups are per-SITE (step_groups_and_profiles), not per-role, so there is
+# no group here yet for a role-scoped rule to attach to — creating one
+# would mean re-grouping devices this step does not otherwise touch, which
+# is a bigger change than seeding a rule set should make on the side. The
+# fixture script is where the scoped rule is actually demonstrated.
+CONFIGRX_COMPLIANCE_RULES = [
+    ("Must point at the plant NTP server (10.10.0.1)", "must_match",
+     r"ntp server 10\.10\.0\.1"),
+    ("SNMP community must not be a vendor default (public/private)",
+     "must_not_match", r"snmp-server community (public|private)\b"),
+    ("No plaintext (type 0) password lines", "must_not_match", r"password 0 \S+"),
+    ("Telnet transport must not be enabled", "must_not_match",
+     r"transport input telnet"),
+]
+
+
+def step_configrx_compliance(client: Client, log: SeedLog) -> dict:
+    """9. Seeds the plant baseline's fleet-wide rule set through the real
+    API, once it exists — see demo/configrx_compliance_fixture.py for the
+    rule set's own reasoning and a full offline demonstration with real
+    SSH captures and a genuine pass/fail spread.
+
+    The routes this calls (POST /api/configrx/rule-sets and .../rules)
+    may not be live on every build yet — the same "expected to fail on
+    this build, called anyway and recorded as evidence" shape step_configrx
+    above already uses for DPAPI on Linux, not a sign this step is broken.
+    Once they land, this seeds the SAME rule set into every future campaign
+    for free rather than requiring it to be rebuilt by hand each time.
+    """
+    client.step = "9-configrx-compliance"
+    endpoint = "/api/configrx/rule-sets"
+    status, payload, _ = client.raw("POST", endpoint,
+                                    {"name": "Plant baseline — every device"})
+    if status >= 400:
+        error = error_text(payload)
+        print("[9] configrx rule set -> HTTP %d: %s (not seeded — route may "
+             "not be live on this build yet)" % (status, error))
+        log.refusal("9-configrx-compliance", endpoint, status, error)
+        return {"seeded": False, "status": status, "error": error}
+
+    rule_set_id = payload.get("id") or payload.get("rule_set_id")
+    stored = []
+    for i, (description, kind, pattern) in enumerate(CONFIGRX_COMPLIANCE_RULES):
+        rule_endpoint = "%s/%d/rules" % (endpoint, rule_set_id)
+        status, payload, _ = client.raw("POST", rule_endpoint, {
+            "description": description, "kind": kind, "pattern": pattern,
+            "ordinal": i})
+        if status >= 400:
+            log.refusal("9-configrx-compliance", rule_endpoint, status,
+                       error_text(payload))
+            continue
+        stored.append(description)
+    print("[9] configrx rule set 'Plant baseline — every device' seeded "
+         "(%d/%d rules stored)" % (len(stored), len(CONFIGRX_COMPLIANCE_RULES)))
+    log.note("9-configrx-compliance", "plant baseline rule set seeded",
+             rule_set_id=rule_set_id, rules_stored=len(stored))
+    return {"seeded": True, "rule_set_id": rule_set_id, "rules_stored": len(stored)}
+
+
 def step_settings(client: Client, log: SeedLog, workers: int,
                   defaults: bool = False, ping_interval: int | None = None) -> dict:
     """8. Alerts/syslog/nodes settings, the alert engine, and two lowered
@@ -1074,6 +1139,7 @@ def main(argv=None) -> int:
         summary["wireless"] = step_wireless(client, log)
         summary["configrx"] = step_configrx(
             client, log, summary["devices"]["ids_by_name"], args.ssh_base_port)
+        summary["configrx_compliance"] = step_configrx_compliance(client, log)
         summary["settings"] = step_settings(client, log, args.workers,
                                             args.defaults, args.ping_interval)
         summary["users"] = step_users(client, log, args.base, creds_path)

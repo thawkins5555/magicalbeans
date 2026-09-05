@@ -162,16 +162,30 @@ try:
           (status, payload))
 
     # ---------------------------------------------- whole-fleet cost cap
-    print("whole-fleet top-metrics over more than 7 days is refused")
+    print("whole-fleet-equivalent top-metrics over more than 7 days is refused")
     long_t0 = now - 40 * 86400
     status, payload = call(
         "GET", f"/api/nodes/reports/top-metrics?key=cpu_pct&t0={long_t0}&t1={now}", token=admin)
-    check("400: whole fleet, >7 days is refused",
+    check("400: whole fleet (device_ids omitted), >7 days is refused",
           status == 400, (status, payload))
+
+    # The exact bypass this guard exists to close: explicitly naming every
+    # device on file produces the identical query omitting device_ids
+    # does, and must be refused identically rather than read as "narrowed"
+    # just because the parameter was present.
     status, payload = call(
         "GET", f"/api/nodes/reports/top-metrics?key=cpu_pct&t0={long_t0}&t1={now}"
+               f"&device_ids={dev1},{dev2}", token=admin)
+    check("400: device_ids listing every device is refused exactly like omitting it",
+          status == 400, (status, payload))
+
+    # Genuinely narrowed (half the two-device fleet) over a window short
+    # enough that the scaled-down cost falls back under the cap.
+    short_t0 = now - 10 * 86400
+    status, payload = call(
+        "GET", f"/api/nodes/reports/top-metrics?key=cpu_pct&t0={short_t0}&t1={now}"
                f"&device_ids={dev1}", token=admin)
-    check("...but the identical window narrowed to device_ids is allowed",
+    check("...but a genuinely narrowed request over a shorter window is allowed",
           status == 200, (status, payload))
     # The default 7-day window with no device_ids must NOT be refused --
     # only a window actually longer than the cap should trip it.
