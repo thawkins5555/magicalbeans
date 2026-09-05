@@ -80,10 +80,14 @@ body {
 .dash-scroll { overflow-y: auto; flex: 1; }
 .dash-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  /* auto-fill keeps an empty track's width reserved even once no tile is
+     left to fill it, which is where the ~120px holes at 1920px came from:
+     a leftover strip too narrow for one more 280px tile sat unused rather
+     than being handed to the tiles already there. auto-fit collapses that
+     empty track to zero and lets the real columns take the width instead. */
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 10px;
   margin-top: 10px;
-  align-items: start;
 }
 /* A tile is a .card (dashboard.js says so in the markup) and takes its
    surface, border, radius, padding and eyebrow from there. This used to be
@@ -184,28 +188,85 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .brand .mark-end { fill: var(--ok); }
 body.tiny .brand span { display: none; }
 
-/* ------------------------------------------------------------------ tabs */
+/* ------------------------------------------------------------------ tabs
+   The strip used to need 1,747px before anything was cut, and at 1366px —
+   the commonest NOC laptop width — it dropped Settings, most of Debug,
+   #conn and Sign out with no visible sign there was more to see.
+   `overflow-x: auto` was already here, but Chromium paints no scrollbar
+   until the pointer is actually over the strip, so at rest it simply looked
+   truncated.
+
+   .topbar splits the old single row in two: #tabs, which scrolls, and
+   .tabs-utility, which does not. The utility group — who is signed in, the
+   way to Account, Sign out, and #conn ("the one honest signal during an
+   outage") — can now never scroll out of reach, whatever the width. */
+.topbar {
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border-bottom: 1px solid var(--hairline);
+  flex: none;
+  min-width: 0;
+}
 #tabs {
   display: flex;
   align-items: center;
   gap: 2px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--hairline);
-  padding: 0 12px;
-  flex: none;
-  /* `body { overflow: hidden }` clips rather than scrolls, so below about
-     1,400 px the right-hand tabs — Debug, Settings — and the sign-out button
-     were simply unreachable: cut off with nothing to scroll. This is the
-     one-line half of the narrow-layout problem (a real narrow layout is a
-     separate piece of work): the bar scrolls sideways instead of losing its
-     tail, and nothing in it is allowed to shrink into unreadability. */
+  padding: 0 4px 0 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  position: relative;
+  /* `body { overflow: hidden }` clips rather than scrolls, so a strip that
+     could not scroll left its tail simply unreachable, with nothing to
+     scroll. The bar scrolls sideways instead of losing its tail, and
+     nothing in it is allowed to shrink into unreadability. */
   overflow-x: auto;
   overflow-y: hidden;
   flex-wrap: nowrap;
   scrollbar-width: thin;
 }
 #tabs > * { flex: none; }
-#tabs > .grow { flex: 1 0 auto; }
+/* Shown only while #tabs actually has more to scroll to (app.js toggles
+   this on load and on resize by comparing scrollWidth to clientWidth), so
+   "there is more" is visible at rest rather than only once a pointer finds
+   the scrollbar. Sits over the last ~24px of the scrolling content, not
+   over .tabs-utility, which is a separate, unscrolled element. */
+#tabs::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; right: 0;
+  width: 26px;
+  background: linear-gradient(to right, transparent, var(--panel));
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+#tabs.has-overflow::after { opacity: 1; }
+/* The twelve tabs are grouped into four labelled sections, in the order an
+   operator reaches for them — Now, Inventory, Telemetry, Admin — so the
+   strip reads as a handful of chunks instead of twelve equally-weighted
+   words. Purely presentational: there is exactly one role="tablist" (#tabs)
+   and twelve role="tab" buttons, wherever they are nested
+   (tests/ui/walk.mjs scopes its counts to #tabs). */
+.tab-group { display: flex; align-items: center; flex: none; }
+/* Colour, weight, tracking and case come from the shared eyebrow rule
+   below (.eyebrow, .section, …), the same label style a card's title and
+   a fieldset's legend already use. */
+.tab-group::before {
+  content: attr(data-label);
+  padding: 0 8px 0 12px;
+  border-left: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+.tab-group:first-of-type::before { border-left: none; padding-left: 0; }
+.tabs-utility {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  padding: 0 12px;
+  border-left: 1px solid var(--hairline);
+}
 .tab {
   background: none;
   border: none;
@@ -226,6 +287,11 @@ body.tiny .brand span { display: none; }
    other tab. Never set font-weight here — weight is what marks the active
    tab, and this rule must not compete with it. */
 .tab--proper { font-size: var(--fs-sm); line-height: var(--fs-xs); letter-spacing: 0.02em; text-transform: none; }
+/* 44px of padding per tab across twelve tabs is 528px on its own. Below
+   1500px there is no longer room to spend that freely. */
+@media (max-width: 1500px) {
+  .tab { padding: 10px 12px; }
+}
 
 /* Sub-navigation inside a single tab (IPAM's Subnets / Conflicts / DHCP),
    one visual size down from the top-level tab strip. */
@@ -254,11 +320,32 @@ body.tiny .brand span { display: none; }
 .subtab:hover { color: var(--text); }
 .subtab.active { color: var(--text); border-bottom-color: var(--accent); }
 /* The one sub-tab strip that lives inside a pane (the device drill-down's
-   Interfaces / Events) rather than directly under a page's strip. Same
-   grammar, one step quieter: no filled bar, no gutter, so it stops reading
-   as a second page-level strip five levels deep. */
-.subtabs.nested { background: transparent; padding: 0; }
-.subtabs.nested .subtab { padding: 6px 12px; }
+   Interfaces / Events) rather than directly under a page's strip. Used to
+   differ from the page-level strip only by a transparent background and
+   4px less padding — five levels deep (tab > subtab > device > this), that
+   read as a peer of the strips above it rather than a quieter, nested
+   choice. A segmented control instead: one pill-shaped track holding the
+   options, the active one lifted onto its own surface, so the underline
+   grammar stays reserved for an actual tablist one level up. */
+.subtabs.nested {
+  display: inline-flex;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+  width: fit-content;
+}
+.subtabs.nested .subtab {
+  padding: 5px 12px;
+  border: none;
+  border-radius: calc(var(--radius-sm) - 1px);
+}
+.subtabs.nested .subtab.active {
+  background: var(--panel);
+  color: var(--text);
+  border-bottom-color: transparent;
+}
 .subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .subpage.active { display: flex; }
 
@@ -561,12 +648,12 @@ body.tiny .terms { display: none; }
    overlay's card — rounder and with the one dialog shadow. */
 .panel, .card, fieldset, .target-list, .detail, .subnet-detail, .table-wrap,
 .canvas.chart, .bars, .timeline, .scrollbox,
-.login-box, .ssh-panel, .modal-box {
+.login-box, .ssh-panel, .modal-box, .gsearch-box {
   background: var(--panel);
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
 }
-.panel.float, .login-box, .ssh-panel, .modal-box {
+.panel.float, .login-box, .ssh-panel, .modal-box, .gsearch-box {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-pop);
 }
@@ -609,7 +696,7 @@ body.tiny .terms { display: none; }
    catches the two page headings that were rendering at the user agent's
    1.5em default because nothing in the system had reached them. */
 .eyebrow, .section, .card h3, .sidebar h2, legend,
-.login-box label, .ssh-panel label {
+.login-box label, .ssh-panel label, .tab-group::before {
   color: var(--muted);
   font: 600 var(--fs-2xs)/1 var(--ui);
   letter-spacing: var(--track-wide);
@@ -659,8 +746,14 @@ body.tiny .terms { display: none; }
   list-style: none;
   margin: 0;
   padding: 4px;
-  flex: 1;
-  min-height: 160px;
+  /* Was flex: 1, which stretched an empty or short list to fill the whole
+     sidebar, pushing Add/Edit/Remove ~400px below the destinations they
+     act on. flex-basis: auto sizes the list to its own rows instead; a
+     list too long for the sidebar still gets its own scrollbar rather than
+     growing past it, since the sidebar itself scrolls (see .sidebar). */
+  flex: 0 1 auto;
+  max-height: 45vh;
+  min-height: 60px;
   overflow: auto;
 }
 .target-list li {
@@ -722,6 +815,11 @@ body.tiny .terms { display: none; }
    rather than the single flex row every other .subnet-detail uses — this
    only overrides display, so the panel styling above still applies. */
 .subnet-detail.scope-detail-stacked { display: block; }
+/* Same shape as .target-list's own fix: a short subnet list's .table-wrap
+   (flex: 1) stretched to the sidebar's full height regardless of how many
+   rows it actually had. Capped rather than flex: 1; a long subnet list
+   still gets its own scrollbar inside the cap instead of pushing past it. */
+#ipam-sub-subnets .sidebar .table-wrap { flex: 0 1 auto; max-height: 50vh; }
 .subnet-detail-row { display: flex; align-items: center; gap: 20px; }
 .scope-trend { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
 .scope-trend-header {
@@ -1378,6 +1476,66 @@ body.login-page {
 .err { color: var(--fail); }
 .warn-text { color: var(--warn); }
 
+/* ------------------------------------------------------------- search
+   The global search opened with "/" (App.initGlobalSearch): nine
+   independent per-page search boxes and no way to ask the product a
+   question without already knowing which tab owns the answer. A command
+   palette rather than another use of #modal, since it has to work with a
+   dialog already open behind it (searching for the device a form refers
+   to) without touching that dialog's own state. */
+.gsearch {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  background: var(--scrim);
+  display: flex;
+  justify-content: center;
+  padding-top: 12vh;
+}
+/* Surface, border, radius and shadow come from the .panel.float list above. */
+.gsearch-box {
+  width: min(640px, calc(100vw - 32px));
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.gsearch-input {
+  border: none;
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+  padding: 14px 16px;
+  font-size: var(--fs-md);
+  background: transparent;
+  color: var(--text);
+}
+.gsearch-input:focus { outline: none; }
+.gsearch-results { overflow: auto; padding: 6px; }
+.gsearch-group { padding: 6px 10px 2px; }
+.gsearch-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+}
+.gsearch-hit .name { font-weight: 600; }
+.gsearch-hit .meta { color: var(--muted); font-size: var(--fs-xs); }
+.gsearch-hit:hover, .gsearch-hit.active { background: var(--raised); }
+.gsearch-empty { padding: 16px; color: var(--muted); font-size: var(--fs-xs); }
+.gsearch-hint {
+  padding: 8px 16px;
+  border-top: 1px solid var(--hairline);
+  color: var(--muted);
+  font-size: var(--fs-2xs);
+}
+
 /* ---------------------------------------------------------------- kiosk
    /?kiosk=1 — a wall display. The root font grows a quarter, which through
    the rem scale grows every size, row and figure with it; the tab strip
@@ -1385,7 +1543,7 @@ body.login-page {
    over: the mark, the view's name, the clock and the session's remaining
    life. Height density never applies: a wall is not a laptop. */
 html[data-kiosk] { font-size: 125%; }
-body.kiosk #tabs { display: none; }
+body.kiosk .topbar { display: none; }
 .kiosk-bar {
   display: flex;
   align-items: center;
@@ -1401,6 +1559,14 @@ body.kiosk #tabs { display: none; }
 .kiosk-tab { color: var(--text); font-weight: 600; letter-spacing: var(--track-tab); text-transform: uppercase; }
 .kiosk-clock { font-family: var(--mono); color: var(--text); }
 .kiosk-session.warn { color: var(--warn); }
+/* A rotation (?rotate=a,b,c) draws one dot per stop, the current one
+   filled, plus the plain word for what is coming next rather than assuming
+   everyone reads a bare countdown at a glance from across a room. Both stay
+   hidden (index.html) when there is no rotation to show. */
+.kiosk-dots { display: inline-flex; align-items: center; gap: 6px; }
+.kiosk-dots .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); }
+.kiosk-dots .dot.current { background: var(--accent); }
+.kiosk-next { font-size: var(--fs-2xs); }
 body.kiosk td { padding: 6px 10px; }
 body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .card.strip .figures { display: inline-flex; gap: 14px; }
@@ -1409,11 +1575,18 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 /* ----------------------------------------------------------- breakpoints
    Width, at last. Density above keys on height only, so a narrow, tall
    window — a tablet, a half-screen split — got the full sidebar and a
-   420 px dialog. Two steps: below 1200 px the fixed widths become fluid;
-   below 900 px the side-by-side layouts stack. The .cols splitters keep
-   working when stacked because wireDivider reads the flex direction when
-   a drag starts, not once at load. 768 px is the floor the layout is
-   measured at; below it nothing is clipped, but nothing is designed. */
+   420 px dialog. Three steps: below 1200 px the fixed widths become fluid;
+   below 900 px the side-by-side layouts stack; below ~360 px (a 320 px
+   viewport, the floor this responsive pass targets) several pages'
+   filter bars and dialogs are themselves wider than the screen — Nodes at
+   417px, Alerts 394, NetFlow 503, the Add device dialog 417 — and it was
+   the page, not any one control, that carried the body past the viewport
+   (`body { overflow: hidden }` clips rather than scrolls, so that overflow
+   read as content silently cut off, not as a scrollbar). The .cols
+   splitters keep working when stacked because wireDivider reads the flex
+   direction when a drag starts, not once at load. 768 px is the floor the
+   layout is measured at; below it nothing is clipped, but nothing is
+   designed. */
 @media (max-width: 1200px) {
   .sidebar { width: 240px; }
   .modal-box { min-width: 0; width: min(760px, calc(100vw - 32px)); }
@@ -1433,4 +1606,29 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   .tile.wide { grid-column: span 1; }
   .card.strip { flex-wrap: wrap; row-gap: 6px; }
   .card.strip > .stat, .card.strip > .hint { white-space: normal; }
+}
+/* The tab strip is the one piece of this breakpoint owned here: it must
+   absorb its own overflow rather than pushing the body wider, whatever a
+   page underneath it does. #tabs already scrolls its own content at every
+   width (min-width: 0 keeps the flex item from being forced to its
+   content's full size); this only tightens the utility group beside it,
+   whose plain text (a username, "connecting…") has no scroll of its own to
+   fall back on. Nodes/Alerts/NetFlow's own filter bars and the Add device
+   dialog need the same "shrink or scroll, never push" treatment where their
+   markup lives (nodes.js, alerts.js, netflow.js), which is outside this
+   file. */
+@media (max-width: 360px) {
+  .tab-group::before { padding: 0 5px 0 8px; }
+  .tab { padding: 8px 10px; }
+  .tabs-utility { gap: 6px; padding: 0 8px; }
+  .tabs-utility .linkish { padding: 4px 6px; }
+  #whoami, #conn {
+    display: inline-block;
+    max-width: 68px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  input, select, textarea { max-width: 100%; }
 }

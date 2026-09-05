@@ -654,6 +654,39 @@ async function checkRouting(page, base, dir, tag) {
     return `${state.hash} -> ${state.name}`;
   });
 
+  /* A device selection routed to #/nodes/device/<id> and survived a
+     reload, but switching to a top-level subtab left the URL unchanged, so
+     the URL described a screen that was not on screen and Back restored a
+     pane the history entry never named (Phase 6). Nodes' TOPOLOGY subtab
+     exercises the fix: clicking it now writes #/nodes/topology, and a cold
+     reload of that URL lands back on TOPOLOGY, not on whatever DEVICES
+     left in localStorage. */
+  await check('a subtab route survives a reload', async () => {
+    await selectTab(page, 'nodes');
+    await settle(page, 900);
+    await page.click('#page-nodes > .subtabs > [data-subtab="topology"]');
+    await sleep(600);
+    const subtabHash = await page.evaluate(() => window.location.hash);
+    assert(subtabHash === '#/nodes/topology', `hash is "${subtabHash}"`);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await ready(page);
+    await sleep(2500);
+    const state = await page.evaluate(() => ({
+      hash: window.location.hash,
+      tab: App.state.tab,
+      active: (document.querySelector(
+        '#page-nodes > .subtabs > .subtab[aria-selected="true"]') || {}).dataset,
+    }));
+    assert(state.hash === subtabHash, `hash became "${state.hash}", was "${subtabHash}"`);
+    assert(state.tab === 'nodes', `landed on the ${state.tab} tab`);
+    assert(state.active && state.active.subtab === 'topology',
+           `the active subtab is "${state.active && state.active.subtab}", not topology`);
+    // Leave Nodes the way every other check here found it.
+    await page.click('#page-nodes > .subtabs > [data-subtab="devices"]').catch(() => {});
+    await sleep(400);
+    return `${state.hash} -> subtab ${state.active.subtab}`;
+  });
+
   let alertHash = null;
 
   await check('selecting an alert writes #/alerts/<id>', async () => {

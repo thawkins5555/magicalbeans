@@ -65,6 +65,30 @@ const App = (() => {
     const session = state.session || {};
     const sessionLine = maxRemainingMs != null
       ? `Session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}.` : '';
+    const version = (state.config || {}).version;
+    // Appearance (theme, and the wall-display launcher) is a per-browser
+    // choice, not a server setting, so it lives here rather than on the
+    // Settings page every OTHER account on this install also sees — and is
+    // skipped entirely on the forced must-change-password prompt, which has
+    // nothing to do with either. The tab list mirrors the twelve-tab strip
+    // so a display can rotate through exactly the views its account can
+    // actually read.
+    const appearanceHtml = forced ? '' : `
+      <fieldset><legend>Appearance · this browser</legend>
+        <label>Theme <select id="am-theme">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+          <option value="contrast">High contrast</option>
+        </select></label>
+        <p class="hint">Stored in this browser, not on the server: it applies at once,
+          to every account that signs in on this machine.</p>
+        <p class="hint">A wall display opens this view full-screen with the tab strip
+          hidden; <code>1</code>-<code>9</code> jump to a view once it is open, and a
+          rotation, chosen below, cycles through more than one on its own.</p>
+        <label>Rotate through <select id="am-kiosk-tabs" multiple size="6"></select></label>
+        <label>Every <input type="number" id="am-kiosk-every" min="5" max="3600" value="30"> s</label>
+        <div class="row"><button type="button" id="am-kiosk-open">Open this view as a wall display</button></div>
+      </fieldset>`;
     const box = modal('Account', `
       <p><b>${escapeHtml(session.username || state.username || '')}</b></p>
       <p class="hint">${escapeHtml(accountAccessSummary())}.</p>
@@ -75,10 +99,9 @@ const App = (() => {
         <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
         <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
           session using this account, including this one.</p>
-      </fieldset>`,
-      // The version string in the tab bar moves here in a later phase —
-      // nothing to render yet, so no placeholder element sits empty until
-      // then.
+      </fieldset>
+      ${appearanceHtml}
+      ${version ? `<p class="hint">SappiWhere v${escapeHtml(version)}</p>` : ''}`,
       [
         // Forced, this dialog is the only thing the account can do — the
         // server refuses everything else until the password is replaced — so
@@ -116,6 +139,41 @@ const App = (() => {
       // password) and has to actually open there rather than degrade to a
       // toast like every other dialog does under state.kiosk.
       { kioskSafe: forced });
+    if (!forced) {
+      const themeSelect = box.querySelector('#am-theme');
+      if (themeSelect) {
+        themeSelect.value = currentTheme();
+        themeSelect.onchange = () => {
+          setTheme(themeSelect.value);
+          announce(`Theme: ${themeSelect.options[themeSelect.selectedIndex].text}`);
+        };
+      }
+      const kioskTabs = box.querySelector('#am-kiosk-tabs');
+      if (kioskTabs) {
+        kioskTabs.innerHTML = [...document.querySelectorAll('.tab[data-tab]')]
+          .filter((t) => !t.hidden)
+          .map((t) => {
+            const name = t.dataset.tab;
+            const label = t.textContent.replace(/\d+$/, '').trim();
+            return `<option value="${name}"${name === state.tab ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+          }).join('');
+      }
+      const kioskOpen = box.querySelector('#am-kiosk-open');
+      if (kioskOpen) {
+        kioskOpen.onclick = () => {
+          const chosen = kioskTabs
+            ? [...kioskTabs.selectedOptions].map((o) => o.value) : [state.tab];
+          const every = Number((box.querySelector('#am-kiosk-every') || {}).value) || 30;
+          const params = new URLSearchParams({ kiosk: '1' });
+          if (chosen.length > 1) {
+            params.set('rotate', chosen.join(','));
+            params.set('every', String(Math.max(5, every)));
+          }
+          const first = chosen[0] || state.tab;
+          window.open(`${window.location.origin}/?${params}#/${first}`, '_blank', 'noopener');
+        };
+      }
+    }
     // Escape and a backdrop click must not dismiss this one. Without the
     // lock the prompt was advisory: it closed on a stray keypress, came back
     // only on the next reload, and the account stayed usable throughout.
@@ -228,6 +286,7 @@ const App = (() => {
       if (module === 'dashboard') continue;
       tab.hidden = !canRead(module);
     }
+    updateTabOverflow();
     /* A control the account may not use is DISABLED and says why, rather
        than being deleted from the page.
 
@@ -1680,6 +1739,178 @@ const App = (() => {
     return Boolean(wrap) && !wrap.hidden;
   }
 
+  /* --------------------------------------------------------------- search
+     Nine independent per-page search boxes and no way to ask the product a
+     question without already knowing which tab owns the answer first. "/"
+     opens this one instead of focusing whichever box the current page
+     happens to have; it queries devices, MACs/interfaces (the same
+     mac-search endpoint nodes.js's own MAC lookup uses — a hit reads the
+     way that one already does), alerts and NetPath destinations through
+     endpoints the product already had, and routes to a hit through the
+     hash exactly as every other selection in this app does. */
+  let gsearchTrigger = null;
+  let gsearchToken = 0;
+  let gsearchTimer = null;
+  let gsearchActive = -1;
+
+  function gsearchOpen() {
+    if (!document.getElementById('modal').hidden || helpOpen()) return;
+    let wrap = document.getElementById('gsearch');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'gsearch';
+      wrap.className = 'gsearch';
+      wrap.hidden = true;
+      wrap.innerHTML = `<div class="gsearch-box" role="dialog" aria-modal="true" aria-label="Search">
+        <input id="gsearch-input" class="gsearch-input" type="text" autocomplete="off"
+          aria-label="Search devices, interfaces, MACs, alerts and NetPath destinations"
+          placeholder="Search devices, interfaces, MACs, alerts, destinations…">
+        <div id="gsearch-results" class="gsearch-results"></div>
+        <p class="gsearch-hint">&uarr;&darr; to move &middot; Enter to open &middot; Esc to close</p>
+      </div>`;
+      document.body.appendChild(wrap);
+      wrap.onclick = (event) => { if (event.target === wrap) gsearchClose(); };
+      const input = wrap.querySelector('#gsearch-input');
+      input.addEventListener('input', () => gsearchQueued(input.value));
+      input.addEventListener('keydown', gsearchKeydown);
+    }
+    gsearchTrigger = document.activeElement;
+    wrap.hidden = false;
+    const input = wrap.querySelector('#gsearch-input');
+    input.value = '';
+    input.focus();
+    gsearchRender([]);
+  }
+
+  function gsearchClose() {
+    const wrap = document.getElementById('gsearch');
+    if (!wrap || wrap.hidden) return;
+    wrap.hidden = true;
+    gsearchToken++;                    // any answer still in flight is stale
+    if (gsearchTrigger && document.contains(gsearchTrigger)) gsearchTrigger.focus();
+    gsearchTrigger = null;
+  }
+
+  function gsearchIsOpen() {
+    const wrap = document.getElementById('gsearch');
+    return Boolean(wrap) && !wrap.hidden;
+  }
+
+  function gsearchQueued(text) {
+    clearTimeout(gsearchTimer);
+    const q = text.trim();
+    if (!q) { gsearchRender([]); return; }
+    gsearchTimer = setTimeout(() => gsearchRun(q), 150);
+  }
+
+  async function gsearchRun(q) {
+    const token = ++gsearchToken;
+    const groups = [];
+    // A MAC in any of the notations nodes.js already accepts is worth a
+    // lookup on its own; a plain name never is, so this never fires one
+    // for every keystroke of an ordinary search.
+    const hexOnly = q.replace(/[^0-9a-fA-F]/g, '');
+    try {
+      if (hexOnly.length >= 4 && canRead('nodes')) {
+        const mac = await get('/api/nodes/mac-search', { q });
+        if (mac.locations && mac.locations.length) {
+          groups.push({ title: 'MAC address / interface', hits: mac.locations.slice(0, 8).map((loc) => ({
+            name: loc.mac,
+            meta: `last seen on ${loc.device_name} · ${loc.if_descr}` +
+              (loc.vlan ? ` (VLAN ${loc.vlan})` : '') +
+              (loc.seen_ts ? ` at ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : ''),
+            route: `#/nodes/device/${loc.device_id}/port/${loc.if_index}`,
+          })) });
+        }
+      }
+      if (canRead('nodes')) {
+        const devices = await get('/api/nodes/devices', { q, limit: 8 });
+        if (devices.devices && devices.devices.length) {
+          groups.push({ title: 'Devices', hits: devices.devices.map((d) => ({
+            name: d.name || d.ip,
+            meta: [d.ip, d.status].filter(Boolean).join(' · '),
+            route: `#/nodes/device/${d.id}`,
+          })) });
+        }
+      }
+      if (canRead('alerts')) {
+        const alerts = await get('/api/alerts', { q, limit: 8 });
+        if (alerts.alerts && alerts.alerts.length) {
+          groups.push({ title: 'Alerts', hits: alerts.alerts.map((a) => ({
+            name: a.message || a.entity_label || `Alert ${a.id}`,
+            meta: [a.severity_name, a.entity_label].filter(Boolean).join(' · '),
+            route: `#/alerts/${a.id}`,
+          })) });
+        }
+      }
+      if (canRead('netpath')) {
+        const targets = await get('/api/netpath/targets');
+        const needle = q.toLowerCase();
+        const hits = (targets.targets || []).filter((t) =>
+          (t.label || '').toLowerCase().includes(needle)
+          || (t.host || '').toLowerCase().includes(needle)).slice(0, 8);
+        if (hits.length) {
+          groups.push({ title: 'NetPath destinations', hits: hits.map((t) => ({
+            name: t.label || t.host,
+            meta: t.host && t.host !== t.label ? t.host : '',
+            route: `#/netpath/${t.id}`,
+          })) });
+        }
+      }
+    } catch (error) { /* a failed lookup just leaves that group out */ }
+    if (token !== gsearchToken) return;   // superseded by a newer keystroke
+    gsearchRender(groups);
+  }
+
+  function gsearchRender(groups) {
+    const results = document.getElementById('gsearch-results');
+    if (!results) return;
+    gsearchActive = -1;
+    if (!groups.length) {
+      results.innerHTML = '<p class="gsearch-empty">Type to search devices, interfaces, '
+        + 'MACs, alerts and NetPath destinations.</p>';
+      return;
+    }
+    results.innerHTML = groups.map((group) => `<div class="gsearch-group">
+        <div class="eyebrow">${escapeHtml(group.title)}</div>
+        ${group.hits.map((hit) => `<button type="button" class="gsearch-hit"
+            data-route="${escapeHtml(hit.route)}">
+          <span class="name">${escapeHtml(hit.name)}</span>
+          ${hit.meta ? `<span class="meta">${escapeHtml(hit.meta)}</span>` : ''}
+        </button>`).join('')}
+      </div>`).join('');
+    for (const button of results.querySelectorAll('.gsearch-hit')) {
+      button.onclick = () => gsearchGo(button.dataset.route);
+    }
+    const first = results.querySelector('.gsearch-hit');
+    if (first) { first.classList.add('active'); gsearchActive = 0; }
+  }
+
+  function gsearchGo(route) {
+    gsearchClose();
+    window.location.hash = route;
+  }
+
+  function gsearchKeydown(event) {
+    // Escape is handled once, by the document-level handler in start() —
+    // this listener sits on the input itself and the keydown bubbles to it.
+    const results = document.getElementById('gsearch-results');
+    const hits = results ? [...results.querySelectorAll('.gsearch-hit')] : [];
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!hits.length) return;
+      if (hits[gsearchActive]) hits[gsearchActive].classList.remove('active');
+      gsearchActive = event.key === 'ArrowDown'
+        ? (gsearchActive + 1) % hits.length
+        : (gsearchActive - 1 + hits.length) % hits.length;
+      hits[gsearchActive].classList.add('active');
+      hits[gsearchActive].scrollIntoView({ block: 'nearest' });
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (hits[gsearchActive]) gsearchGo(hits[gsearchActive].dataset.route);
+    }
+  }
+
   /* One confirmation shape for everything that destroys stored data, so
      no button deletes on a single click. Body should name the collateral
      damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
@@ -2148,9 +2379,13 @@ const App = (() => {
      win over what a browser already stored. Only the named splitters are
      dropped — every other pane the user has deliberately sized is left
      alone, which a blanket reset would not respect.
-       2 — Alerts list/detail moved from 60/40 to 70/30. */
-  const LAYOUT_VERSION = 2;
-  const LAYOUT_RESET_ON_UPGRADE = ['alerts-main'];
+       2 — Alerts list/detail moved from 60/40 to 70/30.
+       3 — Nodes devices/detail moved from 2/3 to 3/2: the devices table's
+           own columns asked for more room than 2/3 gave at any laptop
+           width, so the last column was cut before anyone touched the
+           divider. */
+  const LAYOUT_VERSION = 3;
+  const LAYOUT_RESET_ON_UPGRADE = ['alerts-main', 'nodes-devices'];
 
   function migrateLayout(layout) {
     let stored = 0;
@@ -3312,6 +3547,20 @@ const App = (() => {
     document.body.classList.toggle('narrow', window.innerWidth < 900);
     // A stacked .cols splitter is now a horizontal separator: its ARIA says so.
     for (const refresh of dividerAria) refresh();
+    updateTabOverflow();
+  }
+
+  /* The tab strip's right-edge fade (app.css's #tabs::after) is only shown
+     while there is actually more to scroll to — Chromium paints no
+     scrollbar of its own until the pointer is over the strip, so without
+     this the strip looked simply truncated at rest below ~1500px. Checked
+     on every resize and once after the twelve tabs first paint; a tab
+     hidden or shown by applyPermissions can change the answer too, so that
+     calls this again as well. */
+  function updateTabOverflow() {
+    const tabs = document.getElementById('tabs');
+    if (!tabs) return;
+    tabs.classList.toggle('has-overflow', tabs.scrollWidth > tabs.clientWidth + 1);
   }
 
   /* ------------------------------------------------------------- theme
@@ -3340,7 +3589,10 @@ const App = (() => {
     if (!options.silent) {
       try { localStorage.setItem(THEME_KEY, theme); } catch (error) { /* private browsing: applies until reload */ }
     }
-    const select = document.getElementById('set-theme');
+    // #am-theme: the Account dialog's own select, when it happens to be
+    // open (another browser tab changed it, say) — Appearance moved there
+    // from a Settings fieldset that used to carry this id.
+    const select = document.getElementById('am-theme');
     if (select && select.value !== theme) select.value = theme;
     window.dispatchEvent(new Event('theme-changed'));
   }
@@ -3356,11 +3608,22 @@ const App = (() => {
      rem root, and one thin bar naming the view, the time and how long the
      session has left. Read from the query string (the hash is the route
      and stays free), preserved by writeRoute and handed back through
-     sign-in by login.js, so a bookmark works as one. */
+     sign-in by login.js, so a bookmark works as one.
+
+     ?rotate=alerts,dashboard&every=30 drives selectTab on a timer, so a
+     wall display can step through more than one view unattended — before
+     this a display was stuck on whatever tab it was opened with, with no
+     way to change or rotate it from the screen itself (1-9 still worked;
+     nothing on screen said so). Named tabs this account cannot read, or
+     that do not exist, are dropped rather than failing the whole list. */
+  let kioskRotation = null;   // {views, everyMs, lastSwitch} or null
+
   function initKiosk() {
     let wanted = false;
+    let params = new URLSearchParams();
     try {
-      wanted = new URLSearchParams(window.location.search).get('kiosk') === '1';
+      params = new URLSearchParams(window.location.search);
+      wanted = params.get('kiosk') === '1';
     } catch (error) { wanted = false; }
     state.kiosk = wanted;
     if (!wanted) return;
@@ -3368,15 +3631,56 @@ const App = (() => {
     document.body.classList.add('kiosk');
     const bar = document.getElementById('kiosk-bar');
     if (bar) bar.hidden = false;
+    const rotateParam = params.get('rotate') || '';
+    const views = rotateParam.split(',').map((s) => s.trim()).filter(Boolean)
+      .filter((name) => {
+        const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+        return tab && !tab.hidden;
+      });
+    if (views.length > 1) {
+      const everySeconds = Number(params.get('every'));
+      kioskRotation = {
+        views,
+        everyMs: Math.max(5, everySeconds > 0 ? everySeconds : 30) * 1000,
+        lastSwitch: Date.now(),
+      };
+    }
+  }
+
+  function drawKioskDots(now) {
+    const dots = document.getElementById('kiosk-dots');
+    const next = document.getElementById('kiosk-next');
+    if (!dots || !next) return;
+    if (!kioskRotation) { dots.hidden = true; next.hidden = true; return; }
+    dots.hidden = false;
+    next.hidden = false;
+    const index = kioskRotation.views.indexOf(state.tab);
+    dots.innerHTML = kioskRotation.views.map((name, i) =>
+      `<span class="dot${i === index ? ' current' : ''}"></span>`).join('');
+    const nextIndex = (index + 1) % kioskRotation.views.length;
+    const nextTab = document.querySelector(`.tab[data-tab="${kioskRotation.views[nextIndex]}"]`);
+    const nextLabel = nextTab ? nextTab.textContent.replace(/\d+$/, '').trim()
+      : kioskRotation.views[nextIndex];
+    const remainS = Math.max(0, Math.ceil(
+      (kioskRotation.everyMs - (now - kioskRotation.lastSwitch)) / 1000));
+    next.textContent = `Next: ${nextLabel} (${remainS}s)`;
   }
 
   let lastKioskDraw = 0;
   function drawKioskBar(now) {
-    if (!state.kiosk || now - lastKioskDraw < 1000) return;
+    if (!state.kiosk) return;
+    if (kioskRotation && now - kioskRotation.lastSwitch >= kioskRotation.everyMs) {
+      kioskRotation.lastSwitch = now;
+      const index = kioskRotation.views.indexOf(state.tab);
+      const next = kioskRotation.views[(index + 1) % kioskRotation.views.length];
+      selectTab(next);
+    }
+    if (now - lastKioskDraw < 1000) return;
     lastKioskDraw = now;
     const tab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
     const label = document.getElementById('kiosk-tab');
     if (label && tab) label.textContent = tab.textContent.replace(/\d+$/, '').trim();
+    drawKioskDots(now);
     const clockEl = document.getElementById('kiosk-clock');
     if (clockEl) clockEl.textContent = clock(now / 1000);
     const sessionEl = document.getElementById('kiosk-session');
@@ -3493,10 +3797,34 @@ const App = (() => {
     return true;
   }
 
+  /* A tab's own top-level subtabs (Nodes' DEVICES/TOPOLOGY/…, Alerts',
+     IPAM's, Settings') are not entity selections — they have no module of
+     their own to hand a route to — so they are matched and clicked here,
+     generically, before the route reaches the module at all. Clicking the
+     button is enough: every module already wires its own subtab buttons to
+     select the pane AND call App.rememberSub, in the same click handler a
+     person's own click would run (nodes.js's selectSub, for one). A route
+     whose first part is not a known subtab name for this tab (an entity id,
+     "device", a numeric alert id) simply matches nothing here and falls
+     through unchanged to the module below. */
+  function applySubtabFromRoute(route) {
+    const name = route.parts[0];
+    if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
+    const nav = document.querySelector(`#page-${route.tab} > .subtabs`);
+    if (!nav) return;
+    for (const button of nav.querySelectorAll(':scope > .subtab')) {
+      if (button.dataset.subtab === name) {
+        if (!button.classList.contains('active')) button.click();
+        return;
+      }
+    }
+  }
+
   /* Hands the route to the module. The selection half runs after the
      module's first refresh, or nodes.js's own "select the first device if
      none is selected" would overwrite the device the link named. */
   function deliverRoute(route) {
+    applySubtabFromRoute(route);
     const page = pages[route.tab];
     if (!page || !page.activate) return;
     const opts = { route, parts: route.parts, query: route.query };
@@ -3506,6 +3834,29 @@ const App = (() => {
     }
     Promise.resolve(refreshNow(route.tab)).then(() => {
       try { page.activate(opts); } catch (error) { /* a bad link is not fatal */ }
+    });
+  }
+
+  /* The other half: a click on a top-level subtab writes it into the URL,
+     the same "recallSub is the fallback for a route naming none" contract
+     applyRoute/applySubtabFromRoute read back. Delegated on the document so
+     no module has to be touched — a click on the button always runs the
+     module's own onclick (selectSub, rememberSub) first, since that
+     listener lives on the button itself and this one is reached only once
+     the event bubbles past it. Nested subtabs (a device's INTERFACES/…)
+     are deliberately excluded: their parent .subtabs sits inside a pane,
+     not directly inside a .page, and they have no route of their own. */
+  function wireSubtabRouting() {
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('.subtab');
+      if (!button) return;
+      const nav = button.parentElement;
+      if (!nav || !nav.classList.contains('subtabs')) return;
+      const pageEl = nav.parentElement;
+      if (!pageEl || !pageEl.classList.contains('page')) return;
+      const name = button.dataset.subtab;
+      if (!name) return;
+      setRoute([name]);
     });
   }
 
@@ -3796,6 +4147,7 @@ const App = (() => {
         (tab) => selectTab(tab.dataset.tab));
     }
     wireSubtabGroups();
+    wireSubtabRouting();
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {
@@ -3826,29 +4178,22 @@ const App = (() => {
     });
     document.addEventListener('keydown', trapTab);
 
-    /* 1-9 select the first nine visible tabs and '/' focuses the current
-       page's search box. Both are bare keys, so both stand down whenever a
-       field, a dialog or the help panel has the keyboard — which is why the
-       chart shortcuts in netflow.js are Ctrl-modified instead: those have to
-       work while a filter box has focus. */
-    const SEARCH_BOXES = {
-      nodes: '#nd-q', alerts: '#alerts-filter-text', syslog: '#sl-q',
-      snmp: '#sn-q', ipam: '#ipam-search-q', netflow: '#nf-src',
-      configrx: '#cx-q', debug: '#dbg-search', wireless: '#wl-q',
-    };
+    /* 1-9 select the first nine visible tabs and '/' opens the global
+       search — nine independent per-page search boxes used to be the only
+       way in, which meant knowing which tab owned the answer before you
+       could ask. Both are bare keys, so both stand down whenever a field, a
+       dialog or the help panel has the keyboard — which is why the chart
+       shortcuts in netflow.js are Ctrl-modified instead: those have to work
+       while a filter box has focus. */
     document.addEventListener('keydown', (event) => {
       if (event.ctrlKey || event.altKey || event.metaKey) return;
-      if (!document.getElementById('modal').hidden || helpOpen()) return;
+      if (!document.getElementById('modal').hidden || helpOpen() || gsearchIsOpen()) return;
       const active = document.activeElement;
       if (active && (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)
                      || active.isContentEditable)) return;
       if (event.key === '/') {
-        const selector = SEARCH_BOXES[state.tab];
-        const box = selector && document.querySelector(selector);
-        if (!box || box.offsetParent === null) return;
-        event.preventDefault();      // or the '/' lands in the box it focuses
-        box.focus();
-        if (box.select) box.select();
+        event.preventDefault();      // or the '/' lands in the box it opens
+        gsearchOpen();
         return;
       }
       if (event.key < '1' || event.key > '9') return;
@@ -3858,12 +4203,15 @@ const App = (() => {
       event.preventDefault();
       selectTab(tab.dataset.tab);
     });
+    const searchBtn = document.getElementById('global-search-btn');
+    if (searchBtn) searchBtn.onclick = () => gsearchOpen();
     document.addEventListener('keydown', (event) => {
-      // Escape peels one layer: the help panel if it is open, else the
-      // dialog under it. Closing both at once would throw away the form
-      // the operator was reading the help for.
+      // Escape peels one layer at a time: the search box, then the help
+      // panel, then the dialog under it. Closing more than one at once
+      // would throw away the form the operator was reading the help for.
       if (event.key !== 'Escape') return;
-      if (helpOpen()) closeHelp();
+      if (gsearchIsOpen()) gsearchClose();
+      else if (helpOpen()) closeHelp();
       else requestCloseModal();
     });
     document.addEventListener('click', (event) => {
