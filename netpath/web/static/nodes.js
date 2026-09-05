@@ -363,7 +363,12 @@
       // every draw for the same reason onclick is: a cached <tr> already
       // carries a handler closed over the previous draw's `row`, and a
       // plain property assignment replaces it rather than stacking.
-      tr.ondblclick = () => deviceDialog(row.id);
+      // The row itself, not document.activeElement: selectDevice() above
+      // just ran drawTable(), which (see App.grid) detaches and reattaches
+      // this very <tr> to swap the tbody, so by the time the second click's
+      // dblclick fires, focus has already fallen to <body> and App.modal's
+      // own activeElement fallback would capture that instead of the row.
+      tr.ondblclick = () => deviceDialog(row.id, tr);
       body.appendChild(tr);
     }
     // Drop cache entries for devices no longer in the list (removed, or
@@ -581,7 +586,19 @@
     // does not fill the Back button with forty entries.
     App.setRoute(id != null ? ['device', id] : []);
     drawTable();
-    loadDetail();
+    // Not awaited — selecting a row must not wait on the detail fetch — so it
+    // needs its own rejection handler or the browser reports one. Double-
+    // clicking a row selects it twice in quick succession, and App.get aborts
+    // the first fetch in favour of the second: that abort is a `superseded`
+    // rejection, which is the expected outcome here rather than a fault, and
+    // is ignored exactly as app.js's own refresh path ignores it. Anything
+    // else is a real failure and says so on the connection indicator.
+    loadDetail().catch((error) => {
+      if (!(error && error.superseded)) {
+        App.toast(`Could not load that device: ${(error && error.message) || error}`,
+                  'fail');
+      }
+    });
   }
 
   /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
@@ -1164,8 +1181,9 @@
   /* Everything the detail pane shows about ONE device, in a dialog, for a
      device that need not be the selected one — so it fetches by id rather
      than reading view.detail / view.ifaces / view.events, which always
-     describe the selection. Opened by double-clicking a row. */
-  function deviceDialog(deviceId) {
+     describe the selection. Opened by double-clicking a row; `trigger` is
+     that row, passed explicitly (see the ondblclick assignment above). */
+  function deviceDialog(deviceId, trigger) {
     if (deviceId == null) return;
     // The same ticket idiom the interface and OID dialogs use: App.modal
     // reuses one #modal-box, so a slow fetch must not paint into whatever
@@ -1197,7 +1215,7 @@
       <p class="section">EVENT LOG</p>
       <div class="table-wrap scrollbox small"><table id="ndd-ev-table"></table></div>`, [
       { label: 'Close', onClick: App.closeModal },
-    ], { buttonsTop: true });
+    ], { buttonsTop: true, trigger });
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
     box.classList.add('wide');
