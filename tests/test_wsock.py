@@ -424,4 +424,47 @@ assert ws.recv() is None
 assert ws.closed
 print("PASS: an abruptly closed peer ends recv() cleanly")
 
+# ---------------------------------------------------------------- draining
+#
+# close() empties the receive buffer before it shuts the socket down, because
+# Windows resets a connection closed with data still unread and a reset
+# discards the close frame just written — so the peer loses the sentence
+# saying why it was closed. What matters here is that the drain is bounded
+# and cannot be made to hang: it runs on a socket other threads share.
+sock, ws = pair()
+sock.sendall(b"x" * 200_000)          # far more than the drain's own rounds
+started = time.time()
+ws.close(4429, "There are already 16 SSH sessions")   # the caller supplies 4429
+elapsed = time.time() - started
+assert elapsed < 2.0, f"close() took {elapsed:.2f}s draining a flooding peer"
+print(f"PASS: close() drains a flooding peer in {elapsed:.3f}s and gives up bounded")
+sock.close()
+
+# The drain must not inherit a send timeout another thread left on the shared
+# socket: the timeout belongs to the socket, not to the caller, and _write()
+# holds it at SEND_TIMEOUT_S while pushing to a stalled peer.
+sock, ws = pair()
+ws.sock.settimeout(wsock.SEND_TIMEOUT_S)
+sock.sendall(b"y" * 100_000)
+started = time.time()
+ws.close(wsock.CLOSE_NORMAL)
+elapsed = time.time() - started
+assert elapsed < 2.0, \
+    f"close() inherited a {wsock.SEND_TIMEOUT_S}s send timeout: took {elapsed:.2f}s"
+print(f"PASS: the drain sets its own timeout rather than borrowing {wsock.SEND_TIMEOUT_S}s")
+sock.close()
+
+# The close frame itself still goes out — draining is in aid of the peer
+# reading it, so losing it here would defeat the point.
+sock, ws = pair()
+ws.close(4429, "There are already 16 SSH sessions")   # the caller supplies 4429
+head = sock.recv(2)
+assert head and (head[0] & 0x0F) == wsock.OP_CLOSE, head
+payload = sock.recv(head[1] & 0x7F)
+code = struct.unpack("!H", payload[:2])[0]
+assert code == 4429, code
+assert b"already 16 SSH sessions" in payload[2:], payload
+print("PASS: the close frame and its reason survive the drain")
+sock.close()
+
 print("ALL WSOCK ASSERTIONS PASSED")

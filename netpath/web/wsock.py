@@ -466,7 +466,21 @@ class WebSocket:
             pass
 
     def _drain(self, rounds: int = 8) -> None:
-        """Discard what is already in the receive buffer, without blocking."""
+        """Discard what is already in the receive buffer, without blocking.
+
+        The socket's timeout is set explicitly rather than inherited: it is a
+        property of the socket, not of the thread, and a `_write()` in another
+        thread holds it at SEND_TIMEOUT_S while it pushes to a stalled peer.
+        `select()` promising readable is not quite a promise that `recv()`
+        returns at once — a partial TLS record is readable and still has
+        nothing to hand back — so without this a drain could inherit that
+        fifteen seconds instead of returning immediately.
+        """
+        try:
+            previous = self.sock.gettimeout()
+            self.sock.settimeout(0)
+        except (OSError, AttributeError):
+            return
         try:
             for _ in range(rounds):
                 if not select.select([self.sock], [], [], 0)[0]:
@@ -475,6 +489,11 @@ class WebSocket:
                     return
         except (OSError, ValueError, AttributeError):
             pass
+        finally:
+            try:
+                self.sock.settimeout(previous)
+            except (OSError, AttributeError):
+                pass
 
     def unblock(self) -> None:
         """Stop the socket without sending anything and without taking the

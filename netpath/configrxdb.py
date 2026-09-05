@@ -276,9 +276,20 @@ class ConfigRxDatabase:
             self._conn.commit()
 
     def clear_credential(self, device_id: int) -> None:
+        """Both stored secrets, not just the password.
+
+        An operator clearing a device's credential means "this application
+        should hold nothing for this device any more" — decommissioning it,
+        or rotating after an exposure. Leaving the enable secret behind kept
+        an encrypted secret in configrx.db that nothing could reach and
+        nothing would ever use again (a backup needs the SSH password to get
+        as far as an enable prompt), while `has_enable_secret` went on
+        reporting it. Inert, but not what the operator asked for.
+        """
         with self._lock:
             self._conn.execute(
-                "UPDATE device_config SET ssh_password_enc = NULL WHERE device_id = ?",
+                "UPDATE device_config SET ssh_password_enc = NULL, "
+                "enable_secret_enc = NULL WHERE device_id = ?",
                 (device_id,))
             self._conn.commit()
 
