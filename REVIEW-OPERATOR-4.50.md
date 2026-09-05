@@ -3067,3 +3067,52 @@ and the search index's redacted-only invariant survived being moved.
 
 The honest summary of section 10 is that this release's own fixes produced its two worst
 defects, and that reading the diff at scale found what running the tests could not.
+
+### What that review found and this release did NOT fix
+
+Recorded rather than quietly carried, because a known defect an operator can
+read about is a different thing from one nobody wrote down.
+
+**A refused report used to break the page behind it. Fixed after the merge,
+and the reason it got that far is the interesting part.** `App.runJob` toasts a
+failure, announces it, then rethrows for a caller that wants the outcome; an
+onclick is not such a caller, so both Reports run buttons left an unhandled
+rejection — a real page error — while the toast and the button said exactly the
+right thing. The browser gate asserts an admin session sees no page error, and
+it has nothing that makes a job fail. An assertion about failure can only catch
+what something makes fail. It now has one, in its own script, because
+provoking a 400 inside the main walk trips that walk's own "refused nothing"
+invariants.
+
+**The backfill can leave one device's search index a capture behind.**
+`backfill_one_device` checks, reads and writes under three separate lock
+acquisitions. A worker capture landing between its read and its write leaves
+the index holding the older text, and the unchanged branch never repairs it
+because the index is no longer empty. Demonstrated by forced interleaving, not
+by a natural race — the window is one redact-and-insert wide. The stale text is
+still redacted, so nothing leaks; the cost is that one device's search results
+lag by a capture until its config next changes. Open.
+
+**Rule-set names are not unique, and the audit trail keys on the name.** Two
+sets may share a name; the compliance line then shows both identically, and a
+`configrx.rule_set.delete` audit row cannot say which one was deleted. The
+edit route also accepts an empty name, and a non-boolean `enabled` stores as
+written — so a rule set can read "Enabled" in the interface while the sweep's
+`WHERE enabled = 1` skips it. Writer-only, so it is a bookkeeping fault rather
+than a permission one. Open.
+
+**One corrupt stored capture could stop the search backfill for good.** Its
+worker catches `sqlite3.Error` but not the `zlib.error` a corrupt compressed
+capture would raise, and the resume cursor is only advanced on success — so
+every later start would die at the same device and nothing past it would ever
+be indexed. Devices still being polled repair themselves; devices no longer
+polled would not. Reasoned from the code, never reproduced — no corrupt blob
+was manufactured to prove it, and it is recorded at that strength.
+
+**And a note on the estate this was measured against.** None of the three
+seeded accounts — admin, noc, viewer — actually restricts a module: all three
+carry read on everything. So no account in the demo fixtures exercises a
+permission-hidden tab, and the navigation work's own regression check had to
+drive the real `applyPermissions` with a simulated grant to test the case at
+all. Any claim in this document about what a restricted operator sees rests on
+that simulation, not on a seeded account that behaves that way.
