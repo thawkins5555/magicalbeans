@@ -1,4 +1,4 @@
-"""The three server-side gates a browser must not be trusted to enforce.
+"""The server-side gates a browser must not be trusted to enforce.
 
 Each covers a defect the UI review reproduced against a running instance:
 
@@ -13,13 +13,26 @@ Each covers a defect the UI review reproduced against a running instance:
 
 There is no browser here on purpose: these are the halves that have to hold
 whatever the page does.
+
+The last section (`route/gate cross-reference`) is different in kind from
+everything above it: static analysis over server.py and api.py's source,
+not a live request. It turns the 4.48.1 permission audit — every route's
+(module, level) gate, checked against what its handler actually does —
+into a standing check, so the next route added gets the same scrutiny
+without a person doing it by hand. It needs no server and could live in a
+file of its own, but `tests/run_all.py --only gates` and `--only web`
+should not have to know about a second one, and it is the same question
+("can the browser be trusted") asked a different way.
 """
 
+import ast
 import http.client
 import json
 import os
+import re
 import sys
 import time
+from collections import defaultdict
 
 from _paths import free_tcp_port, tmpdir
 
@@ -305,6 +318,238 @@ try:
     check("and its idle countdown was reset by the kiosk heartbeat",
           r2["session"]["idle_seconds_remaining"] >= r1["session"]["idle_seconds_remaining"] - 0.5,
           (r1["session"]["idle_seconds_remaining"], r2["session"]["idle_seconds_remaining"]))
+
+    # ------------------------------------- route/gate cross-reference (4.48.1)
+    # Every route in server.py's ROUTES table, checked against what its
+    # handler in api.py actually does. Parsed straight out of each file's own
+    # AST rather than imported and introspected, so this runs against exactly
+    # the source on disk and does not care whether the objects happen to be
+    # importable in whatever order this process loaded them in.
+    print("route/gate cross-reference")
+
+    import netpath.permissions as permissions_mod
+    import netpath.web.api as api_mod
+    import netpath.web.server as server_mod
+
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _server_src = open(os.path.join(_repo_root, "netpath", "web", "server.py"),
+                       encoding="utf-8").read()
+    _api_src = open(os.path.join(_repo_root, "netpath", "web", "api.py"),
+                    encoding="utf-8").read()
+
+    def _unparse(node):
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return "<?>"
+
+    def _parse_routes(src):
+        """(method, pattern, handler_name, requirement) for every entry in
+        ROUTES. A dynamic requirement (a function of the request itself)
+        comes back as that function's name, a string, since it cannot be
+        reduced to a (module, level) pair without a request to hand it."""
+        tree = ast.parse(src)
+        routes_node = next(
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "ROUTES" for t in node.targets))
+        out = []
+        for elt in routes_node.elts:
+            method_n, pattern_n, handler_n, req_n = elt.elts
+            handler = _unparse(handler_n).split(".")[-1]
+            if isinstance(req_n, ast.Constant) and req_n.value is None:
+                req = None
+            elif isinstance(req_n, ast.Tuple):
+                def resolve(x):
+                    if isinstance(x, ast.Constant):
+                        return x.value
+                    if isinstance(x, ast.Name):
+                        return {"R": "read", "W": "write"}.get(x.id, x.id)
+                    return _unparse(x)
+                req = tuple(resolve(x) for x in req_n.elts)
+            else:
+                req = _unparse(req_n)
+            out.append((method_n.value, pattern_n.value, handler, req))
+        return out
+
+    ROUTES_PARSED = _parse_routes(_server_src)
+
+    _api_tree = ast.parse(_api_src)
+    API_FUNCS = {n.name: n for n in ast.walk(_api_tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    # Write-shaped calls: a db-object method named like a mutation, or a raw
+    # execute() whose SQL text is a write statement. Matched on the call
+    # site's own attribute name regardless of which module implements it, so
+    # this does not need to know the shape of appdb.py/nodesdb.py/etc.
+    WRITE_METHOD_RE = re.compile(
+        r"^(set_|add_|remove_|update_|delete_|insert_|create_|clear_|save_|"
+        r"store_|revoke_|promote_|reset_|resolve_|mute_|ack_|unack_|apply_|"
+        r"start_|stop_|write_|record_|touch_|bump_)")
+    WRITE_SQL_RE = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
+
+    def _find_writes(node, seen=None, depth=0):
+        """Evidence that `node` (an api.py function) performs a write,
+        recursing into other api.py functions it calls, up to 4 hops."""
+        if seen is None:
+            seen = set()
+        evidence = []
+        if node.name in seen or depth > 4:
+            return evidence
+        seen.add(node.name)
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Call):
+                continue
+            func = n.func
+            callee = (func.attr if isinstance(func, ast.Attribute) else
+                     func.id if isinstance(func, ast.Name) else None)
+            if callee is None:
+                continue
+            if callee in ("execute", "executemany"):
+                text = None
+                if n.args and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str):
+                    text = n.args[0].value
+                elif n.args and isinstance(n.args[0], ast.JoinedStr):
+                    text = "".join(v.value for v in n.args[0].values
+                                  if isinstance(v, ast.Constant))
+                if text and WRITE_SQL_RE.search(text):
+                    evidence.append(f"{node.name}: SQL write via {_unparse(n)[:90]}")
+            elif WRITE_METHOD_RE.match(callee):
+                evidence.append(f"{node.name}: calls .{callee}(...) -> {_unparse(n)[:90]}")
+            if callee in API_FUNCS and callee not in seen:
+                evidence.extend(_find_writes(API_FUNCS[callee], seen, depth + 1))
+        return evidence
+
+    # Handlers the write-detector's naming heuristic flags on a route gated
+    # read (or ungated), cleared by reading each through to what it actually
+    # calls (4.48.1 audit). Named here, one reason apiece, so a NEW false
+    # positive has to be justified the same way rather than silently added —
+    # a route not on this list that shows write evidence fails the check
+    # below.
+    KNOWN_NOT_WRITES = {
+        "post_login": "pre-auth bookkeeping on the credential being verified "
+                      "(touch_login/set_password/record_failure) before a "
+                      "session exists to gate; the route is intentionally "
+                      "ungated, not a bypass of one",
+        "get_flow_overview": "hostresolve.resolve_name is a pure SELECT-based "
+                            "name lookup (device_for_ip + app_db.hostnames), "
+                            "matched only on its resolve_ prefix",
+        "get_flow_records": "same hostresolve.resolve_name false match as "
+                           "get_flow_overview",
+        "get_flow_records_export": "same hostresolve.resolve_name false match",
+        "get_syslog_search": "same hostresolve.resolve_name false match",
+        "get_syslog_search_export": "same hostresolve.resolve_name false match",
+        "get_nodes_device": "alerts_db.mute_row is a SELECT for the currently-"
+                           "active mute row, matched only on its mute_ "
+                           "prefix; prune() clears expired rows, not this "
+                           "read path",
+    }
+
+    missing_handlers = [(m, p, h) for m, p, h, r in ROUTES_PARSED if h not in API_FUNCS]
+    check("every route's handler exists as a function in api.py",
+          not missing_handlers, missing_handlers)
+
+    read_or_ungated_writes = []
+    get_writes = []
+    for method, pattern, handler, req in ROUTES_PARSED:
+        fn = API_FUNCS.get(handler)
+        if fn is None or handler in KNOWN_NOT_WRITES:
+            continue
+        evidence = _find_writes(fn)
+        if not evidence:
+            continue
+        if req is None or (isinstance(req, tuple) and req[1] == "read"):
+            read_or_ungated_writes.append((method, pattern, handler, req, evidence[0]))
+        if method == "GET":
+            get_writes.append((method, pattern, handler, req, evidence[0]))
+
+    check("no route gated read (or ungated) shows write evidence, beyond the "
+          "known/explained false positives above",
+          not read_or_ungated_writes, read_or_ungated_writes)
+    check("no GET route shows write evidence, regardless of its gate -- a GET "
+          "can be triggered cross-site and from a plain link",
+          not get_writes, get_writes)
+
+    # The two routes whose requirement is a function of the request body
+    # cannot be checked by the static (module, level) comparison above, so
+    # their logic is exercised directly instead of by naming heuristic.
+    print("dynamic-requirement routes (decided by hand): "
+         "POST /api/password, POST /api/settings")
+    check("changing your own password needs no extra gate",
+          server_mod._password_requirement({"_username": "alice"}, {"username": "alice"}) is None)
+    check("...nor does it when the body names no username at all",
+          server_mod._password_requirement({"_username": "alice"}, {}) is None)
+    check("resetting a DIFFERENT account's password needs admin write",
+          server_mod._password_requirement({"_username": "alice"}, {"username": "bob"})
+          == ("admin", "write"))
+    check("...case-insensitively, so Alice cannot reset alice around the check",
+          server_mod._password_requirement({"_username": "Alice"}, {"username": "alice"}) is None)
+
+    for scope, (_method_name, _key) in api_mod.SETTINGS_SCOPES.items():
+        check(f"settings scope {scope!r} is gated on its own module's write",
+              server_mod._settings_requirement({}, {"scope": scope}) == (scope, "write"))
+    _no_own_scope = (set(permissions_mod.MODULES)
+                    - set(api_mod.SETTINGS_SCOPES) - {"settings"})
+    for scope in sorted(_no_own_scope) + ["bogus-scope-nobody-defined", "global"]:
+        check(f"settings scope {scope!r} (no entry in SETTINGS_SCOPES) falls "
+              "to settings:write -- the exact fix for the debug:write account "
+              "that could once rewrite the LDAP config and the self-update "
+              "toggle by going through this fall-through",
+              server_mod._settings_requirement({}, {"scope": scope}) == ("settings", "write"))
+    check("SETTINGS_SCOPES covers every module except settings/debug/ssh/admin "
+          "-- a module added to permissions.MODULES with no entry here would "
+          "silently fall through to the global Settings writer",
+          set(api_mod.SETTINGS_SCOPES) == set(permissions_mod.MODULES) - {"settings", "debug", "ssh", "admin"},
+          sorted(set(permissions_mod.MODULES) - {"settings", "debug", "ssh", "admin"}
+                ^ set(api_mod.SETTINGS_SCOPES)))
+
+    # Reachable with no session at all. A data route landing in either set
+    # is the worst thing that can happen to this table, so both are an exact
+    # expected set rather than a substring or "at least" check.
+    PUBLIC_PATHS_EXPECTED = {"/login", "/login.html", "/login.js", "/tokens.css",
+                            "/app.css", "/boot.js", "/favicon.ico", "/favicon.svg"}
+    PUBLIC_API_EXPECTED = {"/api/login", "/api/session"}
+    check("PUBLIC_PATHS is exactly the sign-in page's own static assets",
+          server_mod.PUBLIC_PATHS == PUBLIC_PATHS_EXPECTED,
+          server_mod.PUBLIC_PATHS ^ PUBLIC_PATHS_EXPECTED)
+    check("PUBLIC_API is exactly /api/login and /api/session",
+          server_mod.PUBLIC_API == PUBLIC_API_EXPECTED,
+          server_mod.PUBLIC_API ^ PUBLIC_API_EXPECTED)
+
+    # The 8 routes with no gate at all, each justified in server.py's own
+    # comments (pre-auth, a property of the host, or — state/config/dashboard
+    # — filtered per-module inside the handler, which the /api/state and
+    # /api/config checks earlier in this suite already exercise). A ninth
+    # route reaching this set is a deliberate act with this test to update,
+    # not an omission nobody notices.
+    UNGATED_EXPECTED = {
+        ("POST", r"^/api/login$"), ("POST", r"^/api/logout$"),
+        ("POST", r"^/api/heartbeat$"), ("GET", r"^/api/session$"),
+        ("GET", r"^/api/state$"), ("GET", r"^/api/config$"),
+        ("GET", r"^/api/platform$"), ("GET", r"^/api/dashboard$"),
+    }
+    ungated_actual = {(m, p) for m, p, h, r in ROUTES_PARSED if r is None}
+    check("the ungated route set is exactly what it was when this was audited",
+          ungated_actual == UNGATED_EXPECTED, ungated_actual ^ UNGATED_EXPECTED)
+
+    # Route counts by (module, level): loose enough that an ordinary new
+    # route is not noise, tight enough that ssh growing a read tier (an
+    # interactive shell has no meaningful "read") or a module losing its
+    # write tier entirely goes red.
+    counts = defaultdict(int)
+    for method, pattern, handler, req in ROUTES_PARSED:
+        if isinstance(req, tuple):
+            counts[req] += 1
+    print("  route counts by (module, level): " + ", ".join(
+        f"{m}:{l}={n}" for (m, l), n in sorted(counts.items())))
+    check("ssh has no read tier",
+          ("ssh", "read") not in counts, dict(counts))
+    check("ssh still has a write tier (the terminal and its socket)",
+          counts[("ssh", "write")] >= 1, counts[("ssh", "write")])
+    for module in sorted(set(permissions_mod.MODULES) - {"ssh", "settings"}):
+        check(f"{module} still has both a read and a write tier",
+              counts[(module, "read")] >= 1 and counts[(module, "write")] >= 1,
+              (module, counts[(module, "read")], counts[(module, "write")]))
 
     print("FAILED: " + ", ".join(failures) if failures else "ALL WEB GATE ASSERTIONS PASSED")
 finally:

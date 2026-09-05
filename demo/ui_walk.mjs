@@ -30,7 +30,12 @@
  *                                   ConfigRX's device-settings and
  *                                   bulk-settings dialogs (both carry the SSH
  *                                   credential fields — there is no separate
- *                                   credential dialog to capture)
+ *                                   credential dialog to capture), and an
+ *                                   actual SSH terminal session (a real
+ *                                   popup window, not a #modal dialog —
+ *                                   gated on a module ("ssh") seed.py never
+ *                                   grants viewer or noc at all, so only
+ *                                   admin ever opens it)
  *   dlg-viewer-<name>-<tag>.png      the same dialog walk run under `viewer`,
  *   dlg-noc-<name>-<tag>.png         and under `noc`. A screenshot exists
  *                                    only for a dialog that actually OPENED;
@@ -74,11 +79,26 @@
  *                                   control this walk actually clicked (a
  *                                   real DOM click event tracked from page
  *                                   load, not a guess from which steps
- *                                   passed). `not_activated_ids` in each
- *                                   file's cross_reference is the honest
- *                                   list of what "every button was
- *                                   exercised" does NOT yet cover for that
- *                                   account.
+ *                                   passed — this includes the top-level tab
+ *                                   strip, which selectTab() now clicks for
+ *                                   real before falling back to its JS call).
+ *                                   cross_reference reconciles the id-less
+ *                                   controls (listed, not just counted) and
+ *                                   splits not_activated into
+ *                                   skipped_destructive (this campaign's own
+ *                                   policy — see DESTRUCTIVE_SKIP),
+ *                                   refused_or_absent (the write gate, or
+ *                                   the seed left no data — the permission
+ *                                   boundary working) and not_reached (an
+ *                                   actual coverage gap) — only the last one
+ *                                   is a gap "every button was exercised"
+ *                                   has not yet closed for that account.
+ *                                   driveSafeControls (called before the
+ *                                   census runs) widens what gets exercised
+ *                                   first: every filter apply/clear, export,
+ *                                   pager and collector toggle safe enough
+ *                                   to drive without changing state this
+ *                                   walk cannot put back.
  *   console-<tag>.json              console errors/warnings, page errors,
  *                                   failed requests and every response >= 400
  *                                   (from every pass above — admin, viewer,
@@ -425,11 +445,23 @@ async function login(page, base, username, password) {
  * account cannot reach a control — it can tell `absent` (not on the page,
  * or hidden because the seed left no row/data to select), `refused`
  * (present, visible, disabled by the write gate) and clickable apart.
+ *
+ * Also records the element's id (when it has one) into window.__considered
+ * — a second set alongside installActivationTracker's __activated, read by
+ * censusAccount so "the walk looked at this control and had a reason not
+ * to click it" (refused by the write gate, or found absent right here) can
+ * be told apart from "nothing in this walk ever encountered it at all".
+ * Every gated dialog trigger and every SAFE_CLICKS/SAFE_TOGGLES entry goes
+ * through this one function, so nothing needs to opt into being counted.
  */
 async function gateState(page, selector) {
   return page.evaluate((sel) => {
     const el = document.querySelector(sel);
     if (!el) return { present: false };
+    if (el.id) {
+      window.__considered = window.__considered || new Set();
+      window.__considered.add(el.id);
+    }
     const visible = el.offsetParent !== null;
     if (!visible) return { present: true, visible: false };
     const disabled = 'disabled' in el ? Boolean(el.disabled) : Boolean(el.inert);
@@ -1009,6 +1041,7 @@ async function harvestControls(page, scopeSelector, tabLabel) {
 async function installActivationTracker(context) {
   await context.addInitScript(() => {
     window.__activated = window.__activated || new Set();
+    window.__considered = window.__considered || new Set();   // see gateState
     document.addEventListener('click', (event) => {
       let el = event.target;
       while (el && el !== document.documentElement) {
@@ -1114,11 +1147,16 @@ async function driveSafeControls(page, dir, tag, recorder, account) {
  * honestly be called either. `no_id_controls` lists them individually
  * (tab, tag, label) rather than just a count, per team-lead's request:
  * a control nobody can address is itself worth knowing about.
- * `not_activated_detail` splits not_activated_ids into `skipped` (this
- * account's write grant refused it, or the seed left no data to act on —
- * recorded by the very steps that tried) and `not_reached` (nothing in
- * this walk, including driveSafeControls, ever clicked it) — the first is
- * the permission boundary working, the second is an actual coverage gap.
+ * `not_activated_detail` splits not_activated_ids three ways:
+ * `skipped_destructive` (DESTRUCTIVE_SKIP — this walk never even looks at
+ * these, on purpose), `refused_or_absent` (gateState found the control —
+ * refused by the write gate, or present only fleetingly — recorded via its
+ * own window.__considered set, not by pattern-matching step names back to
+ * ids, which is a different population than the dialog-shaped step log)
+ * and `not_reached` (nothing in this walk, including driveSafeControls,
+ * ever encountered it at all). Only the last one is an actual coverage gap;
+ * the first two are the permission boundary and this campaign's own policy
+ * working as intended.
  */
 async function censusAccount(page, dir, tag, recorder, account) {
   try {
@@ -1158,21 +1196,25 @@ async function censusAccount(page, dir, tag, recorder, account) {
     const activatedIdList = uniqueIds.filter((id) => activatedIds.has(id));
     const notActivatedIdList = uniqueIds.filter((id) => !activatedIds.has(id));
 
-    // Every recorded step this account's own run produced, so
-    // not_activated can be split into "the walk decided not to click this"
-    // (skipped/refused/absent — a step exists and says why) versus
-    // "nothing ever tried" (no matching step at all).
-    const stepById = new Map();
-    for (const s of recorder.steps) {
-      const m = s.name.match(/^(?:[a-z]+:)?(?:safe(?:-toggle)?|skip|dlg|feature):(.+)$/);
-      if (m) stepById.set(m[1], s);
-    }
-    const skipped = [];
+    // Split not_activated into three, not two: DESTRUCTIVE_SKIP is a static
+    // list (this walk never even looks at those ids), __considered is
+    // gateState's own record of every id it found present (refused by the
+    // write gate, or found and then not driven for some other reason —
+    // either way, the walk actually looked), and what's left is what never
+    // came up at all. This reads DOM-side state gateState already recorded
+    // rather than pattern-matching step names back to ids, which broke the
+    // first time it was tried: most dlg: step names describe the DIALOG
+    // ("dlg:settings-nodes"), not the button id that opens it ("nd-settings").
+    const consideredIds = new Set(
+      await page.evaluate(() => [...(window.__considered || [])]).catch(() => []));
+    const skippedDestructive = [];
+    const refusedOrAbsent = [];
     const notReached = [];
     for (const id of notActivatedIdList) {
-      const s = stepById.get(id);
-      if (s && (s.state === 'skipped' || /^(absent|refused) —/.test(s.detail))) {
-        skipped.push({ id, reason: s.detail || s.state });
+      if (DESTRUCTIVE_SKIP.has(id)) {
+        skippedDestructive.push({ id, reason: DESTRUCTIVE_SKIP.get(id) });
+      } else if (consideredIds.has(id)) {
+        refusedOrAbsent.push(id);
       } else {
         notReached.push(id);
       }
@@ -1192,7 +1234,8 @@ async function censusAccount(page, dir, tag, recorder, account) {
         activated_ids: activatedIdList.sort(),
         not_activated_ids: notActivatedIdList.sort(),
         not_activated_detail: {
-          skipped_or_refused: skipped.sort((a, b) => a.id.localeCompare(b.id)),
+          skipped_destructive: skippedDestructive.sort((a, b) => a.id.localeCompare(b.id)),
+          refused_or_absent: refusedOrAbsent.sort(),
           not_reached: notReached.sort(),
         },
       },
@@ -1202,7 +1245,8 @@ async function censusAccount(page, dir, tag, recorder, account) {
     recorder.step(`${account}:census`, 'ok',
       `${uniqueIds.length} controls enumerated (${noId.length} more with no id), ` +
       `${activatedIdList.length} activated, ${notActivatedIdList.length} not activated ` +
-      `(${skipped.length} skipped/refused, ${notReached.length} never reached)`);
+      `(${skippedDestructive.length} destructive-skip, ${refusedOrAbsent.length} refused/absent, ` +
+      `${notReached.length} never reached)`);
     return { enumerated: uniqueIds.length, activated: activatedIdList.length,
              notActivated: notActivatedIdList.length };
   } catch (error) {
@@ -1459,6 +1503,7 @@ async function main() {
     adminTabs = await walkTabs(page, dir, tag, recorder, 'tab');
     await walkDialogs(page, dir, tag, recorder, 'admin');
     metrics = await measure(page, recorder);
+    await driveSafeControls(page, dir, tag, recorder, 'admin');
     await censusAccount(page, dir, tag, recorder, 'admin');
     await context.close();
 
@@ -1480,6 +1525,7 @@ async function main() {
       viewerTabs = await walkTabs(viewerPage, dir, tag, recorder, 'viewer');
       await walkDialogs(viewerPage, dir, tag, recorder, 'viewer');
       await writeBoundaryActions(viewerPage, recorder, 'viewer');
+      await driveSafeControls(viewerPage, dir, tag, recorder, 'viewer');
       await censusAccount(viewerPage, dir, tag, recorder, 'viewer');
       await viewerContext.close();
     } else {
@@ -1559,6 +1605,7 @@ async function main() {
       nocTabs = await walkTabs(nocPage, dir, tag, recorder, 'noc');
       await walkDialogs(nocPage, dir, tag, recorder, 'noc');
       await writeBoundaryActions(nocPage, recorder, 'noc');
+      await driveSafeControls(nocPage, dir, tag, recorder, 'noc');
       await censusAccount(nocPage, dir, tag, recorder, 'noc');
       await nocContext.close();
     } else {

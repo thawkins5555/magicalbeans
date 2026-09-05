@@ -117,6 +117,9 @@
     App.setText(App.el('alerts-toggle'), alerts.running ? 'Stop alert engine' : 'Start alert engine');
     const c = alerts.counters || {};
     if (App.state.kiosk) {
+      // Deliberately open_count, not unresolvedCount below: a wall display
+      // is read as "how many things has nobody looked at yet", and an
+      // acked alert has been looked at.
       App.setHtml(App.el('alerts-counters'), App.figures([
         { value: alerts.open_count || 0, label: 'open',
           className: alerts.open_count ? 'warn' : '' },
@@ -142,10 +145,20 @@
       (view.bulkNotice && Date.now() < view.bulkNotice.until
         ? ` · ${view.bulkNotice.text}` : ''));
     if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
+    // The default Alerts view is State=unresolved (open + acked), but this
+    // badge used to count open_count alone — state='open' only — so the
+    // moment anything was acknowledged, a routine action, the badge ran
+    // behind what the list right below it actually showed, with nothing
+    // saying that was expected rather than a bug. unresolved_count is what
+    // the default view counts; the `?? alerts.open_count` fallback is only
+    // for a server that has not shipped that field yet, so this degrades to
+    // the old (narrower, but never wrong) number rather than showing 0.
+    // The tab strip's own badge (app.js) reads the same field and needs the
+    // same fallback — see the note routed to that owner.
     const badge = App.el('alerts-open-badge');
-    const openCount = alerts.open_count || 0;
-    App.setText(badge, String(openCount));
-    if (badge.hidden !== (openCount === 0)) badge.hidden = openCount === 0;
+    const unresolvedCount = alerts.unresolved_count ?? alerts.open_count ?? 0;
+    App.setText(badge, String(unresolvedCount));
+    if (badge.hidden !== (unresolvedCount === 0)) badge.hidden = unresolvedCount === 0;
     // Both injected in init() (see its own comment on why) rather than
     // declared with data-requires-write, so this is what keeps them honest
     // against a grant that changes while the page is open.

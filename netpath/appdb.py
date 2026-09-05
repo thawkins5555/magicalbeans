@@ -120,6 +120,7 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit(ts);
 -- threshold" from a full scan into an index lookup.
 CREATE INDEX IF NOT EXISTS ix_audit_username ON audit(username);
 CREATE INDEX IF NOT EXISTS ix_audit_action ON audit(action);
+CREATE INDEX IF NOT EXISTS ix_audit_target ON audit(target);
 
 -- API tokens (Tier 1 #10): service-account credentials that authenticate an
 -- HTTP request the same way a session cookie does, but never expire from

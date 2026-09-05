@@ -87,6 +87,20 @@ class MibParseTimeout(ValueError):
     """Parsing spent longer than `budget_s` and was abandoned."""
 
 
+def _check_deadline(deadline: float | None, budget_s: float) -> None:
+    """Raises MibParseTimeout once `deadline` (an absolute time.monotonic()
+    value) has passed; `deadline is None` means no budget is in force.
+    Shared by parse()'s own per-phase checks and by any phase — currently
+    just the comment/string masking pass — that checks its own progress from
+    inside a loop, so both report the same message regardless of which one
+    caught it."""
+    if deadline is not None and time.monotonic() > deadline:
+        raise MibParseTimeout(
+            f"This file took longer than {budget_s:g}s to parse and was "
+            "abandoned; it is far larger or far more unusual than any "
+            "real MIB module.")
+
+
 @dataclass
 class ParsedObject:
     name: str
@@ -117,7 +131,8 @@ class ParseResult:
 _MASK_OPEN_RE = re.compile(r'"|--')
 
 
-def _strip_comments_and_strings(text: str) -> str:
+def _strip_comments_and_strings(text: str, deadline: float | None = None,
+                                budget_s: float = 0.0) -> str:
     """Masks `-- comment` (to the next `--` or end of line, per ASN.1
     comment syntax) and `"quoted strings"` with spaces of the same
     length, preserving every other byte's offset. Never removes bytes —
@@ -132,10 +147,35 @@ def _strip_comments_and_strings(text: str) -> str:
     Written as "copy the span up to the next `"` or `--`, then blank that
     one span" rather than as a per-character walk: `list(text)` cost nine
     bytes of memory per input byte and 3.6 s on an 8 MB file before any
-    regex had run, for a pass that only ever blanks two kinds of span."""
+    regex had run, for a pass that only ever blanks two kinds of span.
+
+    `no_newline_from` caches the result of the "where does this comment end"
+    search below: once a search for the next `\\n` comes up empty, no later
+    search — starting further along the same string — can find one either,
+    so it is never searched for again. Without this, a file whose ASN.1 `--`
+    comments run to end-of-file with nothing to close them and no newline
+    anywhere in between (one long logical line, which is exactly how a
+    minified or half-downloaded MIB looks) paid one full end-of-file scan
+    *per comment marker* — O(markers x length) — the same bug class this
+    function's own docstring already names two instances of, a third one,
+    found by fuzzing rather than by review. The equivalent search for the
+    next `--` (a comment's other possible closer) does not need the same
+    cache: each one only ever looks for a `--` that a *later* iteration of
+    this same loop would otherwise have opened a new comment on, so at most
+    one such search per call can come up empty, however large the file is.
+
+    `deadline`/`budget_s` let a caller with its own wall-clock budget (see
+    parse()) be checked from inside this loop rather than only after it
+    returns — a budget checked solely between phases cannot bound the phase
+    it is checked after, which is exactly how the bug above outlasted it."""
     parts: list[str] = []
     i, n = 0, len(text)
+    no_newline_from: int | None = None
+    iterations = 0
     while i < n:
+        iterations += 1
+        if deadline is not None and not iterations % 4096:
+            _check_deadline(deadline, budget_s)
         opener = _MASK_OPEN_RE.search(text, i)
         if opener is None:
             parts.append(text[i:])
@@ -149,8 +189,14 @@ def _strip_comments_and_strings(text: str) -> str:
         else:
             # ASN.1: a comment runs to the next `--` or to end of line,
             # whichever comes first. The newline itself is not part of it.
-            newline = text.find("\n", start + 2)
-            dashes = text.find("--", start + 2)
+            search_from = start + 2
+            if no_newline_from is not None and search_from >= no_newline_from:
+                newline = -1
+            else:
+                newline = text.find("\n", search_from)
+                if newline == -1:
+                    no_newline_from = search_from
+            dashes = text.find("--", search_from)
             if dashes != -1 and (newline == -1 or dashes < newline):
                 end = dashes + 2
             else:
@@ -347,10 +393,13 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
     endpoint keeps turning them into a 400 with their own message:
     `MibTooLarge` for the byte cap, checked before any scanning so a
     pasted multi-megabyte file is refused cheaply, and `MibParseTimeout`
-    for the wall-clock budget, checked between phases and periodically
-    within one. Nothing else escapes: an enum value too long for
-    `int()`, a truncated clause, an unterminated string are all just
-    definitions that do not get recorded."""
+    for the wall-clock budget, checked between every phase and, within the
+    ones that scan the file more than once per pass — the comment/string
+    masking, and the object-scanning loops below it — periodically inside
+    them too, so no single phase can itself outlast the budget uncaught.
+    Nothing else escapes: an enum value too long for `int()`, a truncated
+    clause, an unterminated string are all just definitions that do not
+    get recorded."""
     if len(text.encode("utf-8", "replace")) > max_bytes:
         raise MibTooLarge(f"File exceeds the {max_bytes:,} byte limit")
 
@@ -361,14 +410,14 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
     deadline = (time.monotonic() + budget_s) if budget_s and budget_s > 0 else None
 
     def check_budget() -> None:
-        if deadline is not None and time.monotonic() > deadline:
-            raise MibParseTimeout(
-                f"This file took longer than {budget_s:g}s to parse and was "
-                "abandoned; it is far larger or far more unusual than any "
-                "real MIB module.")
+        _check_deadline(deadline, budget_s)
 
     notes: list[str] = []
-    masked = _strip_comments_and_strings(text)
+    # The masking pass gets the deadline directly, and checks it from inside
+    # its own loop, rather than only being checked here once it returns: a
+    # budget applied solely between phases cannot bound the phase it is
+    # applied after.
+    masked = _strip_comments_and_strings(text, deadline, budget_s)
     check_budget()
 
     module_match = _MODULE_RE.search(masked)

@@ -1007,6 +1007,36 @@
         .sort((a, b) => a.ts - b.ts);
       if (older && newer) showDiff(older.id, newer.id);
     };
+    // Both buttons carry data-requires-write="configrx" in index.html, left
+    // over from before 4.48.0 moved fetching a single stored backup to
+    // ConfigRX read (get_configrx_backup). Diffing two backups a reader can
+    // already open one at a time is not a write, and it is the single most
+    // common thing anyone does with a config backup — "what changed on this
+    // switch before it stopped answering" is a reader's question, not a
+    // writer's. Undone here rather than in the markup (not mine to edit):
+    // the attribute is stripped so applyPermissions' generic write-gate
+    // (app.js), which only ever walks `[data-requires-write]`, never reaches
+    // these two again — but loadState() runs applyPermissions() before any
+    // module's init() (see app.js's start()), so a read-only account has
+    // already had both buttons disabled-with-reason by the time this line
+    // runs; stripping the attribute alone would stop future re-disabling
+    // without ever undoing that first pass. So this also reverses it by
+    // hand, the same way applyWriteGate's own "allowed" branch would.
+    // /api/configrx/diff itself still requires write server-side
+    // (server.py:479) — until that changes to match get_configrx_backup's
+    // R, a read-only account clicking either button gets showDiff's own
+    // "Could not diff these backups: ..." toast instead of a 403 with no
+    // explanation, which is at least an honest answer while the two catch up.
+    for (const id of ['cx-backup-diff-prev', 'cx-backup-diff-selected']) {
+      const btn = App.el(id);
+      btn.removeAttribute('data-requires-write');
+      if (btn.dataset.writeDenied) {
+        btn.disabled = false;
+        delete btn.dataset.writeDenied;
+        btn.removeAttribute('title');
+      }
+      btn.classList.remove('write-denied');
+    }
     App.el('cx-diff-close').onclick = closeDiff;
     App.el('cx-bulk-settings').onclick = bulkSettings;
     App.el('cx-bulk-backup').onclick = bulkBackupNow;

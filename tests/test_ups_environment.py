@@ -26,7 +26,12 @@ Four sections, matching the four things asked for:
   4. Each new built-in alert rule (alertsdb._BUILTIN_RULES) opening and
      clearing against synthetic metric samples, through a real AlertEngine
      tick -- not evaluate_threshold alone.
+  5. alertsdb's _retire_temp_high migration: an installation that already
+     seeded the old single "temp_high" rule gets it disabled (not deleted
+     -- that would cascade-delete its alert history) and its open alerts
+     resolved with an explanatory note, on the next startup.
 """
+import os
 import socket
 import time
 
@@ -355,6 +360,58 @@ for rule_key, metric_key, label, unit, breach_value, clear_value in CASES:
     finally:
         engine.stop()
         nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+# =================================================== § 5 the retirement migration
+
+# Simulates an installation that already seeded 4.49.0's first cut of this
+# feature -- one "temp_high" rule over one "temp_c" metric key -- before the
+# fix landed. A fresh AlertsDatabase() never creates that row any more (it
+# is gone from _BUILTIN_RULES), so it is inserted by hand here, exactly as
+# it shipped, with one open alert against it.
+migration_dir = tmpdir("ups_env_migration_")
+alerts_path = os.path.join(migration_dir, "alerts.db")
+alerts = AlertsDatabase(alerts_path)
+now = time.time()
+alerts._conn.execute(
+    "INSERT INTO rules(key, name, kind, source_kind, severity, enabled,"
+    " is_builtin, device_filter, notify, threshold, clear_threshold,"
+    " for_polls, created_ts) VALUES ('temp_high', 'Temperature high',"
+    " 'threshold', 'temp_c', 4, 1, 1, '', 1, 35.0, 30.0, 2, ?)", (now,))
+old_rule = alerts._conn.execute(
+    "SELECT id FROM rules WHERE key = 'temp_high'").fetchone()
+alerts._conn.execute(
+    "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
+    " entity_label, severity, message, state, count, opened_ts, last_ts,"
+    " extra_json) VALUES (?, 'temp_high:device:1', 'device', '1', 'sw1',"
+    " 4, 'hot', 'open', 1, ?, ?, '{}')", (old_rule["id"], now, now))
+# The FIRST AlertsDatabase(alerts_path) above already ran every named
+# migration once, including retire_temp_high_1 -- as a no-op, since the
+# temp_high row above did not exist yet. A real pre-fix install would have
+# seeded that row BEFORE this migration's code ever existed, so its
+# schema_migrations marker would not be there yet either; forgetting that
+# marker here is what makes the row inserted above look like a genuine
+# upgrade case to the next open, instead of a migration this database has
+# (as far as it knows) already run.
+alerts._conn.execute(
+    "DELETE FROM schema_migrations WHERE name = 'retire_temp_high_1'")
+alerts._conn.commit()
+alerts.close()
+
+# Reopening the same file is the "next startup" this migration runs on.
+alerts = AlertsDatabase(alerts_path)
+retired = alerts.rule_by_key("temp_high")
+check("the pre-fix temp_high rule survives (not deleted -- deleting it "
+      "would cascade-delete its alert history) but is disabled and "
+      "relabelled so it reads as retired rather than merely broken",
+      retired is not None and retired["enabled"] == 0
+      and "retired" in retired["name"].lower(),
+      dict(retired) if retired else None)
+still_open = [r for r in alerts.alerts(state="unresolved")
+             if retired and r["rule_id"] == retired["id"]]
+check("its open alert is resolved on upgrade instead of staying open "
+      "forever (temp_c will never arrive again to clear it on its own)",
+      still_open == [], still_open)
+alerts.close()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

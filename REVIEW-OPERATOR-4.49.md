@@ -39,7 +39,36 @@ Identifiers are prefixed by section, because the last review's first draft reuse
 
 ## 1. Verdict
 
-⏳ Written last, from the evidence.
+⏳ Written last, from the evidence. The shape of it, as the campaign stands:
+
+This is a genuinely well-built monitoring system with an unusually honest codebase, and
+it is not yet a *fleet management* system. The distinction matters for the decision.
+
+What it does, it does properly. The SNMP implementation handles the five things that
+decide whether polling real gear works at all. The alert state model is right, and its
+notification rollup is now demonstrably right: a 108-device site outage in this campaign
+opened 228 alerts and sent **11 emails**, where the same shape of event at 4.35.0
+produced 1,355. The collectors decode rather than approximate. And the code explains
+itself, including the decisions it chose *not* to make — which is rarer and more useful
+than most vendor documentation.
+
+Where it falls short is not in what it measures but in what it lets you *do with*
+what it measured. It holds 400 days of every metric and cannot produce a report. It
+holds two thousand device configurations and cannot answer a question about them. It
+collects the topology and will not let you use it. It writes an audit trail nobody can
+read. In each case the data is already there and the last mile is missing — which is
+good news for the roadmap and bad news for the operator who needs the answer this
+month.
+
+The estate gap is the other half. This campaign found the product could not see a UPS,
+a printer, an environmental sensor, or a Windows host's memory — four device classes a
+plant is full of — and built two of them. That work also produced the campaign's most
+instructive defect: the moment `temp_c` existed, ten switches' transceiver temperatures
+started tripping a rule meant for a comms room. Adding a metric is easy; adding one that
+means the same thing on every device it appears on is the hard part, and it is where a
+monitoring product is won or lost.
+
+⏳ Final judgement, with the 1,000 and 2,000 tier numbers, lands here.
 
 ---
 
@@ -285,6 +314,15 @@ products treat both as an afterthought.
 when the platform store is unavailable — and the code refuses to store a secret it
 cannot protect rather than storing it badly. Refusing is the right answer and it is
 rare.
+
+**The notification rollup works, and the number says so.** In the 250-device campaign,
+the scripted site outage — the core switch plus the Site-A access layer, 108 devices —
+opened **228 alerts and sent 11 emails**. The earlier review of 4.35.0 measured the same
+shape of event at 1,000 devices producing 377 child alerts and 1,355 emails. The hold on
+first notification, so the dependency rollup can suppress children before anything is
+sent, and the coalescing of everything due in the same flush into one digest, is the
+difference between a mailbox an operator reads and one they filter to a folder. This is
+the single most important thing 4.47.0 got right.
 
 **The collectors decode properly rather than approximately.** NetFlow v5/v9 with real
 template handling, SNMP traps and informs with varbind decoding against an uploadable
