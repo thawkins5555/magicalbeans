@@ -24,6 +24,35 @@ TAIL = 15
 # here. 77 is the automake convention for exactly this.
 SKIP_EXIT_CODE = 77
 
+# A suite's own stdout is captured with encoding="utf-8" below -- decoding a
+# byte a suite wrote under some other encoding (its own stdout is cp1252 by
+# default here, same as this runner's, whenever neither end is a real
+# console) already gets the U+FFFD replacement character rather than
+# crashing the reader thread, and the comment beside that call names the
+# UnicodeDecodeError this fixed. What nothing fixed is the *encode* side:
+# this process's own console is cp1252 too, and printing a captured tail
+# straight back out -- one PASS/FAIL line, or fifteen lines of a suite's own
+# output -- raised UnicodeEncodeError on any character cp1252 cannot hold,
+# including that very U+FFFD. The runner then died with a raw traceback
+# instead of the report it had already correctly computed, which reads as
+# "the whole run is broken" for what was really one suite's output containing
+# a character this console cannot draw.
+#
+# Reconfigured once, here, rather than wrapping every print in a try/except:
+# every print in this file goes through these two objects, so this is the one
+# place that has to know about it. errors="backslashreplace" rather than
+# "replace" so a character this console cannot show comes out as literally
+# what it is (`�`, `—`), which is more useful in a build log than a
+# silently substituted "?" -- and, unlike "replace", cannot itself collide
+# with a real "?" a suite printed on purpose.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):
+            pass
+
 
 def main(argv) -> int:
     only = ""

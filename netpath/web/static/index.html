@@ -1035,6 +1035,7 @@
     <button class="subtab" data-subtab="directory">TOKENS &amp; DIRECTORY</button>
     <button class="subtab" data-subtab="maintenance">MAINTENANCE</button>
     <button class="subtab" data-subtab="modules">MODULES</button>
+    <button class="subtab" data-subtab="audit">AUDIT</button>
   </nav>
   <!-- Each subpage carries .scroll itself (rather than one shared wrapper
        around all seven) so it is a direct child of .page, a sibling of the
@@ -1310,6 +1311,43 @@
         same dialog from one list rather than requiring you to already know which
         tab it lives on.</p>
       <div id="settings-modules-list" class="row wrap"></div>
+    </fieldset>
+    </div>
+
+    <!-- The on-disk audit trail (appdb.py's audit table) is written and
+         served (GET /api/audit) and, before this, had no page anywhere
+         that read it — the one feature whose entire purpose is to be read
+         by a person, unreadable by any person. Read-only throughout:
+         there is nothing here that writes to the trail, matching the API
+         underneath it exactly. Addressable at #/settings/audit, and its
+         target filter reads ?target=<kind>:<value> from the URL (query
+         below), so a device's own page can one day link straight to its
+         own history the same way target itself already names it. -->
+    <div id="settings-sub-audit" class="subpage scroll">
+    <fieldset>
+      <legend>AUDIT TRAIL</legend>
+      <p class="hint" id="audit-denied" hidden>Reading the audit trail needs admin
+        access. Ask an administrator if you need it.</p>
+      <div id="audit-body" hidden>
+      <p class="hint">Who changed what, recorded on disk and never trimmed by anything
+        in this application. Newest first; the filters below narrow what is shown,
+        they do not remove anything from the trail itself.</p>
+      <div class="bar wrap">
+        <label>Window <select id="audit-range" aria-label="Date range"></select></label>
+        <label>User <select id="audit-user" aria-label="Filter by user"><option value="">Any user</option></select></label>
+        <label>Action <select id="audit-action" aria-label="Filter by action"><option value="">Any action</option></select></label>
+        <label>Target <input id="audit-target" size="18" placeholder="device:10.20.3.4" aria-label="Exact target"></label>
+        <label>Search <input id="audit-q" size="20" placeholder="any part of the target or detail" aria-label="Search target and detail"></label>
+        <button id="audit-apply">Search</button>
+        <button id="audit-clear">Clear</button>
+      </div>
+      <div class="table-wrap" style="max-height:420px"><table id="audit-table"></table></div>
+      <div class="row" style="margin-top:6px">
+        <span class="hint" id="audit-status"></span>
+        <span class="grow"></span>
+        <button id="audit-more" hidden>Load older</button>
+      </div>
+      </div>
     </fieldset>
     </div>
   <div class="bar footer">

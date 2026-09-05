@@ -2176,22 +2176,35 @@ set.
 
 ### Upstream suggestions (`nodesdb.py`, `web/api.py`) — 4.49.0
 
-The means the rollup above was missing: `alertrules.py` is explicit that
-`ROLLED_UP_BY` suppression must be driven only by an operator-confirmed
-`devices.upstream_id`, never by an LLDP/CDP neighbour match — a neighbour row
-is a best-effort guess that can go stale between walks or collide on a
-non-unique sysName, and suppressing a real fault on a wrong guess is the one
-failure this feature must not have. What nothing offered, before this
-release, was a way to turn that guess into a confirmed value faster than one
-Edit dialog per device.
+The means a *different*, cross-device rollup was missing — not the
+same-device metric rollup the previous section documents (a device's own
+CPU/disk/interface alerts folding under that same device's `device_down`),
+but `alertengine._upstream_outage` (called from the `device_down` occurrence
+path), which walks `nodesdb.upstream_chain(device_id)` looking for an
+ancestor with its own already-open `device_down` alert and, if found,
+absorbs the child occurrence into that same alert row rather than opening a
+new one. That mechanism has existed since `upstream_id` shipped in 4.37.0
+and works correctly; what was missing is that `upstream_id` is a plain
+operator-typed field with no assistance populating it, so at fleet scale
+nobody sets it and the walk has nothing to climb. `alertrules.py` is
+explicit that this may only ever be driven by an operator-confirmed
+`devices.upstream_id`, never directly by an LLDP/CDP neighbour match — a
+neighbour row is a best-effort guess that can go stale between walks or
+collide on a non-unique sysName, and suppressing a real fault on a wrong
+guess is the one failure this feature must not have. What nothing offered,
+before this release, was a way to turn that guess into a confirmed value
+faster than one Edit dialog per device.
 
-`nodesdb._upstream_confidence(match_kind, present)` scores one candidate: a
-`chassis_mac` match ranks above a `sys_name` one (a MAC collision is far
-rarer than two sites both naming a switch "core-sw-1"), and `present=False`
-(nothing has confirmed the neighbour row since an earlier walk) ranks a
-candidate down a tier regardless of match kind — this is a sort/filter hint
-only, never a threshold anything applies automatically.
-`_group_upstream_candidates()` folds the raw per-neighbour-row SQL into one
+`nodesdb._upstream_confidence(match_kind, present)` scores one candidate into
+one of four tiers: `chassis_mac` + `present` is **high** (rank 3);
+`chassis_mac` + stale, or `sys_name` + `present`, is **medium** (rank 2);
+`sys_name` + stale is **low** (rank 1) — a MAC-address match rates above a
+sysName match regardless of freshness (a MAC collision is far rarer than two
+sites both naming a switch "core-sw-1"), and a neighbour row nothing has
+confirmed since an earlier walk never rates above a fresh one of the same
+kind. This is a sort/filter hint only, never a threshold anything applies
+automatically. `_group_upstream_candidates()` folds the raw per-neighbour-row
+SQL into one
 entry per observing device, keeping the single best-evidenced candidate per
 distinct matched device (present beats stale, then confidence tier, then most
 recently seen) and flagging `ambiguous: true` whenever a device's own rows

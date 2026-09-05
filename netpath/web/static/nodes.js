@@ -5031,6 +5031,17 @@
     App.el('nd-topo-zoom-out').onclick = () => topoZoomBy(0.8);
     App.el('nd-topo-reset').onclick = topoResetView;
     App.el('nd-topo-export-csv').onclick = () => App.exportCsv('/api/nodes/topology/export.csv', {});
+    // Injected rather than declared in index.html, the same reason alerts.js
+    // hand-builds its own Maintenance windows/Bulk mute buttons: this needs
+    // no write grant to open (reading suggestions is a Nodes-read question,
+    // same as the diagram beside it), so it is not behind data-requires-write
+    // — the dialog itself hides Apply for an account that cannot use it.
+    const upstreamBtn = document.createElement('button');
+    upstreamBtn.id = 'nd-topo-upstream-suggestions';
+    upstreamBtn.textContent = 'Upstream suggestions';
+    upstreamBtn.onclick = () => upstreamSuggestionsDialog().catch((error) =>
+      App.toast(`Could not open upstream suggestions: ${error.message}`, 'fail'));
+    App.el('nd-topo-export-csv').insertAdjacentElement('afterend', upstreamBtn);
     App.el('nd-page-size').onchange = () => { view.pageOffset = 0; App.refreshNow('nodes'); };
     App.el('nd-page-prev').onclick = () => {
       view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);
@@ -5228,6 +5239,209 @@
     }
     for (const page of document.querySelectorAll('#nd-detail .subpage')) {
       page.classList.toggle('active', page.id === `nd-d-sub-${name}`);
+    }
+  }
+
+  /* ------------------------------------------------ upstream suggestions
+
+     alertrules.py's ROLLED_UP_BY comment explains why a device's alerts get
+     folded under its upstream's outage rather than opening 108 device_down
+     and 108 packet_loss_high alerts for one switch going dark: it needs
+     devices.upstream_id set, and that comment is explicit that a guessed
+     neighbour match may never drive that on its own. Before this dialog the
+     only way to set it was one Edit dialog per device — thousands of clicks
+     with a topology diagram open in another window to know what to type, at
+     fleet scale. This is the other half: nodesdb.upstream_suggestions()
+     already computed the same LLDP/CDP matches the Topology diagram draws,
+     for every device with no upstream_id yet; this dialog is what turns one
+     of those into an operator's decision instead of a guess. Nothing here
+     ever applies one on its own — every assignment sent to the apply route
+     came from a checkbox or a radio an operator actually set. */
+
+  const CONFIDENCE_COLOR = { high: 'var(--ok)', medium: 'var(--warn)', low: 'var(--muted)' };
+  const MATCH_KIND_LABEL = { chassis_mac: 'MAC address match', sys_name: 'name match' };
+
+  function confidenceBadgeHtml(c) {
+    return `<span style="color:${CONFIDENCE_COLOR[c.confidence] || 'var(--muted)'}">${
+      escape(c.confidence)}</span>`;
+  }
+
+  /* What lets an operator say "yes, that is the uplink" without opening a
+     cable schedule: which protocol(s) saw it, on which of THIS device's own
+     ports, and whether the neighbour that reported it is still there. A
+     confidence word alone is a number asking to be trusted; this is the
+     evidence behind it. */
+  function candidateEvidenceHtml(c) {
+    const proto = (c.protocols || []).map((p) => p.toUpperCase()).join('/') || '—';
+    const port = c.local_port ? ` on ${escape(c.local_port)}` : '';
+    const stale = c.stale
+      ? ' <span class="warn-text">— stale, not seen on the last walk</span>' : '';
+    return `${escape(MATCH_KIND_LABEL[c.match_kind] || c.match_kind)}${port} ` +
+      `(${escape(proto)})${stale} · last seen ${ago(c.seen_ts)}`;
+  }
+
+  /* The apply route's own cycle guard names the devices it walked as bare
+     ids ("...through device(s): 41 -> 42 -> 41") — correct for a server
+     that has no reason to hold display names, useless to an operator who
+     was never shown an id anywhere else in this dialog. Resolved through
+     the same shared device index every cross-module device link already
+     uses, rather than a second lookup invented for this one error. Falls
+     back to the original message untouched if the wording ever changes
+     under this — a mis-parsed guess would be worse than the ids. */
+  async function humanizeUpstreamCycleError(error) {
+    const message = (error && error.message) || '';
+    const marker = 'device(s): ';
+    const at = message.indexOf(marker);
+    if (at === -1) return error;
+    const ids = message.slice(at + marker.length).split('->')
+      .map((s) => s.trim()).filter(Boolean);
+    if (!ids.length || !ids.every((s) => /^\d+$/.test(s))) return error;
+    const { byId } = await App.deviceIndex();
+    const names = ids.map((idText) => {
+      const device = byId.get(Number(idText));
+      return device ? displayName(device) : `device ${idText}`;
+    });
+    return new Error(message.slice(0, at + marker.length) + names.join(' -> '));
+  }
+
+  function confidentSuggestionRowHtml(s, writable) {
+    const c = s.candidates[0];
+    const label = escape(s.device_name || s.device_ip || `device ${s.device_id}`);
+    return `<tr data-device-id="${s.device_id}">
+      <td><input type="checkbox" class="us-confident-check" data-device-id="${s.device_id}"
+        data-upstream-id="${c.matched_device_id}" data-confidence="${escape(c.confidence)}"
+        aria-label="Set upstream for ${label}"${writable ? '' : ' disabled'}></td>
+      <td>${label}</td>
+      <td>${escape(c.matched_device_name || '—')}</td>
+      <td>${candidateEvidenceHtml(c)}</td>
+      <td>${confidenceBadgeHtml(c)}</td>
+    </tr>`;
+  }
+
+  /* Two or more plausible upstreams for the same device is not a list to
+     tick — every candidate is shown, but the only way to act on one is to
+     pick it by hand, one radio group per device; "Skip — decide later" is
+     what a device starts on and what leaving it alone means, said outright
+     rather than left as an absence nothing here would otherwise explain. */
+  function ambiguousSuggestionBlockHtml(s, writable) {
+    const label = escape(s.device_name || s.device_ip || `device ${s.device_id}`);
+    const name = `us-amb-${s.device_id}`;
+    const options = s.candidates.map((c) => `
+      <label class="check"><input type="radio" name="${name}" class="us-amb-pick"
+        data-device-id="${s.device_id}" value="${c.matched_device_id}"${writable ? '' : ' disabled'}>
+        ${escape(c.matched_device_name || '—')} — ${candidateEvidenceHtml(c)} ${confidenceBadgeHtml(c)}</label>`
+    ).join('');
+    return `<div class="us-amb-block">
+      <p><b>${label}</b> — ${s.candidates.length} possible upstream(s), pick one</p>
+      <label class="check"><input type="radio" name="${name}" class="us-amb-pick"
+        data-device-id="${s.device_id}" value="" checked${writable ? '' : ' disabled'}>
+        Skip — decide later</label>
+      ${options}
+    </div>`;
+  }
+
+  async function upstreamSuggestionsDialog() {
+    let payload;
+    try {
+      payload = await App.get('/api/nodes/upstream-suggestions');
+    } catch (error) {
+      App.toast(`Could not read upstream suggestions: ${error.message}`, 'fail');
+      return;
+    }
+    const suggestions = payload.suggestions || [];
+    const writable = App.canWrite('nodes');
+    if (!suggestions.length) {
+      // lldp_walks (node_poller's own counters, already on App.state from
+      // every poll) is what tells "nothing has run yet" from "it ran and
+      // there is genuinely nothing to suggest" — the same fleet with zero
+      // suggestions reads very differently depending on which one is true,
+      // and a blank list cannot say which.
+      const walks = ((App.state.serverState || {}).nodes || {}).counters || {};
+      const lead = walks.lldp_walks
+        ? 'No upstream suggestions right now — every device either already ' +
+          'has an upstream set, or none of its LLDP/CDP neighbours matched ' +
+          'another device in this fleet.'
+        : 'No suggestions yet. Neighbour discovery (LLDP/CDP) runs as part ' +
+          'of the regular poll cycle and has not completed a walk yet — ' +
+          'check back once devices have been polled a few times.';
+      App.modal('Upstream suggestions', `<p class="hint">${lead}</p>`,
+        [{ label: 'Close', onClick: App.closeModal }]);
+      return;
+    }
+    const confident = suggestions.filter((s) => !s.ambiguous);
+    const ambiguous = suggestions.filter((s) => s.ambiguous);
+    const box = App.modal('Upstream suggestions', `
+      <p class="hint">Matches against ${confident.length + ambiguous.length} device(s) with
+        no upstream set, from LLDP/CDP neighbours already matched to a device in this fleet.
+        ${writable ? 'Nothing is applied until you press Apply.'
+                   : 'Read-only: needs Nodes write to apply.'}</p>
+      ${confident.length ? `
+      <div class="bar wrap"><span class="section">CONFIDENT MATCHES — ${confident.length} device(s)</span>
+        <span class="grow"></span>
+        <span id="us-selected-count" class="hint"></span>
+        ${writable ? `<button type="button" id="us-select-high">Select all high-confidence</button>
+        <button type="button" id="us-select-none">Clear selection</button>` : ''}</div>
+      <div class="table-wrap scrollbox large"><table id="us-confident-table">
+        <caption class="sr-only">Confident upstream matches</caption>
+        <thead><tr><th scope="col"></th><th scope="col">Device</th><th scope="col">Matched upstream</th>
+          <th scope="col">Evidence</th><th scope="col">Confidence</th></tr></thead>
+        <tbody>${confident.map((s) => confidentSuggestionRowHtml(s, writable)).join('')}</tbody>
+      </table></div>` : ''}
+      ${ambiguous.length ? `
+      <div class="bar"><span class="section">AMBIGUOUS — ${ambiguous.length} device(s), pick one</span></div>
+      <div class="scrollbox large">
+        ${ambiguous.map((s) => ambiguousSuggestionBlockHtml(s, writable)).join('')}
+      </div>` : ''}`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      ...(writable ? [{ label: 'Apply', primary: true, onClick: async (dialogBox, button) => {
+        const assignments = [];
+        for (const cb of dialogBox.querySelectorAll('.us-confident-check:checked')) {
+          assignments.push({ device_id: Number(cb.dataset.deviceId),
+                            upstream_id: Number(cb.dataset.upstreamId) });
+        }
+        for (const radio of dialogBox.querySelectorAll('.us-amb-pick:checked')) {
+          if (!radio.value) continue;   // "Skip — decide later"
+          assignments.push({ device_id: Number(radio.dataset.deviceId),
+                            upstream_id: Number(radio.value) });
+        }
+        if (!assignments.length) {
+          throw new Error('Nothing selected — tick a confident match, or pick one for an ambiguous device.');
+        }
+        return App.runJob(button, { queued: 'Applying…',
+          done: (result) => `Applied ${result.updated}.` }, (async () => {
+          let result;
+          try {
+            result = await App.post('/api/nodes/upstream-suggestions/apply', { assignments });
+          } catch (error) {
+            throw await humanizeUpstreamCycleError(error);
+          }
+          App.closeModal();
+          App.refreshNow('nodes');
+          return result;
+        })());
+      } }] : []),
+    ], { buttonsTop: true });
+    box.classList.add('wide');
+    if (writable) {
+      const updateSelectedCount = () => {
+        const n = box.querySelectorAll('.us-confident-check:checked').length +
+          box.querySelectorAll('.us-amb-pick:checked:not([value=""])').length;
+        const el = box.querySelector('#us-selected-count');
+        if (el) el.textContent = n ? `${n} selected` : '';
+      };
+      box.addEventListener('change', updateSelectedCount);
+      const selectHigh = box.querySelector('#us-select-high');
+      if (selectHigh) selectHigh.onclick = () => {
+        for (const cb of box.querySelectorAll('.us-confident-check')) {
+          cb.checked = cb.dataset.confidence === 'high';
+        }
+        updateSelectedCount();
+      };
+      const selectNone = box.querySelector('#us-select-none');
+      if (selectNone) selectNone.onclick = () => {
+        for (const cb of box.querySelectorAll('.us-confident-check')) cb.checked = false;
+        updateSelectedCount();
+      };
     }
   }
 

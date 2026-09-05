@@ -39,9 +39,11 @@ the scrolling strip entirely, so narrowing the window can shrink the tabs but
 never scroll those out of reach — and below about 480 px, Search, Account and
 Sign out collapse from a text label to an icon so they go on fitting beside
 the tabs rather than crowding them out (each keeps its accessible name, so
-nothing a screen reader announces changes). A tab that becomes current while
-the strip is scrolled elsewhere — a digit shortcut, a pasted link, kiosk
-rotation — scrolls itself into view. Routes is the NetPath module — the tab
+nothing a screen reader announces changes); below about 360 px the signed-in
+username and the wordmark's own text disappear as well rather than merely
+truncating. A tab that becomes current while the strip is scrolled elsewhere
+— a digit shortcut, a pasted link, Back/Forward, kiosk rotation — scrolls
+itself into view. Routes is the NetPath module — the tab
 says what it shows, the package, database and settings keep the name they
 have always had. Dashboard aggregates whatever other modules the signed-in
 account can read — see Permissions, under Settings — rather than holding data
@@ -1217,18 +1219,19 @@ name can collide (two sites both naming a switch "core-sw-1"); suppressing a
 real, unrelated fault because of a guess is the one failure this feature must
 never have, so the neighbour table alone never sets `upstream_id`.
 
-**From 4.49.0, reviewing that guess is no longer one Edit dialog per
-device.** `GET /api/nodes/upstream-suggestions` lists every device with no
-`upstream_id` set whose own collected neighbours matched another monitored
-device, ranked by evidence — a chassis-MAC match rated above a sysName match,
-a neighbour nothing has confirmed recently rated down regardless of match
-kind — and flags a device with more than one plausible match rather than
-picking one for you. An operator reviews the list and accepts a batch in one
-call; the whole proposed graph is checked for a cycle no single pair could
-show before anything is written, and a batch that would create one is
-refused outright, naming the devices involved. This is still a proposal an
-operator confirms, never something the rollup applies on its own — the
-review is the fix for "two thousand manual edits", not a reason to stop
+**From 4.49.0, reviewing that guess no longer has to mean one Edit dialog per
+device.** An API pair does the work a review screen will eventually sit in
+front of: one route lists every device with no `upstream_id` set whose own
+collected neighbours matched another monitored device, ranked by evidence —
+a chassis-MAC match rated above a sysName match, a neighbour nothing has
+confirmed recently rated down regardless of match kind — and flags a device
+with more than one plausible match rather than picking one for you; a second
+route takes a batch of accepted device/upstream pairs and applies them
+together, after checking the whole proposed graph for a cycle no single pair
+could show on its own, refusing the batch outright and naming the devices
+involved if it would create one. This is still a proposal to be confirmed,
+never something the rollup applies on its own — the review is the fix for
+"two thousand manual edits", not a reason to stop
 requiring one.
 
 When a device stops answering and its upstream is also down, the alert rolls up

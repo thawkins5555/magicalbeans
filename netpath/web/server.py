@@ -350,6 +350,13 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/timeline$", api.get_nodes_device_timeline, ("nodes", R)),
+    # Fleet-wide reports (netpath/report.py), not scoped to one device the
+    # way the routes above are — matched before any "(\d+)" device route
+    # could apply, though "reports" would never match \d+ anyway.
+    ("GET", r"^/api/nodes/reports/availability$",
+     api.get_nodes_reports_availability, ("nodes", R)),
+    ("GET", r"^/api/nodes/reports/top-metrics$",
+     api.get_nodes_reports_top_metrics, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/(\d+)/credential$", api.post_nodes_device_credential, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)/credential$", api.delete_nodes_device_credential, ("nodes", W)),
     ("GET", r"^/api/nodes/device-groups$", api.get_nodes_device_groups, ("nodes", R)),

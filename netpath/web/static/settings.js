@@ -549,6 +549,222 @@
     }
   }
 
+  /* -------------------------------------------------------------- audit
+
+     appdb.py's audit table (audit_query()) — every credential store/clear,
+     user create/permission-change/delete, token issue/revoke, settings
+     change, maintenance prune, self-update attempt and sign-in outcome,
+     written to disk and never trimmed by anything in this application.
+     It existed, was served at GET /api/audit, and had no page anywhere
+     that read it: the one feature whose entire purpose is to be read by
+     a person, unreadable by any person. Read-only end to end, matching
+     the API beneath it — nothing here writes to the trail.
+
+     Keyset pagination, newest first: Load older asks for rows older than
+     the smallest id already on screen (`before_id`), and the server
+     answers "more below" by fetching one row past `limit` rather than a
+     COUNT(*) over a table that is deliberately never trimmed. */
+  const AUDIT_LIMIT = 100;
+  // Persisted across visits: the range/target/search text. NOT the user/
+  // action dropdowns — those are rebuilt from server data on every load
+  // (auditFillDropdowns), and restoring a value into a <select> that does
+  // not have that option yet (the very first paint, before any data has
+  // arrived) silently drops it; keeping this to controls that always
+  // exist avoids that race rather than working around it.
+  const AUDIT_CONTROLS = ['audit-range', 'audit-target', 'audit-q'];
+  let auditRows = [];        // what's on screen, oldest-loaded last
+  let auditTruncated = false;
+  // Bumped on every filter change, Clear, or fresh load; a page fetched
+  // for a generation that is no longer current (Load older answering
+  // after the operator has already changed the filters) is discarded
+  // rather than appended onto rows it no longer belongs with.
+  let auditGeneration = 0;
+
+  function auditVisible() {
+    return App.canRead('admin');
+  }
+
+  function auditWindow() {
+    const seconds = Number(App.el('audit-range').value) || 2592000;
+    const t1 = Date.now() / 1000;
+    return { t0: t1 - seconds, t1 };
+  }
+
+  function auditFilters() {
+    return {
+      username: App.el('audit-user').value,
+      action: App.el('audit-action').value,
+      target: App.el('audit-target').value.trim(),
+      q: App.el('audit-q').value.trim(),
+    };
+  }
+
+  /* `target` follows "<kind>:<value>" for credential.store/clear and
+     alert.mute/unmute (device:<ip>, profile:<name>, configrx:<ip>,
+     controller:<ip>) but is a bare id, username or name for most other
+     actions (user.*, token.*, alert.ack/resolve/window_*) — there is
+     nothing to link a bare value to. Of the kinds that do carry an
+     identifier, only device: and configrx: name something this
+     application already has a page for; profile: and controller: do
+     not, so they stay plain text until one exists. This is the first
+     half of making target a link — the second half is whoever wires a
+     device's own page to link back here with ?target=device:<ip>
+     already filled in (see the route read in App.pages.settings.activate,
+     below), which this only has to be ready to receive. */
+  async function auditTargetHtml(target) {
+    const text = escape(target || '');
+    if (!target) return '';
+    const at = target.indexOf(':');
+    if (at === -1) return text;
+    const kind = target.slice(0, at);
+    const value = target.slice(at + 1);
+    if (kind !== 'device' && kind !== 'configrx') return text;
+    const { byIp } = await App.deviceIndex();
+    const device = byIp.get(value);
+    if (!device) return text;
+    return `<a class="linkish inline" href="${App.buildRoute(kind, ['device', device.id])}">${text}</a>`;
+  }
+
+  // Thirty days of every administrative action is a lot of rows, and most
+  // of them are not what "who changed that" is actually asking about: a
+  // routine alert acknowledgement or an ordinary successful sign-in
+  // happens dozens of times a day and would otherwise bury the handful of
+  // rows a month that changed something. Nothing here is hidden, excluded
+  // or fetched differently — every row every filter matches is still on
+  // screen and still counted — this only mutes the text, the same
+  // distinction severity already draws with colour elsewhere in this
+  // application, so the rows that changed configuration or access still
+  // read first even in an unfiltered thirty-day view.
+  const AUDIT_ROUTINE_PREFIXES = ['alert.', 'signin.ok', 'token.expired_use'];
+  function auditIsRoutine(action) {
+    return AUDIT_ROUTINE_PREFIXES.some((prefix) => action.startsWith(prefix));
+  }
+
+  async function auditRowHtml(row) {
+    const targetHtml = await auditTargetHtml(row.target);
+    const routine = auditIsRoutine(row.action);
+    return `<tr${routine ? ' class="audit-row-routine"' : ''}>` +
+      `<td>${App.agoCell(row.ts)}</td>` +
+      `<td>${escape(row.username)}</td>` +
+      `<td class="mono">${escape(row.client)}</td>` +
+      `<td>${escape(row.action)}</td>` +
+      `<td>${targetHtml}</td>` +
+      `<td>${escape(row.detail)}</td></tr>`;
+  }
+
+  function auditStatusText() {
+    if (!auditRows.length) return 'Nothing in this window matches.';
+    const noun = auditRows.length === 1 ? 'row' : 'rows';
+    return auditTruncated ? `${auditRows.length} ${noun} shown, more below`
+                          : `${auditRows.length} ${noun} shown`;
+  }
+
+  async function auditDrawTable() {
+    const table = App.el('audit-table');
+    if (!table) return;
+    table.innerHTML = '<caption class="sr-only">Audit trail</caption><thead><tr>' +
+      '<th scope="col">Time</th><th scope="col">User</th>' +
+      '<th scope="col">Client</th><th scope="col">Action</th>' +
+      '<th scope="col">Target</th><th scope="col">Detail</th></tr></thead>';
+    const body = document.createElement('tbody');
+    // One await per row (a device link needs the shared index) resolved
+    // together rather than in sequence — a hundred rows awaited one at a
+    // time would be a hundred microtask round trips for what is, after
+    // the first row warms App.deviceIndex()'s own cache, no real work.
+    body.innerHTML = (await Promise.all(auditRows.map(auditRowHtml))).join('');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+    App.el('audit-status').textContent = auditStatusText();
+    App.el('audit-more').hidden = !auditTruncated;
+  }
+
+  async function auditFetchPage(beforeId) {
+    const { t0, t1 } = auditWindow();
+    const params = { t0, t1, limit: AUDIT_LIMIT, ...auditFilters() };
+    if (beforeId !== undefined) params.before_id = beforeId;
+    return App.get('/api/audit', params);
+  }
+
+  /* Rebuilt from the same response the rows came from, not fetched
+     separately — audit_usernames()/audit_action_names() are cheap next to
+     the query this already ran, and folding them in means the dropdowns
+     can never disagree with what the rows just showed. The empty "Any…"
+     option is the one already in index.html; only the real values are
+     regenerated. */
+  function auditFillDropdowns(payload) {
+    const fill = (id, values) => {
+      const select = App.el(id);
+      const keep = select.value;
+      const blank = select.querySelector('option[value=""]');
+      select.innerHTML = (blank ? blank.outerHTML : '')
+        + values.map((v) => `<option value="${escape(v)}">${escape(v)}</option>`).join('');
+      if (values.includes(keep)) select.value = keep;
+    };
+    fill('audit-user', payload.usernames || []);
+    fill('audit-action', payload.actions || []);
+  }
+
+  async function auditLoad() {
+    if (!auditVisible()) {
+      App.el('audit-denied').hidden = false;
+      App.el('audit-body').hidden = true;
+      return;
+    }
+    App.el('audit-denied').hidden = true;
+    App.el('audit-body').hidden = false;
+    const generation = ++auditGeneration;
+    App.el('audit-status').textContent = 'Loading…';
+    App.el('audit-more').hidden = true;
+    try {
+      const payload = await auditFetchPage();
+      if (generation !== auditGeneration) return;   // a newer load is already in flight
+      // GET /api/audit answers `since`/`limit` today (a live cursor,
+      // audit_events()) and does not yet accept t0/t1/username/action/
+      // target/q/before_id (audit_query()) — a real gap between this
+      // subtab and the server it talks to, not a bug in either half, and
+      // worth saying so plainly rather than showing an empty table that
+      // looks like "nothing happened" when the truth is "not wired up yet".
+      if (payload.rows === undefined && payload.events !== undefined) {
+        auditRows = [];
+        auditTruncated = false;
+        await auditDrawTable();
+        App.el('audit-status').textContent = 'The server has not been updated to answer '
+          + 'this search yet (GET /api/audit still only answers the old since/limit '
+          + 'shape) — this is not an empty audit trail.';
+        return;
+      }
+      auditRows = payload.rows || [];
+      auditTruncated = !!payload.truncated;
+      auditFillDropdowns(payload);
+      await auditDrawTable();
+    } catch (error) {
+      if (generation !== auditGeneration) return;
+      auditRows = [];
+      App.el('audit-status').textContent = `Could not load the audit trail: ${error.message}`;
+    }
+  }
+
+  async function auditLoadMore() {
+    if (!auditRows.length) return;
+    const generation = auditGeneration;
+    const oldestId = auditRows[auditRows.length - 1].id;
+    const button = App.el('audit-more');
+    button.disabled = true;
+    try {
+      const payload = await auditFetchPage(oldestId);
+      if (generation !== auditGeneration) return;   // filters changed while this was in flight
+      auditTruncated = !!payload.truncated;
+      auditRows = auditRows.concat(payload.rows || []);
+      await auditDrawTable();
+    } catch (error) {
+      if (generation === auditGeneration) {
+        App.el('audit-status').textContent = `Could not load more: ${error.message}`;
+      }
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   /* ------------------------------------------------------------- users */
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -941,6 +1157,28 @@
     loadUsers().catch(() => {});
     loadTokens().catch(() => {});
     App.el('add-token').onclick = addToken;
+    App.fillRanges(App.el('audit-range'), 'Last 30 days');
+    App.rememberControls('settings', AUDIT_CONTROLS);
+    App.el('audit-apply').onclick = () => auditLoad();
+    App.el('audit-clear').onclick = () => {
+      App.el('audit-range').value = '2592000';
+      App.el('audit-user').value = '';
+      App.el('audit-action').value = '';
+      App.el('audit-target').value = '';
+      App.el('audit-q').value = '';
+      App.syncControls('settings', AUDIT_CONTROLS);
+      auditLoad();
+    };
+    App.el('audit-target').onkeydown = (e) => { if (e.key === 'Enter') auditLoad(); };
+    App.el('audit-q').onkeydown = (e) => { if (e.key === 'Enter') auditLoad(); };
+    App.el('audit-user').onchange = () => auditLoad();
+    App.el('audit-action').onchange = () => auditLoad();
+    App.el('audit-range').onchange = () => auditLoad();
+    App.el('audit-more').onclick = () => auditLoadMore();
+    // Last, like the range list above it: the range is filled first so a
+    // restored choice has an option to land on.
+    App.restoreControls('settings', AUDIT_CONTROLS);
+    auditLoad();
     App.el('ldap-apply').onclick = applyLdapSettings;
     App.el('ldap-test').onclick = testLdap;
     for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
@@ -1004,7 +1242,24 @@
 
   App.pages.settings = {
     init,
-    activate: () => { load(); loadUsers().catch(() => {}); loadTokens().catch(() => {}); },
+    // #/settings/audit?target=device:<ip> (or configrx:<ip>) is the route a
+    // device's own page can one day link back here with, pre-filtered to
+    // its own history — the subtab itself is already selected by the time
+    // this runs (app.js's applySubtabFromRoute matches `parts[0]` against
+    // the .subtab buttons before activate() is called), so this only has
+    // to read the query and hand it to the same Search a person typing it
+    // by hand would trigger.
+    activate: (opts) => {
+      load();
+      loadUsers().catch(() => {});
+      loadTokens().catch(() => {});
+      const target = opts && opts.query && opts.query.target;
+      if (target) {
+        App.el('audit-target').value = target;
+        App.syncControls('settings', AUDIT_CONTROLS);
+      }
+      auditLoad();
+    },
     refresh: () => {},
     forcePasswordChange,
   };

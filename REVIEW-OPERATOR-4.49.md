@@ -838,12 +838,10 @@ Not one packet dropped, rejected or errored in either collector, across 107,000 
 and 36,000 syslog messages including a deliberate burst over both UDP and TCP framings.
 The alert engine evaluated 122,425 occurrences with zero backlog and zero apply errors.
 
-**And 6,587 rolled up against 1,475 opened, which puts O-25 in proportion.** The rollup
-is not broken — it suppressed four and a half times more alerts than it let through. What
-it cannot do is retract a child that was already open when its parent arrived, and on the
-shipped configuration that case is guaranteed for the metric rules, because a metric
-degrades before a device is declared down. So the rollup works hard and misses precisely
-the 108 that mattered most.
+**And 6,587 rolled up against 1,475 opened.** The rollup suppressed four and a half
+times more alerts than it let through, while evaluating 122,000 occurrences with no
+backlog. See section 5.6 for a finding of mine about it that turned out to be wrong, and
+the better one that replaced it.
 
 **The three zeros are a finding of their own — see O-27.** After 5,261 polls, no LLDP
 walk, no PoE poll and no STP poll has ever happened, because no persona in the demo fleet
@@ -1350,4 +1348,45 @@ would actually cost this operator.
 
 ## 9. Evidence index
 
-⏳
+Everything in this document that carries a number came from one of these. Nothing was
+reconstructed after the fact.
+
+**The campaign runs**, under `demo/out/`: `tierA/` for the 250-device run —
+`scenario-250.log` with its per-step alert, email, CPU and RSS figures,
+`results-250.json` and `.md`, `seed_summary.json`, `mail-250.log`, the app, fleet and
+generator logs, and `ui/` holding the browser walk's screenshots, console capture,
+metrics and per-step results. `rehearsal/` holds the 25-device proving run that found the
+`FLEET_CONTROL_PORT` defect. ⏳ Tier B and Tier C directories land beside them.
+
+**The button census**, `demo/out/*/ui/buttons-<account>-<tag>.json` — per account, every
+control enumerated with its label, disabled state and disabled reason, and the
+cross-reference of which were activated against which were not. This is what the
+coverage claim in section 2 rests on, and it is deliberately published rather than
+summarised, because "every button was tested" is a claim nobody should accept without
+the list.
+
+**The nav-bar screenshots**, including the pair that is the whole argument for one fix:
+the overflow fade sitting at the strip's true right edge at `scrollLeft 0`, and absent at
+the true end. Plus the strip at 1920, 1366, 1280, 900 and 360 px in both themes, and as
+a read-only account.
+
+**The device-pane screenshots** showing the four new cross-module links in place, each
+target landing pre-filtered, and the permission parity check under a read-only account.
+
+**The fuzzing harness and its curves** — input size against elapsed time for both
+quadratic findings, with the control cases that isolate each mechanism, and the
+independent re-measurement that confirmed time-per-element stays flat once the caps are
+disabled.
+
+**The route-gate cross-reference**, now a permanent check in `tests/test_web_gates.py`
+rather than a one-off: 213 routes parsed from the table, every handler walked for write
+evidence, seven named false positives, and exact expected sets for the ungated routes and
+the public paths.
+
+**The test suites.** Baseline before the campaign: 53 of 53 green. ⏳ Final count lands
+here. Every new suite added by this work is listed in section 7.
+
+**The live instances themselves**, queried directly for the alert composition, the
+collector counters, the API response times and payload sizes, the per-device metric
+tables that establish what a UPS, a Room Alert, a printer and a Windows host actually
+report, and the 108-of-108 measurement of child alerts opening before their parent.

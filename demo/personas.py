@@ -53,7 +53,17 @@ from bisect import bisect_right
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netpath import fortinetoids as fgoids            # noqa: E402
-from netpath.nodeoids import oid_key                  # noqa: E402
+from netpath.nodeoids import (                        # noqa: E402
+    CDP_CACHE_ADDRESS, CDP_CACHE_DEVICE_ID, CDP_CACHE_DEVICE_PORT,
+    CDP_CACHE_PLATFORM, CISCO_POE_PORT_POWER_MW, DOT1D_STP_DESIGNATED_ROOT,
+    DOT1D_STP_PORT_STATE, DOT1D_STP_PRIORITY, DOT1D_STP_PROTOCOL_SPEC,
+    DOT1D_STP_ROOT_COST, DOT1D_STP_ROOT_PORT, DOT1D_STP_TIME_SINCE_CHANGE,
+    DOT1D_STP_TOP_CHANGES, LLDP_REM_CHASSIS_ID, LLDP_REM_CHASSIS_ID_SUBTYPE,
+    LLDP_REM_PORT_DESC, LLDP_REM_PORT_ID, LLDP_REM_PORT_ID_SUBTYPE,
+    LLDP_REM_SYS_DESC, LLDP_REM_SYS_NAME, PETH_MAIN_PSE_CONSUMPTION,
+    PETH_MAIN_PSE_OPER_STATUS, PETH_MAIN_PSE_POWER, PETH_PSE_PORT_ADMIN,
+    PETH_PSE_PORT_DETECTION, oid_key,
+)
 from netpath.trapdecode import (                      # noqa: E402
     T_COUNTER32, T_COUNTER64, T_GAUGE32, T_INTEGER, T_IPADDRESS,
     T_OCTET_STRING, T_OID, T_TIMETICKS, _tlv, enc_int, enc_octets, enc_oid,
@@ -649,6 +659,167 @@ def arc_objects(arc: int, extra_scalars: dict | None = None) -> dict:
     return entries
 
 
+# ---------------------------------------------------------- L2 topology
+#
+# LLDP/CDP neighbours, PoE and STP were three of 4.47.0's Tier 1 features
+# and none of them had ever been answered by this fleet — the Topology
+# tab, the device pane's Neighbours/Bridge&RF subtabs and the upstream-
+# suggestion feature all had nothing to draw. What follows makes a
+# specific, deliberate SUBSET of the fleet answer all four, shaped to
+# match the site plan fleet_plan() already describes rather than wired so
+# every device claims to neighbour every other one (which would light up
+# the Topology tab and prove nothing).
+#
+# The anchor is core-sw-01 — index 0, the one name fleet_plan() NEVER
+# varies regardless of --count — so every claim below can be a real,
+# resolvable fact about the fleet's actual shape without needing to know
+# which specific device instance is being built: acc-sw-001 through
+# acc-sw-010 are the ten access switches SPECIALS always numbers first
+# (indices 2-7,9-12), so they exist at any --count large enough to reach
+# those indices at all, the same guarantee this file's other "pin one
+# early" reasoning already relies on (see _MUST_APPEAR_EARLY's since-
+# removed comment history, or SPECIALS itself).
+
+def _mac_for(name: str, offset: int = 0) -> bytes:
+    """The MAC DeviceState.mac(offset) would compute for the device
+    NAMED `name` — used here so one persona's LLDP chassis-MAC claim
+    about ANOTHER device agrees with what that other device's own
+    interface table actually answers for ifPhysAddress (nodesdb's
+    chassis-MAC neighbour join, gated on chassis_id_subtype 4), without
+    needing a live DeviceState for it: a persona builder only ever knows
+    a neighbour's NAME, never its instance. Must stay byte-for-byte
+    identical to DeviceState.mac()'s own formula."""
+    seed = h("mac", name)
+    return bytes((0x02, (seed >> 16) & 0xFF, (seed >> 8) & 0xFF,
+                 seed & 0xFF, (offset >> 8) & 0xFF, offset & 0xFF))
+
+
+# Every switch persona that answers dot1dStp agrees on this SAME 8-octet
+# bridge id (2-byte priority + 6-byte MAC) as the designated root — the
+# way a real, converged spanning tree actually looks from any bridge in
+# it — computed from core-sw-01's own identity so it is not just a
+# plausible-looking constant.
+ROOT_BRIDGE_ID = bytes((0x80, 0x00)) + _mac_for("core-sw-01", 0)
+
+
+def lldp_neighbor(if_index: int, sys_name: str, chassis_id, port_id: str,
+                  port_descr: str = "", sys_descr: str = "",
+                  chassis_id_subtype: int = 4, port_id_subtype: int = 5,
+                  rem_index: int = 1) -> dict:
+    """One lldpRemTable row (LLDP-MIB) describing the neighbour seen on
+    THIS device's own `if_index`. Indexed
+    lldpRemTimeMark.lldpRemLocalPortNum.lldpRemIndex; nodepoll._walk_lldp
+    uses lldpRemLocalPortNum directly as the ifIndex (see nodeoids' LLDP
+    block for why — the overwhelming majority of real agents, this one
+    included, number it identically) and treats the rest of the suffix as
+    an opaque key, so timeMark is fixed at 0 and remIndex at 1 — this demo
+    never puts two neighbours on one port.
+
+    chassis_id defaults to a MAC (subtype 4,
+    nodeoids.LLDP_CHASSIS_SUBTYPE_MAC_ADDRESS) — pass bytes from
+    _mac_for() so nodesdb's chassis-MAC join actually resolves rather
+    than only the sysName one; a caller with no real MAC to offer can
+    pass a string and chassis_id_subtype=7 (locallyAssigned) instead.
+    """
+    suffix = f"0.{if_index}.{rem_index}"
+    return {
+        f"{LLDP_REM_CHASSIS_ID_SUBTYPE}.{suffix}": (T_INTEGER, chassis_id_subtype),
+        f"{LLDP_REM_CHASSIS_ID}.{suffix}": (T_OCTET_STRING, chassis_id),
+        f"{LLDP_REM_PORT_ID_SUBTYPE}.{suffix}": (T_INTEGER, port_id_subtype),
+        f"{LLDP_REM_PORT_ID}.{suffix}": (T_OCTET_STRING, port_id),
+        f"{LLDP_REM_PORT_DESC}.{suffix}": (T_OCTET_STRING, port_descr),
+        f"{LLDP_REM_SYS_NAME}.{suffix}": (T_OCTET_STRING, sys_name),
+        f"{LLDP_REM_SYS_DESC}.{suffix}": (T_OCTET_STRING, sys_descr),
+    }
+
+
+def cdp_neighbor(if_index: int, device_id: str, device_port: str = "",
+                 platform: str = "", address: bytes | None = None,
+                 cache_index: int = 1) -> dict:
+    """One CISCO-CDP-MIB cdpCacheTable row, on the vendor's own arc as a
+    fallback/supplement alongside LLDP — indexed cdpCacheIfIndex directly
+    (unlike LLDP's local-port assumption, this really IS the ifIndex per
+    the MIB's own INDEX clause, so no join is needed). `address` (raw
+    bytes, e.g. a 4-byte IPv4) is optional: cdpCacheAddress is display-
+    only in this app (nodesdb never joins on it), so a caller with
+    nothing plausible to offer can simply leave it out.
+    """
+    suffix = f"{if_index}.{cache_index}"
+    entries = {
+        f"{CDP_CACHE_DEVICE_ID}.{suffix}": (T_OCTET_STRING, device_id),
+        f"{CDP_CACHE_DEVICE_PORT}.{suffix}": (T_OCTET_STRING, device_port),
+        f"{CDP_CACHE_PLATFORM}.{suffix}": (T_OCTET_STRING, platform),
+    }
+    if address is not None:
+        entries[f"{CDP_CACHE_ADDRESS}.{suffix}"] = (T_OCTET_STRING, address)
+    return entries
+
+
+def dot1d_stp(priority: int, root_cost: int, root_port: int,
+             top_changes: int = 3, time_since_change_ticks: int = 360_000) -> dict:
+    """The seven dot1dStp scalars (BRIDGE-MIB) nodepoll._poll_stp reads in
+    one GET. designated_root is always ROOT_BRIDGE_ID — see that
+    constant's own comment — so every bridge that answers this agrees on
+    who the root is; priority/cost/port are what actually varies per
+    bridge, the same way a real spanning tree does. root_cost=0,
+    root_port=0 for the root bridge itself (core-sw-01's own call site).
+    """
+    return {
+        DOT1D_STP_PROTOCOL_SPEC: (T_INTEGER, 3),            # ieee8021d
+        DOT1D_STP_PRIORITY: (T_INTEGER, priority),
+        DOT1D_STP_TIME_SINCE_CHANGE: (T_TIMETICKS, time_since_change_ticks),
+        DOT1D_STP_TOP_CHANGES: (T_COUNTER32, top_changes),
+        DOT1D_STP_DESIGNATED_ROOT: (T_OCTET_STRING, ROOT_BRIDGE_ID),
+        DOT1D_STP_ROOT_COST: (T_INTEGER, root_cost),
+        DOT1D_STP_ROOT_PORT: (T_INTEGER, root_port),
+    }
+
+
+def dot1d_stp_ports(port_states: dict) -> dict:
+    """dot1dStpPort's per-port state. Keyed by the SAME bridge-port number
+    bridge_ports()/the FDB tables already use — dot1dStpPort IS
+    dot1dBasePort (nodeoids' STP comment), so this shares that numbering
+    rather than inventing a second one. port_states: {bridge_port: state}
+    — 5 (forwarding) for a normal working port, 2 (blocking) for a
+    redundant link deliberately shown blocked."""
+    return {f"{DOT1D_STP_PORT_STATE}.{port}": (T_INTEGER, state)
+            for port, state in port_states.items()}
+
+
+def poe_pse(budget_w: float, port_ifindexes, port_draw_w: dict | None = None,
+           cisco_extension: bool = False) -> dict:
+    """POWER-ETHERNET-MIB: pethMainPseTable (one PSU, group index 1) and
+    pethPsePortTable — nodeoids' PoE comment: pethPsePortIndex is treated
+    as an ifIndex directly, the same real-agent convention LLDP's local-
+    port number already relies on. `cisco_extension` adds the per-port
+    milliwatt reading at CISCO_POE_PORT_POWER_MW (arc 9.9.402) for a
+    device whose sysDescr says Cisco; a non-Cisco PSE must never answer
+    it, which is why this defaults off.
+
+    port_draw_w: {if_index: watts} for a port actually delivering power
+    (admin enabled, detected deliveringPower); every if_index in
+    port_ifindexes NOT in port_draw_w answers enabled/searching instead —
+    a real switch with more PoE-capable ports than connected powered
+    devices.
+    """
+    port_draw_w = port_draw_w or {}
+    consumption_w = sum(port_draw_w.values())
+    entries = {
+        f"{PETH_MAIN_PSE_POWER}.1": (T_GAUGE32, int(budget_w)),
+        f"{PETH_MAIN_PSE_OPER_STATUS}.1": (T_INTEGER, 1),          # on
+        f"{PETH_MAIN_PSE_CONSUMPTION}.1": (T_GAUGE32, int(consumption_w)),
+    }
+    for if_index in port_ifindexes:
+        entries[f"{PETH_PSE_PORT_ADMIN}.1.{if_index}"] = (T_INTEGER, 1)  # enabled
+        drawing = if_index in port_draw_w
+        entries[f"{PETH_PSE_PORT_DETECTION}.1.{if_index}"] = (
+            T_INTEGER, 3 if drawing else 2)     # deliveringPower / searching
+        if drawing and cisco_extension:
+            entries[f"{CISCO_POE_PORT_POWER_MW}.1.{if_index}"] = (
+                T_INTEGER, int(port_draw_w[if_index] * 1000))
+    return entries
+
+
 # --------------------------------------------------------------- personas
 
 def _gig_ports(count: int, uplinks: int, uplink_kind: str = "TenGigabitEthernet",
@@ -726,6 +897,27 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.9.9.48.1.1.1.5.1": (
             T_GAUGE32, lambda st, now: 90_000_000 + (h("memfree", st.name) % 40_000_000)),
     }))
+    # L2 topology: every access switch's real uplink is core-sw-01 (see
+    # this section's own module comment) — reported via both LLDP and CDP,
+    # the way a real Cisco access switch actually answers both at once.
+    uplink_if = access + 1
+    entries.update(lldp_neighbor(
+        uplink_if, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id="GigabitEthernet1/0/1", port_descr="downlink 1",
+        sys_descr=CISCO_CORE_DESCR))
+    entries.update(cdp_neighbor(
+        uplink_if, device_id="core-sw-01", device_port="GigabitEthernet1/0/1",
+        platform="cisco WS-C9500-24Y4C"))
+    # PoE: every access port capable, roughly a third actually drawing
+    # power right now — a real closet switch with more PoE ports than
+    # currently-plugged-in phones/APs.
+    entries.update(poe_pse(
+        740, range(1, access + 1),
+        port_draw_w={i: 6.5 + (h("poe", i) % 90) / 10.0
+                    for i in range(1, access + 1) if h("poedraw", i) % 3 == 0},
+        cisco_extension=True))
+    entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=uplink_if))
+    entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))  # forwarding
     return entries
 
 
@@ -757,6 +949,24 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
         slice_macs = {port: macs[(int(vlan) // 10) % len(macs):][:2]
                       for port, macs in port_macs.items()}
         entries.update(dot1d_fdb(slice_macs))
+    # L2 topology: only the DEFAULT-sized core (core-sw-01, `ports` falsy)
+    # gets a downlink neighbour table — the 500-port chassis SPECIALS
+    # variant (chassis_ports=500, a different device entirely) exists to
+    # demonstrate the interface cap, not this device's own place in the
+    # topology, and claiming the same ten access switches would make two
+    # different "core" devices both report being their upstream.
+    if not ports:
+        for n in range(1, 11):
+            name = f"acc-sw-{n:03d}"
+            entries.update(lldp_neighbor(
+                n, sys_name=name, chassis_id=_mac_for(name, 49),
+                port_id="GigabitEthernet1/0/49", port_descr="uplink to core",
+                sys_descr=CISCO_ACCESS_DESCR))
+            entries.update(cdp_neighbor(
+                n, device_id=name, device_port="GigabitEthernet1/0/49",
+                platform="cisco WS-C2960X-48FPD-L"))
+        entries.update(dot1d_stp(priority=4096, root_cost=0, root_port=0))
+        entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     return entries
 
 
@@ -779,6 +989,20 @@ def _build_aruba(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.14823.2.2.1.1.1.9.0": (
             T_INTEGER, lambda st, now: 15 + (h("acpu", st.name) % 35)),
     }))
+    # L2 topology: this switch's uplink (its last port, 1/24) really does
+    # go to the plant core. No CDP — Aruba is not Cisco.
+    entries.update(lldp_neighbor(
+        count, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id="GigabitEthernet1/0/1", port_descr="downlink 1",
+        sys_descr=CISCO_CORE_DESCR))
+    # PoE+: the model name (2930F-8G-PoE+) already promises it — standard
+    # MIB only, no Cisco extension.
+    entries.update(poe_pse(
+        370, range(1, count + 1),
+        port_draw_w={i: 5.0 + (h("apoe", i) % 60) / 10.0
+                    for i in range(1, count + 1) if h("apoedraw", i) % 3 == 0}))
+    entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=count))
+    entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     return entries
 
 
@@ -849,6 +1073,13 @@ def _build_juniper(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.2636.3.1.13.1.11.9.1.0.0": (     # jnxOperatingBuffer
             T_INTEGER, lambda st, now: 30 + (h("jbuf", st.name) % 40)),
     }))
+    # L2 topology: this distribution switch's first uplink (xe-0/1/0,
+    # ifIndex 25) goes to the plant core.
+    entries.update(lldp_neighbor(
+        25, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id="GigabitEthernet1/0/1", port_descr="downlink 1",
+        sys_descr=CISCO_CORE_DESCR))
+    entries.update(dot1d_stp(priority=32768, root_cost=4, root_port=25))
     return entries
 
 
@@ -999,6 +1230,15 @@ def _build_scalance(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.4196.1.1.5.3.1.1.0": (T_INTEGER, 1),      # power supply 1 ok
         "1.3.6.1.4.1.4196.1.1.5.3.1.2.0": (T_INTEGER, 2),      # power supply 2 failed
     }))
+    # L2 topology: this cell/area switch's uplink (port 8) goes to the
+    # plant core. No PoE — industrial DIN-rail switches this size
+    # typically are not PSEs.
+    entries.update(lldp_neighbor(
+        8, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id="GigabitEthernet1/0/1", port_descr="downlink 1",
+        sys_descr=CISCO_CORE_DESCR))
+    entries.update(dot1d_stp(priority=32768, root_cost=19, root_port=8))
+    entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     return entries
 
 
@@ -1016,6 +1256,14 @@ def _build_moxa(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.8691.7.6.1.1.1.0": (T_OCTET_STRING, "EDS-408A-MM-SC"),
         "1.3.6.1.4.1.8691.7.6.1.1.5.0": (T_INTEGER, 1),        # turbo ring healthy
     }))
+    # L2 topology: this field switch's uplink (port 8) goes to the plant
+    # core. No PoE, same reasoning as SCALANCE above.
+    entries.update(lldp_neighbor(
+        8, sys_name="core-sw-01", chassis_id=_mac_for("core-sw-01", 1),
+        port_id="GigabitEthernet1/0/1", port_descr="downlink 1",
+        sys_descr=CISCO_CORE_DESCR))
+    entries.update(dot1d_stp(priority=32768, root_cost=19, root_port=8))
+    entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     return entries
 
 

@@ -995,6 +995,11 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
    class="mono". */
 table { width: 100%; border-collapse: collapse; font-family: var(--ui); font-size: var(--fs-xs); }
 td.mono, th.mono, .mono { font-family: var(--mono); }
+/* The Audit subtab's routine rows (settings.js's AUDIT_ROUTINE_PREFIXES —
+   alert.*, signin.ok, token.expired_use): still on screen, still counted,
+   only quieter, the same distinction severity already draws with colour
+   elsewhere rather than a second vocabulary invented for this one table. */
+.audit-row-routine td { color: var(--muted); }
 th {
   position: sticky; top: 0;
   background: var(--raised);

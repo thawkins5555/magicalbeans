@@ -40,6 +40,7 @@ from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
+from .. import report as reportmod
 from .. import permissions as _permissions
 from .. import appdb as _appdb
 
@@ -115,12 +116,32 @@ def _num(params, key, default=None, cast=float):
         return default
 
 
-def _window(params) -> tuple[float, float]:
+def _window(params, default_span_s: float = 3600.0) -> tuple[float, float]:
     t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 3600)
+    t0 = _num(params, "t0", t1 - default_span_s)
     if t1 <= t0:
         t1 = t0 + 60
     return t0, t1
+
+
+def _id_list(raw) -> list[int] | None:
+    """A comma-separated `device_ids=1,2,3` query param -> [1, 2, 3], or
+    None when the param was not given at all — distinct from an explicit
+    empty list, which a caller cannot actually send through a query string
+    the same way a POST body could, so None is the only "not specified"
+    a GET route here needs to recognise."""
+    if raw in (None, ""):
+        return None
+    out = []
+    for piece in str(raw).split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            out.append(int(piece))
+        except ValueError:
+            raise ValueError(f"device_ids must be a comma-separated list of ids, not {piece!r}")
+    return out
 
 
 # ------------------------------------------------------------------ general
@@ -3739,6 +3760,81 @@ def get_nodes_device_timeline(service, params, body, device_id) -> dict:
     t0, t1 = _window(params)
     segments = service.nodes_db.device_status_segments(device_id, t0, t1)
     return {"t0": t0, "t1": t1, "segments": segments}
+
+
+# ------------------------------------------------------------------ reports
+#
+# netpath/report.py owns the actual computation (device_availability_report,
+# top_metric_ranking) and the four ways a gap in device_status_segments is
+# NOT the same as "the device was down" — see that module's own docstring.
+# These two routes are the thin dispatch on top of it: query-string parsing,
+# resolving "no device_ids given" to the whole fleet, and, for the top-N
+# ranking, refusing a request shaped the way report.py's own docstring
+# measured at 95-100 seconds rather than letting it block a request thread.
+#
+# A week (604800s) is the exact span top_metric_ranking's docstring measured
+# at 22-23s against a 2,000-device/6-metric-family fixture; a month projects
+# to ~95-100s there. That is the only number either route enforces — the
+# report author's own two suggested levers (narrow device_ids, or route a
+# long whole-fleet ask through something other than a synchronous request)
+# are both offered to the caller: device_ids narrows it, and the refusal
+# below is what stands in for "the background/scheduled path" until one
+# exists. device_availability_report has no equivalent documented cost at
+# fleet scale (report.py's own docstring/benchmarks only measured top-N), so
+# nothing here caps it — a real number should replace this comment, not a
+# guess, if a fleet-wide availability report turns out to be slow too.
+REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S = 7 * 86400.0
+REPORT_TOP_METRICS_MAX_N = 500
+
+
+def get_nodes_reports_availability(service, params, body) -> dict:
+    """Availability/outage/MTTR for a device or the whole fleet over
+    [t0, t1] (default the last 7 days) — see report.device_availability_report
+    for what "available" means and the four things a gap in the history is
+    deliberately NOT treated as. `device_ids` (comma-separated) narrows it;
+    omitted, every device on file is reported on."""
+    t0, t1 = _window(params, default_span_s=7 * 86400.0)
+    device_ids = _id_list(params.get("device_ids"))
+    if device_ids is None:
+        device_ids = [row["id"] for row in service.nodes_db.devices()]
+    result = reportmod.device_availability_report(
+        service.nodes_db, device_ids, t0, t1, alertsdb=service.alerts_db)
+    return result.to_dict()
+
+
+def get_nodes_reports_top_metrics(service, params, body) -> dict:
+    """The top (or bottom) `n` metric series by peak or mean value over
+    [t0, t1] (default the last 7 days) — "which twenty links came closest to
+    saturation" is `key=if_in_util_pct.%&like=1`; "which devices ran
+    hottest" is `key=cpu_pct&rank_by=mean`. See report.top_metric_ranking
+    for the query itself and the measured cost at fleet scale.
+
+    Ranking the WHOLE fleet (no `device_ids`) over more than 7 days is
+    refused outright rather than left to block the request thread for the
+    ~100s report.py's own docstring measured at that shape — narrow
+    `device_ids` or ask for a shorter window instead.
+    """
+    key = str(params.get("key", "")).strip()
+    if not key:
+        raise ValueError("key is required")
+    t0, t1 = _window(params, default_span_s=7 * 86400.0)
+    device_ids = _id_list(params.get("device_ids"))
+    if not device_ids and (t1 - t0) > REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S:
+        raise ValueError(
+            "ranking the whole fleet over more than 7 days is too slow for "
+            "a live request (measured ~100s at 2,000 devices for a month "
+            "in report.top_metric_ranking's own benchmark) — narrow "
+            "device_ids or request a shorter window")
+    rank_by = str(params.get("rank_by") or "peak")
+    if rank_by not in ("peak", "mean"):
+        raise ValueError("rank_by must be 'peak' or 'mean'")
+    like = str(params.get("like", "")).strip().lower() in ("1", "true", "yes")
+    ascending = str(params.get("ascending", "")).strip().lower() in ("1", "true", "yes")
+    n = max(1, min(int(_num(params, "n", 20, int) or 20), REPORT_TOP_METRICS_MAX_N))
+    result = reportmod.top_metric_ranking(
+        service.nodes_db, key, t0, t1, n=n, rank_by=rank_by,
+        ascending=ascending, like=like, device_ids=device_ids)
+    return result.to_dict()
 
 
 def get_nodes_device_events(service, params, body, device_id) -> dict:

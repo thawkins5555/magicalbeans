@@ -244,21 +244,41 @@ logged once, and an operator looking at it is moved off automatically.
 
 **The tab bar went back to twelve flat tabs, with the labelled groups
 replaced by a hairline.** Four named groups (Now/Inventory/Telemetry/Admin,
-new in 4.48.0) are gone; a thin rule before the first tab of each group after
-the first stands in for the label a wrapping `<div data-label>` used to draw.
-Two real bugs came with the four-group markup and are fixed regardless of the
-layout choice: the overflow fade — the gradient that tells you the strip has
-more to scroll to — was drawn as part of the scrolling content itself, so
-scrolling the strip dragged the fade into the middle of it, washing out
-whichever tab sat underneath while the real right edge went un-faded; it now
-lives on the utility group, which never scrolls, and reads the strip's real
-edge regardless of scroll position. And a tab that becomes current while the
-strip is scrolled elsewhere — a digit shortcut, a pasted hash route, kiosk
-rotation — now scrolls itself into view rather than leaving the highlighted
-tab off-screen. Below 480 px, Search/Account/Sign out collapse from text
-buttons to icon-only ones (the accessible name is unchanged, so nothing a
-screen reader announces changes) rather than crowding out the tabs beside
-them.
+new in 4.48.0) were four `<div class="tab-group" data-label="…">` wrappers
+between the tablist and its twelve buttons, and carried two real accessibility
+defects along with the label: a group every one of whose tabs was hidden (a
+permission that covers none of it, or every module in it failing to load)
+left its label standing over nothing, and the twelve `role="tab"` buttons sat
+two DOM levels deep instead of one, so a screen reader's announced position
+("tab 3 of 12") was computed wrong for every one of them. Both are gone by
+construction now that the buttons are direct children of the tablist again; a
+thin rule before the first tab of each old group after the first
+(`.tab--group-start`) stands in for the label at the cost of a few pixels
+rather than roughly 300 of dead heading space. Two more real bugs came with
+the wrapper markup and are fixed regardless of the layout choice: the
+overflow fade — the gradient that tells you the strip has more to scroll to
+— was an absolutely-positioned child of the scrolling strip itself, so it
+translated with `scrollLeft` like any other child would, washing out
+whichever tab it drifted over the moment the strip was scrolled away from
+rest, while the strip's true right edge (Settings, Debug) never got a fade at
+all; a second bug compounded it, since the class that shows the fade ignored
+`scrollLeft` entirely and so stayed lit even scrolled all the way to the true
+end, with nothing left to warn about. The fade now lives on the utility
+group, which never scrolls, reads the strip's true right edge regardless of
+scroll position, and clears once nothing remains to scroll to. And a tab
+that becomes current while the strip is scrolled elsewhere — a digit
+shortcut, a pasted hash route, Back/Forward, kiosk rotation, or the
+automatic fallback off a tab that just lost read access — now scrolls itself
+into view rather than leaving the highlighted tab off-screen. Below 480 px,
+Search/Account/Sign out collapse from text buttons to icon-only ones (the
+accessible name is unchanged, so nothing a screen reader announces changes);
+below 360 px, separately, the signed-in username and the wordmark's own text
+disappear rather than merely truncating — at 360 px the change reclaims
+about 75 px for the tab strip, 55% of the width to 34%. 1366 px, the
+commonest NOC laptop width, still overflows by about 119 px, one tab's
+width; ten of twelve are visible with no interaction there, and the fade
+and the scroll-into-view fix are what make the other two reachable rather
+than merely present.
 
 **The rollup that stops a site outage becoming a mailbox full of alerts
 depended on a field an operator had to set by hand, once per device.**
@@ -286,34 +306,47 @@ into something the rollup may trust. The rollup itself, unchanged since
 switch and 108 devices behind it — opened 228 alerts and sent 11 emails,
 where the same shape of event measured against 4.35.0 produced 1,355.
 
-**A dozen interface defects, one of them a real functional break.** Bulk mute
-failed for every selection, silently: the bulk-mute and maintenance-window
-dialogs share one scope picker, and the picker answers in the window's own
-field shape (`scope_kind`/`scope_group_id`/`scope_device_ids`) that the older
-bulk-mute route never grew — so every bulk mute reached the server as fields
-it does not read and failed regardless of what was selected, with the
-resulting error the only part behaving as intended. Fixed by translating at
-the call site, since the windows dialog is right to keep the shape it has.
-Template Preview read the stored row rather than the request body, so
-previewing an edit had always saved it first — an operator who previewed a
-change and thought better of it had already overwritten the template with no
-way back; Preview now snapshots the server's version when the dialog opens and
-restores it on Cancel. A device-count label with nothing to compare against
-("500 device(s)", on a list now server-paged and possibly showing a fraction
-of what matched) moved onto the same shared count label the rest of the
-product already uses. Destructive actions that shared a button row with Save
+**Over a dozen interface defects, one of them a real functional break every
+time it was used.** Bulk mute failed for every selection, loudly rather than
+silently: the bulk-mute and maintenance-window dialogs share one scope
+picker, and the picker answers in the window's own field shape
+(`scope_kind`/`scope_group_id`/`scope_device_ids`) that the older bulk-mute
+route never grew — so every bulk mute reached the server as fields it does
+not read and was refused regardless of what was selected, with the server's
+own validation message the only part behaving as intended. Fixed by
+translating the scope at the bulk-mute call site, since the maintenance
+windows dialog is right to keep the shape it has. Template Preview read the
+stored row rather than the request body, so previewing an edit had always
+saved it first — an operator who previewed a change and thought better of it
+had already overwritten the live template, the one the alert engine actually
+sends mail from, with no way back; Preview now snapshots the template when
+the dialog opens and restores it on Cancel (Escape and a backdrop click go
+through a different, shared discard path that doesn't yet call the same
+restore — recorded as the honest limit of this fix rather than papered over).
+A device-count label with nothing to compare against ("500 device(s)", on a
+list now server-paged and possibly showing a fraction of what matched) moved
+onto the same shared count label the rest of the product already uses, and
+the Alerts tab's own badge and subtab pill — which counted `open` alerts
+only, against a view that shows open *and* acknowledged by default —
+stopped undercounting the moment anything was acknowledged. Eleven
+destructive actions across five files that shared a button row with Save,
 looking identical to it — clearing a stored enable secret, forgetting an SSH
-host key, removing a subnet or a DHCP server, clearing IPAM stats, removing a
-device, discarding a scan — now carry the `danger` styling every other
+host key, removing a subnet, a DHCP server or a wireless controller,
+clearing IPAM stats, removing a device, discarding a scan, resetting a
+template to default — now carry the `danger` styling every other
 trust-destroying action in the product already used, peeled away from Save
-rather than sitting beside it. `resolveMacSearch` said nothing when a search
-box held something that wasn't a MAC at all, rather than distinguishing "not a
-MAC" from "the server refused this MAC" — the far more common reason to type
-digits and dots into that box is an IP address, whose octets are valid hex
-too. And ConfigRX's Diff buttons were gated `configrx: write`, left over from
-before 4.48.0 moved reading a single stored backup to `configrx: read`;
-comparing two backups a reader can already open one at a time is not a write,
-and it's the single most common thing anyone does with a config backup.
+rather than sitting beside it; a maintenance window's End now and Delete
+buttons, previously fully enabled but silently wired to nothing for a
+read-only account, now show the same disabled-with-reason every other
+write-gated control already does. `resolveMacSearch` said nothing when a
+search box held something that wasn't a MAC at all, rather than
+distinguishing "not a MAC" from "the server refused this MAC" — the far more
+common reason to type digits and dots into that box is an IP address, whose
+octets are valid hex too. And ConfigRX's Diff buttons were gated
+`configrx: write`, left over from before 4.48.0 moved reading a single
+stored backup to `configrx: read`; comparing two backups a reader can
+already open one at a time is not a write, and it's the single most common
+thing anyone does with a config backup.
 
 **Started under a service manager, the application printed nothing at all —
 including the one line that warns a sign-in is travelling in the clear.**
@@ -333,14 +366,30 @@ over every decoder that takes unauthenticated or uploaded input.** Every one
 of 213 routes in `web/server.py` was parsed and every handler's write
 behaviour traced up to four calls deep; the seven flagged as possible
 mismatches were all false positives on reading, and the two routes whose gate
-depends on the request body were confirmed correct by hand. `trapdecode`,
-`nfdecode`, and both regular expressions in `syslogparse` were fuzzed to 1 MB
-and came back clean — truncation at every one of the 84 byte boundaries of a
-valid v2c trap, a template that redefines itself mid-packet, a 60,000-byte
-field claimed in a 10-byte record, all rejected or handled with no unhandled
-exception. `demo/selftest.py`, the offline wire-format conformance check every
-persona is driven through, went from 623 checks to 897 as the new device
-classes were added, all passing.
+depends on the request body were confirmed correct by hand. That
+cross-reference now runs at test time, against a seven-entry allow-list of
+the named false positives, so a new mismatch has to be justified rather than
+silently absorbed — "we checked once" and "it cannot regress" are different
+claims, and only the second is durable. `trapdecode`, `nfdecode`, and both
+regular expressions in `syslogparse` were fuzzed to 1 MB and came back clean
+— truncation at every one of the 84 byte boundaries of a valid v2c trap, a
+template that redefines itself mid-packet, a 60,000-byte field claimed in a
+10-byte record, all rejected or handled with no unhandled exception.
+`demo/selftest.py`, the offline wire-format conformance check every persona
+is driven through, went from 623 checks to 897 as the new device classes
+were added, all passing.
+
+A related residual, found by the same fuzzing and left as a stated
+observation rather than a third fix: `mibparse._iter_macro_clauses`, the
+generator behind the macro-clause scan, also escapes `parse()`'s per-unit
+budget check — its interior is invisible to a check that only ever fires on
+a *yielded* clause, and a generator's interior is a unit of work like any
+other. Measured at up to 16× its expected cost, but bounded by the shipped
+8 MB upload cap to 2.1 s against the 5 s budget, so it stays inside budget at
+every size this application will actually parse rather than needing the fix
+the other two got. The lesson generalizes past this one file: a budget
+checked between units of work cannot bound a unit of work, and "unit"
+includes whatever a generator does before its next yield.
 
 **The harness could not run this campaign on Windows at all, and now it
 can.** Two callers of the same `ping` binary resolved it two different ways —
@@ -356,14 +405,56 @@ for CPU and memory, which does not exist on Windows and silently returned
 nothing; it now reads the same figures through `GetProcessTimes` and
 `GetProcessMemoryInfo` on Windows, with no new dependency.
 
+**A real Windows deployment cost this measured rather than only described.**
+Every SNMP-polled device is also pinged, several probes per poll, through
+`ipam_scan.ping_many` — the same function IPAM's discovery scan uses, which
+4.47.0 moved off a subprocess per probe onto one socket per process, and
+documented the subprocess path as the deliberate, unchanged fallback
+wherever a raw or unprivileged datagram ping socket isn't available — which
+on Windows is always. This campaign put a number on that fallback's real
+cost to the ordinary poll cycle: eight runs of `ping_many(ip, 3, 1000)`
+against the real `C:\WINDOWS\system32\ping.EXE` (not the demo harness's
+Python shim, which pays interpreter startup and a `cmd.exe`/launcher hop
+that a real binary doesn't, and cannot be quoted as a product cost) measured
+a mean of 46.7 ms per call — 15.6 ms per probe. At the shipped defaults for
+a 2,000-device fleet — ping enabled, three probes, every 60-second poll —
+that is 6,000 process creations a minute, or 94 seconds of `CreateProcess`
+work that has to happen inside every 60-second window. It does not fit
+serially, on the same machine that also has to run the poller. Nothing
+about this is a bug — the code already explains the fallback and already
+names `ping_interval_s`/`ping_enabled` as the way to back off it — but
+neither setting is one an operator would know to reach for, and this is the
+number that says why they'd need to.
+
+**A NetPath destination's own numbers could turn one target into a runaway
+spawn loop.** `interval_s`, `max_hops`, `probes`, `timeout_s` and
+`trace_workers` were only ever checked for being *a number*, never a sane
+one, and four of them are not cosmetic: `max_hops`/`probes`/`timeout_s` are
+handed straight to `tracer`'s traceroute/tracert command line and to its own
+worst-case-runtime arithmetic, and `monitor.py`'s scheduler computes
+`next_run = last_run + interval_s` — so an interval at or below zero makes a
+destination perpetually due, and the scheduler launches a fresh traceroute
+subprocess against it as fast as the worker pool turns them over, the same
+spawn-storm shape `ipam_scan.py`'s own docstring already describes for an
+unpaced ping sweep. All five are now clamped (`interval_s` 5 s–30 days,
+`max_hops` 1–255, one byte on the wire so no path is ever longer, `probes`
+1–20, `timeout_s` 0.1–30 s, `trace_workers` 1–64), each bound justified by
+the mechanism it guards rather than picked round.
+
 Still open, and part of why this campaign keeps running rather than closing
-here: no report of device availability or link utilisation over any stored
-history, though the samples to build one already exist; no way to search or
-check compliance across two thousand stored ConfigRX backups; an audit trail
-that still cannot be read from the interface and does not yet cover adding a
-device, editing an alert rule or pushing a ConfigRX backup; and a printer,
-identified correctly, that still answers with nothing but an interface
-counter and a ping time.
+here: a printer, identified correctly, that still answers with nothing but
+an interface counter and a ping time; and an audit trail that still cannot
+be read from the interface and does not yet cover adding a device, editing
+an alert rule or pushing a ConfigRX backup. Two things are further along
+than "open" but not yet reachable: search and named compliance rule sets
+across stored ConfigRX backups are built and tested against the database
+directly — redacted text only, ever — and device availability and top-N
+utilisation reporting (`netpath/report.py`) are likewise built and tested
+against real history, four different ways a gap in that history is *not*
+the same as "the device was down" reasoned through and handled explicitly
+(a maintenance window, an expired mute, the device not existing yet, the
+poller itself having been stopped). Neither has a route serving it to the
+interface yet.
 
 ### 4.48.0 — The interface, reviewed
 
