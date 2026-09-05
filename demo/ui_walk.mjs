@@ -16,8 +16,17 @@
  * Produces, in --out:
  *   tab-<name>-<tag>.png             every top-level tab, admin pass
  *   sub-<tab>-<name>-<tag>.png       every subtab (admin pass), including
- *                                    Nodes' Topology, the device-detail
- *                                    pane's four nested subtabs, and
+ *                                    Nodes' Topology, Discovery, Profiles &
+ *                                    MIBs and Reports (4.50.0 — its own
+ *                                    nested availability/top-metrics tablist
+ *                                    is driven by the feature:nodes-*-report
+ *                                    steps below, not screenshot here on its
+ *                                    own), the device-detail pane's four
+ *                                    nested subtabs, ConfigRX's Devices,
+ *                                    Search and Compliance (also 4.50.0 —
+ *                                    see feature:configrx-search-* and
+ *                                    dlg:configrx-compliance-* below for
+ *                                    what actually runs on them), and
  *                                    Settings' eight (general/retention/
  *                                    signin/users/directory/maintenance/
  *                                    modules/audit)
@@ -42,7 +51,13 @@
  *                                   Topology bar's upstream-suggestions
  *                                   review dialog (nodes:read only — the
  *                                   dialog itself hides Apply for an
- *                                   account that cannot use it)
+ *                                   account that cannot use it), and
+ *                                   ConfigRX's Compliance rule-set list, a
+ *                                   created-evaluated-then-deleted rule set
+ *                                   and its per-device results (4.50.0 —
+ *                                   configrx:write, admin only; the rule
+ *                                   set this walk creates is always gone
+ *                                   again before the step returns)
  *   dlg-viewer-<name>-<tag>.png      the same dialog walk run under `viewer`,
  *   dlg-noc-<name>-<tag>.png         and under `noc`. A screenshot exists
  *                                    only for a dialog that actually OPENED;
@@ -57,10 +72,19 @@
  *                                    is a gap in coverage or a failure of
  *                                    this walk — a dialog an account cannot
  *                                    reach is the permission boundary working.
- *   feature-<name>-<tag>.png        a MAC search on Nodes, and ConfigRX's
+ *   feature-<name>-<tag>.png        a MAC search on Nodes, ConfigRX's
  *                                   inline config viewer and unified diff
  *                                   (viewer/diff are panes, not dialogs),
- *                                   also run under `viewer` and `noc`
+ *                                   also run under `viewer` and `noc`; and,
+ *                                   4.50.0's Nodes Reports (availability run
+ *                                   over 90 days, plus its own caveats box
+ *                                   when the report actually emits one, and
+ *                                   top-N by the cpu_pct metric) and
+ *                                   ConfigRX Search (a query that matches —
+ *                                   "interface" is real indexed content on
+ *                                   this instance — and one built to return
+ *                                   the genuine empty state), all read-only
+ *                                   and so also run under `viewer` and `noc`
  *   theme-<theme>-<name>-<tag>.png  every top-level tab under each of the
  *                                   three themes (dark, light, contrast),
  *                                   set via localStorage before first paint
@@ -229,9 +253,21 @@ const TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
 // Subtabs are `.subtab[data-subtab=...]` inside each page section, in the
 // order the tab strip itself lists them.
 const SUBTABS = {
-  nodes: ['devices', 'topology', 'discovery', 'profiles'],
+  // 'reports' (4.50.0) was missing here entirely — its subtab button carries
+  // no id of its own in index.html, so app.js's wireSubtabGroups falls back
+  // to `subtab-for-${panel.id}` (`subtab-for-nodes-sub-reports`), and with
+  // this array not naming it, nothing in this file ever clicked it: the
+  // census could see the button but this walk never reached it, exactly the
+  // gap the previous campaign's report on this same file warned would
+  // recur once the app grew past this list again.
+  nodes: ['devices', 'topology', 'discovery', 'profiles', 'reports'],
   alerts: ['current', 'rules'],
   ipam: ['subnets', 'conflicts', 'dhcp'],
+  // ConfigRX (4.50.0) had no entry here at all — its own three subtabs
+  // (devices/search/compliance) went completely unwalked, DEVICES (its
+  // landing pane) included, since nothing in this loop ever clicked any of
+  // them for real.
+  configrx: ['devices', 'search', 'compliance'],
   settings: ['general', 'retention', 'signin', 'users', 'directory', 'maintenance',
              'modules', 'audit'],
 };
@@ -338,6 +374,14 @@ const SAFE_EXPORTS = [
   ['syslog', null, 'sl-export-csv'],
   ['ipam', 'subnets', 'ipam-hosts-export-csv'],
   ['wireless', null, 'wl-export-csv'],
+  // nd-rep-avail-export-csv sits on Reports' own landing subtab
+  // (availability), so it is visible the moment 'reports' is selected —
+  // exportAvailReportCsv (nodes.js) toasts a warning and returns rather than
+  // throwing when no report has been run yet, so this is safe to click cold.
+  // Its top-metrics sibling is nested one subtab deeper (topmetrics is not
+  // the landing pane) and is driven instead inside
+  // feature:nodes-topmetrics-report, where that click is already reached.
+  ['nodes', 'reports', 'nd-rep-avail-export-csv'],
 ];
 
 // Collector start/stop toggles: clicked once, then clicked again to put the
@@ -739,6 +783,91 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return `note shown=${noteShown}`;
   });
 
+  // ---- Nodes: Reports subtab (new in 4.50.0 — netpath/report.py). Both
+  // reports are read-only (nodes:read), so all three accounts run them the
+  // same way; each is actually RUN, not just opened, so the screenshot shows
+  // real rows rather than the landing pane's "pick a period" empty state.
+  //
+  // Availability: every period preset gets a real click (so each one's own
+  // id leaves the census's not_reached list, not just whichever this run
+  // happens to submit), landing on 90 days for the run itself — the widest
+  // window this walk offers, and so the one likeliest to actually cross a
+  // maintenance window or a mute and produce a caveat worth capturing. A
+  // caveat is never forced to exist — report.py emits global_caveats only
+  // for what it genuinely could not account for — so this records whichever
+  // way that came out rather than treating an empty caveats box as a
+  // failure.
+  await guarded(recorder, step('feature:nodes-availability-report'), async () => {
+    await page.click('#page-nodes .subtab[data-subtab="reports"]').catch(() => {});
+    await settle(page, 500);
+    await page.click('#nodes-sub-reports .subtab[data-subtab="availability"]').catch(() => {});
+    await page.click('#nd-rep-avail-7d', { timeout: 5000 });
+    await page.click('#nd-rep-avail-30d', { timeout: 5000 });
+    await page.click('#nd-rep-avail-lastmonth', { timeout: 5000 });
+    await page.click('#nd-rep-avail-90d', { timeout: 5000 });
+    await page.click('#nd-rep-avail-run', { timeout: 5000 });
+    // runAvailabilityReport (nodes.js) runs through App.runJob, which
+    // disables the button for exactly as long as the request is in flight —
+    // the same re-enabled signal nd-poll-now's own wait already relies on.
+    await page.waitForFunction(
+      () => !document.getElementById('nd-rep-avail-run').disabled,
+      null, { timeout: 20000 }).catch(() => {});
+    await settle(page, 500);
+    await shoot(page, dir, shot('feature', 'nodes-availability-report'));
+    const caveatsShown = await page.isVisible('#nd-rep-avail-caveats').catch(() => false);
+    if (caveatsShown) {
+      // A dedicated shot: the caveats box sits below the fold on a full
+      // device table, and it is the one thing on this screen this campaign
+      // was specifically asked to make sure a screenshot actually shows.
+      await page.locator('#nd-rep-avail-caveats').scrollIntoViewIfNeeded().catch(() => {});
+      await settle(page, 300);
+      await shoot(page, dir, shot('feature', 'nodes-availability-caveats'));
+    }
+    const rows = await page.locator('#nd-rep-avail-table tbody tr').count().catch(() => 0);
+    return `${rows} row(s), caveats shown=${caveatsShown}`;
+  });
+
+  await guarded(recorder, step('feature:nodes-topmetrics-report'), async () => {
+    await page.click('#nodes-sub-reports .subtab[data-subtab="topmetrics"]').catch(() => {});
+    await settle(page, 400);
+    // Every preset gets a real click for the census's sake, but the run
+    // itself has to land back on 7 days: api.py's own
+    // REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S caps a whole-fleet (no
+    // device_ids — "any group" here is exactly that) top-N request at 7
+    // days flat, independent of fleet size, and refuses anything wider
+    // with a 400 rather than run it — confirmed against this instance:
+    // 90 days here failed outright ("too slow for a live request"). See
+    // the report to team-lead for why that fixed cap reads as a rough
+    // edge on a fleet this small, not a bug in this walk.
+    await page.click('#nd-rep-topn-30d', { timeout: 5000 });
+    await page.click('#nd-rep-topn-90d', { timeout: 5000 });
+    await page.click('#nd-rep-topn-7d', { timeout: 5000 });
+    // cpu_pct is a real device-level metric key (see report.py's own
+    // docstring example) — every seeded device polls it, so this needs no
+    // wildcard/interface-suffix handling to return rows.
+    await page.fill('#nd-rep-topn-key', 'cpu_pct');
+    await page.click('#nd-rep-topn-run', { timeout: 5000 });
+    await page.waitForFunction(
+      () => !document.getElementById('nd-rep-topn-run').disabled,
+      null, { timeout: 20000 }).catch(() => {});
+    await settle(page, 500);
+    await shoot(page, dir, shot('feature', 'nodes-topmetrics-report'));
+    // A failed request (the 400 above, or any other) leaves the table on
+    // whatever it last showed — its own empty-state placeholder is one
+    // <tr>, same as a genuine one-row result — so the row count alone
+    // cannot tell "ran and found one series" from "never successfully
+    // ran"; the summary line is only ever written by the success path
+    // (runTopMetricsReport, nodes.js), so its emptiness is what actually
+    // distinguishes them.
+    const rows = await page.locator('#nd-rep-topn-table tbody tr').count().catch(() => 0);
+    const summary = await page.locator('#nd-rep-topn-summary').textContent().catch(() => '');
+    const gate = await gateState(page, '#nd-rep-topn-export-csv');
+    if (gate.present && gate.visible && !gate.disabled) {
+      await page.click('#nd-rep-topn-export-csv', { timeout: 5000 });
+    }
+    return `${rows} table row(s), summary="${summary}"`;
+  });
+
   // ---- OID browser (needs a selected device; nodes.js:1253 bails without
   // one). Not write-gated in the markup.
   await guarded(recorder, step('dlg:oid-browser'), async () => {
@@ -969,6 +1098,124 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       }
     }
     return 'absent — no device has two or more stored backups to diff';
+  });
+
+  // ---- ConfigRX: SEARCH subtab (new in 4.50.0 — netpath/configrx_search.py).
+  // Read-only end to end (configrx:read), so this runs the same for all
+  // three accounts. Two queries, not one: "interface" is real indexed
+  // content on this instance (the same string this release's search-index
+  // fix — a device is only indexed once its config has actually changed —
+  // was confirmed against), and a token built not to appear anywhere gets
+  // the genuine "No matches" state drawSearchResults renders, distinct from
+  // "no search has run yet" (the tab's own landing state, already captured
+  // by walkTabs' sub-configrx-search screenshot).
+  await guarded(recorder, step('feature:configrx-search-match'), async () => {
+    await selectTab(page, 'configrx');
+    await page.click('#page-configrx .subtab[data-subtab="search"]').catch(() => {});
+    await settle(page, 400);
+    await page.fill('#cxse-q', 'interface');
+    await page.click('#cxse-run', { timeout: 5000 });
+    await settle(page, 800);
+    await shoot(page, dir, shot('feature', 'configrx-search-match'));
+    const rows = await page.locator('#cxse-results tbody tr').count().catch(() => 0);
+    return `${rows} match row(s)`;
+  });
+
+  await guarded(recorder, step('feature:configrx-search-empty'), async () => {
+    await page.fill('#cxse-q', 'ui-walk-no-such-config-token-zzz');
+    await page.click('#cxse-run', { timeout: 5000 });
+    await settle(page, 800);
+    await shoot(page, dir, shot('feature', 'configrx-search-empty'));
+    const empty = await page.isVisible('#cxse-empty').catch(() => false);
+    // clearSearch (configrx.js) — leaves the query box the way this subtab
+    // started, and is otherwise never clicked anywhere in this walk.
+    await page.click('#cxse-clear', { timeout: 5000 }).catch(() => {});
+    await settle(page, 300);
+    return `genuine empty state shown=${empty}`;
+  });
+
+  // ---- ConfigRX: COMPLIANCE subtab (new in 4.50.0 — netpath/
+  // configrx_compliance.py). The rule-set list itself only needs
+  // configrx:read, so every account captures it; creating one, adding a
+  // rule and evaluating it needs configrx:write, which seed.py grants only
+  // to admin (noc's own write is nodes+alerts only) — viewer and noc both
+  // record `refused` here, the write gate working as intended, same as
+  // every other write-gated dialog in this file.
+  //
+  // Whatever admin creates below is temporary: made, evaluated, screenshot,
+  // then deleted through the product's own "Delete rule set" button and its
+  // confirm dialog before this step returns, in a `finally` so a failure
+  // partway through still cleans up — a previous run on this exact instance
+  // left a rule set and four rules behind, which is precisely the mess this
+  // is written not to repeat. A final raw-API check-and-delete backs up the
+  // UI path in case that click itself is what fails.
+  await guarded(recorder, step('dlg:configrx-compliance-list'), async () => {
+    await selectTab(page, 'configrx');
+    await page.click('#page-configrx .subtab[data-subtab="compliance"]').catch(() => {});
+    await settle(page, 600);
+    await shoot(page, dir, shot('dlg', 'configrx-compliance-list'));
+    const rows = await page.locator('#cxrs-table tbody tr').count();
+    return `${rows} rule set(s) listed`;
+  });
+
+  const RULESET_NAME = 'ui-walk-temp-ruleset';
+  await guarded(recorder, step('dlg:configrx-compliance-results'), async () => {
+    const gate = await gateState(page, '#cxrs-new');
+    if (!gate.present || !gate.visible) return 'absent — #cxrs-new not visible';
+    if (gate.disabled && gate.denied) return `refused — ${gate.reason}`;
+    let created = false;
+    try {
+      await page.click('#cxrs-new', { timeout: 5000 });
+      await page.waitForSelector('#modal:not([hidden]) #cxrs-f-name', { timeout: 8000 });
+      await page.fill('#cxrs-f-name', RULESET_NAME);
+      await page.click('#modal:not([hidden]) button.primary', { timeout: 5000 });
+      await page.waitForFunction(() => document.getElementById('modal').hidden,
+                                 null, { timeout: 8000 });
+      created = true;
+      await settle(page, 500);
+
+      await page.click('#cxrs-add-rule', { timeout: 5000 });
+      await page.waitForSelector('#modal:not([hidden]) #cxrs-f-pattern', { timeout: 8000 });
+      // "interface" — the same string confirmed present in this instance's
+      // stored captures above — so most devices PASS this rule and the
+      // results table shows real pass/fail data, not one status throughout.
+      await page.fill('#cxrs-f-pattern', 'interface');
+      await page.fill('#cxrs-f-desc', 'config mentions an interface (ui-walk check)');
+      await page.click('#modal:not([hidden]) button.primary', { timeout: 5000 });
+      await page.waitForFunction(() => document.getElementById('modal').hidden,
+                                 null, { timeout: 8000 });
+      await settle(page, 400);
+      await shoot(page, dir, shot('dlg', 'configrx-compliance-ruleset'));
+
+      await page.click('#cxrs-evaluate', { timeout: 5000 });
+      await page.waitForFunction(
+        () => !document.getElementById('cxrs-evaluate').disabled,
+        null, { timeout: 20000 }).catch(() => {});
+      await settle(page, 600);
+      await shoot(page, dir, shot('dlg', 'configrx-compliance-results'));
+      const rows = await page.locator('#cxrs-results-table tbody tr').count().catch(() => 0);
+      return `evaluated, ${rows} per-device result(s)`;
+    } finally {
+      if (created) {
+        await closeAnyModal(page);
+        if (await page.isVisible('#cxrs-delete').catch(() => false)) {
+          await page.click('#cxrs-delete', { timeout: 5000 }).catch(() => {});
+          await page.waitForSelector('#modal:not([hidden]) button.danger',
+                                     { timeout: 8000 }).catch(() => {});
+          await page.click('#modal:not([hidden]) button.danger', { timeout: 5000 }).catch(() => {});
+          await page.waitForFunction(() => document.getElementById('modal').hidden,
+                                     null, { timeout: 8000 }).catch(() => {});
+        }
+        // Belt and braces: confirm nothing by this name survived the UI
+        // delete above (a stray failure there is exactly how the last
+        // leftover rule set happened) and remove it straight against the
+        // API if it did.
+        const listing = await rawApi(page, 'GET', '/api/configrx/rule-sets');
+        const stray = ((listing.json && listing.json.rule_sets) || [])
+          .find((r) => r.name === RULESET_NAME);
+        if (stray) await rawApi(page, 'DELETE', `/api/configrx/rule-sets/${stray.id}`);
+      }
+    }
   });
 
   // ---- The three loopback "send test" dialogs, each gated on its own module.
