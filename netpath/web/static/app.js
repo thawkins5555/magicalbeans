@@ -4796,14 +4796,21 @@ const App = (() => {
   // sends a strict Content-Security-Policy, and 'self' does not permit inline
   // script.
   //
-  // Every module script carries `defer`, so all thirteen have run — and every
-  // App.pages.<x> is registered — before DOMContentLoaded fires and start()
-  // runs. Before `defer`, this file ran while the parser was still at its
-  // own <script> tag: readyState was already 'interactive', start() was
-  // called synchronously, and the twelve modules below it had not even been
-  // fetched. It worked only because start()'s first `await loadState()`
-  // yielded long enough for the parser to reach them. The branch for
-  // 'interactive' stays for a page that loads this file without defer.
+  // Only dashboard.js still carries `defer` alongside this file — the other
+  // eleven modules are lazy now (see "lazy modules" above) and are never
+  // fetched at all until their tab is first selected, so "every module has
+  // run before start()" stopped being true the day that landed. It was
+  // never what this branch depended on anyway: start() only initialises
+  // whatever `pages` already holds (Dashboard, at this point) and leaves
+  // ensureModuleReady to init() every other module on its own first
+  // selection, so nothing here needed all thirteen files present, only
+  // dashboard.js. Before `defer`, this file ran while the parser was still
+  // at its own <script> tag: readyState was already 'interactive', start()
+  // was called synchronously, and dashboard.js — the one module start()
+  // actually needs at this point — had not even been fetched yet. It
+  // worked only because start()'s first `await loadState()` yielded long
+  // enough for the parser to reach it. The branch for 'interactive' stays
+  // for a page that loads this file without defer.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => { start(); });
   } else {

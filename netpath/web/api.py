@@ -116,6 +116,32 @@ def _audit(service, params, action: str, target: str = "",
                          action, target, detail)
 
 
+# Never shown with either value in an audit diff — the SNMP community
+# string is credential-adjacent, same as every secret this file already
+# redacts before it reaches a log line or an export; naming a field as
+# merely "changed" here is still enough to answer "was this touched".
+_AUDIT_REDACTED_FIELDS = ("community",)
+
+
+def _audit_diff(before, fields: dict) -> str:
+    """"field: old -> new" for every key in `fields` that actually differs
+    from `before`'s own value, joined with "; " — the shape an audit line
+    for an update route wants (put_nodes_device, put_nodes_group, and
+    friends). `before` is a row (or anything supporting `row[key]`); a
+    field in _AUDIT_REDACTED_FIELDS is named as changed, never with
+    either value. Empty when nothing in `fields` actually changed.
+    """
+    parts = []
+    for key, value in fields.items():
+        if before[key] == value:
+            continue
+        if key in _AUDIT_REDACTED_FIELDS:
+            parts.append(f"{key}: changed")
+        else:
+            parts.append(f"{key}: {before[key]} -> {value}")
+    return "; ".join(parts)
+
+
 def _num(params, key, default=None, cast=float):
     value = params.get(key)
     if value in (None, ""):
@@ -555,8 +581,7 @@ def put_target(service, params, body, target_id: int) -> dict:
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
     if before is not None and fields:
-        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
-                           if before[k] != v) or "no change"
+        detail = _audit_diff(before, fields) or "no change"
         _audit(service, params, "target.update", target=str(target_id), detail=detail)
     return {"ok": True}
 
@@ -1957,8 +1982,7 @@ def put_ipam_subnet(service, params, body, subnet_id) -> dict:
              ("cidr", "label", "vlan", "enabled")}
     service.ipam_db.update_subnet(subnet_id, **fields)
     if before is not None and fields:
-        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
-                           if before[k] != v) or "no change"
+        detail = _audit_diff(before, fields) or "no change"
         _audit(service, params, "ipam_subnet.update", target=str(subnet_id), detail=detail)
     return {"ok": True}
 
@@ -3241,8 +3265,7 @@ def put_nodes_device(service, params, body, device_id) -> dict:
               detail=f"vendor_override: {before['vendor_override'] or ''!r} -> {value!r}")
     if fields:
         service.nodes_db.update_device(device_id, **fields)
-        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
-                           if before[k] != v)
+        detail = _audit_diff(before, fields)
         if detail:
             _audit(service, params, "device.update", target=f"device:{before['ip']}",
                   detail=detail)
@@ -4106,12 +4129,7 @@ def put_nodes_group(service, params, body, group_id) -> dict:
         raise ValueError("No such polling profile")
     fields = {k: v for k, v in body.items() if k in _GROUP_EDITABLE_BODY}
     service.nodes_db.update_group(group_id, **fields)
-    # community is the SNMP community string — credential-adjacent, same as
-    # every other secret this file redacts before it reaches an audit
-    # trail or a log line. Named as changed, never with either value.
-    detail = "; ".join(
-        "community: changed" if k == "community" else f"{k}: {before[k]} -> {v}"
-        for k, v in fields.items() if before[k] != v)
+    detail = _audit_diff(before, fields)
     if detail:
         _audit(service, params, "profile.update", target=f"profile:{before['name']}",
               detail=detail)
@@ -4492,6 +4510,8 @@ def post_nodes_mib(service, params, body) -> dict:
                         f"({len(skipped)} already present); "
                         f"{summary['resolved_count']}/{summary['object_count']} "
                         f"object(s) resolved overall")
+        _audit(service, params, "mib.upload", target=filename,
+              detail=f"loaded={len(loaded)}, skipped={len(skipped)}")
         return {"zip": True, "loaded": loaded, "skipped": skipped,
                 "object_count": summary["object_count"],
                 "resolved_count": summary["resolved_count"],
@@ -4507,6 +4527,8 @@ def post_nodes_mib(service, params, body) -> dict:
     service.log.add(NODES_CATEGORY,
                     f"Uploaded MIB {filename} ({result['module'] or 'unknown module'}): "
                     f"{result['resolved_count']}/{result['object_count']} object(s) resolved")
+    _audit(service, params, "mib.upload", target=filename,
+          detail=f"module={result['module'] or 'unknown'}")
     return result
 
 
@@ -4573,6 +4595,7 @@ def delete_nodes_mib(service, params, body, mib_file_id) -> dict:
     service.nodes_db.remove_mib_file(mib_file_id)
     service._snmp_settings_with_mibs()
     service.log.add(NODES_CATEGORY, f"Removed MIB {row['filename']}")
+    _audit(service, params, "mib.delete", target=row["filename"])
     return {"ok": True}
 
 

@@ -1524,6 +1524,20 @@ database whose admin password had already been changed. The one scenario nobody 
 exercised was the first thirty seconds of a new installation, which is the only scenario
 every single customer experiences.
 
+**The fix removes the dependency rather than working around it.** `accountModal` lives in
+`app.js` and needs nothing from `settings.js`, so the forced prompt now calls it directly
+instead of delegating through a module that may not be loaded. And the sentinel is set
+only once the call has actually run, inside a `try`, so a genuine failure — the modal
+element missing from the DOM, say — is retried on the next poll rather than never
+prompting again. Both faults closed, and the control no longer has a load-order
+precondition at all.
+
+It has its own browser test, `tests/ui/pristine_login.mjs`, deliberately separate from the
+main walk — because `demo/seed.py`'s first step changes the admin password and clears
+`must_change`, so the existing suite *cannot* exercise this path. A test that needs an
+unseeded instance cannot live in a file that needs a seeded one, and saying so in the test
+is how the next person avoids folding it back in.
+
 **Bulk mute was not leaking an error message — it was broken outright. CONFIRMED.**
 This went in as a cosmetic item ("the server's `device_ids and/or group_id is
 required` reaches the operator verbatim") and turned out to be the symptom of a real

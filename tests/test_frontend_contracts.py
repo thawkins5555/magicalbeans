@@ -385,6 +385,30 @@ check("?target=" in SETTINGS or "opts.query.target" in SETTINGS,
 check("function auditIsRoutine(" in SETTINGS and ".audit-row-routine" in read("app.css"),
       "routine actions are visually de-emphasised, not hidden, in the default view")
 
+# ---------------------------------------------------------------------------
+# 17. The forced password-change prompt does not depend on a lazy module.
+#
+# It used to run through `pages.settings.forcePasswordChange`, a one-line
+# delegate to `App.accountModal({forced: true})` that both already lived
+# beside — and once Settings became a lazy module (loaded on first
+# selection, not before), `pages.settings` did not exist yet on the very
+# first /api/state poll after login, so the `if` guarding the call was
+# false and the dialog silently never opened. The sentinel meant to record
+# "we asked" was set unconditionally regardless, so it never got a second
+# chance. An administrator left on a fresh install's admin/admin with no
+# visible sign anything was owed is as serious as this application's UI
+# gets — accountModal is called directly now, and the sentinel is set only
+# once that call has actually run.
+check("pages.settings" not in APP.split("must_change")[1].split("return payload;")[0],
+      "the forced prompt no longer reaches through pages.settings at all")
+must_change_block = APP.split("if (payload.session.must_change")[1].split("\n      }")[0]
+check("accountModal({ forced: true })" in must_change_block,
+      "the forced prompt calls App.accountModal directly")
+check("state.promptedChange = true" in must_change_block.split("accountModal({ forced: true })")[1],
+      "the sentinel is set AFTER the call that must actually run, not before it")
+check("function forcePasswordChange(" not in SETTINGS and "forcePasswordChange," not in SETTINGS,
+      "the now-dead one-line delegate is gone from settings.js, not left orphaned")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

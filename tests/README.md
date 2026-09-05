@@ -97,6 +97,29 @@ work was "verified with a Playwright test" when no such test was in the
 repository; this is that test, and the CI workflow's `ui-walk` job runs it on
 every push.
 
+`tests/ui/pristine_login.mjs` is a second, much smaller browser check with a
+requirement `walk.mjs` cannot satisfy: an instance that has never had
+`demo/seed.py` run against it, because seed.py's own first step changes the
+admin password and clears `must_change` — the exact state this check exists
+to walk in before. It signs in with the shipped `admin`/`admin`, does nothing
+else (no tab, no click), and asserts the forced password-change dialog opens
+on its own within a few seconds of the state poll, *and* that it did so
+before `App.pages.settings` was ever registered — 4.49.0's lazy module
+loading broke this dialog silently by routing it through a lazy module that
+had not loaded yet on the very first poll after login, and this is the
+regression guard for exactly that failure mode, not just "the dialog
+eventually shows up":
+
+```bash
+python3 -m netpath --headless --port 8471 --db /tmp/pristine.db &  # no seed.py
+node tests/ui/pristine_login.mjs --base http://127.0.0.1:8471
+```
+
+Same exit-code convention as `walk.mjs` (0 pass, 1 fail, 77 SKIP for no
+Playwright/browser); also SKIPs, rather than failing, if it is pointed at an
+instance whose admin account does not have `must_change` set, since that
+means the instance is not the pristine one this check needs.
+
 Two exceptions to "no dependencies": `stub_ssh_device.py` is a real paramiko
 SSH server, imported in-process rather than spawned (there is no `sshd`
 here, and no banner to wait for — construct `StubDevice()` and read

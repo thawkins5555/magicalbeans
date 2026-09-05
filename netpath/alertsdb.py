@@ -1977,9 +1977,26 @@ class AlertsDatabase:
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
 
     def alerts_rolled_up_into(self, parent_id: int) -> list[sqlite3.Row]:
-        """Every alert absorbed into `parent_id`'s rollup, oldest first —
-        the structured form of what rollup_note already says in prose, for
-        a parent's own detail view. Backed by ix_alerts_rolled_up_into."""
+        """Every alert absorbed DIRECTLY into `parent_id`'s rollup, oldest
+        first — the structured form of what rollup_note already says in
+        prose, for a parent's own detail view. Backed by
+        ix_alerts_rolled_up_into.
+
+        `rolled_up_into` can chain, and this method does not follow the
+        chain: a child alert resolved by its own device's device_down
+        (alertengine._absorb_subordinates) points at that device_down row,
+        and if an ancestor's outage later absorbs that device_down TOO
+        (_absorb_downstream), the device_down's own rolled_up_into moves to
+        the ancestor -- but the grandchild alert's does not, because
+        resolve_by_dedup only ever touches open/acked rows and the
+        grandchild was already resolved by the time the ancestor's outage
+        ran. So a caller that wants "the ultimate parent of this alert",
+        rather than "what specifically absorbed it", has to follow
+        rolled_up_into by hand until it hits an alert with no rolled_up_into
+        of its own -- this treats one hop as the whole answer, which is
+        right for a detail view ("this outage directly absorbed these") and
+        wrong for anything that assumes the pointer is always the current,
+        topmost outage."""
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE rolled_up_into = ?"
