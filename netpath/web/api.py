@@ -6406,10 +6406,31 @@ def delete_configrx_rule_set(service, params, body, rule_set_id) -> dict:
     return {"ok": True}
 
 
+def _compliance_rule_json(row, reveal: bool) -> dict:
+    # A rule's pattern is not incidental text that MIGHT contain a secret
+    # (the way a backup line might) — the Add-rule dialog tells the author
+    # outright that this is the point ("a rule can check a secret's actual
+    # value"), so the pattern itself can simply BE the community string or
+    # password it checks for. That makes it the same class of value
+    # get_configrx_backup already gates behind ConfigRX write, not the
+    # plain read this route otherwise matches (see the search/compliance
+    # comment on the route table in server.py). There is no partial
+    # redaction to fall back on the way a backup has: the whole pattern IS
+    # the value, so a caller without write gets every other field — kind,
+    # description, ordinal, id — and an explicit `pattern_hidden` flag
+    # rather than a pattern that silently reads as empty.
+    fields = dict(row)
+    if not reveal:
+        fields["pattern"] = None
+        fields["pattern_hidden"] = True
+    return fields
+
+
 def get_configrx_rule_set_rules(service, params, body, rule_set_id) -> dict:
     if not service.configrx_db.rule_set(rule_set_id):
         raise ValueError("No such rule set")
-    return {"rules": [dict(r) for r in service.configrx_db.rules_for(rule_set_id)]}
+    reveal = _may_read_secrets(service, params, "configrx")
+    return {"rules": [_compliance_rule_json(r, reveal) for r in service.configrx_db.rules_for(rule_set_id)]}
 
 
 def post_configrx_rule_set_rule(service, params, body, rule_set_id) -> dict:

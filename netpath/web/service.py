@@ -20,7 +20,7 @@ from ..appdb import AppDatabase, migrate_from
 from ..collector import Collector
 from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
-from ..db import Database
+from ..db import Database, FORCED_PRUNE_BUDGET_S, TRIM_BUDGET_S
 from ..eventlog import NODES, SYSTEM, EventLog
 from ..flowdb import FlowDatabase
 from ..fortipoll import WirelessPoller
@@ -835,15 +835,31 @@ class Service:
             return
         try:
             self._last_maintenance = now
-            self._run_maintenance_body()
+            self._run_maintenance_body(force=force)
         finally:
             self._maintenance_lock.release()
 
-    def _run_maintenance_body(self) -> None:
-        self.db.prune(float(self.settings.get("trace_retention_days", 90)))
+    def _run_maintenance_body(self, force: bool = False) -> None:
+        # A forced pass runs synchronously on the HTTP thread that asked for
+        # it (apply_global_settings, on every settings save) rather than on
+        # the maintenance timer thread. netpath.db is the only store here
+        # with per-hop rows at real fleet volume, and at db.TRIM_BUDGET_S
+        # its own prune()/trim_to_size() calls were measured stalling that
+        # request for up to ~30s each with a backlog -- three settings
+        # saves in a row, three ~30s hangs. The periodic timer call
+        # (force=False) keeps the full budget, since it isn't blocking a
+        # request and a real backlog still needs to be worked down; a
+        # forced call gets a short one instead of skipping retention
+        # outright, so a burst of settings saves can't outrun what
+        # retention is supposed to enforce -- it just chips away at a large
+        # backlog across more calls, the same as the periodic path already
+        # does once TRIM_PASSES or its own budget runs out in one call.
+        prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
+        self.db.prune(float(self.settings.get("trace_retention_days", 90)),
+                      budget_s=prune_budget)
         cap = int(self.settings.get("max_trace_db_mb", 0)) * 1024 * 1024
         if cap:
-            removed = self.db.trim_to_size(cap)
+            removed = self.db.trim_to_size(cap, budget_s=prune_budget)
             if removed:
                 self.log.add(SYSTEM, f"Trace database over its "
                                      f"{cap // 1048576} MB cap: removed "

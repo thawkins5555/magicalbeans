@@ -1242,7 +1242,13 @@
 
   const RULE_COLUMNS = [
     { key: 'kind', label: 'Kind', cell: (r) => (r.kind === 'must_match' ? 'Must match' : 'Must not match') },
-    { key: 'pattern', label: 'Pattern', cell: (r) => `<span class="mono">${escape(r.pattern)}</span>` },
+    { key: 'pattern', label: 'Pattern', cell: (r) => (r.pattern_hidden
+      // A pattern can BE the secret it checks for (the Add-rule dialog says
+      // so), so it is gated the same as a backup's unredacted content —
+      // hidden rather than blank, with the reason a reader can see, the
+      // same as gateAttr()'s title on a write-gated button.
+      ? '<span class="hint" title="Visible to accounts with ConfigRX write.">hidden — may be a secret value</span>'
+      : `<span class="mono">${escape(r.pattern)}</span>`) },
     { key: 'description', label: 'Description', cell: (r) => escape(r.description) },
     { key: 'delete', label: '', sortable: false, cell: (r) =>
       `<button type="button" class="cxrs-rule-delete" data-requires-write="configrx"${gateAttr()}>`

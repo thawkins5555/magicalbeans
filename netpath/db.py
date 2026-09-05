@@ -31,7 +31,29 @@ TRIM_CHUNK_MIN = 500
 TRIM_CHUNK_MAX = 50_000
 TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
 TRIM_PASSES = 40             # delete/reclaim rounds before giving up
-TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
+TRIM_BUDGET_S = 30.0         # wall clock for one full (periodic-timer) call
+
+# prune()'s reclaim pass gets this much time of its own, on top of
+# older_than_days' delete budget, rather than sharing one deadline with it.
+# A delete sweep that runs long (a big backlog) used to leave nothing for
+# reclaim -- measured at zero pages freed after a 30s delete pass on 1.5M
+# rows -- which is harmless now that trim_to_size no longer trusts
+# unreclaimed freelist pages as if they were live data (see
+# live_size_bytes), but still meant the file sat needlessly large until the
+# next maintenance pass happened to have spare budget.
+PRUNE_RECLAIM_BUDGET_S = 5.0
+
+# A settings save runs maintenance synchronously on the HTTP thread
+# (Service.apply_global_settings -> run_maintenance(force=True)); with a
+# real backlog the default TRIM_BUDGET_S made every such save block the
+# request for up to ~30s per call (measured 30.3s/30.1s/30.0s on
+# successive saves). Retention still has to run on that path -- skipping it
+# entirely would mean a burst of settings saves could outrun the periodic
+# timer's enforcement -- so it gets a short leash instead of the full one;
+# a backlog too big to clear in one short pass gets worked down over
+# several saves, the same way it is worked down over several periodic
+# passes today.
+FORCED_PRUNE_BUDGET_S = 2.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS targets (
@@ -158,6 +180,16 @@ MIN_MAX_HOPS, MAX_MAX_HOPS = 1, 255
 MIN_PROBES, MAX_PROBES = 1, 20
 MIN_TIMEOUT_S, MAX_TIMEOUT_S = 0.1, 30.0
 MIN_TRACE_WORKERS, MAX_TRACE_WORKERS = 1, 64
+# Mirrors api.py's _GLOBAL_SETTINGS_RANGES entry for the same key. That check
+# only runs on a save over HTTP; a value already sitting in the settings
+# table -- written before this floor existed, or by a script -- reaches
+# prune() through settings() -> coerce_settings(strict=False), which checks
+# type but never range. coerce_settings has no notion of per-key bounds, so
+# the clamp happens here, right after it, rather than by teaching it one.
+# Left unclamped, a stored 0 computes cutoff = time.time() (prune's own
+# `time.time() - older_than_days * 86400`) and deletes every trace, every
+# maintenance pass, forever.
+MIN_TRACE_RETENTION_DAYS, MAX_TRACE_RETENTION_DAYS = 1, 3650
 
 
 def _clamp(value, lo, hi, kind=float):
@@ -199,6 +231,13 @@ def _clamp_target_fields(fields: dict) -> dict:
 class Database:
     def __init__(self, path: str):
         self.path = path
+        # Set by prune(): whether its last call finished the whole sweep
+        # inside budget, or gave up with rows past the cutoff still in the
+        # table. api.py's manual "prune traces now" action reports a plain
+        # row count either way; this lets that message (or any other
+        # caller) tell a completed sweep from a partial one without prune()
+        # changing what it returns.
+        self.last_prune_incomplete = False
         self._lock = threading.RLock()
         self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
@@ -249,7 +288,12 @@ class Database:
                     values[row["key"]] = json.loads(row["value"])
                 except (ValueError, TypeError):
                     pass
-        return settingsutil.coerce_settings(NETPATH_DEFAULTS, values, strict=False)
+        coerced = settingsutil.coerce_settings(NETPATH_DEFAULTS, values, strict=False)
+        if "trace_retention_days" in coerced:
+            coerced["trace_retention_days"] = _clamp(
+                coerced["trace_retention_days"], MIN_TRACE_RETENTION_DAYS,
+                MAX_TRACE_RETENTION_DAYS, int)
+        return coerced
 
     def save_settings(self, values: dict) -> None:
         values = dict(values)
@@ -703,15 +747,42 @@ class Database:
                 pass
         return total
 
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest traces, and their hops, until the file fits
-        under the cap."""
+    def live_size_bytes(self) -> int:
+        """Estimated size of the *live* data: pages actually holding rows,
+        excluding both the WAL and any page already on SQLite's freelist.
+
+        trim_to_size decides how much to delete from this, not from
+        size_bytes(). size_bytes() is a file-size figure that counts
+        freelist pages and the WAL as if they were rows still in the table.
+        A prune() that used its whole time budget on deletes and never
+        reached reclaim (its own docstring covers why that happens) leaves
+        exactly that: a large freelist and an unshrunk file, with nothing
+        actually wrong. Deciding from size_bytes() there reads that
+        unreclaimed-but-already-free space as more rows to delete on top of
+        the ones prune() already removed -- measured on a synthetic 2M-trace
+        database as a trim_to_size call deleting 98,999 rows that were still
+        inside the retention window, on a database that was already at 99 MB
+        of live data against a 406 MB cap once fully reclaimed. Free pages
+        get reclaimed by the reclaim() calls below and by the next prune();
+        they are never a reason to delete a row that is not itself past
+        either retention rule.
+        """
+        with self._lock:
+            page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+            freelist_count = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+            page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        return max(0, page_count - freelist_count) * page_size
+
+    def trim_to_size(self, max_bytes: int, budget_s: float = TRIM_BUDGET_S) -> int:
+        """Delete the oldest traces, and their hops, until the *live* data
+        fits under the cap -- see live_size_bytes() for why "live" and not
+        "the file"."""
         if max_bytes <= 0:
             return 0
         removed = 0
-        deadline = time.monotonic() + TRIM_BUDGET_S
+        deadline = time.monotonic() + budget_s
         for _ in range(TRIM_PASSES):
-            size = self.size_bytes()
+            size = self.live_size_bytes()
             if size <= max_bytes:
                 break
             with self._lock:
@@ -762,12 +833,13 @@ class Database:
                     break
             if not deletable or time.monotonic() >= deadline:
                 break
-        if self.size_bytes() > max_bytes:
-            log.warning("%s: %d bytes after removing %d rows, still above the "
-                        "%d byte cap; continuing at the next maintenance pass",
-                        "netpath.db", self.size_bytes(), removed, max_bytes)
+        live = self.live_size_bytes()
+        if live > max_bytes:
+            log.warning("%s: %d live bytes after removing %d rows, still above "
+                        "the %d byte cap; continuing at the next maintenance "
+                        "pass", "netpath.db", live, removed, max_bytes)
         return removed
-    def prune(self, older_than_days: float) -> int:
+    def prune(self, older_than_days: float, budget_s: float = TRIM_BUDGET_S) -> int:
         """Delete every trace (and its hops) older than `older_than_days`.
 
         Batched in the same adaptive, lock-bounded chunks trim_to_size uses
@@ -785,6 +857,19 @@ class Database:
         started_ts, so a device with a wrong clock (trim_to_size's own
         reason for preferring id ordering there) cannot make prune() keep or
         drop the wrong rows here.
+
+        `budget_s` bounds only the delete loop below; the reclaim pass that
+        follows gets its own fixed PRUNE_RECLAIM_BUDGET_S regardless of how
+        much of `budget_s` the deletes used, rather than sharing what is
+        left of one deadline. A big backlog used to consume the whole shared
+        deadline on deletes and leave reclaim nothing to run with at all
+        (measured: zero pages freed after a 30s delete pass) — harmless
+        after live_size_bytes() (trim_to_size's fix) stopped a large
+        freelist from being mistaken for live rows, but still meant space
+        this call had already earned back sat unreclaimed until whatever
+        later pass had spare budget. `Service._run_maintenance_body` passes
+        a short `budget_s` on the forced/synchronous settings-save path so
+        that request is bounded; the periodic timer keeps the long default.
         """
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
@@ -793,9 +878,10 @@ class Database:
                 " WHERE started_ts < ?", (cutoff,)).fetchone()
         low, high = bounds["lo"], bounds["hi"]
         if low is None:
+            self.last_prune_incomplete = False
             return 0
         removed = 0
-        deadline = time.monotonic() + TRIM_BUDGET_S
+        deadline = time.monotonic() + budget_s
         chunk = TRIM_CHUNK
         cut = high + 1   # exclusive: every id in [low, cut) is a candidate
         while low < cut and time.monotonic() < deadline:
@@ -820,7 +906,8 @@ class Database:
                 chunk = max(TRIM_CHUNK_MIN, chunk // 2)
             elif held < TRIM_LOCK_TARGET_S / 4:
                 chunk = min(TRIM_CHUNK_MAX, chunk * 2)
-        if low < cut:
+        self.last_prune_incomplete = low < cut
+        if self.last_prune_incomplete:
             log.warning("netpath.db: prune of traces older than %.1f days did "
                         "not finish within its budget; continuing at the next "
                         "maintenance pass", older_than_days)
@@ -833,7 +920,13 @@ class Database:
             # rather than one longer reclaim() call at whatever its own
             # defaults are, for the same reason the deletes above are
             # chunked: this can now run under a settings-save request too.
-            while time.monotonic() < deadline:
+            #
+            # Its own deadline, not `deadline` above: that one may already
+            # be spent (a big backlog can use the whole delete budget), and
+            # reclaim is worth a little dedicated time even then -- see the
+            # docstring's PRUNE_RECLAIM_BUDGET_S paragraph.
+            reclaim_deadline = time.monotonic() + PRUNE_RECLAIM_BUDGET_S
+            while time.monotonic() < reclaim_deadline:
                 if not dbmaint.reclaim(self._conn, self._lock, pages=500,
                                        budget_s=0.2, label="netpath.db"):
                     break
