@@ -16,10 +16,11 @@ wiring, no server involved), then against a real Service+WebServer:
   - The default adjacent pair (no from/to) diffs the two most recent
     backups; from/to name any other pair; a pair spanning two different
     devices, or a device with fewer than two backups, is refused.
-  - The gate matches get_configrx_backup exactly (Tier 2's route is a
-    content read like that one, not a metadata read): a configrx:write
-    account may diff, a configrx:read-only account is refused, and so is
-    an account holding write on an unrelated module.
+  - The gate matches get_configrx_backup exactly (4.49.0: diffing two
+    backups a configrx:read account can already fetch individually is not
+    a write, so it no longer needs one): a configrx:write account may
+    diff, so may a configrx:read-only account, and an account holding
+    write on an unrelated module is refused.
 """
 import http.client
 import json
@@ -206,7 +207,7 @@ try:
     status, payload = call("GET", "/api/configrx/diff", {"device": 999999}, token=admin)
     check("an unknown device is refused", status == 400, (status, payload))
 
-    print("gates: matches get_configrx_backup exactly (configrx WRITE, not read)")
+    print("gates: matches get_configrx_backup exactly (configrx read is enough)")
     service.app_db.add_user("cx-diff-writer", hash_password("CxDiffWriterPW2026"), must_change=False)
     service.app_db.set_permissions("cx-diff-writer", {"configrx": "write"})
     writer = login("cx-diff-writer", "CxDiffWriterPW2026")
@@ -221,8 +222,8 @@ try:
     status, payload = call("GET", "/api/configrx/diff", params, token=writer)
     check("a configrx:write account may diff", status == 200, (status, payload))
     status, payload = call("GET", "/api/configrx/diff", params, token=reader)
-    check("a configrx:read-only account is refused (content reads need write, same as a"
-          " single backup's own content route)", status == 403, (status, payload))
+    check("a configrx:read-only account may diff too (same grant as fetching either "
+          "backup on its own)", status == 200, (status, payload))
     status, payload = call("GET", "/api/configrx/diff", params, token=outsider)
     check("an account with write on an unrelated module is refused",
           status == 403, (status, payload))

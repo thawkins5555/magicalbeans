@@ -627,7 +627,83 @@ large win in the product.
 
 ### 5.8 Performance and scale
 
-⏳ The tier numbers land here.
+#### Tier A — 250 devices, all nine incidents
+
+Setup, which is itself a number worth having: **250 devices added in 0.661 s** (378 a
+second) as part of a seed that completed in 10.9 s, and the **first full poll cycle
+finished 10.0 s later with 249 of 250 up.** A fresh installation is monitoring a
+250-device site inside twenty seconds.
+
+| Step | Duration | Alerts opened | Cleared | Emails | CPU | RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 · baseline | 120 s | 122 | 0 | 0 | 23.8 % | 97.8 MB |
+| 2 · core + Site-A down (108 devices) | 240 s | 228 | 292 | **11** | 11.4 % | 106.3 MB |
+| 3 · outage recovery | 150 s | 296 | 109 | 7 | 22.8 % | 109.2 MB |
+| 4 · interface flap storm | 120 s | 72 | 6 | 4 | 26.3 % | **236.7 MB** |
+| 5 · reboot 20 devices | 120 s | 111 | 45 | 10 | 28.7 % | 103.4 MB |
+| 6 · SNMP auth failure on 5 | 90 s | 73 | 18 | 5 | 31.4 % | 104.3 MB |
+| 7 · trap + syslog burst | 75 s | 128 | 19 | 6 | 38.0 % | 160.4 MB |
+| 8 · NetFlow burst, 200 flows/s | 75 s | 37 | 8 | 10 | 24.8 % | 176.3 MB |
+| 9 · recovery | 150 s | 43 | 61 | 31 | 32.3 % | 102.7 MB |
+
+Three things to read out of that table.
+
+**The notification rollup is the headline.** A 108-device site outage opened 228 alerts
+and sent **11 emails**. The 4.35.0 campaign measured the equivalent event producing
+1,355. That is the difference between a mailbox somebody reads and one they filter away,
+and it is the most valuable thing 4.47.0 shipped.
+
+**Memory is a high-water mark, not a leak.** RSS more than doubled during the flap storm
+— 109 MB to 237 MB in 120 seconds, for a storm against *three* devices — and was back to
+103 MB by step 5. Sampling the process directly a minute into that step confirmed
+101.9 MB. So the allocator returns it. What is not established is the scaling factor: a
+site-wide flap event at 2,000 devices — a spanning-tree reconvergence, a UPS transfer
+browning out a wiring closet — is precisely the moment the monitoring system must not
+run out of memory, and it is the moment its own memory peaks. That is a Tier C question.
+
+**CPU sits between 11 % and 38 % of one core** across every incident, on a 28-core
+machine, at 250 devices with a 60-second interval and 32 workers. Notably it is *lower*
+during the outage (11.4 %) than at baseline (23.8 %) — a device that has stopped
+answering costs a timeout, not a walk.
+
+#### API response times at 250 devices
+
+Measured against the live campaign instance, signed in as admin:
+
+| Route | Time | Payload |
+| --- | ---: | ---: |
+| `/api/config` | 4.7 ms | 7.3 KB |
+| `/api/state` | 40.5 ms | 4.7 KB |
+| `/api/nodes/devices?limit=250` | 43.2 ms | **423 KB** |
+| `/api/alerts?limit=500` | 48.0 ms | 309 KB |
+| `/api/dashboard` | 53.6 ms | 3.3 KB |
+
+`/api/state` is the one to watch: its own docstring notes it is polled every two seconds
+by every open tab and that every count is a `COUNT(*)`, with a short cache over the
+figures that cannot usefully change at that rate. At 40 ms and 4.7 KB for 250 devices
+that is comfortable; the fan-out across ten databases is what Tier C tests.
+
+The device list is 423 KB for 250 devices — about 1.7 KB each — which at a 500-row page
+is around 845 KB per page on a 2,000-device fleet. It is server-side paged, so that is
+the ceiling rather than the total, but it is a large page for a tablet.
+
+⏳ Tier B (1,000) and Tier C (2,000) land here.
+
+**O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
+Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
+`<script defer>` tags load `app.js` and every module unconditionally. Measured:
+`nodes.js` 264 KB, `app.js` 220 KB, `alerts.js` 90 KB, `app.css` 79 KB, `index.html`
+76 KB, `ipam.js` 61 KB, `netpath.js` 60 KB, `configrx.js` 55 KB — **1.17 MB
+uncompressed**, roughly 324 KB gzipped, on every load.
+
+`defer` means this is not a rendering stall; it is bandwidth, parse time and memory,
+for eleven modules the operator may never open, and it is worst exactly where it is
+least affordable — a tablet on plant Wi-Fi. The fix is contained because the structure
+is already right: `selectTab` exists, each module has its own `init()`, and the assets
+are already versioned and immutably cached. Load a module's script the first time its
+tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previous
+review declined minification (PERF-004) with reasons; this is a different and larger
+lever, and it makes the source no harder to read.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
 Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
@@ -775,9 +851,83 @@ The downgrade from write to read was deliberate, was raised in the previous rele
 security review, and the decision was to keep it; it is recorded here so that whoever
 hands out that grant knows what they are handing out.
 
-**The self-update path, reported and deliberately not changed.** By the operator's own
-instruction this pass documents rather than alters it. ⏳ The exact description, and
-the bounds of the exposure, land here once verified against the current code.
+#### The self-update path, described and deliberately not changed
+
+By the operator's own instruction this pass documents rather than alters it. What
+follows was established by reading `netpath/selfupdate.py` end to end, not from its own
+security note.
+
+**What *is* verified before downloaded code is executed.** The archive size, capped at
+64 MB and enforced by reading one byte past the limit and refusing. That the extracted
+tree looks like this application — both `netpath/__init__.py` and
+`netpath/web/__init__.py` must be present. That the archive contains no symlinks or
+device files and cannot escape its extraction directory, checked by `realpath` and a
+prefix comparison. And every mode bit in the archive is discarded and replaced with
+0755/0644 regardless of what it claimed.
+
+**What is not verified: no tag, no digest, no signature.** `apply()` calls
+`latest_commit()` — the mutable tip of the `main` branch, through GitHub's commits API
+— not `latest_tag()`. `_download_tarball()` does compute a SHA-256 of what it
+downloaded, and nothing compares it to anything; the module says so itself, in as many
+words: *"Nothing checks this digest: the branch pull has no published digest to check it
+against."* `latest_tag()` and `published_digest()` are fully implemented and still
+covered by tests, and `apply()` calls neither.
+
+So push access to that repository is code execution on every install with updates
+enabled.
+
+**The mitigations are real, and were confirmed in the current code rather than taken
+from the docstring.** `updates_enabled` defaults to `False`. The setting is in
+`api.py`'s `ADMIN_ONLY_SETTINGS`, so only an administrator can turn it on. The trigger
+route `POST /api/update` is separately gated on the `admin` permission in the routing
+table, not merely on the setting. `updates_enabled()` is re-read from stored settings on
+every `apply()` call rather than cached, so switching it off takes effect immediately.
+And the archive cap, the discarded mode bits and the shape check above all apply.
+
+The honest summary for an operator: this is off by default, an administrator must
+deliberately enable it, and if they do, the software will fetch and run whatever is at
+the tip of a branch. An installation that leaves it off is not exposed. One that turns
+it on has accepted a supply-chain dependency on that repository's access control, and
+should know that is what it is — which is the reason for writing it down here rather
+than quietly fixing it.
+
+#### Two open items from the previous review that are already closed
+
+Both were carried forward as outstanding and both turn out to be fixed, established by
+reading the current code:
+
+`ipam_scan.read_arp_table` was recorded as catching only `OSError` and not the
+`subprocess.TimeoutExpired` its own ten-second timeout can raise — "a two-line fix
+waiting for the next pass". It now catches `(subprocess.TimeoutExpired, OSError)`, with
+a comment naming the old bug precisely: *"TimeoutExpired is a SubprocessError, not an
+OSError, so the one failure this call arranges for itself was the one it did not
+catch."*
+
+`eventlog.py`'s target set was recorded as growing for the process's lifetime and being
+sorted under the lock on every Debug-page poll. `TARGET_LIMIT` now bounds it as an LRU,
+and `targets()` re-sorts only when a new sighting or an eviction has invalidated the
+cached order.
+
+#### What was checked and found clean
+
+Negative evidence, because on a single-process application with one SQLite writer the
+question "what work happens while a lock is held" decides whether it survives a bad
+night. `dbmaint.reclaim` releases the lock between incremental-vacuum steps and yields
+the GIL between them so a waiting writer is actually scheduled. The DNS resolver's
+blocking calls — `gethostbyaddr`, the UDP exchange, the `nslookup` subprocess — all run
+on a worker pool with no lock held; the registry lock guards only the pending-and-started
+bookkeeping either side. `ipam_worker` has the same shape: its lock guards small sets,
+while sweeps, ARP reads and DHCP polls run outside it on a capped pool. No leaked
+sockets, handles or threads were found on the ICMP paths, which close selector and
+socket in `finally`. And `wsock.py`'s Windows drain-before-shutdown fix is present and
+correct, including the ownership rule that only the thread owning `recv()` may drain
+directly, because two threads reading one SSL object corrupts rather than raises.
+
+One narrow observation rather than a finding: `secretstore` derives its scrypt keys
+inside the cache lock rather than outside it, so a first-ever derivation blocks any
+other thread wanting a *different* parameter set. Since only one parameter set is in use
+per process, this is a one-time cost at the first credential access after startup and
+not a per-call one.
 
 ---
 

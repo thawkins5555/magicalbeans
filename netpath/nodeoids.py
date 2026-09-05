@@ -130,13 +130,27 @@ GENERIC_HEALTH = (
 )
 
 # hrStorageTable: type, allocation unit, size and used, per storage unit.
-# hrStorageFixedDisk is the row an operator means by "disk"; RAM and virtual
-# memory rows live in the same table and would report a machine using its
-# page cache as a full disk.
+# One walk, two completely different questions an operator asks about it,
+# filtered by hrStorageType: hrStorageFixedDisk is the row meant by "disk"
+# (nodepoll._host_resources_disk_pct), hrStorageRam is the row meant by
+# "memory" (nodepoll._host_resources_mem_pct, the HOST-RESOURCES fallback
+# for mem_pct on anything that answers none of UCD-SNMP, a Fortinet scalar
+# or the Cisco memory pool — a Windows host, a printer, most appliances).
+# Both readers exclude every other row in the table on purpose:
+# hrStorageVirtualMemory (swap, or swap-plus-physical depending on the
+# agent) counted as either disk or RAM would make an ordinary machine read
+# as critically low on memory or a disk mysteriously full of nothing;
+# hrStorageOther/RamDisk/CompactDisc/etc. are neither. Both readers are a
+# used/size RATIO, so HR_STORAGE_UNITS never needs multiplying in: size and
+# used share one hrStorageAllocationUnits scale factor on a given row (RFC
+# 2790), and that factor cancels out of a ratio exactly the way it does for
+# disk_pct already — it would only matter to a reader that wanted an
+# absolute size in bytes, which neither of these is.
 HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
 HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
 HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
 HR_STORAGE_USED = "1.3.6.1.2.1.25.2.3.1.6"
+HR_STORAGE_RAM = "1.3.6.1.2.1.25.2.1.2"
 HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
 
 # ipAddrTable's ipAdEntAddr column: every IPv4 address this device answers

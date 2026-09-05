@@ -199,10 +199,20 @@ async function signIn(page, base, username, password) {
 }
 
 async function selectTab(page, tab) {
-  await page.evaluate(async (name) => {
-    App.selectTab(name);
-    await App.refreshNow(name);
-  }, tab);
+  await page.evaluate((name) => { App.selectTab(name); }, tab);
+  // 4.49.0: eleven of the twelve modules are lazy — the first selection of
+  // a tab fetches its script, rather than it having loaded already at
+  // startup. App.refreshNow(name) is a safe no-op while that is still in
+  // flight (there is no App.pages[name] yet for it to call refresh() on),
+  // so awaiting it alone, as this used to, proved nothing here — wait for
+  // the module to actually register itself (or for its tab to be hidden,
+  // the way a failed load degrades) before asking for a refresh.
+  await page.waitForFunction((name) => {
+    if (window.App && window.App.pages[name]) return true;
+    const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+    return !tab || tab.hidden;
+  }, tab, { timeout: 20000 });
+  await page.evaluate(async (name) => { await App.refreshNow(name); }, tab);
 }
 
 async function shoot(page, dir, name) {
@@ -226,6 +236,48 @@ async function closeAnything(page) {
 
 async function checkTabsAndAria(page, dir, tag, watcher) {
   section('Every tab renders, with the accessibility the grids need (E1, E2)');
+
+  await check('eleven of the twelve tab modules are lazy: not loaded before their tab is opened',
+    async () => {
+      // This runs before the loop below ever selects a tab, on the tab this
+      // account landed on at sign-in (Dashboard, ordinarily) — the one
+      // point in the whole walk where "nothing else has been clicked yet"
+      // is actually true.
+      const state = await page.evaluate(() => ({
+        loaded: Object.keys(App.pages),
+        scripts: [...document.querySelectorAll('script[src]')]
+          .map((s) => s.src.split('/').pop().split('?')[0]),
+      }));
+      const unexpected = state.loaded.filter((name) => name !== 'dashboard'
+        && name !== App.state.tab);
+      assert(unexpected.length === 0,
+             `module(s) loaded before their tab was ever selected: ${unexpected.join(', ')}`);
+      const eagerScripts = ['boot.js', 'app.js', 'dashboard.js'];
+      const lazyScriptsPresent = state.scripts.filter((src) =>
+        src.endsWith('.js') && !eagerScripts.includes(src) && src !== 'login.js');
+      assert(lazyScriptsPresent.length === 0,
+             `lazy module script(s) already in the DOM before selection: ${lazyScriptsPresent.join(', ')}`);
+      return `App.pages: ${state.loaded.join(', ')}`;
+    });
+
+  await check('selecting a lazy tab loads its script exactly once, even selected twice fast',
+    async () => {
+      // netflow is never the tab this account lands on at sign-in, so it is
+      // guaranteed to still be lazy at this point in the walk.
+      const result = await page.evaluate(async () => {
+        App.selectTab('netflow');
+        App.selectTab('netflow');          // the second call must join the first's load, not start a second
+        await new Promise((resolve) => {
+          const check = () => (App.pages.netflow ? resolve() : setTimeout(check, 50));
+          check();
+        });
+        const scripts = [...document.querySelectorAll('script[src*="netflow.js"]')];
+        return { count: scripts.length, ready: Boolean(App.pages.netflow && App.pages.netflow.init) };
+      });
+      assert(result.count === 1, `netflow.js was inserted ${result.count} time(s), want 1`);
+      assert(result.ready, 'netflow.js loaded but App.pages.netflow never registered');
+      return `1 <script>, App.pages.netflow present`;
+    });
 
   for (const tab of TABS) {
     await check(`tab ${tab} renders without a page error`, async () => {

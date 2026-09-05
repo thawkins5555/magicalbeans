@@ -2033,24 +2033,35 @@ class NodePoller:
             return None
         return 100.0 * used_total / total
 
-    def _host_resources_disk_pct(self, device, config: dict):
-        """The busiest fixed disk, as a percentage.
-
-        hrStorageTable also holds RAM and virtual memory rows; reporting
-        those as disk would make a machine using its page cache look full.
-        Only hrStorageFixedDisk rows count, and the fullest of them is what
-        an operator means by "the disk is filling up"."""
+    def _host_resources_storage_rows(self, device, config: dict) -> tuple:
+        """(types, sizes, used) — hrStorageType/Size/Used, walked ONCE and
+        shared by every reader of hrStorageTable (today: disk_pct's worst
+        fixed disk and mem_pct's HOST-RESOURCES fallback), so a device that
+        needs both pays for this table exactly once per poll rather than
+        once per kind of row somebody wants out of it. All three empty
+        dicts on a device with no HOST-RESOURCES-MIB support at all, or on
+        any SnmpError — best-effort, same as everything else this reads."""
         try:
             types = self._walk_column(device, config, nodeoids.HR_STORAGE_TYPE)
             if not types:
-                return None
+                return {}, {}, {}
             sizes = self._walk_column(device, config, nodeoids.HR_STORAGE_SIZE)
             used = self._walk_column(device, config, nodeoids.HR_STORAGE_USED)
         except SnmpError:
-            return None
+            return {}, {}, {}
+        return types, sizes, used
+
+    @staticmethod
+    def _worst_storage_pct(types: dict, sizes: dict, used: dict,
+                           wanted_type: str) -> float | None:
+        """The fullest hrStorageTable row of one hrStorageType, as a
+        percentage — the one computation disk_pct and mem_pct both are,
+        filtered to a different type. See nodeoids.HR_STORAGE_TYPE's
+        comment for why no allocation-unit scaling belongs here: a
+        used/size ratio does not need it."""
         worst = None
         for index, kind in types.items():
-            if str(kind).strip(".") != nodeoids.HR_STORAGE_FIXED_DISK:
+            if str(kind).strip(".") != wanted_type:
                 continue
             size = sizes.get(index)
             taken = used.get(index)
@@ -2061,6 +2072,37 @@ class NodePoller:
             pct = 100.0 * float(taken) / float(size)
             worst = pct if worst is None else max(worst, pct)
         return worst
+
+    def _host_resources_disk_pct(self, types: dict, sizes: dict, used: dict):
+        """The busiest fixed disk, as a percentage, from an already-walked
+        hrStorageTable (see _host_resources_storage_rows).
+
+        hrStorageTable also holds RAM and virtual memory rows; reporting
+        those as disk would make a machine using its page cache look full.
+        Only hrStorageFixedDisk rows count, and the fullest of them is what
+        an operator means by "the disk is filling up"."""
+        return self._worst_storage_pct(types, sizes, used,
+                                       nodeoids.HR_STORAGE_FIXED_DISK)
+
+    def _host_resources_mem_pct(self, types: dict, sizes: dict, used: dict):
+        """Physical memory, as a percentage, from the SAME already-walked
+        hrStorageTable _host_resources_disk_pct reads — the HOST-RESOURCES
+        fallback for mem_pct, tried only when neither UCD-SNMP, a Fortinet
+        scalar nor the Cisco memory pool answered (see _poll_vendor_health):
+        a Windows server or endpoint, a printer, most appliances answer
+        none of those three and so have never had a mem_pct at all, on a
+        fleet where cpu_pct and disk_pct already worked for them through
+        this exact table.
+
+        hrStorageRam is the physical-memory row alone. hrStorageVirtualMemory
+        (swap, or swap-plus-physical depending on the agent) is a different
+        row under a different type and is never read here, for the same
+        reason the disk reader above excludes it: counting swap as physical
+        memory would make a machine with a perfectly ordinary swap file read
+        as critically low on RAM, the mirror image of the page-cache mistake
+        that filter was already written to prevent.
+        """
+        return self._worst_storage_pct(types, sizes, used, nodeoids.HR_STORAGE_RAM)
 
     def _refresh_addresses(self, device, config: dict) -> None:
         """Remember every address this device answers on.
@@ -2141,9 +2183,24 @@ class NodePoller:
             for key, label, unit, oid, how in nodeoids.GENERIC_HEALTH:
                 add(key, label, unit,
                     self._health_column(device, config, oid, how))
-        if "disk_pct" not in known:
-            add("disk_pct", "Storage", "%",
-                self._host_resources_disk_pct(device, config))
+        # hrStorageTable answers BOTH disk_pct's and mem_pct's HOST-
+        # RESOURCES fallback, so it is walked once (see
+        # _host_resources_storage_rows) and only when at least one of the
+        # two is still missing — a Cisco box that already has mem_pct from
+        # its own memory pool, or a net-snmp box that already has it from
+        # UCD-SNMP, costs nothing extra here, and one that answers neither
+        # (a Windows host, a printer, most appliances) now gets mem_pct for
+        # the first time from a table this poll was already reading for
+        # disk_pct alone.
+        if "disk_pct" not in known or "mem_pct" not in known:
+            types, sizes, used = self._host_resources_storage_rows(device, config)
+            if types:
+                if "disk_pct" not in known:
+                    add("disk_pct", "Storage", "%",
+                        self._host_resources_disk_pct(types, sizes, used))
+                if "mem_pct" not in known:
+                    add("mem_pct", "Memory", "%",
+                        self._host_resources_mem_pct(types, sizes, used))
         self._refresh_addresses(device, config)
         return metrics
 
