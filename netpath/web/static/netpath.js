@@ -38,6 +38,14 @@
     timeline: null,
     topology: null,
     drag: null,
+    // Bumped on every refresh() — Live recomputes t0/t1 on every tick (below),
+    // so two overlapping polls never share a URL and app.js's per-path
+    // abort-dedupe cannot cancel either one. Checked after each of refresh()'s
+    // sequential awaits: without it, a slow poll that resolves after a faster
+    // one overwrites view.timeline/view.topology and the DOM with an older
+    // window — or with the target/window the operator has since left. Same
+    // pattern as configrx.js's searchGen / app.js's gsearchRun.
+    refreshGen: 0,
   };
 
   /* ----------------------------------------------------------- helpers */
@@ -1240,7 +1248,11 @@
 
   async function refresh() {
     if (App.state.tab !== 'netpath') return;
+    const generation = ++view.refreshGen;
     const payload = await App.get('/api/netpath/targets');
+    // A newer refresh already redrew this — the operator switched targets,
+    // dragged the window, or left the tab while the above was in flight.
+    if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
     view.targets = payload.targets;
     pruneWindows();
     if (view.targetId === null && view.targets.length) view.targetId = view.targets[0].id;
@@ -1266,6 +1278,10 @@
     view.timeline = await App.get('/api/netpath/timeline', {
       target: view.targetId, t0: view.t0, t1: view.t1, width,
     });
+    // Same check, now that the timeline fetch (window and target both live
+    // in its query, so an overlapping refresh built a different URL app.js
+    // could not abort for us) has landed.
+    if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
     App.el('block-label').textContent = view.timeline.bucket_s
       ? (view.timeline.polls_per_block === 1
         ? `1 block = 1 poll (${App.span(view.timeline.bucket_s)})`
@@ -1282,6 +1298,8 @@
     const params = { target: view.targetId, t0: view.t0, t1: view.t1 };
     if (view.pinned) params.at = view.pinned;
     view.topology = await App.get('/api/netpath/topology', params);
+    // Same check, now that the topology fetch has landed too.
+    if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
     if (view.expandAll) {
       for (const [a, b] of silentRuns(view.topology)) view.expanded.add(`${a}-${b}`);
     }

@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import fortinetoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
+from .nodeoids import oid_key
 from .nodepoll import EngineCache, _Session, credential_for
 from .snmppoll import (
     PDU_GET, PDU_GETNEXT, PDU_REPORT, SnmpError, SnmpTimeout,
@@ -338,8 +339,26 @@ class WirelessPoller:
                 break
             if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
                 break
+            if oid_key(oid) <= oid_key(current):
+                # A broken or malicious agent that keeps answering GETNEXT
+                # with the same OID (or one that sorts no later) would
+                # otherwise spin through every iteration below, writing
+                # the same dict key each time and ending with a silently
+                # one-entry table. nodepoll.py's own walk
+                # (_walk_column_status) guards against exactly this by
+                # requiring the returned OID to have lexicographically
+                # advanced; mirrored here.
+                break
             values[oid[len(base_oid) + 1:]] = vb["value"]
             current = oid
+        else:
+            # The loop ran all 4096 iterations without ever breaking out
+            # -- unlike nodepoll.py's walk, which logs when it hits its
+            # row cap, this used to end with a truncated table and no
+            # sign anything was cut short.
+            self.log.add(WIRELESS, f"Table walk of {base_oid} on {controller['ip']} "
+                                   f"stopped at the 4096-row cap",
+                         target=controller["ip"])
         return values
 
     def _snmp_get_next(self, controller, config: dict, oid: str):

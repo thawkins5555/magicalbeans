@@ -543,6 +543,29 @@ _MAC_SEPARATORS = ":-. \t"
 _HEX = set("0123456789abcdefABCDEF")
 
 
+# One SQLite statement can bind at most SQLITE_MAX_VARIABLE_NUMBER
+# parameters, and the bulk device routes bind one per id in a
+# "WHERE id IN (?,?,…)". That ceiling is 32766 on SQLite 3.32 and newer
+# (3.45 here) but 999 on anything older, and this application does not
+# choose which SQLite its Python was linked against — so the number is not
+# knowable at the call site, and a request that works on one operator's
+# install would fail on another's with "too many SQL variables", an
+# OperationalError the route would answer as a 500.
+#
+# Splitting the ids rather than capping them keeps the shipped workflow
+# whole: the Devices page offers a 1000-row page size and a select-all that
+# checks every row on it, so any cap below 1000 breaks bulk delete or bulk
+# poll for an operator doing the obvious thing. Every chunk runs inside the
+# caller's single `with self._lock:` and one commit, so the operation stays
+# atomic — the split is a statement-size detail, not a transaction boundary.
+_ID_CHUNK = 500
+
+
+def _id_chunks(ids: list[int], size: int = _ID_CHUNK):
+    for start in range(0, len(ids), size):
+        yield ids[start:start + size]
+
+
 def normalize_mac(text) -> str:
     """A MAC (or the start of one) as stored: lowercase hex, no separators.
 
@@ -1551,6 +1574,7 @@ class NodesDatabase:
             self._config_generation += 1
 
     def bulk_update_devices(self, device_ids: list[int], **fields) -> None:
+        # (see _id_chunks below for why the id list is split)
         """The same field allow-list as update_device, applied to many rows
         in one statement/transaction rather than one round trip per
         device — the shape post_nodes_discovery_promote's device_ids list
@@ -1559,11 +1583,12 @@ class NodesDatabase:
         if not allowed or not device_ids:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
-        marks = ",".join("?" * len(device_ids))
         with self._lock:
-            self._conn.execute(
-                f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
-                (*allowed.values(), *device_ids))
+            for chunk in _id_chunks(device_ids):
+                marks = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE devices SET {clauses} WHERE id IN ({marks})",
+                    (*allowed.values(), *chunk))
             self._conn.commit()
             self._config_generation += 1
 
@@ -1608,13 +1633,16 @@ class NodesDatabase:
     def bulk_remove_devices(self, device_ids: list[int]) -> int:
         if not device_ids:
             return 0
-        marks = ",".join("?" * len(device_ids))
+        removed = 0
         with self._lock:
-            cursor = self._conn.execute(
-                f"DELETE FROM devices WHERE id IN ({marks})", device_ids)
+            for chunk in _id_chunks(device_ids):
+                marks = ",".join("?" * len(chunk))
+                cursor = self._conn.execute(
+                    f"DELETE FROM devices WHERE id IN ({marks})", chunk)
+                removed += cursor.rowcount or 0
             self._conn.commit()
             self._config_generation += 1
-            return cursor.rowcount or 0
+            return removed
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
                               password_enc: bytes) -> None:

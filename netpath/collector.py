@@ -66,6 +66,7 @@ class Collector:
         # "stopped unexpectedly" instead of looking like an operator stop.
         self._loop_errors = 0
         self._last_error_log = 0.0
+        self._last_write_error_log = 0.0
         self._crash: str | None = None
         self._drops: udpsock.KernelDrops | None = None
         self._drops_logged = False
@@ -77,7 +78,14 @@ class Collector:
 
     @property
     def running(self) -> bool:
-        return self._rx_thread is not None and self._rx_thread.is_alive()
+        # Both threads, not just the receiver: a batch that killed netflow-wr
+        # (see _write's guard below) used to leave this True forever, because
+        # only _rx_thread was checked. The receiver kept accepting packets and
+        # status_text() kept reporting "last packet just now" while zero flows
+        # were being stored from any exporter -- a monitoring tool that has
+        # silently stopped monitoring but still shows green.
+        return (self._rx_thread is not None and self._rx_thread.is_alive()
+               and self._wr_thread is not None and self._wr_thread.is_alive())
 
     def start(self, settings: dict) -> bool:
         self.stop()
@@ -248,6 +256,25 @@ class Collector:
             self.log.add(ERROR, f"Receive error: {exc}",
                          detail=traceback.format_exc())
 
+    def _note_write_error(self, exc: Exception) -> None:
+        """Count a batch the writer thread could not store, and log at most
+        one traceback a minute so a flood cannot fill the event log.
+
+        Without this, a batch that raised -- an OverflowError from a
+        sampling rate that reached the database despite _set_sampling's
+        clamp, or any other bad row -- printed itself to stderr (no event
+        log entry an operator would ever see) and unwound out of netflow-wr,
+        ending the writer thread for good while netflow-rx kept accepting
+        packets. `running` checks both threads precisely so that failure
+        stops reading as "listening, last packet just now" forever."""
+        self._loop_errors += 1
+        self.counters["errors"] = self.decoder.stats["errors"] + self._loop_errors
+        now = time.time()
+        if now - self._last_write_error_log >= 60:
+            self._last_write_error_log = now
+            self.log.add(ERROR, f"A batch of flows failed to write: {exc}",
+                         detail=traceback.format_exc())
+
     def _receive(self) -> None:
         sock = self._sock
         while not self._stop.is_set() and sock is not None:
@@ -331,11 +358,22 @@ class Collector:
             self._poll_kernel_drops()
             due = time.time() - last_flush >= 1.0
             if pending and (due or len(pending) >= 500):
-                written = self.db.insert_flows(pending)
-                self.counters["flows"] += written
-                self.db.touch_exporters(
-                    [(exporter, entry[3], entry[0], entry[1], entry[2])
-                     for exporter, entry in per_exporter.items()])
+                # A batch that fails to write must not end this thread: a
+                # single crafted options record could already push
+                # Flow.sampling past SQLite's int64 bind range (see
+                # nfdecode._set_sampling's clamp for the other half of this
+                # fix), and an unguarded OverflowError here used to escape
+                # _write and permanently end the writer thread while
+                # netflow-rx kept running -- see the `running` property
+                # above for what that did to the status strip.
+                try:
+                    written = self.db.insert_flows(pending)
+                    self.counters["flows"] += written
+                    self.db.touch_exporters(
+                        [(exporter, entry[3], entry[0], entry[1], entry[2])
+                         for exporter, entry in per_exporter.items()])
+                except Exception as exc:
+                    self._note_write_error(exc)
                 pending.clear()
                 per_exporter.clear()
                 last_flush = time.time()
@@ -344,7 +382,10 @@ class Collector:
                     self.on_batch()
 
         if pending:
-            self.counters["flows"] += self.db.insert_flows(pending)
+            try:
+                self.counters["flows"] += self.db.insert_flows(pending)
+            except Exception as exc:
+                self._note_write_error(exc)
         self._apply_learned_rates()
 
     def _apply_learned_rates(self) -> None:

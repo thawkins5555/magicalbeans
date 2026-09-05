@@ -64,6 +64,28 @@ SNMP_TRAP_ENTERPRISE_0 = "1.3.6.1.6.3.1.1.4.3.0"
 
 MAX_DATAGRAM = 65535
 
+# SNMP's own wire types bound these fields far tighter than a BER INTEGER's
+# own encoding does. RFC 2578 7.1: plain "INTEGER" as used by SNMP -- the v1
+# generic-trap/specific-trap fields and the v2/v3 request-id -- is Integer32,
+# a 4-byte signed value, -2147483648..2147483647; TimeTicks (7.1.8, used for
+# the agent-uptime field) is unsigned 32-bit, 0..4294967295. Nothing enforced
+# either range at decode time, so a crafted 20-byte BER INTEGER produced a
+# Python int SQLite's int64 bind cannot hold (traps.generic, .specific and
+# .uptime are all stored as plain INTEGER columns): the OverflowError it
+# raised on the next executemany took the whole in-flight batch of up to
+# BATCH traps down with it -- see snmptrapd.py's _insert_batch for the other
+# half of this fix.
+_INT32_MIN, _INT32_MAX = -2147483648, 2147483647
+_UINT32_MAX = 4294967295
+
+
+def _clamp_int32(n: int) -> int:
+    return max(_INT32_MIN, min(_INT32_MAX, n))
+
+
+def _clamp_uint32(n: int) -> int:
+    return max(0, min(_UINT32_MAX, n))
+
 
 class BerError(Exception):
     pass
@@ -491,9 +513,9 @@ class Decoder:
         pdu = Reader(data, ps, pe)
         s, e = pdu.expect(T_OID);          trap.enterprise = _oid(data, s, e)
         tag, s, e = pdu.read_tlv();        trap.agent_addr = _ipv4(data, s, e)
-        s, e = pdu.expect(T_INTEGER);      trap.generic = _signed(data, s, e)
-        s, e = pdu.expect(T_INTEGER);      trap.specific = _signed(data, s, e)
-        tag, s, e = pdu.read_tlv();        trap.uptime = _unsigned(data, s, e)
+        s, e = pdu.expect(T_INTEGER);      trap.generic = _clamp_int32(_signed(data, s, e))
+        s, e = pdu.expect(T_INTEGER);      trap.specific = _clamp_int32(_signed(data, s, e))
+        tag, s, e = pdu.read_tlv();        trap.uptime = _clamp_uint32(_unsigned(data, s, e))
         vtag_start = pdu.pos
         vs, ve = pdu.expect(T_SEQUENCE)
         trap.varbinds_tlv_span = (vtag_start, ve)
@@ -514,7 +536,7 @@ class Decoder:
 
     def _read_trap_v2(self, data, ps, pe, trap):
         pdu = Reader(data, ps, pe)
-        s, e = pdu.expect(T_INTEGER);  trap.request_id = _signed(data, s, e)
+        s, e = pdu.expect(T_INTEGER);  trap.request_id = _clamp_int32(_signed(data, s, e))
         pdu.expect(T_INTEGER)          # error-status, always 0 in a trap
         pdu.expect(T_INTEGER)          # error-index,  always 0 in a trap
         vtag_start = pdu.pos
@@ -525,7 +547,7 @@ class Decoder:
         for vb in trap.varbinds:
             if vb["oid"] == SYS_UPTIME_0 and not trap.uptime:
                 try:
-                    trap.uptime = int(vb["value"])
+                    trap.uptime = _clamp_uint32(int(vb["value"]))
                 except (TypeError, ValueError):
                     pass
             elif vb["oid"] == SNMP_TRAP_OID_0 and not trap.trap_oid:

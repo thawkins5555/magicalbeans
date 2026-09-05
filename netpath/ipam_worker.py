@@ -14,7 +14,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .eventlog import ERROR, IPAM, NullLog, SYSTEM
-from .ipam_dhcp import DhcpUnavailable
 from .ipam_dhcp import poll as dhcp_poll
 from .ipam_scan import SubnetTooLarge, normalize_mac, read_arp_table, sweep, usable_addresses
 from .ipamdb import IpamDatabase, scope_size
@@ -114,8 +113,13 @@ class IpamWorker:
             self._scan_pool_size = 0
         if pool is not None:
             # Not waited on: a sweep in flight can take minutes, and stop()
-            # is called from the UI thread and from shutdown.
-            pool.shutdown(wait=False)
+            # is called from the UI thread and from shutdown. cancel_futures
+            # matches every other pool-owning worker's stop() (see
+            # monitor.py's Monitor.shutdown()): without it, a scan that was
+            # only queued — never started — still runs after stop() returns
+            # and then fails writing to a database this same stop() may have
+            # just closed underneath it.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def shutdown(self) -> None:
         self.stop()
@@ -349,7 +353,7 @@ class IpamWorker:
             snapshot = dhcp_poll(server["address"],
                                  timeout_s=float(settings.get("dhcp_timeout_s", 30)),
                                  username=username, password=password)
-        except (DhcpUnavailable, Exception) as exc:
+        except Exception as exc:
             self.db.set_dhcp_poll_result(server_id, ok=False, error=str(exc))
             self.log.add(ERROR, f"DHCP poll of {server['label']} failed: {exc}",
                          target=server["address"])

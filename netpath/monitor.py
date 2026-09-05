@@ -61,6 +61,12 @@ class Monitor:
         self._started: dict[int, float] = {}
         self._lock = threading.Lock()
         self._next_run: dict[int, float] = {}
+        # Counts a tick that raised, the same bookkeeping collector.py's
+        # receive loop keeps for the identical reason: nothing outside this
+        # process can see a silent failure, but this at least gives an
+        # operator poking around in a debugger or a future status endpoint
+        # something to look at.
+        self._loop_errors = 0
 
     @property
     def running(self) -> bool:
@@ -158,22 +164,43 @@ class Monitor:
     # ------------------------------------------------------------- internals
 
     def _loop(self) -> None:
+        """The scheduler thread: decides what is due and hands it to a
+        worker. Every pass is guarded — before this guard, a single
+        transient failure reading `self.db.targets()` or `self.db.
+        last_trace()` (a `sqlite3.OperationalError: database is locked`,
+        which RUNBOOK.md documents as expected under contention) was enough
+        to end this thread silently. The web UI stayed up, every other
+        collector kept running, and nothing about the dashboard said that
+        scheduling — the feature this product is named after — had
+        stopped. Mirrors the same discipline NodePoller._loop uses for the
+        analogous failure in its own scheduling pass.
+        """
         while not self._stop.is_set():
-            now = time.time()
-            for target in self.db.targets():
-                if not target["enabled"]:
-                    continue
-                due = self._next_run.get(target["id"])
-                if due is None:
-                    last = self.db.last_trace(target["id"])
-                    due = (last["started_ts"] + target["interval_s"]) if last else now
-                    self._next_run[target["id"]] = due
-                if now >= due:
-                    self._next_run[target["id"]] = now + target["interval_s"]
-                    if target["id"] in self.inflight():
-                        self._record_overrun(target, now)
-                    else:
-                        self._submit(target["id"])
+            try:
+                now = time.time()
+                for target in self.db.targets():
+                    if not target["enabled"]:
+                        continue
+                    due = self._next_run.get(target["id"])
+                    if due is None:
+                        last = self.db.last_trace(target["id"])
+                        due = (last["started_ts"] + target["interval_s"]) if last else now
+                        self._next_run[target["id"]] = due
+                    if now >= due:
+                        self._next_run[target["id"]] = now + target["interval_s"]
+                        if target["id"] in self.inflight():
+                            self._record_overrun(target, now)
+                        else:
+                            self._submit(target["id"])
+            except Exception as exc:
+                import traceback
+                self._loop_errors += 1
+                self.log.add(ERROR, f"Scheduler tick failed: {exc}",
+                             detail=traceback.format_exc())
+                traceback.print_exc()
+            # Outside the try, so a persistent failure (the database file
+            # gone, not just momentarily locked) still paces itself at one
+            # attempt per second instead of becoming a hot spin loop.
             self._stop.wait(1.0)
 
     def _record_overrun(self, target, now: float) -> None:

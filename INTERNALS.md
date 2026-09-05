@@ -55,10 +55,67 @@ netpath/
   ipam_scan.py     ping sweep, ARP table read, MAC normalization
   ipam_dhcp.py     PowerShell scripts that query a DHCP server
   ipam_worker.py   IPAM scheduler: subnet scans, DHCP polls, conflict checks
+  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller
+  nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
+  nodesdb.py       nodes.db: devices, profiles, interfaces, metrics/
+                   samples, state events, uploaded MIBs, discovery jobs
+  nodediscover.py  per-device/subnet discovery: ping sweep + best-effort
+                   SNMP v1/v2c identification
+  snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
+                   GETBULK builders, response decoder, v1/v2c/v3 assembly
+  vendorid.py      vendor identification from a device's populated
+                   enterprise OID arcs
+  enterprises.py   IANA enterprise-number -> vendor table
+  mibcatalog.py    curated catalog of vendor MIB bundles, installed on
+                   demand
+  mibparse.py      stdlib-only, best-effort MIB text parser
+  alertsdb.py      alerts.db: rules, open/acked/resolved alerts,
+                   templates, notification history, SMTP settings
+  alertrules.py    alert rule/occurrence matching, flapping and
+                   threshold hysteresis evaluators
+  alertengine.py   AlertEngine: the 5-second evaluation scheduler,
+                   drains events/traps/syslog/IPAM into alerts
+  alertmail.py     alert email: {{token}} template rendering, stdlib SMTP
+  fortinetoids.py  OID constants for FortiGate Wireless Controller polling
+  fortipoll.py     WirelessPoller: polls FortiGate controllers for
+                   managed APs over SNMP
+  wirelessdb.py    wireless.db: controller storage and SNMP credentials
+  configrxdb.py    configrx.db: backup config storage, keyed to Nodes'
+                   device ids
+  configrx.py      ConfigRxWorker: scheduled read-only SSH config pulls
+  configrx_vendors.py     per-vendor allow-list of the exact commands a
+                   backup may send over SSH
+  configrx_redact.py      strips secrets from a captured config before
+                   it is stored
+  configrx_search.py      cross-device search over stored configs, with
+                   a bounded-regex compiler
+  configrx_compliance.py  rule sets: must/must-not-match checks against
+                   each device's latest capture
+  hostkeys.py      remembered SSH host keys, shared by ConfigRX and the
+                   SSH terminal
+  sshterm.py       interactive SSH sessions for the browser terminal,
+                   over a WebSocket
+  permissions.py   the per-module read/write permission model
+  report.py        availability and link-saturation reports, from
+                   history Nodes and Alerts already keep
+  hostresolve.py   shared "best display name for an IP", used by
+                   Syslog, Alerts and NetPath alike
+  dbmaint.py       incremental-vacuum space reclamation without
+                   VACUUM's stop-the-world lock
+  dbopen.py        opens a SQLite file with owner-only file permissions
+  settingsutil.py  type coercion for settings dicts to/from the
+                   settings table
+  secretstore.py   portable secret store: passphrase-derived key,
+                   stand-in for DPAPI off Windows
+  ldapclient.py    minimal LDAPv3 simple-bind client for directory auth
+  udpsock.py       dual-stack UDP bind and drop-counter helpers shared
+                   by the three collectors
   web/
+    __init__.py    exports Service and WebServer
     service.py     Service: owns every database and background worker
     api.py         JSON endpoint handlers, one function per route
     server.py      HTTP(S) server, routing, sessions, static files
+    wsock.py       RFC 6455 WebSocket framing, server side, stdlib only
     static/        the browser interface
 tests/
   run_all.py       runs every tests/test_*.py as its own process, PASS/FAIL per file
@@ -71,7 +128,7 @@ tests/
 
 One process, several threads, no external dependencies beyond the standard
 library (PySide6 only for the console window). `netpath/__main__.py`'s
-`main()` builds a `Service` (`web/service.py`), which opens five SQLite
+`main()` builds a `Service` (`web/service.py`), which opens ten SQLite
 connections and starts every background worker, then either hands it to a
 `WebServer` alone (`--headless`) or to both a `WebServer` and a
 `ConsoleWindow` (default). Every module below is a thread or a pool of

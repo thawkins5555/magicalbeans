@@ -153,7 +153,7 @@ class FlowDatabase:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
-            dbmaint.enable_incremental_vacuum(self._conn, "netflow.db")
+            dbmaint.enable_incremental_vacuum(self._conn, "flows.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -393,14 +393,14 @@ class FlowDatabase:
             # little at a time rather than for one long run.
             while time.monotonic() < deadline:
                 if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="netflow.db"):
+                                       budget_s=0.2, label="flows.db"):
                     break
             if not deletable or time.monotonic() >= deadline:
                 break
         if self.size_bytes() > max_bytes:
             log.warning("%s: %d bytes after removing %d rows, still above the "
                         "%d byte cap; continuing at the next maintenance pass",
-                        "netflow.db", self.size_bytes(), removed, max_bytes)
+                        "flows.db", self.size_bytes(), removed, max_bytes)
         return removed
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
         """Busiest source and destination addresses seen recently.

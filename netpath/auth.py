@@ -286,10 +286,30 @@ class SessionStore:
             self._sessions.pop(token, None)
 
     def destroy_user(self, username: str) -> int:
-        """Used when a password changes or an account is removed."""
+        """Used when a password changes or an account is removed — both are
+        incident-response actions that only work if they actually end the
+        sessions a stolen credential is still holding.
+
+        Matched case-insensitively (casefold both sides) because every
+        account lookup elsewhere in this application is: app_db.user(),
+        set_password() and remove_user() all resolve the username against
+        a COLLATE NOCASE column. A session was created from whatever casing
+        the account signed in with (SessionStore.create is never told to
+        normalise it), so an exact, case-sensitive match here would silently
+        depend on the caller happening to pass that same casing back. It
+        does not, reliably: an administrator resetting "Bob.Smith"'s
+        password types the case variant on screen, the DB row updates
+        correctly under NOCASE, the caller reports "N session(s) ended" —
+        and if the live session was created as "bob.smith", N is 0 and the
+        compromised session that this reset exists to kill keeps working.
+        Casefolding here keeps this method's notion of "same account" in
+        agreement with app.db's, so the caller's casing can never be the
+        thing silently deciding whether the sessions die.
+        """
+        target = username.casefold()
         with self._lock:
             gone = [token for token, session in self._sessions.items()
-                    if session["username"] == username]
+                    if session["username"].casefold() == target]
             for token in gone:
                 self._sessions.pop(token, None)
         return len(gone)

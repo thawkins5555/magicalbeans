@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
-import time
+import threading
 
 
 def default_db_path() -> str:
@@ -203,9 +204,44 @@ def run_headless(args) -> int:
           "password before it can do anything else.")
     print("  Ctrl+C to stop.")
 
+    stop_event = threading.Event()
+
+    def _request_stop(signum, frame) -> None:
+        # Only sets a flag. The actual cleanup runs below, on the normal
+        # control flow once the wait returns — not inside a signal handler,
+        # which can land while the interpreter is anywhere at all.
+        stop_event.set()
+
+    # RUNBOOK.md's documented way to stop this service is `systemctl
+    # stop sappiwhere` (or `restart`) on Linux and `nssm stop SappiWhere` on
+    # Windows, and both deliver SIGTERM. Its default disposition kills the
+    # process outright, which skipped the `finally` below entirely — ten
+    # SQLite databases killed mid-WAL-checkpoint, open SSH sessions to live
+    # network devices simply gone, and an in-flight trace never drained.
+    # SIGINT gets the same handler for consistency and because a plain
+    # `kill` from a shell defaults to it too; the `except KeyboardInterrupt`
+    # below stays as a fallback for whatever this loop does not cover, so an
+    # interactive Ctrl+C still works even if, for some reason, no handler
+    # below was installed. SIGBREAK is what NSSM actually delivers to a
+    # console process on `nssm stop` on Windows — it has no true SIGTERM —
+    # so it is handled the same way there, when Python defines it at all.
+    #
+    # Guarded rather than called bare: signal.signal raises ValueError when
+    # called off the main thread, and this is reachable from contexts other
+    # than a plain `python -m netpath` launch, so a platform or thread that
+    # cannot install a handler degrades to the old Ctrl+C-only behaviour
+    # instead of crashing the service on startup.
+    for _sig_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        _sig = getattr(signal, _sig_name, None)
+        if _sig is None:
+            continue          # SIGBREAK only exists on Windows
+        try:
+            signal.signal(_sig, _request_stop)
+        except (ValueError, OSError):
+            pass
+
     try:
-        while True:
-            time.sleep(1)
+        stop_event.wait()
     except KeyboardInterrupt:
         print("\nStopping…")
     finally:

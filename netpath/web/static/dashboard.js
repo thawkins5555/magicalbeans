@@ -15,9 +15,7 @@
    and the link is a real anchor with a real href, so it can be middle-clicked
    into a second tab and copied into a ticket. */
 (() => {
-  const escape = (s) => String(s ?? '').replace(/[&<>"'`]/g,
-    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
-              "'": '&#39;', '`': '&#96;' }[c]));
+  const escape = App.escapeHtml;
 
   const view = {
     dashboard: null,

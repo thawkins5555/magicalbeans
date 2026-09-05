@@ -418,10 +418,19 @@ budget_nodes.add(102, device_group_id=None)
 
 # 250-char lines of nothing but 'a' — the worst case _has_adjacent_
 # quantifiers still lets through, forcing full backtracking with no match
-# ever found. ~40 lines is already enough to blow well past the budget at
-# ~0.33s/line if the deadline were not checked per line.
+# ever found. At ~0.33s/line against a 10s budget, ~40 lines is the
+# arithmetic minimum to overrun it — and that is exactly why 40 was the
+# wrong number to write. Whether device 101 ran out of budget partway (the
+# not_yet_assessed this section asserts) or squeaked through all 40 lines
+# and was marked `pass` came down to how fast this machine happened to be
+# on the day, and the suite failed roughly one run in three because of it.
+# The count is now far past the point where any plausible machine could
+# finish one device inside the budget, which costs nothing: the deadline is
+# checked per line, so elapsed time is bounded by the budget itself no
+# matter how many lines sit behind it — more lines only make the truncation
+# certain, never slower.
 worst_line = "a" * 250
-adversarial_capture = "\n".join([worst_line] * 40)
+adversarial_capture = "\n".join([worst_line] * 400)
 budget_db.add_backup(101, adversarial_capture)
 budget_db.add_backup(102, adversarial_capture)
 

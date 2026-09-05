@@ -46,6 +46,36 @@ CLOCK_SKEW_S = 3600.0
 # more to parse; see _strip_structured_data for what it costs without a cap.
 MAX_SD_ELEMENTS = 64
 
+# Every *run* of C0 control bytes (0x00-0x1F) and DEL (0x7F). `.strip(
+# "\r\n\x00 ")` only ever trimmed the *ends* of the decoded text, so an
+# embedded NUL, CR or LF — or a full ANSI/VT100 escape sequence, which always
+# opens with ESC, 0x1B — reached the stored message unmodified from any
+# unauthenticated sender on UDP/514. The web UI escapes correctly on render
+# (verified: this is not a stored-XSS issue), but the stored column is a
+# ready-made terminal-escape-injection primitive for any CLI or export
+# consumer that later cats these rows to a real terminal — a message can end
+# with its own colour or cursor codes and hide or rewrite whatever prints
+# after it.
+#
+# Replaced with a single space, not deleted: a device that legitimately
+# packs a multi-line block (a stack trace, a config diff) into one syslog
+# datagram separates its lines with a real \n, and deleting it outright would
+# silently weld the words on either side into one ("line one\nline two"
+# becomes "line oneline two") — corrupting a message this parser is supposed
+# to store as-is just as surely as the injection this fix closes. A run of
+# several control bytes (a Windows \r\n, or padding) collapses to one space
+# rather than one per byte, so it still reads as a single word boundary.
+# This still fully destroys CR, LF, NUL and the ESC byte every ANSI/VT100
+# sequence starts with, and costs nothing real: the PRI, the RFC 5424 header
+# fields and the structured-data brackets this parser reads are all
+# printable ASCII, and none of the shapes below need a raw control byte to
+# recognise them.
+_CONTROL_BYTES = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _strip_control(text: str) -> str:
+    return _CONTROL_BYTES.sub(" ", text)
+
 
 def facility_name(number) -> str:
     try:
@@ -137,7 +167,7 @@ def parse(data: bytes, source: str, now: float | None = None) -> LogEntry:
     """Turn one datagram into an entry. Never raises."""
     now = now or time.time()
     try:
-        text = data.decode("utf-8", "replace").strip("\r\n\x00 ")
+        text = _strip_control(data.decode("utf-8", "replace")).strip(" ")
     except Exception:
         text = repr(data)
 

@@ -538,10 +538,16 @@ API. There is deliberately no button for it — turning it on is a decision abou
 one switch, taken by somebody who knows what that switch's configuration
 contains.
 
-**Be clear about what redaction is and is not.** It is a pattern list. It
-covers the directives above across the vendors ConfigRX supports, and it will
-not cover a directive nobody has thought of, a vendor added later, or a secret
-an operator has put in a description field. A redacted backup is
+**Be clear about what redaction is and is not.** It is a pattern list, not a
+parser or a guarantee. It covers the directive families the vendors ConfigRX
+ships support for actually use — Cisco IOS/IOS-XE/NX-OS/IOS-XR, FortiOS,
+Juniper Junos, MikroTik RouterOS and HP/Aruba — but coverage across that set
+is uneven: `configrx_redact.py`'s own module docstring names exactly what is
+and is not covered today, including the two documentation-sourced vendors
+(Moxa, Siemens) with no pattern of their own yet. It will not cover a
+directive nobody has thought of, a vendor added later without a matching
+pattern, or a secret an operator has put in a description field. A redacted
+backup is
 *substantially* safer to hand to somebody than an unredacted one; it is not a
 sanitised document you should treat as public. Read it as defence in depth
 underneath the permission change, not as a replacement for it.
@@ -919,11 +925,25 @@ module every caller in this application imports, and dispatches to
    r=8, p=1 — see §1). The 32-byte output is expanded into two independent
    32-byte keys, `key_enc` and `key_mac`, with HMAC-SHA256 under distinct
    labels — never the same bytes doing two jobs. This is the expensive step,
-   run once per process and cached in memory for its lifetime: "held in
-   memory only" describes these two derived keys, never the passphrase
-   sitting in a file this application wrote, and never scrypt's ~128 MiB
-   being paid again on every credential decrypt (some of them happen once per
-   device, per poll cycle).
+   cached in memory for as long as the passphrase that produced it stays
+   unchanged: "held in memory only" describes these two derived keys, never
+   the passphrase sitting in a file this application wrote, and never
+   scrypt's ~128 MiB being paid again on every credential decrypt (some of
+   them happen once per device, per poll cycle) for as long as nothing about
+   the passphrase source has actually changed. The cache is keyed on a
+   digest of the current passphrase alongside the scrypt parameters, not on
+   the scrypt parameters alone — a corrected or rotated passphrase file (or
+   environment variable) is read fresh on every `protect()`/`unprotect()`
+   call and, producing a different digest, misses the cache and re-derives,
+   so it takes effect on the very next call this process makes rather than
+   only after a restart. (An earlier build of this cache keyed on the
+   scrypt parameters alone, which — because `protect()` always calls it with
+   this build's own three constants — meant the very first key derived in a
+   process satisfied every later call in it: an operator who rewrote the
+   passphrase file to rotate away from one they believed had leaked, then
+   re-entered every credential through the UI, was silently re-encrypting
+   all of them under the old, leaked key. Fixed in `netpath/secretstore.py`;
+   see that module's own docstring on `_keys_for` for the full account.)
 2. **Encryption.** A keystream built from `HMAC-SHA256(key_enc, nonce ||
    counter)` for successive counters, concatenated and truncated to the
    plaintext's length, XORed with the plaintext — a keyed hash run in counter
@@ -1026,12 +1046,18 @@ about, and the portable store is no exception:
 
 #### Limitations
 
-- **No passphrase rotation.** There is no re-key operation. Changing the
-  passphrase makes every credential already stored undecryptable under it;
-  every one of them has to be re-entered under the new passphrase, the same
-  as if DPAPI's machine key had changed. Plan a passphrase change the way
-  you would plan re-entering every credential in the interface, because
-  that is what it is.
+- **No passphrase rotation, in the re-keying sense.** There is no re-key
+  operation. Changing the passphrase makes every credential already stored
+  undecryptable under it; every one of them has to be re-entered under the
+  new passphrase, the same as if DPAPI's machine key had changed. Plan a
+  passphrase change the way you would plan re-entering every credential in
+  the interface, because that is what it is. What *is* true, and matters for
+  planning that change safely: a rotated passphrase file or environment
+  variable takes effect on the very next credential this process encrypts or
+  decrypts, not only after a restart — so re-entering credentials through
+  the UI right after rewriting the passphrase file re-encrypts them under
+  the new one immediately, in the same running process, rather than
+  silently continuing to use whatever passphrase this process first read.
 - **The browser UI has not caught up** — see "A gap this workstream did not
   close" above. The backend enforces and works correctly regardless; the
   disabled-looking form fields are a display issue, not a security one, but

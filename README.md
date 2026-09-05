@@ -762,6 +762,10 @@ netpath/
   syslogparse.py   RFC 3164 and RFC 5424 message parsing
   syslogd.py       syslog UDP/TCP listener
   syslogdb.py      syslog storage, rollup counts, trigram substring search
+  trapdecode.py    SNMP trap BER/ASN.1 decoding and encoding, v3 USM auth
+  trapoids.py      well-known trap OID names, enum tables, default severities
+  snmptrapd.py     SNMP trap UDP listener
+  snmptrapdb.py    SNMP trap storage, rollup counts
   namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup
   procs.py         launching child processes with no console window
   auth.py          password hashing, users, sessions, login throttling
@@ -772,14 +776,74 @@ netpath/
   ipam_scan.py     subnet ping sweep and ARP-table reconciliation
   ipam_dhcp.py     polls a Windows DHCP server's scopes, leases and reservations
   ipam_worker.py   background scheduler for subnet scans and DHCP polling
+  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller
+  nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
+  nodesdb.py       nodes.db: devices, polling profiles, interfaces, polled
+                   metrics/samples, state events, uploaded MIBs, discovery
+  nodediscover.py  per-device and per-subnet discovery: ping sweep plus
+                   best-effort SNMP v1/v2c identification
+  snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
+                   GETBULK builders, response decoder, v1/v2c/v3 assembly
+  vendorid.py      vendor identification from a device's populated
+                   enterprise OID arcs
+  enterprises.py   IANA enterprise-number -> vendor table, for arcs no
+                   uploaded MIB describes
+  mibcatalog.py    curated catalog of vendor MIB bundles, installed on demand
+  mibparse.py      stdlib-only, best-effort MIB text parser
+  alertsdb.py      alerts.db: rule definitions, open/acked/resolved alerts,
+                   email templates, notification history, SMTP settings
+  alertrules.py    alert rule/occurrence matching, flapping and threshold
+                   hysteresis evaluators
+  alertengine.py   AlertEngine: the 5-second evaluation scheduler that
+                   drains events/traps/syslog/IPAM into alerts
+  alertmail.py     alert email: {{token}} template rendering, stdlib SMTP
+  fortinetoids.py  OID constants for FortiGate Wireless Controller polling
+  fortipoll.py     WirelessPoller: polls FortiGate controllers for managed
+                   APs over SNMP
+  wirelessdb.py    wireless.db: controller storage and SNMP credentials
+  configrxdb.py    configrx.db: backup config storage, keyed to Nodes'
+                   own device ids
+  configrx.py      ConfigRxWorker: scheduled read-only "show config" pulls
+                   over SSH, the backup path's safety boundary
+  configrx_vendors.py    per-vendor allow-list of the exact commands a
+                   backup may ever send over SSH
+  configrx_redact.py     strips secrets (community strings, PSKs, enable
+                   passwords) from a captured config before it is stored
+  configrx_search.py     cross-device search over stored configs, with a
+                   bounded-regex compiler so a query can't hang
+  configrx_compliance.py rule sets: must-match/must-not-match checks
+                   against each device's latest capture
+  hostkeys.py      remembered SSH host keys, shared by ConfigRX and the
+                   SSH terminal; refuses a changed key
+  sshterm.py       interactive SSH sessions for the browser terminal
+                   window, over a WebSocket
+  permissions.py   the per-module read/write permission model
+  report.py        availability and link-saturation reports, computed
+                   from history Nodes and Alerts already keep
+  hostresolve.py   shared "best-known display name for an IP", used by
+                   Syslog, Alerts and NetPath alike
+  dbmaint.py       incremental-vacuum space reclamation without VACUUM's
+                   stop-the-world lock
+  dbopen.py        opens a SQLite file with owner-only file permissions
+  settingsutil.py  type coercion for settings dicts loaded from or
+                   written to the settings table
+  secretstore.py   the portable secret store: a passphrase-derived key,
+                   a stand-in for DPAPI on hosts without it
+  ldapclient.py    a minimal LDAPv3 simple-bind client for directory auth
+  udpsock.py       dual-stack UDP bind and drop-counter helpers shared
+                   by the three collectors
   web/
     __init__.py    exports Service and WebServer
     service.py     headless service: opens the databases, starts the
                    scheduler, resolver and collectors
     api.py         JSON endpoints — one function per route, grouped by
-                   NetPath, NetFlow, syslog, IPAM, auth and users
+                   NetPath, NetFlow, syslog, IPAM, auth and users, plus
+                   nodes, alerts, snmp, wireless, configrx, ssh, debug,
+                   settings, dashboard, audit, maintenance, update,
+                   platform, config, tokens and password
     server.py      HTTP(S) server: routing, sessions/cookies, access log,
                    serving static/
+    wsock.py       RFC 6455 WebSocket framing, server side, stdlib only
     static/        the browser interface
       index.html   the twelve-tab shell
       login.html   the sign-in page
@@ -788,14 +852,31 @@ netpath/
       app.css      shared styling for the whole interface, on the tokens
       app.js       shared plumbing: server calls, tab switching, the
                    refresh loop, modals
+      boot.js      marks which tab paints first, before <body> has a
+                   single byte of content to render
+      dashboard.js Dashboard tab: fleet/alert/collector/storage/poller
+                   tiles, worst-ten offender lists
       netpath.js   Routes tab: route graph, timeline, destinations
       netflow.js   NetFlow tab: traffic chart, top-N, flow table, filters
+      snmp.js      SNMP Trap tab: hourly histogram, trap table, varbinds
       syslog.js    Syslog tab: message table, filters, collector settings
       ipam.js      IPAM tab: subnets & hosts, conflicts, DHCP
+      nodes.js     Nodes tab: device inventory, per-device drill-down
+                   chart, discovery, polling profiles, vendor MIBs
+      alerts.js    Alerts tab: open/acked/resolved alerts, histogram,
+                   rules, email templates
+      wireless.js  Wireless tab: FortiGate-managed APs at a glance
+      configrx.js  ConfigRX tab: device list, stored backups, read-only
+                   backup viewer
       debug.js     Debug tab: trace workers, event log
       settings.js  Settings tab: reverse DNS, refresh interval, database
                    locations, maintenance
       login.js     sign-in form and idle/session-timeout handling
+      ssh.html     the standalone SSH terminal popup window
+      ssh.css      styling for the SSH popup, on top of app.css
+      ssh.js       the SSH window: xterm.js terminal driven over a
+                   WebSocket
+      vendor/      vendored third-party JS (xterm.js and its fit addon)
 ```
 
 Traces and hops go in `traces` and `hops`, with resolved names in `hostnames`. A hop row exists per distinct address seen at that TTL in that run, plus a null-address row when every probe timed out — that is what lets a single run show a fork, and what makes the `no reply` boxes appear in the graph.

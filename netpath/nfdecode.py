@@ -22,8 +22,60 @@ from dataclasses import dataclass, field
 # wire, so both caches are keyed on data an attacker (or a rebooting exporter
 # that never reuses a domain) chooses. Bounded, least-recently-used, and
 # generous enough for a few thousand exporters' worth of real templates.
+# Kept as the historical name for the *overall* order of magnitude this
+# module has always targeted; the template cache itself is no longer one
+# flat LRU of this size -- see MAX_TEMPLATES_PER_EXPORTER below for why, and
+# for the bound that actually governs it now.
 MAX_TEMPLATES = 4096
 MAX_SAMPLING = 4096
+
+# A real exporter's own template set is small: even a chassis exporting
+# several protocols at once (v4, v6, MPLS, BGP next-hop, plus a couple of
+# options templates for sampling and interface metadata) rarely reaches a
+# few dozen distinct (domain, template_id) layouts. 64 is generous headroom
+# above that ceiling per exporter.
+#
+# The old single MAX_TEMPLATES-sized cache was keyed
+# (exporter, domain, template_id), and domain and template_id are both wire
+# data the *sending source* controls outright -- no spoofing required.
+# Varying the 4-byte observation-domain field once per packet let one source
+# mint unlimited distinct keys in the one cache every exporter shared, and
+# evict every real exporter's templates well before their own resend cycle
+# came around: a few thousand 32-byte packets was enough to make every other
+# exporter's data flowsets undecodable (counted in stats["no_template"])
+# until each one happened to resend, often minutes later. Bounding the cache
+# *per exporter* means the worst a flood from one source can do is push out
+# its own earlier templates.
+MAX_TEMPLATES_PER_EXPORTER = 64
+# How many distinct exporter addresses the template cache remembers at all,
+# matching collector.py's MAX_SEEN_SOURCES: the address is the datagram's
+# source, which is spoofable, so this outer bound is an LRU too rather than
+# an unbounded dict of per-exporter buckets.
+MAX_TEMPLATE_EXPORTERS = 4096
+
+# A template describes one data record's field layout. Real ones carry a
+# handful of fields up to a few dozen at the outside -- an IPFIX record
+# carrying every common counter and address IE plus MPLS labels and a BGP
+# next hop for both IP versions is still under 40. The wire format's
+# `count` is a 16-bit value the exporter (or anyone spoofing its address)
+# sets outright, up to 65535, and nothing capped how many (id, len,
+# enterprise) tuples a template could accumulate before this fix -- the same
+# finding trapdecode.py already guards against for varbinds via
+# max_varbinds. 128 is roughly 2x the largest real template ever seen here.
+MAX_FIELDS_PER_TEMPLATE = 128
+
+# Real NetFlow/IPFIX sampling is commonly 1-in-1000 and rarely above
+# 1-in-65536 (a 16-bit hardware sampler is the ceiling on most ASICs that do
+# this in hardware). An options record's declared rate had no upper bound at
+# all: _set_sampling cached whatever integer it carried, and every
+# subsequent flow for that exporter/domain/sampler carried it as
+# Flow.sampling. On the next flush, binding a rate past SQLite's int64 range
+# raised OverflowError out of the write, which (see collector.py's _write
+# guard for the other half of this fix) used to end the writer thread for
+# good. 1,000,000 is far above anything a real exporter sends -- roughly 15x
+# the highest plausible hardware rate -- while staying nowhere near int64's
+# ceiling (~9.2e18), so it costs no real deployment anything.
+MAX_PLAUSIBLE_SAMPLING = 1_000_000
 
 V5 = 5
 V9 = 9
@@ -129,6 +181,78 @@ class _Lru(collections.OrderedDict):
         return default
 
 
+_MISSING = object()
+
+
+class _TemplateCache:
+    """The template cache, bounded per exporter rather than as one flat LRU.
+
+    Presents the same dict-like surface as `_Lru` -- `[key] = value`, `.get`,
+    `.pop`, `in`, `len()`, `.evictions` -- against the same
+    (exporter, domain, template_id) tuple keys callers already use, so
+    nothing above this class needs to know it is really an outer LRU of
+    exporter addresses, each holding its own bounded inner `_Lru` of that
+    exporter's own (domain, template_id) templates.
+
+    Splitting the bound this way is the actual fix: `domain` and
+    `template_id` are wire data the sending source controls outright, so a
+    single flat cache shared by every exporter let one source evict every
+    other exporter's templates just by varying the observation domain it
+    sends. An inner cap of MAX_TEMPLATES_PER_EXPORTER means the worst a
+    flood from one source can do is push out its own earlier templates; the
+    outer cap of MAX_TEMPLATE_EXPORTERS bounds how many distinct exporter
+    addresses (also spoofable) are remembered at all.
+    """
+
+    def __init__(self, per_exporter: int, max_exporters: int):
+        self._per_exporter = per_exporter
+        self._max_exporters = max_exporters
+        self._exporters: collections.OrderedDict = collections.OrderedDict()
+        self.evictions = 0
+
+    def __setitem__(self, key, value) -> None:
+        exporter, domain, template_id = key
+        bucket = self._exporters.get(exporter)
+        if bucket is None:
+            bucket = _Lru(self._per_exporter)
+            self._exporters[exporter] = bucket
+            while len(self._exporters) > self._max_exporters:
+                # An exporter evicted wholesale here (rather than one
+                # template at a time) is one this cache has not heard from
+                # in a very long time -- MAX_TEMPLATE_EXPORTERS is sized to
+                # the same order of magnitude as collector.py's own
+                # MAX_SEEN_SOURCES, so this is a last resort, not the
+                # steady-state eviction path.
+                _, dropped = self._exporters.popitem(last=False)
+                self.evictions += len(dropped)
+        else:
+            self._exporters.move_to_end(exporter)
+        before = bucket.evictions
+        bucket[(domain, template_id)] = value
+        self.evictions += bucket.evictions - before
+
+    def get(self, key, default=None):
+        exporter, domain, template_id = key
+        bucket = self._exporters.get(exporter)
+        if bucket is None:
+            return default
+        self._exporters.move_to_end(exporter)
+        return bucket.get((domain, template_id), default)
+
+    def __contains__(self, key) -> bool:
+        return self.get(key, _MISSING) is not _MISSING
+
+    def pop(self, key, default=None):
+        exporter, domain, template_id = key
+        bucket = self._exporters.get(exporter)
+        if bucket is None:
+            return default
+        return bucket.pop((domain, template_id), default)
+
+    def __len__(self) -> int:
+        return sum(len(bucket) for bucket in self._exporters.values())
+
+
 @dataclass
 class Template:
     template_id: int
@@ -196,7 +320,8 @@ class Decoder:
     """Stateful across packets: holds the template cache and per-exporter sampling."""
 
     def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True):
-        self.templates: _Lru = _Lru(MAX_TEMPLATES)
+        self.templates: _TemplateCache = _TemplateCache(
+            MAX_TEMPLATES_PER_EXPORTER, MAX_TEMPLATE_EXPORTERS)
         # (exporter, observation domain, sampler id) -> rate
         self.sampling: _Lru = _Lru(MAX_SAMPLING)
         # Rates learned since the caller last drained this, so it can correct
@@ -205,7 +330,8 @@ class Decoder:
         self.default_sampling = max(1, int(default_sampling))
         self.trust_exporter_sampling = trust_exporter_sampling
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
-                      "no_template": 0, "bad_template": 0}
+                      "no_template": 0, "bad_template": 0,
+                      "implausible_sampling": 0}
 
     def sampling_for(self, exporter: str, domain: int = 0,
                      sampler_id: int = 0) -> int:
@@ -230,7 +356,19 @@ class Decoder:
         can correct the flows already stored under that key: an options
         template arrives on a slower cycle than data, so the flows decoded
         before the first one were stored with sampling=1 permanently and every
-        byte figure for that window was understated by the sampling factor."""
+        byte figure for that window was understated by the sampling factor.
+
+        `rate` is whatever integer the options record declared, with no
+        upper bound from the wire format itself. Past MAX_PLAUSIBLE_SAMPLING
+        it is rejected outright rather than cached: every flow built while
+        this key was in effect would otherwise carry it as Flow.sampling,
+        and a rate large enough eventually exceeds what SQLite's int64 bind
+        can hold, which raised OverflowError on the next flush and (see
+        collector.py's _write guard) used to end the writer thread for good.
+        """
+        if rate > MAX_PLAUSIBLE_SAMPLING:
+            self.stats["implausible_sampling"] += 1
+            return
         key = (exporter, domain, sampler_id)
         if self.sampling.get(key) == rate:
             self.sampling[key] = rate           # refresh its LRU position
@@ -360,7 +498,13 @@ class Decoder:
             offset += 4
             template = Template(template_id=template_id, is_options=options,
                                 ipfix=ipfix)
-            broken = count == 0
+            # count is a 16-bit value straight off the wire (up to 65535);
+            # past MAX_FIELDS_PER_TEMPLATE the fields are still walked, to
+            # keep `offset` in sync for whatever template or data set follows
+            # in this same flowset, but none of them are appended, so the
+            # cached-or-not Template never allocates a fields list sized by
+            # an attacker rather than by a real device.
+            broken = count == 0 or count > MAX_FIELDS_PER_TEMPLATE
             for _ in range(count):
                 if offset + 4 > len(body):
                     return
@@ -375,13 +519,16 @@ class Decoder:
                     offset += 4
                 if size <= 0:
                     broken = True
-                template.fields.append((field_id, size, enterprise))
+                if not broken:
+                    template.fields.append((field_id, size, enterprise))
             if broken:
-                # A template with no fields, or with a zero-length field, has a
-                # record length of zero: caching it made _read_data loop
-                # forever at 100% CPU on the receive thread with `running`
-                # still true. Refuse it, and forget any earlier template with
-                # the same id so stale layouts cannot be decoded either.
+                # A template with no fields, with a zero-length field, or
+                # with more fields than any real device sends has a record
+                # length of zero or is not worth caching at all: caching a
+                # zero-length one made _read_data loop forever at 100% CPU
+                # on the receive thread with `running` still true. Refuse
+                # it, and forget any earlier template with the same id so
+                # stale layouts cannot be decoded either.
                 self.stats["bad_template"] += 1
                 self.stats["errors"] += 1
                 self.templates.pop((exporter, domain, template_id), None)
@@ -409,7 +556,12 @@ class Decoder:
 
         template = Template(template_id=template_id, is_options=True,
                             scope_count=scope_count, ipfix=ipfix)
-        broken = field_count == 0
+        # Same field-count cap as _read_templates, and the same reason: the
+        # loop still walks every field so `offset` stays correct for
+        # whatever follows in the flowset, but nothing past the cap is
+        # appended, so a template claiming an absurd field_count never grows
+        # the fields list to match.
+        broken = field_count == 0 or field_count > MAX_FIELDS_PER_TEMPLATE
         for _ in range(field_count):
             if offset + 4 > len(body):
                 break
@@ -424,7 +576,8 @@ class Decoder:
                 offset += 4
             if size <= 0:
                 broken = True
-            template.fields.append((field_id, size, enterprise))
+            if not broken:
+                template.fields.append((field_id, size, enterprise))
         if broken:
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1

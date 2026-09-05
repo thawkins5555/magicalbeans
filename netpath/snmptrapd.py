@@ -66,6 +66,7 @@ class TrapCollector:
         # counted here and _crash records a thread that ended anyway so the
         # status strip does not read like a deliberate stop.
         self._last_error_log = 0.0
+        self._last_batch_error_log = 0.0
         self._crash: str | None = None
         self._drops: udpsock.KernelDrops | None = None
         self._drops_logged = False
@@ -87,7 +88,15 @@ class TrapCollector:
 
     @property
     def running(self) -> bool:
-        return any(t.is_alive() for t in self._threads)
+        # Every thread, not just any one of them: with `any`, a dead
+        # snmp-write (see _insert_batch above) left this True as long as
+        # snmp-udp was still receiving, so status_text() kept reading
+        # "listening ... last trap just now" while nothing was being
+        # stored -- the same blind spot the flow collector had in
+        # collector.py's `running` (fixed there; syslogd.py's `running` has
+        # the identical shape and the same bug, but that module belongs to a
+        # different owner).
+        return bool(self._threads) and all(t.is_alive() for t in self._threads)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -439,20 +448,70 @@ class TrapCollector:
             self._poll_kernel_drops()
             due = time.time() - last_flush >= FLUSH_S
             if pending and (due or len(pending) >= BATCH):
-                try:
-                    self.counters["stored"] += self.db.insert(pending)
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
+                self.counters["stored"] += self._insert_batch(pending)
                 pending.clear()
                 last_flush = time.time()
                 if self.on_batch:
                     self.on_batch()
         if pending:
+            self.counters["stored"] += self._insert_batch(pending)
+
+    def _insert_batch(self, traps: list) -> int:
+        """Insert one flush's worth of traps.
+
+        A batch failing outright used to print a bare traceback to stderr —
+        invisible in the event log every other error path in this module
+        uses — and drop the whole batch, up to BATCH good traps lost along
+        with whichever one actually poisoned it (an oversized BER INTEGER
+        that survived clamping to reach here would be one way; any other bad
+        row is another). One poisoned trap should not cost the other 199, so
+        a batch that fails is retried one row at a time: the common case
+        pays a single executemany, and only the rare failing batch pays for
+        BATCH separate commits.
+
+        The rollback matters as much as the retry: sqlite3 does not
+        auto-commit each row of an executemany, so the rows that *did* bind
+        successfully before the poisoned one raised are left sitting in an
+        open, uncommitted transaction on the shared connection. Left alone,
+        the next successful commit() -- from the very first per-row retry
+        below -- would silently commit them a second time (they are still
+        pending from the failed attempt) as well as the row it meant to
+        commit, double-storing everything that came before the poisoned row
+        in the original batch.
+        """
+        try:
+            return self.db.insert(traps)
+        except Exception as exc:
+            # Under the database's own lock, not beside it. This connection
+            # is shared (check_same_thread=False) with the retention thread,
+            # whose prune/trim_to_size commit chunked deletes under that same
+            # lock -- rolling back from outside it could discard a delete
+            # that had bound its rows and not yet committed. The lock is an
+            # RLock and this thread holds nothing else, so taking it here
+            # cannot deadlock against the insert path that just failed.
             try:
-                self.db.insert(pending)
+                with self.db._lock:
+                    self.db._conn.rollback()
             except Exception:
                 pass
+            stored = 0
+            lost = 0
+            for trap in traps:
+                try:
+                    stored += self.db.insert([trap])
+                except Exception:
+                    lost += 1
+            now = time.time()
+            if now - self._last_batch_error_log >= 60:
+                self._last_batch_error_log = now
+                self.log.add(ERROR,
+                             f"A batch of {len(traps)} traps failed to insert "
+                             f"together ({exc}); {lost} could not be stored "
+                             f"even retried one at a time and were discarded, "
+                             f"{stored} were saved",
+                             detail=traceback.format_exc())
+            self.counters["errors"] += 1
+            return stored
 
     # ------------------------------------------------------------------ status
 

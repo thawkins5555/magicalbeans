@@ -231,8 +231,24 @@ def main() -> int:
         settings_js = fh.read()
     with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as fh:
         index_html = fh.read()
+    # "Reachable" means a control exists somewhere an administrator can get
+    # at, not specifically on the Settings page. The listener keys
+    # (web_host/web_port/web_cert/web_key) joined ADMIN_ONLY_SETTINGS when a
+    # review found that a plain settings:write grant — deliberately weaker
+    # than admin — could repoint the TLS material and the bind address
+    # through the API. They have never had a Settings-page control and
+    # should not get one: the listener is changed from the service console
+    # (console.py's Apply and restart), which needs a session on the host
+    # itself, and from the command line. So the console counts as a control
+    # surface here. What this check is really guarding against is the
+    # updates_enabled case in the comment above — a key the API guards that
+    # NOTHING anywhere can set, which can therefore only ever hold its
+    # default — and that guarantee is unchanged.
+    with open(os.path.join(_paths.REPO_ROOT, "netpath", "console.py"),
+              encoding="utf-8") as fh:
+        console_py = fh.read()
     unreachable = [key for key in _api.ADMIN_ONLY_SETTINGS
-                   if key not in settings_js]
+                   if key not in settings_js and key not in console_py]
     check("D3 every administrator-only setting has a control that sets it",
           not unreachable, str(unreachable))
     # And that control is gated on the grant the API actually demands, so it

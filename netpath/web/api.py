@@ -19,7 +19,7 @@ import time
 
 from ..alertrules import device_id_for
 from ..alertsdb import is_window_active
-from ..analysis import availability, build_timeline, build_topology
+from ..analysis import availability, build_timeline, build_topology, clamp_window
 from .. import hostresolve
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
@@ -68,11 +68,32 @@ MIN_BLOCK_PX = 3
 # to the text itself, not a header, since there is no raw response for a
 # header to sit on — Excel opens a BOM-led file as UTF-8 instead of
 # guessing a system codepage and mangling anything outside ASCII.
+#
+# RFC 4180 quoting is not the whole job, because the program that opens
+# these files is a spreadsheet, not a CSV parser. Excel and Sheets treat a
+# cell whose text begins with = + - or @ as a formula, and the DDE forms of
+# that (=cmd|'\u2026'!A0) prompt to launch a program. The content here is not
+# ours: a syslog message is written by anything that can reach UDP/514,
+# which needs no account and no HTTP request at all, and a device name, an
+# interface description or an LLDP neighbour's name comes from the device.
+# So an unauthenticated sender on the network could put a formula in a
+# syslog line, wait for an operator to export a search and open it, and get
+# the prompt on the analyst's workstation. A leading apostrophe is the
+# conventional inert prefix: the spreadsheet drops it and shows the text.
+_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value):
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_LEAD):
+        return "'" + value
+    return value
+
+
 def _csv_text(header: list[str], rows) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\r\n")
     writer.writerow(header)
-    writer.writerows(rows)
+    writer.writerows([_csv_cell(cell) for cell in row] for row in rows)
     return "\ufeff" + buf.getvalue()
 
 
@@ -155,11 +176,24 @@ def _num(params, key, default=None, cast=float):
 
 
 def _window(params, default_span_s: float = 3600.0) -> tuple[float, float]:
+    """The (t0, t1) every windowed route reads from the query string.
+
+    Runs through analysis.clamp_window, which is the same rule the NetPath
+    side has always applied and which this helper used to skip. Skipping it
+    mattered because `_num(..., float)` happily parses "inf", "nan" and
+    "1e18": nothing here rejected them, and t1 <= t0 does not catch a NaN or
+    an infinity. A caller could then hand a downstream aggregator a span of
+    1e18 seconds, and flowdb.overview sizes its per-series lists from
+    (t1 - t0) / bucket_s — an allocation with no ceiling but the machine's
+    memory, attempted on the request thread of a host that is also polling
+    devices and receiving flows. clamp_window bounds the magnitude, the
+    ordering and the span, and returns a sane pair for input that is not a
+    finite number at all."""
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - default_span_s)
     if t1 <= t0:
         t1 = t0 + 60
-    return t0, t1
+    return clamp_window(t0, t1)
 
 
 def _id_list(raw) -> list[int] | None:
@@ -845,15 +879,34 @@ def _flow_label(service, dimension: str, key, names: dict | None = None) -> str:
     return text
 
 
+# flowdb.overview allocates one float per bucket per series, so the bucket
+# count — not the span — is what decides how much memory a chart request
+# costs. The ladder below stops at 14 days, and every wider span used to
+# fall through to a flat six-hour bucket however wide it actually was, so
+# the count kept growing with the window instead of levelling off. A
+# configured bucket_seconds could do the same from the other direction: a
+# ten-second bucket over a year is 3.15 million of them. Both are bounded
+# here by widening the bucket until the count fits, which is the same thing
+# analysis.build_timeline does for its own MAX_BUCKETS rather than
+# narrowing the window the operator asked for.
+FLOW_MAX_BUCKETS = 5000
+
+
 def _flow_bucket(service, span: float) -> float:
     configured = int(service.flow_settings.get("bucket_seconds", 0) or 0)
     if configured:
-        return float(configured)
-    for limit, bucket in [(900, 10), (7200, 60), (43200, 300),
-                          (172800, 900), (1209600, 3600)]:
-        if span <= limit:
-            return float(bucket)
-    return 21600.0
+        bucket = float(configured)
+    else:
+        bucket = 21600.0
+        for limit, step in [(900, 10), (7200, 60), (43200, 300),
+                            (172800, 900), (1209600, 3600)]:
+            if span <= limit:
+                bucket = float(step)
+                break
+    bucket = max(bucket, 1.0)
+    if span / bucket > FLOW_MAX_BUCKETS:
+        bucket = math.ceil(span / FLOW_MAX_BUCKETS)
+    return float(bucket)
 
 
 def get_flow_overview(service, params, body) -> dict:
@@ -1307,9 +1360,27 @@ SETTINGS_SCOPES = {
 # its own code from the internet, and the ldap_* keys decide who may sign
 # in at all and where a password gets sent — both are administrator
 # decisions in the same sense creating an account is, not preferences.
+#
+# The session_* and web_* keys are here for the same reason, and were
+# missed when "admin" was first carved out of "settings" (see
+# permissions.py's docstring for why that split exists at all). They are
+# already classified as sensitive server internals by SETTINGS_ONLY_KEYS
+# below — "where the listener binds and which TLS material it loads, how
+# long a sign-in lasts" — but classifying them only hid them from a reader
+# without Settings access; nothing stopped a plain settings:write grant,
+# deliberately weaker than admin, from writing them. That grant could
+# extend session_idle_minutes and session_max_hours for every account on
+# the host (apply_global_settings hands them straight to
+# SessionStore.configure, so it takes effect immediately, not at the next
+# restart), or repoint web_cert/web_key/web_host/web_port at material of
+# its own choosing for the next start. Deciding how long a sign-in lasts
+# and which certificate the listener presents is an administrator's call
+# in exactly the sense the ldap_* keys already were.
 ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
                       "ldap_bind_dn_template", "ldap_allow_cleartext",
-                      "ldap_timeout_s")
+                      "ldap_timeout_s",
+                      "session_idle_minutes", "session_max_hours",
+                      "web_host", "web_port", "web_cert", "web_key")
 
 
 def _is_admin(service, params) -> bool:
@@ -1410,7 +1481,18 @@ def post_settings(service, params, body) -> dict:
     if not isinstance(values, dict):
         raise ValueError("values must be an object")
     granted = service.app_db.permissions_for(params.get("_username", ""))
-    touched = [key for key in ADMIN_ONLY_SETTINGS if key in values]
+    # Only the keys this scope would actually write. A per-module scope
+    # discards anything outside its own defaults a few lines below, so a
+    # netpath-scope POST that happens to carry web_cert never sets web_cert
+    # — and refusing the whole request because the key was *mentioned* would
+    # turn a harmless ignored field into a 403, which is a behaviour change
+    # in its own right and one an existing suite pins deliberately (a
+    # module-scope write that names a global key is accepted, and the global
+    # key is dropped). Filtering by the scope's own defaults keeps that
+    # contract intact while still refusing the write that would really land.
+    scope_keys = _scope_defaults(scope)
+    touched = [key for key in ADMIN_ONLY_SETTINGS
+               if key in values and key in scope_keys]
     if touched and not _may_change_admin_settings(service, params):
         raise _permissions.Forbidden(
             f"Changing {', '.join(touched)} needs administrator access")
@@ -3340,17 +3422,50 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     row = service.nodes_db.device(device_id)
     if not row:
         raise ValueError("No such device")
-    service.nodes_db.remove_device(device_id)
+    # ConfigRX first, Nodes second. These are two databases, so this cannot
+    # be one transaction and one of the two orders has to be wrong on a
+    # crash — the question is only which residue is survivable. Dropping the
+    # nodes row first leaves configrx.db holding this device_id's
+    # device_config row, with its ssh_password_enc and enable_secret_enc
+    # still in it, keyed on an id nothing owns any more. devices.id is
+    # INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite reissues the
+    # highest freed rowid to the next device added: delete the newest
+    # device, have this call fail or the process die between the two lines,
+    # add a device, and that new and entirely unrelated device silently
+    # inherits the old one's stored SSH credentials, with nothing logged.
+    # This order fails the other way instead — a nodes row that outlives its
+    # ConfigRX config, which the operator can simply delete again.
     service.configrx_db.forget_device(device_id)
+    service.nodes_db.remove_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     _audit(service, params, "device.delete", target=f"device:{row['ip']}")
     return {"ok": True}
+
+
+# The 16 MB body cap leaves room for well over a million integers, and an
+# id list that long is a mistake or an attack rather than a fleet: it costs
+# real time and memory before anything can reject it on its merits. This is
+# the ceiling on that, nothing more.
+#
+# It is deliberately far above any list the interface can produce. The
+# SQLite parameter limit that a bulk id list actually runs into
+# (SQLITE_MAX_VARIABLE_NUMBER, 999 on builds older than 3.32) is handled
+# where it belongs, by chunking the statement in nodesdb._id_chunks — not
+# by capping the request. An earlier version of this guard capped at 900 to
+# stay under that limit, which broke the Devices page's own select-all at
+# its shipped 1000-row page size: the fix for a 500 nobody had hit turned
+# into a 400 an operator would hit on an ordinary afternoon.
+BULK_DEVICE_ID_MAX = 50000
 
 
 def _bulk_device_ids(body) -> list[int]:
     ids = body.get("device_ids") or []
     if not ids:
         raise ValueError("device_ids is required")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many devices in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     return [int(i) for i in ids]
 
 
@@ -3384,9 +3499,11 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
-    removed = service.nodes_db.bulk_remove_devices(device_ids)
+    # ConfigRX first, for the credential-inheritance reason spelled out in
+    # delete_nodes_device.
     for device_id in device_ids:
         service.configrx_db.forget_device(device_id)
+    removed = service.nodes_db.bulk_remove_devices(device_ids)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     _audit(service, params, "device.bulk_delete", target=f"{len(device_ids)} devices")
     return {"ok": True, "removed": removed}
@@ -4439,7 +4556,10 @@ def post_nodes_discovery(service, params, body) -> dict:
 
 
 def get_nodes_discovery(service, params, body) -> dict:
-    limit = int(_num(params, "limit", 50, int) or 50)
+    # Clamped like every other paginated list route in this file. It was the
+    # one that wasn't: SQLite reads a negative LIMIT as "no limit", so
+    # ?limit=-1 returned the whole discovery_jobs table instead of a page.
+    limit = max(1, min(int(_num(params, "limit", 50, int) or 50), 500))
     return {"jobs": [_discovery_job_json(r) for r in service.nodes_db.discovery_jobs(limit)]}
 
 
@@ -5191,6 +5311,88 @@ def get_alerts_rules(service, params, body) -> dict:
     return {"rules": [_rule_json(r) for r in service.alerts_db.rules()]}
 
 
+# The three rule kinds alertrules.evaluate_threshold decides, and so the
+# three whose threshold/clear_threshold have to mean something.
+_THRESHOLD_RULE_KINDS = ("threshold", "dhcp_threshold", "netpath_threshold")
+
+
+def _validated_threshold_fields(kind: str, row, fields: dict) -> dict:
+    """Refuse a threshold rule that can never raise, and refuse a threshold
+    or clear threshold that is not a finite number.
+
+    Nothing checked either field before, on the create route or the update
+    route, and the Edit Rule dialog reached both with `Number(input.value)`
+    — which is 0 for an empty box, not null. Every other optional numeric
+    field in that same dialog maps blank to null explicitly and says so in a
+    comment; these two did not. Clearing the Threshold box therefore saved
+    `threshold = 0`, and the breach test is `value >= threshold`, so on the
+    next tick every device reporting that metric breached at once: the
+    fleet-wide page storm the rollup and digest machinery exists to spare
+    the operator from, self-inflicted, and entirely legitimate as far as the
+    engine could tell. Clearing the Clear threshold box saved
+    `clear_threshold = 0`, and the clear test is `value < clear_threshold`,
+    which for any metric that is never negative can never be satisfied — the
+    alert raised normally and then stayed open forever.
+
+    What is required here is `threshold` alone. A threshold rule without one
+    cannot fire at all (alertrules.evaluate_threshold returns "" immediately
+    when it is None), so its absence is never anything but a mistake.
+    `clear_threshold` is deliberately NOT required: leaving it out is a
+    coherent choice — the alert then closes on auto_resolve_after_s, on a
+    paired CLEARS occurrence, or by hand — and demanding it would refuse
+    rules this application has always accepted. What the blank box used to
+    produce was not that coherent choice but a silent, unsatisfiable
+    numeric one, and the dialog now sends null for blank, which means the
+    coherent thing.
+
+    Zero is not refused. It is a perfectly good threshold for a metric that
+    can go negative — an environmental temperature sensor — so rejecting it
+    outright would be wrong; what was wrong was inferring it from an empty
+    box. `clear_threshold == threshold` also stays legal: several shipped
+    rules (ups_on_battery, netpath_unreachable) set them equal on purpose,
+    for quantised metrics that do not hover at a boundary the way a
+    continuous one does."""
+    if kind not in _THRESHOLD_RULE_KINDS:
+        return fields
+    # Only what this request is actually setting. Reading the stored value
+    # back for a key the body never mentioned, and then refusing on it, made
+    # an unrelated edit impossible: a custom rule created before this check
+    # existed could have a NULL threshold (the create route allowed it), and
+    # every PUT against it — including the operator's likely first move,
+    # disabling the noisy thing — was refused until a threshold was supplied.
+    # A rule that is already stored is not this request's to validate. It
+    # also meant untouched stored values were copied back into `fields` and
+    # rewritten on every save, which is an invisible write nobody asked for.
+    #
+    # `threshold` is still required when the request supplies it as null, or
+    # when a rule is being created or changed INTO a threshold kind, because
+    # those are the paths that produce a rule that can never raise at all.
+    creating_or_retyping = row is None or "kind" in fields
+    for name in ("threshold", "clear_threshold"):
+        if name in fields:
+            value = fields[name]
+        elif creating_or_retyping and row is not None and name in row.keys():
+            value = row[name]
+        elif creating_or_retyping:
+            value = None
+        else:
+            continue
+        if value is None:
+            if name == "threshold":
+                raise ValueError(
+                    f"A {kind} rule needs a threshold; without one the rule "
+                    f"can never raise an alert.")
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name.replace('_', ' ')} must be a number") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{name.replace('_', ' ')} must be a finite number")
+        fields[name] = number
+    return fields
+
+
 def post_alerts_rule(service, params, body) -> dict:
     key = str(body.get("key", "")).strip()
     name = str(body.get("name", "")).strip()
@@ -5208,6 +5410,7 @@ def post_alerts_rule(service, params, body) -> dict:
              ("severity", "enabled", "device_filter", "threshold",
               "clear_threshold", "for_polls", "for_seconds", "template_id",
               "auto_resolve_after_s", "notify")}
+    fields = _validated_threshold_fields(kind, None, fields)
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
     _audit(service, params, "alert_rule.create", target=key,
@@ -5234,6 +5437,11 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
     fields = {k: v for k, v in body.items() if k in allowed_keys}
+    # The kind an update leaves in place, not the one it arrived with: a
+    # built-in cannot change kind at all, and a custom rule that is changing
+    # kind has to satisfy the rules of the kind it is becoming.
+    fields = _validated_threshold_fields(
+        str(fields.get("kind", row["kind"]) or ""), row, fields)
     service.alerts_db.update_rule(rule_id, **fields)
     if fields:
         ordered = dict(sorted(
@@ -6171,7 +6379,22 @@ def get_configrx_backup(service, params, body, backup_id) -> dict:
         raise ValueError("No such backup")
     content = service.configrx_db.backup_content(backup_id)
     backup_json = _configrx_backup_json(row)
-    if not backup_json["redacted"] and not _may_read_secrets(service, params, "configrx"):
+    # Redact on the way out for anyone without ConfigRX write, whatever the
+    # stored flag says. That flag used to gate this, and it could not carry
+    # the weight: configrx._backup_device writes `redacted=not store_secrets`
+    # — "we ran the redactor" — not "the redactor found and removed
+    # something". Every pattern in configrx_redact was anchored on Cisco-IOS
+    # or FortiOS directive syntax while ConfigRX ships backup support for
+    # Juniper, MikroTik, HP/Aruba, Moxa, Siemens and Rockwell too, so for
+    # those vendors redact() matched nothing, returned the config verbatim,
+    # and the row was still stamped redacted=True. Trusting that stamp here
+    # then served a Juniper RADIUS key or an IKE pre-shared key in full to a
+    # caller holding only ConfigRX read — the one thing this branch exists
+    # to prevent. The pattern list has since been widened, but the read path
+    # must not depend on that list being complete: redaction is idempotent,
+    # so re-running it over an already-redacted config costs one pass and
+    # removes the flag from the trust boundary entirely.
+    if not _may_read_secrets(service, params, "configrx"):
         content, _ = configrx_redact.redact(content or "")
         backup_json["redacted"] = True
     return {"backup": backup_json, "content": content}

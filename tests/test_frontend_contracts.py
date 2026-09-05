@@ -513,6 +513,87 @@ _handle_control = SSH[SSH.index("function handleControl("):SSH.index("function f
 check("ws.__closeMessage = message.message" in _handle_control,
       "the status:closed frame's own message is what gets stashed, on the socket that received it")
 
+# ---------------------------------------------------------------------------
+# 22. Polling refresh() cannot overlap itself, and its own stale answer
+#     cannot overwrite a newer one (hostile front-end review, 4.50.0).
+#
+# master()'s only gate used to be `now - page.lastFetch < rateFor(tab)`,
+# stamped BEFORE `await page.refresh()` began — so a refresh() slower than
+# its own poll interval (precisely what a degrading server produces) let the
+# very next 100ms tick launch a second, fully concurrent refresh() for the
+# same tab. Separately, syslog.js and snmp.js recompute t1 = Date.now() / 1000
+# on every Live tick, so two overlapping polls never share a URL and app.js's
+# own per-path abort-dedupe (call()) cannot cancel either one; nodes.js's
+# devices fetch has the same shape against live filter/pagination controls,
+# netpath.js's against the selected target and window, and configrx.js's own
+# periodic refresh() (distinct from its search, which already had this)
+# against its own filter controls. If the older of two overlapping responses
+# lands last, it silently paints a stale window, the wrong filter's devices,
+# or a tab the operator has since left. configrx.js's own searchGen (search
+# only) and app.js's gsearchRun already carried the fix — a generation
+# token, bumped per attempt and checked before painting; this is that same
+# pattern applied to master()'s poll gate and each page's periodic refresh(),
+# configrx.js's own periodic refresh() included, since it is the file the
+# pattern was copied from and so the one place leaving it unfixed would be
+# most confusing to the next reader.
+check("page.refreshing" in APP,
+      "master()'s poll gate does not let a tab's refresh() overlap itself")
+for _name in ("syslog.js", "snmp.js", "nodes.js", "netpath.js", "configrx.js", "alerts.js"):
+    _body = read(_name)
+    check("refreshGen" in _body,
+          "%s's periodic refresh() carries a generation token" % _name)
+    check(bool(re.search(r"view\.refreshGen\s*!==\s*generation", _body)),
+          "%s checks the generation token before painting a response" % _name)
+
+# ---------------------------------------------------------------------------
+# 23. A dialog with unsaved changes warns before the browser tab itself
+#     closes, not just before Escape/backdrop/Close discard it.
+#
+# modalDirty already gated Escape, the backdrop and Close, all routed
+# through requestCloseModal — but nothing listened for beforeunload, so
+# closing the tab mid-edit discarded a half-filled dialog with no warning at
+# all, even though every in-app way of leaving the same dialog was
+# protected. ssh.js already registers its own beforeunload, for a session it
+# has to tear down rather than a form it has to protect.
+check(bool(re.search(r"addEventListener\('beforeunload'[\s\S]{0,200}modalDirty", APP)),
+      "beforeunload warns when a dialog has unsaved changes (modalDirty)")
+
+# ---------------------------------------------------------------------------
+# 24. The two Save buttons that wrote straight to App.put with no
+#     double-submit guard now hold themselves down for the life of the
+#     request, like every sibling PUT/POST button beside them
+#     (#ndd-reidentify, #ndd-install-bundle, #nd-pc-add) already did — PUT is
+#     deliberately excluded from app.js's GET abort-dedupe, so a double-click
+#     really did fire two concurrent writes.
+NODES = read("nodes.js")
+_vendor_save = NODES[NODES.index("function renderVendorSection("):
+                     NODES.index("function ifaceStatsHtml(")]
+check("#ndd-vendor-save" in _vendor_save
+      and "save.disabled = true" in _vendor_save and "App.put(" in _vendor_save,
+      "#ndd-vendor-save disables itself before its PUT")
+_devgroup_save = NODES[NODES.index("function wireDeviceGroupRows("):
+                       NODES.index("async function refreshDeviceGroupsList(")]
+check("save.disabled = true" in _devgroup_save and "App.put(" in _devgroup_save,
+      ".devgroup-save disables itself before its PUT")
+
+# ---------------------------------------------------------------------------
+# 25. Forgetting a stored SSH host key and clearing a stored enable secret
+#     are both deletions of unrecoverable credential material — the same
+#     category "clear SNMP credential" (nodes.js's editDevice) already put
+#     behind App.confirmDestructive. Both configrx.js buttons used to act on
+#     the click alone, reasoning that their own "danger" styling was warning
+#     enough; nodes.js had already made, and documented, the opposite call
+#     for the equivalent action, so both now ask first too, the same way
+#     every other credential-destroying control in the product does.
+_forget = CONFIGRX[CONFIGRX.index("async function drawHostKey("):
+                   CONFIGRX.index("function wireEnableSecretClear(")]
+check("App.confirmDestructive(" in _forget,
+      "#cx-hostkey-forget confirms before deleting the stored host key")
+_clear_secret = CONFIGRX[CONFIGRX.index("function wireEnableSecretClear("):
+                         CONFIGRX.index("function deviceSettingsModal(")]
+check("App.confirmDestructive(" in _clear_secret,
+      "#cx-enable-secret-clear confirms before deleting the stored enable secret")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

@@ -386,6 +386,31 @@ def simple_bind(url: str, dn: str, password: str, *,
     on the wire in the clear). There is no StartTLS support — see the
     module docstring for what this client deliberately does not do.
     """
+    if password == "":
+        # RFC 4511 §4.2: a BindRequest with a non-empty name and a
+        # zero-length simple password is not "wrong credentials" at all —
+        # it is a distinct, legal operation called an "unauthenticated
+        # bind", and the directory is entitled to answer it with resultCode
+        # 0 (success) rather than 49 (invalidCredentials), because as far
+        # as the protocol is concerned no credential was being checked.
+        # RFC 4513 §5.1.2 says a client SHOULD prohibit sending one for
+        # exactly this reason. Left unchecked, this client would forward
+        # the bind, get resultCode 0 back from any directory that follows
+        # the RFC literally, and report success — so POST /api/login with
+        # {"password": ""} would mint a real session for any ldap-mapped
+        # username with no credential verified whatsoever. Refused here,
+        # before _parse_url or any socket is opened: an empty password is
+        # never valid no matter what url or dn accompany it, so there is
+        # nothing to gain from reaching the network first. Raising
+        # LDAPInvalidCredentials rather than LDAPConfigError is deliberate:
+        # authenticate_ldap already maps that exception to False, so the
+        # login route answers "wrong username or password" and records a
+        # normal failed sign-in — the same outcome as any other bad
+        # credential, not a distinct "misconfigured" error.
+        raise LDAPInvalidCredentials(
+            "empty password refused before bind (RFC 4513 section 5.1.2 "
+            "prohibits an unauthenticated bind)")
+
     use_tls, host, port = _parse_url(url)
     if not use_tls and not allow_cleartext:
         raise LDAPConfigError(

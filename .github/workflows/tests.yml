@@ -55,9 +55,15 @@ jobs:
       - name: Install paramiko (Linux)
         if: runner.os == 'Linux'
         # The only third-party package this repository allows, and only for
-        # ConfigRX and the SSH terminal. Without it test_ssh_hostkeys.py and
-        # test_ssh_terminal.py exit 77 and run_all.py reports SKIP, so the
-        # Windows leg of this matrix runs everything else and skips those two.
+        # ConfigRX and the SSH terminal. Without it, five suites
+        # (test_configrx_cisco_platforms.py, test_configrx_industrial.py,
+        # test_configrx_search_backfill.py, test_ssh_hostkeys.py,
+        # test_ssh_terminal.py) exit 77 and run_all.py reports SKIP. Installed
+        # on both legs of the matrix below, so those suites run on Windows too.
+        run: python -m pip install --disable-pip-version-check "paramiko<5"
+
+      - name: Install paramiko (Windows)
+        if: runner.os == 'Windows'
         run: python -m pip install --disable-pip-version-check "paramiko<5"
 
       - name: Report the environment

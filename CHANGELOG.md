@@ -118,6 +118,192 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.51.0 — The patterns this codebase already knew
+
+Eleven reviewers were pointed at the whole codebase with one instruction: you
+hate this implementation, now prove it. Every criticism had to name a file and
+a line, describe a path from an input to a wrong outcome, and quote the code
+that made it true. `REVIEW-SENIOR-DEV-4.51.md` is the record, including the
+findings that did not survive verification and the one this release argues is
+not a defect at all.
+
+What came back was not carelessness. It was the same sentence, over and over:
+**this codebase already contains the correct pattern, applied somewhere else,
+and simply did not apply it here.** `syslogd.py`'s writer thread guards its
+database call and `snmptrapd.py`'s does; `collector.py`'s did not. Four
+schedulers in `monitor.py` are wrapped in `except Exception`, one under a
+comment reading *"a scheduler thread must never die quietly"*; the trace
+scheduler this product is named after was not. `trim_to_size()` deletes in
+chunks against a deadline under a comment citing a measured 38.9-second stall;
+`prune()`, sixty lines above it, deletes from the same table in one statement.
+Eleven of thirteen front-end files alias the shared HTML escape; `dashboard.js`
+had pasted its own copy. That is what 68 flat modules and a 7,496-line
+`api.py` do to a team otherwise doing careful work: they make "apply this fix
+everywhere it belongs" something you have to remember.
+
+**An LDAP account could be signed into with no password.** RFC 4511 defines a
+bind carrying a real DN and a zero-length password not as a wrong credential
+but as a distinct legal operation — an *unauthenticated bind* — which a
+directory following the RFC answers with resultCode 0, success. `simple_bind`
+returned success on resultCode 0. `post_login` never checked the password for
+emptiness. `{"username": "<any directory account>", "password": ""}` minted a
+full session with nothing verified. RFC 4513 §5.1.2 says a client SHOULD
+prohibit sending one, and now this one does, before it opens a socket.
+
+**Resetting a password did not end the session it was reset because of.**
+`destroy_user` compared usernames with `==`. Every account lookup in the
+application resolves through a `COLLATE NOCASE` column. An administrator
+resetting `Bob.Smith`'s password after a suspected compromise updated the row
+correctly, was told "1 session ended", and ended none — the stolen session for
+`bob.smith` kept working with full permissions. The one control that makes a
+password reset an incident-response action was decided by the caller's
+capitalisation.
+
+**One crafted UDP packet stopped flow storage for good, and the status line
+kept saying it was fine.** Three faults compounding. A v9/IPFIX options record
+could declare a sampling rate with no upper bound, so a crafted one set a
+Python int past SQLite's int64 range. `collector.py` called `insert_flows`
+with no `try/except` — unlike the two sibling collectors that guard the
+identical call in the identical position — so the `OverflowError` ended the
+writer thread. And `running` checked only the *receiver* thread, so the
+receiver kept accepting packets and the strip kept reporting "last packet just
+now" while zero flows were stored from any exporter, indefinitely. A
+monitoring tool that has silently stopped monitoring while showing green is
+the worst failure mode there is, and it was reachable from an unauthenticated
+port with about fifty bytes. Separately, the template cache was one global
+4,096-entry LRU keyed on an observation-domain field that comes out of the
+packet body rather than the source address, so one sender with no spoofing
+could evict every real exporter's templates and blind the collector.
+
+**A stored device configuration could be handed to someone not allowed to see
+it.** Backups are stamped `redacted = not store_secrets`, which records "the
+redactor ran", not "the redactor removed something" — and every redaction
+pattern was anchored on Cisco-IOS or FortiOS syntax while ConfigRX ships
+backup support for Juniper, MikroTik, HP, Aruba, Moxa, Siemens and Rockwell.
+For those vendors nothing matched, the file was stored verbatim, and the row
+was stamped redacted anyway. The read path believed the stamp. A Juniper
+RADIUS key or IKE pre-shared key went out in full to a caller holding ConfigRX
+*read*. Blacklist redaction is fail-open by construction; making a permission
+decision from its output made the failure silent too. The read path now
+re-redacts for anyone without write regardless of the flag, and the pattern
+list covers the vendors that actually ship — including the bare Cisco
+`password 7` line inside a `line vty` block, which had no pattern at all in
+the vendor family the module claimed to cover completely.
+
+**Deleting a device could hand its SSH password to a different device.** The
+Nodes row was committed first and ConfigRX's credentials dropped second.
+`devices.id` is `INTEGER PRIMARY KEY` with no `AUTOINCREMENT`, so SQLite
+reissues the highest freed rowid. Delete the newest device, have the second
+call fail, add a device — it lands on that id and inherits the previous
+device's `ssh_password_enc` and `enable_secret_enc`, with nothing logged.
+These are two databases and it cannot be one transaction, but one of the two
+orders is survivable and the other is not. They are the other way round now.
+
+**Two blank boxes in the Edit Rule dialog.** `Number('')` is `0`. Every other
+optional field in the same save handler mapped blank to `null` explicitly,
+with a comment saying why; the threshold and clear-threshold boxes did not,
+and no server-side validation existed to catch the result. Clear the Clear
+threshold box and the clear test becomes `value < 0` — unsatisfiable for any
+metric that is never negative, so the alert raises and then stays open for
+ever. Clear the Threshold box and the breach test becomes `value >= 0`, so on
+the next tick the entire fleet breaches at once: the page storm the rollup and
+digest machinery exists to prevent, self-inflicted by a mis-click. Blank now
+sends null, and the server refuses a threshold rule with no threshold. It does
+*not* refuse a missing clear threshold — that is a coherent choice, closing on
+`auto_resolve_after_s` or by hand — and the first version of this fix that did
+refuse it was wrong and broke a suite that was right.
+
+**The documented way to stop this service skipped shutdown entirely.**
+`RUNBOOK.md` says `systemctl stop sappiwhere` and `nssm stop SappiWhere`. Both
+deliver SIGTERM. There was no signal handler anywhere in the package — only
+`except KeyboardInterrupt` — so the documented procedure killed the process
+outright every time, skipping `server.stop()` and `service.shutdown()`: ten
+SQLite databases ended mid-WAL-checkpoint, live SSH sessions to network
+devices simply gone, an in-flight trace never drained. The runbook and the code
+disagreed about the most basic operation there is, and the runbook was the one
+being followed.
+
+**A failed self-update left the process running with everything switched off.**
+`apply()` stops the listener, every worker and every database *before* it tries
+the package swap. On a locked file — Windows AV real-time scanning is enough —
+it returned an error dict and restarted nothing. Alive process, no listener, no
+collectors, all databases closed, until a human noticed the box had gone dark.
+The three marker writes afterwards were unguarded too, in a function whose
+docstring promises it never raises, and a failure there also skipped the
+restart, so the new code never loaded either.
+
+The poller stopped applying one 64/32-bit counter-width flag to two counters
+that fall back independently, and clamps utilization — which could read above
+100% when a port fell back to the RFC 2863 `ifSpeed` sentinel. It also stopped
+emitting fabricated link-down events on platforms that renumber ifIndex across
+a reload, and that fix is worth reading twice, because the first version of it
+was worse than the bug. Suppressing the comparison whenever a reboot was seen
+also suppressed the real events on every other platform: a port that was up
+before a reload and does not come back was never compared against "up" again,
+so `interface_down` could not fire for the commonest post-maintenance failure
+there is. It is now suppressed only when the port answering at that ifIndex has
+demonstrably changed — ifPhysAddress, falling back to ifDescr, with an absent
+value never counted as evidence — so an ordinary reboot on stable ifIndex still
+alerts. Trading a spurious page for a missed one is the wrong direction, and an
+independent review caught it before this shipped.
+The reachable ceiling was ~130%, not the 140% first claimed; `counter_rate`'s
+existing 1.3× rejection already capped it, and the review says so rather than
+repeating the wrong number. `fortipoll.py`'s hand-rolled walk gained the
+non-increasing-OID guard `nodepoll.py` has had for some time. Rotating the
+secret-store passphrase now takes effect without a restart — the derived-key
+cache was keyed on the scrypt parameters alone, which never change, so an
+operator who believed their passphrase had leaked and re-entered every
+credential was silently re-encrypting all of them under the old key.
+
+Every `(\d+)` route answers 400 rather than 500 for an oversized integer;
+`OverflowError` is not a `ValueError` and nothing caught it. Time windows run
+through `analysis.clamp_window` — the helper this codebase already had and this
+path skipped, while `_num` parsed `"inf"` and `"1e18"` without complaint into
+something that sized nine list allocations. CSV exports neutralise a leading
+`=`, `+`, `-` or `@`, because a syslog message is written by anything that can
+reach UDP/514 and lands in a file an analyst opens in Excel. Six live-window
+`refresh()` functions gained a generation token — Alerts, ConfigRX, NetPath,
+Nodes, SNMP Trap and Syslog. Those views recompute `t1` every tick, so every
+poll built a different URL, the per-path abort could never fire, and a slow
+response landing after a newer one silently painted a stale window with no
+error and no staleness indicator. NetFlow already had the same guard under a
+different name and needed nothing; every periodic refresh in the product that
+can race itself is now guarded, which is a sentence worth checking rather than
+asserting — an earlier draft of these notes claimed it while Alerts still had
+the race, and the reviewer that caught that was right to.
+
+`INTERNALS.md` said the service opens five SQLite connections on line 74 and
+ten on line 133. Both "Layout" file maps listed roughly 25 of 68 modules,
+omitting `nodepoll.py` and `nodesdb.py` — the two largest files here — and five
+of the twelve shipped tabs. `flowdb.py` called its database `netflow.db` in
+every diagnostic; the file on disk is `flows.db`. And CI installed paramiko
+only on Linux, so the five suites proving host-key pinning refuses a changed
+key, that the ConfigRX command allowlist holds, and that the SSH terminal's
+permission boundary holds all reported SKIP on Windows — this product's primary
+deployment target. The workflow's own comment said it was two.
+
+What this release did **not** fix is named in the review with the same
+specificity: five `prune()` implementations that never learned their sibling's
+chunking lesson, a disabled threshold rule orphaning its own open alert, a
+muted outage that outlives its window never being alerted, and the self-updater
+still following a mutable branch tip with `published_digest()` written, tested,
+and not wired in. Those are behavioural changes to subsystems that are
+currently correct-but-incomplete, and a rushed fix to alert clearing or
+retention deletion is worse than a known gap with a name.
+
+One test was fixed that this release did not otherwise touch. The ConfigRX
+compliance suite's sweep-budget section built its adversarial fixture with 40
+worst-case lines — the arithmetic minimum to overrun a 10-second budget — so
+whether the device under test ran out of budget partway (the `not_yet_assessed`
+the section asserts) or squeaked through and was marked `pass` depended on how
+fast the machine happened to be. It failed about one run in three. The fixture
+now carries ten times the lines, which costs nothing because the deadline is
+checked per line: elapsed time is still bounded by the budget, and only the
+truncation becomes certain. A test that fails a third of the time teaches
+people to rerun rather than to look.
+
+86 test suites, all passing, up from 80.
+
 ### 4.50.0 — The last mile, walked
 
 An overnight evaluation campaign for 4.49.0 was cut off mid-run when a Windows

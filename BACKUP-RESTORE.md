@@ -50,12 +50,15 @@ Everything in the data directory:
 | `ipam.db` | subnets, hosts, conflicts, DHCP scopes and leases, the DHCP credential | address inventory |
 | `wireless.db` | controllers, access points, radios | wireless history |
 | `configrx.db` | stored configuration backups, SSH host keys, the SSH credential and the optional per-device enable secret | **your device configuration history** — for many sites the most valuable file here |
+| `secret.salt` | the per-install salt the portable secret store (`netpath/secretstore.py`, non-Windows hosts with a passphrase configured — see `CREDENTIAL-SECURITY.md`, "The portable secret store") derives its encryption key from | **every credential encrypted with it, permanently** — not a database, and easy to miss for exactly that reason, but restoring the nine `.db` files above onto new hardware without it generates a fresh salt on first start and no stored credential encrypted under the old one will ever decrypt again, correct passphrase or not |
 
 The default directory is `~/.local/share/netpath-monitor/` on Linux and macOS,
 `%APPDATA%\netpath-monitor\` on Windows. If you moved any of them with `--db`,
 `--nodes-db`, `--alerts-db`, `--flow-db`, `--syslog-db`, `--app-db`,
 `--ipam-db`, `--snmp-db`, `--wireless-db` or `--configrx-db`, back up where
-they actually are.
+they actually are. `secret.salt` is not affected by any of those flags — it
+always lives in the default data directory itself, next to whichever of the
+databases you left in place there.
 
 Nothing outside that directory needs backing up. The application is code you
 can re-fetch; a TLS certificate and key, if you pointed `--cert`/`--key` at
@@ -75,7 +78,10 @@ A clean shutdown checkpoints and removes the `-wal` files, so what you have
 tarred is complete. If the process was killed rather than stopped, the `-wal`
 files will still be there — the `tar` above includes them, which is why it
 archives the whole directory rather than a `*.db` glob. Never archive `*.db`
-alone.
+alone. Archiving the whole directory also means `secret.salt` (see the table
+above) comes along automatically — this method needs no special-casing for
+it the way Method 2 below does, because it never enumerates the databases by
+name in the first place.
 
 Windows:
 
@@ -102,15 +108,21 @@ for f in app nodes alerts netpath flows snmptraps syslog ipam wireless configrx;
     [ -f "$SRC/$f.db" ] || continue
     sqlite3 "$SRC/$f.db" ".backup '$DST/$f.db'"
 done
+# secret.salt is not a database -- .backup has nothing to do with it -- but
+# skipping it here is exactly how a Method 2 backup loses every credential
+# the portable secret store ever encrypted: restore the nine .db files above
+# onto new hardware without this file and a fresh salt is generated on first
+# start, silently undecryptable against everything backed up above.
+[ -f "$SRC/secret.salt" ] && cp -p "$SRC/secret.salt" "$DST/secret.salt"
 sqlite3 "$DST/nodes.db" "PRAGMA integrity_check;"    # sanity, not a formality
 ```
 
 Notes, all of which have bitten someone:
 
 - **Run it as the account that owns the files.** From 4.39.0 the directory is
-  `0700` and the databases `0600`, so a backup job running as a different user
-  reads nothing and — depending on your `set -e` — may exit successfully having
-  copied nothing.
+  `0700` and the databases `0600` — `secret.salt`, where present, is `0600`
+  too — so a backup job running as a different user reads nothing and —
+  depending on your `set -e` — may exit successfully having copied nothing.
 - **`flows.db` and `syslog.db` are the big ones**, up to their configured size
   caps of 2 GB and 1 GB. If your window is tight, back them up less often than
   the rest; a lost day of flow records is a smaller problem than a lost
@@ -163,13 +175,13 @@ longer exist. They render as an id rather than a name; nothing breaks.
 
 ### The DPAPI caveat — read this before you restore onto different hardware
 
-**Stored credentials do not survive a move to another machine or another
-Windows account.** Every encrypted credential — the DHCP credential, SNMPv3
-authentication passwords, the SMTP password, the wireless controller's SNMP
-credential, ConfigRX's SSH password and its optional per-device enable secret
-— is protected with the Windows Data Protection API in machine-and-account
-scope. That is the whole point of it: a copy of `nodes.db` on someone else's
-laptop is inert.
+**On Windows, stored credentials do not survive a move to another machine or
+another Windows account.** Every encrypted credential — the DHCP credential,
+SNMPv3 authentication passwords, the SMTP password, the wireless controller's
+SNMP credential, ConfigRX's SSH password and its optional per-device enable
+secret — is protected with the Windows Data Protection API in
+machine-and-account scope. That is the whole point of it: a copy of
+`nodes.db` on someone else's laptop is inert.
 
 The consequence for a restore is that the ciphertext comes back and cannot be
 decrypted. Concretely:
@@ -184,9 +196,20 @@ decrypted. Concretely:
   credential on the replacement host, and keep them somewhere a person can get
   at them. A password manager is the correct place; a text file next to the
   backup is not.
-- Restoring a **Linux** backup — there are no stored credentials to lose,
-  because a non-Windows host cannot store one at all
-  (`CREDENTIAL-SECURITY.md` §10).
+- Restoring a **Linux** backup — depends on whether the portable secret store
+  (`netpath/secretstore.py`, `CREDENTIAL-SECURITY.md`, "The portable secret
+  store") was configured on the host you took it from. If no
+  `NETPATH_SECRET_PASSPHRASE_FILE` or `NETPATH_SECRET_PASSPHRASE` was ever
+  set there, nothing was encrypted and there is nothing to lose. If one
+  *was* configured, this is the same DPAPI-shaped problem under a different
+  name: the encrypted credentials decrypt again only where both the same
+  passphrase and `secret.salt` (see "What to back up" above) are present —
+  restoring the nine databases without `secret.salt`, or onto a host
+  configured with a different passphrase, leaves every one of them
+  permanently undecryptable, correct database contents or not. This
+  application ran on Linux and macOS for several releases before the
+  portable store shipped, when this bullet's older wording — "a non-Windows
+  host cannot store one at all" — was still true; it has not been true since.
 
 The application does not fail silently about this: a credential that will not
 decrypt is reported as an error against the device or the setting that uses it,

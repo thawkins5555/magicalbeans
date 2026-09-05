@@ -1199,6 +1199,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, 401)
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400)
+            except OverflowError:
+                # A number the caller sent that is too large to be one.
+                # Every `(\d+)` route arg is turned into an int a few lines
+                # up with a bare int(), which happily parses thirty digits,
+                # and a numeric query filter goes the same way through
+                # _num(). Neither is a valid row id or port, but the place
+                # that finds that out is sqlite3's parameter binding, which
+                # raises OverflowError ("Python int too large to convert to
+                # SQLITE_INTEGER") — not a ValueError, so this used to fall
+                # through to the 500 below and report a server fault for
+                # what is plainly a bad request. The message stays generic:
+                # which parameter overflowed is not worth reflecting back.
+                self._json({"error": "A numeric value in that request is out "
+                                     "of range"}, 400)
             except Exception as exc:
                 traceback.print_exc()
                 self._json({"error": "Internal Server Error"}, 500)

@@ -12,9 +12,11 @@ and a third-party dependency this application does not take).
 
 What this module does NOT try to be: a key-file scheme. The 32-byte "key"
 that actually encrypts data is derived from the passphrase every time it is
-needed (and then cached in memory — see `_keys_for`) — nothing that could
-decrypt a stored credential is ever written to disk. What IS written to disk
-is a per-install salt (`_salt_path`), which is not a secret: its only job is
+needed (and then cached in memory, keyed on which passphrase produced it,
+so a changed passphrase source is noticed rather than masked by the
+cache — see `_keys_for`) — nothing that could decrypt a stored credential
+is ever written to disk. What IS written to disk is a per-install salt
+(`_salt_path`), which is not a secret: its only job is
 to make the same passphrase derive a different key on every install, so a
 password reused across two installs of this application does not hand an
 attacker who breaks one of them a working key for the other. An attacker who
@@ -49,10 +51,14 @@ that produced the stored MAC, and the comparison fails anyway. The MAC
 comparison itself is `hmac.compare_digest`, not `==` — constant-time, so a
 timing side channel cannot be used to guess the MAC one byte at a time.
 
-What this module deliberately does not solve: rotating the passphrase. A
-credential encrypted under one passphrase stays encrypted under it; there is
-no re-key operation. Changing the passphrase means every stored credential
-becomes undecryptable and has to be re-entered — see CREDENTIAL-SECURITY.md.
+What this module deliberately does not solve: re-keying. A credential
+encrypted under one passphrase stays encrypted under it; there is no re-key
+operation. Changing the passphrase means every stored credential becomes
+undecryptable and has to be re-entered — see CREDENTIAL-SECURITY.md. What it
+does solve is a rotated passphrase *source* being noticed: a corrected or
+rotated passphrase file (or environment variable) takes effect on the very
+next `protect()`/`unprotect()` call this process makes, not only after a
+restart — see `_keys_for`'s docstring for the defect this fixes.
 """
 
 from __future__ import annotations
@@ -64,6 +70,7 @@ import secrets
 import stat
 import struct
 import threading
+from collections import OrderedDict
 
 MAGIC = b"NPSS"
 VERSION = 1
@@ -238,7 +245,28 @@ def _install_salt() -> bytes:
 # --------------------------------------------------------------- key derivation
 
 _cache_lock = threading.Lock()
-_key_cache: dict[tuple[int, int, int], tuple[bytes, bytes]] = {}
+
+# Keyed on (n, r, p, passphrase_digest), not (n, r, p) alone — see
+# _keys_for's docstring for why the passphrase has to be part of the key
+# rather than something looked up only on a cache miss. An OrderedDict
+# rather than a plain dict so a cache hit can be moved to the end
+# (`move_to_end`) and eviction can drop from the other end in O(1),
+# turning this into a bounded least-recently-used cache rather than a
+# structure with no eviction policy at all — see _MAX_CACHE_ENTRIES.
+_key_cache: "OrderedDict[tuple[int, int, int, bytes], tuple[bytes, bytes]]" = OrderedDict()
+
+# A process that lives through many passphrase rotations (or, less
+# alarmingly, just polls devices whose blobs were written under more than
+# one historical scrypt parameter set) would otherwise grow _key_cache
+# forever — nothing ever expired an entry. Each distinct (n, r, p,
+# passphrase) combination is one scrypt run's worth of memory pressure
+# once (the two 32-byte keys themselves are trivial; the risk is entries
+# accumulating without bound over a very long-lived process), so a small
+# fixed ceiling with least-recently-used eviction is enough to stop that
+# growth while still keeping the common case -- the current passphrase,
+# possibly alongside one or two blobs made under an older scrypt cost --
+# fully cached.
+_MAX_CACHE_ENTRIES = 8
 
 # A generous but firmly bounded range for a blob's recorded n/r/p, checked
 # in plain Python *before* n/r/p ever reach hashlib.scrypt. `maxmem` alone
@@ -293,26 +321,68 @@ def _derive_keys(passphrase: bytes, salt: bytes, n: int, r: int, p: int) -> tupl
 
 
 def _keys_for(n: int, r: int, p: int) -> tuple[bytes, bytes]:
-    """The derived keys for one (n, r, p) triple, computed once and cached
-    in memory for the rest of the process — "held in memory only" is the
-    property this design is chosen for, and re-running scrypt on every
-    single protect()/unprotect() call (nodepoll.py alone can make one of
-    these calls per device, per poll cycle) would be needlessly slow
-    without buying anything extra: the raw passphrase is not what is being
-    protected by not caching it, the derived key already is the secret.
-    A cache miss means either the first call in this process, or a blob
-    made under different scrypt parameters after this module's defaults
-    were changed in a later release — both read the passphrase source
-    fresh, so a corrected/rotated passphrase file takes effect on the next
-    key this process has not already derived."""
+    """The derived keys for one (n, r, p, passphrase) combination, computed
+    once and cached in memory for the rest of the process — "held in
+    memory only" is the property this design is chosen for, and
+    re-running scrypt on every single protect()/unprotect() call
+    (nodepoll.py alone can make one of these calls per device, per poll
+    cycle) would be needlessly slow without buying anything extra: the raw
+    passphrase is not what is being protected by not caching it, the
+    derived key already is the secret.
+
+    The passphrase source is read fresh on *every* call, cache hit or
+    miss — that part is cheap (a small file, or a single environment
+    variable lookup) — and a digest of what it returns is folded into the
+    cache key alongside (n, r, p). This used to cache on (n, r, p) alone,
+    which are the same three module constants on every protect() call;
+    the very first key derived in a process satisfied every later
+    protect() in that process, forever, and the passphrase source was
+    never looked at again. An operator who believed their passphrase had
+    leaked, rewrote the passphrase file, and re-entered every stored
+    credential through the UI was silently re-encrypting all of them
+    under the OLD, leaked key, because nothing ever missed that cache
+    entry to notice the file had changed — this docstring used to claim
+    "a corrected/rotated passphrase file takes effect on the next key
+    this process has not already derived", which was false in practice,
+    since there was never such a key. Hashing the passphrase into the
+    cache key fixes that: a changed passphrase produces a different
+    digest, which misses the cache and re-derives, so a corrected or
+    rotated passphrase file takes effect on the very next
+    protect()/unprotect() call this process makes — no restart required.
+    A cache miss for an unchanged passphrase still means only one of two
+    things: the first call in this process, or a blob made under
+    different scrypt parameters after this module's defaults changed in a
+    later release.
+
+    Only a digest of the passphrase is ever kept in the cache — never the
+    passphrase itself — the same reasoning the module docstring gives for
+    not writing it to disk applies equally to not holding it in memory
+    any longer than the one call that needs it.
+
+    Two consequences of reading the source on every call, both deliberate
+    and neither free. The read is a stat and a short file read per
+    protect()/unprotect(), which nodepoll can make once per device per poll
+    cycle; that is a syscall pair against a page the OS has cached, against
+    an scrypt run this still avoids. And a passphrase source that becomes
+    unreadable AFTER startup — the file deleted, its permissions tightened,
+    a transient I/O error — now fails the next credential operation instead
+    of being masked indefinitely by a cache that never looked again. That
+    is the correct behaviour for a store whose whole contract is "the
+    configured passphrase decides", but it is a change: the failure surfaces
+    at the next poll rather than at the next restart."""
+    passphrase = _load_passphrase()
+    passphrase_tag = hashlib.sha256(passphrase).digest()
+    cache_key = (n, r, p, passphrase_tag)
     with _cache_lock:
-        cached = _key_cache.get((n, r, p))
+        cached = _key_cache.get(cache_key)
         if cached is not None:
+            _key_cache.move_to_end(cache_key)
             return cached
-        passphrase = _load_passphrase()
         salt = _install_salt()
         keys = _derive_keys(passphrase, salt, n, r, p)
-        _key_cache[(n, r, p)] = keys
+        _key_cache[cache_key] = keys
+        if len(_key_cache) > _MAX_CACHE_ENTRIES:
+            _key_cache.popitem(last=False)
         return keys
 
 

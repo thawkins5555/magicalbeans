@@ -525,8 +525,26 @@ def apply(app_db) -> dict:
         try:
             _swap_in(new_netpath)
         except OSError as exc:
+            # _run_before_restart() has already happened: the listener is
+            # down and every worker, collector and database is closed. That
+            # makes "return the error and leave the process as it is" the
+            # one answer that is never acceptable here — the process would
+            # stay alive with nothing running behind it, indefinitely, until
+            # an operator noticed the box had gone dark. _swap_in's own
+            # except clause has already put the previous netpath/ back for
+            # any failure inside shutil.move (a locked file under Windows
+            # AV/EDR real-time scanning, or ENOSPC), so what is on disk here
+            # is the same install this process booted from. Restarting onto
+            # it is what a service manager or `nssm`/`systemd` restart would
+            # do anyway, and schedule_restart()'s own before-restart call is
+            # a documented no-op once _run_before_restart() has already run
+            # once — so this is not a second teardown, just the restart that
+            # has to happen regardless of which branch got us here.
+            schedule_restart()
             return {"ok": False, "error": f"Update downloaded but could not be "
-                                          f"installed: {exc}"}
+                                          f"installed: {exc}. Restarting on the "
+                                          f"previous version rather than staying "
+                                          f"down."}
 
         for name in _COPY_ALONGSIDE:
             src = os.path.join(new_root, name)
@@ -538,14 +556,28 @@ def apply(app_db) -> dict:
 
         # The hook above closed app.db, so the markers go through a
         # short-lived connection of their own rather than the handle the
-        # service was using.
+        # service was using. They are bookkeeping, not the restart — a
+        # failure writing any one of them must not skip schedule_restart()
+        # below (apply()'s own docstring promises it never raises, and an
+        # unguarded write_meta escaping here would also leave the
+        # newly-swapped code never actually loaded, which matters far more
+        # than one stale marker).
         from .appdb import write_meta
-        write_meta(db_path, INSTALLED_COMMIT_KEY, sha)
-        write_meta(db_path, INSTALLED_AT_KEY, str(time.time()))
+        try:
+            write_meta(db_path, INSTALLED_COMMIT_KEY, sha)
+        except Exception as exc:
+            _log_restart(f"write_meta({INSTALLED_COMMIT_KEY!r}) failed: {exc}")
+        try:
+            write_meta(db_path, INSTALLED_AT_KEY, str(time.time()))
+        except Exception as exc:
+            _log_restart(f"write_meta({INSTALLED_AT_KEY!r}) failed: {exc}")
         # The tag marker is what the verified path records, and a branch
         # pull cannot honestly claim one. Cleared rather than left behind,
         # so a stale tag never reads as "this is what is installed".
-        write_meta(db_path, INSTALLED_TAG_KEY, "")
+        try:
+            write_meta(db_path, INSTALLED_TAG_KEY, "")
+        except Exception as exc:
+            _log_restart(f"write_meta({INSTALLED_TAG_KEY!r}) failed: {exc}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

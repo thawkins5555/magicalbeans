@@ -44,6 +44,14 @@
     pageOffset: 0,
     pageLimit: 300,
     pageFilterSig: null,
+    // Bumped on every refresh() — window_() recomputes t1 = Date.now() / 1000
+    // on every tick, so two overlapping polls never share a URL and app.js's
+    // per-path abort-dedupe (call(), around line 551) cannot cancel either
+    // one. Without this, a slow poll N that resolves after a faster poll N+1
+    // overwrites the view and the DOM with the OLDER window — silently,
+    // exactly during the slow-server case this page exists to surface. Same
+    // pattern as configrx.js's refreshGen / searchGen.
+    refreshGen: 0,
   };
 
   const MUTE_HOURS = [1, 6, 12, 24];
@@ -932,8 +940,18 @@
           ? null : Number(autoText) * 60;
         values.notify = box.querySelector('#ar-notify').checked;
         if (isThreshold) {
-          values.threshold = Number(box.querySelector('#ar-threshold').value);
-          values.clear_threshold = Number(box.querySelector('#ar-clear').value);
+          // Blank means NULL here too — and NULL is refused by the server,
+          // which is the point. Number('') is 0, so these two used to turn
+          // a cleared box into a rule that either never clears (clear 0,
+          // and the clear test is `value < clear_threshold`) or breaches on
+          // every device at once (threshold 0, and the breach test is
+          // `value >= threshold`). Sending null instead makes the server
+          // say which box is empty rather than silently accepting a rule
+          // that cannot work.
+          const thresholdText = box.querySelector('#ar-threshold').value.trim();
+          const clearText = box.querySelector('#ar-clear').value.trim();
+          values.threshold = thresholdText === '' ? null : Number(thresholdText);
+          values.clear_threshold = clearText === '' ? null : Number(clearText);
           values.for_polls = Number(box.querySelector('#ar-forpolls').value);
           const seconds = box.querySelector('#ar-forseconds');
           if (seconds) {
@@ -1450,6 +1468,7 @@
     const filterSig = JSON.stringify(f);
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
+    const generation = ++view.refreshGen;
     const [overview, list, total, rules, ruleExtras, templates, mutes] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
@@ -1462,6 +1481,12 @@
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
     ]);
+    // A newer refresh already redrew this — a later tick, a filter change, or
+    // the operator leaving this tab entirely while the above was in flight —
+    // so painting this answer now would only put a stale window back on
+    // screen. One Promise.all, so every write below lands together: one
+    // guard, right after it resolves and before any of them, covers them all.
+    if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
     view.hist = overview.buckets;
     view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
     // No dedicated summary line exists for this histogram yet (unlike

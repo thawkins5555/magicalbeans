@@ -62,6 +62,15 @@
     pageLimit: 500,
     pageTotal: 0,
     pageFilterSig: null,
+    // Bumped on every refresh() — the devices fetch below is built from
+    // live filter/pagination controls, so two overlapping refreshes (one
+    // fired by the poll tick, one by an operator changing a filter or page
+    // mid-fetch) can carry different query strings and app.js's per-path
+    // abort-dedupe cannot cancel either. Without this, the older response
+    // landing last overwrites view.devices — and the table — with the wrong
+    // group's devices while the filter controls already read the new one.
+    // Same pattern as configrx.js's searchGen / app.js's gsearchRun.
+    refreshGen: 0,
     // Fleet-wide reports (netpath/report.py via /api/nodes/reports/*):
     // fetched only on "Run report", never on the poll tick — the top-N
     // route can cost real seconds at fleet scale (report.py's own
@@ -1540,7 +1549,16 @@
     const save = holder.querySelector('#ndd-vendor-save');
     if (save) save.onclick = async () => {
       const text = holder.querySelector('#ndd-vendor-override').value.trim();
-      await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: text });
+      // Held down for the life of the request, the same guard #ndd-reidentify
+      // and #ndd-install-bundle above already use: PUT is deliberately
+      // excluded from app.js's GET abort-dedupe, so without this a
+      // double-click really does fire two concurrent writes.
+      save.disabled = true;
+      try {
+        await App.put(`/api/nodes/devices/${deviceId}`, { vendor_override: text });
+      } finally {
+        save.disabled = false;
+      }
       if (current()) refresh().catch(() => {});
       App.refreshNow('nodes');
     };
@@ -3251,10 +3269,20 @@
   function wireDeviceGroupRows(box) {
     for (const tr of box.querySelectorAll('[data-devgroup-id]')) {
       const id = Number(tr.dataset.devgroupId);
-      tr.querySelector('.devgroup-save').onclick = async () => {
+      const save = tr.querySelector('.devgroup-save');
+      save.onclick = async () => {
         const name = tr.querySelector('.devgroup-name').value.trim();
         if (!name) return;
-        await App.put(`/api/nodes/device-groups/${id}`, { name });
+        // Held down for the life of the request — see #ndd-vendor-save
+        // above; PUT is deliberately excluded from app.js's GET
+        // abort-dedupe, so without this a double-click fires two
+        // concurrent writes.
+        save.disabled = true;
+        try {
+          await App.put(`/api/nodes/device-groups/${id}`, { name });
+        } finally {
+          save.disabled = false;
+        }
         await refreshDeviceGroupsList(box);
         App.refreshNow('nodes');
       };
@@ -5153,6 +5181,7 @@
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
+    const generation = ++view.refreshGen;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
       App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
                                       limit: view.pageLimit, offset: view.pageOffset }),
@@ -5162,6 +5191,11 @@
       loadDiscJobsIfNeeded(),
       topologyVisible() ? loadTopology().catch(() => {}) : Promise.resolve(),
     ]);
+    // A newer refresh already redrew this — a filter or page change, or the
+    // operator leaving this tab, while the above was in flight — so this
+    // answer (built from filters/offset that may no longer be current) must
+    // not overwrite what the newer one already painted.
+    if (view.refreshGen !== generation || App.state.tab !== 'nodes') return;
     view.devices = devices.devices;
     view.pageTotal = devices.total != null ? devices.total : view.devices.length;
     drawPager();

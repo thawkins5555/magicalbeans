@@ -34,6 +34,16 @@
     // being drawn needs a way to tell "am I still the current one" apart
     // from merely comparing view.search.ran (true for any two searches).
     searchGen: 0,
+    // Bumped on every periodic refresh() (below) — the devices fetch it
+    // makes is built from live filter controls (cx-q, cx-enabled-only,
+    // cx-filter-vendor), so two overlapping refreshes (a poll tick racing a
+    // filter change) can carry different query strings and app.js's
+    // per-path abort-dedupe cannot cancel either one. Without this, the
+    // older response landing last overwrites view.devices — and the table —
+    // with the wrong filter's devices while the controls already read the
+    // new one. Same pattern as searchGen just above, which this module's
+    // own search already used; the periodic refresh() had not.
+    refreshGen: 0,
     // Rule sets (netpath/configrx_compliance.py). null (not []) means "not
     // fetched yet" — refreshRuleSets() is only ever called once up front,
     // the first time either the Compliance subtab or a device's own
@@ -813,17 +823,23 @@
         : '');
     const forget = target.querySelector('#cx-hostkey-forget');
     if (forget) {
-      forget.onclick = async () => {
-        forget.disabled = true;
-        try {
-          await App.del(`/api/ssh/devices/${device.id}/hostkey`, {});
-        } catch (error) {
-          if (!target.isConnected) return;
-          target.innerHTML += `<p class="hint err">${escape(error.message)}</p>`;
-          return;
-        }
-        if (!target.isConnected) return;
-        await drawHostKey(box, device);
+      // Routed through the same confirm every other trust- or
+      // credential-destroying action in this product uses — Clear
+      // credential in nodes.js is the closest cousin: forgetting this key
+      // is exactly as unrecoverable as clearing a stored password, and the
+      // danger styling alone was judged not to be warning enough for that
+      // one either (see the comment on Clear credential in nodes.js).
+      forget.onclick = () => {
+        App.confirmDestructive('Forget host key',
+          `<p>Forget the stored host key for <b>${escape(device.name)}</b>?</p>` +
+          '<p class="hint">The next connection then stores whatever key it is ' +
+          'offered, with nothing to check it against — only do this when the ' +
+          'device was genuinely rebuilt or replaced.</p>',
+          'Forget', async () => {
+            await App.del(`/api/ssh/devices/${device.id}/hostkey`, {});
+          }, (confirmed) => {
+            if (confirmed && target.isConnected) drawHostKey(box, device).catch(() => {});
+          });
       };
     }
   }
@@ -867,10 +883,11 @@
     return `<label>Enable secret <input id="cx-enable-secret" type="password"
         placeholder="${device.has_enable_secret ? 'stored — leave blank to keep' : 'most platforms do not need this'}"></label>
       ${device.has_enable_secret && App.canWrite('configrx')
-        // danger, same as Forget beside the host key above: it acts the
-        // moment it is clicked, with no confirm of its own, so the tier
-        // that usually says "second thought needed" is the only warning
-        // this button gets before the click itself.
+        // danger, same tier confirmDestructive's own confirm button uses —
+        // and, like Clear credential in nodes.js, still opens one rather
+        // than trusting the tier alone to be warning enough: this clears a
+        // stored password just as unrecoverably as that one does, and a
+        // misclick here is no cheaper to notice.
         ? '<p><button id="cx-enable-secret-clear" class="danger">Clear stored enable secret</button>'
           + '<span class="hint"> Leaves the SSH username and password untouched.</span></p>'
         : ''}`;
@@ -880,19 +897,20 @@
     const wrap = box.querySelector('#cx-enable-secret-wrap');
     const clearBtn = wrap.querySelector('#cx-enable-secret-clear');
     if (!clearBtn) return;
-    clearBtn.onclick = async () => {
-      clearBtn.disabled = true;
-      try {
-        await App.del(`/api/configrx/devices/${device.id}/credential/enable-secret`, {});
-      } catch (error) {
-        clearBtn.disabled = false;
-        App.toast(`Could not clear the enable secret: ${error.message}`, 'fail');
-        return;
-      }
-      device.has_enable_secret = false;
-      wrap.innerHTML = enableSecretFieldHtml(device);
-      wireEnableSecretClear(box, device);
-      App.announce('Enable secret cleared.');
+    clearBtn.onclick = () => {
+      App.confirmDestructive('Clear stored enable secret',
+        `<p>Clear the stored enable secret for <b>${escape(device.name)}</b>?</p>` +
+        '<p class="hint">The stored password cannot be recovered. Leaves the SSH ' +
+        'username and password untouched.</p>',
+        'Clear', async () => {
+          await App.del(`/api/configrx/devices/${device.id}/credential/enable-secret`, {});
+        }, (confirmed) => {
+          if (!confirmed) return;
+          device.has_enable_secret = false;
+          wrap.innerHTML = enableSecretFieldHtml(device);
+          wireEnableSecretClear(box, device);
+          App.announce('Enable secret cleared.');
+        });
     };
   }
 
@@ -1584,7 +1602,13 @@
     const params = { q: App.el('cx-q').value.trim() };
     if (App.el('cx-enabled-only').checked) params.enabled_only = 1;
     if (vendor) params.vendor = vendor;
+    const generation = ++view.refreshGen;
     const result = await App.get('/api/configrx/devices', params);
+    // A newer refresh already redrew this — a filter change, or the operator
+    // leaving this tab, while the above was in flight — so this answer
+    // (built from filters that may no longer be current) must not overwrite
+    // what the newer one already painted.
+    if (view.refreshGen !== generation || App.state.tab !== 'configrx') return;
     view.devices = result.devices;
     drawVendorFilter(result.devices, vendorSelect);
     drawDevices();

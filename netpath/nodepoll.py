@@ -350,6 +350,38 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
                   f"hundredths of a second after {elapsed_s:.0f}s")
 
 
+def _interface_reassigned(prior: "sqlite3.Row | dict", row: dict) -> bool:
+    """True only when there is affirmative evidence that the physical port
+    answering at this ifIndex changed between `prior` (last poll's stored
+    row) and `row` (this poll's fresh read) -- used to decide, on the poll
+    a reboot is first observed, whether an oper_status transition at this
+    ifIndex is real or an artifact of the agent renumbering ifIndex across
+    the reload (a stack member reboot can move port 5 from ifIndex 10 to
+    14).
+
+    ifPhysAddress (the port's burned-in MAC) is checked first: it is tied
+    to the hardware itself, not to how the agent currently names or
+    numbers the port, so it survives a stack member being renumbered
+    without the physical port changing (descr encodes the member number
+    and would differ across such a renumbering even though the port is
+    the same). ifDescr is the fallback for rows/platforms that leave
+    phys_addr blank (common for logical or aggregate interfaces).
+
+    A field that is empty/None on either side is never treated as
+    evidence of a change -- only a genuine disagreement between two
+    non-empty values counts. Otherwise a platform that simply doesn't
+    populate one of these columns would have every reboot treated as an
+    ifIndex reassignment, silently reintroducing the bug this function
+    exists to fix (every post-reboot oper_status comparison suppressed,
+    forever)."""
+    for field in ("phys_addr", "descr"):
+        old = prior[field] if field in prior.keys() else None
+        new = row.get(field)
+        if old and new:
+            return old != new
+    return False
+
+
 def _credential_label(config: dict) -> str:
     """How to name the credential in an operator-facing message, without
     ever printing the credential itself: a community string is a secret."""
@@ -1675,13 +1707,20 @@ class NodePoller:
                          and discontinuity != prior["discontinuity_ts"])
                 if prior is not None and not rebooted and not broke:
                     since = prior["last_sample_ts"] or 0
-                    bits = row.get("_octet_bits", 32)
+                    # in_bits/out_bits track ifHCIn/OutOctets independently
+                    # (see _poll_interfaces) because a device can answer
+                    # one 64-bit ifXTable counter for a row without
+                    # answering the other: applying one combined width to
+                    # both counters would treat a genuinely 32-bit
+                    # fallback as 64-bit and drop its wrapped sample.
+                    in_bits = row.get("_in_octet_bits", 32)
+                    out_bits = row.get("_out_octet_bits", 32)
                     in_bps = counter_rate(
                         prior["last_in_octets"], since, row.get("in_octets"),
-                        sample_ts, bits, speed_bps=row.get("speed_bps"))
+                        sample_ts, in_bits, speed_bps=row.get("speed_bps"))
                     out_bps = counter_rate(
                         prior["last_out_octets"], since, row.get("out_octets"),
-                        sample_ts, bits, speed_bps=row.get("speed_bps"))
+                        sample_ts, out_bits, speed_bps=row.get("speed_bps"))
                     # ifInErrors/ifOutErrors and ifInDiscards/ifOutDiscards
                     # are 32-bit counters; the rate is events per second
                     # between polls.
@@ -1698,9 +1737,16 @@ class NodePoller:
                         prior["last_out_discards"], since, row.get("out_discards"),
                         sample_ts, 32)
                 speed_bps = row.get("speed_bps")
-                in_util = (100.0 * in_bps * 8 / speed_bps
+                # counter_rate already refuses any rate implying more than
+                # 1.3x speed_bps (treating that as a reset rather than a
+                # real burst), so a raw util here tops out around 130%,
+                # not unbounded -- still above 100%, which is not a real
+                # utilization. Clamped into [0, 100] for the same reason
+                # the rate itself is bounded: a number a dashboard or
+                # alert rule can trust.
+                in_util = (max(0.0, min(100.0, 100.0 * in_bps * 8 / speed_bps))
                            if in_bps is not None and speed_bps else None)
-                out_util = (100.0 * out_bps * 8 / speed_bps
+                out_util = (max(0.0, min(100.0, 100.0 * out_bps * 8 / speed_bps))
                             if out_bps is not None and speed_bps else None)
                 rate_rows.append({
                     "if_index": if_index, "in_octets": row.get("in_octets"),
@@ -1716,7 +1762,27 @@ class NodePoller:
                     "discontinuity_ts": discontinuity,
                     "ts": sample_ts})
                 interface_id = interface_ids.get(if_index)
-                if interface_id is not None and prior is not None:
+                # Suppressed only when `rebooted` AND _interface_reassigned
+                # says the port at this ifIndex actually changed: some
+                # platforms (stack members, some firmware upgrades)
+                # renumber ifIndex across a reload, so on the poll that
+                # first observes a reboot, `prior` at this if_index may
+                # describe a physically different port than the new row --
+                # comparing their oper_status would then fabricate a
+                # link_up/link_down event on a port that never actually
+                # changed. But a reboot alone is not evidence of a
+                # renumbering: on the overwhelming majority of platforms
+                # ifIndex is stable across a reload, and a reboot is
+                # exactly when a port that was up and does not come back
+                # is most likely to happen. Skipping the comparison for
+                # every reboot regardless of identity meant that case could
+                # never fire an interface_down alert on any platform, and a
+                # missed link_down is far worse than an occasional
+                # fabricated one -- so the comparison still runs whenever
+                # the prior and current rows agree (or we simply can't
+                # tell, e.g. phys_addr/descr blank on one side).
+                if (interface_id is not None and prior is not None
+                        and not (rebooted and _interface_reassigned(prior, row))):
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
                         kind = "link_up" if row.get("oper_status") == "up" else "link_down"
                         if row.get("oper_status") in ("up", "down"):
@@ -2913,13 +2979,35 @@ class NodePoller:
 
             speed = _val(nodeoids.IF_TABLE, "if_speed")
             high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
+            # ifSpeed is a Gauge32 that RFC 2863 defines as saturating at
+            # 4294967295 for any link it cannot express in 32 bits of
+            # bits/sec -- a real 10G+ port reports exactly that sentinel
+            # here, which is why ifHighSpeed (Mbit/s) exists. Tempting to
+            # treat the sentinel as "speed unknown" (None) instead of a
+            # literal ~4.295 Gbit/s denominator, but that would only trade
+            # one wrong number for a missing one: in_util/out_util below
+            # are clamped into [0, 100] precisely so a row stuck with the
+            # sentinel (ifHighSpeed absent) still reports a bounded,
+            # honest-enough utilization instead of losing the metric
+            # outright.
             speed_bps = (float(high_speed) * 1_000_000 if isinstance(high_speed, (int, float)) and high_speed
                         else (float(speed) if isinstance(speed, (int, float)) else None))
             hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
             hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
             in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
             out_octets = hc_out if isinstance(hc_out, (int, float)) else _val(nodeoids.IF_TABLE, "if_out_octets")
-            octet_bits = 64 if isinstance(hc_in, (int, float)) or isinstance(hc_out, (int, float)) else 32
+            # in_octets/out_octets fall back from the ifXTable 64-bit
+            # counters to the ifTable 32-bit ones independently of each
+            # other above, so the bit width used for the wrap maths below
+            # has to be tracked independently too. A flaky agent that
+            # answers ifHCInOctets but not ifHCOutOctets for this row (a
+            # partial per-varbind failure) would otherwise get a single
+            # combined width of 64 applied to the genuinely 32-bit
+            # ifOutOctets fallback: when that counter wraps, counter_rate's
+            # `bit_width >= 64` branch returns None instead of computing
+            # the wrap-adjusted rate, and the sample is silently dropped.
+            in_octet_bits = 64 if isinstance(hc_in, (int, float)) else 32
+            out_octet_bits = 64 if isinstance(hc_out, (int, float)) else 32
 
             admin_raw = _val(nodeoids.IF_TABLE, "if_admin_status")
             oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
@@ -2947,7 +3035,8 @@ class NodePoller:
                 "out_discards": int(out_discards) if isinstance(out_discards, (int, float)) else None,
                 "discontinuity_ts": (float(discontinuity)
                                      if isinstance(discontinuity, (int, float)) else None),
-                "_octet_bits": octet_bits,
+                "_in_octet_bits": in_octet_bits,
+                "_out_octet_bits": out_octet_bits,
                 "_sample_ts": sample_ts,
             })
         if skipped or abandoned:

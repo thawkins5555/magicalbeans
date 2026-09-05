@@ -216,6 +216,19 @@ class Service:
         """
         from .. import ldapclient
 
+        # Defence in depth: ldapclient.simple_bind already refuses a
+        # zero-length password before it ever opens a socket (RFC 4513
+        # §5.1.2 — a non-empty DN with an empty password is a legal LDAP
+        # "unauthenticated bind", which many directories answer with
+        # resultCode 0/success rather than invalidCredentials, so this
+        # cannot be left to the directory to reject). Checking again here
+        # costs nothing and means this route's safety does not rest on
+        # remembering to keep calling into ldapclient correctly — a future
+        # caller of authenticate_ldap, or a refactor of simple_bind's own
+        # guard, cannot silently reopen the empty-password bind.
+        if password == "":
+            return False
+
         try:
             dn = ldapclient.render_bind_dn(
                 str(self.settings.get("ldap_bind_dn_template", "")), username)

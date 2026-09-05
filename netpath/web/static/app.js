@@ -4573,8 +4573,19 @@ const App = (() => {
       try { page.fastTick(); } catch (error) { /* a repaint must not stop the loop */ }
     }
     if (!page.refresh) return;
+    // A refresh() slower than its own poll interval — precisely what happens
+    // as the server degrades, which is exactly when this matters most — used
+    // to let the next tick's rate check pass anyway and launch a second,
+    // fully concurrent refresh() for the same tab, racing the first against
+    // an already-struggling server. lastFetch alone cannot catch that: it
+    // only spaces out ticks that each start on time, and says nothing about
+    // one still running when the next is due. This flag does, and is reset
+    // in a finally so a refresh() that throws — the superseded case included
+    // — still lets the next attempt through rather than jamming the tab.
+    if (page.refreshing) return;
     if (now - (page.lastFetch || 0) < rateFor(state.tab)) return;
     page.lastFetch = now;
+    page.refreshing = true;
     try {
       // The page in view says a refresh is in flight (app.css draws a line
       // after 400 ms, so the ordinary two-second poll never flickers).
@@ -4589,6 +4600,8 @@ const App = (() => {
     } catch (error) {
       if (error && error.superseded) return;
       connected(false, String(error.message || error));
+    } finally {
+      page.refreshing = false;
     }
   }
 
@@ -4697,6 +4710,20 @@ const App = (() => {
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') requestCloseModal();
     };
+    /* Escape, a click on the backdrop and Close all go through
+       requestCloseModal, which is what asks before a half-filled dialog is
+       thrown away — closing the browser tab itself skipped that question
+       entirely, discarding the same edit with no warning at all. ssh.js
+       already registers its own beforeunload, for a session it has to tear
+       down rather than a form it has to protect; this is the modal's own
+       reason for the same event. The confirmation text itself is the
+       browser's, not this product's — event.returnValue is only a flag that
+       says "ask", and every modern browser ignores whatever string it holds. */
+    window.addEventListener('beforeunload', (event) => {
+      if (!modalDirty) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
     /* The skip link names <main id="view">, which is display: contents and
        so has no box to take focus. What the operator means is "the page I
        am looking at", so focus goes to the active section — made focusable

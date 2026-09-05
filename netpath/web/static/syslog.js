@@ -14,6 +14,14 @@
     messages: [],
     selected: null,
     showHostname: true,
+    // Bumped on every refresh() — window_() recomputes t1 = Date.now() / 1000
+    // on every Live tick, so two overlapping polls never share a URL and
+    // app.js's per-path abort-dedupe (call(), around line 551) cannot cancel
+    // either one. Without this, a slow poll N that resolves after a faster
+    // poll N+1 overwrites the view and the DOM with the OLDER window —
+    // silently, exactly during the slow-server case this page exists to
+    // surface. Same pattern as configrx.js's searchGen / app.js's gsearchRun.
+    refreshGen: 0,
   };
 
   // One implementation, in app.js. This was twelve copies of the same
@@ -387,6 +395,7 @@
   async function refresh() {
     if (App.state.tab !== 'syslog') return;
     drawStatus();
+    const generation = ++view.refreshGen;
 
     const { t0, t1 } = window_();
     const f = filters();
@@ -397,6 +406,11 @@
       App.get('/api/syslog/overview', { t0, t1, bucket, ...f }),
       App.get('/api/syslog/search', { t0, t1, limit: App.el('sl-limit').value, ...f }),
     ]);
+    // A newer refresh already redrew this — a later Live tick, a filter
+    // change, or the operator switching off this tab entirely while the
+    // above was in flight — so painting this answer now would only put a
+    // stale window back on screen.
+    if (view.refreshGen !== generation || App.state.tab !== 'syslog') return;
 
     view.hist = overview;
     view.messages = search.messages;
