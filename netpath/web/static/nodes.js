@@ -703,6 +703,60 @@
     link.hidden = false;
   }
 
+  /* Every module that knows a device links back to it — App.deviceLink,
+     alerts.js's loadDeviceLinks, snmp.js/syslog.js/ipam.js/wireless.js's own
+     copies — but Nodes never linked the other way. The device pane is the
+     page an operator is on first, during an outage, by construction: a
+     device went dark, so they opened the device. From there, "does this
+     have open alerts", "did its configuration change", "what has it
+     logged" used to mean switching tabs and re-finding the same device by
+     hand, in each one, four times.
+
+     Built the same way those inbound links already are — App.buildRoute,
+     and the exact query key or route part each target module's own
+     activate() already reads (alerts: ?device=, matching entity_label's
+     free-text filter the way an operator typing a name into that box
+     already would; ConfigRX: #/configrx/device/<id>, already read by its
+     activate(); syslog/snmp: ?source=<ip>, the same key loadDeviceLinks
+     below already uses for the identical question asked from an alert) —
+     not a fifth way to construct a route.
+
+     No count fetched per link: this runs on every drawDetailHeader, i.e.
+     every refresh tick for whichever device is selected, and a count would
+     mean a request per device per refresh to earn a number nothing else on
+     this line costs anything to show. A link with no number beats one that
+     costs a poll cycle per device.
+
+     Gated on canRead, not canWrite: these are read-only questions about the
+     device, asked from a pane an account with only Nodes read already
+     sees — an account without (say) Alerts read must not be shown a link
+     that only 403s. */
+  function deviceCrossLinksHtml(d) {
+    if (!d || !d.id) return '';
+    const links = [];
+    if (App.canRead('alerts')) {
+      links.push(`<a class="linkish inline" href="${
+        App.buildRoute('alerts', [], { device: displayName(d) })}">Alerts</a>`);
+    }
+    if (App.canRead('configrx')) {
+      links.push(`<a class="linkish inline" href="${
+        App.buildRoute('configrx', ['device', d.id])}">ConfigRX</a>`);
+    }
+    // Syslog and SNMP both filter by the raw source address, not the
+    // device — a device with no IP recorded (never polled) has nothing to
+    // hand either one.
+    if (d.ip && App.canRead('syslog')) {
+      links.push(`<a class="linkish inline" href="${
+        App.buildRoute('syslog', [], { source: d.ip })}">Syslog</a>`);
+    }
+    if (d.ip && App.canRead('snmp')) {
+      links.push(`<a class="linkish inline" href="${
+        App.buildRoute('snmp', [], { source: d.ip })}">SNMP traps</a>`);
+    }
+    return links.length
+      ? `<p class="hint nd-crosslinks">${links.join(' · ')}</p>` : '';
+  }
+
   /* The identity line for one device, as markup. Takes the device rather
      than reading view.detail so the device dialog can render a device that
      is not the selected one through the same code — the alternative was a
@@ -777,7 +831,7 @@
       // of the severity is true whatever the agent says.
       field('snmp', d.snmp_error, 'nd-err'),
     ].filter(Boolean);
-    return parts.join('');
+    return deviceCrossLinksHtml(d) + parts.join('');
   }
 
   function timelineWindow() {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -104,9 +105,35 @@ class Monitor:
         self.stop()
         # Queued work is dropped, but a trace already running still wants to
         # write its result; closing the database under it raises inside the
-        # worker and loses the measurement.
+        # worker and loses the measurement. A flat 3s used to be the whole
+        # policy, which is not always long enough — a trace's own worst case
+        # is bounded by its own settings (see expected_budget), so wait at
+        # least as long as whichever in-flight target is slowest, not a
+        # fixed guess. _run_one's own guard below is the backstop for
+        # anything that still overruns this.
         self._executor.shutdown(wait=False, cancel_futures=True)
-        self.drain(drain_s)
+        self.drain(max(drain_s, self._inflight_budget_s()))
+
+    def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
+        """The longest a currently in-flight trace could still legitimately
+        run, per its own target's hop count/probes/timeout — the drain
+        window shutdown() should honour before giving up on it. Capped so
+        one misconfigured target (a high max_hops with a long timeout)
+        cannot hang shutdown indefinitely; _run_one's guard covers whatever
+        this ceiling does not."""
+        worst = 0.0
+        for target_id in self.inflight():
+            try:
+                target = self.db.target(target_id)
+            except Exception:
+                continue
+            if target is None:
+                continue
+            keys = target.keys()
+            timeout_s = float(target["timeout_s"]) if "timeout_s" in keys else 2.0
+            worst = max(worst, expected_budget(
+                target["max_hops"], target["probes"], timeout_s))
+        return min(worst, ceiling_s)
 
     def inflight(self) -> set[int]:
         with self._lock:
@@ -255,10 +282,24 @@ class Monitor:
             if self.on_complete:
                 self.on_complete(target_id)
         except Exception as exc:  # a scheduler thread must never die quietly
-            import traceback
-            self.log.add(ERROR, f"Worker raised {type(exc).__name__}: {exc}",
-                         target=label, detail=traceback.format_exc())
-            traceback.print_exc()
+            # ...with one exception to that rule: "Cannot operate on a
+            # closed database" while _stop is set means this trace ran past
+            # shutdown()'s drain window (bounded by _inflight_budget_s, not
+            # unlimited) and the database closed under it. That is an
+            # accepted, bounded consequence of stopping promptly rather than
+            # waiting on the network forever, not a bug — so it does not get
+            # the traceback below, which would read exactly like a crash in
+            # a log an operator checks right after a service stop. The same
+            # exception NOT during a stop is still a real bug and still gets
+            # the full treatment.
+            if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
+                self.log.add(SYSTEM, f"Trace for {label} finished after the "
+                                    f"scheduler stopped; its result was not saved")
+            else:
+                import traceback
+                self.log.add(ERROR, f"Worker raised {type(exc).__name__}: {exc}",
+                             target=label, detail=traceback.format_exc())
+                traceback.print_exc()
         finally:
             with self._lock:
                 self._inflight.discard(target_id)

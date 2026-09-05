@@ -98,6 +98,20 @@
   const logDecoder = new TextDecoder();
   let logBuffer = '';
   const LOG_MAX_LINES = 500;
+  /* Most device prompts ("acc-sw-001#") arrive with no trailing newline —
+     the device is done talking and waiting for a keystroke, not about to
+     print a new line — so the code above left them sitting in logBuffer
+     forever: the one line a screen-reader user most needs (the device is
+     ready; here is its output) was the one line #ssh-log never announced,
+     for the entire session, unless something later happened to send a bare
+     "\n". Announcing on every byte would read a typed username out loud one
+     letter at a time, which is exactly what the buffering above exists to
+     avoid; announcing after a short silence does not, because a real typist
+     leaves less than this between keystrokes far more often than not, and
+     the cost when they do pause is an extra, harmless read of a line that
+     is about to be completed anyway — not the silence this replaces. */
+  const LOG_IDLE_MS = 400;
+  let logIdleTimer = null;
 
   function stripAnsi(text) {
     return text

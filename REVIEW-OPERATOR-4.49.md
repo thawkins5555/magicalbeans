@@ -413,7 +413,70 @@ because the same query makes them concrete:
 
 ### 5.2 The navigation bar
 
-⏳
+The operator's own complaint was that the four group descriptors — NOW, INVENTORY,
+TELEMETRY, ADMIN — look like navigation and link to nothing. They were not elements at
+all: CSS generated content off a `data-label` attribute, so not selectable, not
+focusable, not translatable by a page translator, and invisible to every JavaScript
+query in the application. And because nothing hid the wrapper when permissions hid the
+tabs inside it, an account without telemetry grants saw a "TELEMETRY" heading with
+nothing beneath it.
+
+**Decision: flatten to twelve tabs, not build dropdowns.** The reasoning, since it is a
+judgement rather than a defect. The alerts count badge has to be readable without an
+interaction, and under a "Now" menu it is invisible until the menu opens unless the
+number is mirrored onto the trigger — creating a second owner of the same figure. Under
+alarm, twelve fixed one-click targets beat four triggers and a transient overlay. The
+`.page` elements are `role="tabpanel"` pointing back at each tab, and the roving-tabindex
+handler is shared with four real subtab strips, so `role="menubar"` would fork the
+keyboard contract into two implementations. `boot.js`'s first-paint rule underlines
+`.tab[data-tab="…"]`, which would need a tab-to-group map inside it — a second list to
+fall out of step. Kiosk hides the strip entirely, so a menu buys a wall display nothing.
+And the four words cost roughly 300 px of a strip that must live inside 1366 px.
+
+The grouping survives without the words: a 1 px hairline on the first tab of each group.
+About 9 px each instead of 75, no generated text inside the tablist — and, the point,
+when permissions hide that tab the divider goes with it, so the orphan-heading defect
+becomes structurally impossible rather than fixed by a second hiding pass.
+
+**Ten further defects were found alongside it and all are fixed.** The one an operator
+would actually have noticed: `#tabs::after`, the fade that signals "there is more strip
+off to the right", was an absolutely positioned child of the scrolling container, so it
+translated with `scrollLeft` — correct only at rest, drifting into the middle of the
+strip and washing out whatever tab sat under it once scrolled, and never appearing at
+the real right edge at all. It is now drawn on the utility group outside the scroller.
+The evidence is two screenshots: the fade at the true edge at `scrollLeft 0`, and gone at
+the true end.
+
+Also fixed: `has-overflow` never cleared at the right end, so once a strip overflowed the
+fade stayed lit forever, including where there was nothing left to warn about; nothing
+recomputed overflow on scroll, or when the alerts badge changed digit count and altered
+the ALERTS tab's width; the newly active tab was never scrolled into view, so a digit
+shortcut, a hash route, Back/Forward, kiosk rotation or the permissions fallback could
+all leave it off-screen; every tab was a tab stop until the first `selectTab` ran at the
+very end of `start()`; the wordmark was a focusable non-tab inside `role="tablist"`,
+making arrow keys a silent no-op when it held focus; and at 360 px the utility group's
+three text labels took 55% of the bar, leaving the strip 33%. Search, Account and Sign
+out became icons below 480 px: **the strip went from 119 px to 194 px, the utility group
+from 198 px to 123 px**, measured before and after in the same live session.
+
+**One thing my brief got wrong, and the correction is a better finding.** I reported the
+kiosk help text as promising digit shortcuts the handler did not implement. It did not —
+the title said 1-9 and the handler checked 1-9. The real defect underneath was that
+`aria-keyshortcuts` did not exist at all, and nothing kept it in step as permissions
+hid tabs and shifted which nine were visible. That is now generated and recomputed, with
+a test pairing the two so they cannot drift.
+
+**And an honest limit, in the reviewer's own words:** at 1366 px the strip still
+overflows by 119 px — one tab's worth — against 0 px at 1920. That is categorically
+different from the 360 px case where more than half the bar was three buttons with no
+business costing that much. Ten of twelve tabs are visible with no interaction, the fade
+now honestly signals the other two, and `scrollIntoView` guarantees any route to a tab
+lands it in view. Squeezing further buys 40–90 px at one width, worsens click targets
+everywhere the breakpoint applies, and still would not close the gap at 1280. Twelve
+full-vocabulary tabs is simply more chrome than a 1366 px laptop shows flat, once
+shortening the names and re-grouping are both off the table — and shortening was off the
+table deliberately, because FORTIWIRELESS was renamed to be honest about being
+FortiGate-only.
 
 ### 5.3 The shape of the estate
 
@@ -444,7 +507,34 @@ an interface, a NetPath destination or a DHCP scope. `MAX_MUTE_HOURS = 24` and t
 60-hour occurrence cap are sensible and well argued; the scope model underneath them
 is not rich enough to use.
 
-### 5.4 Finding things
+### 5.4 The ten minutes that matter most
+
+**O-32 — every module links into Nodes. Nodes links back to nothing. CONFIRMED
+(exhaustive).** `alerts.js`, `syslog.js`, `snmp.js`, `ipam.js` and `wireless.js` each
+link a device address back to its Nodes page. Across the whole of `nodes.js` —
+5,100 lines — **`App.buildRoute` is called exactly once**, and it targets Nodes' own
+device route. Not one call anywhere builds a route into Alerts, ConfigRX, Syslog or SNMP
+for the device on screen.
+
+So the device detail pane — the page an operator is looking at *first*, during an
+outage, by construction, because a device went dark and they opened the device — cannot
+answer: does this have any open alerts? did its configuration change recently? what has
+it logged in the last hour? has it sent a trap? Each of those is a tab switch and a
+re-lookup of the same device by name or address, four times, by hand, done by the person
+with the least time available to do it.
+
+This is not new infrastructure. Every one of those modules already knows how to land
+pre-filtered on a specific device — that is precisely what the existing inbound links
+prove — so it is the same three-line pattern, pointed the other way, in the device
+summary header beside SSH and WEB.
+
+It is ranked here, above every interface defect in this review and below only the
+ConfigRX and reporting gaps, because it costs almost nothing and it changes the shape of
+the ten minutes that matter most. It was also not on anybody's list: it came from an
+agent that had spent two hours correlating exactly this information by hand, across all
+twelve modules, in order to verify other fixes — which is its own argument.
+
+### 5.5 Finding things
 
 **O-1 — global search drops every group after the first failure. CONFIRMED (source,
 exhaustive).** `netpath/web/static/app.js:1876-1932`. One `try` wraps all four lookups
@@ -496,7 +586,7 @@ and an alert rule for a device that falls out of compliance. This is the differe
 between a backup tool and a configuration management tool, and it is the most common
 reason an operator keeps paying for a second product.
 
-### 5.5 Being told about it
+### 5.6 Being told about it
 
 **O-4 — the rollup that stops a site outage becoming three hundred alerts depends on a
 field you must set by hand, two thousand times, and the data to propose it is already
@@ -616,7 +706,7 @@ This was only visible because the fleet gained personas with real sensors. A
 network-only fleet would never have shown it, which is the argument for the persona
 work in section 2.2.
 
-### 5.6 Answering for it afterwards
+### 5.7 Answering for it afterwards
 
 **O-10 — the audit trail is written, is served, and cannot be seen. CONFIRMED
 (exhaustive).** `netpath/appdb.py:107-116` defines the `audit` table, whose own comment
@@ -642,7 +732,7 @@ On a site under an ISO, food-safety or pharmaceutical regime that is a complianc
 blocker rather than a nicety. The mechanism is already there: `_audit` is one line per
 handler.
 
-### 5.7 Showing somebody else
+### 5.8 Showing somebody else
 
 **O-12 — the data for a report is kept for four hundred days and there is no report.
 CONFIRMED.** `netpath/nodesdb.py:427-437` keeps three days of raw samples and **400
@@ -661,7 +751,7 @@ availability of these thirty devices" and "which twenty links came closest to
 saturation". Both are a `GROUP BY` away from data already on disk. This is the cheapest
 large win in the product.
 
-### 5.8 Performance and scale
+### 5.9 Performance and scale
 
 #### Tier A — 250 devices, all nine incidents
 
@@ -803,7 +893,7 @@ tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previou
 review declined minification (PERF-004) with reasons; this is a different and larger
 lever, and it makes the source no harder to read.
 
-### 5.9 Security and permissions
+### 5.10 Security and permissions
 
 #### Two ways to stop the monitoring system with one packet
 
@@ -1155,9 +1245,98 @@ MAC", using a client-side mirror of `nodesdb`'s own `looks_like_mac_search` carv
 for digits and dots — because an IP address's octets are valid hex too, and searching
 by address is the far more common reason to type digits and dots into that box.
 
+**O-29 — a read-only account was shown two live-looking buttons that did nothing at
+all. CONFIRMED, and it is the worst of this class.** In the Maintenance windows dialog,
+`windowRowHtml()` rendered "End now" and "Delete" on every row regardless of grant,
+while the wiring loop sat behind `if (!writable) return box;`. So for an account with
+Alerts read, both buttons rendered exactly like working ones and simply had no
+`onclick`. Reachable, not theoretical: the outer button is deliberately *not*
+write-gated, because viewing the windows is a legitimate read action.
+
+A disabled button that says "Needs Alerts write" teaches an operator the shape of their
+own access. A button that looks live and silently does nothing teaches them the software
+is broken — and the next thing they do is stop trusting the parts that work.
+
+The sweep that found it is worth as much as the fix: about fifty `.disabled =` sites
+across twelve module files, sorted into transient in-flight states that self-describe
+through their own button text ("Polling…", "Failed", "3 already polling") and legitimately
+need no title, and durable business-rule disables that do — of which the handful that
+exist already carried a real reason. No second instance of this shape exists anywhere in
+those files.
+
+**O-30 — and one control hides where it should disable.** The OID browser's whole-device
+walk button was `hidden` for a non-writer rather than disabled with a reason: the exact
+inverse, and against the reasoning written beside the application's own write-gate
+mechanism. A control that vanishes leaves an operator unable to tell "I may not do this"
+from "this product cannot do this", and the second conclusion is the one that loses a
+sale. Now disabled in place, after checking that the button sits last in its row so the
+layout does not move, and that every path which re-enables it is reachable only by
+clicking the button itself.
+
+**The tab badge undercounted the list it sits above.** `open_count` counts `state =
+'open'` only, while the Alerts list's default State is "unresolved", which the server
+maps to `state IN ('open','acked')`. From the moment anybody acknowledged anything —
+routine — the badge undercounted the default view by exactly the acked count, with
+nothing saying that was expected. `/api/state` now carries `unresolved_count` off the
+summary dict it was already fetching, at no extra query; the client reads it with a
+fallback so the two halves could land in either order. The kiosk wall-display figure was
+deliberately left on the narrower number, because "what has nobody looked at yet" is a
+different and also useful question, and an acknowledged alert has been looked at.
+
+**A read-only account could open two configurations and not diff them.** `server.py:479`
+gated `get_configrx_diff` on ConfigRX *write*, while `server.py:470` — the deliberate
+4.48.0 change — gates fetching a stored backup on *read*. Diffing two things you are
+already permitted to read is not a write, and it is the most common thing anyone does
+with configuration backups: the person asking "what changed on that switch before the
+line stopped" needed the same grant as the person who can push a credential. Now `read`,
+with the test that asserted the old behaviour updated to assert the new one.
+
 ## 8. What was deliberately not built
 
-⏳
+Named, with the reason, so that nothing here reads as an oversight.
+
+**Printer polling.** The operator's decision: simulate it, prove the gap, do not build
+it. It is proved — `prn-01`, correctly vendor-identified as `hp`, returns twelve metrics
+of which every one is an interface counter or a ping result. RFC 3805's Printer-MIB
+would give toner and waste levels, paper trays, page counts and a printer status. Ranked
+below UPS and environmental because a printer that has run out of toner does not stop a
+production line.
+
+**The self-update supply chain.** The operator's decision: report, do not change. Fully
+described in section 5.10, including exactly what is and is not verified and the five
+mitigations that actually hold. Changing it would change what an existing installation
+follows on its next update, and that is not a decision to make inside a review.
+
+**A "below N is bad" threshold direction.** `evaluate_threshold` supports only "breach
+when value is at or above the threshold". So `ups_runtime_low` — alert when a UPS has
+under ten minutes left — cannot be expressed, and neither can a low battery charge, a
+low free-disk figure, or an interface that has gone abnormally quiet. The agent that hit
+this declined to ship the rule with an inverted metric, which would have corrupted the
+value for charting and booby-trapped the threshold field for whoever edited it next.
+Right call; the evaluator change is real work with real blast radius across every
+existing rule, and it belongs in its own pass. It is the highest-ranked item in the
+backlog.
+
+**Per-device bulk-action attribution in the audit trail.** A bulk update, delete or
+import cannot carry a filterable per-device target without either overflowing the
+256-character target field on any real-sized batch, or a join table. So "was device N
+touched by a bulk operation" remains unanswerable after this pass. Stated as an accepted
+limitation rather than half-solved.
+
+**Fan-out capping in the topology builder.** `build_topology`'s edge loop is O(fan-out²)
+per hop-pair, where fan-out is the number of distinct addresses seen at one TTL within a
+single trace. Measured at 0.4 s for fan-out 20 and 1.2 s for 40. But fan-out is a set,
+it is 1 whenever a hop answers consistently, it grows only with genuine ECMP diversity —
+a handful of parallel uplinks in any real network — and it is driven by neither trace
+count, window length, nor fleet size, and no remote party can raise it. A work ceiling
+was added at a level no real network reaches; the picture is deliberately not collapsed,
+because showing path divergence is the entire purpose of that view.
+
+**Everything structural.** SAML and multi-factor authentication, per-site RBAC, remote
+pollers, sharding, high availability, sFlow, NETCONF, and multi-vendor wireless. Each
+changes the process model, the permission table's shape, or what "one SQLite writer"
+means. They are later work, not declined work, and section 6 ranks them by what they
+would actually cost this operator.
 
 ## 9. Evidence index
 

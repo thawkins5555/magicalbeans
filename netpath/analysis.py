@@ -40,6 +40,22 @@ MAX_BUCKETS = 2000
 MAX_TIMESTAMP = 4102444800.0
 MAX_SPAN_S = 10 * 366 * 24 * 3600.0
 
+# build_topology's own ceiling: the most distinct addresses at one TTL,
+# *within a single trace*, that are paired into edges against the next TTL's
+# own set. Nothing bounds how many different IPs a trace's own probes can
+# return at one hop -- it is genuine ECMP path diversity, or a malformed
+# trace, whichever produced the rows -- and pairing every one of them against
+# every one of the next hop's is O(fanout^2): measured at 0.4 s for a fanout
+# of 20 and 1.2 s for 40, on a single trace, before this cap existed. A real
+# hop's ECMP diversity is a handful of parallel uplinks, essentially never
+# above sixteen, so 64 is invisible to every real network and turns the
+# worst case into a bounded 4,096 edge increments per hop-pair per trace.
+# Deliberately not a cap on how many nodes are drawn -- accumulated over many
+# traces a TTL can and should show more than 64 distinct addresses over time,
+# and only the O(n^2) edge-pairing within one trace is what this bounds; see
+# Topology.truncated_ttls for how a hit is reported rather than hidden.
+MAX_HOP_FANOUT = 64
+
 
 def clamp_window(t0, t1) -> tuple[float, float]:
     """A finite, ordered, epoch-plausible (t0, t1) of at most MAX_SPAN_S.
@@ -149,6 +165,14 @@ class Topology:
     columns: dict[int, list[PathNode]] = field(default_factory=dict)
     total_traces: int = 0
     distinct_paths: int = 0
+    # TTLs where at least one trace answered with more than MAX_HOP_FANOUT
+    # distinct addresses of its own, so build_topology only paired the first
+    # MAX_HOP_FANOUT of them into edges rather than every one of them. Every
+    # node at that TTL is still counted and still drawn -- only which edges
+    # got built from a single pathological trace is affected -- but the
+    # caller needs this to say so, rather than let the diagram look complete
+    # when part of one column's connections were never computed.
+    truncated_ttls: set[int] = field(default_factory=set)
 
     def share(self, count: int) -> float:
         return count / self.total_traces if self.total_traces else 0.0
@@ -217,6 +241,7 @@ def build_topology(hop_rows, dest_ip: str | None = None,
     signatures: Counter = Counter()
     node_seen: dict[tuple[int, str | None], float] = {}
     edge_seen: dict[tuple[tuple[int, str | None], tuple[int, str | None]], float] = {}
+    truncated_ttls: set[int] = set()
 
     for trace_id, ttl_map in per_trace.items():
         started = trace_ts.get(trace_id, 0.0)
@@ -228,8 +253,20 @@ def build_topology(hop_rows, dest_ip: str | None = None,
         for ttl in ttl_map:
             if ttl + 1 not in ttl_map:
                 continue
-            for src in ttl_map[ttl]:
-                for dst in ttl_map[ttl + 1]:
+            # Every node above is still counted and still drawn regardless of
+            # size; only the pairing below, which is O(len(srcs)*len(dsts)),
+            # is bounded. Sorted rather than left in set-iteration order, so
+            # which addresses get kept when a trace is truncated is
+            # deterministic rather than depending on hash order.
+            srcs, dsts = ttl_map[ttl], ttl_map[ttl + 1]
+            if len(srcs) > MAX_HOP_FANOUT:
+                srcs = sorted(srcs)[:MAX_HOP_FANOUT]
+                truncated_ttls.add(ttl)
+            if len(dsts) > MAX_HOP_FANOUT:
+                dsts = sorted(dsts)[:MAX_HOP_FANOUT]
+                truncated_ttls.add(ttl + 1)
+            for src in srcs:
+                for dst in dsts:
                     edge = ((ttl, src), (ttl + 1, dst))
                     edge_counts[edge] += 1
                     if started > edge_seen.get(edge, 0.0):
@@ -251,7 +288,8 @@ def build_topology(hop_rows, dest_ip: str | None = None,
 
     hostnames = hostnames or {}
     asn_data = asn_data or {}
-    topo = Topology(total_traces=len(per_trace), distinct_paths=len(signatures))
+    topo = Topology(total_traces=len(per_trace), distinct_paths=len(signatures),
+                    truncated_ttls=truncated_ttls)
     for key, count in node_counts.items():
         ttl, ip = key
         seen = node_seen.get(key, 0.0)

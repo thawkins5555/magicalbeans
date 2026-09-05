@@ -87,6 +87,30 @@ up to 3 seconds) before closing any database, since a trace still running
 when its database closes raises inside the worker thread and loses the
 measurement.
 
+**`main()` reconfigures stdout/stderr for line buffering before anything
+prints — 4.49.0.** CPython only line-buffers a stream attached to a real
+terminal; redirected to a file or a pipe, exactly what a service manager
+gives it, both switch to block buffering and hold output in an 8 KB buffer
+until it fills or the process exits. That's invisible in the console window,
+where every `print()` appears to work, which is exactly how it went
+unnoticed: nothing here is wrong until something downstream is watching the
+log rather than the terminal. Measured: `python -m netpath --headless` with
+stdout redirected to a file left the log completely empty after 120 seconds
+while the server was already answering requests the whole time; the same
+command with `-u` printed its banner in 1.2 s (`demo/scenario.py` already
+passed `-u`, which is how this stayed hidden through every campaign that used
+the demo harness). The consequence that matters most: the line that never
+arrived under the bug is `WARNING: serving on <host> without TLS. Sign-ins …
+travel in the clear` — the one warning whose entire job is to reach someone
+before they put a password on an unencrypted page. `_line_buffer_stdio()`
+calls `sys.stdout.reconfigure(line_buffering=True)` and the same for
+`sys.stderr`, once, at the top of `main()`, rather than adding `flush=True`
+to each of the module's `print()` call sites individually; `reconfigure` is
+`None` under `pythonw.exe` (no console at all) and the call is skipped
+there, and any `AttributeError`/`ValueError`/`OSError` — a stream already
+detached or replaced — is swallowed rather than crashing startup over a
+cosmetic improvement.
+
 ## Data layer
 
 Ten SQLite files, each opened with `PRAGMA journal_mode=WAL` and (for
@@ -362,6 +386,112 @@ where the two were the same value by definition. `vendor_source` —
 away; it is now stored, because an IANA arc assignment and a sysDescr
 substring guess are not equally trustworthy and the header used to present
 them identically.
+
+### UPS and environmental health (`nodeoids.py`, `nodepoll.py`, `alertsdb.py`) — 4.49.0
+
+Two new best-effort reads ride the ordinary poll, both added because a plant
+site is full of devices that are not routers or switches: `_poll_ups_health`
+(UPS-MIB, RFC 1628) and `_poll_environment` (ENTITY-SENSOR-MIB, RFC 3433,
+promoted from an interface-only on-demand read to a whole-device cadenced
+one). Both are gated for cost, differently, because the two device
+populations they cover are shaped differently.
+
+**UPS-MIB is not keyed by enterprise arc, unlike `VENDOR_HEALTH`.**
+`nodeoids.UPS_HEALTH` is a flat tuple of (metric key, label, unit, OID,
+"scalar"/"column_first"/"column_max", scale) probes, tried on *every* device
+regardless of vendor — a UPS's maker varies far more than a switch's does
+(APC's arc is 318, Eaton's 534, Vertiv/Liebert's 476, plenty of small brands
+sit on a rebadged OEM card under yet another arc), and UPS-MIB is the one
+object tree nearly all of them answer regardless, which is the whole reason
+it was standardised. Cost is controlled without an arc gate:
+`NodePoller._poll_ups_health` sends one GET of every scalar in `UPS_HEALTH`
+first (`upsBatteryStatus`, `upsSecondsOnBattery`, `upsEstimatedMinutes`,
+`upsEstimatedChargePct`, `upsBatteryVoltage`, `upsBatteryTemperature`,
+`upsOutputSource`, `upsAlarmsPresent`), no more expensive than the UCD-SNMP
+probe every device already gets, and only sends the two GETBULK table walks
+(`upsInputTable`, `upsOutputTable`) once that GET shows at least one scalar
+answered. A device that isn't a UPS answers none of the scalars and is never
+asked for the tables at all — one extra GET a poll, the same one UCD-SNMP
+already costs a non-UPS device. `upsBatteryVoltage` is the one probe scaled
+(×0.1): RFC 1628 defines it in tenths of a volt, and storing 240 as "24.0 V"
+would read as a battery string rather than mains-adjacent wiring. If the
+standard `upsEstimatedMinutesRemaining` scalar didn't answer, and the
+device's arc is APC's (318), `_apc_runtime_fallback` asks
+`nodeoids.APC_BATTERY_RUNTIME_TIMETICKS` — PowerNet-MIB's own runtime object,
+in TimeTicks (hundredths of a second) rather than whole minutes — the one OID
+in this file not cross-checked against a live unit or a bundled MIB, standing
+on the same kind of secondhand evidence `enterprises.py`'s CURATED table
+already accepts elsewhere.
+
+**ENTITY-SENSOR-MIB's device-level read shares its decode with the existing
+per-port one, and nothing else.** Before 4.49.0 the only reader of this MIB
+was `read_dom`, the on-demand SFP/DDM dialog, gated on
+`entAliasMappingIdentifier` mapping a sensor entity to the one `ifIndex` a
+human opened a dialog for — a gate that made every dedicated environmental
+monitor's chassis temperature and humidity sensors invisible everywhere in
+the app, because they map to no port at all. `_decode_entity_sensor` factors
+the actual RFC 3433 scaling arithmetic (`value × 10^(3×(scale-9)) /
+10^precision`) out of `read_dom` so both callers do it identically; the new
+`_poll_environment` calls it for every sensor entity a device answers, using
+`_walk_port_mapped_entities` (the same `entAliasMappingIdentifier` /
+`entPhysicalContainedIn` walk `read_dom` already does, generalised from "does
+this belong to ifIndex N" to "does this belong to any port at all") only to
+*classify* a temperature reading, never to gate whether it's read.
+
+A temperature reading becomes one of three metric keys before it is ever
+stored:
+- `temp_optic_c` — the sensor's containment chain reaches an entity
+  `entAliasMappingIdentifier` maps to a port. Normal well above ambient by
+  design (a transceiver's DOM commonly runs 40–55 °C).
+- `temp_ambient_c` — the sensor maps to no port, *and* the same device
+  answers at least one humidity sensor (`entPhySensorType` 9). A chassis
+  essentially never carries a humidity probe; a dedicated room/rack monitor
+  (AVTECH Room Alert and the like) always does, on any vendor's arc — using
+  the humidity table as the signal generalises past AVTECH for free, rather
+  than hard-coding a vendor check.
+- `temp_chassis_c` — everything else unmapped, the deliberate *default*
+  rather than `temp_ambient_c`: a device this can't positively identify as an
+  environmental monitor must not have its ordinary board/PSU/fan warmth read
+  as a room getting hot, which is the mistake this classification exists to
+  fix. Juniper's own `jnxOperatingTable` temperature reading (`VENDOR_HEALTH`)
+  was renamed from `temp_c` to this same key, so a device answering both
+  never reports two disagreeing chassis figures.
+
+The gate that made this necessary: for about a day of this campaign,
+temperature shipped as a single `temp_c` key with a single `temp_high` rule,
+and a running instance immediately produced ten false alerts on a 25-device
+fleet — seven access switches and two core switches reporting their SFPs'
+entirely normal 40–45 °C DOM readings, indistinguishable from a genuine
+41.8 °C reading off the one real Room Alert in the fleet. `alertsdb.py`'s
+`_retire_temp_high` migration disables and renames (never deletes, since
+`rules.id` cascades onto `alerts`) any installation's copy of that rule that
+still looks exactly like what shipped — `is_builtin`, unmodified
+`source_kind`/`threshold`/`clear_threshold` — resolving its open alerts with
+a note, and leaving a customized copy alone to simply never fire again.
+
+**A third gap closed the same pass, smaller and in the same family:**
+`mem_pct` had no HOST-RESOURCES-MIB fallback at all, while `cpu_pct` and
+`disk_pct` for the same device already did. `_host_resources_storage_rows`
+walks `hrStorageType`/`Size`/`Used` once per poll and shares the result
+between `_host_resources_disk_pct` (the fullest `hrStorageFixedDisk` row) and
+the new `_host_resources_mem_pct` (the `hrStorageRam` row alone — never
+`hrStorageVirtualMemory`, for the same reason the disk reader excludes
+anything that isn't a fixed disk: counting swap as physical memory would make
+an ordinary swap file read as critically low RAM). Tried only once neither
+UCD-SNMP, the Fortinet scalar nor the Cisco memory pool has already answered
+`mem_pct`, so a net-snmp box or a FortiGate costs nothing extra; a Windows
+host, a printer or most appliances — which answer none of the other three —
+now get a `mem_pct` at all.
+
+Both reads are cadenced rather than run on the ordinary poll cycle:
+`_poll_ups_health` is best-effort every poll (cheap once gated, as above);
+`_poll_environment` re-walks a device at most once every `_SENSOR_REFRESH_S`
+(300 s, in-memory only, the same shape `_addresses_read`'s hourly
+`ipAddrTable` cadence already uses) — comfortably inside the 900-second
+default `threshold_stale_s` a threshold rule tolerates before treating a
+metric as absent, since a temperature reading doesn't change between one
+poll and the next the way an interface counter does, so there's nothing to
+buy by re-walking it as often.
 
 ### Scheduler (`nodepoll.py`)
 
@@ -1186,6 +1316,38 @@ resolves is a read-only no-op rather than a rewrite of every row. It runs
 after a zip upload, after a catalog install, after bundled-MIB seeding,
 and behind the **Resolve all** button. In practice the bundled IETF set
 needs three passes and finishes at 100% resolved.
+
+**A wall-clock budget checked only between phases cannot bound the phase
+it's checked after — the fix in 4.49.0.** `parse()` refuses a file over
+`max_bytes` (8 MiB by default) before scanning anything (`MibTooLarge`), and
+is meant to abandon a file that runs past `budget_s` (`PARSE_BUDGET_S`, 5.0)
+mid-parse (`MibParseTimeout`) via `check_budget()`, called between phases.
+`_strip_comments_and_strings()` — the very first phase, masking `--
+comments` and `"quoted strings"` before any structural regex runs — called
+`text.find("\n", ...)` on every ASN.1 `--` comment marker to find where it
+closes; where no newline lies ahead (one long logical line — a minified or
+half-downloaded MIB, or a deliberately hostile upload) each call scanned to
+end of file for a newline that wasn't there, at O(markers × length): 600,000
+markers (~1.8 MB) measured at 5.25 s, already past `PARSE_BUDGET_S`, and
+700,000 (~2.1 MB) at 7.21 s — and `check_budget()` never got a chance to fire
+on any of it, because it only runs *after* this call returns. This is a third
+instance of one bug class in a file whose docstring already named two
+earlier ones (the macro-clause `::=` scan, the `IMPORTS` symbol-list scan),
+both fixed by patching the one instance found.
+
+Fixed two ways, together. `no_newline_from` caches the result once a search
+for the next `\n` comes up empty: no later search, starting further along
+the same string, can find one either, so the O(length) failure-mode search
+only ever runs once per file rather than once per marker (the mirror `--`
+search needs no such cache — at most one such search per call can come up
+empty regardless of file size). And `_strip_comments_and_strings` now takes
+the caller's `deadline` directly and calls a shared `_check_deadline()` every
+4,096 loop iterations, rather than only being checked once it returns — so a
+phase slow enough to blow the whole budget on its own is cut off *during*
+it now, not after. Both fixes are independent: the cache makes the
+pathological shape fast again; the in-loop check makes the budget actually
+bound whichever phase it's checked inside, including this one and the
+object-scanning loops below it, not only the boundaries between them.
 
 ### MIB catalog (`mibcatalog.py`)
 
@@ -2012,6 +2174,54 @@ still deliberately off it — their occurrences always carry `source_kind ""`,
 so filtering on it would silently stop matching any custom rule that has one
 set.
 
+### Upstream suggestions (`nodesdb.py`, `web/api.py`) — 4.49.0
+
+The means the rollup above was missing: `alertrules.py` is explicit that
+`ROLLED_UP_BY` suppression must be driven only by an operator-confirmed
+`devices.upstream_id`, never by an LLDP/CDP neighbour match — a neighbour row
+is a best-effort guess that can go stale between walks or collide on a
+non-unique sysName, and suppressing a real fault on a wrong guess is the one
+failure this feature must not have. What nothing offered, before this
+release, was a way to turn that guess into a confirmed value faster than one
+Edit dialog per device.
+
+`nodesdb._upstream_confidence(match_kind, present)` scores one candidate: a
+`chassis_mac` match ranks above a `sys_name` one (a MAC collision is far
+rarer than two sites both naming a switch "core-sw-1"), and `present=False`
+(nothing has confirmed the neighbour row since an earlier walk) ranks a
+candidate down a tier regardless of match kind — this is a sort/filter hint
+only, never a threshold anything applies automatically.
+`_group_upstream_candidates()` folds the raw per-neighbour-row SQL into one
+entry per observing device, keeping the single best-evidenced candidate per
+distinct matched device (present beats stale, then confidence tier, then most
+recently seen) and flagging `ambiguous: true` whenever a device's own rows
+resolve to two or more *different* matched devices — a two-candidate device
+an operator resolves is useful; a confident wrong pick chosen automatically
+is exactly the failure `ROLLED_UP_BY`'s own comment warns against.
+`NodesDatabase.upstream_suggestions()`/`upstream_suggestions_count()` expose
+this, paged the same way `devices()` is, behind
+`GET /api/nodes/upstream-suggestions`.
+
+`POST /api/nodes/upstream-suggestions/apply` takes `{"assignments":
+[{"device_id", "upstream_id"}, ...]}` (up to 2,000 pairs; a repeated
+`device_id` collapses to its last entry) and writes them all in one
+transaction — but not before `_find_upstream_cycle()` checks the *whole
+proposed graph* for a cycle no individual pair could show. `_clean_upstream_id`
+already refuses a single device pointed at itself; what it cannot see is a
+batch where device A's upstream becomes B and, in the same batch, B's becomes
+A — each pair valid alone, only the two together forming a loop.
+`_find_upstream_cycle` walks every touched device's own upstream chain under
+the proposed values (falling back to what's on file for a device the batch
+doesn't mention), and — unlike the alert engine's own hot-path
+`upstream_chain`, which caps its walk at `max_depth=8` for latency reasons —
+can afford to walk as far as the whole fleet before concluding there's no
+cycle, since this only ever runs against an operator-submitted batch. A batch
+that would create one is refused outright, naming the devices involved,
+rather than silently applying whatever assignments aren't part of it.
+`NodesDatabase.set_upstream_ids()` is the one write behind an accepted batch
+— `executemany`, since (unlike a bulk edit broadcasting one value to many
+devices) every device here gets its own value.
+
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
 `alertrules.evaluate_flapping()` always took `window_s` and
@@ -2668,6 +2878,27 @@ BSD timestamps carry no year (`_parse_3164_time()`); the year is inferred
 from the current date, with a December-message-read-in-January (or the
 reverse) case explicitly handled so a year boundary doesn't file a day of
 logs twelve months off.
+
+**`_strip_structured_data()` walks an RFC 5424 message's `[...]` SD-ELEMENT
+run with an index now, not by reslicing — the DoS fix in 4.49.0.** RFC 5424
+places no limit on how many SD-ELEMENTs a message carries; before this fix
+the loop was `rest = rest[end:].lstrip()` each time round, which copies
+everything left in the string on every element, costing O(elements²) for N
+tiny ones on this unauthenticated port (514/udp+tcp): 240,000 elements
+(~720 KB) measured at 2.34 s, 500,000 (~1.5 MB) did not finish in 8 s.
+`_end_of_element()` now takes a `start` offset and the walk advances `pos`
+through one string rather than creating a new one per element, so the whole
+walk is linear in the message's length once no fresh slice is taken.
+`MAX_SD_ELEMENTS` (64) bounds it further, independent of that fix: the
+element *count* is capped directly, since real devices never send more than
+a handful (a chained rsyslog relay is the heaviest ordinary case, at two or
+three) and each element costs the same regardless of how small it is — so
+capping length instead would either truncate a legitimately large single
+element's value or need to be generous enough to let the pathological shape
+run anyway. Past the cap, whatever is left — genuine elements the device
+sent, or an attacker's padding — is kept verbatim as message text rather
+than parsed further or dropped, so a real oversized message is still stored
+in full, just with some of its structured data unlabelled.
 
 ### Listener (`syslogd.py`)
 
@@ -4069,6 +4300,101 @@ Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+### Lazy module loading (`app.js`, `index.html`) — 4.49.0
+
+Before this release, `index.html` carried thirteen `<script defer>` tags —
+`app.js`, `dashboard.js` and the other eleven per-tab modules — all
+downloading, parsing and compiling before the Dashboard painted, on every
+visit: 1.17 MB uncompressed, roughly 324 KB gzipped, most of it for tabs an
+operator may never open. Only `app.js` and `dashboard.js` are still eager
+now; Dashboard is what an account lands on and what `start()` still
+initialises unconditionally the same way it always has.
+
+Every other module's name is its filename's stem (`nodes` → `nodes.js`), so
+nothing new needs to be kept in step. `isLazyModule(name)` is just
+`name !== 'dashboard'`. `ensureModuleReady(name)`, called from
+`activateTab()` (the one place `selectTab`/`applyRoute` hand off to a
+module), is the whole mechanism: a module already marked `__ready` resolves
+immediately; otherwise `loadScript()` appends a `<script src="/name.js?v=…">`
+element to `<head>` and waits for its `load` event, then calls the module's
+own `init()` exactly once and marks it ready. `moduleLoads`, keyed by tab
+name, de-duplicates a digit shortcut, a click and a hash route all naming the
+same not-yet-loaded tab inside the same second onto one fetch and one
+`init()` rather than three. `ASSET_VERSION_QUERY`, captured once from
+`document.currentScript.src` at this file's own top-level execution (the only
+point that property is valid), makes a lazily inserted `<script>` ask for the
+identical `?v=` query a `defer` tag would have, so a lazy module gets the same
+immutable-cache behaviour every asset URL already carries.
+
+The one visible sign a script is still in flight is `aria-busy="true"` on
+`#page-<name>` — the identical mechanism `.page[aria-busy="true"]::before`
+already draws for an ordinary data refresh over 400 ms, rather than a second
+loading vocabulary invented just for this. A script that fails to fetch, or
+whose `init()` throws, degrades exactly the way a module that failed during
+eager startup already degraded before this release: added to `brokenPages`,
+its tab hidden, the failure logged once, `updateTabOverflow()`/
+`updateTabShortcuts()` recalculated for the tab that just disappeared, and
+the operator moved off it automatically if it was the one open. The tab being
+hidden is what stops a second attempt — never a silent retry loop.
+
+### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
+
+4.48.0 wrapped the twelve tabs in four `<div class="tab-group" data-label="…">`
+wrappers (Now/Inventory/Telemetry/Admin) purely for a CSS `::before` label.
+4.49.0 flattens them back to twelve direct children of `#tabs` — still one
+`role="tablist"` and twelve `role="tab"` buttons, which `tests/ui/walk.mjs`
+asserts by scoping its counts to `#tabs` either way — with a
+`.tab.tab--group-start` hairline (`border-left`, `margin-left`) on the first
+tab of each group after the first standing in for the label a wrapper div
+used to draw with generated content, without introducing another DOM layer
+for a hidden tab to end up orphaned inside. It's written as the compound
+selector `.tab.tab--group-start` (specificity 0,2,0,0) rather than the bare
+class alone, because two later breakpoints (1500px, 360px) redeclare `.tab`'s
+own padding as a shorthand — a bare class would lose that specificity fight
+by source order and the divider gap would vanish under 1500px.
+
+**The overflow fade moved off `#tabs` itself.** It used to be `#tabs::after`
+— an absolutely positioned child of the scrolling container, which put it at
+the strip's visible right edge only while the strip was scrolled to rest.
+Scrolling `#tabs` dragged the fade along with `scrollLeft`, washing out
+whichever tab happened to sit under it while the strip's real right edge
+went un-faded. It's drawn on `.tabs-utility` now — `#tabs`'s next sibling,
+which never scrolls — as `#tabs.has-overflow + .tabs-utility::before`, with
+`right: 100%` of `.tabs-utility` being `#tabs`'s real right edge regardless of
+`#tabs`'s own `scrollLeft`. No `z-index` is needed: `.tabs-utility` simply
+paints after `#tabs`'s own tabs in source order. `app.js` toggles
+`#tabs.has-overflow` on load, on resize and on scroll by comparing
+`scrollWidth` to `clientWidth` at both ends, same as before.
+
+`selectTab()` now calls `current.scrollIntoView({inline: 'nearest', block:
+'nearest'})` on the tab that just became current, guarded on
+`bar.scrollWidth > bar.clientWidth + 1` so it's a no-op on every ordinary
+click where the strip doesn't overflow at all — a digit shortcut, a pasted
+hash route, Back/Forward, kiosk rotation and the `applyPermissions` fallback
+(moving off a tab that just lost read access) could all previously land on a
+tab while `#tabs` was scrolled elsewhere, leaving the newly-active tab
+off-screen with nothing showing which one was selected.
+
+Below 480px, `#global-search-btn`/`#account-btn`/`#signout` collapse from a
+text label to an inline SVG icon: `.icon-toggle .label { display: none }` /
+`.icon-toggle .ico { display: block }` under that breakpoint, reversed at
+rest. `title`/`aria-label` on each button are unconditional, so the
+accessible name never changes — only how much of the bar three buttons cost
+changes, freeing room for the tab strip on a narrow viewport instead of
+crowding it.
+
+**`gsearchRun()`'s eight lookup groups (MAC, devices, alerts, NetPath
+destinations, and — new in 4.49.0 — IPAM hosts, IPAM subnets, syslog
+messages, wireless APs) each get their own `try`/`catch` now, not one shared
+around the whole function.** The old single `try` carried a comment saying
+"a failed lookup just leaves that group out", which the code did not
+actually do: an exception thrown by the devices lookup skipped every group
+queried after it in source order, not just that one. A working search that
+happened to hit a slow or erroring dependency looked identical to a search
+that returned nothing at all, which is the point of the fix — a group with
+nothing to add (no permission, no match) and a group that failed are both
+simply absent from the results, indistinguishable to the operator either way.
 
 ### Shared components (`app.js`, `app.css`) — 4.45.0
 

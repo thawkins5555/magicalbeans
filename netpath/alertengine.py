@@ -2072,6 +2072,76 @@ class AlertEngine:
                 self._skip_held_open_notify(
                     resolved, settings,
                     f"not sent: rolled up under “{parent_row['entity_label']}”")
+                # resolved['device_down'] alert is gone, but that downstream
+                # device's OWN packet_loss_high/cpu_high/etc never get an
+                # is_new occurrence of their own to trigger _absorb_subordinates
+                # from - THIS device's device_down alert is what they roll up
+                # under, and it just proved it will never open one. Without
+                # this, a downstream device with (say) a packet_loss_high alert
+                # already open when the site outage reached it stayed on the
+                # Alerts page for the rest of the outage, fully covered in
+                # every way except this one.
+                self._absorb_children_of(
+                    resolved["entity_id"], resolved["entity_label"],
+                    occurrence.ts, parent_row["id"], settings)
+
+    def _absorb_children_of(self, device_id, device_label: str, ts: float,
+                            note_alert_id: int | None, settings) -> None:
+        """Resolve `device_id`'s own already-open ROLLED_UP_BY children under
+        "device_down" - packet_loss_high, cpu_high, and the rest.
+
+        Exists for the two places a device's OWN device_down alert never
+        opens an alert row at all, so _absorb_subordinates' is_new branch —
+        the only other thing that calls this same resolve — never runs for
+        it: a downstream device _absorb_downstream just resolved (its own
+        device_down absorbed into the ancestor whose alert got there first),
+        and a device whose own "down" event arrives after an ancestor's
+        alert is already open (_rollup_parent's upstream-outage answer, in
+        _apply below). Both leave a device fully covered by a site outage in
+        every way except this one: whatever it had already opened on its own
+        account — a packet_loss_high alert that started climbing before the
+        outage reached it, say — has nothing left to trigger its absorption,
+        because the device_down alert that absorption is normally hung off
+        of is precisely the one that never opened here.
+
+        Bounded the same way _absorb_subordinates already is: one indexed
+        resolve_by_dedup per name in ROLLS_UP["device_down"] (a short, fixed
+        list — about a dozen rule keys), never a scan of the alerts table,
+        so a site outage covering a hundred devices this way costs a
+        hundred times a fixed dozen lookups, not a hundred passes over
+        however large the table has grown.
+
+        note_alert_id names the alert an operator would find the note on —
+        the ancestor's, when the site outage has one open. It is None for
+        the operator-resolved-but-still-down cover _rollup_parent's
+        SUPPRESSED answer represents, which has no open row to write a note
+        onto either — the same asymmetry _apply's own SUPPRESSED branch
+        already has for the device_down alert itself, reused here via
+        _ROLLUP_NO_ROW_REASON.
+        """
+        probe = Occurrence(kind="device_event", source_kind="down",
+                           entity_kind="device", entity_id=device_id,
+                           entity_label=device_label, ts=ts, message="")
+        for child_key in ROLLS_UP.get("device_down", ()):
+            child_rule = self.db.rule_by_key(child_key)
+            if child_rule is None:
+                continue
+            resolved = self.db.resolve_by_dedup(
+                dedup_key(child_rule, probe), by="")
+            if resolved is None:
+                continue
+            self.counters["resolved"] += 1
+            if note_alert_id is not None:
+                self.db.add_rollup_note(
+                    note_alert_id,
+                    f"Resolved “{child_rule['name']}” — implied by the "
+                    f"outage covering {device_label}")
+                self._skip_held_open_notify(
+                    resolved, settings,
+                    f"not sent: rolled up under an outage covering {device_label}")
+            else:
+                self._skip_held_open_notify(
+                    resolved, settings, self._ROLLUP_NO_ROW_REASON)
 
     def _apply(self, rules, occurrence: Occurrence, settings) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
@@ -2127,6 +2197,14 @@ class AlertEngine:
                     # parent was hand-resolved while the device is still
                     # down, or the upstream's own alert has been worked.
                     self.counters["rolled_up"] += 1
+                    if (rule["key"] or "") == "device_down":
+                        # This occurrence IS a device_down: this device's
+                        # own outage alert will never open one of its own
+                        # either, so nothing else ever sweeps its OTHER
+                        # already-open children — see _absorb_children_of.
+                        self._absorb_children_of(
+                            occurrence.entity_id, occurrence.entity_label,
+                            occurrence.ts, None, settings)
                     continue
                 if parent is not None:
                     # Not opened at all, so no email and no row to work. The
@@ -2137,6 +2215,10 @@ class AlertEngine:
                     self.db.add_rollup_note(
                         parent["id"],
                         f"Suppressed “{rule['name']}” — implied by this outage")
+                    if (rule["key"] or "") == "device_down":
+                        self._absorb_children_of(
+                            occurrence.entity_id, occurrence.entity_label,
+                            occurrence.ts, parent["id"], settings)
                     continue
                 if self._parent_operator_resolved(rule, occurrence):
                     # The parent was resolved by hand while its condition
