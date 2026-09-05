@@ -203,7 +203,8 @@ def main() -> int:
 
     device_ids: dict[str, int] = {}
     print("Pulling real captures over real SSH (demo/fake_ssh.py, in-process):")
-    for name, persona_name, vendor_key, group_name, store_secrets in FIXTURE_DEVICES:
+    for i, (name, persona_name, vendor_key, group_name, store_secrets) in enumerate(
+            FIXTURE_DEVICES, start=1):
         t0 = time.time()
         cleaned, problem = pull_real_capture(persona_name, vendor_key)
         elapsed = time.time() - t0
@@ -211,12 +212,20 @@ def main() -> int:
             print(f"  {name:<10} FAILED TO CAPTURE: {problem}")
             continue
         device_id = nodes_db.add_device(
-            f"127.0.0.1", name=name, group_id=default_group,
+            f"127.0.100.{i}", name=name, group_id=default_group,
             device_group_id=group_by_name[group_name])
         device_ids[name] = device_id
-        search_text = (cleaned if store_secrets
-                      else configrx_redact.redact(cleaned)[0])
-        stored_text = cleaned if store_secrets else configrx_redact.redact(cleaned)[0]
+        # Exactly configrx.py's own _backup_device split: the STORED backup
+        # respects store_secrets (verbatim when it's on); the cross-device
+        # SEARCH index is redacted unconditionally, regardless — see
+        # configrx_search.py's module docstring for why that is stricter
+        # than the storage decision on purpose.
+        if store_secrets:
+            stored_text = cleaned
+            search_text, _ = configrx_redact.redact(cleaned)
+        else:
+            stored_text, _ = configrx_redact.redact(cleaned)
+            search_text = stored_text
         backup_id, _digest = configrx_db.add_backup(
             device_id, stored_text, redacted=not store_secrets)
         configrx_db.replace_search_lines(device_id, search_text)
@@ -312,7 +321,7 @@ def main() -> int:
 
     configrx_db.close()
     nodes_db.close()
-    return 0 if fail_count or True else 1   # informational script, not a test — always 0
+    return 0   # an informational demonstration, not a pass/fail test
 
 
 if __name__ == "__main__":

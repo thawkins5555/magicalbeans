@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import random
 import socket
+import sqlite3
 import threading
 import time
 import traceback
@@ -806,6 +807,11 @@ class NodePoller:
     _MAC_WALK_WORKERS = 4
 
     def stop(self) -> None:
+        """Fast: cancels queued work and returns without waiting for a poll
+        already running to finish. Used for a hot restart (start() calls
+        this first) and for an operator disabling Nodes polling from
+        Settings on an HTTP thread, neither of which should block on the
+        network — shutdown() below is the version that waits."""
         self._stop.set()
         for job in list(self._discovery_jobs.values()):
             job.cancel()
@@ -818,8 +824,69 @@ class NodePoller:
             self._thread.join(timeout=2)
         self._thread = None
 
-    def shutdown(self) -> None:
+    def _inflight_ids(self) -> set[int]:
+        with self._lock:
+            return set(self._queued) | set(self._started)
+
+    def drain(self, timeout_s: float) -> bool:
+        """Wait for in-flight polls to finish. True if they all did. The
+        same shape as Monitor.drain (netpath/monitor.py) for the trace
+        scheduler this class was copied from."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if not self._inflight_ids():
+                return True
+            time.sleep(0.05)
+        return not self._inflight_ids()
+
+    # A full poll's fixed part: the ping sweep (if enabled) plus a handful
+    # of SNMP round trips that always happen (scalars, ifTable, ifXTable) —
+    # not a page-by-page model of a GETBULK walk against a very-high-port-
+    # count chassis, which _inflight_budget_s cannot see coming. _run_one's
+    # guard is the backstop for whatever this approximation misses, exactly
+    # as expected_budget's own docstring in tracer.py says of a trace.
+    _SNMP_ROUND_TRIPS = 4
+
+    def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
+        """The longest a currently in-flight poll could still legitimately
+        run, per its own device's configured ping/SNMP timeouts and
+        retries — the drain window shutdown() should honour before giving
+        up on it. Capped so one misconfigured device cannot hang shutdown
+        indefinitely. Mirrors Monitor._inflight_budget_s for the trace
+        scheduler this class was copied from."""
+        worst = 0.0
+        for device_id in self._inflight_ids():
+            try:
+                device = self.db.device(device_id)
+                if device is None:
+                    continue
+                config = self.db.effective_config(device)
+            except Exception:
+                continue
+            budget = 0.0
+            if config.get("ping_enabled"):
+                budget += (int(config.get("ping_count", 3) or 1)
+                          * (int(config.get("ping_timeout_ms", 1000) or 1000) / 1000))
+            timeout_s = float(config.get("snmp_timeout_s", 3.0))
+            retries = int(config.get("snmp_retries", 2))
+            budget += timeout_s * (retries + 1) * self._SNMP_ROUND_TRIPS
+            try:
+                if len(self.db.credential_candidates(device)) > 1:
+                    budget += self._PROBE_BUDGET_S
+            except Exception:
+                pass
+            worst = max(worst, budget)
+        return min(worst, ceiling_s)
+
+    def shutdown(self, drain_s: float = 0.0) -> None:
+        """Same as stop(), but waits for whatever was already running to
+        finish (or to hit its own worst-case budget) before returning, so
+        the databases Service.shutdown() closes right after this are not
+        closed under a poll still writing its result. See _run_one's
+        except clause for the backstop when a poll still overruns even
+        this."""
         self.stop()
+        self.drain(max(drain_s, self._inflight_budget_s()))
 
     def pool_state(self) -> dict:
         """How much of the poll pool is in use right now.

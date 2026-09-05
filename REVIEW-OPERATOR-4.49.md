@@ -39,38 +39,63 @@ Identifiers are prefixed by section, because the last review's first draft reuse
 
 ## 1. Verdict
 
-⏳ Written last, from the evidence. The shape of it, as the campaign stands:
+Would I run my site on this? **Yes, with three things fixed and two settings changed on
+day one** — and I would want the reasons in section 6 understood before signing anything,
+because what it does not do it does not do at all rather than badly.
 
-This is a genuinely well-built monitoring system with an unusually honest codebase, and
-it is not yet a *fleet management* system. The distinction matters for the decision.
+**What it is.** A genuinely well-built monitoring system, in a codebase that explains
+itself better than most vendor documentation, that is not yet a fleet *management*
+system. The distinction is the whole decision.
 
-What it does, it does properly. The SNMP implementation handles the five things that
-decide whether polling real gear works at all. The alert state model is right, and its
-notification rollup is now demonstrably right: a 108-device site outage in this campaign
-opened 228 alerts and sent **11 emails**, where the same shape of event at 4.35.0
-produced 1,355. The collectors decode rather than approximate. And the code explains
-itself, including the decisions it chose *not* to make — which is rarer and more useful
-than most vendor documentation.
+**What it does, it does properly.** The SNMP implementation handles the five things that
+decide whether polling real gear works at all — 64-bit counters preferred, request and
+response ids matched, `tooBig` halved and retried, GETNEXT fallback for a v1-only device,
+and the last working credential cached per device. The alert state model is right, with
+hysteresis as a separate number, persistence requirements, and a rollup. Its notification
+layer is demonstrably right: a 108-device site outage in this campaign opened 228 alerts
+and sent **11 emails**, where the same shape of event at 4.35.0 produced 1,355. The
+collectors decode rather than approximate — 107,000 NetFlow flows and 36,000 syslog
+messages across a deliberate burst, with nothing dropped, rejected or errored. And the
+permission model held under an exhaustive mechanical check of all 213 routes.
 
-Where it falls short is not in what it measures but in what it lets you *do with*
-what it measured. It holds 400 days of every metric and cannot produce a report. It
-holds two thousand device configurations and cannot answer a question about them. It
-collects the topology and will not let you use it. It writes an audit trail nobody can
-read. In each case the data is already there and the last mile is missing — which is
-good news for the roadmap and bad news for the operator who needs the answer this
+**Where it falls short is not in what it measures but in what it lets you do with what it
+measured.** It keeps 400 days of every metric and cannot produce a report. It holds two
+thousand device configurations and, until this pass, could not answer a question about
+them. It collects the topology and would not let you use it. It writes an audit trail
+nobody can read. In each case the data is already on disk and the last mile is missing,
+which is good news for a roadmap and bad news for the operator who needs the answer this
 month.
 
-The estate gap is the other half. This campaign found the product could not see a UPS,
-a printer, an environmental sensor, or a Windows host's memory — four device classes a
-plant is full of — and built two of them. That work also produced the campaign's most
-instructive defect: the moment `temp_c` existed, ten switches' transceiver temperatures
-started tripping a rule meant for a comms room. Adding a metric is easy; adding one that
-means the same thing on every device it appears on is the hard part, and it is where a
-monitoring product is won or lost.
+**The single most important thing this review found is not a bug.** With shipped defaults
+— `down_after_failures = 3` and `poll_interval_s = 120` — **a dead device is reported
+about six minutes after it dies, and an outage shorter than three poll cycles is never
+reported at all.** Each setting is individually sensible; nothing multiplies them out and
+tells the operator what their configuration means in minutes. Measured on this campaign,
+81 of 165 devices in a scripted site outage were noticed to be down at approximately the
+moment the site came back. Every other alerting feature — the rollup, the digest, the
+topology — is downstream of an alert that has to be raised first.
 
-⏳ Final judgement, with the 1,000 and 2,000 tier numbers, lands here.
+**The estate gap is the other half.** This product could not see a UPS, a printer, an
+environmental sensor, or a Windows host's memory — four device classes a plant is full
+of. Two were built here; the vendor coverage table in section 5.1 says plainly what it can
+and cannot tell you about each of sixteen vendors, which nobody had ever written down.
 
----
+**And the most instructive defect of the campaign was one the campaign caused.** Making
+the Settings module load on demand — a measured, tested improvement that cut the cold load
+by 73% — silently broke the forced password change, because a security control consulted a
+module that no longer existed at that moment. A fresh install left an administrator on
+`admin`/`admin` in an application that looked entirely normal. It was found only because
+one reviewer drove a *pristine* instance; every other test in this campaign ran against a
+seeded database whose password had already been changed. That is the class of regression
+that appears in neither the performance review nor the security review, because it belongs
+to neither.
+
+**Three of this review's own findings were withdrawn** after evidence contradicted them,
+including one where the database said the opposite of what I had claimed. They are
+recorded in section 2.4 with what replaced them, because a review that reports only what
+it found gives an operator no way to calibrate the rest.
+
+⏳ The 1,000 and 2,000-device tier numbers land in section 5.10 and may change this.
 
 ## 2. How this was run
 
