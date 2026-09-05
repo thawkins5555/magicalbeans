@@ -173,6 +173,76 @@ check("form.querySelectorAll('button:not([type])')" in read("app.js")
       and "bodyButton.type = 'button'" in read("app.js"),
       "modal() makes every body button type=button so only the primary submits")
 
+# ---------------------------------------------------------------------------
+# 9. One write-only-if-changed guard, in app.js, not one per module.
+#
+# `if (el && el.PROP !== value) el.PROP = value;` guards a redraw that runs
+# on every fastTick — ten times a second whether or not anything changed —
+# against re-queuing a DOM mutation for a value that is already there (and,
+# for `.style.*`, against cancelling a transition already in flight). Seven
+# modules each grew this three times over (setText/setBg/setHtml, ipam.js's
+# setHidden a fourth shape of the same idiom) before app.js carried one.
+# Matched on the guard's shape, not the name — a `setFoo` or `writeIfChanged`
+# would still be this.
+GUARD_RE = re.compile(
+    r"function\s+\w+\(\s*\w+\s*,\s*\w+\s*\)\s*\{\s*"
+    r"if\s*\(\s*\w+\s*&&\s*\w+(?:\.\w+)+\s*!==\s*\w+\s*\)\s*"
+    r"\w+(?:\.\w+)+\s*=\s*\w+;\s*\}"
+)
+guarded = [name for name in MODULES if name != "app.js" and GUARD_RE.search(read(name))]
+check(not guarded, "no module re-implements app.js's write-only-if-changed "
+      "guard (setText/setBg/setHtml and kin) (found in: %s)"
+      % (", ".join(guarded) or "none"))
+
+# ---------------------------------------------------------------------------
+# 10. One device-lookup cache, in app.js, not one per module.
+#
+# "Which device has this IP (or this id)" was answered five times: ipam.js,
+# snmp.js, syslog.js and wireless.js each cached the whole unpaged device
+# list behind a 30-second clock (loadDeviceByIp), and alerts.js kept a
+# fifth, differently shaped cache for the same cross-link the other way
+# (device id -> ip). What the five share, past the naming, is the idiom: an
+# early return on a cache hit — a timestamp still inside its window, or a
+# Map that already has the key — standing in front of a fetch of
+# /api/nodes/devices. A module fetching that endpoint without caching it
+# (a one-off dialog list, say) is not this; the cache-hit idiom is what
+# app.js's App.deviceIndex replaced.
+TIME_CACHE_HIT = re.compile(r"Date\.now\(\)\s*-\s*\w+\s*<\s*\d+\)\s*return\s+\w+;")
+MAP_CACHE_HIT = re.compile(r"\w+\.has\(\w+\)\)\s*return\s+\w+\.get\(\w+\);")
+device_cached = []
+for name in MODULES:
+    if name == "app.js":
+        continue
+    body = read(name)
+    if "/api/nodes/devices" not in body:
+        continue
+    if TIME_CACHE_HIT.search(body) or (MAP_CACHE_HIT.search(body) and ".set(" in body):
+        device_cached.append(name)
+check(not device_cached, "no module keeps its own device-by-ip/id cache in "
+      "front of /api/nodes/devices; that cache is App.deviceIndex "
+      "(found in: %s)" % (", ".join(device_cached) or "none"))
+
+# ---------------------------------------------------------------------------
+# 11. One histogram-range narrower, in app.js, not one per module.
+#
+# alerts.js, snmp.js and syslog.js each carried a character-for-character
+# copy of the fix for a handful of events inside a day-long window plotting
+# as a sliver at the far right of an otherwise-empty chart — one copy's own
+# comment admitted it was done "independently in each owned module rather
+# than a shared one in app.js". The giveaway is the scan for the first and
+# last non-empty bucket and the narrowed flag it returns, not the name
+# plottedRange.
+PLOTTED_RANGE_RE = re.compile(r"findIndex\(\(\w*\)\s*=>\s*\w+\.total\)")
+plotted = []
+for name in MODULES:
+    if name == "app.js":
+        continue
+    body = read(name)
+    if PLOTTED_RANGE_RE.search(body) and "narrowed: false" in body and "narrowed: true" in body:
+        plotted.append(name)
+check(not plotted, "no module re-implements the histogram range narrower; "
+      "that is App.plottedRange (found in: %s)" % (", ".join(plotted) or "none"))
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

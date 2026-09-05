@@ -94,14 +94,26 @@ check(".divider:focus-visible::after { background: var(--accent); }" in css,
 # 4. Kiosk mode and themes are answered on both sides.
 check("get('kiosk') === '1'" in app, "app.js reads ?kiosk=1")
 check("html[data-kiosk] { font-size: 125%; }" in css, "kiosk grows the rem root")
-check("body.kiosk #tabs { display: none; }" in css, "kiosk hides the tab strip")
+# Phase 6 grouped the tab bar into .topbar (the scrolling #tabs plus the
+# now-pinned .tabs-utility carrying #whoami/Account/Sign out/#conn), so
+# hiding only #tabs in kiosk mode would leave that utility group on screen;
+# the rule now hides the whole strip.
+check("body.kiosk .topbar { display: none; }" in css, "kiosk hides the tab strip")
 check('id="kiosk-bar"' in index and 'id="kiosk-session"' in index, "the kiosk bar exists")
 check("{ kiosk: true }" in app and "kioskHeld" in app,
       "the kiosk heartbeat is flagged and one refusal is final")
 check("THEME_KEY = 'sappiwhere.theme'" in app and "function setTheme(" in app,
       "app.js owns the theme key boot.js reads")
-check('id="set-theme"' in index and "set-theme" in read("settings.js"),
-      "Settings has the Appearance selector and settings.js wires it")
+# Appearance (theme, and now the wall-display launcher) moved from a
+# Settings fieldset — which used to lead the page ahead of every setting
+# that actually lives on the server — into the Account dialog, reachable
+# from every page since it is a per-browser choice rather than a server
+# one. #set-theme no longer exists; the select is app.js's own #am-theme,
+# and Settings leaves a plain pointer button where the fieldset was.
+check('id="am-theme"' in app and "am-theme" in app,
+      "Appearance moved to the Account dialog and app.js wires it")
+check('id="open-account-appearance"' in index and "open-account-appearance" in read("settings.js"),
+      "Settings leaves a pointer to Appearance where the fieldset used to be")
 check("App.tile" in read("dashboard.js") and "function tile(" in app and "function figures(" in app,
       "tiles and figures are one shared component")
 check(".dash-figure" not in css and ".dash-tile" not in css, "no dash-prefixed figure classes remain")

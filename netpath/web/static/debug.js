@@ -9,7 +9,7 @@
   const CATEGORY_LABEL = {
     trace: 'Traceroute', dns: 'Reverse DNS', netflow: 'NetFlow',
     snmp: 'SNMP traps', nodes: 'Nodes', alerts: 'Alerts', ipam: 'IPAM',
-    wireless: 'Wireless', configrx: 'ConfigRX', system: 'System',
+    wireless: 'FortiWireless', configrx: 'ConfigRX', system: 'System',
     error: 'Errors',
   };
   const STATUS_COLOR = {
@@ -22,6 +22,9 @@
     // The seq of the last row painted, so an ordinary poll appends only
     // what arrived instead of rebuilding two thousand rows.
     drawnSeq: null,
+    // The .selected wireRowKeyboard last saw, so an idle poll that appends
+    // nothing does not still re-stamp tabindex on every row in the table.
+    wiredSelected: undefined,
     workers: [], cells: [], fetchedAt: 0,
     dnsWorkers: [], dnsCells: [], dnsFetchedAt: 0,
     ipamWorkers: [], ipamCells: [], ipamFetchedAt: 0,
@@ -70,6 +73,19 @@
     return { text: `${value.toFixed(1)}s`, colour: 'var(--accent)' };
   }
 
+  // Written only when the rendered string actually changes: idle, a worker's
+  // elapsed time rounds to the same tenth of a second across several 100ms
+  // beats, and setting textContent/style.color to the value they already
+  // hold still counts as a DOM mutation, so writing unconditionally here
+  // used to churn the Debug page thousands of times over an idle ten seconds.
+  function setCellText(cell, text) {
+    if (cell.textContent !== text) cell.textContent = text;
+  }
+
+  function setCellColour(cell, colour) {
+    if (cell.style.color !== colour) cell.style.color = colour;
+  }
+
   function fastTick() {
     if (view.workers.length) {
       const extra = (Date.now() - view.fetchedAt) / 1000;
@@ -77,36 +93,36 @@
         const worker = view.workers[index];
         if (!worker || worker.elapsed === null || worker.elapsed === undefined) return;
         const { text, colour } = elapsedText(worker, extra);
-        cell.textContent = text;
-        cell.style.color = colour;
+        setCellText(cell, text);
+        setCellColour(cell, colour);
       });
     }
     if (view.dnsCells.length) {
       const extra = (Date.now() - view.dnsFetchedAt) / 1000;
       view.dnsCells.forEach((cell, index) => {
         const worker = view.dnsWorkers[index];
-        if (worker) cell.textContent = `${(worker.elapsed + extra).toFixed(1)}s`;
+        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.ipamCells.length) {
       const extra = (Date.now() - view.ipamFetchedAt) / 1000;
       view.ipamCells.forEach((cell, index) => {
         const worker = view.ipamWorkers[index];
-        if (worker) cell.textContent = `${(worker.elapsed + extra).toFixed(1)}s`;
+        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.nodeCells.length) {
       const extra = (Date.now() - view.nodeFetchedAt) / 1000;
       view.nodeCells.forEach((cell, index) => {
         const worker = view.nodeWorkers[index];
-        if (worker) cell.textContent = `${(worker.elapsed + extra).toFixed(1)}s`;
+        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.discCells.length) {
       const extra = (Date.now() - view.discFetchedAt) / 1000;
       view.discCells.forEach((cell, index) => {
         const scan = view.discScans[index];
-        if (scan) cell.textContent = `${(scan.elapsed + extra).toFixed(1)}s`;
+        if (scan) setCellText(cell, `${(scan.elapsed + extra).toFixed(1)}s`);
       });
     }
   }
@@ -335,6 +351,7 @@
     }
     const tbody = eventsBody();
     const visible = view.events.filter(passes).slice(-EVENT_ROW_CAP);
+    let changed;
 
     if (options.append && view.drawnSeq != null) {
       const fresh = visible.filter((e) => e.seq > view.drawnSeq);
@@ -348,13 +365,21 @@
           tbody.removeChild(tbody.firstChild);
         }
       }
+      changed = fresh.length > 0;
     } else {
       const frag = document.createDocumentFragment();
       for (const event of visible) frag.appendChild(eventRow(event));
       tbody.replaceChildren(frag);
+      changed = true;
     }
     view.drawnSeq = visible.length ? visible[visible.length - 1].seq : null;
-    App.wireRowKeyboard(tbody);
+    // wireRowKeyboard walks every row to set its tabindex, so an idle poll
+    // that appended nothing and left the selection alone skips it rather
+    // than re-stamping tabindex="-1" on up to 2,000 unchanged rows a second.
+    if (changed || view.selected !== view.wiredSelected) {
+      App.wireRowKeyboard(tbody);
+      view.wiredSelected = view.selected;
+    }
 
     if (App.el('dbg-follow').checked) {
       const wrap = table.parentElement;

@@ -12,7 +12,10 @@ The SSH password is DPAPI-encrypted at rest (dpapi.py, the only secret
 storage this app has), exactly like every other stored credential here:
 never returned from any read method as anything but a has_credential
 boolean at the API layer, decrypted only immediately before an SSH
-connection and discarded right after (see configrx.ConfigRxWorker).
+connection and discarded right after (see configrx.ConfigRxWorker). The
+optional per-device enable secret (enable_secret_enc, for a vendor whose
+login shell is not already privileged EXEC) follows the identical
+discipline, one column over — see set_credential/set_enable_secret below.
 
 A backup's content is stored zlib-compressed and only when its hash
 differs from that device's most recently stored backup — an unchanged
@@ -44,6 +47,17 @@ CREATE TABLE IF NOT EXISTS device_config (
     ssh_port             INTEGER NOT NULL DEFAULT 22,
     ssh_username         TEXT,
     ssh_password_enc     BLOB,
+    -- DPAPI-encrypted exactly like ssh_password_enc, for the handful of
+    -- vendors (configrx_vendors.Vendor.enable_command) whose login shell
+    -- is not already privileged EXEC. NULL for every other device, and
+    -- for one of these vendors with no secret stored yet: the escalation
+    -- is still attempted, answering the device's password prompt with an
+    -- empty line, because a device with no enable password set accepts
+    -- exactly that and there is no way to tell the two apart from here.
+    -- One that does want a password re-prompts, the prompt is not a
+    -- prompt this code recognises, and the capture ends as
+    -- "enable-failed" without a show-config ever being sent.
+    enable_secret_enc     BLOB,
     vendor_override       TEXT,
     last_backup_ts        REAL,
     last_backup_status    TEXT,
@@ -141,6 +155,15 @@ DEFAULTS = {
 DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username",
                           "vendor_override", "store_secrets")
 
+# set_credential's fourth argument default: "leave enable_secret_enc exactly
+# as it is". None is not usable for that — it is also the value that CLEARS
+# the column — and every existing caller of set_credential (the API's
+# ssh_username/ssh_password routes) passes only three arguments, so leaving
+# a device's enable secret untouched when only the SSH credential is being
+# (re)saved has to be the default, not something every call site must
+# remember to ask for.
+_UNCHANGED = object()
+
 
 class ConfigRxDatabase:
     def __init__(self, path: str):
@@ -168,7 +191,8 @@ class ConfigRxDatabase:
         TABLE in what is missing, never rewrite the CREATE. Idempotent, so
         it runs on every open."""
         wanted = {
-            "device_config": [("store_secrets", "INTEGER NOT NULL DEFAULT 0")],
+            "device_config": [("store_secrets", "INTEGER NOT NULL DEFAULT 0"),
+                              ("enable_secret_enc", "BLOB")],
             "backups": [("redacted", "INTEGER NOT NULL DEFAULT 0")],
         }
         for table, columns in wanted.items():
@@ -236,20 +260,58 @@ class ConfigRxDatabase:
                 (*allowed.values(), device_id))
             self._conn.commit()
 
-    def set_credential(self, device_id: int, username: str, password_enc: bytes | None) -> None:
+    def set_credential(self, device_id: int, username: str, password_enc: bytes | None,
+                       enable_secret_enc=_UNCHANGED) -> None:
+        """Sets the SSH username/password. `enable_secret_enc` is separate
+        from those two on purpose — omit it (the default) to leave a
+        previously-stored enable secret exactly as it is while the SSH
+        credential is (re)saved; pass encrypted bytes to set one or `None`
+        to clear it, in the same call."""
         with self._lock:
             self._ensure_row(device_id)
-            self._conn.execute(
-                "UPDATE device_config SET ssh_username = ?, ssh_password_enc = ?"
-                " WHERE device_id = ?", (username, password_enc, device_id))
+            if enable_secret_enc is _UNCHANGED:
+                self._conn.execute(
+                    "UPDATE device_config SET ssh_username = ?, ssh_password_enc = ?"
+                    " WHERE device_id = ?", (username, password_enc, device_id))
+            else:
+                self._conn.execute(
+                    "UPDATE device_config SET ssh_username = ?, ssh_password_enc = ?,"
+                    " enable_secret_enc = ? WHERE device_id = ?",
+                    (username, password_enc, enable_secret_enc, device_id))
             self._conn.commit()
 
     def clear_credential(self, device_id: int) -> None:
+        """Both stored secrets, not just the password.
+
+        An operator clearing a device's credential means "this application
+        should hold nothing for this device any more" — decommissioning it,
+        or rotating after an exposure. Leaving the enable secret behind kept
+        an encrypted secret in configrx.db that nothing could reach and
+        nothing would ever use again (a backup needs the SSH password to get
+        as far as an enable prompt), while `has_enable_secret` went on
+        reporting it. Inert, but not what the operator asked for.
+        """
         with self._lock:
             self._conn.execute(
-                "UPDATE device_config SET ssh_password_enc = NULL WHERE device_id = ?",
+                "UPDATE device_config SET ssh_password_enc = NULL, "
+                "enable_secret_enc = NULL WHERE device_id = ?",
                 (device_id,))
             self._conn.commit()
+
+    def set_enable_secret(self, device_id: int, enable_secret_enc: bytes | None) -> None:
+        """Sets or (passed None) clears just the enable secret, independent
+        of the SSH credential — for a vendor with configrx_vendors.Vendor.
+        enable_command, stored and decrypted exactly like ssh_password_enc
+        (see configrx.ConfigRxWorker._backup_device)."""
+        with self._lock:
+            self._ensure_row(device_id)
+            self._conn.execute(
+                "UPDATE device_config SET enable_secret_enc = ? WHERE device_id = ?",
+                (enable_secret_enc, device_id))
+            self._conn.commit()
+
+    def clear_enable_secret(self, device_id: int) -> None:
+        self.set_enable_secret(device_id, None)
 
     def forget_device(self, device_id: int) -> None:
         """Called when a device is removed from Nodes, so ConfigRX does not
@@ -338,6 +400,17 @@ class ConfigRxDatabase:
                 "SELECT sha256 FROM backups WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
                 (device_id,)).fetchone()
         return row["sha256"] if row else None
+
+    def latest_backup_size(self, device_id: int) -> int | None:
+        """The stored byte size of the device's most recent backup, or None
+        when it has none yet — for ConfigRxWorker's own "this capture is
+        far smaller than the last one" check, run before add_backup below
+        so the caller still has a size to compare a NEW capture against."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT size_bytes FROM backups WHERE device_id = ? ORDER BY ts DESC LIMIT 1",
+                (device_id,)).fetchone()
+        return row["size_bytes"] if row else None
 
     def add_backup(self, device_id: int, content: str,
                    redacted: bool = False) -> tuple[int | None, str]:

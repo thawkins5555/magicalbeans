@@ -123,6 +123,60 @@ try:
     status, payload, _ = call("POST", "/api/nodes/devices", {"ip": "10.20.3.7"}, token=token)
     check("still refuses a duplicate", status != 200, f"{status} {payload}")
 
+    # -------------------------------------------- NetPath target host checks
+    # 999.999.999.999 used to be accepted as a NetPath destination and then
+    # sat forever as a target that could never resolve or trace. The add
+    # route now validates; this also pins that the *edit* route (PUT) holds
+    # the same line, since a validated Add with an unguarded Edit is no gate
+    # at all — a browser (or a script) can always PUT its way around POST.
+    print("netpath target host validation")
+    for bad, why in [("999.999.999.999", "four numeric groups but not an address"),
+                     ("-bad-.example.com", "a hostname label that starts with a hyphen"),
+                     ("bad_underscore.example.com", "a hostname label with an invalid character"),
+                     ("", "blank")]:
+        status, payload, _ = call("POST", "/api/netpath/targets", {"host": bad}, token=token)
+        check(f"add refuses {why}: {bad!r}", status != 200, f"{status} {payload}")
+
+    status, payload, _ = call("POST", "/api/netpath/targets",
+                              {"host": "999.999.999.999"}, token=token)
+    check("…and the refusal names the host and says it is not valid",
+          isinstance(payload, dict)
+          and "999.999.999.999" in str(payload.get("error", ""))
+          and "not a valid" in str(payload.get("error", "")).lower(),
+          payload)
+
+    good_ids = []
+    for good in ["10.20.4.9", "2001:db8::2", "core-sw-01.example.com"]:
+        status, payload, _ = call("POST", "/api/netpath/targets", {"host": good}, token=token)
+        check(f"add accepts {good}", status == 200 and "id" in payload, f"{status} {payload}")
+        if status == 200 and "id" in payload:
+            good_ids.append(payload["id"])
+
+    # The edit path, PUT /api/netpath/targets/<id>: the same 999.999.999.999
+    # that add refuses must not be reachable by editing a target that was
+    # created with a good host.
+    assert good_ids, "at least one target must have been created to edit"
+    edit_id = good_ids[0]
+    status, payload, _ = call("PUT", f"/api/netpath/targets/{edit_id}",
+                              {"host": "999.999.999.999"}, token=token)
+    check("edit refuses the same bad host the add route refuses",
+          status != 200, f"{status} {payload}")
+    status, rows, _ = call("GET", "/api/netpath/targets", token=token)
+    edited = next((t for t in rows.get("targets", []) if t["id"] == edit_id), None)
+    check("…and the stored host is unchanged by the refused edit",
+          edited is not None and edited["host"] == "10.20.4.9",
+          edited)
+    status, payload, _ = call("PUT", f"/api/netpath/targets/{edit_id}",
+                              {"host": "10.20.4.10"}, token=token)
+    check("edit accepts a legitimate replacement host", status == 200, f"{status} {payload}")
+    status, rows, _ = call("GET", "/api/netpath/targets", token=token)
+    edited = next((t for t in rows.get("targets", []) if t["id"] == edit_id), None)
+    check("…and the new host is stored",
+          edited is not None and edited["host"] == "10.20.4.10", edited)
+
+    for target_id in good_ids:
+        call("DELETE", f"/api/netpath/targets/{target_id}", token=token)
+
     # ------------------------------------------------- /api/state per grant
     # The bug this pins: a module's block is omitted for an account that
     # cannot read it, and the page used to assume every block was present.

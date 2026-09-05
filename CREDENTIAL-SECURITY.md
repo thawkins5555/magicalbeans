@@ -17,7 +17,8 @@ ways:
 | An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
-| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored, and the content endpoint requires `configrx: write` rather than `configrx: read`. See §6a. |
+| An optional enable-mode secret (ConfigRX) | Encrypted in `configrx.db`, if the device's vendor needs one to reach privileged EXEC and you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored. Reading one backup's content is `configrx: read`, same as the listing beside it, with a verbatim (unredacted) capture redacted on the fly for a caller without `configrx: write`; comparing two backups still requires `configrx: write`. See §6a. |
 
 Everything below explains why each row is true.
 
@@ -450,20 +451,62 @@ that boundary is load-bearing, not incidental.** (The interactive SSH
 terminal, section 7, is a separate module under a separate permission; it
 shares this credential, not this code.) The only function in ConfigRX that
 ever writes to a device's SSH shell channel, `configrx._pull_config()`,
-sends exactly two things: a fixed, per-vendor pagination-disable command
-(session-scoped and itself read-only, e.g. `terminal length 0`) and one
-fixed, per-vendor "show config" command (`show running-config`, `show
-full-configuration`, and so on) — both sourced from
-`configrx_vendors.VENDORS`, a hardcoded dictionary, never from request
-text. A device's vendor-override field is free text, but it only ever
-*selects* which vendor's fixed commands to use; an unrecognized value
-fails to resolve to anything and the backup is skipped with a clear
-error rather than sent as literal input. There is no command parameter
-anywhere in ConfigRX's API, and no free-form input field anywhere in its
-UI — the credential this section protects can only ever be used to run
-one of a short, fixed, read-only list of commands, never anything an
+sends exactly two things — three, for the handful of vendors whose login
+shell is not already privileged EXEC (currently just Cisco ASA): a fixed,
+per-vendor pagination-disable command (session-scoped and itself
+read-only, e.g. `terminal length 0`), one fixed, per-vendor "show config"
+command (`show running-config`, `show full-configuration`, and so on),
+and for those few vendors, the fixed `enable` command followed by the
+device's own stored enable secret (the next subsection) — sent back only
+as the answer to that device's own password prompt, never as a command in
+its own right. All of it is sourced from `configrx_vendors.VENDORS`, a
+hardcoded dictionary, never from request text; the pattern that recognises
+the device's password prompt is likewise fixed there and is never used to
+build anything sent to the device. A device's vendor-override field is
+free text, but it only ever *selects* which vendor's fixed commands to
+use; an unrecognized value fails to resolve to anything and the backup is
+skipped with a clear error rather than sent as literal input. There is no
+command parameter anywhere in ConfigRX's API, and no free-form input field
+anywhere in its UI — the credential this section protects can only ever
+be used to run one of a short, fixed, read-only list of commands, plus,
+for these few vendors, the one fixed escalation step, never anything an
 operator (or an attacker who somehow obtained write access to this
-module) could supply.
+module) could supply. A vendor with `enable_command` set whose account
+never actually reaches privileged mode ends the backup in a refusal
+rather than sending `pager_off`/`show_config` into a shell that is not
+where their output is expected to land.
+
+**A second, optional secret: the enable password.** A device whose vendor
+carries `enable_command` (currently just Cisco ASA) logs in at user EXEC
+rather than the privileged mode `show_config` needs, and reaches it only
+by running `enable` and answering the password prompt that raises. That
+secret is stored separately from the SSH password — same `device_config`
+row, its own `enable_secret_enc` column — through the identical DPAPI (or
+portable-store) mechanism described above, and exposed the same way:
+`POST .../credential` takes it as a third, optional `enable_secret` field
+with its own three-way contract (absent leaves whatever is stored
+untouched; an empty string clears it; anything else (re)encrypts and
+replaces it), and the device's own API response carries only
+`has_enable_secret: bool`, never the secret itself. That flag does not
+distinguish "this device's vendor has no enable step at all" from "it
+does, and nothing has been stored for it yet" — both read `false`, the
+same way `has_credential` does not distinguish "no SSH credential" from
+"nothing about this device uses SSH." **`DELETE .../credential` clears both
+secrets.** It clears only the SSH password in an earlier draft of this
+release, and a security review of the branch called that what it was: an
+operator clearing a device's credential is decommissioning it, or clearing
+up after an exposure, and either way means "hold nothing for this device."
+What was left behind was unreachable — a backup needs the SSH password to
+get as far as an enable prompt — but it was still a stored secret the
+operator believed they had deleted, with `has_enable_secret` still
+reporting it. To replace an SSH login without touching the enable secret,
+POST a credential without the `enable_secret` key; an absent key leaves a
+stored one alone. `_backup_device()`
+only ever decrypts it when the resolved vendor's `enable_command` is set,
+into a local variable immediately before the connection that needs it,
+cleared by a `finally` block the moment the pull ends — the same
+decrypt-immediately-before-use, discard-immediately-after discipline as
+the SSH password itself.
 
 ## 6a. What is inside a stored configuration backup
 
@@ -503,13 +546,27 @@ an operator has put in a description field. A redacted backup is
 sanitised document you should treat as public. Read it as defence in depth
 underneath the permission change, not as a replacement for it.
 
-**Reading a backup's content now requires `configrx: write`.** Listing which
-backups exist, when they were taken and whether the configuration changed
-stays on `configrx: read`, because that is the useful read-only view; the
-configuration text itself is behind the write grant. This is the one place in
-the product where a read operation deliberately requires a write grant, and it
-is because "read a config backup" is not the same kind of act as "read the
-alert list".
+**Reading one backup's content is `configrx: read`, the same as the listing
+beside it — comparing two is `configrx: write`.** Listing which backups
+exist, when they were taken and whether the configuration changed, and the
+configuration text of a single stored backup, all sit on `configrx: read`:
+that is the useful read-only view, "has this switch changed" being exactly
+the question a read-only operator needs answered. The one case that still
+needs guarding is a backup captured **verbatim** — `store_secrets` was on
+for that device at capture time, so the stored row itself holds the
+device's real secrets rather than `<redacted>` in their place — and a
+caller without `configrx: write` reading that row gets it redacted on the
+fly, through the identical `configrx_redact.redact()` pass, rather than
+403ing outright; the response's own `redacted` flag says so, even though
+the stored row's flag still correctly says it was not. Comparing two
+backups is a different act: `get_configrx_diff` hands over the device's own
+configuration lines exactly as a single-backup read does, but it stays
+behind `configrx: write` regardless of either backup's own redacted flag,
+and applies redaction unconditionally on top — a secret that merely changed
+value reads as no line at all in the hunks, never what it became. The diff
+route is the one place left in the product where a read operation
+deliberately requires a write grant, and it is because "compare two
+configurations" is not the same kind of act as "read the alert list".
 
 Everything in §6 about the SSH password that *fetches* the backup is
 unchanged, including the host-key store described there.
@@ -609,10 +666,12 @@ the device.
   concatenation.
 - Never gives ConfigRX a way to run an arbitrary command on a device over
   SSH — only a short, fixed, per-vendor allow-list of read-only "show
-  config" commands exists anywhere in that module, and there is no
-  free-form command field in its UI or API. The interactive terminal
-  (section 7) is the single, deliberate place a person's own input reaches
-  a device, behind its own permission that no account holds by default.
+  config" commands, plus (for a few vendors) one fixed `enable` escalation
+  answered with that device's own stored secret, exists anywhere in that
+  module, and there is no free-form command field in its UI or API. The
+  interactive terminal (section 7) is the single, deliberate place a
+  person's own input reaches a device, behind its own permission that no
+  account holds by default.
 - Never logs a password, on success or failure, in the event log or the
   access log.
 - Never falls back to weaker or absent protection silently — a DPAPI
@@ -704,14 +763,18 @@ things remain outside its reach entirely:
   give an SNMPv3 polling user read-only access on the device side; give
   the SMTP account only send rights, not a full mailbox; give a
   ConfigRX SSH account only enough privilege to run one read-only "show
-  config" command, not enable/configure access. SappiWhere enforces that
-  the calls it makes with a credential are read-only (DHCP, ConfigRX) or
-  exactly what the credential is for (an SNMP GET, an SMTP send); it
-  cannot enforce what the account itself is authorized to do beyond
-  that — a ConfigRX SSH account that happens to also have enable
-  privilege on the device is a risk the device's own account
-  configuration controls, not something SappiWhere can restrict from its
-  side of the connection.
+  config" command — for most vendors that means no enable or configure
+  access at all; for the few whose privileged EXEC gates that command
+  (Cisco ASA), only enough to reach enable, never configure terminal,
+  since ConfigRX's own escalation goes no further than that mode and
+  never issues a command that would. SappiWhere enforces that the calls
+  it makes with a credential are read-only (DHCP, ConfigRX) or exactly
+  what the credential is for (an SNMP GET, an SMTP send); it cannot
+  enforce what the account itself is authorized to do beyond that — a
+  ConfigRX SSH account granted configure access or higher on the device
+  is a risk the device's own account configuration controls, not
+  something SappiWhere can restrict from its side of the connection,
+  even where ConfigRX itself never asks for more than enable.
 - **TLS in any deployment that matters.** `--cert`/`--key` turns on HTTPS and
   with it the `Secure` cookie flag; without it, session cookies (though still
   `HttpOnly` and `SameSite=Strict`) travel in the clear on the network.
@@ -745,10 +808,11 @@ that it now describes an opt-in, not a wall.
 
 Every encrypted credential in the table at the top of this file — the DHCP
 credential, the SNMPv3 authentication password, the SMTP password, the
-wireless controller's SNMP credential, ConfigRX's SSH password, and the
-password the interactive SSH terminal reuses — goes through
-`netpath/dpapi.py`. On Windows that has always meant, and still means, the
-Windows Data Protection API, unchanged: `dpapi.available()` is unconditionally
+wireless controller's SNMP credential, ConfigRX's SSH password, ConfigRX's
+optional enable secret, and the password the interactive SSH terminal
+reuses — goes through `netpath/dpapi.py`. On Windows that has always meant,
+and still means, the Windows Data Protection API, unchanged:
+`dpapi.available()` is unconditionally
 true there, and `dpapi.protect()`/`dpapi.unprotect()` call `CryptProtectData`/
 `CryptUnprotectData` exactly as before. Off Windows, `dpapi.py` now dispatches
 to `netpath/secretstore.py` — a portable secret store, described in full

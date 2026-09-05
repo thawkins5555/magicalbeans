@@ -47,10 +47,9 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const wireless = server.wireless || { counters: {} };
-    const text = wireless.status || 'Poller stopped';
-    App.el('wl-status').textContent = text;
-    App.el('wl-dot').style.background = wireless.running ? 'var(--ok)' : 'var(--line)';
-    App.el('wl-toggle').textContent = wireless.running ? 'Stop poller' : 'Start poller';
+    App.setText(App.el('wl-status'), wireless.status || 'Poller stopped');
+    App.setBg(App.el('wl-dot'), wireless.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('wl-toggle'), wireless.running ? 'Stop poller' : 'Start poller');
     const counts = wireless.ap_counts || {};
     const c = wireless.counters || {};
     const parts = [`${wireless.controller_count || 0} controller(s)`,
@@ -58,9 +57,9 @@
       `${counts.offline || 0} offline`];
     if (counts.out_of_service) parts.push(`${counts.out_of_service} out of service`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
-    App.el('wl-counters').textContent = parts.join(' · ');
-    App.el('wl-last-reported').textContent = view.lastReportedTs
-      ? `last reported ${ago(view.lastReportedTs)}` : 'never reported';
+    App.setText(App.el('wl-counters'), parts.join(' · '));
+    App.setText(App.el('wl-last-reported'), view.lastReportedTs
+      ? `last reported ${ago(view.lastReportedTs)}` : 'never reported');
   }
 
   /* ------------------------------------------------------------- table */
@@ -195,25 +194,29 @@
 
   function showDetail(row) {
     const lines = [
-      row.name || row.wtp_id, '',
-      `controller  ${controllerName(row.controller_id)}`,
-      `wtp id      ${row.wtp_id}`,
-      `vdom        ${row.vdom || '—'}`,
-      `status      ${row.status}${row.out_of_service ? ' (marked out of service)' : ''}`,
-      `model       ${row.model || '—'}`,
-      `MAC         ${row.mac_address || '—'}`,
+      escape(row.name || row.wtp_id), '',
+      // The name goes in a span rather than straight into the line: the
+      // controller is its own entity here, but the same FortiGate is often
+      // ALSO a Nodes device at the same IP, and linkController() below
+      // upgrades this into a link to it once that lookup resolves.
+      `controller  <span id="wl-d-controller">${escape(controllerName(row.controller_id))}</span>`,
+      `wtp id      ${escape(row.wtp_id)}`,
+      `vdom        ${escape(row.vdom || '—')}`,
+      `status      ${escape(row.status)}${row.out_of_service ? ' (marked out of service)' : ''}`,
+      `model       ${escape(row.model || '—')}`,
+      `MAC         ${escape(row.mac_address || '—')}`,
       `clients     ${row.station_count ?? '—'}`,
-      `last seen   ${App.when(row.last_seen_ts)}`,
+      `last seen   ${escape(App.when(row.last_seen_ts))}`,
       '', `radios (${row.radios.length})`, '-'.repeat(40),
     ];
     for (const radio of row.radios) {
       const raw = radio.operating_power_dbm;
-      lines.push(`radio ${radio.radio_id}`,
-        `  mode         ${radio.mode || '—'}`,
+      lines.push(`radio ${escape(String(radio.radio_id))}`,
+        `  mode         ${escape(radio.mode || '—')}`,
         `  channel      ${radio.channel ?? '—'}`,
         // Both the reading and the number it was read from, so an operator
         // can check the guess against the controller's own display.
-        `  tx power     ${powerText(raw, row.power_unit, radio.is_scan)}` +
+        `  tx power     ${escape(powerText(raw, row.power_unit, radio.is_scan))}` +
           (raw != null ? `  (raw ${raw})` : ''),
         `  clients      ${radio.station_count ?? '—'}`, '');
     }
@@ -224,7 +227,26 @@
                  'a transmit power. It is left out of this AP\'s tx power',
                  'and out of the dBm-or-percent decision for the others.', '');
     }
-    App.el('wl-detail').textContent = lines.join('\n');
+    App.el('wl-detail').innerHTML = lines.join('\n');
+    linkController(row.controller_id, row.id);
+  }
+
+  /* Upgrades the plain controller name above into a link to the matching
+     Nodes device, once the ip -> device lookup resolves — done after the
+     pane is already on screen rather than before, so opening an AP never
+     waits on a Nodes fetch. Guarded by the AP id still being the one
+     selected: a slow lookup landing after the operator moved to another AP
+     (or another tab) must not rewrite a pane that has moved on. */
+  async function linkController(controllerId, apId) {
+    const controller = view.controllers.find((x) => x.id === controllerId);
+    if (!controller || !controller.ip) return;
+    const { byIp: map } = await App.deviceIndex();
+    if (view.selected !== apId) return;
+    const device = map.get(controller.ip);
+    const span = document.getElementById('wl-d-controller');
+    if (!device || !span) return;
+    span.outerHTML = `<a class="linkish inline" href="${
+      App.buildRoute('nodes', ['device', device.id])}">${escape(controller.name)}</a>`;
   }
 
   /* -------------------------------------------------------- controllers */
@@ -329,7 +351,7 @@
         <th scope="col">Name</th><th scope="col">IP</th><th scope="col">State</th><th scope="col">Last poll</th><th scope="col"></th>
       </tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">No controllers configured</td></tr>'}</tbody></table>`,
       [
-        { label: 'Close', onClick: App.closeModal },
+        { label: 'Cancel', onClick: App.closeModal },
         { label: 'Add controller', primary: true, onClick: () => editController(null) },
       ]);
     for (const btn of box.querySelectorAll('[data-edit]')) {
@@ -389,7 +411,8 @@
       ${App.columnPickerFieldset('ACCESS POINT COLUMNS', 'wireless', ALL_COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (m) => {
+      { label: 'Save', primary: true, onClick: (m, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
@@ -400,7 +423,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('wireless');
-      } },
+        })()) },
     ]);
     App.wireColumnPickers(box);
     return box;

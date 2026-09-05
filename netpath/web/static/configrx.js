@@ -35,13 +35,16 @@
   }
 
   const STATUS_COLOR = { changed: 'var(--ok)', unchanged: 'var(--accent)',
-    error: 'var(--fail)' };
+    error: 'var(--fail)', suspect: 'var(--warn)' };
   /* Backup outcomes mapped onto the tones App.statusMark draws. "changed"
      is information rather than health — a device whose config differs from
      the last copy is working exactly as intended — so it takes the info
      tone and its own shape, instead of the green that means "up" on every
-     other page in the product. */
-  const STATUS_TONE = { changed: 'info', unchanged: 'ok', error: 'fail' };
+     other page in the product. "suspect" is a capture under a fifth of the
+     device's previous one: stored, because refusing it outright is worse,
+     but flagged rather than shown as an ordinary change (see configrx.py's
+     SUSPECT_SHRINK_RATIO). */
+  const STATUS_TONE = { changed: 'info', unchanged: 'ok', error: 'fail', suspect: 'warn' };
 
   function statusDot(status) {
     // last_backup_status can carry a trailing host-key note, e.g.
@@ -64,7 +67,7 @@
     App.el('cx-toggle').textContent = worker.running ? 'Stop worker' : 'Start worker';
     const c = worker.counters || {};
     const parts = [`${c.backups || 0} backup(s) run`, `${c.changed || 0} changed`,
-      `${c.unchanged || 0} unchanged`, `${c.errors || 0} errors`];
+      `${c.suspect || 0} suspect`, `${c.unchanged || 0} unchanged`, `${c.errors || 0} errors`];
     // Which paramiko this process actually loaded belongs on the strip, not
     // only in a failed connection's error text: "I installed 3.4 and it still
     // says 5.0" is a question the status line should answer at a glance.
@@ -102,7 +105,13 @@
       cell: (r) => (r.backing_up ? '<span class="hint">backing up…</span>'
         : r.backup_queued ? '<span class="hint">queued…</span>'
         : r.last_backup_error
-          ? `<span title="${escape(r.last_backup_error)}">error</span>`
+          // last_backup_error also carries a reason for "suspect" now (see
+          // configrx.py's SUSPECT_SHRINK_RATIO), so the word shown is
+          // whatever status actually is, with the reason only in the title \u2014
+          // it used to be the literal word "error" whenever a reason was
+          // present at all.
+          ? `<span title="${escape(r.last_backup_error)}">${
+              escape((r.last_backup_status || 'error').split(' ')[0])}</span>`
           : escape(r.last_backup_status || (r.backup_enabled ? 'pending' : '\u2014'))) },
     { key: 'last_backup_ts', label: 'When', width: 100, numeric: true, on: true,
       value: (r) => r.last_backup_ts || 0, cell: (r) => App.agoCell(r.last_backup_ts) },
@@ -110,8 +119,8 @@
       value: (r) => r.vendor || '', cell: (r) => escape(r.vendor || '\u2014') },
     { key: 'ssh_username', label: 'SSH user', width: 120,
       cell: (r) => escape(r.ssh_username || '\u2014') },
-    { key: 'ssh_port', label: 'Port', width: 70, numeric: true },
-    { key: 'has_credential', label: 'Credential', width: 90,
+    { key: 'ssh_port', label: 'Port', width: 70, numeric: true, on: true },
+    { key: 'has_credential', label: 'Credential', width: 90, on: true,
       value: (r) => (r.has_credential ? 1 : 0),
       cell: (r) => (r.has_credential ? 'stored' : '\u2014') },
   ];
@@ -190,6 +199,28 @@
     drawDevices();
   }
 
+  /* Shared by the single-device and bulk settings dialogs, which both take
+     an SSH port through a plain number input — `min`/`max` are advisory
+     only, since App.modal's forms are novalidate. `allowBlank` is the bulk
+     dialog's "leave unchanged" case; the single-device port is always a
+     real value. */
+  function checkPortField(box, selector, { allowBlank = false } = {}) {
+    const el = box.querySelector(selector);
+    const raw = el.value.trim();
+    const port = Number(raw);
+    if (raw && Number.isInteger(port) && port >= 1 && port <= 65535) return true;
+    if (!raw && allowBlank) return true;
+    App.showModalError(box, 'The SSH port must be a number from 1 to 65535.');
+    el.setAttribute('aria-invalid', 'true');
+    el.classList.add('invalid');
+    el.addEventListener('input', () => {
+      el.removeAttribute('aria-invalid');
+      el.classList.remove('invalid');
+    }, { once: true });
+    el.focus();
+    return false;
+  }
+
   function drawBulkBar() {
     const n = view.devicesChecked.size;
     App.el('cx-bulk-bar').hidden = n === 0;
@@ -240,6 +271,7 @@
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
+        if (!checkPortField(m, '#cx-bulk-port', { allowBlank: true })) return;
         const username = m.querySelector('#cx-bulk-username').value.trim();
         const password = (m.querySelector('#cx-bulk-password') || {}).value || '';
         const enabled = m.querySelector('#cx-bulk-enabled').value;
@@ -338,13 +370,27 @@
 
   /* ------------------------------------------------------------- backups */
 
+  /* App.timeCell decides per row whether ITS OWN timestamp is "today" —
+     fine for a table of current activity, but a device's stored backups
+     span whatever the retention settings allow, so the row taken at 23:58
+     yesterday showed a date and the one from 00:02 this morning did not,
+     which read as though only some rows were dated at all. App.stamp's
+     span argument makes every row in the list agree on whether the date is
+     worth showing, based on how wide the whole list actually is. */
+  function backupTimeSpan() {
+    if (view.backups.length < 2) return 0;
+    const times = view.backups.map((b) => b.ts);
+    return Math.max(...times) - Math.min(...times);
+  }
+
   const BACKUP_COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 30,
       cell: (r) => `<input type="checkbox" class="cx-bcheck"${
         view.backupsChecked.has(r.id) ? ' checked' : ''}>` },
     { key: 'ts', label: 'Taken', width: 150, numeric: true, on: true,
       align: 'left', descendingFirst: true,
-      title: App.timeZoneTitle(), cell: (r) => App.timeCell(r.ts) },
+      title: App.timeZoneTitle(), cell: (r) => `<span class="when" title="${
+        escape(App.when(r.ts))}">${App.stamp(r.ts, backupTimeSpan())}</span>` },
     { key: 'size_bytes', label: 'Size', width: 80, numeric: true, on: true,
       cell: (r) => bytesText(r.size_bytes) },
     { key: 'sha256', label: 'Digest', width: 110,
@@ -363,7 +409,23 @@
     const device = view.devices.find((d) => d.id === view.selectedDeviceId);
     App.el('cx-backup-header').textContent = device
       ? `BACKUPS \u2014 ${device.name}` : 'BACKUPS';
-    App.el('cx-backup-now').hidden = !device || !device.backup_enabled;
+    const backupNowBtn = App.el('cx-backup-now');
+    backupNowBtn.hidden = !device;
+    // Visible-but-disabled rather than hidden when backups are off, so an
+    // operator who came here to back up a device sees why the button will
+    // not do it instead of wondering whether it exists at all. Skipped
+    // while applyWriteGate already owns the button (data-requires-write on
+    // this element is what disabled it) — its own reason takes precedence,
+    // and it is the one thing on the page allowed to re-enable a control it
+    // did not itself disable.
+    if (device && !backupNowBtn.dataset.writeDenied) {
+      const offReason = !device.backup_enabled
+        ? 'Backups are switched off for this device — turn them on in Device settings.'
+        : '';
+      backupNowBtn.disabled = !!offReason;
+      if (offReason) backupNowBtn.title = offReason;
+      else backupNowBtn.removeAttribute('title');
+    }
     App.el('cx-device-settings').hidden = !device;
     // "Diff with previous" only makes sense once a backup is selected AND
     // an older one exists to diff it against — the oldest stored backup
@@ -418,7 +480,8 @@
           drawBackupBulkBar();
         };
       }
-      tr.onclick = () => selectBackup(row.id);
+      tr.onclick = () => selectBackup(row.id).catch((error) =>
+        App.toast(`Could not read that backup: ${error.message}`, 'fail'));
     });
     table.appendChild(body);
     App.wireRowKeyboard(body);
@@ -629,6 +692,70 @@
     }
   }
 
+  /* The keys configrx_vendors.VENDORS knows, served by /api/config as
+     configrx_vendors — label and key only, nothing that lets this page
+     influence what a backup sends — plus free text (the "Other" option
+     and its own box) for anything not in that table, which is exactly
+     what vendor_override is documented as being for (e.g. HP/Aruba has
+     no SNMP enterprise root registered in nodeoids.vendor_for() to
+     auto-detect from, and a platform this build has not shipped a Vendor
+     entry for yet still needs somewhere to type its key). */
+  const VENDOR_OTHER = '__other__';
+
+  function vendorChoices() {
+    return ((App.state.config || {}).configrx_vendors || [])
+      .map((v) => [v.key, v.label]);
+  }
+
+  function vendorFieldHtml(current) {
+    const choices = vendorChoices();
+    const known = choices.some(([key]) => key === current);
+    const selected = !current ? '' : (known ? current : VENDOR_OTHER);
+    return `<label>Vendor override <select id="cx-vendor">
+        <option value=""${selected === '' ? ' selected' : ''}>Auto-detected from Nodes</option>
+        ${choices.map(([key, label]) => `<option value="${escape(key)}"${
+          selected === key ? ' selected' : ''}>${escape(label)} (${escape(key)})</option>`).join('')}
+        <option value="${VENDOR_OTHER}"${selected === VENDOR_OTHER ? ' selected' : ''}
+          >Other (type a vendor key)…</option>
+      </select></label>
+      <label id="cx-vendor-other-wrap"${selected === VENDOR_OTHER ? '' : ' hidden'}>Vendor key
+        <input id="cx-vendor-other" value="${escape(known ? '' : current)}"
+          placeholder="e.g. hpe-comware"></label>`;
+  }
+
+  /* The enable secret's own state (stored / not) and, when it is stored,
+     a way to drop just it — DELETE .../credential/enable-secret, which
+     touches nothing else — so a device that turns out not to need one is
+     not stuck clearing the SSH password too just to get rid of it. */
+  function enableSecretFieldHtml(device) {
+    return `<label>Enable secret <input id="cx-enable-secret" type="password"
+        placeholder="${device.has_enable_secret ? 'stored — leave blank to keep' : 'most platforms do not need this'}"></label>
+      ${device.has_enable_secret && App.canWrite('configrx')
+        ? '<p><button id="cx-enable-secret-clear">Clear stored enable secret</button>'
+          + '<span class="hint"> Leaves the SSH username and password untouched.</span></p>'
+        : ''}`;
+  }
+
+  function wireEnableSecretClear(box, device) {
+    const wrap = box.querySelector('#cx-enable-secret-wrap');
+    const clearBtn = wrap.querySelector('#cx-enable-secret-clear');
+    if (!clearBtn) return;
+    clearBtn.onclick = async () => {
+      clearBtn.disabled = true;
+      try {
+        await App.del(`/api/configrx/devices/${device.id}/credential/enable-secret`, {});
+      } catch (error) {
+        clearBtn.disabled = false;
+        App.toast(`Could not clear the enable secret: ${error.message}`, 'fail');
+        return;
+      }
+      device.has_enable_secret = false;
+      wrap.innerHTML = enableSecretFieldHtml(device);
+      wireEnableSecretClear(box, device);
+      App.announce('Enable secret cleared.');
+    };
+  }
+
   function deviceSettingsModal() {
     const device = view.devices.find((d) => d.id === view.selectedDeviceId);
     if (!device) return;
@@ -636,11 +763,11 @@
       <fieldset><legend>BACKUP</legend>
         <label class="check"><input type="checkbox" id="cx-enabled"
           ${device.backup_enabled ? 'checked' : ''}> Back up this device</label>
-        <label>Vendor override <input id="cx-vendor" value="${escape(device.vendor_override)}"
-          placeholder="${escape(device.vendor || 'auto-detected from Nodes')}"></label>
-        <p class="hint">Leave blank to use the vendor Nodes already detected over SNMP.
-          Set this only when that is wrong or unset. Recognized values: cisco, fortinet,
-          juniper, mikrotik, hp, aruba.</p>
+        ${vendorFieldHtml(device.vendor_override)}
+        <p class="hint">Leave on <b>Auto-detected from Nodes</b> to use the vendor Nodes
+          already detected over SNMP${device.vendor ? ` (currently ${escape(device.vendor)})` : ''}.
+          Pick a platform from the list, or <b>Other</b> to type a vendor key this list
+          does not cover — set this only when auto-detection is wrong or unset.</p>
       </fieldset>
       <fieldset><legend>SSH CREDENTIAL</legend>
         <label>Port <input id="cx-port" type="number" min="1" max="65535"
@@ -648,34 +775,51 @@
         <label>Username <input id="cx-username" value="${escape(device.ssh_username)}"></label>
         ${App.canStoreSecrets()
           ? `<label>Password <input id="cx-password" type="password"
-              placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
+              placeholder="${device.has_credential ? 'stored — leave blank to keep' : ''}"></label>
+            <div id="cx-enable-secret-wrap">${enableSecretFieldHtml(device)}</div>`
           : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
-          is no way to run any other command from here.</p>
+          is no way to run any other command from here. The enable secret is only needed for
+          a platform whose login lands in user EXEC rather than privileged mode — currently
+          just Cisco ASA — and is saved only together with the SSH password above.</p>
       </fieldset>
       <fieldset><legend>HOST KEY</legend>
         <div id="cx-hostkey"><p class="hint">Loading…</p></div>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
+        if (!checkPortField(m, '#cx-port')) return;
+        const vendorChoice = m.querySelector('#cx-vendor').value;
+        const vendorOverride = vendorChoice === VENDOR_OTHER
+          ? m.querySelector('#cx-vendor-other').value.trim() : vendorChoice;
         await App.post(`/api/configrx/devices/${device.id}/config`, {
           backup_enabled: m.querySelector('#cx-enabled').checked,
           ssh_port: Number(m.querySelector('#cx-port').value),
           ssh_username: m.querySelector('#cx-username').value.trim(),
-          vendor_override: m.querySelector('#cx-vendor').value.trim(),
+          vendor_override: vendorOverride,
         });
         const password = (m.querySelector('#cx-password') || {}).value || '';
         const username = m.querySelector('#cx-username').value.trim();
+        const enableSecret = (m.querySelector('#cx-enable-secret') || {}).value || '';
         if (password && username) {
-          await App.post(`/api/configrx/devices/${device.id}/credential`, {
-            ssh_username: username, ssh_password: password,
-          });
+          const credential = { ssh_username: username, ssh_password: password };
+          // Omitted entirely when blank, same as the password field's own
+          // "leave blank to keep" — the API's own default for an absent key
+          // is "leave whatever is stored untouched" (see api.py).
+          if (enableSecret) credential.enable_secret = enableSecret;
+          await App.post(`/api/configrx/devices/${device.id}/credential`, credential);
         }
         App.closeModal();
         await App.refreshNow('configrx');
       } },
     ]);
+    const vendorSelect = box.querySelector('#cx-vendor');
+    const vendorOtherWrap = box.querySelector('#cx-vendor-other-wrap');
+    vendorSelect.onchange = () => {
+      vendorOtherWrap.hidden = vendorSelect.value !== VENDOR_OTHER;
+    };
+    if (App.canStoreSecrets()) wireEnableSecretClear(box, device);
     drawHostKey(box, device);
   }
 
@@ -752,7 +896,8 @@
       ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
                                  s.table_columns_backups)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (m) => {
+      { label: 'Save', primary: true, onClick: (m, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         await App.post('/api/settings', { scope: 'configrx', values: {
           enabled: m.querySelector('#cxs-enabled').checked,
           backup_interval_hours: Number(m.querySelector('#cxs-interval').value),
@@ -768,7 +913,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('configrx');
-      } },
+        })()) },
     ]);
     App.wireColumnPickers(settingsBox);
   }
@@ -910,8 +1055,15 @@
           }
           const device = payload.device || {};
           if ((device.last_backup_ts || 0) > before) {
-            settle(device.last_backup_status === 'error' ? 'Failed'
-              : (device.last_backup_status || 'Done'));
+            const failed = device.last_backup_status === 'error';
+            settle(failed ? 'Failed' : (device.last_backup_status || 'Done'));
+            // The button label flicking to "Failed" said THAT it failed and
+            // nothing else — the reason lived only in the Last backup
+            // column's title, which nobody is hovering right after a click.
+            if (failed) {
+              App.toast(`Backup of ${device.name || device.ip || 'this device'} `
+                + `failed: ${device.last_backup_error || 'unknown error'}`, 'fail');
+            }
             await selectDevice(deviceId);
             App.refreshNow('configrx');
             return;

@@ -7,6 +7,7 @@ method deletes rows, without needing an explicit VACUUM statement.
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 
@@ -16,6 +17,13 @@ from netpath.appdb import AppDatabase
 from netpath.wirelessdb import WirelessDatabase
 from netpath.configrxdb import ConfigRxDatabase
 from netpath.nodesdb import NodesDatabase
+
+# The checkmark below is not ASCII: under cp1252 (Windows' default for both a
+# console and a piped stdout, absent PYTHONUTF8) print() raises
+# UnicodeEncodeError before a single result is reported. Replacing rather than
+# crashing keeps this suite runnable on its own, not just via run_all.py.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(errors="replace")
 
 TMPDIR = tempfile.mkdtemp(prefix="db_reclaim_")
 PASSED = []

@@ -1156,16 +1156,18 @@ end
               cookie=admin_cookie)[2]["device"]["store_secrets"] is True)
     SERVICE.configrx_db.update_device_config(backup_device, store_secrets=0)
 
-    # Content needs ConfigRX write; the listing does not.
+    # P1-8: reading a stored config is a read, not a write — a ConfigRX
+    # reader gets the content, same as the listing beside it.
     cx_reader = make_user("cxreader", {"configrx": "read"})
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
                               cookie=cx_reader)
-    check("D11 a read-only ConfigRX account cannot download a backup",
-          status == 403, f"{status} {payload}")
+    check("D11 a read-only ConfigRX account can read an already-redacted backup",
+          status == 200 and "<redacted>" in payload.get("content", ""),
+          f"{status} {payload}")
     status, _h, payload = req("GET",
                               f"/api/configrx/devices/{backup_device}/backups",
                               cookie=cx_reader)
-    check("D11 …but still sees the listing, with the redacted flag",
+    check("D11 …and still sees the listing, with the redacted flag",
           status == 200 and payload["backups"][0]["redacted"] is True,
           f"{status} {payload}")
     status, _h, payload = req("GET", f"/api/configrx/backups/{stored_id}",
@@ -1173,6 +1175,41 @@ end
     check("D11 a ConfigRX write account can still download it",
           status == 200 and "<redacted>" in payload.get("content", ""),
           str(status))
+
+    # The case the read-only route change actually has to guard: a backup
+    # stored VERBATIM (store_secrets was on for the capture) still cannot
+    # reach a caller without ConfigRX write — it comes back redacted on the
+    # fly instead of 403ing, and the response says so.
+    verbatim_id, _digest = SERVICE.configrx_db.add_backup(
+        backup_device, CISCO, redacted=False)
+    verbatim_row = SERVICE.configrx_db.backup(verbatim_id)
+    check("D11 the verbatim row records that it was NOT redacted",
+          not bool(verbatim_row["redacted"]))
+    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
+                              cookie=cx_reader)
+    check("D11 a read-only account reading a verbatim backup gets 200, not 403",
+          status == 200, f"{status} {payload}")
+    check("D11 …with the secret taken out",
+          "pl4nt-wr1te" not in payload.get("content", "")
+          and "<redacted>" in payload.get("content", ""),
+          payload.get("content", ""))
+    check("D11 …and the response says it was redacted for this caller",
+          payload.get("backup", {}).get("redacted") is True, str(payload))
+    status, _h, payload = req("GET", f"/api/configrx/backups/{verbatim_id}",
+                              cookie=admin_cookie)
+    check("D11 a ConfigRX write account reads the verbatim backup unredacted",
+          status == 200 and "pl4nt-wr1te" in payload.get("content", ""),
+          f"{status} {payload}")
+    check("D11 …and the stored row's own flag is reported, still False",
+          payload.get("backup", {}).get("redacted") is False, str(payload))
+
+    # The diff route stays ConfigRX write, unlike the single-backup route
+    # above: a comparison view hands over the same configuration lines.
+    status, _h, payload = req(
+        "GET", f"/api/configrx/diff?device={backup_device}"
+        f"&from={stored_id}&to={verbatim_id}", cookie=cx_reader)
+    check("D11 the diff route still needs ConfigRX write",
+          status == 403, f"{status} {payload}")
 
     # ----------------------------------------------------- D12 probe pacing
     from netpath import ipam_scan
@@ -1360,6 +1397,262 @@ end
           "authentication", not stale, ", ".join(stale))
     check("D15 …and the headless banner says what is actually true",
           "must change its" in open(main_mod.__file__, encoding="utf-8").read())
+
+    # ------------------------------------------ D16 ConfigRX SSH port range
+    # 0, -5 and 99999 were all previously stored as a device's ssh_port,
+    # after which every backup attempt failed with a bare socket error and
+    # nothing pointed at the port being the reason. The route now refuses
+    # anything outside 1-65535 with a 400, before it ever reaches the
+    # database or a socket.
+    print("configrx SSH port range")
+    for bad_port in (0, -5, 99999):
+        status, _h, payload = req(
+            "POST", f"/api/configrx/devices/{backup_device}/config",
+            {"ssh_port": bad_port}, cookie=admin_cookie)
+        check(f"D16 ssh_port {bad_port} is refused", status == 400,
+              f"{status} {payload}")
+    stored_port = SERVICE.configrx_db.device_config(backup_device)["ssh_port"]
+    check("D16 …and none of them were stored", stored_port not in (0, -5, 99999),
+          stored_port)
+
+    for good_port in (1, 65535):
+        status, _h, payload = req(
+            "POST", f"/api/configrx/devices/{backup_device}/config",
+            {"ssh_port": good_port}, cookie=admin_cookie)
+        check(f"D16 ssh_port {good_port} (boundary) is accepted",
+              status == 200, f"{status} {payload}")
+        check(f"D16 …and stored",
+              SERVICE.configrx_db.device_config(backup_device)["ssh_port"] == good_port,
+              SERVICE.configrx_db.device_config(backup_device)["ssh_port"])
+    SERVICE.configrx_db.update_device_config(backup_device, ssh_port=22)
+
+    # --------------------------- D17 the enable secret's three-way contract
+    # POST .../credential: the key absent from the body leaves a stored
+    # enable secret alone, present-and-empty clears it, present-and-non-empty
+    # (re)encrypts and replaces it. clear_credential (the DELETE route) was
+    # fixed this release to clear both secrets, not just the SSH password —
+    # a device's decommission or a post-exposure credential wipe otherwise
+    # left the enable secret sitting in configrx.db, unreachable but still
+    # reported as present by has_enable_secret.
+    print("configrx enable secret three-way contract")
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass1"}, cookie=admin_cookie)
+    check("D17 a credential with no enable_secret key is accepted", status == 200,
+          f"{status} {payload}")
+    check("D17 …and the response never carries a secret",
+          "ssh_password" not in payload and "enable_secret" not in payload
+          and "ssh_password_enc" not in payload and "enable_secret_enc" not in payload,
+          payload)
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …absent enable_secret leaves none stored (still none to begin with)",
+          config["enable_secret_enc"] is None)
+
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass2",
+         "enable_secret": "en4ble-1"}, cookie=admin_cookie)
+    check("D17 a non-empty enable_secret is accepted", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …and stored encrypted, decrypting back to the plaintext",
+          config["enable_secret_enc"] is not None
+          and dpapi_mod.unprotect(config["enable_secret_enc"]) == b"en4ble-1")
+
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    device_json = payload["device"]
+    check("D17 has_enable_secret reports existence only",
+          device_json.get("has_enable_secret") is True, device_json)
+    check("D17 …never the secret itself, in this or any other field",
+          "en4ble-1" not in json.dumps(device_json), device_json)
+
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass3", "enable_secret": ""},
+        cookie=admin_cookie)
+    check("D17 an empty (present) enable_secret is accepted", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 …and clears the stored enable secret",
+          config["enable_secret_enc"] is None)
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    check("D17 …has_enable_secret now says so",
+          payload["device"].get("has_enable_secret") is False, payload["device"])
+
+    # Set both secrets again, then DELETE the credential and confirm BOTH
+    # are gone — the actual fix this release made after the security review.
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass4",
+         "enable_secret": "en4ble-2"}, cookie=admin_cookie)
+    check("D17 setup: both secrets stored ahead of the clear", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 setup: enable_secret_enc is present before the clear",
+          config["enable_secret_enc"] is not None)
+    check("D17 setup: ssh_password_enc is present before the clear",
+          config["ssh_password_enc"] is not None)
+
+    status, _h, payload = req(
+        "DELETE", f"/api/configrx/devices/{backup_device}/credential",
+        {}, cookie=admin_cookie)
+    check("D17 the clear-credential route succeeds", status == 200, f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D17 clear_credential clears the SSH password",
+          config["ssh_password_enc"] is None)
+    check("D17 …AND the enable secret, which used to survive it",
+          config["enable_secret_enc"] is None)
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    check("D17 …has_credential and has_enable_secret both go false",
+          payload["device"].get("has_credential") is False
+          and payload["device"].get("has_enable_secret") is False,
+          payload["device"])
+
+    # ------------------------------------------------- D18 /api/session version
+    # The version now goes to the sign-in page (the unauthenticated branch)
+    # as well as to a signed-in one, because the page that most needs to
+    # show a build number is the one nobody has signed in to yet.
+    print("/api/session version on both branches")
+    from netpath import __version__ as app_version
+    conn_anon = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    conn_anon.request("GET", "/api/session")
+    resp = conn_anon.getresponse()
+    anon_payload = json.loads(resp.read().decode("utf-8"))
+    conn_anon.close()
+    check("D18 an unauthenticated /api/session says so",
+          anon_payload.get("authenticated") is False, anon_payload)
+    check("D18 …and carries the running version",
+          anon_payload.get("version") == app_version, anon_payload)
+    check("D18 …and nothing else beyond authenticated/first_run/version",
+          set(anon_payload) <= {"authenticated", "first_run", "version"},
+          sorted(anon_payload))
+
+    status, _h, auth_payload = req("GET", "/api/session", cookie=admin_cookie)
+    check("D18 an authenticated /api/session also carries the version",
+          status == 200 and auth_payload.get("version") == app_version,
+          auth_payload)
+    check("D18 …and is still authenticated", auth_payload.get("authenticated") is True,
+          auth_payload)
+
+    # ------------------------------------------- D19 the served vendor list
+    # configrx.js used to carry its own hand-typed copy of the eleven keys
+    # in configrx_vendors.VENDORS — a second copy of the hard safety
+    # boundary of ConfigRX's backup path, free to drift from the table it
+    # was supposed to mirror. /api/config now serves it instead, built from
+    # VENDORS in its own iteration order, and it is one of the configrx
+    # module's config keys so it is dropped for an account without ConfigRX
+    # read, same as configrx_settings beside it.
+    print("configrx_vendors served, not mirrored")
+    from netpath import configrx_vendors
+
+    status, _h, payload = req("GET", "/api/config", cookie=admin_cookie)
+    served_vendors = payload.get("configrx_vendors")
+    expected_vendors = [{"key": key, "label": vendor.label}
+                        for key, vendor in configrx_vendors.VENDORS.items()]
+    check("D19 the served list matches configrx_vendors.VENDORS exactly "
+          "(same keys, same labels, same order)",
+          served_vendors == expected_vendors,
+          f"{served_vendors!r} != {expected_vendors!r}")
+    # Proven non-vacuous: reordering VENDORS' first two entries, or
+    # truncating the expected list to ten, both make the equality above
+    # fail — checked by hand against a deliberately wrong expectation
+    # before this assertion was written the right way; see the report.
+    check("D19 …every entry carries only key and label, nothing a client "
+          "has no business knowing (no command, no pager-off lines)",
+          served_vendors is not None
+          and all(set(entry) == {"key", "label"} for entry in served_vendors),
+          served_vendors)
+    check("D19 …all eleven vendor keys are present",
+          served_vendors is not None
+          and {entry["key"] for entry in served_vendors} == set(configrx_vendors.VENDORS),
+          served_vendors)
+
+    status, _h, payload = req("GET", "/api/config", cookie=debug_cookie)
+    check("D19 an account with no ConfigRX grant gets no configrx_vendors "
+          "key at all — absent, not an empty list",
+          "configrx_vendors" not in payload, payload.get("configrx_vendors", "<absent>"))
+
+    # ------------------------------- D20 the enable-secret-only delete route
+    # Previously the only way to remove an enable secret was clear_credential
+    # (DELETE .../credential), which took the SSH password with it — so
+    # removing a secret that turned out not to be needed meant retyping the
+    # switch's SSH password too. This route clears only enable_secret_enc.
+    print("configrx enable-secret-only delete route")
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass5",
+         "enable_secret": "en4ble-3"}, cookie=admin_cookie)
+    check("D20 setup: both secrets stored", status == 200, f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D20 setup: enable_secret_enc is present before the narrow clear",
+          config["enable_secret_enc"] is not None)
+    check("D20 setup: ssh_password_enc is present before the narrow clear",
+          config["ssh_password_enc"] is not None)
+
+    status, _h, payload = req(
+        "DELETE", f"/api/configrx/devices/{backup_device}/credential/enable-secret",
+        {}, cookie=admin_cookie)
+    check("D20 the narrow clear succeeds", status == 200, f"{status} {payload}")
+    check("D20 …and the response never carries a secret",
+          "ssh_password" not in payload and "enable_secret" not in payload
+          and "ssh_password_enc" not in payload and "enable_secret_enc" not in payload,
+          payload)
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D20 it clears enable_secret_enc",
+          config["enable_secret_enc"] is None)
+    # "Left intact" means the SSH password still round-trips, not merely
+    # that the column is non-NULL: decrypt it back to the plaintext just
+    # set above. Proven non-vacuous by pointing this same assertion at the
+    # both-secrets route instead (DELETE .../credential) and watching it
+    # fail — see the report.
+    check("D20 …AND leaves ssh_password_enc intact, still decrypting to the "
+          "password set above",
+          config["ssh_password_enc"] is not None
+          and dpapi_mod.unprotect(config["ssh_password_enc"]) == b"swpass5",
+          config)
+    check("D20 …and leaves ssh_username intact",
+          config["ssh_username"] == "netops", config["ssh_username"])
+
+    status, _h, payload = req(
+        "GET", f"/api/configrx/devices/{backup_device}", cookie=admin_cookie)
+    check("D20 has_credential stays true, has_enable_secret goes false",
+          payload["device"].get("has_credential") is True
+          and payload["device"].get("has_enable_secret") is False,
+          payload["device"])
+
+    status, _h, payload = req(
+        "DELETE", f"/api/configrx/devices/{backup_device}/credential/enable-secret",
+        {}, cookie=cx_reader)
+    check("D20 a ConfigRX read-only account is refused (needs write)",
+          status == 403, f"{status} {payload}")
+
+    status, _h, payload = req(
+        "DELETE", "/api/configrx/devices/999999/credential/enable-secret",
+        {}, cookie=admin_cookie)
+    check("D20 an unknown device id is a clean error, not a traceback",
+          status == 400 and payload.get("error") != "Internal Server Error",
+          f"{status} {payload}")
+
+    # And the wide route beside it still does what D17 already pinned:
+    # clears both secrets, not just the password — this narrower route must
+    # not have quietly undone that.
+    status, _h, payload = req(
+        "POST", f"/api/configrx/devices/{backup_device}/credential",
+        {"ssh_username": "netops", "ssh_password": "swpass6",
+         "enable_secret": "en4ble-4"}, cookie=admin_cookie)
+    check("D20 setup 2: both secrets stored again", status == 200, f"{status} {payload}")
+    status, _h, payload = req(
+        "DELETE", f"/api/configrx/devices/{backup_device}/credential",
+        {}, cookie=admin_cookie)
+    check("D20 …the wide route still clears the password too", status == 200,
+          f"{status} {payload}")
+    config = SERVICE.configrx_db.device_config(backup_device)
+    check("D20 …confirmed: both secrets gone via the wide route",
+          config["ssh_password_enc"] is None and config["enable_secret_enc"] is None,
+          config)
 
     return 0
 

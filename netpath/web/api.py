@@ -36,6 +36,7 @@ from .. import trapoids
 from .. import nodeoids
 from .. import configrx
 from .. import configrx_redact
+from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
@@ -148,7 +149,7 @@ _CONFIG_MODULE_KEYS = {
     "nodes": ("nodes_settings",),
     "alerts": ("alerts_settings",),
     "wireless": ("wireless_settings",),
-    "configrx": ("configrx_settings",),
+    "configrx": ("configrx_settings", "configrx_vendors"),
 }
 _STATE_MODULE_KEYS = {
     "netflow": ("collector",),
@@ -231,6 +232,12 @@ def get_config(service, params, body) -> dict:
         "alerts_settings": service.alerts_settings,
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
+        # The vendor override <select> is built from this, not a JS copy of
+        # configrx_vendors.VENDORS — label and key only, nothing a client
+        # could use to influence what a backup sends over SSH. Order matches
+        # the table's own (Python dicts keep insertion order).
+        "configrx_vendors": [{"key": key, "label": vendor.label}
+                             for key, vendor in configrx_vendors.VENDORS.items()],
     }
     _drop_unreadable(result, granted, _CONFIG_MODULE_KEYS)
     # "settings" itself stays present even without Settings access — every
@@ -358,6 +365,36 @@ def _storage(service) -> dict:
 
 # ------------------------------------------------------------------ netpath
 
+def _valid_hostname_label(label: str) -> bool:
+    return bool(label) and len(label) <= 63 and label[0] != "-" and label[-1] != "-" \
+        and all(c.isalnum() or c == "-" for c in label)
+
+
+def _valid_hostname(host: str) -> bool:
+    return bool(host) and len(host) <= 253 \
+        and all(_valid_hostname_label(label) for label in host.split("."))
+
+
+def _validate_target_host(host: str) -> str:
+    """A NetPath destination is traced, not polled, so unlike a Nodes device
+    it may be a hostname as well as an address — but `999.999.999.999` used
+    to be accepted as one and created a target that could never succeed. A
+    string shaped like an IPv4 address (four dot-separated numeric groups)
+    is held to being one rather than falling through to the hostname rule,
+    which would otherwise wave it through as a very ordinary-looking name."""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    parts = host.split(".")
+    looks_like_ipv4 = len(parts) == 4 and all(part.isdigit() for part in parts)
+    if looks_like_ipv4 or not _valid_hostname(host):
+        raise ValueError(
+            f"{host!r} is not a valid address or hostname.")
+    return host
+
+
 def _target_json(service, row, last=None) -> dict:
     keys = row.keys()
     return {
@@ -390,6 +427,7 @@ def post_target(service, params, body) -> dict:
     host = str(body.get("host", "")).strip()
     if not host:
         raise ValueError("A destination host or address is required")
+    host = _validate_target_host(host)
     target_id = service.db.add_target(
         host=host,
         label=str(body.get("label") or host).strip(),
@@ -408,6 +446,17 @@ def put_target(service, params, body, target_id: int) -> dict:
     fields = {k: v for k, v in body.items()
               if k in {"host", "label", "interval_s", "max_hops", "probes",
                        "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
+    # The same check the add route makes. Without it the validation there was
+    # worth nothing: add a destination with a host that resolves, then edit it
+    # to anything at all, and the traceroute thread spends every interval
+    # failing against a name that cannot exist — which is the state this
+    # release added that validation to stop.
+    if "host" in fields:
+        # str() first, the way the add route does it: `ip_address(123)` is a
+        # perfectly valid address object, so an integer would be stored as
+        # 0.0.0.123, and a null would raise AttributeError as a 500 rather
+        # than a refusal.
+        fields["host"] = _validate_target_host(str(fields["host"] or "").strip())
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
@@ -1129,6 +1178,50 @@ def _may_change_admin_settings(service, params) -> bool:
     return _is_admin(service, params)
 
 
+# Mirrors the min/max already on each of these inputs in index.html: the
+# Settings page refuses an out-of-range number before ever posting, but an
+# API client can skip the browser entirely, so this route holds the global
+# scope's numeric settings to the same bounds. None as a high means the
+# field is open-ended (a database cap has a floor, never a ceiling).
+_GLOBAL_SETTINGS_RANGES = {
+    "dns_workers": (1, 32),
+    "dns_timeout_s": (0.5, 30),
+    "dns_cache_days": (1, 365),
+    "asn_cache_days": (1, 365),
+    "netpath_refresh_s": (1, 300),
+    "nodes_refresh_s": (1, 3600),
+    "alerts_refresh_s": (1, 3600),
+    "netflow_refresh_s": (1, 3600),
+    "snmp_refresh_s": (1, 3600),
+    "syslog_refresh_s": (1, 3600),
+    "ipam_refresh_s": (1, 3600),
+    "wireless_refresh_s": (1, 3600),
+    "configrx_refresh_s": (1, 3600),
+    "dashboard_refresh_s": (1, 3600),
+    "debug_refresh_s": (1, 60),
+    "max_trace_db_mb": (16, None),
+    "max_flow_db_mb": (16, None),
+    "max_snmp_db_mb": (16, None),
+    "max_syslog_db_mb": (16, None),
+    "max_ipam_db_mb": (16, None),
+    "max_nodes_db_mb": (16, None),
+    "max_alerts_db_mb": (16, None),
+    "session_idle_minutes": (1, 1440),
+    "session_max_hours": (1, 168),
+}
+
+
+def _check_settings_ranges(values: dict) -> None:
+    for key, (low, high) in _GLOBAL_SETTINGS_RANGES.items():
+        if key not in values:
+            continue
+        value = values[key]
+        if value < low or (high is not None and value > high):
+            range_text = (f"between {low} and {high}" if high is not None
+                         else f"at least {low}")
+            raise ValueError(f"{key} must be {range_text}")
+
+
 def _scope_defaults(scope: str) -> dict:
     """The defaults dict whose value types a scope's settings must match."""
     from .. import (alertsdb, appdb, configrxdb, db, flowdb, ipamdb, nodesdb,
@@ -1160,6 +1253,7 @@ def post_settings(service, params, body) -> dict:
     # then raised from the next start's int() — every start, until the
     # database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
+    _check_settings_ranges(values)
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
@@ -2216,9 +2310,23 @@ def _discovery_job_json(row) -> dict:
             "error": row["error"]}
 
 
-def _discovery_result_json(row, installed=None) -> dict:
-    """`installed` is the set of MIB filenames present, passed by the caller
-    once per listing so the "install these MIBs" hint is not a query per row."""
+def _device_display_name(row) -> str:
+    """nodes.js's displayName() precedence: manual name if pinned to it,
+    else the SNMP hostname, else the manual name anyway, else the IP."""
+    return ((row["name"] if row["display_name_source"] == "manual" else None)
+            or row["sys_name"] or row["name"] or row["ip"])
+
+
+def _discovery_result_json(row, installed=None, devices_by_ip=None) -> dict:
+    """`installed` is the set of MIB filenames present, and `devices_by_ip`
+    an ip -> device row map, each passed by the caller once per listing so
+    neither the MIB hint nor the already-added check is a query per row.
+    `promoted_device_id` alone missed an address added to Nodes some other
+    way — by hand, or from an earlier scan — so `devices_by_ip` is checked
+    too; either source wins because promote() always reuses that same row."""
+    existing = devices_by_ip.get(row["ip"]) if devices_by_ip else None
+    existing_id = existing["id"] if existing else row["promoted_device_id"]
+    existing_name = _device_display_name(existing) if existing else None
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
@@ -2226,6 +2334,8 @@ def _discovery_result_json(row, installed=None) -> dict:
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
             "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
             "promoted_device_id": row["promoted_device_id"],
+            "existing_device_id": existing_id,
+            "existing_device_name": existing_name,
             **_discovery_identification(row, installed)}
 
 
@@ -3794,8 +3904,12 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
         raise ValueError("No such discovery job")
     results = service.nodes_db.discovery_results(job_id)
     installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
+    # One pass over the fleet rather than a device_by_ip() per row — a scan
+    # of a /22 can carry over a thousand results.
+    devices_by_ip = {d["ip"]: d for d in service.nodes_db.devices()}
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r, installed) for r in results]}
+            "results": [_discovery_result_json(r, installed, devices_by_ip)
+                        for r in results]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -5150,6 +5264,9 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
         # Same has_credential convention as every other stored password in
         # this app — the encrypted blob itself never reaches the browser.
         "has_credential": bool(config["ssh_password_enc"]) if config else False,
+        # Same convention again, for the separate enable secret a vendor like
+        # cisco-asa needs to reach privileged EXEC (see _do_enable).
+        "has_enable_secret": bool(config["enable_secret_enc"]) if config else False,
         "vendor_override": (config["vendor_override"] if config else "") or "",
         "last_backup_ts": config["last_backup_ts"] if config else None,
         "last_backup_status": config["last_backup_status"] if config else None,
@@ -5240,6 +5357,14 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
     fields = {k: v for k, v in body.items()
              if k in ("backup_enabled", "ssh_port", "ssh_username",
                       "vendor_override", "store_secrets")}
+    if "ssh_port" in fields:
+        try:
+            port = int(fields["ssh_port"])
+        except (TypeError, ValueError):
+            raise ValueError("The SSH port must be a number from 1 to 65535.") from None
+        if not 1 <= port <= 65535:
+            raise ValueError("The SSH port must be a number from 1 to 65535.")
+        fields["ssh_port"] = port
     if "store_secrets" in fields:
         fields["store_secrets"] = 1 if fields["store_secrets"] else 0
         _audit(service, params,
@@ -5360,13 +5485,24 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only, so ConfigRX refuses to store an SSH password "
             "here rather than keep it in plain text.")
+    # The enable secret is separate and optional, with set_credential's own
+    # three-way contract: the key absent from the body leaves whatever is
+    # already stored untouched, present-and-empty clears it, present-and-
+    # non-empty (re)encrypts and stores it. Needed only by a vendor whose
+    # login shell is not already privileged EXEC (currently just cisco-asa).
+    enable_kwargs = {}
+    if "enable_secret" in body:
+        enable_secret = str(body.get("enable_secret") or "")
+        enable_kwargs["enable_secret_enc"] = (
+            dpapi.protect(enable_secret.encode("utf-8")) if enable_secret else None)
+        enable_secret = None
     try:
         encrypted = dpapi.protect(password.encode("utf-8"))
     except dpapi.DpapiUnavailable as exc:
         raise ValueError(str(exc))
     finally:
         password = None
-    service.configrx_db.set_credential(device_id, username, encrypted)
+    service.configrx_db.set_credential(device_id, username, encrypted, **enable_kwargs)
     service.log.add(CONFIGRX_CATEGORY, f"Stored an SSH credential for {row['ip']}")
     _audit(service, params, "credential.store", target=f"configrx:{row['ip']}",
            detail=f"username {username}")
@@ -5383,6 +5519,22 @@ def delete_configrx_device_credential(service, params, body, device_id) -> dict:
     return {"ok": True}
 
 
+def delete_configrx_device_enable_secret(service, params, body, device_id) -> dict:
+    """The SSH username/password are untouched — only ConfigRxDatabase.
+    clear_enable_secret runs, for the device that turned out not to need
+    one. Clearing the whole credential (above) still clears both, per this
+    release's security review; this is the narrower operation that was
+    missing beside it."""
+    row = service.nodes_db.device(device_id)
+    if not row:
+        raise ValueError("No such device")
+    service.configrx_db.clear_enable_secret(device_id)
+    service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored enable secret for {row['ip']}")
+    _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}",
+           detail="enable secret only")
+    return {"ok": True}
+
+
 def get_configrx_device_backups(service, params, body, device_id) -> dict:
     if not service.nodes_db.device(device_id):
         raise ValueError("No such device")
@@ -5395,11 +5547,21 @@ def get_configrx_device_backups(service, params, body, device_id) -> dict:
 
 
 def get_configrx_backup(service, params, body, backup_id) -> dict:
+    """Reading a stored config is a read — the route this backs is gated
+    ConfigRX read, not write, so a viewer's click on a backup answers "has
+    this switch changed" instead of 403ing. A verbatim backup (captured
+    with store_secrets on) is the one case that still needs guarding: a
+    caller without ConfigRX write gets it through the same redaction pass
+    get_configrx_diff always applies, never the stored secrets themselves."""
     row = service.configrx_db.backup(backup_id)
     if not row:
         raise ValueError("No such backup")
     content = service.configrx_db.backup_content(backup_id)
-    return {"backup": _configrx_backup_json(row), "content": content}
+    backup_json = _configrx_backup_json(row)
+    if not backup_json["redacted"] and not _may_read_secrets(service, params, "configrx"):
+        content, _ = configrx_redact.redact(content or "")
+        backup_json["redacted"] = True
+    return {"backup": backup_json, "content": content}
 
 
 def _configrx_backup_label(row) -> str:
@@ -5783,14 +5945,23 @@ def _first_run(service) -> bool:
 
 
 def get_session(service, params, body) -> dict:
+    # The version goes to the sign-in page as well as to a signed-in one: it
+    # is the first thing asked for when someone reports a problem, and the
+    # page that shows it to an operator who cannot get in yet is the page
+    # they are looking at. It is not a secret — the login page is served
+    # before any session exists, and so is every asset the version is
+    # stamped on.
+    from .. import __version__
     session = service.sessions.get(params.get("_token", ""))
     if not session:
-        return {"authenticated": False, "first_run": _first_run(service)}
+        return {"authenticated": False, "first_run": _first_run(service),
+                "version": __version__}
     row = service.app_db.user(session["username"])
     idle_remaining = service.sessions.idle_seconds - (time.time() - session["last_seen"])
     return {
         "authenticated": True,
         "username": session["username"],
+        "version": __version__,
         "must_change": bool(row["must_change"]) if row else False,
         "idle_timeout_minutes": service.sessions.idle_seconds // 60,
         "idle_seconds_remaining": max(0, round(idle_remaining)),

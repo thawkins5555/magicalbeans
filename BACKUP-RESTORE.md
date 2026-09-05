@@ -49,7 +49,7 @@ Everything in the data directory:
 | `syslog.db` | messages, hourly rollups, the FTS5 search index | log history |
 | `ipam.db` | subnets, hosts, conflicts, DHCP scopes and leases, the DHCP credential | address inventory |
 | `wireless.db` | controllers, access points, radios | wireless history |
-| `configrx.db` | stored configuration backups, SSH host keys, the SSH credential | **your device configuration history** — for many sites the most valuable file here |
+| `configrx.db` | stored configuration backups, SSH host keys, the SSH credential and the optional per-device enable secret | **your device configuration history** — for many sites the most valuable file here |
 
 The default directory is `~/.local/share/netpath-monitor/` on Linux and macOS,
 `%APPDATA%\netpath-monitor\` on Windows. If you moved any of them with `--db`,
@@ -166,9 +166,10 @@ longer exist. They render as an id rather than a name; nothing breaks.
 **Stored credentials do not survive a move to another machine or another
 Windows account.** Every encrypted credential — the DHCP credential, SNMPv3
 authentication passwords, the SMTP password, the wireless controller's SNMP
-credential, ConfigRX's SSH password — is protected with the Windows Data
-Protection API in machine-and-account scope. That is the whole point of it: a
-copy of `nodes.db` on someone else's laptop is inert.
+credential, ConfigRX's SSH password and its optional per-device enable secret
+— is protected with the Windows Data Protection API in machine-and-account
+scope. That is the whole point of it: a copy of `nodes.db` on someone else's
+laptop is inert.
 
 The consequence for a restore is that the ciphertext comes back and cannot be
 decrypted. Concretely:

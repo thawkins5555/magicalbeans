@@ -26,14 +26,29 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 - [Data](#data)
 - [Deliberate limits](#deliberate-limits)
 
-**Dashboard**, **Nodes**, **Alerts**, **NetPath**, **NetFlow**, **SNMP
-Trap**, **Syslog**, **IPAM**, **Wireless**, **ConfigRX**, then **Debug**
-and **Settings**, which stay rightmost so adding a module never moves
-them. Dashboard aggregates whatever other modules the signed-in account
-can read — see Permissions, under Settings — rather than holding data of
-its own; from 4.39.0 it is a real page rather than a placeholder, and it
-is described under **Dashboard** below. A tab the signed-in account has no
-read access to is hidden from the tab bar entirely.
+The twelve tabs sit in four labelled groups, in frequency order: **Now**
+(**Dashboard**, **Alerts**), **Inventory** (**Nodes**, **IPAM**,
+**FortiWireless**, **ConfigRX**), **Telemetry** (**Routes**, **NetFlow**,
+**Syslog**, **SNMP Trap**) and **Admin** (**Settings**, **Debug**) — Admin
+stays rightmost so adding a module never moves it. The grouping is purely
+presentational: there is one tab list underneath it, and who is signed in,
+the way to the **Account** dialog, Sign out and the connection indicator
+sit outside the scrolling strip entirely, so narrowing the window can
+shrink the tabs but never scroll those out of reach. Routes is the NetPath
+module — the tab says what it shows, the package, database and settings
+keep the name they have always had. Dashboard aggregates whatever other
+modules the signed-in account can read — see Permissions, under Settings —
+rather than holding data of its own; from 4.39.0 it is a real page rather
+than a placeholder, and it is described under **Dashboard** below. A tab
+the signed-in account has no read access to is hidden from the tab bar
+entirely.
+
+**A global search, on `/`,** looks across devices, MAC addresses,
+interfaces, alerts and NetPath destinations at once and opens whatever is
+picked at that record's own URL — the same link a colleague could be sent
+instead. It stands down whenever a field, a dialog or the help panel
+already has the keyboard, and the **Search** button beside Account and
+Sign out opens it for a mouse.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -47,7 +62,9 @@ open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 `#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
 `#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
 `#/syslog/8801` and `#/wireless/3` for a trap, a message and an access
-point. Back walks the selections, a reload lands where you were,
+point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/topology`,
+`#/settings/users` — so a pasted link lands a colleague on the pane that was
+actually open, not just the tab. Back walks the selections, a reload lands where you were,
 and a link pasted into a ticket or an email opens what it names for
 anybody who can sign in and read that module. A route naming something the
 account cannot read, or that no longer exists, falls back to the tab.
@@ -60,9 +77,11 @@ way, whatever was typed into a search box, every dropdown filter, and the
 sub-tab a page was on (Devices or Discovery, Subnets or DHCP) all come back
 as they were. That covers the nine pages that have filters and sortable
 tables — Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless,
-ConfigRX and Debug. Dashboard and Settings have nothing of the kind to
-keep, and NetPath keeps its own time window per destination instead, since
-there the window belongs to the destination rather than to the page. What
+ConfigRX and Debug. **Settings** remembers only which of its own subtabs
+was open, the same per-browser way, since it has no filters or tables of
+its own to keep; Dashboard has nothing of the kind at all, and NetPath
+keeps its own time window per destination instead, since there the window
+belongs to the destination rather than to the page. What
 is deliberately *not* remembered is the Live / follow switch on the
 streaming pages: a page that came back with its updates quietly switched
 off would read as broken, so those start on every load. It is also *per
@@ -136,7 +155,8 @@ rather than records to work through.
 
 ### Themes
 
-Three, chosen on the Settings tab under **Appearance · this browser**: Dark
+Three, chosen in the **Account** dialog under **Appearance · this
+browser**: Dark
 (the default), Light, and High contrast. The choice is stored in the browser,
 not on the server — it belongs to the screen and the eyes in front of it, so
 a shared NOC workstation keeps it across sign-ins and every account on that
@@ -161,12 +181,64 @@ mouse. A pane splitter can be moved from the keyboard: Tab to it, arrow keys
 move it 5 % (1 % with Shift), Home and End park it, Enter resets it, exactly
 as a double-click does. A column header resizes with Alt+Left/Right.
 
+### Accessibility
+
+Keyboard and screen-reader support are built into the shell, not layered
+onto it afterward.
+
+- **The tab bar and every subtab bar behave like the tabs they say they
+  are.** ArrowRight/ArrowLeft and Home/End move both focus and selection
+  along the strip, and only the active tab sits in the page's own Tab
+  order, so leaving the strip is one stop rather than twelve. One shared
+  helper wires the same roving-tabindex behaviour onto every module's own
+  subtab row — a device's INTERFACES/NEIGHBOURS/BRIDGE & RF/EVENTS group
+  included — so no module has to implement it for itself.
+- **Every chart, the route graph, the timeline and the topology map are
+  reachable without a pointer.** Each carries a label built from the same
+  summary its own header already shows, a visually hidden table stands
+  beside a histogram with the buckets its bars draw, and a tooltip answers
+  focus the same way it answers hover, in NetFlow, IPAM, NetPath, Nodes,
+  SNMP Trap and Syslog alike. Keyboard movement suits what the chart is
+  for: NetFlow's arrow keys pan and zoom, NetPath's timeline walks bucket
+  by bucket with the crosshair following, IPAM's scope trend walks point
+  by point, and the NetPath destination list — the control that decides
+  what the whole module is showing — is a real listbox rather than a set
+  of mouse-only rows.
+- **The SSH terminal talks back to assistive technology.** Its status line
+  is announced as it changes, and a visually hidden log receives each
+  completed line of device output, so a screen reader hears the session
+  instead of silence. The terminal has to keep Tab for the programs
+  running on the device — vi, less, a switch's own menu console all need
+  it — so Escape is left alone to reach them, and the published way out is
+  **Ctrl+F6** instead, named in a hint under the terminal's header.
+- **Status is never colour alone.** Every status mark on screen — up/down,
+  a ConfigRX backup's changed/unchanged/suspect, a trap's or a syslog
+  line's severity — pairs a distinct shape with the colour, and shows the
+  word itself wherever there is room for it; a column too narrow for the
+  word still names the mark through its own accessible label. The device
+  status timeline and the route graph carry the same idea into texture —
+  refused, skipped and unknown are each their own hatch or stripe, not
+  only their own hue — while a plain, textureless fill is kept for "no
+  data at all", so silence and an unknown reading never draw identically.
+- **Focus is never thrown away by a redraw.** A discard prompt marks the
+  form behind it inert rather than leaving Tab to wander through the
+  fields it is asking about, sorting a table column restores focus to the
+  header that was just sorted, and the idle-session countdown keeps
+  ticking visibly every second but is only announced at its checkpoints,
+  not on every tick.
+
 ### On a wall — `/?kiosk=1`
 
 Open the application as `/?kiosk=1#/dashboard` (any tab route works) for a
 wall display: the tab strip goes, everything is a quarter larger, and one
 thin bar names the view, shows the clock, the account, and **how long the
 session has left**. Sign-in keeps the flag, so a bookmark works.
+
+The **Account** dialog can build the same link without typing it: choose
+which tabs to **Rotate through** and **Every** how many seconds, then
+**Open this view as a wall display**. A rotating kiosk shows a row of dots
+for the views in the cycle and a countdown to the next one, so a person
+walking past the wall can see what's coming as well as what's on it now.
 
 The session is held open — the heartbeat goes without anyone at the
 keyboard — **only for an account with no write permission on any module**.
@@ -373,15 +445,27 @@ own subtabs.
   defaults — the values apply to that one sweep only. Extra ping passes
   revisit only the addresses that haven't answered; SNMP retries re-attempt
   each credential.
-- **A finished scan ends in an approve/deny dialog** — every discovered
-  device listed with a checkbox, SNMP-identified ones pre-checked, and
-  nothing added until "Add approved" is clicked. Dismissing adds nothing,
-  and either answer is final for that scan's dialog (the RESULTS pane
-  remains for promoting later, with the same defaults). Devices that only
-  answered ping are excluded unless the scan was started with the
-  "Also offer ping-only devices" option — enforced server-side, not just
-  in the dialog — and an approved ping-only device is created with SNMP
-  polling switched off so it doesn't sit failing SNMP forever.
+- **A finished scan opens an approve/deny dialog once**, and only for the
+  browser that started it — every discovered device listed with a
+  checkbox, SNMP-identified ones pre-checked, and nothing added until
+  "Add approved" is clicked. It no longer pops back open over whatever the
+  operator came to Nodes to do: from any other visit, an unreviewed scan is
+  a dismissible line in the strip instead, naming how many new devices it
+  found with its own **Review** (opens the same dialog) and **Dismiss**.
+  Dismissing, from either place, adds nothing, and either answer is final
+  for that scan (the RESULTS pane remains for promoting later, with the
+  same defaults). Devices that only answered ping are excluded unless the
+  scan was started with the "Also offer ping-only devices" option —
+  enforced server-side, not just in the dialog — and an approved ping-only
+  device is created with SNMP polling switched off so it doesn't sit
+  failing SNMP forever.
+- **A result whose address is already a device says so, and drops out of
+  the pile to add.** In place of a checkbox its row reads "Already added —
+  <name>", linked straight to that device, and it is left out of the
+  header's select-all — ticking every remaining box can never resubmit an
+  address that's already monitored. **Add approved** reports how many of
+  the ticked results were genuinely new, since a batch that included
+  already-added rows would otherwise look like it added more than it did.
 - **A cancelled scan gets the same dialog for whatever it found** before
   it stopped — add those devices, or Discard the scan and its results
   entirely. Any scan that is no longer running can be removed from the
@@ -577,6 +661,12 @@ from — never the password. **Remove** now lives in the device's Edit dialog, b
 credential, so the pane's buttons are the things you do *to* a device
 rather than the one thing you do to get rid of it.
 
+**A WEB button sits beside SSH**, a plain link to the device's own web
+interface (`http://<ip>/`, IPv6 bracketed) opened in a new tab. Unlike
+SSH it carries no permission of its own — it opens nothing on this
+server, only a tab in the browser — so it shows for anyone who can see the
+device at all, once the device has an address to link to.
+
 **The status timeline is the device pane's headline** — a thin colored
 bar of up/down/unsupported/auth-failed segments across the selected time
 window, sized to match NetPath's own status lane rather than reading as
@@ -706,6 +796,10 @@ guess and an operator-chosen OID are not equally trustworthy.
 column is unique, adding one that already exists is refused by name rather
 than by a database error, and promoting a discovery result whose address is
 already a device links to that device instead of creating a second one.
+**Add device** validates before it posts — a blank address is flagged on
+the field rather than the button silently doing nothing — and a refusal
+from the server, a duplicate address included, is shown in the dialog's own
+error line instead of vanishing into a rejected request nobody sees.
 
 **Browse OIDs** opens a live view of what the device actually answers,
 decoded against every MIB the app knows. It opens on `system`,
@@ -1674,8 +1768,11 @@ arrival time** in the settings.
 
 ## IPAM — address inventory, conflicts, DHCP visibility
 
-Three views inside one tab, switched locally: DHCP (the default view when
-the tab opens), Conflicts, and Subnets & Hosts.
+Three views inside one tab, switched locally: Subnets & Hosts (the default
+view when the tab opens), Conflicts, and DHCP. Subnets & Hosts works on
+every platform; DHCP needs a Windows host (below) and its subtab is
+disabled and explained, rather than opening onto a page that can never
+load, wherever it isn't available.
 
 ### Find
 
@@ -1716,7 +1813,12 @@ subnet's sidebar row gives the exact numbers as a tooltip.
 
 The host table sorts and resizes the same way NetFlow's flow record table
 does: click a heading to order by it, drag an edge to resize, both remembered
-per browser. **Last reply** is when an address last actually answered;
+per browser. Its Alive column, and the Find box's results (above), draw up
+and down with the same shape-and-colour status mark every other module's
+tables use, rather than a colour of their own; an address that has never
+once answered is `none`, not `fail`, matching what the sidebar donut
+already calls "never seen" rather than an outage. **Last
+reply** is when an address last actually answered;
 **First probed** is when it first entered the sweep, which is not the same
 thing and is worth not confusing — an address swept for weeks without ever
 answering has a recent "first probed" and a "Last reply" of *never*.
@@ -1953,6 +2055,14 @@ to a manual name in Nodes.
   There is no editable field and no save-back action anywhere in this
   module: it only ever pulls a config, never pushes one, and there is no
   free-form command box anywhere in its UI or API.
+- **Opening a stored backup needs only ConfigRX read, not write** — seeing
+  what changed on a switch is a narrower thing than being trusted to
+  change it, and a read-only account's click on a backup answers that
+  question instead of being refused outright. The one case still guarded
+  is a backup a device is deliberately configured to keep unredacted: read
+  it without ConfigRX write and it comes back through the same redaction
+  pass the diff view below always applies to both sides, rather than as
+  the secrets themselves.
 - **Diff two backups, from 4.47.0.** A unified diff between any two of a
   device's stored backups — adjacent by default — gated exactly like
   reading a backup itself. Both sides are re-redacted before the diff
@@ -1964,17 +2074,30 @@ to a manual name in Nodes.
   one** (compared by SHA-256 hash) — an unchanged config updates that
   device's last-checked time without growing the database. **Back up
   now** forces an immediate pull for one device, the same "do it now"
-  convention Nodes' own **Poll now** uses.
+  convention Nodes' own **Poll now** uses. A device with backups switched
+  off shows the button disabled with that reason rather than hiding it
+  outright, and a failed attempt toasts the device and the reason instead
+  of only flipping the button's label to *Failed*.
 - **Exactly one fixed, read-only command per vendor**, matched against
   the device's vendor as Nodes already detected it over SNMP (or an
-  explicit override, for a vendor Nodes didn't identify): Cisco IOS
-  `show running-config`, FortiOS `show full-configuration`, Junos `show
-  configuration`, MikroTik RouterOS `/export`, HP/Aruba `show
-  running-config` — plus, for vendors that need it, a session-scoped
-  pagination-disable command (e.g. `terminal length 0`) sent first. An
-  unrecognized vendor is skipped with a clear error rather than guessed
-  at. ConfigRX never enters a device's configuration/enable-write mode
-  and never sends anything beyond that one fixed command.
+  explicit override, for a vendor Nodes didn't identify): Cisco IOS/IOS-XE,
+  NX-OS and IOS-XR all `show running-config`; Cisco Small Business
+  (SG/CBS) the same, after `terminal datadump`; Cisco ASA the same, after
+  `terminal pager 0`; Cisco WLC (AireOS) `show run-config`, after `config
+  paging disable`; FortiOS `show full-configuration`; Junos `show
+  configuration`; MikroTik RouterOS `/export`; HP/Aruba `show
+  running-config` — each preceded, where the platform needs it, by that
+  one session-scoped pagination-disable command. An unrecognized vendor is
+  skipped with a clear error rather than guessed at.
+- **A platform whose login lands in user EXEC, not privileged, escalates
+  first.** Cisco ASA is the one that ships this way: before its
+  pagination-disable command, ConfigRX sends the literal `enable` and,
+  when the device's own prompt asks for one, the enable secret stored for
+  that device (below) — never a secret from anywhere else. A capture that
+  never actually reaches privileged mode is refused rather than stored.
+  Past that one step, ConfigRX still never enters a device's configuration
+  mode and never sends anything beyond its fixed pager-off, enable and
+  show-config commands.
 - **A stored backup can be deleted**, one at a time or several at once from
   the backups list's own checkboxes. Deleting the **most recent** backup is
   called out separately in the confirmation: a new backup is only stored when
@@ -2015,10 +2138,26 @@ to a manual name in Nodes.
   than no backup at all: it becomes the newest version, the next real backup
   reads as an enormous change, and a restore from history hands someone a
   fragment.
+- **A capture that completed but is suspiciously small is stored and
+  flagged, not silently treated as a real change.** One under a fifth of
+  the size of that device's previous stored backup did reach the device's
+  own prompt, so it isn't refused outright — but it's marked `suspect`
+  rather than `changed`, with its own count in the backups summary,
+  because storing it as an ordinary change would make the next diff read
+  as though the entire configuration had been deleted.
 - **The SSH password is encrypted at rest** (see `CREDENTIAL-SECURITY.md`)
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and
   discarded the moment the connection attempt finishes.
+- **An enable secret can be stored per device**, beside the SSH username
+  and password in the same single-device credential dialog, with a hint
+  that it is only needed on a platform whose login lands in user EXEC
+  rather than privileged EXEC. It is protected exactly like the SSH
+  password — encrypted at rest, decrypted only in memory right before it's
+  sent, never returned by any API response — and leaving the field blank
+  on a save leaves a stored secret alone; **Clear credential** clears the
+  enable secret along with the password rather than leaving it behind,
+  unreachable, for the device.
 - **Backing up with the worker stopped says so.** "Back up now" used to
   report success and do nothing: the queue it went into was never being
   drained. It is now refused with a message naming the reason, and the
@@ -2122,6 +2261,16 @@ endpoints. ASN/owner lookup sits beside it for the same reason and can name a
 different query server, since a resolver good enough for internal reverse DNS
 may not be able to reach the public internet, which the ASN lookup needs.
 
+**The Settings tab has seven subtabs of its own** — General, Data &
+retention, Sign-in, Users, Tokens & directory, Maintenance and Modules —
+addressable in the URL (`#/settings/users`) the same way every other
+module's subtabs are. **Modules** is one list linking to all nine
+per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow, SNMP
+Trap, Syslog, IPAM, FortiWireless, ConfigRX) rather than each module's own
+Settings button being the only way to reach it — one place that answers
+"where is the setting for X" without already knowing which tab it lives
+on.
+
 **Database size caps** — one per database, defaulting to 512 MB for traces,
 2 GB for flows, 256 MB for SNMP traps, 1 GB for syslog, 256 MB for IPAM,
 1 GB for Nodes and 128 MB for Alerts — are checked every 15 minutes. When
@@ -2171,8 +2320,13 @@ password ends every session on that account, this one included.
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
 ConfigRX, SSH, Settings, Debug and — new in 4.39.0 — Admin, set from
-**Settings → Users** (itself gated on Admin write access). Write implies
-read; no grant at all means no
+**Settings → Users** (itself gated on Admin write access). The grid there
+offers a handful of **role presets** — Viewer, Operator, Admin — that fill
+it in one click as a starting point rather than a lock (one manual change
+and the picker relabels itself Custom), a **copy from** field that seeds a
+new account's grants from an existing one's, and a **generated initial
+password** rather than an empty field left for someone to fill in by
+convention. Write implies read; no grant at all means no
 access. A tab the signed-in account can't read is hidden from the tab
 bar. A write-gated control within a tab the account *can* read — an
 add/edit/delete button, a module's Settings gear — is **disabled and says
@@ -2205,8 +2359,12 @@ from there the two can be granted and taken away separately.
 **Changing your own password always works**, even with zero access to
 Settings — it lives in an "Account" control in the top bar, independent
 of the Settings tab, rather than being gated like everything else there.
-Resetting a *different* account's password requires Admin write, same as
-adding, editing or removing an account.
+The same dialog also shows how long the current session has left and
+gathers **Appearance · this browser** — theme and the kiosk launcher (see
+**On a wall**, above) — a per-browser preference that has no business
+being on a page of settings the server stores for everyone. Resetting a
+*different* account's password requires Admin write, same as adding,
+editing or removing an account.
 
 An install upgrading from a version before this shipped keeps every
 existing account's access exactly as it was — the first time the
@@ -2342,14 +2500,15 @@ moves its settings, accounts and name cache into it on the first start.
   a DHCP server, has no such restriction — it is configured per machine
   anyway, not shipped inside the database.
 - **ConfigRX can only back up a device whose vendor it recognizes.** A
-  fixed, deliberately short allow-list — Cisco, FortiOS, Junos, MikroTik,
-  HP/Aruba — is the entire set of "show config" commands this app knows
-  how to run; a device Nodes couldn't identify, or one from a vendor not
-  in that list, needs a vendor override set to a value on the list before
-  it can be backed up, or it's skipped with a clear error. This is
-  deliberate: adding a new vendor means adding its fixed, read-only show-
-  command to `configrx_vendors.py`, never accepting one typed into a
-  field.
+  fixed, deliberately short allow-list — six Cisco platform families (IOS/
+  IOS-XE, NX-OS, IOS-XR, Small Business, ASA, WLC), FortiOS, Junos,
+  MikroTik, HP/Aruba — is the entire set of "show config" commands this
+  app knows how to run; a device Nodes couldn't identify, or one from a
+  vendor not in that list, needs a vendor override set to a value on the
+  list before it can be backed up, or it's skipped with a clear error.
+  This is deliberate: adding a new vendor means adding its fixed,
+  read-only show-command to `configrx_vendors.py`, never accepting one
+  typed into a field.
 - **ConfigRX never pushes a configuration change, to any device, ever.**
   There is no code path in this module capable of it — no free-form
   command box, no "push config" action, nowhere in its UI or API. It only

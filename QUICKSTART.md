@@ -16,7 +16,7 @@ does, `RUNBOOK.md` what to do when one of them stops.
 4. [Add a polling profile](#4-add-a-polling-profile)
 5. [Add your first device](#5-add-your-first-device)
 6. [Check the poll actually worked](#6-check-the-poll-actually-worked)
-7. [Add a NetPath destination](#7-add-a-netpath-destination)
+7. [Add a Routes destination](#7-add-a-routes-destination)
 8. [Turn on email — or read why you cannot](#8-turn-on-email--or-read-why-you-cannot)
 9. [The next hour](#9-the-next-hour)
 
@@ -94,7 +94,7 @@ capability, on **Settings → Users**. One account is one lost password away fro
 a stopped service, and the recovery procedure involves deleting a table.
 
 **What the grants mean.** Each account gets read or write per module — Nodes,
-Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless, ConfigRX, SSH,
+Alerts, Routes, NetFlow, SNMP Trap, Syslog, IPAM, FortiWireless, ConfigRX, SSH,
 Debug, Settings — where write implies read and no grant means no access. Above
 those sits one capability, **`admin`**, which gates user administration,
 permission changes, the update path and the destructive maintenance actions.
@@ -167,9 +167,9 @@ Open the device's detail pane and look at an interface: you should see
 inbound and outbound rates. The first poll shows no rate — a rate needs two
 samples — which is correct, not a fault.
 
-## 7. Add a NetPath destination
+## 7. Add a Routes destination
 
-**NetPath → Add.** Give it an address you care about reaching — a site
+**Routes → Add.** Give it an address you care about reaching — a site
 gateway, a cloud endpoint — an interval of five minutes, and the default hop
 and probe counts.
 

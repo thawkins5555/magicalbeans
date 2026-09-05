@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in — SappiWhere</title>
-<link rel="stylesheet" href="/tokens.css">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/tokens.css?v=__SW_VERSION__">
+<link rel="stylesheet" href="/app.css?v=__SW_VERSION__">
 <!-- Applies the stored theme before the first frame; see boot.js. -->
-<script src="/boot.js"></script>
+<script src="/boot.js?v=__SW_VERSION__"></script>
 </head>
 <body class="login-page">
 <main class="login-box">
@@ -17,11 +17,12 @@
 
   <form id="login-form" autocomplete="on">
     <label for="username">Username</label>
-    <input id="username" name="username" autocomplete="username" autofocus required>
+    <input id="username" name="username" autocomplete="username" autofocus required
+           aria-describedby="login-error">
 
     <label for="password">Password</label>
     <input id="password" name="password" type="password"
-           autocomplete="current-password" required>
+           autocomplete="current-password" required aria-describedby="login-error">
 
     <p id="login-error" class="err" role="alert" hidden></p>
     <button id="login-button" type="submit" class="primary">Sign in</button>
@@ -32,8 +33,14 @@
   <p id="login-note" class="hint" hidden>First time here? Sign in as
     <b>admin</b> with the password <b>admin</b>. You will be asked to choose a
     new password before anything else.</p>
+  <!-- The rest of the interface names its own version in the Account
+       dialog; this page had nothing at all before it, which left no way to
+       tell a stale bookmark or a caching proxy from an actual upgrade
+       without signing in first. Set from /api/session, which already
+       answers before there is a session. -->
+  <p id="login-version" class="hint" hidden></p>
 
 </main>
-<script src="/login.js" defer></script>
+<script src="/login.js?v=__SW_VERSION__" defer></script>
 </body>
 </html>

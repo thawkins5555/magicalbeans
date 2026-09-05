@@ -246,19 +246,24 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
   await check('the shell announces itself: h1, skip link, tablist, tabpanels',
     async () => {
+      // Scoped to the top-level strip (#tabs and its twelve .page panels)
+      // rather than the whole document: the .subtabs groups inside Nodes,
+      // Alerts and IPAM are genuine nested tablists with their own
+      // role="tablist"/"tab"/"tabpanel" now (see the check below), so a
+      // document-wide count of either role is no longer twelve or one.
       const shell = await page.evaluate(() => ({
         h1: document.querySelectorAll('h1').length,
         skip: Boolean(document.querySelector('.skip-link')),
-        tablist: document.querySelectorAll('[role="tablist"]').length,
+        tablist: document.querySelectorAll('#tabs[role="tablist"]').length,
         tabs: document.querySelectorAll('.tab[role="tab"]').length,
         selected: document.querySelectorAll('.tab[aria-selected="true"]').length,
-        panels: document.querySelectorAll('[role="tabpanel"]').length,
+        panels: document.querySelectorAll('.page[role="tabpanel"]').length,
         connLive: (document.getElementById('conn') || {}).getAttribute
           ? document.getElementById('conn').getAttribute('role') : null,
       }));
       assert(shell.h1 >= 1, 'no <h1> in the document');
       assert(shell.skip, 'no skip link');
-      assert(shell.tablist === 1, `expected one tablist, found ${shell.tablist}`);
+      assert(shell.tablist === 1, `expected one #tabs tablist, found ${shell.tablist}`);
       assert(shell.tabs === TABS.length,
              `expected ${TABS.length} role="tab", found ${shell.tabs}`);
       assert(shell.selected === 1,
@@ -268,6 +273,66 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       assert(shell.connLive === 'status',
              `#conn should be role="status", is ${shell.connLive}`);
       return `h1 ${shell.h1}, tabs ${shell.tabs}, panels ${shell.panels}`;
+    });
+
+  await check('the .subtabs groups are their own nested tablists, keyboard and all',
+    async () => {
+      // Nodes' top-level nav, its nested device-detail pane (present in the
+      // DOM whether or not a device is selected — only its ancestor is
+      // [hidden]), Alerts and IPAM: each .subtabs is a tablist in its own
+      // right, wired by App.wireSubtabGroups rather than by the module.
+      await selectTab(page, 'nodes');
+      await settle(page, 700);
+      const audit = await page.evaluate(() => {
+        const groups = [...document.querySelectorAll('.subtabs')];
+        return groups.map((nav) => {
+          const tabs = [...nav.querySelectorAll(':scope > .subtab')];
+          return {
+            tablist: nav.getAttribute('role') === 'tablist',
+            tabCount: tabs.length,
+            tabRole: tabs.every((t) => t.getAttribute('role') === 'tab'),
+            selected: tabs.filter((t) => t.getAttribute('aria-selected') === 'true').length,
+            panelled: tabs.every((t) => t.getAttribute('aria-controls')
+              && document.getElementById(t.getAttribute('aria-controls'))
+              && document.getElementById(t.getAttribute('aria-controls'))
+                .getAttribute('role') === 'tabpanel'),
+          };
+        });
+      });
+      assert(audit.length >= 3, `expected at least 3 .subtabs groups, found ${audit.length}`);
+      for (const [index, group] of audit.entries()) {
+        assert(group.tablist, `.subtabs #${index} has no role="tablist"`);
+        assert(group.tabRole, `.subtabs #${index} has a .subtab without role="tab"`);
+        assert(group.selected === 1,
+               `.subtabs #${index} has ${group.selected} aria-selected="true" subtabs, want 1`);
+        assert(group.panelled, `.subtabs #${index} has a subtab whose aria-controls ` +
+               'does not name a role="tabpanel"');
+      }
+      // ArrowRight from the first subtab of the top-level Nodes group moves
+      // focus AND selection to the second, the same contract #tabs has.
+      const before = await page.evaluate(() =>
+        document.querySelector('#page-nodes > .subtabs > .subtab[aria-selected="true"]')
+          .dataset.subtab);
+      await page.focus('#page-nodes > .subtabs > .subtab:first-child');
+      await page.keyboard.press('ArrowRight');
+      await settle(page, 300);
+      const after = await page.evaluate(() => ({
+        selected: document.querySelector(
+          '#page-nodes > .subtabs > .subtab[aria-selected="true"]').dataset.subtab,
+        focused: document.activeElement
+          && document.activeElement.classList.contains('subtab')
+          && document.activeElement.getAttribute('aria-selected') === 'true',
+      }));
+      assert(after.selected !== before, `ArrowRight did not change the selected subtab ` +
+             `(stayed on ${before})`);
+      assert(after.focused, 'ArrowRight moved the selection but not the keyboard focus');
+      // Leave Nodes as every other check here found it.
+      await page.evaluate(() => {
+        const first = document.querySelector('#page-nodes > .subtabs > .subtab:first-child');
+        if (first) first.click();
+      });
+      await settle(page, 300);
+      return `${audit.length} subtab tablist(s), arrow keys move focus and selection`;
     });
 
   await check('every rendered table has a caption and scope="col" headers',
@@ -361,12 +426,16 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         const svg = document.getElementById('nd-status-timeline-svg');
         const segs = svg ? [...svg.querySelectorAll('.timeline-seg')] : [];
         return {
-          patterns: svg ? svg.querySelectorAll('#sw-pat-defs pattern').length : 0,
+          // Each host svg now carries its own suffixed <defs> (App.
+          // statusPatternDefs), rather than every chart sharing the one
+          // #sw-pat-defs id — the very collision this fixed — so this
+          // svg's own <pattern> children are what to count.
+          patterns: svg ? svg.querySelectorAll('pattern').length : 0,
           segments: segs.length,
           focusable: segs.filter((g) => g.getAttribute('tabindex') === '0').length,
           labelled: segs.filter((g) => (g.getAttribute('aria-label') || '').length > 3).length,
-          patternForDown: App.statusPatternUrl('down'),
-          patternForUp: App.statusPatternUrl('up'),
+          patternForDown: App.statusPatternUrl('down', svg),
+          patternForUp: App.statusPatternUrl('up', svg),
         };
       });
       assert(audit.patterns >= 5,
@@ -451,6 +520,97 @@ async function checkDialog(page, dir, tag) {
   });
 
   await closeAnything(page);
+
+  await check('Account opens with a Cancel button and closes on Escape', async () => {
+    await page.click('#account-btn');
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await sleep(300);
+    const before = await page.evaluate(() => ({
+      title: (document.getElementById('modal-title') || {}).textContent,
+      hasCancel: [...document.querySelectorAll('.modal-buttons button')]
+        .some((b) => b.textContent.trim() === 'Cancel'),
+    }));
+    assert(before.hasCancel, `no Cancel button in "${before.title}"`);
+    await page.keyboard.press('Escape');
+    await sleep(400);
+    const closed = await page.evaluate(() => document.getElementById('modal').hidden);
+    assert(closed, 'Escape did not close the Account dialog');
+    return `"${before.title}" had Cancel, Escape closed it`;
+  });
+
+  await closeAnything(page);
+
+  await check('the WEB link on a selected device points at http://<ip>/', async () => {
+    await selectTab(page, 'nodes');
+    await settle(page, 900);
+    await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
+    await page.click('#nodes-table tbody tr:first-child');
+    await sleep(500);
+    const web = await page.evaluate(() => {
+      const el = document.getElementById('nd-web-device');
+      return { hidden: el ? el.hidden : true, href: el ? el.getAttribute('href') : null };
+    });
+    assert(!web.hidden, 'the WEB link stayed hidden with a device selected');
+    assert(web.href && web.href.startsWith('http://'), `href was ${web.href}`);
+    return web.href;
+  });
+
+  await check('a discovery result for an already-added IP is not checkable', async () => {
+    const setup = await page.evaluate(async () => {
+      const devices = await App.get('/api/nodes/devices', { limit: 1 });
+      const device = (devices.devices || [])[0];
+      if (!device) return { error: 'no devices to reuse' };
+      const groups = await App.get('/api/nodes/groups');
+      const group = (groups.groups || [])[0];
+      if (!group) return { error: 'no polling profile to scan with' };
+      // allow_ping_only sidesteps the "no v1/v2c community" refusal — the
+      // point here is only that the address matches an existing device,
+      // which nodediscover.py records regardless of ping/SNMP outcome.
+      const job = await App.post('/api/nodes/discovery',
+        { target: device.ip, group_id: group.id, allow_ping_only: true });
+      for (let i = 0; i < 40; i += 1) {
+        const status = await App.get(`/api/nodes/discovery/${job.id}`);
+        if (status.job.state !== 'running') {
+          return { jobId: job.id, deviceId: device.id, target: device.ip,
+                    state: status.job.state };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return { jobId: job.id, deviceId: device.id, target: device.ip, state: 'timeout' };
+    });
+    if (setup.error) return `skipped: ${setup.error}`;
+    try {
+      assert(setup.state === 'done', `job ended in state ${setup.state}`);
+      await page.click('#page-nodes .subtabs [data-subtab="discovery"]');
+      await settle(page, 500);
+      await page.waitForSelector('#disc-jobs-table tbody tr', { timeout: 10000 });
+      await page.locator('#disc-jobs-table tbody tr', { hasText: setup.target })
+        .first().click();
+      await sleep(500);
+      const row = await page.evaluate(() => {
+        const hit = [...document.querySelectorAll('#disc-results-table tbody tr')]
+          .find((tr) => tr.textContent.includes('Already added'));
+        if (!hit) return null;
+        const link = hit.querySelector('a');
+        return { text: hit.textContent.trim(),
+                 hasCheckbox: !!hit.querySelector('input[type=checkbox]'),
+                 href: link ? link.getAttribute('href') : null };
+      });
+      assert(row, 'no "Already added" row found in the results table');
+      assert(!row.hasCheckbox, 'an "Already added" row still carries a checkbox');
+      assert(row.href === `#/nodes/device/${setup.deviceId}`, `link was ${row.href}`);
+      return row.text;
+    } finally {
+      await page.evaluate((id) => App.del(`/api/nodes/discovery/${id}`).catch(() => {}),
+        setup.jobId).catch(() => {});
+      // Leave the Nodes subtab as every other check here found it — the
+      // devices grid other checks (checkRouting) rely on being visible.
+      await page.click('#page-nodes .subtabs [data-subtab="devices"]').catch(() => {});
+      await settle(page, 300);
+    }
+  });
+
+  await closeAnything(page);
 }
 
 async function checkRouting(page, base, dir, tag) {
@@ -492,6 +652,39 @@ async function checkRouting(page, base, dir, tag) {
              `restored "${state.name}" instead of "${deviceName}"`);
     }
     return `${state.hash} -> ${state.name}`;
+  });
+
+  /* A device selection routed to #/nodes/device/<id> and survived a
+     reload, but switching to a top-level subtab left the URL unchanged, so
+     the URL described a screen that was not on screen and Back restored a
+     pane the history entry never named (Phase 6). Nodes' TOPOLOGY subtab
+     exercises the fix: clicking it now writes #/nodes/topology, and a cold
+     reload of that URL lands back on TOPOLOGY, not on whatever DEVICES
+     left in localStorage. */
+  await check('a subtab route survives a reload', async () => {
+    await selectTab(page, 'nodes');
+    await settle(page, 900);
+    await page.click('#page-nodes > .subtabs > [data-subtab="topology"]');
+    await sleep(600);
+    const subtabHash = await page.evaluate(() => window.location.hash);
+    assert(subtabHash === '#/nodes/topology', `hash is "${subtabHash}"`);
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await ready(page);
+    await sleep(2500);
+    const state = await page.evaluate(() => ({
+      hash: window.location.hash,
+      tab: App.state.tab,
+      active: (document.querySelector(
+        '#page-nodes > .subtabs > .subtab[aria-selected="true"]') || {}).dataset,
+    }));
+    assert(state.hash === subtabHash, `hash became "${state.hash}", was "${subtabHash}"`);
+    assert(state.tab === 'nodes', `landed on the ${state.tab} tab`);
+    assert(state.active && state.active.subtab === 'topology',
+           `the active subtab is "${state.active && state.active.subtab}", not topology`);
+    // Leave Nodes the way every other check here found it.
+    await page.click('#page-nodes > .subtabs > [data-subtab="devices"]').catch(() => {});
+    await sleep(400);
+    return `${state.hash} -> subtab ${state.active.subtab}`;
   });
 
   let alertHash = null;
@@ -674,6 +867,37 @@ async function checkMisc(page) {
         && typeof window.App.selectTab === 'function');
     assert(ok, 'window.App is still undefined');
     return '';
+  });
+
+  // Two tables can share a column set — the interface list is drawn in the
+  // Nodes pane and again inside the device dialog — and a reused <tr> is
+  // MOVED when it is appended, not copied. A row cache keyed on the columns
+  // alone therefore had the two tables taking rows off each other: opening
+  // the dialog emptied the pane, and the next poll emptied the dialog.
+  await check('the device dialog does not take the pane\'s interface rows', async () => {
+    await page.evaluate(() => window.App.selectTab('nodes'));
+    await page.waitForTimeout(1200);
+    const row = await page.$('#nodes-table tbody tr');
+    assert(row, 'no device rows to open');
+    await row.click();
+    await page.waitForTimeout(1500);
+    const count = (sel) => page.evaluate((s) => {
+      const table = document.querySelector(s);
+      return table ? table.querySelectorAll('tbody tr').length : -1;
+    }, sel);
+    const before = await count('#nd-if-table');
+    if (before < 1) return 'skipped: the selected device lists no interfaces';
+    await row.dblclick();
+    await page.waitForTimeout(1500);
+    const pane = await count('#nd-if-table');
+    const dialog = await count('#ndd-if-table');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
+    assert(pane === before,
+           `the pane held ${before} interfaces and has ${pane} with the dialog open`);
+    assert(dialog === before,
+           `the dialog shows ${dialog} interfaces where the pane shows ${before}`);
+    return `${before} in both`;
   });
 
   await check('the favicon is served, and the title carries the alert count (E5)',

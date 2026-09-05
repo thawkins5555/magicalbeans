@@ -4,7 +4,10 @@ enabled device over SSH, on a schedule.
 The hard safety boundary of the BACKUP PATH lives here: `_pull_config()`
 is the only place in this module that talks to a device's shell, and it
 sends exactly the fixed vendor.pager_off lines plus vendor.show_config
-from configrx_vendors.py — nothing else, ever. There is no free-form
+from configrx_vendors.py — plus, for the few vendors whose login shell is
+not already privileged EXEC, the fixed vendor.enable_command and the
+device's own stored enable secret, sent back only as the answer to that
+device's own password prompt — nothing else, ever. There is no free-form
 command execution anywhere in ConfigRX, by construction.
 
 That is a statement about backups, not about the whole application. The
@@ -54,6 +57,15 @@ SHELL_SETUP_MAX_S = 15          # per pager_off line
 # off on this device. A real config is longer than one screen but not
 # thousands of them; a loop here would otherwise sit answering forever.
 MAX_PAGER_REPLIES = 2000
+# A capture this much smaller than the device's own last stored backup is
+# far more likely to be a read that got cut short in some way _capture_problem
+# does not already catch than a device that genuinely shed 80% of its config
+# in one change. Stored — refusing it would be worse, the same reasoning
+# _capture_problem's own docstring gives for a truncated read reaching a
+# prompt — but flagged "suspect" instead of "changed" rather than presented
+# as an ordinary diff, because the next real backup would otherwise read as
+# almost the whole config coming back.
+SUSPECT_SHRINK_RATIO = 0.2
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x08")
 _PAGER_RE = re.compile(r"^\s*--\s*More\s*--\s*$", re.IGNORECASE)
@@ -70,6 +82,9 @@ _PAGER_TAIL_RE = re.compile(
     r"-{2,}\s*\(?\s*more[^)\n]{0,12}\)?\s*-{0,3}\s*$", re.IGNORECASE)
 # A prompt ends in one of these once the shell is ready for another command.
 _PROMPT_ENDS = "#>$%"
+# The end of a privileged-EXEC prompt, for recognising that an enable escalation
+# landed somewhere that looks privileged even before the new prompt is learned.
+_HASH_END_RE = re.compile(r"#\s*$")
 # The line a device prints before it starts building its config. Seeing it as
 # the LAST thing in a capture means the read ended while the device was still
 # working — the exact failure this module shipped with.
@@ -393,24 +408,89 @@ def _read_until_prompt(channel, prompt: str, max_s: float,
             return text, "prompt"
 
 
+def _read_until_match(channel, pattern, max_s: float,
+                      quiet_s: float = SHELL_QUIET_S) -> tuple[str, str]:
+    """Like _read_until_prompt, but ends on a regex match against the tail
+    of the stream instead of an exact known prompt string — used only for
+    the enable escalation below, where the text that will end the wait
+    (a password prompt, or a privileged prompt not yet learned) is not
+    known up front. Ends the same four other ways _read_until_prompt does
+    ("quiet"/"timeout"/"closed", plus "matched" here in place of "prompt")."""
+    channel.settimeout(0.5)
+    chunks: list[str] = []
+    started = time.time()
+    last_data = started
+    while True:
+        now = time.time()
+        if now - started > max_s:
+            return "".join(chunks), "timeout"
+        if chunks and now - last_data > quiet_s:
+            return "".join(chunks), "quiet"
+        try:
+            data = channel.recv(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            return "".join(chunks), "closed"
+        if not data:
+            return "".join(chunks), "closed"
+        chunks.append(data.decode("utf-8", "replace"))
+        last_data = time.time()
+        if _waiting_at("".join(chunks), needle_re=pattern):
+            return "".join(chunks), "matched"
+
+
+def _do_enable(channel, vendor: configrx_vendors.Vendor, enable_secret: str
+              ) -> tuple[str, str]:
+    """Sends vendor.enable_command — the ONLY thing this function ever sends
+    besides the device's own stored enable secret, answering the password
+    prompt that command raises. Never sends anything else, and never sends
+    the secret unless the device's own output matched enable_password_re
+    first.
+
+    Some devices reach privileged EXEC without a password (none configured,
+    or already authenticated via AAA); the '#'-ending alternative in the wait
+    covers that so this does not sit waiting for a prompt that never comes.
+    """
+    channel.send(vendor.enable_command + "\n")
+    combo_re = re.compile(f"(?:{vendor.enable_password_re})|(?:#\\s*$)")
+    resp, ended = _read_until_match(channel, combo_re, max_s=SHELL_SETUP_MAX_S)
+    if ended != "matched":
+        return resp, ended
+    tail = _ANSI_RE.sub("", resp[-4096:]).replace("\r", "").rstrip(" \t")
+    if re.search(vendor.enable_password_re, tail) and not _HASH_END_RE.search(tail):
+        channel.send(enable_secret + "\n")
+        more, ended2 = _read_until_prompt(channel, "", max_s=SHELL_SETUP_MAX_S, quiet_s=0.5)
+        return resp + more, ended2
+    return resp, ended
+
+
 def _pull_config(client, vendor: configrx_vendors.Vendor,
-                 max_s: float) -> tuple[str, str]:
+                 max_s: float, enable_secret: str = "") -> tuple[str, str]:
     """The only function in this file that talks to a device's shell.
 
     Sends exactly vendor.pager_off, then vendor.show_config — nothing else,
-    with one deliberate exception: when the device stops mid-output at its own
-    pager marker ("--More--"), a single space character is sent to advance it.
-    That is a fixed in-band answer to a prompt the device raised, carrying no
-    newline and no text, so it cannot execute anything; it is the keypress a
-    human would make. The boundary — only pager_off and show_config are ever
-    run on the device — is intact.
+    with two deliberate exceptions: when the device stops mid-output at its
+    own pager marker ("--More--"), a single space character is sent to
+    advance it, and when a vendor's login shell is not privileged EXEC
+    (prompt ends '>'), vendor.enable_command is sent once, answered with the
+    device's own stored enable secret if and only if the device's own output
+    asks for one (see _do_enable). Every one of these is a fixed, in-band
+    answer to a prompt the device itself raised — none of them carries
+    anything an operator typed or anything not already nailed down in
+    configrx_vendors.py — so the boundary (only pager_off, show_config and,
+    for these vendors, the fixed enable step ever run on the device) is
+    intact.
 
     The boundary is this path's, not the application's: sshterm.py opens an
     interactive shell for a human to type into, behind the separate `ssh`
     permission. Nothing it carries reaches this function, and nothing here
     grows a way to send anything else.
 
-    Returns (raw text, how the read ended); see _read_until_prompt.
+    Returns (raw text, how the read ended); see _read_until_prompt. A vendor
+    with enable_command whose account never reaches privileged EXEC ends on
+    "enable-failed" rather than proceeding to pager_off/show_config with a
+    prompt that cannot possibly match what those commands' output ends on.
     """
     channel = client.invoke_shell(width=512, height=1000)
     try:
@@ -418,13 +498,27 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
         # end on silence — and its last line is where the prompt comes from.
         banner, _ = _read_until_prompt(channel, "", max_s=5, quiet_s=0.5)
         prompt = _learn_prompt(banner)
+        if vendor.enable_command and prompt.endswith(">"):
+            enable_text, _ended = _do_enable(channel, vendor, enable_secret)
+            prompt = _learn_prompt(enable_text) or prompt
+            if prompt.endswith(">"):
+                return enable_text, "enable-failed"
         for line in vendor.pager_off:
             channel.send(line + "\n")
             _read_until_prompt(channel, prompt, max_s=SHELL_SETUP_MAX_S, quiet_s=0.5)
         channel.send(vendor.show_config + "\n")
         return _read_until_prompt(channel, prompt, max_s=max_s)
     finally:
-        channel.close()
+        # Best-effort: a device that hung up (the "closed" ended value above)
+        # may have already torn down the whole transport by the time this
+        # runs, and paramiko's own close handshake then raises EOFError
+        # trying to write a channel-close message down a socket that is
+        # already gone. That must never clobber a read that already
+        # completed — the return above already happened; this is cleanup.
+        try:
+            channel.close()
+        except Exception:
+            pass
 
 
 # Two floors, because "too short to be a config" means different things
@@ -446,6 +540,9 @@ MIN_PROMPT_TERMINATED_CHARS = 80
 def _capture_problem(cleaned: str, ended: str) -> str:
     """Why this capture must not be stored, or "" when it looks complete."""
     body = cleaned.strip()
+    if ended == "enable-failed":
+        return ("The account did not reach privileged mode — check the "
+                "enable secret")
     if not body:
         return "The device returned no output for the show-config command"
     if ended == "timeout":
@@ -512,7 +609,8 @@ class ConfigRxWorker:
         self._queued: dict[int, float] = {}
         self._started: dict[int, float] = {}
         self._lock = threading.Lock()
-        self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0}
+        self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0,
+                        "suspect": 0}
         self.error: str | None = None
         # Last settings start() was handed; only allow_legacy_ssh is read from
         # here (the loop reads the rest from the database each pass).
@@ -689,6 +787,23 @@ class ConfigRxWorker:
                                           error="Stored SSH credential could not be decrypted")
             return
 
+        # Only decrypted for a vendor that actually needs it (enable_command
+        # set) — same discipline as the SSH password: a local variable,
+        # discarded the moment the pull is done. "" for a vendor with no
+        # enable step (_pull_config never uses it) and for one with no
+        # enable secret stored, which _pull_config's own "enable-failed"
+        # result then reports clearly rather than silently.
+        enable_secret = ""
+        if vendor.enable_command and config["enable_secret_enc"] is not None:
+            try:
+                enable_secret = dpapi.unprotect(
+                    bytes(config["enable_secret_enc"])).decode("utf-8")
+            except Exception:
+                self.db.record_backup_attempt(
+                    device_id, ok=False, status="error",
+                    error="Stored enable secret could not be decrypted")
+                return
+
         # The shared host-key store (hostkeys.py), the same one the SSH
         # terminal uses: prepare() loads what we remember so paramiko itself
         # checks the connection against it, and the policy stores the key on a
@@ -740,12 +855,14 @@ class ConfigRxWorker:
         except (TypeError, ValueError):
             capture_max_s = 180.0
         try:
-            raw, ended = _pull_config(client, vendor, max_s=capture_max_s)
+            raw, ended = _pull_config(client, vendor, max_s=capture_max_s,
+                                      enable_secret=enable_secret)
         except Exception as exc:
             self.db.record_backup_attempt(device_id, ok=False, status="error", error=str(exc))
             return
         finally:
             client.close()
+            enable_secret = None
 
         cleaned = _clean_output(raw)
         # A truncated capture must never be stored. Storing one is worse than
@@ -772,6 +889,9 @@ class ConfigRxWorker:
         else:
             cleaned, redacted_count = configrx_redact.redact(cleaned)
 
+        # Read before add_backup inserts the new row, or this would be
+        # comparing the capture against itself.
+        previous_size = self.db.latest_backup_size(device_id)
         backup_id, _digest = self.db.add_backup(
             device_id, cleaned, redacted=not store_secrets)
         # Only when a key was actually stored, and said once: the note used to
@@ -780,14 +900,29 @@ class ConfigRxWorker:
         # time. It now marks the one backup that taught this app the key.
         note = " (host key stored on first connection)" if policy.stored_new else ""
         if backup_id is not None:
-            self.counters["changed"] += 1
-            self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
-            self.log.add(
-                CONFIGRX, f"Stored a changed config backup for {device['ip']}",
-                detail=(f"{redacted_count} secret-bearing line(s) redacted "
-                        f"before storage" if not store_secrets else
-                        "Stored verbatim: this device has \"keep secrets in "
-                        "backups\" switched on"))
+            new_size = len(cleaned.encode("utf-8"))
+            suspect = bool(previous_size) and new_size < previous_size * SUSPECT_SHRINK_RATIO
+            if suspect:
+                self.counters["suspect"] += 1
+                self.db.record_backup_attempt(
+                    device_id, ok=True, status="suspect" + note,
+                    error=f"Captured {new_size} bytes, under a fifth of the "
+                          f"previous backup's {previous_size} bytes — stored, "
+                          f"but check this capture before trusting it as a diff base.")
+                self.log.add(
+                    CONFIGRX, f"Stored a suspect config backup for {device['ip']}",
+                    detail=f"{new_size} bytes captured, {previous_size} bytes previously "
+                           f"stored — well short of the {SUSPECT_SHRINK_RATIO:.0%} floor, "
+                           f"so this is marked suspect rather than changed.")
+            else:
+                self.counters["changed"] += 1
+                self.db.record_backup_attempt(device_id, ok=True, status="changed" + note)
+                self.log.add(
+                    CONFIGRX, f"Stored a changed config backup for {device['ip']}",
+                    detail=(f"{redacted_count} secret-bearing line(s) redacted "
+                            f"before storage" if not store_secrets else
+                            "Stored verbatim: this device has \"keep secrets in "
+                            "backups\" switched on"))
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)

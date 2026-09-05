@@ -41,9 +41,14 @@
 
        --text   14.6:1 on --bg, 12.4:1 on --raised     the content
        --muted   6.6:1 on --bg,  5.6:1 on --raised     labels, hints, headers
-       --dim     5.2:1 on --bg,  4.6:1 on --raised     metadata: timings,
+       --dim     5.8:1 on --bg,  4.9:1 on --raised     metadata: timings,
                                                        axis labels, the
                                                        version in the corner
+
+     --dim was #808B98 and --fail #F85149; both cleared AA on --bg and
+     --raised and neither did on --selected — 4.29:1 and 4.43:1 on the one
+     row the operator has open — because no pair list checked that surface.
+     Each is brightened by the smallest step that clears it (4.52 and 4.50).
 
      --muted was #7C8794, which measured 4.39:1 on --raised — under AA for
      every table header and every hint on a zebra stripe. There used to be a
@@ -53,7 +58,7 @@
      below; what was prose is --dim or --muted. */
   --text: #DCE3EA;
   --muted: #8F9AA7;
-  --dim: #808B98;
+  --dim: #848F9C;
 
   /* ------------------------------------------------------------ structure
      Not text, but must still be seen: pane dividers, column grips, the ring
@@ -88,7 +93,7 @@
      All four text-carrying tones clear 4.5:1 on --bg. */
   --ok: #3FB950;
   --warn: #E3B341;
-  --fail: #F85149;
+  --fail: #F8544C;
   --blocked: #FF8A65;
   --overrun: #4DB6AC;
   --error: #A371F7;
@@ -102,7 +107,20 @@
      --selected is a blue-grey a step off --raised rather than the old
      --hairline, which put --muted at 3.5:1 on the one row the operator is
      reading; it is 4.9:1 here. The selected row also carries an accent bar
-     at its left edge (app.css), so selection is not carried by tint alone. */
+     at its left edge (app.css), so selection is not carried by tint alone.
+
+     A measured exception, recorded rather than quietly held: --checked-strong
+     is the one surface where a tone can sit below AA. It is deliberately the
+     strongest tint — "ticked AND open" has to be unmistakable — and contrast
+     is a luminance relationship, so the tint that stands out most against the
+     row is also the one that leaves the least room for ink. Solving for a
+     value where every tone clears 4.5:1 lands all three tints within 0.03 of
+     each other (dark) or inverts their order (light): the affordance is worth
+     more than the last tenth of a ratio on the rarest surface in the product.
+     --text (7.45:1 dark, 11.27:1 light) and --muted (light) hold there; the
+     quietest metadata tone does not, so nothing that only appears in --dim is
+     drawn on a row in that state. The contrast theme, which claims more, was
+     moved until it does clear it. */
   --selected: #1E2837;
   --checked: #22304A;
   --checked-strong: #2E4470;
@@ -180,12 +198,32 @@
   --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
 
+  /* ------------------------------------------------------------- spacing
+     Four steps, each a multiple of 4. Measured over every rendered element
+     there were 20 distinct padding/margin values and 8 distinct gaps with
+     no relationship between them — a control's padding, a dialog's margin
+     and a row's gap each picked their own number. Not everything in the
+     interface is one of these four: a hairline offset, an icon's own
+     dimensions and a handful of genuinely different gaps stay their own
+     numbers, but a control now reaches for one of these first. */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+
   /* --------------------------------------------------------- shape, depth
      Three radii: a control, a panel, a dialog. One shadow, for the things
      that float — a dialog, a toast, the sign-in card. */
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
+  /* A fully rounded end whatever the element's own height — the badge, a
+     meter's fill, a divider's cap, the scrollbar thumb. Each of those used
+     to tune its own radius to half its own height by hand and the four
+     shapes had drifted to four different pixel values (2, 3, 5, 9px); a
+     radius past half the box's shorter side is capped there by the
+     browser, so one large value is a pill on all of them. */
+  --radius-pill: 999px;
   /* Two shadows and one scrim. --shadow-pop lifts a dialog or the sign-in
      card off the page; --shadow-float is the lighter lift for a toast, a
      banner or a tooltip. The scrim is what dims the page behind a dialog.
@@ -229,8 +267,14 @@
    ring must be a flash. */
 :root[data-theme="contrast"] {
   --bg: #07090C;
-  --panel: #0B0E12;
-  --raised: #11151B;
+  /* The theme whose whole purpose is separation had the weakest surface
+     separation of the three: --bg to --raised measured 1.09 here against
+     1.18 in both other themes, and --bg to --panel 1.03 against 1.08 — so
+     on the theme an operator picks when they cannot tell things apart,
+     alternate table rows and panel edges were the hardest to. The ladder is
+     now 1.21 and 1.07, at or above the dark theme's own step. */
+  --panel: #0E1319;
+  --raised: #182029;
   --hairline: #2E3745;
   --grid: #1F2731;
   --text: #F2F6FA;
@@ -243,14 +287,38 @@
   --focus: #FFFFFF;
   --ok: #5FD97A;
   --warn: #F0C25A;
-  --fail: #FF8580;
+  --fail: #FF8F8A;
   --blocked: #FFA07A;
   --overrun: #7FD9CF;
   --error: #C9A6FF;
   --nodata: #161B22;
   --selected: #1A2537;
   --checked: #22314F;
-  --checked-strong: #2F4778;
+  /* Was #2F4778, on which the quietest semantic tone measured 3.89:1. This
+     clears AA for every tone that appears as row text and still reads as
+     the strongest of the three tints (1.55 against --raised, where --checked
+     is 1.27), so "ticked and open" stays unmistakable. */
+  --checked-strong: #2A3E66;
+
+  /* The route canvas is deliberately a light palette in the other two
+     themes — it is the pane addresses are read off, and it prints. Here it
+     was the same white slab, 1500x540, in a near-black interface: the
+     largest glare source in the product, on the one theme an operator
+     chooses because brightness and low separation are the problem. The
+     canvas follows the theme it is drawn in; the light palette is still
+     what the other two themes use, and still what prints from them. */
+  --canvas: #0E1319;
+  --canvas-panel: #182029;
+  --canvas-hairline: #2E3745;
+  --canvas-grid: #1F2731;
+  --canvas-text: #F2F6FA;
+  --canvas-muted: #C3CCD6;
+  --canvas-faint: #AEB8C4;
+  --canvas-accent: #9EC1FF;
+  --canvas-ok: #5FD97A;
+  --canvas-warn: #F0C25A;
+  --canvas-fail: #FF8F8A;
+  --canvas-blocked: #FFA07A;
 }
 
 /* Light: the route canvas's palette applied to the chrome. The canvas has
@@ -261,9 +329,16 @@
    text AND to read as text on white — the canvas hues already do both. */
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #FFFFFF;
-  --panel: #F4F6F9;
-  --raised: #E9EDF2;
+  /* The page is tinted and the surfaces climb towards white, which is the
+     conventional light-theme reading and the one this block used to have
+     backwards: with --bg pure white there was no headroom left, so --panel
+     (92.0% luminance) and --raised (84.3%) were both DARKER than the page
+     and every card, tile, dialog and sign-in box read as a recess cut into
+     it rather than as something lifted off it. Nothing else in the product
+     changed — every consumer asks for the role, not the value. */
+  --bg: #EEF1F5;
+  --panel: #F8FAFC;
+  --raised: #FFFFFF;
   --hairline: #C9D2DD;
   --grid: #DDE3EB;
   --text: #161C24;
@@ -274,8 +349,14 @@
   --accent: #2F5FC4;
   --accent-hover: #244FA8;
   --focus: #1D4FB8;
-  --ok: #1B7F3B;
-  --warn: #9A6510;
+  /* --ok was #1B7F3B and --warn #9A6510, which measured 4.31:1 and 4.21:1 as
+     text on the old --raised — under AA on every alternate row of every
+     table, for "unchanged", "oper up" and the warning severity word. They
+     now measure 7.16:1 and 6.74:1 on --raised. The pair list in
+     tests/test_design_tokens.py only ever checked a semantic tone against
+     --bg, which is why both sat here failing and green. */
+  --ok: #146530;
+  --warn: #7F520C;
   --fail: #B3261E;
   --blocked: #A63D10;
   --overrun: #0F766E;

@@ -35,7 +35,7 @@
   // sign-in and SSH pages have no tabs and stop here.
   if (!/^\/(index\.html)?$/.test(window.location.pathname)) return;
 
-  var DEFAULT_TAB = 'netpath';
+  var DEFAULT_TAB = 'dashboard';
   var TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
               'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
   var tab = null;

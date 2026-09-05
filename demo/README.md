@@ -69,7 +69,7 @@ Ports used: **8443** (app), **8099** (fleet control), **1025** (SMTP sink),
 | `generators.py` | NetFlow v5/v9, SNMP traps and syslog senders, as functions and as a CLI. |
 | `bin/ping`, `bin/traceroute` | Scripted stand-ins put at the front of `PATH`, so NetPath traces a network that does not exist. Paths come from `routes.json`. |
 | `seed.py` | Fills a running app over its HTTP API: groups, profiles, devices, NetPath targets, IPAM, wireless, ConfigRX, settings, alert rules, users. `--defaults` seeds without tuning anything the application ships — see [Campaign settings vs shipped defaults](#campaign-settings-vs-shipped-defaults). |
-| `ui_walk.mjs` | Drives the browser with Playwright: every tab, every subtab, every dialog, screenshots, console log, timing metrics. |
+| `ui_walk.mjs` | Drives the browser with Playwright: every tab (by `data-tab`, so a label rename cannot break it), every subtab including Nodes' Topology and the device-detail pane's four nested ones, every dialog it can reach (device groups, the MIB catalog, Upload MIB, ConfigRX's device-settings and bulk-settings dialogs, and the rest), a MAC search and ConfigRX's inline config viewer and diff, a kiosk-mode (`?kiosk=1`) pass, and every top-level tab again under each of the three themes and at three viewport sizes — screenshots, console log, timing metrics. |
 | `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the eight incidents, runs `ui_walk.mjs`, writes the report, stops everything. |
 | `.gitignore` | Ignores `out/`. |
 
@@ -232,12 +232,21 @@ app-<count>.log           the app's stdout
 fleet-<count>.log         the fleet's stdout
 scenario-<count>.log      the run's own log
 data-<count>/             the ten SQLite databases for this run
-ui/tab-*.png              one screenshot per tab
-ui/sub-*.png              one per subtab
-ui/dlg-*.png              one per dialog
-ui/viewer-*.png               the same tabs as the read-only `viewer` account
+ui/tab-*.png              one screenshot per top-level tab, admin pass
+ui/sub-*.png              one per subtab, admin pass (includes Nodes'
+                          Topology and the device-detail pane's four
+                          nested subtabs)
+ui/dlg-*.png              one per dialog it could open
+ui/feature-*.png          MAC search, ConfigRX's inline config viewer
+                          and diff (panes, not dialogs)
+ui/theme-<theme>-*.png    every top-level tab under dark/light/contrast
+ui/viewport-<WxH>-*.png   every top-level tab at 1920x1080, 1366x768
+                          and 1280x720
+ui/kiosk-*.png            a kiosk-mode (?kiosk=1) session
+ui/viewer-*.png           the same top-level tabs as the read-only
+                          `viewer` account
 ui/console-<count>.json   console errors/warnings, page errors, failed
-                          requests, every HTTP response >= 400
+                          requests, every HTTP response >= 400 (every pass)
 ui/metrics-<count>.json   nodes-table fill time, long tasks, payload size
 ui/walk-<count>.json      per-step ok/skipped/failed
 ```

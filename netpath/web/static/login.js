@@ -8,6 +8,12 @@
   function show(message) {
     error.textContent = message;
     error.hidden = !message;
+    for (const id of ['username', 'password']) {
+      const field = document.getElementById(id);
+      if (!field) continue;
+      if (message) field.setAttribute('aria-invalid', 'true');
+      else field.removeAttribute('aria-invalid');
+    }
   }
 
   async function submit(event) {
@@ -67,6 +73,13 @@
         note.hidden = false;
         const user = document.getElementById('username');
         if (user && !user.value) user.value = 'admin';
+      }
+      // Not every build sends d.version — /api/session gained it in 4.48.0 —
+      // so this draws only once something supplies one.
+      const versionEl = document.getElementById('login-version');
+      if (versionEl && d.version) {
+        versionEl.textContent = `v${d.version}`;
+        versionEl.hidden = false;
       }
     })
     .catch(() => {});

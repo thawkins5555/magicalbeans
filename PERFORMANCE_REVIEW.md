@@ -24,6 +24,14 @@ patterns) have been implemented and verified with end-to-end tests — see
 out to be a false positive: the index already exists, added via `_migrate()` in
 `nodesdb.py` rather than the `SCHEMA` block the review agent read.
 
+**Status Update (2026-09-04):** A separate body of frontend work landed on the
+4.48.0 UI/UX remediation branch that changes several things this document
+measures or recommends about the client — idle-tab DOM churn, Debug's event
+table, static asset caching, and the minification question this document never
+directly took a position on before. None of it touches the backend query work
+above; different files, different problem. See "Frontend Runtime Performance —
+4.48.0" below.
+
 ---
 
 ## Implementation Status
@@ -309,6 +317,132 @@ Fetch settings once and reuse throughout
 
 ---
 
+## Frontend Runtime Performance — 4.48.0
+
+Everything in this section is separate work from the 4.48.0 UI/UX remediation
+branch (`claude/ui-ux-review-improvements-ylkdll`), landed after the backend
+fixes above, against different files (`netpath/web/static/*.js`,
+`netpath/web/server.py`'s static handler). It supplements the "Frontend
+Performance Observations" above rather than replacing it — the checkbox
+rendering and virtual-scrolling items there are untouched by anything here.
+Every number below is the one measured in the commit cited, or measured
+directly against the running instance for this document, not a reconstruction.
+
+### Idle-tab DOM churn
+
+A tab left open and idle was still writing to the DOM continuously: each
+module's status draw ran on every 100ms master tick (`fastTick`) regardless of
+whether anything had changed, and a write to `textContent`/`className`/`style`/
+an attribute queues a real DOM mutation even when the new value equals the old
+one. `1c309c9` made these draws conditional on the value actually differing.
+Idle DOM mutations per tab, measured over ten seconds:
+
+| Tab | Before | After |
+|---|---|---|
+| Nodes | 515 | 118 |
+| IPAM | 500 | 0 |
+| Alerts | 767 | 60 |
+| SNMP | 515 | 10 |
+| Syslog | 520 | 10 |
+| NetFlow | 500 | 10 |
+| Wireless | 500 | 10 |
+
+NetPath is deliberately not in this table — see below.
+
+### Debug's event table
+
+Debug was the worst offender in the product at 8,042 DOM mutations per ten
+idle seconds, against 6 for Dashboard and 10 for Settings (`b5d6e65`). The
+append-vs-rebuild logic in `drawEvents` was not the cause — that had already
+been fixed before this branch. What remained was `drawEvents` calling
+`App.wireRowKeyboard` on every poll regardless of whether any row had changed;
+that function walks the entire table stamping a `tabindex` on every row, up to
+its 2,000-row cap. Fixed in two steps:
+
+1. `b5d6e65` — the call is now conditional on rows actually having been
+   appended or the selection having moved. Measured on a paused Debug tab:
+   871 mutations per 10s became 367.
+2. `1534a60` — `wireRowKeyboard` itself now skips writing a `tabindex` that is
+   already correct, instead of writing it unconditionally on every row it
+   walks. This is the change that mattered most: measured on a live event
+   table with events still arriving, 5,472 writes per 30s became 0.
+
+### NetPath's timeline: no defect where one was reported
+
+An earlier review of this product (not this document) reported NetPath's
+timeline rebuilding roughly a hundred times a second. Checked against the code
+as part of this release's frontend work: NetPath had never registered a
+`fastTick` handler at all — `App.pages.netpath` listed `init, refresh,
+activate` and nothing else — so the reported rebuild was not running and could
+not be reproduced. `1c309c9` gives it a correct one, wired to `drawTimeline`,
+that writes only on an actual change: frozen, a hundred ticks produce zero
+mutations; live, a real playhead move produces two attribute writes. Recorded
+here, next to the rest of this release's frontend numbers, as a correction of
+a claim this document never itself made — the failure was in a different
+review, not a regression this one needs to walk back.
+
+### Static asset caching
+
+Every static asset was revalidated on every load — `no-cache` plus an ETag —
+so a warm reload was up to sixteen conditional (304) round trips before
+anything rendered. `b5d6e65` adds a `versioned` path to `Handler._static`
+(`netpath/web/server.py`): a request carrying a `v` query parameter is served
+`Cache-Control: public, max-age=31536000, immutable` and skips revalidation
+entirely; the unversioned path is unchanged (`no-cache`, same ETag byte for
+byte), which is what `tests/test_static_headers.py` pins, and `/` and `/login`
+stay `no-store` regardless of the query string.
+
+Confirmed directly against the live instance (`http://127.0.0.1:8443`, signed
+in as admin): `GET /app.js` returns `Cache-Control: no-cache` with an ETag;
+`GET /app.js?v=4.48.0` returns `Cache-Control: public, max-age=31536000,
+immutable` with the same ETag and the same body. The mechanism works exactly
+as described.
+
+That wiring has since landed. `__version__` is `4.48.0`, and the markup asks
+for its assets as `?v=__SW_VERSION__`, substituted with the running version
+as each HTML file is read into the static cache. Measured in a browser
+against the finished branch: seventeen asset requests on an ordinary page
+load, all seventeen carrying `?v=4.48.0`, all seventeen answered
+`public, max-age=31536000, immutable`, and no placeholder surviving into the
+markup a browser receives. A warm reload no longer spends sixteen
+conditional requests before anything renders.
+
+### Minification: declined
+
+Recorded here as a deliberate decision, not an oversight. The application is
+stdlib-only Python with vanilla JS/CSS and no build step; gzip is already
+negotiated server-side at `GZIP_LEVEL = 6` (confirmed current in
+`netpath/web/server.py`), and the cache work above was judged the higher-value
+use of the same effort. Measured against the 4.47.0 build the decision was
+made against (commit `fc6b3e1`): the fourteen files a cold load actually pulls
+in (`index.html`, `boot.js`, `app.js`, the twelve module scripts, `tokens.css`,
+`app.css`), gzipped at level 6, totalled about 285KB.
+
+Re-measured the same way for this document, against the current tip of this
+branch (committed state only): the same fourteen files now gzip to about
+324KB. That is a real increase, not a caching regression — it comes from
+committed 4.48.0 feature and accessibility work (chart labels, ARIA/keyboard
+wiring, the label-grid CSS, and the rest of Phases 1–3) landing in the same
+files since the 285KB figure was taken. It does not change the decision — the
+reasoning was never "285KB is small enough," it was "a build step buys
+marginal bytes on a compression scheme already doing the real work" — but the
+285KB figure itself is now stale, and a reader re-measuring this branch today
+would get a different number. Both are given here rather than only the
+original.
+
+### Nodes refresh cost: still open
+
+A Nodes tab refresh costs about 154ms median (175ms p95) for 61 rows under a
+full teardown-and-rebuild, per the 4.48.0 UI/UX review (`2600605`). For this
+document, `git log` and the working tree were checked and show no commit and
+no in-progress change to `nodes.js`'s refresh path addressing it — the
+uncommitted `nodes.js` changes present as this document was written are Phase
+4 outcome-messaging and form work, unrelated to the render path. Left here as
+open, matching its status everywhere else it is tracked; if it lands after
+this document is written, this section will be stale on that one point.
+
+---
+
 ## Database Performance Analysis
 
 ### Current Indexes (Good):
@@ -488,4 +622,5 @@ The codebase is well-structured but has clear performance bottlenecks related to
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-09-01 | Initial comprehensive performance review |
+| 2.0 | 2026-09-04 | Added "Frontend Runtime Performance — 4.48.0": idle-tab DOM churn per module, Debug's event table fix, NetPath's fastTick correction, static asset caching (verified live), the minification decision and a re-measured cold-load size, and the still-open Nodes refresh cost |
 

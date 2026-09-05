@@ -21,6 +21,26 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
+  /* Upgrades the plain address a placeholder span carries into either a
+     link to the matching Nodes device, or an "Add as a device" link that
+     opens Nodes with the address already in the Add form — turning "no
+     device has this source" into one click instead of a copy-paste across
+     two tabs. Enhanced after the pane is already on screen, so opening a
+     message never waits on a Nodes fetch; `stillCurrent` guards against a
+     slow lookup landing after the operator moved to a different message. */
+  async function linkSourceIp(spanId, ip, stillCurrent) {
+    if (!ip) return;
+    const { byIp: map } = await App.deviceIndex();
+    if (!stillCurrent()) return;
+    const span = document.getElementById(spanId);
+    if (!span) return;
+    const device = map.get(ip);
+    span.outerHTML = device
+      ? `<a class="linkish inline" href="${App.buildRoute('nodes', ['device', device.id])}">${escape(ip)}</a>`
+      : `${escape(ip)} — <a class="linkish inline" href="${
+          App.buildRoute('nodes', [], { add: ip })}">Add as a device</a>`;
+  }
+
   /* Long messages need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
     const out = [];
@@ -63,9 +83,10 @@
     // The stacked histogram is App.stackedHistogram: this page, SNMP and
     // Alerts each drew their own, two of them character-for-character the
     // same. The click narrows the search to the hour and leaves Live.
+    const plot = view.histPlot || { buckets: (view.hist || {}).buckets || [], span: view.t1 - view.t0 };
     App.stackedHistogram(App.el('sl-hist-svg'), App.el('sl-hist'), {
-      buckets: (view.hist || {}).buckets || [],
-      unit: 'messages', span: view.t1 - view.t0,
+      buckets: plot.buckets,
+      unit: 'messages', span: plot.span,
       empty: 'No messages in this window',
       onBucket: (bucket) => pinWindow(bucket.t0, bucket.t1),
     });
@@ -126,6 +147,14 @@
     drawTable();
   }
 
+  // Names the window, since widening it is usually the answer — a bare
+  // "no messages" said nothing about why, over a header with nothing
+  // under it.
+  function noMessagesText() {
+    return `No messages between ${App.when(view.t0)} and ${App.when(view.t1)}. ` +
+      'Widen the time window or clear a filter.';
+  }
+
   function drawTable() {
     const columns = messageColumns();
     const table = App.grid(App.el('syslog-table'),
@@ -142,29 +171,31 @@
         showDetail(row);
         drawTable();
       };
-    });
+    }, noMessagesText());
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
 
   function showDetail(row) {
     const lines = [
-      App.when(row.ts),
+      escape(App.when(row.ts)),
       '',
-      `severity   ${row.severity_name} (${row.severity})`,
-      `facility   ${row.facility_name} (${row.facility})`,
-      `source     ${row.source}${row.source_name ? `  (${row.source_name})` : ''}`,
-      `host       ${row.host || '—'}`,
-      `app        ${row.app || '—'}`,
-      `pid        ${row.procid || '—'}`,
-      `msgid      ${row.msgid || '—'}`,
+      `severity   ${escape(row.severity_name)} (${row.severity})`,
+      `facility   ${escape(row.facility_name)} (${row.facility})`,
+      `source     <span id="sl-d-source">${escape(row.source)}</span>` +
+        (row.source_name ? `  (${escape(row.source_name)})` : ''),
+      `host       ${escape(row.host || '—')}`,
+      `app        ${escape(row.app || '—')}`,
+      `pid        ${escape(String(row.procid || '—'))}`,
+      `msgid      ${escape(String(row.msgid || '—'))}`,
       '',
-      row.message,
+      escape(row.message),
     ];
     if (row.raw && row.raw !== row.message) {
-      lines.push('', '-'.repeat(52), 'raw line as it arrived:', row.raw);
+      lines.push('', '-'.repeat(52), 'raw line as it arrived:', escape(row.raw));
     }
-    App.el('sl-detail').textContent = lines.join('\n');
+    App.el('sl-detail').innerHTML = lines.join('\n');
+    linkSourceIp('sl-d-source', row.source, () => view.selected === row.id);
   }
 
   /* ---------------------------------------------------------- settings */
@@ -215,7 +246,8 @@
       ${App.columnPickerFieldset('MESSAGE LIST COLUMNS', 'syslog', COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -237,7 +269,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('syslog');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
 
@@ -307,22 +339,27 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sl-status');
-    status.textContent = text;
+    App.setText(status, text);
     // The line is ellipsized so it can never push the buttons out of the card,
     // so the full text has to be reachable some other way.
-    status.title = text;
-    status.classList.toggle('error', failed);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
+      status.tabIndex = 0;
       status.onmousemove = (event) => App.tooltip(wrap(status.title), event);
       status.onmouseleave = App.hideTooltip;
+      status.onfocus = () => {
+        const box = status.getBoundingClientRect();
+        App.tooltip(wrap(status.title), { clientX: box.left + box.width / 2, clientY: box.bottom });
+      };
+      status.onblur = App.hideTooltip;
     }
 
-    App.el('sl-dot').style.background = syslog.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('sl-toggle').textContent = syslog.running
-      ? 'Stop collector' : 'Start collector';
+    App.setBg(App.el('sl-dot'), syslog.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    App.setText(App.el('sl-toggle'), syslog.running ? 'Stop collector' : 'Start collector');
     const c = syslog.counters || {};
     const parts = [`${c.messages || 0} received`, `${c.stored || 0} stored`];
     if (c.filtered) parts.push(`${c.filtered} filtered by severity`);
@@ -339,7 +376,7 @@
     } else {
       parts.push('indexed search, matches anywhere in a word');
     }
-    App.el('sl-counters').textContent = parts.join(' · ');
+    App.setText(App.el('sl-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -359,8 +396,11 @@
     view.hist = overview;
     view.messages = search.messages;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
+    const p = view.histPlot;
     App.el('sl-hist-summary').textContent =
-      `${total.toLocaleString()} messages · ${App.stamp(t0, span)} – ${App.stamp(t1, span)}` +
+      `${total.toLocaleString()} messages · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
+      (p.narrowed ? ` (of a ${App.duration(span)} window)` : '') +
       ` · ${overview.stats.rows.toLocaleString()} stored in total`;
     // "300 of 4,120 shown": the total is the histogram's own sum over the
     // same window and filters, already in hand on this tick.
@@ -443,10 +483,26 @@
      filled the list it lives in. A row that is not in the current
      window is simply not selected — these three tables are live
      tails, and silently widening the window to find one row would
-     change what the operator asked to see. */
-  function activate(opts) {
-    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
-    const id = Number(opts.parts[0]);
+     change what the operator asked to see.
+
+     #/syslog?source=<ip> (Alerts' "Syslog for this device", and any
+     other cross-module link naming an address) sets the filter and
+     re-searches, the same way a typed address and Apply would. */
+  async function activate(opts) {
+    if (!opts) return;
+    const query = opts.query || {};
+    let filtered = false;
+    for (const [id, key] of [['sl-source', 'source'], ['sl-host', 'host']]) {
+      if (query[key] === undefined) continue;
+      const field = App.el(id);
+      if (!field) continue;
+      field.value = query[key];
+      filtered = true;
+    }
+    if (filtered) await App.refreshNow('syslog');
+    const parts = opts.parts || [];
+    if (parts[0] === undefined) return;
+    const id = Number(parts[0]);
     if (!Number.isFinite(id)) return;
     const row = (view.messages || []).find((r) => r.id === id);
     if (!row) return;

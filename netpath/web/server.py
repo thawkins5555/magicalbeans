@@ -128,6 +128,18 @@ class StaticCache:
         with open(full, "rb") as handle:
             body = handle.read()
         content_type = content_type_for(full)
+        # The markup asks for its assets as `/app.js?v=__SW_VERSION__`, and the
+        # version is put in here rather than written into the file, because a
+        # hand-maintained copy of it is a copy that drifts — and this one has
+        # teeth: an asset URL is served immutable for a year, so a static file
+        # that changed while the version did not would go on being served from
+        # every warm cache until the next release. Substituting at load time
+        # means bumping __version__ re-versions every URL and nothing else has
+        # to remember. Done before the ETag and the gzip, so both describe the
+        # bytes that actually go out.
+        if content_type.startswith("text/html"):
+            from .. import __version__
+            body = body.replace(b"__SW_VERSION__", __version__.encode("ascii"))
         gzipped = (gzip.compress(body, GZIP_LEVEL)
                    if is_compressible(content_type) and len(body) >= GZIP_MIN_BYTES
                    else None)
@@ -422,20 +434,40 @@ ROUTES = [
     ("POST", r"^/api/configrx/devices/(\d+)/config$", api.post_configrx_device_config, ("configrx", W)),
     ("POST", r"^/api/configrx/devices/(\d+)/credential$", api.post_configrx_device_credential, ("configrx", W)),
     ("DELETE", r"^/api/configrx/devices/(\d+)/credential$", api.delete_configrx_device_credential, ("configrx", W)),
+    # Clears only the enable secret, leaving the SSH password (and username)
+    # exactly as stored — set_credential's own three-way contract already
+    # lets an empty enable_secret clear it there, but that route requires
+    # re-supplying the SSH password too. A device that turns out not to need
+    # an enable secret needs a way to drop it alone; this is that way.
+    ("DELETE", r"^/api/configrx/devices/(\d+)/credential/enable-secret$",
+     api.delete_configrx_device_enable_secret, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
-    # The backup's CONTENT, not its metadata: even after the redaction pass
-    # a captured config is a map of the device — interfaces, ACLs, VPN
-    # peers, management addresses — so downloading one is a ConfigRX write's
-    # privilege. The listing (dates, sizes, hashes, whether it was redacted)
-    # stays a read, which is what a read-only operator needs to answer "has
-    # this switch changed".
-    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", W)),
+    # The backup's CONTENT, not its metadata: reading a stored config is a
+    # read, the same as the listing beside it (dates, sizes, hashes,
+    # whether it was redacted) — a read-only operator needs both to answer
+    # "has this switch changed". get_configrx_backup itself is what still
+    # guards a verbatim (store_secrets) capture: a caller without ConfigRX
+    # write gets it redacted rather than 403ing outright.
+    #
+    # Weakened from write to read deliberately, and reviewed as such: the
+    # redaction strips secrets, not topology, so a read-only account can now
+    # see interface addressing, ACLs, routes and VPN peers for any device
+    # with a stored capture. That is a wider grant than "read" carries in
+    # most other modules, it was raised as such by this release's security
+    # review, and the operator's answer was to keep it — being able to see
+    # what changed on a switch without holding the permission to change it
+    # is the point of the module. Narrow it here, not in the handler, if
+    # that judgement is ever revisited.
+    ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
     # A diff hands over the device's own configuration lines exactly as
-    # reading one backup's content does (see get_configrx_backup's own
-    # comment above), so it is gated the same way — matched before the
-    # "(\d+)" backup route above could ever apply, though "diff" would
-    # never match \d+ anyway.
+    # reading one backup's content does, and until this release the two were
+    # gated identically. They are not any more: the content route above is a
+    # read, and this one is still a write. Worth stating plainly rather than
+    # leaving the older "gated the same way" comment to say otherwise — and
+    # worth revisiting, since a caller who can fetch two backups can diff
+    # them without this route at all. Matched before the "(\d+)" backup route
+    # above could ever apply, though "diff" would never match \d+ anyway.
     ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
@@ -1136,9 +1168,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             self._json({"error": "No such endpoint"}, 404)
             return
-        self._static(path)
+        # `?v=` is a cache-buster, not a route parameter: it selects nothing
+        # about which file is served, only how long the response may be
+        # kept, so a bare presence check is enough.
+        self._static(path, versioned="v" in params)
 
-    def _static(self, path: str) -> None:
+    def _static(self, path: str, versioned: bool = False) -> None:
         if path in ("/", ""):
             path = "/index.html"
         if path == "/login":
@@ -1164,8 +1199,17 @@ class Handler(BaseHTTPRequestHandler):
         # `immutable`): the URLs are fixed names, so the browser must ask;
         # what changed is that asking is now answered from memory with a
         # content hash, and the answer carries the same headers as a 200.
+        #
+        # `?v=` is the one exception: index.html spells it out with the
+        # running __version__, so the URL itself changes on every release and
+        # a year-long cache never serves a byte the release after it wrote.
+        # A warm reload used to mean sixteen conditional requests answered
+        # 304 — cheap on a LAN, sixteen round trips over a NOC's VPN.
         if candidate.endswith(".html"):
             cache = {"Cache-Control": "no-store"}
+        elif versioned:
+            cache = {"Cache-Control": "public, max-age=31536000, immutable",
+                     "ETag": entry["etag"]}
         else:
             cache = {"Cache-Control": "no-cache", "ETag": entry["etag"]}
             if self._etag_matches(entry["etag"]):

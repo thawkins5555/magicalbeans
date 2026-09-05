@@ -7,8 +7,8 @@
 <!-- Every load used to 404 on /favicon.ico. SVG so one file covers
      every size a browser or a pinned tab asks for. -->
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/tokens.css">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/tokens.css?v=__SW_VERSION__">
+<link rel="stylesheet" href="/app.css?v=__SW_VERSION__">
 <!-- Marks which tab should paint first, before <body> has a single byte of
      content to render — see app.css's html[data-tab] rules and boot.js.
      A plain <script src> (no defer, no module) so it still blocks parsing
@@ -16,7 +16,7 @@
      It is a separate file rather than an inline block because the server
      sends `default-src 'self'`, under which an inline <script> is refused
      outright and this never ran at all. -->
-<script src="/boot.js"></script>
+<script src="/boot.js?v=__SW_VERSION__"></script>
 </head>
 <body>
 
@@ -30,41 +30,69 @@
      and has no box of its own to focus. -->
 <a class="skip-link" href="#view">Skip to the current view</a>
 
+<!-- .topbar holds the tab strip and the utility group side by side. #tabs
+     is the ONLY thing that scrolls (overflow-x, below): the utility group —
+     who is signed in, the way to the Account dialog, Sign out, and #conn,
+     "the one honest signal during an outage" — sits outside it entirely, so
+     narrowing the window can never scroll it out of reach. Grouping the
+     twelve tabs into four labelled sections (Now/Inventory/Telemetry/Admin)
+     is presentational only: there is exactly one role="tablist" here and
+     twelve role="tab" buttons inside it, wherever they are nested
+     (tests/ui/walk.mjs scopes its counts to #tabs, not the four wrappers). -->
+<div class="topbar">
 <nav id="tabs" role="tablist" aria-label="Views">
   <h1 class="brand"><a href="#/dashboard" title="Dashboard"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></a></h1>
-  <button class="tab" data-tab="dashboard">DASHBOARD</button>
-  <button class="tab" data-tab="nodes">NODES</button>
-  <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
-  <button class="tab" data-tab="netpath">NETPATH</button>
-  <button class="tab" data-tab="netflow">NETFLOW</button>
-  <button class="tab" data-tab="snmp">SNMP TRAP</button>
-  <button class="tab" data-tab="syslog">SYSLOG</button>
-  <button class="tab" data-tab="ipam">IPAM</button>
-  <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
-       FORTINET-FORTIGATE-MIB); the tab used to just say WIRELESS, which
-       reads as "every wireless estate" and only corrects itself once an
-       Aruba or Ubiquiti shop opens the page and finds nothing there. -->
-  <button class="tab" data-tab="wireless">WIRELESS (FORTIGATE)</button>
-  <button class="tab" data-tab="configrx">CONFIGRX</button>
-  <button class="tab" data-tab="debug">DEBUG</button>
-  <button class="tab" data-tab="settings">SETTINGS</button>
-  <span class="grow"></span>
-  <span id="version" class="conn"></span>
+  <div class="tab-group" data-label="Now">
+    <button class="tab" data-tab="dashboard">DASHBOARD</button>
+    <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
+  </div>
+  <div class="tab-group" data-label="Inventory">
+    <button class="tab" data-tab="nodes">NODES</button>
+    <button class="tab" data-tab="ipam">IPAM</button>
+    <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
+         FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than
+         plain WIRELESS, which read as "every wireless estate" and only
+         corrected itself once an Aruba or Ubiquiti shop opened the page and
+         found nothing there. -->
+    <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
+    <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
+  </div>
+  <div class="tab-group" data-label="Telemetry">
+    <button class="tab" data-tab="netpath">ROUTES</button>
+    <button class="tab" data-tab="netflow">NETFLOW</button>
+    <button class="tab" data-tab="syslog">SYSLOG</button>
+    <button class="tab" data-tab="snmp">SNMP TRAP</button>
+  </div>
+  <div class="tab-group" data-label="Admin">
+    <button class="tab" data-tab="settings">SETTINGS</button>
+    <button class="tab" data-tab="debug">DEBUG</button>
+  </div>
+</nav>
+<div id="tabs-utility" class="tabs-utility">
+  <button id="global-search-btn" class="linkish" title="Search (/)" aria-label="Search">Search</button>
   <span id="whoami" class="conn user"></span>
   <button id="account-btn" class="linkish">Account</button>
   <button id="signout" class="linkish">Sign out</button>
   <!-- The one honest signal during an outage: announced, not just recoloured. -->
   <span id="conn" class="conn" role="status" aria-live="polite">connecting…</span>
-</nav>
+</div>
+</div>
 
 <!-- Wall display. Shown only when the page was opened as /?kiosk=1 (app.js
      initKiosk): the tab strip is hidden, the root font grows a quarter, and
      this one thin line says what is on screen, whose session it is and how
      long that session has left — the absolute ceiling used to arrive as an
      unexplained sign-in page overnight. -->
-<div id="kiosk-bar" class="kiosk-bar" hidden>
+<div id="kiosk-bar" class="kiosk-bar" hidden
+     title="Press 1-9 on a connected keyboard to jump straight to a view">
   <span class="brand" aria-hidden="true"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg></span>
   <span id="kiosk-tab" class="kiosk-tab"></span>
+  <!-- Only drawn when ?rotate=... names more than one view (App.drawKioskBar):
+       a dot per stop in the rotation, the current one filled, and the plain
+       word "next" rather than assuming everyone reads a countdown at a
+       glance from across a room. -->
+  <span id="kiosk-dots" class="kiosk-dots" hidden></span>
+  <span id="kiosk-next" class="kiosk-next" hidden></span>
   <span class="grow"></span>
   <span id="kiosk-clock" class="kiosk-clock"></span>
   <span id="kiosk-session" class="kiosk-session"></span>
@@ -98,6 +126,17 @@
     <button id="nd-manage-devgroups" data-requires-write="nodes">Manage groups</button>
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
+  </div>
+  <!-- P1-9: a finished/cancelled scan no longer pops its approval dialog on
+       every arrival at this tab — that ambushed whoever opened it next,
+       in every session. This line offers the same dialog instead of
+       forcing it; nodes.js's drawDiscStrip hides it when nothing is
+       unreviewed. -->
+  <div class="bar wrap" id="nd-disc-strip" hidden>
+    <span id="nd-disc-strip-text" class="hint"></span>
+    <span class="grow"></span>
+    <button id="nd-disc-strip-review">Review</button>
+    <button id="nd-disc-strip-dismiss">Dismiss</button>
   </div>
 
   <nav class="subtabs">
@@ -162,11 +201,17 @@
       <button id="nd-bulk-clear">Clear selection</button>
     </div>
     <div class="cols" data-splitter="nodes-devices">
-      <div class="pane" data-grow="2">
+      <!-- The devices table's own columns ask for more room than the old
+           2/3 split gave them at any laptop width, so the right-most column
+           was cut mid-value before anyone had touched the divider. 3/2 gives
+           the table the larger share instead; LAYOUT_VERSION in app.js is
+           bumped alongside this so a browser holding the old split takes
+           the new one. -->
+      <div class="pane" data-grow="3">
         <div class="table-wrap"><table id="nodes-table"></table></div>
       </div>
       <div class="divider"></div>
-      <aside class="pane pad-x pad-b" data-grow="3">
+      <aside class="pane pad-x pad-b" data-grow="2">
         <div id="nd-detail-empty" class="empty">Select a device to see its stats.</div>
         <div id="nd-detail" hidden>
           <div class="bar">
@@ -183,6 +228,11 @@
                  label, as App.helpLink documents. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
+            <!-- P1-4: a plain outbound link to the device's own web UI, set
+                 by nodes.js from the selected device's IP. No write gate —
+                 unlike SSH it opens nothing on this server, just a tab in
+                 the browser. -->
+            <a id="nd-web-device" class="linkish" target="_blank" rel="noopener" hidden>WEB</a>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The status timeline, with its own range picker: "how long has
@@ -363,6 +413,10 @@
       <span class="grow"></span>
       <button id="alerts-bulk-clear">Clear selection</button>
     </div>
+    <header class="bar">
+      <span class="section">ALERTS PER HOUR</span>
+      <span id="alerts-hist-summary" class="hint"></span>
+    </header>
     <div id="alerts-hist" class="canvas chart small"><svg id="alerts-hist-svg"></svg></div>
     <div class="cols" data-splitter="alerts-main">
       <div class="pane" data-grow="7">
@@ -491,7 +545,6 @@
     <label>Port <input id="nf-port" size="5"></label>
     <select id="nf-protocol" aria-label="Protocol"></select>
     <select id="nf-exporter" aria-label="Exporter"></select>
-    <label class="check"><input type="checkbox" id="nf-resolve"> Resolve names</label>
     <button id="nf-apply">Search</button>
     <button id="nf-clear">Clear</button>
     <button id="nf-export-csv">Export CSV</button>
@@ -677,12 +730,12 @@
   </div>
 
   <nav class="subtabs">
-    <button class="subtab active" data-subtab="dhcp">DHCP</button>
+    <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
     <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
-    <button class="subtab" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
+    <button class="subtab" data-subtab="dhcp">DHCP</button>
   </nav>
 
-  <div id="ipam-sub-subnets" class="subpage">
+  <div id="ipam-sub-subnets" class="subpage active">
    <div class="cols" data-splitter="ipam-subnets">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
@@ -692,12 +745,11 @@
         <button id="ipam-edit-subnet" data-requires-write="ipam">Edit</button>
         <button id="ipam-add-subnet" class="primary" data-requires-write="ipam">Add</button>
       </div>
+      <!-- The alive/seen-before/never-seen legend used to be repeated here
+           a third time: the subnet donut (ipam.js) now carries a centre
+           figure and its own legend, and the table's own status column
+           already says the same word per row. -->
       <div class="table-wrap"><table id="ipam-subnet-table"></table></div>
-      <p class="hint pad-x" style="padding-top:8px">
-        <span style="color:var(--ok)">&#9679;</span> alive &nbsp;
-        <span style="color:var(--warn)">&#9679;</span> seen before, now down &nbsp;
-        <span style="color:var(--line)">&#9679;</span> never seen
-      </p>
     </aside>
     <div class="divider"></div>
     <div class="pane pad-x pad-b" data-grow="3">
@@ -728,7 +780,7 @@
     <div class="table-wrap pad-x pad-b" style="flex:1"><table id="ipam-conflicts-table"></table></div>
   </div>
 
-  <div id="ipam-sub-dhcp" class="subpage active">
+  <div id="ipam-sub-dhcp" class="subpage">
     <!-- Shown instead of the form on a host with no PowerShell: reading a
          Windows DHCP server needs it, and the whole subtab rendered in full
          on Linux with Windows-only help text and no hint it could not work.
@@ -850,7 +902,7 @@
   <div class="bar wrap">
     <label>Search <input id="cx-q" size="26" placeholder="device name or IP"></label>
     <label>Vendor <select id="cx-filter-vendor"></select></label>
-    <label class="check"><input type="checkbox" id="cx-enabled-only"> Backup-enabled only</label>
+    <label class="check"><input type="checkbox" id="cx-enabled-only" checked> Backup-enabled only</label>
     <button id="cx-apply">Search</button>
     <button id="cx-clear">Clear</button>
     <span class="grow"></span>
@@ -881,7 +933,7 @@
    </div>
    <div class="divider"></div>
    <div class="pane" data-grow="1">
-    <header class="bar">
+    <header class="bar wrap">
       <span id="cx-backup-header" class="section">BACKUPS</span>
       <span class="grow"></span>
       <!-- Diffs the selected row against the next-OLDER one in this list —
@@ -969,27 +1021,42 @@
 
 <!-- =========================== SETTINGS ============================ -->
 <section id="page-settings" class="page">
-  <div class="scroll">
-    <p class="hint">
-      These apply across every module. NetPath's worker pool, retention and
-      destination defaults are under Settings on the NetPath tab; the
-      collector's listener, sampling and storage are under Settings on the
-      NetFlow tab.
-    </p>
-    <!-- Client state, not server state: the only fieldset on this page that
-         does not round-trip to /api/settings. Applied on change, not on Apply
-         changes, and never gated — a read-only operator may choose how their
-         own screen looks. -->
-    <fieldset id="appearance">
-      <legend>APPEARANCE · THIS BROWSER</legend>
-      <label>Theme <select id="set-theme">
-        <option value="dark">Dark</option>
-        <option value="light">Light</option>
-        <option value="contrast">High contrast</option>
-      </select></label>
-      <p class="hint">Stored in this browser, not on the server: it applies at once,
-        to every account that signs in on this machine, and needs no Apply.</p>
-    </fieldset>
+  <!-- Eleven fieldsets used to be one 3,760px scroll with no way to jump
+       partway down it. Seven subtabs, same nav/subpage/recallSub grammar as
+       every other multi-section page, so #/settings/users is addressable
+       and a page-wide search for "where do I change X" has somewhere
+       shorter to look than Ctrl-F over the whole thing. -->
+  <nav class="subtabs">
+    <button class="subtab active" data-subtab="general">GENERAL</button>
+    <button class="subtab" data-subtab="retention">DATA &amp; RETENTION</button>
+    <button class="subtab" data-subtab="signin">SIGN-IN</button>
+    <button class="subtab" data-subtab="users">USERS</button>
+    <button class="subtab" data-subtab="directory">TOKENS &amp; DIRECTORY</button>
+    <button class="subtab" data-subtab="maintenance">MAINTENANCE</button>
+    <button class="subtab" data-subtab="modules">MODULES</button>
+  </nav>
+  <!-- Each subpage carries .scroll itself (rather than one shared wrapper
+       around all seven) so it is a direct child of .page, a sibling of the
+       nav above, exactly like every other multi-section page's subpages —
+       the shape App.wireSubtabGroups (app.js) pairs a .subtab with its
+       .subpage by. A shared wrapper here left the subpages nested one
+       level too deep for that pairing to find them. -->
+  <p class="hint pad-x" style="padding-top:10px">
+    These apply across every module. NetPath's worker pool, retention and
+    destination defaults are under Settings on the NetPath tab; the
+    collector's listener, sampling and storage are under Settings on the
+    NetFlow tab.
+  </p>
+    <div id="settings-sub-general" class="subpage scroll active">
+    <!-- Appearance (theme, and now the wall-display/kiosk launcher) is a
+         per-browser choice, not a server setting, and used to lead this
+         page ahead of every setting that actually lives on the server. It
+         now lives in the Account dialog, reachable from every page; this is
+         the pointer left in its old place. -->
+    <p class="hint">Appearance — theme and the wall-display view — moved to
+      <button type="button" class="linkish" id="open-account-appearance">Account</button>
+      in the top bar, since it is a per-browser choice rather than a server
+      setting.</p>
     <fieldset>
       <legend>REVERSE DNS</legend>
       <label class="check"><input type="checkbox" id="set-dns-enabled"> Resolve addresses to names</label>
@@ -1032,14 +1099,14 @@
       <label>ConfigRX <input type="number" id="set-refresh-configrx" min="1" max="3600" step="1"> s</label>
       <label>Dashboard <input type="number" id="set-refresh-dashboard" min="1" max="3600" step="1"> s</label>
       <label>Debug <input type="number" id="set-refresh-debug" min="1" max="60" step="1"> s</label>
-      <p class="hint">Set per module because they want different rates. The route graph is
-        cheap and benefits from feeling live; the flow charts are aggregations over a whole
-        window and barely change in a few seconds, so a slow rate costs nothing and saves a
-        lot of work. The Debug page's elapsed counters advance smoothly ten times a second
-        without asking the server again, so its rate only controls how often new events and
-        worker state are fetched.</p>
+      <p class="hint">Set per module because they want different rates.<button type="button"
+        class="help-link" data-help="settings.refresh.rates" title="What does this control?"
+        aria-label="Help">?</button></p>
       <p class="hint" id="set-timezone"></p>
     </fieldset>
+    </div>
+
+    <div id="settings-sub-retention" class="subpage scroll">
     <fieldset>
       <legend>DATA FILES</legend>
       <label>Application <input id="set-app-path" readonly>
@@ -1070,12 +1137,13 @@
         deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
         oldest scan history first — subnets, discovered hosts and open conflicts describe the
         network as it is now, not a log, so they aren't what a size cap trims.</p>
-      <p class="hint">The application file holds settings, accounts, and the shared reverse-DNS
-        and ASN caches — one row per address rather than one row per event, so it stays small
-        on its own; those caches are already bounded by age via the DNS and ASN cache-days
-        settings above, not by a size cap. It has no cap because it is the one file worth
-        backing up — the other seven can all be rebuilt by simply collecting again.</p>
+      <p class="hint">The application file has no cap because it is the one file worth
+        backing up.<button type="button" class="help-link" data-help="settings.data.appfile"
+        title="What does this control?" aria-label="Help">?</button></p>
     </fieldset>
+    </div>
+
+    <div id="settings-sub-signin" class="subpage scroll">
     <fieldset>
       <legend>SIGN-IN</legend>
       <label>Idle timeout <input type="number" id="set-idle-minutes" min="1" max="1440" step="1"> min</label>
@@ -1086,6 +1154,54 @@
         regardless of activity. Changing either applies to every session at the next check, not
         only new ones.</p>
     </fieldset>
+    </div>
+
+    <div id="settings-sub-users" class="subpage scroll">
+    <fieldset data-requires-write="settings">
+      <legend>USERS</legend>
+      <p class="hint">Your own password is changed from the <b>Account</b> button in the top
+        bar, reachable regardless of what you have access to here — everything below needs
+        write access to Settings.</p>
+      <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
+      <div class="row" style="margin-top:10px">
+        <input id="new-username" placeholder="username" size="18" aria-label="New username">
+        <input id="new-password" type="password" placeholder="initial password" size="22" aria-label="Initial password">
+        <button type="button" id="gen-password" aria-label="Generate a random initial password">Generate</button>
+        <button type="button" id="copy-password" aria-label="Copy the initial password">Copy</button>
+        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-local" value="local" checked>
+          Local password</label>
+        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
+          Sign in via LDAP directory</label>
+      </div>
+      <!-- Twelve modules times three raw radios, with a staged Apply beside
+           it, used to be the only way to grant anyone anything. A preset
+           sets the whole grid in one click; "copy from" repeats an account
+           that already has the shape a new one needs; either still leaves
+           every radio open to a one-off change afterwards, which switches
+           the preset back to Custom (see settings.js). -->
+      <div class="row" id="new-perm-tools">
+        <label>Role <select id="new-perm-preset">
+          <option value="custom">Custom</option>
+          <option value="viewer">Viewer — read everything</option>
+          <option value="operator">Operator — write to every module, not Settings</option>
+          <option value="admin">Admin — write to everything</option>
+        </select></label>
+        <label>Copy permissions from <select id="new-perm-copyfrom">
+          <option value="">— choose an account —</option>
+        </select></label>
+      </div>
+      <div id="new-user-grid"></div>
+      <div class="row"><button id="add-user" data-requires-write="admin">Add user</button></div>
+      <p class="hint" id="users-status">A new user must change the initial password when they
+        first sign in, and starts with whatever access is set above — write implies read, and
+        nothing checked means no access to that module at all. An LDAP account has no local
+        password at all — the initial-password field above is ignored for one — and its password
+        is only ever changed in the directory.</p>
+      <p class="hint" id="sessions-line"></p>
+    </fieldset>
+    </div>
+
+    <div id="settings-sub-directory" class="subpage scroll">
     <fieldset data-requires-write="admin">
       <legend>DIRECTORY (LDAP)</legend>
       <p class="hint">Lets accounts created below with "Sign in via LDAP directory" verify their
@@ -1113,36 +1229,12 @@
       </div>
       <p class="hint" id="ldap-status"></p>
       <div class="row" style="margin-top:8px">
-        <input id="ldap-test-username" placeholder="test username" size="16">
-        <input id="ldap-test-password" type="password" placeholder="test password" size="18">
+        <input id="ldap-test-username" placeholder="test username" size="16" aria-label="Test username">
+        <input id="ldap-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
         <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
       </div>
       <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
         ones, for any left blank) without saving anything or creating a session.</p>
-    </fieldset>
-
-    <fieldset data-requires-write="settings">
-      <legend>USERS</legend>
-      <p class="hint">Your own password is changed from the <b>Account</b> button in the top
-        bar, reachable regardless of what you have access to here — everything below needs
-        write access to Settings.</p>
-      <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
-      <div class="row" style="margin-top:10px">
-        <input id="new-username" placeholder="username" size="18">
-        <input id="new-password" type="password" placeholder="initial password" size="22">
-        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-local" value="local" checked>
-          Local password</label>
-        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
-          Sign in via LDAP directory</label>
-      </div>
-      <div id="new-user-grid"></div>
-      <div class="row"><button id="add-user" data-requires-write="admin">Add user</button></div>
-      <p class="hint" id="users-status">A new user must change the initial password when they
-        first sign in, and starts with whatever access is set above — write implies read, and
-        nothing checked means no access to that module at all. An LDAP account has no local
-        password at all — the initial-password field above is ignored for one — and its password
-        is only ever changed in the directory.</p>
-      <p class="hint" id="sessions-line"></p>
     </fieldset>
 
     <fieldset data-requires-write="admin">
@@ -1154,14 +1246,16 @@
         itself is shown once, right after you create it, and never again.</p>
       <div class="table-wrap" style="max-height:220px"><table id="tokens-table"></table></div>
       <div class="row" style="margin-top:10px">
-        <input id="new-token-username" placeholder="account username" size="16">
-        <input id="new-token-label" placeholder="label — what this is for" size="26">
-        <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12">
+        <input id="new-token-username" placeholder="account username" size="16" aria-label="Token account username">
+        <input id="new-token-label" placeholder="label — what this is for" size="26" aria-label="Token label">
+        <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12" aria-label="Token expiry, in days">
         <button id="add-token" data-requires-write="admin">Create token</button>
       </div>
       <p class="hint" id="tokens-status"></p>
     </fieldset>
+    </div>
 
+    <div id="settings-sub-maintenance" class="subpage scroll">
     <fieldset>
       <legend>SOFTWARE UPDATE</legend>
       <p class="hint">Running <span id="update-version"></span>, commit
@@ -1174,15 +1268,10 @@
         <label class="check"><input type="checkbox" id="set-updates-enabled">
           Allow updates from GitHub</label>
       </div>
-      <p class="hint" data-requires-write="admin">Off unless you turn it on, and
-        saved the moment you tick it. What it installs is <strong>whatever is at
-        the tip of <code>main</code> right now</strong> — there is no signature,
-        no tag and no checksum in that path, so anyone who can push to that
-        repository chooses the code this host runs at the next press of the
-        button, on a machine holding your SNMP communities and SSH credentials.
-        This is a known, temporary state, recorded as S-B1 in
-        <code>REVIEW-NETWORK-ENGINEER.md</code>. If that is not acceptable here,
-        leave this off and replace the <code>netpath</code> folder by hand.</p>
+      <p class="hint" data-requires-write="admin">Off unless you turn it on — installs
+        whatever is at the tip of <code>main</code>, unsigned, at the next press of the
+        button below.<button type="button" class="help-link" data-help="settings.update.risk"
+        title="What does this control?" aria-label="Help">?</button></p>
       <div class="row">
         <button id="update-now" class="primary half" data-requires-write="admin">Check for update &amp; restart</button>
       </div>
@@ -1207,7 +1296,21 @@
       </div>
       <p class="hint">These act immediately and cannot be undone.</p>
     </fieldset>
-  </div>
+    </div>
+
+    <!-- One place that answers "where is the setting for X" without already
+         knowing: module settings otherwise live in one place — a button on
+         each module's own strip, and nowhere else — so this lists all nine
+         and opens the same dialog the module's own button does. -->
+    <div id="settings-sub-modules" class="subpage scroll">
+    <fieldset>
+      <legend>MODULE SETTINGS</legend>
+      <p class="hint">Each module keeps its own settings on its own tab; this opens the
+        same dialog from one list rather than requiring you to already know which
+        tab it lives on.</p>
+      <div id="settings-modules-list" class="row wrap"></div>
+    </fieldset>
+    </div>
   <div class="bar footer">
     <span id="set-status" class="hint"></span>
     <span class="grow"></span>
@@ -1234,18 +1337,18 @@
      order, and all finish before DOMContentLoaded — which is also what
      makes app.js's start-up ordering sound (see the end of app.js).
      boot.js must keep blocking: its whole job is to run before <body>. -->
-<script src="/app.js" defer></script>
-<script src="/dashboard.js" defer></script>
-<script src="/nodes.js" defer></script>
-<script src="/alerts.js" defer></script>
-<script src="/netpath.js" defer></script>
-<script src="/netflow.js" defer></script>
-<script src="/snmp.js" defer></script>
-<script src="/syslog.js" defer></script>
-<script src="/ipam.js" defer></script>
-<script src="/wireless.js" defer></script>
-<script src="/configrx.js" defer></script>
-<script src="/debug.js" defer></script>
-<script src="/settings.js" defer></script>
+<script src="/app.js?v=__SW_VERSION__" defer></script>
+<script src="/dashboard.js?v=__SW_VERSION__" defer></script>
+<script src="/nodes.js?v=__SW_VERSION__" defer></script>
+<script src="/alerts.js?v=__SW_VERSION__" defer></script>
+<script src="/netpath.js?v=__SW_VERSION__" defer></script>
+<script src="/netflow.js?v=__SW_VERSION__" defer></script>
+<script src="/snmp.js?v=__SW_VERSION__" defer></script>
+<script src="/syslog.js?v=__SW_VERSION__" defer></script>
+<script src="/ipam.js?v=__SW_VERSION__" defer></script>
+<script src="/wireless.js?v=__SW_VERSION__" defer></script>
+<script src="/configrx.js?v=__SW_VERSION__" defer></script>
+<script src="/debug.js?v=__SW_VERSION__" defer></script>
+<script src="/settings.js?v=__SW_VERSION__" defer></script>
 </body>
 </html>

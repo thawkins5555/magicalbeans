@@ -110,18 +110,22 @@ def capability_detection_and_fallback():
         socket.socket = real_socket
 
     # ping_once must still return a plain bool in that situation — falling
-    # back to the subprocess path — not raise. There is no `ping` binary
-    # on this machine (confirmed by test_nodediscover_e2e.py's own
-    # comment), so subprocess.run itself fails with FileNotFoundError,
-    # which ping_once already turns into False; either way this call must
-    # not raise past the refused socket.
+    # back to the subprocess path — not raise. What that bool *is* depends
+    # on the machine: where there is no `ping` binary subprocess.run raises
+    # FileNotFoundError, which ping_once turns into False; where there is
+    # one (every Windows host, most Linux ones) 127.0.0.1 answers and it is
+    # True. Asserting False here made this suite pass only on a host with no
+    # ping, which is the same environment assumption tests/README.md says
+    # these suites must not make. The property under test is that a refused
+    # socket does not raise past ping_once.
     reset_capability_cache()
     socket.socket = always_refused
     try:
         result = ipam_scan.ping_once("127.0.0.1", timeout_ms=200)
-        check(result is False,
-             "ping_once falls back cleanly (to False, no ping binary here) "
-             "when no ICMP socket can be opened at all")
+        check(isinstance(result, bool),
+             f"ping_once falls back cleanly (to a bool, by whichever route "
+             f"this host offers) when no ICMP socket can be opened at "
+             f"all: {result!r}")
     finally:
         socket.socket = real_socket
     reset_capability_cache()
@@ -206,9 +210,17 @@ def subprocess_path_still_works():
     real_run = subprocess.run
     calls = []
 
+    # ping_many parses its host platform's own ping output — _WIN_PING_TIME
+    # on Windows (whole milliseconds, "time=4ms"), _UNIX_PING_TIME elsewhere
+    # ("time=4.20 ms"). Feeding the Unix form on both made the RTT check fail
+    # on Windows against a parser that was working exactly as designed.
+    win = ipam_scan.IS_WINDOWS
+    expected_rtt = 4.0 if win else 4.20
+
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        out = "64 bytes from 10.0.0.9: icmp_seq=1 ttl=64 time=4.20 ms\n"
+        out = ("Reply from 10.0.0.9: bytes=32 time=4ms TTL=64\n" if win else
+               "64 bytes from 10.0.0.9: icmp_seq=1 ttl=64 time=4.20 ms\n")
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     subprocess.run = fake_run
@@ -222,7 +234,7 @@ def subprocess_path_still_works():
         sent, received, rtt = ipam_scan.ping_many("10.0.0.9", count=3, timeout_ms=500)
         check((sent, received) == (3, 3),
              f"ping_many (subprocess mode) still sends/counts 3 probes: {(sent, received)}")
-        check(rtt is not None and abs(rtt - 4.20) < 1e-6,
+        check(rtt is not None and abs(rtt - expected_rtt) < 1e-6,
              f"ping_many still parses the RTT out of ping's own output: {rtt}")
         check(len(calls) == 3, f"ping_many still spawns one subprocess per probe: {len(calls)}")
 

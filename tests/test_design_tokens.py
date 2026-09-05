@@ -64,6 +64,17 @@ for theme_name, body_text in BLOCKS:
         BASE = values
 TOKENS = BASE
 check(len(TOKENS) > 40, "tokens.css parsed (%d tokens)" % len(TOKENS))
+# The spacing scale: four steps, each a multiple of 4px and each bigger
+# than the last, so a control's padding stops being a number picked by eye.
+SPACE_STEPS = ["--space-xs", "--space-sm", "--space-md", "--space-lg"]
+check(all(name in TOKENS for name in SPACE_STEPS),
+      "tokens.css defines the spacing scale (%s)" % SPACE_STEPS)
+if all(name in TOKENS for name in SPACE_STEPS):
+    space_px = [int(TOKENS[name].strip().rstrip("px")) for name in SPACE_STEPS]
+    check(space_px == sorted(space_px) and len(set(space_px)) == 4,
+          "the spacing scale is four distinct, ascending steps (%s)" % space_px)
+    check(all(value % 4 == 0 for value in space_px),
+          "every spacing step is a multiple of 4px (%s)" % space_px)
 THEMES = {"dark": dict(BASE)}
 for theme_name, values in OVERRIDES.items():
     THEMES[theme_name] = dict(BASE, **values)
@@ -98,6 +109,23 @@ TEXT_ON = [
     ("--dim", "--bg", 4.5), ("--dim", "--panel", 4.5), ("--dim", "--raised", 4.5),
     ("--ok", "--bg", 4.5), ("--warn", "--bg", 4.5), ("--fail", "--bg", 4.5),
     ("--accent", "--bg", 4.5), ("--fail", "--raised", 4.5),
+    # A semantic tone used to be checked against --bg only, and --fail was the
+    # single one also checked against --raised. But --raised is every alternate
+    # row of every table, which is where these tones actually live: "unchanged"
+    # and "oper up" in --ok, the warning severity word in --warn. Both sat under
+    # AA in the light theme (4.31 and 4.21) with this list reporting green.
+    ("--ok", "--raised", 4.5), ("--warn", "--raised", 4.5),
+    ("--accent", "--raised", 4.5), ("--blocked", "--raised", 4.5),
+    ("--overrun", "--raised", 4.5), ("--error", "--raised", 4.5),
+    ("--ok", "--panel", 4.5), ("--warn", "--panel", 4.5), ("--fail", "--panel", 4.5),
+    # ...and on the row the operator has actually opened.
+    ("--ok", "--selected", 4.5), ("--warn", "--selected", 4.5),
+    ("--fail", "--selected", 4.5), ("--accent", "--selected", 4.5),
+    ("--dim", "--selected", 4.5),
+    # --checked-strong carries text too. Only the two tones that are allowed to
+    # be drawn on it are held here; tokens.css records why the rest are not.
+    ("--text", "--checked", 4.5), ("--muted", "--checked", 4.5),
+    ("--text", "--checked-strong", 4.5),
     # dark text on the three badge fills
     ("--bg", "--fail", 4.5), ("--bg", "--warn", 4.5), ("--bg", "--accent", 4.5),
     ("--focus", "--bg", 4.5),
@@ -112,6 +140,12 @@ GRAPHIC_ON = [
     ("--line", "--raised", 3.0), ("--line", "--panel", 3.0), ("--line", "--bg", 3.0),
     ("--data-neutral", "--panel", 3.0),
     ("--accent", "--raised", 3.0),       # the selected-row bar, the focus ring
+    # The meter fill against its own track (.usage .meter, .dash-bar), which
+    # is --raised, not --accent/--ok/--warn/--fail against --data-neutral —
+    # the pair that was actually failing (1.66-2.82:1) while the track read
+    # fine against --panel. --accent's copy of this pair already existed
+    # above for an unrelated reason and is not repeated here.
+    ("--ok", "--raised", 3.0), ("--warn", "--raised", 3.0), ("--fail", "--raised", 3.0),
 ]
 # High contrast is held to AAA: 7:1 for text, 4.5:1 for a line or a ring.
 FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5)}
@@ -184,6 +218,14 @@ for sheet in SHEETS:
     # shadows and scrims are tokens too: five hand-written rgba shadows and
     # two scrims used to sit beside the token that existed for them
     check("rgba(" not in body, "%s: no literal rgba (shadows and scrims are tokens)" % sheet)
+    # radii are tokens too: seven hand-tuned pixel values (2, 3, 5, 9px)
+    # used to sit beside the three the contract named, one per shape,
+    # before --radius-pill gave the half-height ones a single home. A
+    # radius still allowed to use a token in a calc() (the nested subtab's
+    # `calc(var(--radius-sm) - 1px)`) is not a literal of its own.
+    radii = [value for value in re.findall(r"border-radius:\s*([^;]+);", body)
+             if "px" in value and "var(" not in value]
+    check(not radii, "%s: no pixel border-radius (found %s)" % (sheet, radii[:3] or "none"))
 check(read(STATIC, "app.css").count(".sr-only {") == 1, "app.css defines .sr-only once")
 APP_CSS = read(STATIC, "app.css")
 check(APP_CSS.count("background: var(--panel);\n  border: 1px solid var(--hairline);") == 1,
@@ -193,6 +235,9 @@ check(APP_CSS.count("font: 600 var(--fs-2xs)/1 var(--ui);\n  letter-spacing: var
       "one eyebrow rule")
 check("table { width: 100%; border-collapse: collapse; font-family: var(--ui);" in APP_CSS
       and "td.mono" in APP_CSS, "tables are proportional with mono opt-in per column")
+space_uses = sum(APP_CSS.count("var(%s)" % name) for name in SPACE_STEPS)
+check(space_uses > 50, "app.css actually uses the spacing scale (%d references)" % space_uses)
+check("var(--radius-pill)" in APP_CSS, "app.css uses --radius-pill for the half-height shapes")
 
 for name in sorted(os.listdir(STATIC)):
     if name.endswith((".js", ".html")):
@@ -209,13 +254,32 @@ for name in sorted(os.listdir(STATIC)):
             numeric = re.findall(r"'font-size':\s*\d+\b(?![\d.]*\s*[*+])", body)
             check(not numeric, "%s: SVG text sizes are tokens (found %d numeric)"
                   % (name, len(numeric)))
+            # A script setting a CSS radius directly (rather than through
+            # app.css) is the same drift a hard-coded hex colour would be.
+            # SVG rx/ry (netpath's and netflow's node boxes and legend
+            # swatches) are a diagram's own geometry, not this contract, and
+            # are exempt on purpose.
+            radius = re.findall(r"(?:borderRadius\s*[:=]|'border-radius':)\s*['\"]?[\d.]+px", body)
+            check(not radius, "%s: no pixel border-radius set from script (found %s)"
+                  % (name, radius[:3] or "none"))
 
 # --------------------------------------------------------------------------
 # 4. tokens.css is where it has to be: first on every page, and public.
+# The asset URLs carry `?v=__SW_VERSION__`, substituted with the running
+# version as the file is loaded (server.py's static cache) so that a
+# year-long immutable cache cannot outlive the release that filled it. These
+# checks are about which file is asked for and in what order, so they match
+# the path and let the query alone — but the placeholder itself is asserted
+# below, because markup that lost it would be served with a literal
+# "?v=__SW_VERSION__" and cache the wrong bytes forever.
 for page in ("index.html", "login.html", "ssh.html"):
     body = read(STATIC, page)
-    check('href="/tokens.css"' in body and body.index("tokens.css") < body.index("app.css"),
+    check('href="/tokens.css?v=' in body and body.index("tokens.css") < body.index("app.css"),
           "%s links tokens.css before app.css" % page)
+    for asset in re.findall(r'(?:src|href)="(/[\w./-]+\.(?:js|css))([^"]*)"', body):
+        path, query = asset
+        check(query.startswith("?v=__SW_VERSION__"),
+              "%s: %s carries the version placeholder (found %r)" % (page, path, query))
 server = read(REPO_ROOT, "netpath", "web", "server.py")
 check('"/tokens.css"' in server.split("PUBLIC_PATHS")[1].split("}")[0],
       "server.py serves /tokens.css before sign-in")
@@ -226,7 +290,8 @@ check("sappiwhere.theme" in boot and "dataset.theme" in boot,
       "boot.js applies the stored theme before first paint")
 for page in ("index.html", "login.html", "ssh.html"):
     body = read(STATIC, page)
-    check('<script src="/boot.js"></script>' in body, "%s loads boot.js blocking, in <head>" % page)
+    check(re.search(r'<script src="/boot\.js\?v=[^"]*"></script>', body),
+          "%s loads boot.js blocking, in <head>" % page)
     check('class="brand"' in body and 'class="mark"' in body, "%s carries the wordmark" % page)
     marks = re.findall(r"<svg class=\"mark\".*?</svg>", body, re.S)
     check(marks and not any(re.search(r"#[0-9A-Fa-f]{3,6}\b", m) for m in marks),

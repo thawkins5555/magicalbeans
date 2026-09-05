@@ -65,6 +65,26 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = (ts) => App.ago(ts, '\u2014');
 
+  /* Fills in the two device-address links beside the object line once the
+     ip lookup resolves \u2014 done after the pane is already on screen so
+     opening an alert never waits on a Nodes fetch. Guarded by the alert
+     still being the one on screen: a slow lookup landing after the
+     operator moved to another alert must not rewrite a pane that has
+     moved on. deviceId arrives as the String() showDetail's signature
+     needs; App.deviceIndex's byId is keyed by the device row's own
+     (numeric) id, so it is looked up back as a number. */
+  async function loadDeviceLinks(deviceId, alertId) {
+    const { byId } = await App.deviceIndex();
+    const device = byId.get(Number(deviceId));
+    const ip = device ? device.ip : null;
+    if (view.selected !== alertId || !ip) return;
+    const box = document.getElementById('alerts-d-links');
+    if (!box) return;
+    box.innerHTML =
+      `<a class="linkish inline" href="${App.buildRoute('syslog', [], { source: ip })}">Syslog for this device</a> \u00b7 ` +
+      `<a class="linkish inline" href="${App.buildRoute('snmp', [], { source: ip })}">Recent traps</a>`;
+  }
+
   function window_() {
     const seconds = Number(App.el('alerts-range').value) || 86400;
     view.t1 = Date.now() / 1000;
@@ -92,18 +112,18 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const alerts = server.alerts || { counters: {} };
-    App.el('alerts-status').textContent = alerts.status || 'Alert engine stopped';
-    App.el('alerts-dot').style.background = alerts.running ? 'var(--ok)' : 'var(--line)';
-    App.el('alerts-toggle').textContent = alerts.running ? 'Stop alert engine' : 'Start alert engine';
+    App.setText(App.el('alerts-status'), alerts.status || 'Alert engine stopped');
+    App.setBg(App.el('alerts-dot'), alerts.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('alerts-toggle'), alerts.running ? 'Stop alert engine' : 'Start alert engine');
     const c = alerts.counters || {};
     if (App.state.kiosk) {
-      App.el('alerts-counters').innerHTML = App.figures([
+      App.setHtml(App.el('alerts-counters'), App.figures([
         { value: alerts.open_count || 0, label: 'open',
           className: alerts.open_count ? 'warn' : '' },
         { value: c.opened || 0, label: 'opened' },
         { value: c.resolved || 0, label: 'resolved' },
-      ]);
-    } else App.el('alerts-counters').textContent =
+      ]));
+    } else App.setText(App.el('alerts-counters'),
       `${c.opened || 0} opened · ${c.resolved || 0} resolved · ` +
       `${c.emails_sent || 0} emails sent` +
       (c.suppressed ? ` · ${c.suppressed} suppressed` : '') +
@@ -120,12 +140,12 @@
       (c.backlog ? ` · ${Number(c.backlog).toLocaleString()} event(s) behind` : '') +
       (c.apply_errors ? ` · ${Number(c.apply_errors).toLocaleString()} apply errors` : '') +
       (view.bulkNotice && Date.now() < view.bulkNotice.until
-        ? ` · ${view.bulkNotice.text}` : '');
+        ? ` · ${view.bulkNotice.text}` : ''));
     if (view.bulkNotice && Date.now() >= view.bulkNotice.until) view.bulkNotice = null;
     const badge = App.el('alerts-open-badge');
     const openCount = alerts.open_count || 0;
-    badge.textContent = openCount;
-    badge.hidden = openCount === 0;
+    App.setText(badge, String(openCount));
+    if (badge.hidden !== (openCount === 0)) badge.hidden = openCount === 0;
     // Both injected in init() (see its own comment on why) rather than
     // declared with data-requires-write, so this is what keeps them honest
     // against a grant that changes while the page is open.
@@ -133,8 +153,9 @@
     for (const id of ['alerts-bulkmute-btn', 'alerts-bulk-unack']) {
       const btn = document.getElementById(id);
       if (!btn) continue;
-      btn.disabled = !writable;
-      btn.title = writable ? '' : 'Needs Alerts write';
+      if (btn.disabled !== !writable) btn.disabled = !writable;
+      const title = writable ? '' : 'Needs Alerts write';
+      if (btn.title !== title) btn.title = title;
     }
   }
 
@@ -143,8 +164,9 @@
   function drawHistogram() {
     // No click here: Alerts has no pinned-window mode, so the bars carry no
     // pointer cursor either (they used to promise a click they never had).
+    const plot = view.histPlot || { buckets: view.hist || [], span: view.t1 - view.t0 };
     App.stackedHistogram(App.el('alerts-hist-svg'), App.el('alerts-hist'), {
-      buckets: view.hist || [], unit: 'alerts', span: view.t1 - view.t0,
+      buckets: plot.buckets, unit: 'alerts', span: plot.span,
       empty: 'No alerts in this window', minHeight: 70,
     });
   }
@@ -304,11 +326,11 @@
   }
 
   async function bulkResolve() {
-    await bulkAction('/api/alerts/bulk-resolve', 'Resolved', 'resolved');
+    return bulkAction('/api/alerts/bulk-resolve', 'Resolved', 'resolved');
   }
 
   async function bulkAcknowledge() {
-    await bulkAction('/api/alerts/bulk-ack', 'Acknowledged', 'acknowledged');
+    return bulkAction('/api/alerts/bulk-ack', 'Acknowledged', 'acknowledged');
   }
 
   /* Both bulk actions have the same shape: act on exactly what is ticked,
@@ -317,22 +339,24 @@
      hands back ({"resolved": n} / {"acknowledged": n}) — read here rather
      than assumed equal to the selection, since a row someone else already
      resolved between the tick and the click counts as ticked but not acted
-     on, and a mismatch is exactly what an operator needs to see. */
+     on, and a mismatch is exactly what an operator needs to see. Returns
+     the outcome sentence — App.runJob at the call site defaults its "done"
+     label to a resolved string, and toasts (and announces) it there, so
+     this no longer has to call App.announce itself. */
   async function bulkAction(path, verb, key) {
     const ids = [...view.checked];
-    if (!ids.length) return;
+    if (!ids.length) return null;
     const result = await App.post(path, { alert_ids: ids });
-    // The notice is painted on the counters line, which reruns every poll
-    // and would be a noisy live region; the one-shot result is announced
-    // through the shared sr-only status instead.
-    App.announce(`${verb} ${result[key]} of ${ids.length}`);
-    view.bulkNotice = { text: `${verb} ${result[key]} of ${ids.length}`,
-                        until: Date.now() + 6000 };
+    const text = `${verb} ${result[key]} of ${ids.length}`;
+    // Also painted on the counters line, which reruns every poll and would
+    // be a noisy live region on its own — the toast is the one-shot report.
+    view.bulkNotice = { text, until: Date.now() + 6000 };
     clearSelection();
     view.checked.clear();
     drawBulkBar();
     drawStatus();
     App.refreshNow('alerts');
+    return text;
   }
 
   /* One line at the top of the detail pane saying an action on THIS alert
@@ -360,16 +384,30 @@
     line.textContent = text;
   }
 
+  // Past tense for the button/toast once App.runJob's promise settles —
+  // the label a caller passes in ("Resolve", "Mute") is the verb, not the
+  // outcome.
+  const DETAIL_DONE = { Resolve: 'Resolved', Acknowledge: 'Acknowledged',
+    Unacknowledge: 'Unacknowledged', Mute: 'Muted', 'Lift mute': 'Mute lifted' };
+
   /* Every single-row action in the detail pane goes through here. Each one
      used to `await App.post` bare, so a 403 (an account whose grant changed
      under an open page) or a 500 left the button looking as though it had
-     worked and the alert unchanged. A failure now lands in three places that
-     matter: the engine counters line, where the bulk actions report theirs;
-     the detail pane itself, where the button is; and nowhere at all in the
-     console, because the refresh is awaited inside its own try. */
-  async function detailAction(label, run) {
+     worked and the alert unchanged — and Acknowledge was the sharpest case:
+     the pane kept offering "Acknowledge" after it had worked, so the only
+     way to tell was to re-read the State column. App.runJob now disables
+     the button, names the outcome on it and in a toast, and — since
+     showDetail() below rebuilds the button row from the alert's new state —
+     a button whose action just succeeded is usually not even there any
+     more by the time its "done" label would revert. A failure now lands in
+     three places that matter: the engine counters line, where the bulk
+     actions report theirs; the detail pane itself, where the button is; and
+     nowhere at all in the console, because the refresh is awaited inside
+     its own try. */
+  async function detailAction(label, run, button) {
     try {
-      await run();
+      await App.runJob(button, { queued: `${label}…`,
+        done: DETAIL_DONE[label] || 'Done' }, run());
       detailError('');
     } catch (error) {
       const text = `${label} failed: ${error.message}`;
@@ -455,7 +493,10 @@
         ${writable && row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}
         ${writable && row.state === 'acked' ? '<button id="alerts-d-unack">Unacknowledge</button>' : ''}</div>
       ${muteHint}
-      <p><b>${escape(row.entity_label)}</b> · ${escape(row.rule_name)}</p>
+      <p><b>${deviceId
+        ? `<a class="linkish inline" href="${App.buildRoute('nodes', ['device', deviceId])}">${escape(row.entity_label)}</a>`
+        : escape(row.entity_label)}</b> · ${escape(row.rule_name)}` +
+        `${deviceId ? ` · <span id="alerts-d-links"></span>` : ''}</p>
       <p>${escape(row.message)}</p>
       ${row.detail ? `<p class="hint">${escape(row.detail)}</p>` : ''}
       ${row.rollup_note ? `<p class="hint"><b>Rolled up into this alert</b><br>` +
@@ -470,24 +511,25 @@
         `${App.duration(row.resolved_ts - row.opened_ts) ? ` · open for ${App.duration(row.resolved_ts - row.opened_ts)}` : ''}</p>` : ''}
       <div class="bar"><span class="section">NOTIFICATIONS</span></div>
       <div id="alerts-d-notifications" class="hint">Loading…</div>`;
+    if (deviceId) loadDeviceLinks(deviceId, row.id);
     const resolveBtn = document.getElementById('alerts-d-resolve');
     if (resolveBtn) resolveBtn.onclick = () =>
-      detailAction('Resolve', () => App.post(`/api/alerts/${row.id}/resolve`, {}));
+      detailAction('Resolve', () => App.post(`/api/alerts/${row.id}/resolve`, {}), resolveBtn);
     const ackBtn = document.getElementById('alerts-d-ack');
     if (ackBtn) ackBtn.onclick = () =>
-      detailAction('Acknowledge', () => App.post(`/api/alerts/${row.id}/ack`, {}));
+      detailAction('Acknowledge', () => App.post(`/api/alerts/${row.id}/ack`, {}), ackBtn);
     const unackBtn = document.getElementById('alerts-d-unack');
     if (unackBtn) unackBtn.onclick = () =>
-      detailAction('Unacknowledge', () => App.post(`/api/alerts/${row.id}/unack`, {}));
+      detailAction('Unacknowledge', () => App.post(`/api/alerts/${row.id}/unack`, {}), unackBtn);
     const muteBtn = muteable ? document.getElementById('alerts-d-mute') : null;
     if (muteBtn) muteBtn.onclick = () => detailAction('Mute', () => {
       const hours = Number(App.el('alerts-d-mute-hours').value) || 1;
       return App.post('/api/alerts/mute',
                       { entity_kind: 'device', entity_id: deviceId, hours });
-    });
+    }, muteBtn);
     const unmuteBtn = document.getElementById('alerts-d-unmute');
     if (unmuteBtn) unmuteBtn.onclick = () => detailAction('Lift mute', () =>
-      App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId }));
+      App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId }), unmuteBtn);
     App.get(`/api/alerts/${row.id}`).then((full) => {
       const box = document.getElementById('alerts-d-notifications');
       if (!box) return;
@@ -501,7 +543,7 @@
   /* ---------------------------------- bulk unacknowledge, and unack gate */
 
   async function bulkUnacknowledge() {
-    await bulkAction('/api/alerts/bulk-unack', 'Unacknowledged', 'unacknowledged');
+    return bulkAction('/api/alerts/bulk-unack', 'Unacknowledged', 'unacknowledged');
   }
 
   /* -------------------------------- maintenance windows and bulk mute
@@ -648,8 +690,8 @@
         <tbody>${rows.length ? rows.map(windowRowHtml).join('')
           : '<tr><td colspan="6" class="hint">No maintenance windows.</td></tr>'}</tbody>
       </table></div>`, [
-      { label: 'Close', onClick: App.closeModal },
-      ...(writable ? [{ label: 'Add window', onClick: addWindowDialog }] : []),
+      { label: 'Cancel', onClick: App.closeModal },
+      ...(writable ? [{ label: 'Add window', primary: true, onClick: addWindowDialog }] : []),
     ], { buttonsTop: true });
     if (!writable) return box;
     for (const btn of box.querySelectorAll('.aw-end')) {
@@ -971,7 +1013,7 @@
       <label>Body <textarea id="at-body" rows="10">${escape(t.body)}</textarea></label>
       <label class="check"><input type="checkbox" id="at-html" ${t.is_html ? 'checked' : ''}> HTML body</label>
       <div class="bar"><span class="section">TOKENS (click to insert)</span></div>
-      <div id="at-tokens" style="max-height:140px;overflow:auto;border:1px solid var(--hairline);border-radius:4px;padding:6px">
+      <div id="at-tokens" class="scrollbox small" style="padding:6px">
         ${tokens.map((tok) => `<div class="clickable token-row" data-token="${escape(tok.token)}"><code>{{${escape(tok.token)}}}</code> — ${escape(tok.description)}</div>`).join('')}
       </div>
       <div id="at-preview" class="hint"></div>`, [
@@ -1171,22 +1213,25 @@
                                  s.table_columns)}
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
-        <p class="hint" id="as-test-status"></p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Send test', onClick: async (box) => {
+      // The one control in the product whose only purpose is to report an
+      // outcome — it used to write its own tiny status line, missable next
+      // to a 4000-pixel form. App.runJob toasts the success; a refusal
+      // (bad host, auth failure) lands in .modal-error like every other
+      // failure in this dialog, since a result whose ok is false is not a
+      // rejected request but still has to be reported as one.
+      { label: 'Send test', onClick: (box, button) => {
+        if (!App.requireFields(box, [['#as-testto', 'A recipient']])) return;
         const to = box.querySelector('#as-testto').value.trim();
-        const status = box.querySelector('#as-test-status');
-        if (!to) { status.textContent = 'Enter a recipient first'; return; }
-        status.textContent = 'Sending…';
-        try {
-          const result = await App.post('/api/alerts/smtp/test', { to });
-          status.textContent = result.ok ? 'Sent.' : `Failed: ${result.error}`;
-        } catch (error) {
-          status.textContent = `Error: ${error.message}`;
-        }
+        return App.runJob(button, { queued: 'Sending…', done: 'Sent' },
+          App.post('/api/alerts/smtp/test', { to }).then((result) => {
+            if (!result.ok) throw new Error(result.error || 'not sent');
+            return result;
+          }));
       } },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -1196,7 +1241,7 @@
             await App.post('/api/alerts/smtp/credential', { password });
           } catch (error) {
             box.querySelector('#as-cred-status').textContent = error.message;
-            return;
+            throw error;
           }
         }
         // Per browser, so it is stored (and its permission asked for) here
@@ -1234,7 +1279,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('alerts');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
     const select = box.querySelector('#as-minsev');
@@ -1329,6 +1374,19 @@
       App.get('/api/alerts/mutes'),
     ]);
     view.hist = overview.buckets;
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
+    // No dedicated summary line exists for this histogram yet (unlike
+    // Syslog/SNMP's #sl-hist-summary / #sn-hist-summary) — guarded until
+    // index.html grows an #alerts-hist-summary span beside "ALERTS PER
+    // HOUR" for this to fill in.
+    const histSummaryEl = App.el('alerts-hist-summary');
+    if (histSummaryEl) {
+      const histTotal = overview.buckets.reduce((sum, b) => sum + b.total, 0);
+      const p = view.histPlot;
+      histSummaryEl.textContent =
+        `${histTotal.toLocaleString()} alerts · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
+        (p.narrowed ? ` (of a ${App.duration(span)} window)` : '');
+    }
     view.alerts = list.alerts;
     view.alertTotal = total;
     drawAlertsPager();
@@ -1460,12 +1518,14 @@
         '<p class="hint">Every open alert on the server — not your ticked ' +
         'selection, and not just the ones matching the current filter. Use ' +
         '"Acknowledge selected" for the rows you have ticked, or Unacknowledge ' +
-        'afterwards for any that were acted on too soon.</p>', 'Acknowledge', async () => {
-          await App.post('/api/alerts/ack-all', {});
+        'afterwards for any that were acted on too soon.</p>', 'Acknowledge',
+        (button) => App.runJob(button, { queued: 'Acknowledging…' }, (async () => {
+          const result = await App.post('/api/alerts/ack-all', {});
           view.checked.clear();
           clearSelection();
           App.refreshNow('alerts');
-        });
+          return `Acknowledged ${Number(result.acknowledged || 0).toLocaleString()} alert(s)`;
+        })()));
     };
     App.el('alerts-bulk-ack').onclick = () => {
       const n = view.checked.size;
@@ -1474,7 +1534,8 @@
         `<p>Acknowledge the <b>${n}</b> selected alert(s)?</p>` +
         '<p class="hint">Only the ones you have ticked, and only those still ' +
         'open.</p>',
-        'Acknowledge', bulkAcknowledge);
+        'Acknowledge', (button) => App.runJob(button,
+          { queued: 'Acknowledging…' }, bulkAcknowledge()));
     };
     // Injected rather than declared in the bulk bar's own markup: it is the
     // one bulk action that reverses another one (Acknowledge selected /
@@ -1491,7 +1552,8 @@
         `<p>Return the <b>${n}</b> selected alert(s) to unacknowledged?</p>` +
         '<p class="hint">Only the ones you have ticked, and only those ' +
         'currently acknowledged.</p>',
-        'Unacknowledge', bulkUnacknowledge);
+        'Unacknowledge', (button) => App.runJob(button,
+          { queued: 'Unacknowledging…' }, bulkUnacknowledge()));
     };
     App.el('alerts-bulk-resolve').onclick = () => {
       const n = view.checked.size;
@@ -1499,7 +1561,8 @@
       App.confirmDestructive('Resolve alerts',
         `<p>Resolve the <b>${n}</b> selected alert(s)?</p>` +
         '<p class="hint">Resolved alerts are what "Delete resolved alerts" in ' +
-        'Settings later removes.</p>', 'Resolve', bulkResolve);
+        'Settings later removes.</p>', 'Resolve', (button) => App.runJob(button,
+          { queued: 'Resolving…' }, bulkResolve()));
     };
     App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
     App.el('alerts-toggle').onclick = async () => {

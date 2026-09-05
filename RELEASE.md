@@ -88,7 +88,13 @@ setting exists and why it is off to begin with.
 ## Checklist
 
 - [ ] `CHANGELOG.md` has the release's section, and `netpath/__init__.py` carries
-      the version being tagged.
+      the version being tagged. From 4.48.0 that number is also load-bearing at
+      runtime: the markup puts it in every static asset's URL (`app.js?v=...`),
+      served `public, max-age=31536000, immutable`, so a browser that already
+      holds one version's URL never asks again. Bump it for any release that
+      changes a static file, however small — a build that ships a changed
+      `app.js` under the same version number is invisible to anyone who already
+      has a warm cache, for up to a year.
 - [ ] `python3 tests/run_all.py` is green.
 - [ ] Tag pushed.
 - [ ] `SHA256SUMS` generated from the codeload tarball for that tag.

@@ -4,7 +4,7 @@
    separate top-level tabs — none of them is a whole module on its own. */
 (() => {
   const view = {
-    sub: 'dhcp',
+    sub: 'subnets',
     subnets: [], subnetId: null,
     hosts: [], hostSort: App.recallSort('ipam-hosts', { key: 'ip', descending: false }),
     conflicts: [],
@@ -31,8 +31,16 @@
      trick — one circle per slice, each dashed to show only its own arc —
      rather than computing SVG arc paths by hand for three fixed slices.
      Takes slices directly so subnets and DHCP scopes, which break their
-     addresses down into genuinely different categories, can both use it. */
-  function donut(slices, size) {
+     addresses down into genuinely different categories, can both use it.
+
+     A panel-coloured circle is drawn under the slices first, and each
+     slice is shortened by a small gap, so two adjacent slices read as
+     separated rather than one ring of touching colour — otherwise a full
+     ring and an empty one differ only by hue. `centerPct`, when given,
+     is the headroom figure the two larger call sites print in the middle
+     ("free" — the address space nothing has claimed yet); the small
+     list-row donuts pass nothing and stay a bare ring. */
+  function donut(slices, size, centerPct) {
     const total = slices.reduce((sum, s) => sum + (s.value || 0), 0);
     const radius = size / 2 - 3;
     const circumference = 2 * Math.PI * radius;
@@ -45,10 +53,15 @@
       }));
       return svg;
     }
+    const visible = slices.filter((s) => s.value);
+    svg.appendChild(App.svgNode('circle', {
+      cx: size / 2, cy: size / 2, r: radius, fill: 'none',
+      stroke: 'var(--panel)', 'stroke-width': 5,
+    }));
+    const gap = visible.length > 1 ? 3 : 0;
     let offset = 0;
-    for (const slice of slices) {
-      if (!slice.value) continue;
-      const length = (slice.value / total) * circumference;
+    for (const slice of visible) {
+      const length = Math.max((slice.value / total) * circumference - gap, 0);
       svg.appendChild(App.svgNode('circle', {
         cx: size / 2, cy: size / 2, r: radius, fill: 'none',
         stroke: slice.color, 'stroke-width': 5,
@@ -56,27 +69,38 @@
         'stroke-dashoffset': -offset,
         transform: `rotate(-90 ${size / 2} ${size / 2})`,
       }));
-      offset += length;
+      offset += length + gap;
+    }
+    if (centerPct !== undefined) {
+      svg.appendChild(App.svgNode('text', {
+        x: size / 2, y: size / 2 - 1, 'text-anchor': 'middle',
+        fill: 'var(--text)', 'font-family': 'var(--mono)', 'font-weight': 600,
+        'font-size': 'var(--fs-2xl)',
+      }, `${centerPct}%`));
+      svg.appendChild(App.svgNode('text', {
+        x: size / 2, y: size / 2 + 16, 'text-anchor': 'middle',
+        fill: 'var(--dim)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-2xs)',
+      }, 'free'));
     }
     return svg;
   }
 
-  function usageDonut(usage, size) {
+  function usageDonut(usage, size, big) {
     const u = usage || {};
     return donut([
       { value: u.alive || 0, color: 'var(--ok)' },
       { value: u.seen_down || 0, color: 'var(--warn)' },
       { value: u.never_seen || 0, color: 'var(--data-neutral)' },
-    ], size);
+    ], size, big && u.total ? Math.round((u.never_seen || 0) / u.total * 100) : undefined);
   }
 
-  function scopeDonut(usage, size) {
+  function scopeDonut(usage, size, big) {
     const u = usage || {};
     return donut([
       { value: u.leased || 0, color: 'var(--ok)' },
       { value: u.reserved || 0, color: 'var(--accent)' },
       { value: u.available || 0, color: 'var(--data-neutral)' },
-    ], size);
+    ], size, big && u.total ? Math.round((u.available || 0) / u.total * 100) : undefined);
   }
 
   function usageTooltipText(subnet) {
@@ -103,7 +127,7 @@
       return;
     }
 
-    container.appendChild(usageDonut(subnet.usage, 120));
+    container.appendChild(usageDonut(subnet.usage, 120, true));
 
     const u = subnet.usage || {};
     const total = u.total || 0;
@@ -147,21 +171,19 @@
 
   function drawStatus() {
     const ipam = (App.state.serverState || {}).ipam || {};
-    const dot = App.el('ipam-dot');
-    dot.style.background = ipam.running ? 'var(--ok)' : 'var(--line)';
-    App.el('ipam-status').textContent = ipam.running
-      ? 'Worker running' : 'Worker stopped';
+    App.setBg(App.el('ipam-dot'), ipam.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('ipam-status'), ipam.running ? 'Worker running' : 'Worker stopped');
     const toggle = App.el('ipam-toggle');
-    if (toggle) toggle.textContent = ipam.running ? 'Stop worker' : 'Start worker';
+    if (toggle) App.setText(toggle, ipam.running ? 'Stop worker' : 'Start worker');
     const parts = [];
     if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
     if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
-    App.el('ipam-counters').textContent = parts.join(' · ');
+    App.setText(App.el('ipam-counters'), parts.join(' · '));
 
     const badge = App.el('ipam-conflict-badge');
     const count = ipam.open_conflicts || 0;
-    badge.textContent = count;
-    badge.hidden = count === 0;
+    App.setText(badge, String(count));
+    App.setHidden(badge, count === 0);
   }
 
   /* -------------------------------------------------------------- subnets */
@@ -195,6 +217,11 @@
       const tip = usageTooltipText(subnet);
       tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
       tr.onclick = () => {
         view.subnetId = subnet.id;
         renderSubnets();
@@ -214,7 +241,6 @@
         <label>CIDR <input id="sn-cidr" placeholder="10.20.3.0/24" value="${escape(s.cidr ?? '')}"></label>
         <label>Label <input id="sn-label" value="${escape(s.label ?? '')}"></label>
         <label>VLAN <input id="sn-vlan" value="${escape(s.vlan ?? '')}"></label>
-        <p class="hint" id="sn-error"></p>
       </fieldset>`;
   }
 
@@ -222,19 +248,15 @@
     App.modal('Add subnet', subnetForm(null), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Add', primary: true, onClick: async (b) => {
-        try {
-          const payload = await App.post('/api/ipam/subnets', {
-            cidr: b.querySelector('#sn-cidr').value.trim(),
-            label: b.querySelector('#sn-label').value.trim(),
-            vlan: b.querySelector('#sn-vlan').value.trim(),
-          });
-          view.subnetId = payload.id;
-          App.closeModal();
-          await loadSubnets();
-        } catch (error) {
-          b.querySelector('#sn-error').innerHTML =
-            `<span class="err">${escape(error.message)}</span>`;
-        }
+        if (!App.requireFields(b, [['#sn-cidr', 'CIDR']])) return;
+        const payload = await App.post('/api/ipam/subnets', {
+          cidr: b.querySelector('#sn-cidr').value.trim(),
+          label: b.querySelector('#sn-label').value.trim(),
+          vlan: b.querySelector('#sn-vlan').value.trim(),
+        });
+        view.subnetId = payload.id;
+        App.closeModal();
+        await loadSubnets();
       } },
     ]);
   }
@@ -311,8 +333,11 @@
       cell: (r) => escape(r.mac || '\u2014') },
     { key: 'alive', label: 'Alive', width: 70, on: true,
       value: (r) => (r.alive ? 1 : 0),
-      cell: (r) => (r.alive ? '<span class="sev sev-3">up</span>'
-                            : '<span class="sev sev-7">down</span>') },
+      // `none`, not `fail`, for an address that has never answered at all
+      // (alive=0, last_up=NULL) — that's what the sidebar legend already
+      // calls "never seen", not a live outage.
+      cell: (r) => App.statusMark(r.alive ? 'ok' : (r.last_up ? 'fail' : 'none'),
+                                  r.alive ? 'up' : (r.last_up ? 'down' : 'never')) },
     { key: 'hostname', label: 'Hostname', width: 220, on: true,
       value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
     { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
@@ -371,6 +396,15 @@
 
   /* ----------------------------------------------------------- conflicts */
 
+  // A MAC search needs no lookup to be worth linking — Nodes runs it
+  // live and says "not learned" itself when nothing matches — but the IP
+  // is only worth linking when it actually IS a Nodes device, so that
+  // cell starts as plain text and is upgraded once App.deviceIndex resolves.
+  function macSearchLinkHtml(mac) {
+    return `<a class="linkish inline" href="${
+      App.buildRoute('nodes', [], { q: mac })}">${escape(mac)}</a>`;
+  }
+
   function drawConflicts() {
     const table = App.el('ipam-conflicts-table');
     table.innerHTML = '<caption class="sr-only">Address conflicts</caption><thead><tr>' +
@@ -383,7 +417,8 @@
       const sourceText = c.source === 'scan_dhcp'
         ? 'wire vs. DHCP lease' : 'wire, two scans';
       tr.innerHTML =
-        `<td class="mono">${escape(c.ip)}</td><td class="mono">${escape(c.mac_a)}</td><td class="mono">${escape(c.mac_b)}</td>` +
+        `<td class="mono"><span class="ipam-conflict-ip" data-ip="${escape(c.ip)}">${escape(c.ip)}</span></td>` +
+        `<td class="mono">${macSearchLinkHtml(c.mac_a)}</td><td class="mono">${macSearchLinkHtml(c.mac_b)}</td>` +
         `<td>${sourceText}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
       if (!c.resolved) {
         const button = document.createElement('button');
@@ -402,6 +437,24 @@
     App.wireRowKeyboard(body);
     App.el('ipam-conflicts-count').textContent =
       `${view.conflicts.length} ${App.el('ipam-show-resolved').checked ? '' : 'open '}conflict(s)`;
+    linkConflictIps();
+  }
+
+  /* Upgrades each IP cell into a link to its Nodes device, once the ip ->
+     device lookup resolves — done after the table is already on screen so
+     drawing it never waits on a Nodes fetch. Re-queries the DOM by class
+     rather than keeping element references, since a redraw before this
+     resolves replaces every row wholesale. */
+  async function linkConflictIps() {
+    const { byIp: map } = await App.deviceIndex();
+    for (const span of document.querySelectorAll('#ipam-conflicts-table .ipam-conflict-ip')) {
+      const ip = span.dataset.ip;
+      const device = map.get(ip);
+      if (device) {
+        span.outerHTML = `<a class="linkish inline" href="${
+          App.buildRoute('nodes', ['device', device.id])}">${escape(ip)}</a>`;
+      }
+    }
   }
 
   async function loadConflicts() {
@@ -424,6 +477,11 @@
     const usable = Boolean(platform.is_windows && platform.powershell);
     const body = App.el('ipam-dhcp-body');
     const notice = App.el('ipam-dhcp-unavailable');
+    const tab = document.querySelector('#page-ipam .subtab[data-subtab="dhcp"]');
+    if (tab) {
+      tab.disabled = !usable;
+      tab.title = usable ? '' : 'Unavailable on this host - see Subnets & hosts.';
+    }
     if (!body || !notice) return usable;
     body.hidden = !usable;
     notice.hidden = usable;
@@ -432,13 +490,16 @@
         ? 'This host is Windows but no PowerShell was found on it. Reading a '
           + 'DHCP server needs PowerShell with the DhcpServer module (part of '
           + 'RSAT: DHCP Server Tools), installed on the machine running '
-          + 'SappiWhere — not necessarily on the DHCP server itself.'
+          + 'SappiWhere — not necessarily on the DHCP server itself. '
+          + 'Subnets & hosts still works here.'
         : 'Scopes and leases are read by running PowerShell with the '
           + 'DhcpServer module on the machine running SappiWhere, so this '
           + 'subtab only works when SappiWhere itself runs on Windows. '
           + 'Everything else in IPAM — subnets, scans, hosts and conflicts — '
           + 'works here. Subnet scanning finds the same addresses; it just '
           + 'cannot read the server\u2019s own lease records.';
+      // Never leave the page parked on a subtab it just disabled.
+      if (view.sub === 'dhcp') { App.rememberSub('ipam', 'subnets'); selectSub('subnets'); }
     }
     return usable;
   }
@@ -688,6 +749,11 @@
       const tip = scopeTooltipText(scope);
       tr.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
       tr.onclick = () => {
         view.dhcpScopeId = scope.id;
         // Picking a scope by hand is what a later server switch should try to
@@ -720,7 +786,7 @@
 
     const top = document.createElement('div');
     top.className = 'subnet-detail-row';
-    top.appendChild(scopeDonut(scope.usage, 120));
+    top.appendChild(scopeDonut(scope.usage, 120, true));
 
     const u = scope.usage || {};
     const total = u.total || 0;
@@ -803,11 +869,15 @@
     const labelEl = App.el('ipam-scope-trend-label');
     if (!chartEl) return;   // the scope changed again before this landed
     chartEl.innerHTML = '';
+    chartEl.tabIndex = 0;
+    chartEl.setAttribute('role', 'img');
 
     const points = view.scopeTrend || [];
     const windowText = view.scopeTrendWindow === '7d' ? 'last 7 days' : 'last 24 hours';
     if (points.length < 2) {
-      if (labelEl) labelEl.textContent = `Leased IPs (${windowText}): not enough history yet`;
+      const text = `Leased IPs (${windowText}): not enough history yet`;
+      if (labelEl) labelEl.textContent = text;
+      chartEl.setAttribute('aria-label', text);
       return;
     }
 
@@ -863,14 +933,33 @@
     svg.addEventListener('mouseleave', App.hideTooltip);
     chartEl.appendChild(svg);
 
+    // A day of history can be dozens of points, too many for a tab stop
+    // each — the container is the one stop and left/right arrow walks a
+    // cursor across the points it already drew, same tooltip a mouse gets.
+    let cursor = points.length - 1;
+    const showCursorTip = () => {
+      const p = points[cursor];
+      const box = chartEl.getBoundingClientRect();
+      App.tooltip(tipFor(p),
+        { clientX: box.left + x(p.ts), clientY: box.top + y(p.leased) });
+    };
+    chartEl.onkeydown = (event) => {
+      const step = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+      if (!step) return;
+      event.preventDefault();
+      cursor = Math.min(Math.max(cursor + step, 0), points.length - 1);
+      showCursorTip();
+    };
+    chartEl.onfocus = () => { cursor = points.length - 1; showCursorTip(); };
+    chartEl.onblur = App.hideTooltip;
+
     const last = points[points.length - 1].leased;
     const first = points[0].leased;
     const delta = last - first;
     const deltaText = delta === 0 ? 'flat' : (delta > 0 ? `up ${delta}` : `down ${-delta}`);
-    if (labelEl) {
-      labelEl.textContent =
-        `Leased IPs (${windowText}): ${last} now, ${deltaText} over the window`;
-    }
+    const summary = `Leased IPs (${windowText}): ${last} now, ${deltaText} over the window`;
+    if (labelEl) labelEl.textContent = summary;
+    chartEl.setAttribute('aria-label', `${summary}. Focus and use left/right to read each point.`);
   }
 
   const LEASE_COLUMNS = [
@@ -884,7 +973,7 @@
     { key: 'state', label: 'State', width: 140, on: true,
       value: (r) => r.address_state || '',
       cell: (r) => (r.is_reservation
-        ? `<span class="sev sev-5">${escape(r.address_state || 'reservation')}</span>`
+        ? `<span class="mono">${escape(r.address_state || 'reservation')}</span>`
         : escape(r.address_state || '')) },
     { key: 'expires', label: 'Lease expires', width: 150, numeric: true, on: true,
       align: 'left', value: (r) => r.lease_expires || 0,
@@ -1013,7 +1102,8 @@
       ${App.columnPickerFieldset('DHCP LEASE COLUMNS', 'ipamleases',
                                  LEASE_COLUMNS, s.table_columns_leases)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         await App.post('/api/settings', { scope: 'ipam', values: {
@@ -1036,7 +1126,7 @@
         } });
         await App.loadState();
         App.closeModal();
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -1095,11 +1185,11 @@
       `<td style="white-space:nowrap">${escape(r.ip)}</td>` +
       `<td style="white-space:nowrap">${escape(r.mac || '—')}</td>` +
       `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'
-        : r.alive ? '<span class="sev sev-3">up</span>' : '<span class="sev sev-7">down</span>'}</td>` +
+        : App.statusMark(r.alive ? 'ok' : 'fail', r.alive ? 'up' : 'down')}</td>` +
       `<td>${escape(r.subnet || '—')}</td>` +
       `<td class="hint">${escape(r.sources.join(', '))}</td>` +
       `</tr>`).join('');
-    return `<div class="table-wrap" style="max-height:50vh">
+    return `<div class="table-wrap scrollbox large">
       <table><caption class="sr-only">Search results</caption><thead><tr><th scope="col">Hostname</th><th scope="col">IP</th><th scope="col">MAC</th>
       <th scope="col">Status</th><th scope="col">Subnet</th><th scope="col">Source</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
@@ -1113,7 +1203,7 @@
     const CONTROLS = ['ipam-alive-only', 'ipam-show-resolved', 'ipam-scope-sort'];
     App.rememberControls('ipam', CONTROLS);
     // /api/platform has already answered by the time any module inits.
-    applyDhcpAvailability();
+    const dhcpUsable = applyDhcpAvailability();
     for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
       btn.onclick = () => {
         App.rememberSub('ipam', btn.dataset.subtab);
@@ -1161,7 +1251,12 @@
     // as well as on the control, so the two have to start out agreeing.
     App.restoreControls('ipam', CONTROLS);
     view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
-    selectSub(App.recallSub('ipam', view.sub));
+    // A stored choice of the DHCP subtab from a Windows session does not
+    // survive a load where DHCP cannot work — recallSub only checks that
+    // the button still exists, not that it is enabled.
+    let startSub = App.recallSub('ipam', view.sub);
+    if (startSub === 'dhcp' && !dhcpUsable) startSub = 'subnets';
+    selectSub(startSub);
   }
 
   App.pages.ipam = { init, refresh, fastTick: drawStatus };

@@ -27,6 +27,7 @@
   const statusEl = el('ssh-status');
   const noticeEl = el('ssh-notice');
   const termEl = el('ssh-term');
+  const logEl = el('ssh-log');
   const reconnectBtn = el('ssh-reconnect');
   const disconnectBtn = el('ssh-disconnect');
   const credsBox = el('ssh-creds');
@@ -36,7 +37,7 @@
   let term = null;
   let fitAddon = null;
   let socket = null;
-  let device = null;          // {id, ip, name}
+  let device = null;          // {id, ip, name, ssh_port}
   let storedUsername = '';
   let lastSize = { cols: 0, rows: 0 };
   const encoder = new TextEncoder();
@@ -77,10 +78,53 @@
     const shown = nameEl.textContent || openerName || 'device';
     const ip = device ? device.ip : '';
     document.title = ip ? `SSH — ${shown} (${ip})` : `SSH — ${shown}`;
+    // xterm renders to a canvas a screen reader cannot see; the accessible
+    // name at least says whose shell a tab lands the operator in.
+    termEl.setAttribute('aria-label',
+      ip ? `Terminal session with ${shown} (${ip})` : `Terminal session with ${shown}`);
   }
 
   function show(box, visible) {
     box.hidden = !visible;
+  }
+
+  // -------------------------------------------------------------- sr log
+
+  /* #ssh-log mirrors completed lines of device output as plain text, for a
+     screen reader that cannot read xterm's canvas even with screenReaderMode
+     on. Buffered rather than pushed byte-for-byte: a device echoes typed
+     characters back one at a time, and announcing a line before Enter ends
+     it would read every keystroke of a typed username out loud. */
+  const logDecoder = new TextDecoder();
+  let logBuffer = '';
+  const LOG_MAX_LINES = 500;
+
+  function stripAnsi(text) {
+    return text
+      .replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '')   // OSC (title-setting, etc.)
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')             // CSI (colour, cursor movement)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');      // stray control bytes
+  }
+
+  function logLine(text) {
+    if (!logEl || !text) return;
+    for (const line of stripAnsi(text).split('\n')) {
+      const trimmed = line.replace(/\r$/, '');
+      if (!trimmed) continue;
+      const div = document.createElement('div');
+      div.textContent = trimmed;
+      logEl.appendChild(div);
+    }
+    while (logEl.childElementCount > LOG_MAX_LINES) logEl.removeChild(logEl.firstChild);
+  }
+
+  function logOutputBytes(bytes) {
+    logBuffer += logDecoder.decode(bytes, { stream: true });
+    let newline;
+    while ((newline = logBuffer.indexOf('\n')) !== -1) {
+      logLine(logBuffer.slice(0, newline));
+      logBuffer = logBuffer.slice(newline + 1);
+    }
   }
 
   /* Written into the terminal rather than onto the one-line notice: connect
@@ -88,6 +132,7 @@
      matters more than it fits. */
   function writeMessage(text, colour) {
     if (!term || !text) return;
+    logLine(text);
     const colourOn = colour === 'error' ? '\u001b[31m' : '\u001b[33m';
     term.write('\r\n' + colourOn + text.replace(/\n/g, '\r\n') + '\u001b[0m\r\n');
   }
@@ -100,27 +145,46 @@
     return value || fallback;
   }
 
-  /* The palette is the application's, read from the CSS variables rather
+  /* The 16-colour ANSI palette, read from the application's tokens rather
      than copied, so the terminal keeps matching the rest of the product if
-     those ever move. */
+     a theme's colours ever move. The six hues keep one tone for both their
+     base and bright slot — an accent already chosen for contrast against
+     that theme's own background needs to exist, not be lightened or
+     darkened again, the same principle Solarized's light and dark variants
+     use the identical hues for. --nodata/--text/--line/--muted/--dim are
+     different roles, not opposite ends of one ladder, and on the dark
+     themes they happen to double as black/white/brightBlack; the light
+     theme needs the ladder read the other way, or "white" text vanishes
+     into white paper — black/white/brightBlack/brightWhite are the one
+     group that has to be picked by the resolved theme rather than by
+     token role, which is what left brightWhite a hardcoded #FFFFFF (1:1
+     on light) and six bright hues undefined (xterm's own dark-terminal
+     defaults, #FFFF00 among them, 1.07:1 on light) in the first place. */
+  function ansiColors() {
+    const light = document.documentElement.getAttribute('data-theme') === 'light';
+    const red = cssVar('--fail', '#F8544C'), green = cssVar('--ok', '#3FB950'),
+          yellow = cssVar('--warn', '#E3B341'), blue = cssVar('--accent', '#7AA2F7'),
+          magenta = cssVar('--error', '#A371F7'), cyan = cssVar('--overrun', '#4DB6AC');
+    return {
+      black: light ? cssVar('--text', '#161C24') : cssVar('--nodata', '#1E242D'),
+      brightBlack: light ? cssVar('--muted', '#4E5967') : cssVar('--line', '#646E7C'),
+      white: light ? cssVar('--dim', '#5E6975') : cssVar('--text', '#DCE3EA'),
+      brightWhite: light ? cssVar('--line', '#76818F') : cssVar('--text', '#DCE3EA'),
+      red, green, yellow, blue, magenta, cyan,
+      brightRed: red, brightGreen: green, brightYellow: yellow,
+      brightBlue: cssVar('--accent-hover', '#97B6FF'),
+      brightMagenta: magenta, brightCyan: cyan,
+    };
+  }
+
   function theme() {
-    const fg = cssVar('--text', '#DCE3EA');
     return {
       background: cssVar('--bg', '#0E1116'),
-      foreground: fg,
+      foreground: cssVar('--text', '#DCE3EA'),
       cursor: cssVar('--accent', '#7AA2F7'),
       cursorAccent: cssVar('--bg', '#0E1116'),
       selectionBackground: cssVar('--checked-strong', '#2E4470'),
-      black: cssVar('--nodata', '#1E242D'),
-      red: cssVar('--fail', '#F85149'),
-      green: cssVar('--ok', '#3FB950'),
-      yellow: cssVar('--warn', '#E3B341'),
-      blue: cssVar('--accent', '#7AA2F7'),
-      magenta: cssVar('--error', '#A371F7'),
-      cyan: cssVar('--overrun', '#4DB6AC'),
-      white: fg,
-      brightBlack: cssVar('--line', '#646E7C'),
-      brightWhite: '#FFFFFF',
+      ...ansiColors(),
     };
   }
 
@@ -128,6 +192,14 @@
     if (!window.Terminal) {
       setStatus('error', 'The terminal library did not load');
       return false;
+    }
+    // Defensive: nothing today calls buildTerminal() a second time, but a
+    // reconnect that ever grows one must not leave the previous Terminal's
+    // helper textarea behind, stacked a second time in the tab order.
+    if (term) {
+      term.dispose();
+      term = null;
+      fitAddon = null;
     }
     term = new window.Terminal({
       fontFamily: cssVar('--mono', 'monospace'),
@@ -138,12 +210,39 @@
       // The device decides what a newline means; translating here would
       // corrupt anything full-screen (a vendor menu, top, vi).
       convertEol: false,
+      // xterm's own accessibility layer: a live region that tracks what is
+      // actually rendered, on top of #ssh-log's own coarser line-by-line one.
+      screenReaderMode: true,
     });
     if (window.FitAddon && window.FitAddon.FitAddon) {
       fitAddon = new window.FitAddon.FitAddon();
       term.loadAddon(fitAddon);
     }
     term.open(termEl);
+    /* #ssh-term, not this textarea, is the one stop in the tab order — see
+       the focus listener below, which hands real keyboard focus on to it. */
+    const helper = termEl.querySelector('.xterm-helper-textarea');
+    if (helper) helper.tabIndex = -1;
+    if (!termEl.dataset.focusWired) {
+      termEl.dataset.focusWired = '1';
+      termEl.addEventListener('focus', () => { if (term) term.focus(); });
+    }
+    /* A terminal that keeps Tab has to publish some other way out, or it is
+       a keyboard trap. The way out is Ctrl+F6, not Escape: Escape is a real
+       keystroke to the device — vi, less, a menu-driven switch console all
+       need it, and this window exists to reach exactly those — so spending
+       it on focus management would cost an operator the key they use most
+       and hand back one they use once. Ctrl+F6 is the platform convention
+       for leaving a widget that captures the tab key, and nothing on a
+       switch's shell reads it. Documented in the hint line under the
+       header, which is what the guideline actually asks for. */
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown' && event.key === 'F6' && event.ctrlKey) {
+        reconnectBtn.focus();
+        return false;
+      }
+      return true;
+    });
     /* Keystrokes go out as binary frames exactly as typed; the server
        forwards them to the channel without looking at them. */
     term.onData((data) => {
@@ -239,7 +338,9 @@
         handleControl(message);
         return;
       }
-      if (term) term.write(new Uint8Array(event.data));
+      const bytes = new Uint8Array(event.data);
+      if (term) term.write(bytes);
+      logOutputBytes(bytes);
     };
 
     ws.onerror = () => {
@@ -304,10 +405,12 @@
         }
         break;
 
-      case 'error':
-        setStatus('error', firstLine(message.message) || 'Failed');
-        writeMessage(message.message, 'error');
+      case 'error': {
+        const friendly = friendlyError(message.message);
+        setStatus('error', firstLine(friendly) || 'Failed');
+        writeMessage(friendly, 'error');
         break;
+      }
 
       default:
         break;      // an unknown control message is not worth a failure
@@ -316,6 +419,20 @@
 
   function firstLine(text) {
     return (text || '').split('\n')[0].trim();
+  }
+
+  /* paramiko surfaces a bare socket.error on a failed TCP connect —
+     "[Errno None] Unable to connect to port 2201 on 127.0.0.250" — which
+     names neither the fix nor where to make it. Recognise that shape and
+     say what an operator actually needs instead. */
+  function friendlyError(text) {
+    const raw = text || '';
+    if (!/unable to connect to port/i.test(raw) && !/^\[errno/i.test(raw)) return raw;
+    const host = device && device.ip ? device.ip : 'the device';
+    const port = device && device.ssh_port ? device.ssh_port : '';
+    return `Could not reach ${host}${port ? `:${port}` : ''} over SSH. Check that ` +
+      'the device is reachable and listening on that port, or change the port ' +
+      'under ConfigRX → Device settings.';
   }
 
   // ------------------------------------------------------------ overlays
@@ -437,10 +554,11 @@
     }
 
     device = payload.device || { id: deviceId, ip: '' };
+    device.ssh_port = payload.ssh_port || 22;
     // The server resolves the display-name precedence once and sends the
     // answer as `name`; the opener's name is only the stand-in until it does.
     nameEl.textContent = device.name || openerName;
-    ipEl.textContent = device.ip ? `${device.ip}:${payload.ssh_port || 22}` : '';
+    ipEl.textContent = device.ip ? `${device.ip}:${device.ssh_port}` : '';
     setTitle();
 
     const paramiko = payload.paramiko || {};

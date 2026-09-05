@@ -23,8 +23,9 @@ Public surface the seed script depends on (keep stable)::
         [{index, ip, name, persona, site, snmp_version, community,
           profile, knobs}, ...]
         index 0 is the core switch, index 1 the wireless controller, and
-        indices 2..12 are the fixed SPECIALS below. Everything from 13 on
-        is a deterministic weighted mix.
+        indices 2..13 are the fixed SPECIALS below (13 is the ConfigRX SSH
+        demo device, pinned to 127.0.0.1). Everything from 14 on is a
+        deterministic weighted mix.
 
     SPECIALS -> dict[int, dict]
         {index: {ip, persona, profile, knob, note}} — the devices whose
@@ -1022,9 +1023,24 @@ SPECIALS: dict[int, dict] = {
     12: {"persona": "cisco_access", "profile": "v2c-public",
          "knob": "reboot_every_s=240",
          "note": "sysUpTime resets every 240 s — nodepoll.detect_reboot fires"},
+    # A plain, healthy access switch by SNMP — its only special property is
+    # its IP. demo/fake_ssh.py binds exclusively to 127.0.0.1, and Nodes
+    # requires a unique IP per device, so this is the one device seed.py and
+    # scenario.py can point at a real SSH persona (re-pointing its ssh_port
+    # and vendor_override across the fake_ssh personas they want to exercise,
+    # one at a time) to walk ConfigRX's platforms and enable-mode escalation
+    # against something that actually answers, instead of only configuring
+    # vendor overrides nothing ever connects to.
+    13: {"persona": "cisco_access", "profile": "v2c-public", "knob": "",
+         "name": "configrx-ssh-01", "ip": "127.0.0.1",
+         "note": "the ConfigRX SSH demo device — normal SNMP, but its IP is "
+                 "demo/fake_ssh.py's only bind address"},
 }
 
-# One 100-slot cycle of the weighted mix used from index 13 on.
+# The last index SPECIALS occupies; the weighted mix starts one past it.
+_FIXED_INDEX_MAX = max(SPECIALS)
+
+# One 100-slot cycle of the weighted mix used from index _FIXED_INDEX_MAX+1 on.
 _MIX_WEIGHTS = (
     ("cisco_access", 55), ("aruba_switch", 8), ("fortigate", 5),
     ("paloalto", 3), ("juniper", 3), ("ubiquiti_airfiber", 5),
@@ -1063,7 +1079,7 @@ def ip_for(index: int) -> str:
 
 
 def _site_for(index: int, persona: str, access_seen: int) -> str:
-    if index <= 12:
+    if index <= _FIXED_INDEX_MAX:
         return "Site-A"
     if persona == "cisco_access":
         # The first 500 access switches hang off the core at Site-A; the
@@ -1084,7 +1100,8 @@ def fleet_plan(count: int) -> list[dict]:
     `community` is what the DEVICE accepts, which is not always what the
     profile configures — index 3 exists precisely to show the difference.
     Index 0 is the core switch, index 1 the wireless controller, indices
-    2..12 are SPECIALS, and everything after is the weighted mix.
+    2..13 are SPECIALS (13 is the ConfigRX SSH demo device), and everything
+    after is the weighted mix.
     """
     count = max(1, int(count))
     plan: list[dict] = []
@@ -1099,9 +1116,9 @@ def fleet_plan(count: int) -> list[dict]:
         elif index in SPECIALS:
             spec = SPECIALS[index]
             persona, profile = spec["persona"], spec["profile"]
-            name = None
+            name = spec.get("name")
         else:
-            persona = _CYCLE[(index - 13) % len(_CYCLE)]
+            persona = _CYCLE[(index - (_FIXED_INDEX_MAX + 1)) % len(_CYCLE)]
             profile, name = "v2c-public", None
 
         if name is None:
@@ -1153,12 +1170,15 @@ def fleet_plan(count: int) -> list[dict]:
 
         # A handful of flapping ports out in the fleet, so "something is
         # wrong somewhere" is discoverable rather than staged.
-        if index > 12 and persona == "cisco_access" and index % 37 == 0:
+        if (index > _FIXED_INDEX_MAX and persona == "cisco_access"
+                and index % 37 == 0):
             knobs["flapping"] = [3 + (index % 40)]
 
+        ip = (SPECIALS[index]["ip"] if index in SPECIALS and "ip" in SPECIALS[index]
+              else ip_for(index))
         plan.append({
             "index": index,
-            "ip": ip_for(index),
+            "ip": ip,
             "name": name,
             "persona": persona,
             "site": _site_for(index, persona, access_seen),

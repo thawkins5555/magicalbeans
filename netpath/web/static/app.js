@@ -2,7 +2,7 @@
    The per-tab modules hang their render functions off App.pages. */
 const App = (() => {
   const state = {
-    tab: 'netpath',
+    tab: 'dashboard',
     settings: {},
     flowSettings: {},
     dimensions: [],
@@ -28,19 +28,80 @@ const App = (() => {
     return state.permissions[module] === 'write';
   }
 
+  /* What this account can do, for the Account dialog below. `state.session`
+     carries only a username and the idle/absolute clocks — there is no
+     "role" on the wire, only a {module: read|write} grant map — so this
+     reads the same map applyPermissions() already reads, in the same
+     module names MODULE_NAMES gives the rest of the product. `admin` is a
+     module like any other on the wire (writeDeniedReason's "Administrator
+     access is needed") but reads oddly in a list of modules, so it is
+     named on its own rather than folded in as "Admin". */
+  function accountAccessSummary() {
+    const perms = state.permissions || {};
+    const keys = Object.keys(perms).filter((k) => k !== 'admin');
+    const write = keys.filter((k) => perms[k] === 'write').map((k) => MODULE_NAMES[k] || k);
+    const readOnly = keys.filter((k) => perms[k] === 'read').map((k) => MODULE_NAMES[k] || k);
+    const bits = [];
+    if (perms.admin === 'write') bits.push('administrator access');
+    if (write.length) bits.push(`write access to ${write.join(', ')}`);
+    if (readOnly.length) bits.push(`read-only access to ${readOnly.join(', ')}`);
+    return bits.length ? bits.join('; ') : 'no module access granted';
+  }
+
   /* Changing your own password has to be reachable no matter what module
      access you have (or don't) — it lives in the top bar, not gated
      behind Settings, and is a small self-contained modal rather than
      sharing DOM ids with anything in settings.js. `forced` is set for the
      must-change-password prompt: Cancel is hidden, since there's nowhere
-     else useful to go until it's done. */
-  function accountModal(forced = false) {
-    const box = modal('Change your password', `
-      <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
-      <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
-      <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
-      <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
-        session using this account, including this one.</p>`,
+     else useful to go until it's done.
+
+     Titled "Change your password" and showing nothing about the account it
+     belonged to, this used to do two unrelated things and say who neither
+     was for. It now leads with who is signed in, what they can do and when
+     the session ends — the same clock the kiosk bar already computes —
+     with the password form under its own legend rather than being the
+     whole dialog. */
+  function accountModal({ forced = false } = {}) {
+    const session = state.session || {};
+    const sessionLine = maxRemainingMs != null
+      ? `Session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}.` : '';
+    const version = (state.config || {}).version;
+    // Appearance (theme, and the wall-display launcher) is a per-browser
+    // choice, not a server setting, so it lives here rather than on the
+    // Settings page every OTHER account on this install also sees — and is
+    // skipped entirely on the forced must-change-password prompt, which has
+    // nothing to do with either. The tab list mirrors the twelve-tab strip
+    // so a display can rotate through exactly the views its account can
+    // actually read.
+    const appearanceHtml = forced ? '' : `
+      <fieldset><legend>Appearance · this browser</legend>
+        <label>Theme <select id="am-theme">
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+          <option value="contrast">High contrast</option>
+        </select></label>
+        <p class="hint">Stored in this browser, not on the server: it applies at once,
+          to every account that signs in on this machine.</p>
+        <p class="hint">A wall display opens this view full-screen with the tab strip
+          hidden; <code>1</code>-<code>9</code> jump to a view once it is open, and a
+          rotation, chosen below, cycles through more than one on its own.</p>
+        <label>Rotate through <select id="am-kiosk-tabs" multiple size="6"></select></label>
+        <label>Every <input type="number" id="am-kiosk-every" min="5" max="3600" value="30"> s</label>
+        <div class="row"><button type="button" id="am-kiosk-open">Open this view as a wall display</button></div>
+      </fieldset>`;
+    const box = modal('Account', `
+      <p><b>${escapeHtml(session.username || state.username || '')}</b></p>
+      <p class="hint">${escapeHtml(accountAccessSummary())}.</p>
+      ${sessionLine ? `<p class="hint" id="am-session">${escapeHtml(sessionLine)}</p>` : ''}
+      <fieldset><legend>Password</legend>
+        <label>Current <input type="password" id="am-current" autocomplete="current-password"></label>
+        <label>New <input type="password" id="am-new" autocomplete="new-password"></label>
+        <label>Repeat <input type="password" id="am-repeat" autocomplete="new-password"></label>
+        <p class="hint" id="am-status">At least 12 characters. Changing it signs out every
+          session using this account, including this one.</p>
+      </fieldset>
+      ${appearanceHtml}
+      ${version ? `<p class="hint">SappiWhere v${escapeHtml(version)}</p>` : ''}`,
       [
         // Forced, this dialog is the only thing the account can do — the
         // server refuses everything else until the password is replaced — so
@@ -53,29 +114,66 @@ const App = (() => {
               window.location.href = '/login';
             } }]
           : [{ label: 'Cancel', onClick: closeModal }]),
-        { label: 'Change password', primary: true, onClick: async () => {
+        // Its own failures go through showModalError like every other
+        // dialog now does; #am-status stays put for the success/hint text,
+        // which is not a failure and has nowhere else to say it.
+        { label: 'Change password', primary: true, onClick: async (dialogBox) => {
           const status = document.getElementById('am-status');
           const next = document.getElementById('am-new').value;
           const repeat = document.getElementById('am-repeat').value;
           if (next !== repeat) {
-            status.textContent = 'The two new passwords differ';
-            status.style.color = 'var(--fail)';
+            showModalError(dialogBox, 'The two new passwords differ');
             return;
           }
-          try {
-            await post('/api/password', {
-              current_password: document.getElementById('am-current').value,
-              new_password: next,
-            });
-            status.textContent = 'Changed. Signing you back in…';
-            status.style.color = 'var(--ok)';
-            setTimeout(() => { window.location.href = '/login'; }, 1200);
-          } catch (error) {
-            status.textContent = error.message;
-            status.style.color = 'var(--fail)';
-          }
+          await post('/api/password', {
+            current_password: document.getElementById('am-current').value,
+            new_password: next,
+          });
+          status.textContent = 'Changed. Signing you back in…';
+          status.style.color = 'var(--ok)';
+          setTimeout(() => { window.location.href = '/login'; }, 1200);
         } },
-      ]);
+      ],
+      // Forced, this is the must-change-password prompt: it can be reached
+      // from a kiosk session (a shared login left with an expired
+      // password) and has to actually open there rather than degrade to a
+      // toast like every other dialog does under state.kiosk.
+      { kioskSafe: forced });
+    if (!forced) {
+      const themeSelect = box.querySelector('#am-theme');
+      if (themeSelect) {
+        themeSelect.value = currentTheme();
+        themeSelect.onchange = () => {
+          setTheme(themeSelect.value);
+          announce(`Theme: ${themeSelect.options[themeSelect.selectedIndex].text}`);
+        };
+      }
+      const kioskTabs = box.querySelector('#am-kiosk-tabs');
+      if (kioskTabs) {
+        kioskTabs.innerHTML = [...document.querySelectorAll('.tab[data-tab]')]
+          .filter((t) => !t.hidden)
+          .map((t) => {
+            const name = t.dataset.tab;
+            const label = t.textContent.replace(/\d+$/, '').trim();
+            return `<option value="${name}"${name === state.tab ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+          }).join('');
+      }
+      const kioskOpen = box.querySelector('#am-kiosk-open');
+      if (kioskOpen) {
+        kioskOpen.onclick = () => {
+          const chosen = kioskTabs
+            ? [...kioskTabs.selectedOptions].map((o) => o.value) : [state.tab];
+          const every = Number((box.querySelector('#am-kiosk-every') || {}).value) || 30;
+          const params = new URLSearchParams({ kiosk: '1' });
+          if (chosen.length > 1) {
+            params.set('rotate', chosen.join(','));
+            params.set('every', String(Math.max(5, every)));
+          }
+          const first = chosen[0] || state.tab;
+          window.open(`${window.location.origin}/?${params}#/${first}`, '_blank', 'noopener');
+        };
+      }
+    }
     // Escape and a backdrop click must not dismiss this one. Without the
     // lock the prompt was advisory: it closed on a stray keypress, came back
     // only on the next reload, and the account stayed usable throughout.
@@ -87,8 +185,8 @@ const App = (() => {
      below. A key missing here is a bug in the markup rather than a reason
      to say nothing, so the raw key is the fallback. */
   const MODULE_NAMES = {
-    nodes: 'Nodes', alerts: 'Alerts', netpath: 'NetPath', netflow: 'NetFlow',
-    snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'Wireless',
+    nodes: 'Nodes', alerts: 'Alerts', netpath: 'Routes', netflow: 'NetFlow',
+    snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'FortiWireless',
     configrx: 'ConfigRX', settings: 'Settings', ssh: 'SSH',
   };
 
@@ -130,37 +228,58 @@ const App = (() => {
     el.classList.toggle('write-denied', !allowed);
   }
 
-  /* One sentence per bar, not per button. Nine dead buttons in a row want
-     one line saying why, and the line goes at the end of the container they
-     are in so it reads as a note about that group. */
+  /* One sentence per page, not per container. Grouping by the nearest
+     .bar/.strip/.row/fieldset used to repeat the same sentence once for
+     every one of nine dead buttons scattered across a page, each copy
+     inserted afterend with no gutter of its own — on Settings that put a
+     copy after the fixed .bar.footer, past the edge of the scrolling area,
+     where it could never be read. Grouped by page and by module instead:
+     at most a handful of sentences, each said once, each inside the page's
+     own scroll container so it is never clipped by a sibling that does not
+     scroll with it. */
   let deniedSignature = null;
+
+  // A page whose content scrolls inside its own wrapper (Settings' .scroll,
+  // so the note lands above the fixed footer rather than after it) uses
+  // that; every other page uses its own root, which is itself the thing
+  // that lays out and, so far, the thing that scrolls.
+  function writeDeniedHost(pageEl) {
+    return pageEl.querySelector(':scope > .scroll') || pageEl;
+  }
 
   function explainDeniedGroups(denied) {
     // applyPermissions runs on every loadState, twice a minute at the
     // slowest and every two seconds at the fastest. Rebuilding these notes
     // each time would churn the DOM for nothing, so they are rebuilt only
     // when the set of denied controls actually changes.
-    const signature = denied.map((el) => el.id || el.dataset.requiresWrite).join('|');
+    const byPage = new Map();     // pageEl -> Set(module)
+    for (const el of denied) {
+      const pageEl = el.closest('.page');
+      if (!pageEl) continue;
+      // The subpage the control is actually on, where there is one. Settings
+      // is seven subtabs now, only one of them visible at a time, so a note
+      // written to the page's first scroll container explained the Users
+      // subtab's disabled controls from inside a hidden General subtab.
+      const host = el.closest('.subpage') || writeDeniedHost(pageEl);
+      if (!byPage.has(host)) byPage.set(host, new Set());
+      byPage.get(host).add(el.dataset.requiresWrite);
+    }
+    const signature = [...byPage.entries()]
+      .map(([host, modules]) =>
+        `${host.id || (host.closest('.page') || {}).id}:${[...modules].sort().join(',')}`)
+      .sort().join('|');
     if (signature === deniedSignature) return;
     deniedSignature = signature;
     for (const stale of document.querySelectorAll('.write-denied-why')) {
       stale.remove();
     }
-    const groups = new Map();
-    for (const el of denied) {
-      const host = el.closest('.bar, .strip, .row, fieldset') || el.parentElement;
-      if (!host) continue;
-      if (!groups.has(host)) groups.set(host, el.dataset.requiresWrite);
-    }
-    for (const [host, module] of groups) {
-      const note = document.createElement('p');
-      note.className = 'hint write-denied-why';
-      note.textContent = writeDeniedReason(module);
-      // A bar is a flex row: the sentence goes UNDER it rather than
-      // becoming another item squeezed into it. A fieldset is a box, so
-      // the sentence belongs inside, with the fields it is about.
-      if (host.tagName === 'FIELDSET') host.appendChild(note);
-      else host.insertAdjacentElement('afterend', note);
+    for (const [host, modules] of byPage) {
+      for (const module of [...modules].sort()) {
+        const note = document.createElement('p');
+        note.className = 'hint write-denied-why';
+        note.textContent = writeDeniedReason(module);
+        host.appendChild(note);
+      }
     }
   }
 
@@ -172,6 +291,7 @@ const App = (() => {
       if (module === 'dashboard') continue;
       tab.hidden = !canRead(module);
     }
+    updateTabOverflow();
     /* A control the account may not use is DISABLED and says why, rather
        than being deleted from the page.
 
@@ -392,6 +512,59 @@ const App = (() => {
     } catch (error) {
       toast(`Export failed: ${error.message}`, 'fail');
     }
+  }
+
+  /* ip -> device, id -> device: ipam.js, snmp.js, syslog.js and wireless.js
+     each fetched the whole unpaged /api/nodes/devices list on their own
+     30-second clock to answer "which device is this address", and
+     alerts.js kept a third, differently-shaped cache (device id -> ip) for
+     the same underlying question asked in the other direction. One fetch,
+     one cache, both directions.
+
+     Callers must not assume the Maps stay valid across an await — a slow
+     caller should call deviceIndex() again (cheap: it is cached) rather
+     than hold a reference across a long pause, since a fresh fetch replaces
+     both Maps wholesale rather than mutating them. Nodes being unreadable
+     to this account (403) resolves to an empty index, not a rejected
+     promise: "no links" beats a crash. */
+  let deviceIndexCache = null;
+  let deviceIndexAt = 0;
+  async function deviceIndex() {
+    if (deviceIndexCache && Date.now() - deviceIndexAt < 30000) return deviceIndexCache;
+    const byIp = new Map();
+    const byId = new Map();
+    try {
+      const payload = await get('/api/nodes/devices');
+      for (const d of payload.devices || []) {
+        if (d.ip) byIp.set(d.ip, d);
+        byId.set(d.id, d);
+      }
+    } catch (error) { /* Nodes unreadable to this account: empty index, not fatal */ }
+    deviceIndexCache = { byIp, byId };
+    deviceIndexAt = Date.now();
+    return deviceIndexCache;
+  }
+
+  /* Upgrades a plain IP address into a link to its Nodes device
+     (`#/nodes/device/<id>`), or leaves it as escaped plain text when no
+     device on the fleet has that address. Async, because the index may
+     need a fetch — callers enhance a placeholder already on screen (the
+     pattern snmp.js/syslog.js/ipam.js/wireless.js all use) rather than
+     block a render on it.
+
+     This is the plain two-state case only: a caller that wants a
+     different link label than the address itself (wireless.js links a
+     controller's *name* to its device), an "add this address as a device"
+     fallback when nothing matches (snmp.js, syslog.js), or the device
+     object for some other purpose (alerts.js reads a device's ip back out
+     by id) needs the object deviceIndex() resolves to, not this. */
+  async function deviceLink(ip) {
+    if (!ip) return '';
+    const { byIp } = await deviceIndex();
+    const device = byIp.get(ip);
+    return device
+      ? `<a class="linkish inline" href="${buildRoute('nodes', ['device', device.id])}">${escapeHtml(ip)}</a>`
+      : escapeHtml(ip);
   }
 
   /* The dangerous failure this replaces: a wall display that has lost its
@@ -645,11 +818,14 @@ const App = (() => {
     if (!idleBanner) {
       idleBanner = document.createElement('div');
       idleBanner.className = 'idle-banner';
-      // Assertive: being signed out in a minute is worth interrupting
-      // whatever is being read.
-      idleBanner.setAttribute('role', 'alert');
+      // The visible countdown changes every second and lives in a plain,
+      // non-live span — it used to be role="alert" itself, so a screen
+      // reader re-announced "Signing out in NNs" once a second for the
+      // entire warning window. #idle-banner-announce is the only live part
+      // now, and its text only changes at the checkpoints below.
       idleBanner.innerHTML =
         '<span id="idle-banner-text"></span>' +
+        '<span id="idle-banner-announce" class="sr-only" role="alert"></span>' +
         '<button id="idle-banner-stay">Stay signed in</button>';
       document.body.appendChild(idleBanner);
       document.getElementById('idle-banner-stay').onclick = () => {
@@ -661,10 +837,23 @@ const App = (() => {
     return document.getElementById('idle-banner-text');
   }
 
+  // Checkpoints an announcement fires at, rather than every one of the
+  // sixty-odd seconds the visible countdown ticks through.
+  const IDLE_CHECKPOINTS = new Set([60, 30, 10, 5, 4, 3, 2, 1]);
+  let announcedIdleSecond = null;
+
+  function announceIdleCheckpoint(message, secondsLeft) {
+    if (!IDLE_CHECKPOINTS.has(secondsLeft) || announcedIdleSecond === secondsLeft) return;
+    announcedIdleSecond = secondsLeft;
+    const node = document.getElementById('idle-banner-announce');
+    if (node) node.textContent = message;
+  }
+
   function showIdleWarning(secondsLeft) {
     const text = ensureIdleBanner();
     document.getElementById('idle-banner-stay').hidden = false;
     text.textContent = `Signing out in ${secondsLeft}s from inactivity`;
+    announceIdleCheckpoint(`Signing out in ${secondsLeft} seconds from inactivity`, secondsLeft);
   }
 
   /* The absolute ceiling, reached whether or not anyone is at the keyboard.
@@ -677,10 +866,13 @@ const App = (() => {
     text.textContent =
       `Signing out in ${secondsLeft}s — this session has reached its maximum ` +
       'length. Sign in again to carry on.';
+    announceIdleCheckpoint(`Signing out in ${secondsLeft} seconds — this session has ` +
+      'reached its maximum length', secondsLeft);
   }
 
   function hideIdleWarning() {
     if (idleBanner) idleBanner.hidden = true;
+    announcedIdleSecond = null;
   }
 
   /* ------------------------------------------- out-of-app notification
@@ -1086,7 +1278,11 @@ const App = (() => {
      implied visually — Tab could still reach controls the operator cannot
      see. */
   function setBackgroundInert(on) {
-    for (const el of document.querySelectorAll('#tabs, section.page')) {
+    // `.tabs-utility` as well as `#tabs`: Search, Account, Sign out and the
+    // connection indicator moved out of the scrolling strip when the tab bar
+    // was grouped, which left them reachable by assistive technology behind
+    // an open dialog — the scrim stops a pointer, not a screen reader.
+    for (const el of document.querySelectorAll('#tabs, .tabs-utility, section.page')) {
       el.inert = on;
     }
   }
@@ -1137,6 +1333,7 @@ const App = (() => {
     if (!box) return;
     for (const field of box.querySelectorAll('[aria-invalid="true"]')) {
       field.removeAttribute('aria-invalid');
+      field.removeAttribute('aria-describedby');
       field.classList.remove('invalid');
     }
   }
@@ -1178,6 +1375,79 @@ const App = (() => {
     toast(message, 'fail');
   }
 
+  // How long a button keeps saying what just happened before it goes back
+  // to naming the action again. Matches the toast beside it roughly, rather
+  // than the tone-dependent TOAST_MS: the button only ever carries a short
+  // word ("Done", "Failed"), not the sentence the toast can afford to hold
+  // onto longer.
+  const JOB_REVERT_MS = 4000;
+
+  /* Generalises the one thing in this product that already told an operator
+     what happened rather than leaving a table to eventually agree with the
+     click — ConfigRX's "Back up now" (configrx.js): queueing, then queued
+     or running, then the real outcome, the button disabled throughout. Six
+     actions shipped with no outcome message at all before this — Add
+     device, Acknowledge, bulk Acknowledge, Trace now, Back up now and every
+     module Settings Save — and Acknowledge was the sharpest: the detail
+     pane kept offering "Acknowledge" after it had worked, so the only way
+     to tell was to re-read the State column.
+
+     `labels` is `{ queued, done, fail }`. `queued` is shown the instant the
+     button is pressed, before `promise` has settled — a caller free to go
+     on writing to the same button's textContent from inside its own async
+     work (the way ConfigRX's watch loop moves between "Queued…" and
+     "Backing up…") gets that multi-phase text for free, since this only
+     touches the button again once `promise` settles. `done`/`fail` are
+     each either a string or a function of the resolved value/rejection,
+     defaulting to the resolved value when it is itself a string (else
+     "Done"), and to the same sentence a dialog's own .modal-error already
+     shows (failureText) for a failure.
+
+     The outcome is toasted (App.toast, which announces it) and written
+     onto the button itself, briefly, so both a sighted operator watching
+     the button and one who has looked away catch it. A failure inside an
+     open dialog goes to .modal-error instead of a second toast — the place
+     every other dialog failure already lands — the same choice
+     reportActionFailure makes.
+
+     Returns the settled promise, so a modal button spec's onClick can
+     `return App.runJob(...)`: the rejection still propagates, and
+     runModalAction's own disable/error handling composes with this rather
+     than fighting it. */
+  function runJob(button, labels, promise) {
+    if (!button) return promise;
+    const opts = labels || {};
+    const resting = button.textContent;
+    const box = button.closest ? button.closest('#modal-box') : null;
+    const generation = box ? box.dataset.modalGen : null;
+    button.disabled = true;
+    button.textContent = opts.queued || 'Working…';
+    const settle = (text) => {
+      button.textContent = text;
+      button.disabled = false;
+      window.setTimeout(() => {
+        if (button.textContent === text) button.textContent = resting;
+      }, JOB_REVERT_MS);
+    };
+    return promise.then((result) => {
+      const text = typeof opts.done === 'function' ? opts.done(result)
+        : (opts.done || (typeof result === 'string' ? result : 'Done'));
+      settle(text);
+      toast(text, 'ok');
+      return result;
+    }, (error) => {
+      const message = failureText(error);
+      const text = typeof opts.fail === 'function' ? opts.fail(error) : (opts.fail || 'Failed');
+      settle(text);
+      // Said where the operator is already looking rather than doubled
+      // into a toast on top of it — showModalError also announces.
+      if (!(box && modalIsCurrent(generation) && showModalError(box, message))) {
+        toast(message, 'fail');
+      }
+      throw error;
+    });
+  }
+
   /* "A name is required", said once, in the place every dialog already
      says what went wrong.
 
@@ -1199,12 +1469,14 @@ const App = (() => {
       if (!node || String(node.value || '').trim()) continue;
       missing.push(label);
       node.setAttribute('aria-invalid', 'true');
+      node.setAttribute('aria-describedby', 'modal-error');
       node.classList.add('invalid');
       // The mark comes off as soon as the operator answers it, rather than
       // waiting for the next press: a field still outlined in red while it
       // is being typed into reads as a second, different complaint.
       node.addEventListener('input', () => {
         node.removeAttribute('aria-invalid');
+        node.removeAttribute('aria-describedby');
         node.classList.remove('invalid');
       }, { once: true });
       if (!firstEmpty) firstEmpty = node;
@@ -1242,6 +1514,22 @@ const App = (() => {
   function modal(title, bodyHtml, buttons, options = {}) {
     const wrap = document.getElementById('modal');
     const box = document.getElementById('modal-box');
+    // A kiosk display has nobody at the keyboard to answer a dialog (UI-002):
+    // opening one would just sit there, inert background and all, until the
+    // idle timer or the absolute ceiling ends the session with it still
+    // open. Every dialog degrades to a toast unless the caller marks it
+    // kioskSafe — only the forced password prompt does, since that one has
+    // to be answerable from a wall display. The heading still becomes the
+    // toast text, and this still builds and returns the full box below
+    // rather than something bare, since call sites go on to query and wire
+    // it before anyone ever clicks a button.
+    const kioskDegraded = state.kiosk && !options.kioskSafe;
+    if (kioskDegraded) {
+      const titleText = title && typeof title === 'object'
+        ? String(title.html || '').replace(/<[^>]*>/g, '')
+        : String(title || '');
+      toast(titleText, 'info');
+    }
     // Remembered before the dialog takes focus. `options.trigger` lets a
     // caller name the control explicitly when the dialog is opened from
     // code rather than from a click.
@@ -1257,8 +1545,9 @@ const App = (() => {
     // says so by passing {html}.
     const heading = title && typeof title === 'object' && title.html !== undefined
       ? String(title.html) : escapeHtml(title);
-    // Long forms put their buttons at the top, so Save is reachable without
-    // scrolling past every field first.
+    // Buttons default to the top, sticky, so Save is reachable without
+    // scrolling past every field first — most dialogs are long forms; a
+    // short confirm passes {buttonsTop: false} to stay bottom-anchored.
     /* The body and the buttons go inside a real <form>.
 
        Enter did nothing in any of the fifty-odd dialogs in this product
@@ -1278,9 +1567,9 @@ const App = (() => {
        of their own (netflow.js, snmp.js, syslog.js), and only the fact that
        all three happen to pass {buttonsTop} keeps the buttons out of them
        today. */
-    const errorHtml = '<p class="modal-error" hidden></p>';
+    const errorHtml = '<p class="modal-error" id="modal-error" hidden></p>';
     const openForm = '<form class="modal-form" novalidate>';
-    box.innerHTML = options.buttonsTop
+    box.innerHTML = options.buttonsTop !== false
       ? `<h2 id="modal-title">${heading}</h2>${openForm}` +
         `<div class="row modal-buttons top"></div>${errorHtml}${bodyHtml}</form>`
       : `<h2 id="modal-title">${heading}</h2>${openForm}` +
@@ -1308,7 +1597,11 @@ const App = (() => {
       // Only the primary submits; everything else is type=button so a
       // Cancel or a Copy can never submit the form by accident.
       button.type = spec.primary ? 'submit' : 'button';
+      // danger is its own tier, not primary with a colour swapped in: it is
+      // never the implicit-submit button, so Enter in a field can never run
+      // an irreversible action by reflex (see confirmDestructive below).
       if (spec.primary) button.className = 'primary';
+      else if (spec.danger) button.className = 'danger';
       button.onclick = () => {
         // A click on the submit button raises submit, which runs the
         // handler there. Running it here as well would run it twice.
@@ -1343,27 +1636,36 @@ const App = (() => {
     box.setAttribute('role', 'dialog');
     box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-labelledby', 'modal-title');
-    wrap.hidden = false;
-    setBackgroundInert(true);
-    // A dialog with no field to fill still has to take the keyboard, or the
-    // trap has nothing to hold and Escape is the only way to answer it.
-    const first = box.querySelector('input, select, textarea')
-      || box.querySelector('.row button');
-    if (first) first.focus();
-    else {
-      const anything = focusableIn(box)[0];
-      if (anything) anything.focus();
+    // The box above is fully built either way, so a caller that goes on to
+    // query and wire it (several do, before anyone has clicked a button)
+    // works the same in both cases; what a kiosk skips is everything that
+    // would make it visible or trap the keyboard.
+    if (!kioskDegraded) {
+      wrap.hidden = false;
+      setBackgroundInert(true);
+      // A dialog with no field to fill still has to take the keyboard, or
+      // the trap has nothing to hold and Escape is the only way to answer it.
+      const first = box.querySelector('input, select, textarea')
+        || box.querySelector('.row button');
+      if (first) first.focus();
+      else {
+        const anything = focusableIn(box)[0];
+        if (anything) anything.focus();
+      }
     }
     return box;
   }
 
   const closeModal = () => {
+    // Un-inert the background before the lock check below can return early:
+    // a locked dialog must never be able to strand the page behind an
+    // inert #tabs and an inert section.page with no way back in.
+    setBackgroundInert(false);
     if (state.modalLocked) return;
     const wrap = document.getElementById('modal');
     const wasOpen = wrap && !wrap.hidden;
     if (wrap) wrap.hidden = true;
     modalDirty = false;
-    setBackgroundInert(false);
     // Anything a dialog started and must stop — a refresh interval, a
     // pending fetch it should stop painting from — hangs off this rather
     // than off its own Close button, because Escape and a backdrop click
@@ -1411,11 +1713,19 @@ const App = (() => {
       '<button type="button" class="primary discard-keep">Keep editing</button>' +
       '</div>';
     box.appendChild(prompt);
+    // The prompt is a sibling of the form, not inside it, so the 13 fields
+    // behind it were still in the tab order and in trapTab's own
+    // focusableIn(box) walk — Tab could leave "Keep editing" for the very
+    // form the prompt is asking about. inert removes the form from both
+    // until Keep editing answers the question and puts it back.
+    const form = box.querySelector('form.modal-form');
+    if (form) form.inert = true;
     prompt.querySelector('.discard-go').onclick = () => {
       modalDirty = false;
       closeModal();
     };
     prompt.querySelector('.discard-keep').onclick = () => {
+      if (form) form.inert = false;
       prompt.remove();
       const first = box.querySelector('.modal-form input, .modal-form select,'
         + ' .modal-form textarea');
@@ -1491,17 +1801,210 @@ const App = (() => {
     return Boolean(wrap) && !wrap.hidden;
   }
 
+  /* --------------------------------------------------------------- search
+     Nine independent per-page search boxes and no way to ask the product a
+     question without already knowing which tab owns the answer first. "/"
+     opens this one instead of focusing whichever box the current page
+     happens to have; it queries devices, MACs/interfaces (the same
+     mac-search endpoint nodes.js's own MAC lookup uses — a hit reads the
+     way that one already does), alerts and NetPath destinations through
+     endpoints the product already had, and routes to a hit through the
+     hash exactly as every other selection in this app does. */
+  let gsearchTrigger = null;
+  let gsearchToken = 0;
+  let gsearchTimer = null;
+  let gsearchActive = -1;
+
+  function gsearchOpen() {
+    if (!document.getElementById('modal').hidden || helpOpen()) return;
+    let wrap = document.getElementById('gsearch');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.id = 'gsearch';
+      wrap.className = 'gsearch';
+      wrap.hidden = true;
+      wrap.innerHTML = `<div class="gsearch-box" role="dialog" aria-modal="true" aria-label="Search">
+        <input id="gsearch-input" class="gsearch-input" type="text" autocomplete="off"
+          aria-label="Search devices, interfaces, MACs, alerts and NetPath destinations"
+          placeholder="Search devices, interfaces, MACs, alerts, destinations…">
+        <div id="gsearch-results" class="gsearch-results"></div>
+        <p class="gsearch-hint">&uarr;&darr; to move &middot; Enter to open &middot; Esc to close</p>
+      </div>`;
+      document.body.appendChild(wrap);
+      wrap.onclick = (event) => { if (event.target === wrap) gsearchClose(); };
+      const input = wrap.querySelector('#gsearch-input');
+      input.addEventListener('input', () => gsearchQueued(input.value));
+      input.addEventListener('keydown', gsearchKeydown);
+    }
+    // The '/' shortcut can fire with nothing focused (activeElement is then
+    // document.body), which is not a trigger Escape can usefully return to;
+    // fall back to the button that opens the same dialog.
+    gsearchTrigger = document.activeElement;
+    if (!gsearchTrigger || gsearchTrigger === document.body) {
+      gsearchTrigger = document.getElementById('global-search-btn');
+    }
+    setBackgroundInert(true);
+    wrap.hidden = false;
+    const input = wrap.querySelector('#gsearch-input');
+    input.value = '';
+    input.focus();
+    gsearchRender([]);
+  }
+
+  function gsearchClose() {
+    const wrap = document.getElementById('gsearch');
+    if (!wrap || wrap.hidden) return;
+    wrap.hidden = true;
+    setBackgroundInert(false);
+    gsearchToken++;                    // any answer still in flight is stale
+    if (gsearchTrigger && document.contains(gsearchTrigger)) gsearchTrigger.focus();
+    gsearchTrigger = null;
+  }
+
+  function gsearchIsOpen() {
+    const wrap = document.getElementById('gsearch');
+    return Boolean(wrap) && !wrap.hidden;
+  }
+
+  function gsearchQueued(text) {
+    clearTimeout(gsearchTimer);
+    const q = text.trim();
+    if (!q) { gsearchRender([]); return; }
+    gsearchTimer = setTimeout(() => gsearchRun(q), 150);
+  }
+
+  async function gsearchRun(q) {
+    const token = ++gsearchToken;
+    const groups = [];
+    // A MAC in any of the notations nodes.js already accepts is worth a
+    // lookup on its own; a plain name never is, so this never fires one
+    // for every keystroke of an ordinary search.
+    const hexOnly = q.replace(/[^0-9a-fA-F]/g, '');
+    try {
+      if (hexOnly.length >= 4 && canRead('nodes')) {
+        const mac = await get('/api/nodes/mac-search', { q });
+        if (mac.locations && mac.locations.length) {
+          groups.push({ title: 'MAC address / interface', hits: mac.locations.slice(0, 8).map((loc) => ({
+            name: loc.mac,
+            meta: `last seen on ${loc.device_name} · ${loc.if_descr}` +
+              (loc.vlan ? ` (VLAN ${loc.vlan})` : '') +
+              (loc.seen_ts ? ` at ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : ''),
+            route: `#/nodes/device/${loc.device_id}/port/${loc.if_index}`,
+          })) });
+        }
+      }
+      if (canRead('nodes')) {
+        const devices = await get('/api/nodes/devices', { q, limit: 8 });
+        if (devices.devices && devices.devices.length) {
+          groups.push({ title: 'Devices', hits: devices.devices.map((d) => ({
+            name: d.name || d.ip,
+            meta: [d.ip, d.status].filter(Boolean).join(' · '),
+            route: `#/nodes/device/${d.id}`,
+          })) });
+        }
+      }
+      if (canRead('alerts')) {
+        const alerts = await get('/api/alerts', { q, limit: 8 });
+        if (alerts.alerts && alerts.alerts.length) {
+          groups.push({ title: 'Alerts', hits: alerts.alerts.map((a) => ({
+            name: a.message || a.entity_label || `Alert ${a.id}`,
+            meta: [a.severity_name, a.entity_label].filter(Boolean).join(' · '),
+            route: `#/alerts/${a.id}`,
+          })) });
+        }
+      }
+      if (canRead('netpath')) {
+        const targets = await get('/api/netpath/targets');
+        const needle = q.toLowerCase();
+        const hits = (targets.targets || []).filter((t) =>
+          (t.label || '').toLowerCase().includes(needle)
+          || (t.host || '').toLowerCase().includes(needle)).slice(0, 8);
+        if (hits.length) {
+          groups.push({ title: 'NetPath destinations', hits: hits.map((t) => ({
+            name: t.label || t.host,
+            meta: t.host && t.host !== t.label ? t.host : '',
+            route: `#/netpath/${t.id}`,
+          })) });
+        }
+      }
+    } catch (error) { /* a failed lookup just leaves that group out */ }
+    if (token !== gsearchToken) return;   // superseded by a newer keystroke
+    gsearchRender(groups);
+  }
+
+  function gsearchRender(groups) {
+    const results = document.getElementById('gsearch-results');
+    if (!results) return;
+    gsearchActive = -1;
+    if (!groups.length) {
+      results.innerHTML = '<p class="gsearch-empty">Type to search devices, interfaces, '
+        + 'MACs, alerts and NetPath destinations.</p>';
+      return;
+    }
+    results.innerHTML = groups.map((group) => `<div class="gsearch-group">
+        <div class="eyebrow">${escapeHtml(group.title)}</div>
+        ${group.hits.map((hit) => `<button type="button" class="gsearch-hit"
+            data-route="${escapeHtml(hit.route)}">
+          <span class="name">${escapeHtml(hit.name)}</span>
+          ${hit.meta ? `<span class="meta">${escapeHtml(hit.meta)}</span>` : ''}
+        </button>`).join('')}
+      </div>`).join('');
+    for (const button of results.querySelectorAll('.gsearch-hit')) {
+      button.onclick = () => gsearchGo(button.dataset.route);
+    }
+    const first = results.querySelector('.gsearch-hit');
+    if (first) { first.classList.add('active'); gsearchActive = 0; }
+  }
+
+  function gsearchGo(route) {
+    gsearchClose();
+    window.location.hash = route;
+  }
+
+  function gsearchKeydown(event) {
+    // Escape is handled once, by the document-level handler in start() —
+    // this listener sits on the input itself and the keydown bubbles to it.
+    const results = document.getElementById('gsearch-results');
+    const hits = results ? [...results.querySelectorAll('.gsearch-hit')] : [];
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!hits.length) return;
+      if (hits[gsearchActive]) hits[gsearchActive].classList.remove('active');
+      gsearchActive = event.key === 'ArrowDown'
+        ? (gsearchActive + 1) % hits.length
+        : (gsearchActive - 1 + hits.length) % hits.length;
+      hits[gsearchActive].classList.add('active');
+      hits[gsearchActive].scrollIntoView({ block: 'nearest' });
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (hits[gsearchActive]) gsearchGo(hits[gsearchActive].dataset.route);
+    }
+  }
+
   /* One confirmation shape for everything that destroys stored data, so
      no button deletes on a single click. Body should name the collateral
      damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
      "Clear"). Matches the eight hand-written confirms this app already
-     had — Cancel first, the destructive action as the primary button.
+     had — Cancel first, the destructive action as the danger button.
+
+     The confirm button is `danger`, not `primary`: "Delete 40 devices" used
+     to render identically to Save and, being the form's implicit submit
+     button, fire on Enter in a field. danger is never the submit button
+     (see modal(), which only ever makes primary type=submit), so the
+     destructive action now needs an actual click — and modal()'s own
+     auto-focus already lands on Cancel, the first button in the row, so
+     nothing here changes which control the keyboard opens on.
 
      There is only one modal box, so a confirm raised from inside another
      dialog replaces it. Such callers pass `afterClose(confirmed)` to
      reopen their parent — which is how removing a wireless controller
      already behaves. It is told whether the action ran, since a parent
-     rebuilt from now-stale data is usually only wanted on cancel. */
+     rebuilt from now-stale data is usually only wanted on cancel.
+
+     `onConfirm` is called with the dialog's own confirm button, so a caller
+     that wants the queued/outcome treatment can wrap its body in
+     `App.runJob(button, ...)` — the button already carries modal()'s own
+     disable/error handling, so runJob only adds the label and the toast. */
   function confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
                               afterClose = null) {
     const done = (confirmed) => {
@@ -1510,7 +2013,7 @@ const App = (() => {
     };
     return modal(title, bodyHtml, [
       { label: 'Cancel', onClick: () => done(false) },
-      { label: confirmLabel, primary: true, onClick: async () => {
+      { label: confirmLabel, danger: true, onClick: async (box, button) => {
         // No try/catch and no button juggling here any more: this dialog
         // used to be the only one in the product that held its button down
         // while the request ran and stayed open saying why when the request
@@ -1518,10 +2021,13 @@ const App = (() => {
         // rule it exists to keep is unchanged — done() runs only after the
         // await resolves, so a delete that did not happen is never
         // reported as one that did.
-        await onConfirm();
+        await onConfirm(button);
         done(true);
       } },
-    ]);
+    // A one-sentence confirm has no fold to be below; bottom-anchored
+    // matches the discard prompt beside it rather than the sticky top row
+    // long forms need.
+    ], { buttonsTop: false });
   }
 
   /* ------------------------------------------------- charts, shared
@@ -1571,11 +2077,12 @@ const App = (() => {
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
+    const names = state.severities || [];
+    histogramTable(host, buckets, opts, names);
     if (!buckets.length) {
       emptyText(svg, width, height, opts.empty || 'Nothing in this window');
       return;
     }
-    const names = state.severities || [];
     const present = new Set();
     for (const bucket of buckets) {
       for (const sev of Object.keys(bucket.by_severity || {})) {
@@ -1642,9 +2149,28 @@ const App = (() => {
         rows.push({ text: `${names[sev] || sev}: ${bucket.by_severity[String(sev)]}`,
                     color: SEV_COLOR[sev] || 'var(--muted)' });
       }
+      // A bar a mouse can hover has to be a bar a keyboard can reach: the
+      // hit target takes focus and shows the same tooltip a hover would,
+      // and its aria-label says in one sentence what the tooltip shows in
+      // several lines, for whichever comes first.
+      hit.setAttribute('tabindex', '0');
+      hit.setAttribute('role', 'img');
+      hit.setAttribute('aria-label', rows.map((r) => r.text).join(', '));
       hit.addEventListener('mousemove', (event) => tooltip(rows, event));
       hit.addEventListener('mouseleave', hideTooltip);
-      if (opts.onBucket) hit.addEventListener('click', () => opts.onBucket(bucket));
+      hit.addEventListener('focus', () => {
+        const rect = hit.getBoundingClientRect();
+        tooltip(rows, { clientX: rect.left + rect.width / 2, clientY: rect.top });
+      });
+      hit.addEventListener('blur', hideTooltip);
+      if (opts.onBucket) {
+        hit.addEventListener('click', () => opts.onBucket(bucket));
+        hit.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          opts.onBucket(bucket);
+        });
+      }
       svg.appendChild(hit);
     });
     const every = Math.max(1, Math.floor(buckets.length / 8));
@@ -1656,6 +2182,59 @@ const App = (() => {
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, stamp(bucket.t0, opts.span)));
     });
+  }
+
+  /* stackedHistogram's only consumers (alerts.js, snmp.js, syslog.js) each
+     carried an identical copy of this: a handful of events inside a
+     day-long window used to plot as one sliver of bars at the far right of
+     an otherwise-empty chart. When whatever buckets have anything in them
+     span less than a fifth of the requested window, plot just that
+     populated stretch instead — the request itself (t0/t1, the filters) is
+     untouched, only what stackedHistogram draws narrows. Buckets are drawn
+     one per equal-width slot regardless of their timestamps, so a
+     contiguous slice of the array is all it needs. */
+  function plottedRange(buckets, bucketWidth, t0, t1) {
+    const span = t1 - t0;
+    const first = buckets.findIndex((b) => b.total);
+    if (first === -1) return { buckets, t0, t1, span, narrowed: false };
+    let last = buckets.length - 1;
+    while (last > first && !buckets[last].total) last -= 1;
+    const pt0 = buckets[first].t0, pt1 = buckets[last].t0 + bucketWidth;
+    if (pt1 - pt0 >= span / 5) return { buckets, t0, t1, span, narrowed: false };
+    return { buckets: buckets.slice(first, last + 1), t0: pt0, t1: pt1,
+             span: pt1 - pt0, narrowed: true };
+  }
+
+  /* The chart's tabular alternative: everything the bars draw, in one pass
+     over the same `buckets` array, since a screen-reader user gets no
+     equivalent of glancing at the shape of a histogram. Visually hidden
+     (.sr-only) rather than a second visible table, which would just be the
+     chart's data said twice on screen. Lives beside the svg in `host`
+     rather than inside it — a <table> is not valid SVG content. */
+  function histogramTable(host, buckets, opts, names) {
+    let table = host.querySelector(':scope > table.sr-only');
+    if (!buckets.length) {
+      if (table) table.remove();
+      return;
+    }
+    if (!table) {
+      table = document.createElement('table');
+      table.className = 'sr-only';
+      host.appendChild(table);
+    }
+    const unit = opts.unit || 'items';
+    const caption = `${unit.charAt(0).toUpperCase()}${unit.slice(1)} by time`;
+    const rows = buckets.map((bucket) => {
+      const severities = Object.keys(bucket.by_severity || {})
+        .map(Number).sort((a, b) => b - a)
+        .map((sev) => `${names[sev] || sev}: ${bucket.by_severity[String(sev)]}`)
+        .join(', ');
+      return `<tr><td>${escapeHtml(when(bucket.t0))}</td>` +
+        `<td>${bucket.total || 0}</td><td>${escapeHtml(severities || '—')}</td></tr>`;
+    }).join('');
+    table.innerHTML = `<caption>${escapeHtml(caption)}</caption>` +
+      `<thead><tr><th scope="col">Time</th><th scope="col">Total</th>` +
+      `<th scope="col">By severity</th></tr></thead><tbody>${rows}</tbody>`;
   }
 
   /* -------------------------------------------- the filter bar, wired once
@@ -1766,6 +2345,19 @@ const App = (() => {
 
   function el(id) { return document.getElementById(id); }
 
+  /* Write-only-if-changed. drawStatus-style redraws run on every fastTick —
+     ten times a second whether or not anything actually changed — and an
+     unconditional write to textContent/innerHTML/style still queues a real
+     DOM mutation (and, for style, can cancel a CSS transition already in
+     flight) even when the new value equals the old one. Seven modules each
+     grew an identical copy of these three guards; this is the one copy.
+     `el` may be null (the caller's own element lookup, not looked up
+     again here) — all three are no-ops in that case. */
+  function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
+  function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
+  function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
+  function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
+
   /* ------------------------------------------------- status patterns
 
      Under a deuteranopia transform --ok #3FB950, --fail #F85149 and
@@ -1791,52 +2383,84 @@ const App = (() => {
     unknown: 'sw-pat-rows',
   };
 
-  function statusPatternUrl(status) {
-    const id = STATUS_PATTERN[status];
-    return id ? `url(#${id})` : null;
+  /* `url(#sw-pat-hatch)` is a document-wide id lookup, so six identical ids
+     defined on every chart's own <defs> meant every SVG resolved the SAME
+     definitions — whichever chart's <defs> happened to land in the DOM
+     first — rather than its own. The colour-blind texture mechanism rested
+     on that collision. Each host svg now gets its own suffix, derived from
+     the svg's own element id (stable and already unique per chart) or a
+     generated one for a chart built without a static id; `statusPatternIds`
+     is the map a caller threads from `statusPatternDefs` through to
+     `statusPatternUrl` so the fill it builds points at THIS svg's defs.
+
+     `svg` is optional on statusPatternUrl only for a caller that has not
+     been updated to pass it yet — every one shares the fixed 'shared'
+     suffix then, which is the old collision-prone behaviour and no worse
+     than before, rather than losing its texture outright in the meantime. */
+  let patternSeq = 0;
+  const PATTERN_NAMES = ['sw-pat-hatch', 'sw-pat-fail', 'sw-pat-bars', 'sw-pat-rows', 'sw-pat-dots'];
+
+  function statusPatternIds(svg) {
+    const suffix = svg
+      ? (svg.dataset.swPatSuffix = svg.dataset.swPatSuffix || svg.id || `chart${++patternSeq}`)
+      : 'shared';
+    const ids = {};
+    for (const name of PATTERN_NAMES) ids[name] = `${name}-${suffix}`;
+    return ids;
+  }
+
+  function statusPatternUrl(status, svg) {
+    const name = STATUS_PATTERN[status];
+    if (!name) return null;
+    return `url(#${statusPatternIds(svg)[name]})`;
   }
 
   /* Appends the pattern definitions to `svg` once. Ink is white at low
      alpha so one definition works over every status colour and in both
-     themes, exactly as NetPath's original hatch did. */
+     themes, exactly as NetPath's original hatch did. Returns the id map,
+     for a caller that wants it without a second call to statusPatternUrl. */
   function statusPatternDefs(svg) {
-    if (!svg || svg.querySelector('#sw-pat-defs')) return;
-    const defs = svgNode('defs', { id: 'sw-pat-defs' });
+    if (!svg) return null;
+    const ids = statusPatternIds(svg);
+    const defsId = `sw-pat-defs-${svg.dataset.swPatSuffix}`;
+    if (svg.querySelector(`#${defsId}`)) return ids;
+    const defs = svgNode('defs', { id: defsId });
     const stroke = 'rgba(255,255,255,0.45)';
 
-    const hatch = svgNode('pattern', { id: 'sw-pat-hatch', width: 6, height: 6,
+    const hatch = svgNode('pattern', { id: ids['sw-pat-hatch'], width: 6, height: 6,
       patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
     hatch.appendChild(svgNode('line',
       { x1: 0, y1: 0, x2: 0, y2: 6, stroke, 'stroke-width': 2 }));
     defs.appendChild(hatch);
 
-    const fail = svgNode('pattern', { id: 'sw-pat-fail', width: 5, height: 5,
+    const fail = svgNode('pattern', { id: ids['sw-pat-fail'], width: 5, height: 5,
       patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(-45)' });
     fail.appendChild(svgNode('line',
       { x1: 0, y1: 0, x2: 0, y2: 5, stroke, 'stroke-width': 2.2 }));
     defs.appendChild(fail);
 
-    const bars = svgNode('pattern', { id: 'sw-pat-bars', width: 4, height: 4,
+    const bars = svgNode('pattern', { id: ids['sw-pat-bars'], width: 4, height: 4,
       patternUnits: 'userSpaceOnUse' });
     bars.appendChild(svgNode('line',
       { x1: 1, y1: 0, x2: 1, y2: 4, stroke: 'rgba(255,255,255,0.5)',
         'stroke-width': 1.4 }));
     defs.appendChild(bars);
 
-    const rows = svgNode('pattern', { id: 'sw-pat-rows', width: 4, height: 4,
+    const rows = svgNode('pattern', { id: ids['sw-pat-rows'], width: 4, height: 4,
       patternUnits: 'userSpaceOnUse' });
     rows.appendChild(svgNode('line',
       { x1: 0, y1: 1, x2: 4, y2: 1, stroke: 'rgba(255,255,255,0.5)',
         'stroke-width': 1.4 }));
     defs.appendChild(rows);
 
-    const dots = svgNode('pattern', { id: 'sw-pat-dots', width: 5, height: 5,
+    const dots = svgNode('pattern', { id: ids['sw-pat-dots'], width: 5, height: 5,
       patternUnits: 'userSpaceOnUse' });
     dots.appendChild(svgNode('circle',
       { cx: 1.6, cy: 1.6, r: 1.1, fill: 'rgba(255,255,255,0.55)' }));
     defs.appendChild(dots);
 
     svg.insertBefore(defs, svg.firstChild);
+    return ids;
   }
 
   function svgNode(name, attrs = {}, text) {
@@ -1859,9 +2483,13 @@ const App = (() => {
      win over what a browser already stored. Only the named splitters are
      dropped — every other pane the user has deliberately sized is left
      alone, which a blanket reset would not respect.
-       2 — Alerts list/detail moved from 60/40 to 70/30. */
-  const LAYOUT_VERSION = 2;
-  const LAYOUT_RESET_ON_UPGRADE = ['alerts-main'];
+       2 — Alerts list/detail moved from 60/40 to 70/30.
+       3 — Nodes devices/detail moved from 2/3 to 3/2: the devices table's
+           own columns asked for more room than 2/3 gave at any laptop
+           width, so the last column was cut before anyone touched the
+           divider. */
+  const LAYOUT_VERSION = 3;
+  const LAYOUT_RESET_ON_UPGRADE = ['alerts-main', 'nodes-devices'];
 
   function migrateLayout(layout) {
     let stored = 0;
@@ -2074,6 +2702,26 @@ const App = (() => {
      single slot rather than a map: the two always run in sequence for one
      table, and a stale value is discarded by the guards at the point of use. */
   let pendingRowFocus = -1;
+
+  /* drawRows' own row cache, one Map per distinct column set (see below).
+     Module-level rather than per-call: every caller hands drawRows a fresh,
+     empty <tbody> each time it draws (the existing one is already gone by
+     then — grid() above removes it as soon as the head is unchanged), so
+     there is no prior DOM state in that argument for drawRows to diff
+     against. The column-key set is the closest thing to a stable table
+     identity drawRows ever sees, and in practice one table's columns are
+     never another table's — the app's dozen column lists share no key set
+     with each other, not even the two shaped alike (SNMP traps and Syslog
+     both start ts/severity/source and diverge from there). */
+  /* Reused <tr>s, per table and then per column set.
+     Keyed by the table element, not by the column set alone: two tables can
+     legitimately share columns — the interface list appears both in the Nodes
+     detail pane and inside the device dialog, drawn from the same descriptors
+     — and appending a cached node MOVES it, so a single shared bucket had the
+     two tables stealing rows from each other. Opening the dialog emptied the
+     pane; the next poll emptied the dialog. A WeakMap so a table that goes
+     away takes its rows with it. */
+  const rowDrawCaches = new WeakMap();
 
   const COLUMN_KEY = 'sappiwhere.columns';
 
@@ -2353,6 +3001,77 @@ const App = (() => {
     saveView(store);
   }
 
+  /* Roving-tabindex arrow-key contract for a tablist-shaped group: shared
+     by the twelve-tab strip and the .subtabs groups below rather than
+     written twice. ArrowRight/Left wrap through the tabs `tabsFn` returns,
+     Home/End jump to the ends; `activate` both moves focus and performs
+     the selection (selectTab for the main strip, a real click for a
+     subtab group, whose module already owns an onclick for it). A disabled
+     tab (IPAM disables its DHCP subtab off Windows) is dropped from the
+     rotation here rather than trusted to `tabsFn` — `focus()` on a disabled
+     button is a silent no-op, so without this, arrowing toward one just
+     stopped moving, in either direction and from Home/End alike. */
+  function wireRovingTabs(list, tabsFn, activate) {
+    list.addEventListener('keydown', (event) => {
+      if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return;
+      const tabs = tabsFn().filter((t) => !t.disabled);
+      const current = tabs.indexOf(document.activeElement);
+      if (current === -1) return;
+      let next;
+      if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+      else if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+      else if (event.key === 'Home') next = 0;
+      else next = tabs.length - 1;
+      event.preventDefault();
+      tabs[next].focus();
+      activate(tabs[next]);
+    });
+  }
+
+  /* The .subtabs groups (Nodes' top-level nav, its nested device-detail
+     pane, Alerts, IPAM) are genuinely nested tablists — a second level of
+     tabs inside a page the top strip already switched to — and get the
+     full tablist/tab/tabpanel semantics and the same keyboard contract as
+     the twelve-tab strip, wired once here rather than by each module: a
+     module's own selectSub only ever toggles the `active` class, so a
+     MutationObserver on that class is what keeps aria-selected/tabindex
+     and the paired subpage in step however the selection happened — a
+     click, an arrow key, or the recallSub() a module runs on its own
+     init(). tests/ui/walk.mjs's tablist/tab/tabpanel counts are scoped to
+     the top-level strip alone and asserts these groups' own roles
+     separately, so a nested tablist here does not collide with either. */
+  function wireSubtabGroups() {
+    for (const nav of document.querySelectorAll('.subtabs')) {
+      nav.setAttribute('role', 'tablist');
+      const tabs = [...nav.querySelectorAll(':scope > .subtab')];
+      const panels = nav.parentElement
+        ? [...nav.parentElement.querySelectorAll(':scope > .subpage')] : [];
+      if (!tabs.length) continue;
+      tabs.forEach((tab, index) => {
+        tab.setAttribute('role', 'tab');
+        const panel = panels[index];
+        if (!panel) return;
+        tab.id = tab.id || `subtab-for-${panel.id}`;
+        tab.setAttribute('aria-controls', panel.id);
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+      });
+      const sync = () => {
+        for (const tab of tabs) {
+          const active = tab.classList.contains('active');
+          tab.setAttribute('aria-selected', active ? 'true' : 'false');
+          tab.tabIndex = active ? 0 : -1;
+        }
+      };
+      sync();
+      const observer = new MutationObserver(sync);
+      for (const tab of tabs) {
+        observer.observe(tab, { attributes: true, attributeFilter: ['class'] });
+      }
+      wireRovingTabs(nav, () => tabs.filter((t) => !t.hidden), (tab) => tab.click());
+    }
+  }
+
   /* Build a table head that can be dragged wider and clicked to sort.
      
      Widths live in a <colgroup> rather than on each <th>, so a redraw of the
@@ -2607,14 +3326,25 @@ const App = (() => {
     // moment later, so a keyboard user keeps their place across a refresh
     // instead of being returned to the top of the page every poll.
     const focused = document.activeElement;
-    pendingRowFocus = (focused && focused.tagName === 'TR' && table.contains(focused))
+    const focusedInTable = Boolean(focused && table.contains(focused));
+    pendingRowFocus = (focusedInTable && focused.tagName === 'TR')
       ? [...focused.parentElement.rows].indexOf(focused)
+      : -1;
+    // headKey folds in the sort state, so sorting from the keyboard rebuilds
+    // the head and destroys the very <th> Enter or Space was just pressed
+    // on. The column position survives the rebuild the same way
+    // pendingRowFocus carries a row position across a body rebuild.
+    const focusedHeadIndex = (focusedInTable && focused.tagName === 'TH')
+      ? [...focused.parentElement.cells].indexOf(focused)
       : -1;
 
     table.innerHTML = '';
     table.appendChild(caption);
     table.appendChild(colgroup);
     table.appendChild(head);
+    if (focusedHeadIndex >= 0 && row.cells[focusedHeadIndex]) {
+      row.cells[focusedHeadIndex].focus();
+    }
     return table;
   }
 
@@ -2697,27 +3427,107 @@ const App = (() => {
     box.title = box.checked ? 'Clear selection' : name;
   }
 
+  /* One full-width row carrying the same look a detail pane's empty state
+     already has (.empty) — Syslog and SNMP used to render their header over
+     a wholly empty tbody with no word about it, NetFlow drew three
+     different empty treatments on one screen, and the Nodes interfaces
+     table showed headers over nothing when a device's SNMP auth had
+     failed. `columns` only supplies the count to span; `message` is the
+     caller's own sentence. The house pattern is two parts — what is empty,
+     and what would change it ("No messages match these filters. Widen the
+     time window or clear a filter."), not just "Nothing here." */
+  function emptyRow(tbody, columns, message) {
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = Math.max(1, (columns || []).length) || 1;
+    td.className = 'empty';
+    td.textContent = message;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return tbody;
+  }
+
   /* Builds a table body from column descriptors: `cell(row)` renders when
      given, otherwise the raw field with an em dash for blank. This is what
      makes hiding a column safe — every other table in this app used to zip a
      positional array of <td> strings against its column list, so removing one
-     column silently shifted every cell after it into the wrong header. */
-  function drawRows(tbody, rows, columns, onRow) {
-    // Built into a fragment and attached once: a tbody that is already in
-    // the document would otherwise lay out after each of 300 appends.
+     column silently shifted every cell after it into the wrong header.
+
+     `emptyMessage`, when the caller has one, is what appears in place of the
+     rows when there are none (see emptyRow) — every table gets the plumbing
+     for free; the sentence is still the caller's to write. */
+  function drawRows(tbody, rows, columns, onRow, emptyMessage) {
+    const columnsKey = columns.map((c) => c.key).join(',');
+    // This table's own rows. `tbody` is rebuilt by some callers, so the table
+    // is the stable identity to hang them on.
+    const table = tbody.closest('table') || tbody;
+    let byColumns = rowDrawCaches.get(table);
+    if (!byColumns) rowDrawCaches.set(table, byColumns = new Map());
+    // A table whose columns changed — Nodes drops two of them in a narrow
+    // pane — has no use for the rows drawn under the old set.
+    for (const key of [...byColumns.keys()]) {
+      if (key !== columnsKey) byColumns.delete(key);
+    }
+    if (!rows.length && emptyMessage) {
+      // Nothing left to key against; drop the bucket rather than hold rows
+      // that no longer exist until the same column set happens to return.
+      byColumns.delete(columnsKey);
+      emptyRow(tbody, columns, emptyMessage);
+      return tbody;
+    }
+    // Rows are keyed by id: an unchanged row's <tr> is reused outright, and a
+    // changed row only has the cells whose text actually differs touched. The
+    // cost this avoids is building each cell's HTML fresh and throwing the old
+    // <tr> away on every poll, whether or not anything moved.
+    //
+    // The 154ms-per-refresh figure quoted for this was measured on the Nodes
+    // DEVICE table, which does not come through here — it has kept its own
+    // row cache since before that measurement. What this helps is every table
+    // that does: the interface lists, discovery results, syslog, traps, flow
+    // records. Stated because a comment claiming someone else's number is
+    // the kind of thing this file exists not to do.
+    //
+    // `onRow` runs again on a reused <tr>, so it must be idempotent —
+    // assigning handlers is fine, `addEventListener` and appendChild are not.
+    let cache = byColumns.get(columnsKey);
+    if (!cache) byColumns.set(columnsKey, cache = new Map());
+    const seen = new Set();
     const fragment = document.createDocumentFragment();
     for (const row of rows) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = columns.map((c) => {
-        if (c.cell) return `<td class="${cellClass(c)}">${c.cell(row)}</td>`;
+      const id = row.id;
+      const cellHtml = columns.map((c) => {
+        if (c.cell) return c.cell(row);
         const raw = row[c.key];
         const blank = raw === null || raw === undefined || raw === '';
-        return `<td class="${cellClass(c)}">` +
-          `${blank ? '\u2014' : escapeHtml(raw)}</td>`;
-      }).join('');
+        return blank ? '—' : escapeHtml(raw);
+      });
+      const cached = id !== undefined && cache.get(id);
+      let tr;
+      if (cached) {
+        tr = cached.tr;
+        for (let i = 0; i < cellHtml.length; i++) {
+          if (cached.cells[i] !== cellHtml[i]) {
+            tr.children[i].innerHTML = cellHtml[i];
+            cached.cells[i] = cellHtml[i];
+          }
+        }
+      } else {
+        tr = document.createElement('tr');
+        tr.innerHTML = columns.map((c, i) =>
+          `<td class="${cellClass(c)}">${cellHtml[i]}</td>`).join('');
+        if (id !== undefined) cache.set(id, { tr, cells: cellHtml });
+      }
+      // Re-run on every row regardless of whether its cells changed: this is
+      // where a caller sets the row's class (selection, bulk-check), its
+      // click handlers and anything else closed over the current view state,
+      // none of which drawRows itself can know is still correct.
       if (onRow) onRow(tr, row);
+      if (id !== undefined) seen.add(id);
       fragment.appendChild(tr);
     }
+    // Rows dropped from the list (filtered out, deleted) stop being cached,
+    // or the cache would grow by one entry per id this table has ever shown.
+    if (seen.size) for (const id of cache.keys()) if (!seen.has(id)) cache.delete(id);
     tbody.appendChild(fragment);
     wireRowKeyboard(tbody);
     return tbody;
@@ -2760,7 +3570,7 @@ const App = (() => {
         // Only if nothing else has claimed the keyboard in the meantime —
         // an operator who tabbed away during the redraw keeps where they went.
         if (document.activeElement !== document.body || !tbody.isConnected) return;
-        for (const other of rows) other.tabIndex = -1;
+        for (const other of rows) if (other.tabIndex !== -1) other.tabIndex = -1;
         rows[restoreIndex].tabIndex = 0;
         rows[restoreIndex].focus();
       });
@@ -2769,7 +3579,14 @@ const App = (() => {
     // The open row is where the keyboard should land; failing that, the first.
     const landing = rows.find((tr) => tr.classList.contains('selected')) || rows[0];
     for (const tr of rows) {
-      tr.tabIndex = tr === landing ? 0 : -1;
+      // A table that reuses its row elements across polls (Nodes; Debug's
+      // event table, pinned at its 2,000-row cap on a busy fleet) called
+      // this on nearly every tick, and every row got its tabIndex written
+      // whether or not it changed — ~8,000 writes/10s measured on Debug.
+      // Writing only the row whose value is actually moving cut that to the
+      // rows that changed, typically at most two (old landing, new landing).
+      const wantIndex = tr === landing ? 0 : -1;
+      if (tr.tabIndex !== wantIndex) tr.tabIndex = wantIndex;
       // The Nodes table reuses its row elements across refreshes rather than
       // rebuilding them, so this can be called repeatedly on the same <tr>.
       // The position above is recomputed every time; the listeners are
@@ -2777,9 +3594,20 @@ const App = (() => {
       if (tr.dataset.keyboardWired) continue;
       tr.dataset.keyboardWired = '1';
       tr.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
+        if (event.key === 'Enter') {
           event.preventDefault();     // Space would scroll the pane instead
           tr.click();
+          return;
+        }
+        if (event.key === ' ') {
+          event.preventDefault();
+          // A row with its own selection checkbox reads Space the way a
+          // checkbox does — tick it — rather than as a second way to
+          // trigger the row's own click (already Enter's job); a row with
+          // none falls back to that click, so a table without bulk
+          // selection loses nothing.
+          const box = tr.querySelector('input[type="checkbox"]');
+          if (box) box.click(); else tr.click();
           return;
         }
         const step = event.key === 'ArrowDown' ? 1
@@ -2899,6 +3727,20 @@ const App = (() => {
     document.body.classList.toggle('narrow', window.innerWidth < 900);
     // A stacked .cols splitter is now a horizontal separator: its ARIA says so.
     for (const refresh of dividerAria) refresh();
+    updateTabOverflow();
+  }
+
+  /* The tab strip's right-edge fade (app.css's #tabs::after) is only shown
+     while there is actually more to scroll to — Chromium paints no
+     scrollbar of its own until the pointer is over the strip, so without
+     this the strip looked simply truncated at rest below ~1500px. Checked
+     on every resize and once after the twelve tabs first paint; a tab
+     hidden or shown by applyPermissions can change the answer too, so that
+     calls this again as well. */
+  function updateTabOverflow() {
+    const tabs = document.getElementById('tabs');
+    if (!tabs) return;
+    tabs.classList.toggle('has-overflow', tabs.scrollWidth > tabs.clientWidth + 1);
   }
 
   /* ------------------------------------------------------------- theme
@@ -2927,7 +3769,10 @@ const App = (() => {
     if (!options.silent) {
       try { localStorage.setItem(THEME_KEY, theme); } catch (error) { /* private browsing: applies until reload */ }
     }
-    const select = document.getElementById('set-theme');
+    // #am-theme: the Account dialog's own select, when it happens to be
+    // open (another browser tab changed it, say) — Appearance moved there
+    // from a Settings fieldset that used to carry this id.
+    const select = document.getElementById('am-theme');
     if (select && select.value !== theme) select.value = theme;
     window.dispatchEvent(new Event('theme-changed'));
   }
@@ -2943,11 +3788,22 @@ const App = (() => {
      rem root, and one thin bar naming the view, the time and how long the
      session has left. Read from the query string (the hash is the route
      and stays free), preserved by writeRoute and handed back through
-     sign-in by login.js, so a bookmark works as one. */
+     sign-in by login.js, so a bookmark works as one.
+
+     ?rotate=alerts,dashboard&every=30 drives selectTab on a timer, so a
+     wall display can step through more than one view unattended — before
+     this a display was stuck on whatever tab it was opened with, with no
+     way to change or rotate it from the screen itself (1-9 still worked;
+     nothing on screen said so). Named tabs this account cannot read, or
+     that do not exist, are dropped rather than failing the whole list. */
+  let kioskRotation = null;   // {views, everyMs, lastSwitch} or null
+
   function initKiosk() {
     let wanted = false;
+    let params = new URLSearchParams();
     try {
-      wanted = new URLSearchParams(window.location.search).get('kiosk') === '1';
+      params = new URLSearchParams(window.location.search);
+      wanted = params.get('kiosk') === '1';
     } catch (error) { wanted = false; }
     state.kiosk = wanted;
     if (!wanted) return;
@@ -2955,15 +3811,56 @@ const App = (() => {
     document.body.classList.add('kiosk');
     const bar = document.getElementById('kiosk-bar');
     if (bar) bar.hidden = false;
+    const rotateParam = params.get('rotate') || '';
+    const views = rotateParam.split(',').map((s) => s.trim()).filter(Boolean)
+      .filter((name) => {
+        const tab = document.querySelector(`.tab[data-tab="${name}"]`);
+        return tab && !tab.hidden;
+      });
+    if (views.length > 1) {
+      const everySeconds = Number(params.get('every'));
+      kioskRotation = {
+        views,
+        everyMs: Math.max(5, everySeconds > 0 ? everySeconds : 30) * 1000,
+        lastSwitch: Date.now(),
+      };
+    }
+  }
+
+  function drawKioskDots(now) {
+    const dots = document.getElementById('kiosk-dots');
+    const next = document.getElementById('kiosk-next');
+    if (!dots || !next) return;
+    if (!kioskRotation) { dots.hidden = true; next.hidden = true; return; }
+    dots.hidden = false;
+    next.hidden = false;
+    const index = kioskRotation.views.indexOf(state.tab);
+    dots.innerHTML = kioskRotation.views.map((name, i) =>
+      `<span class="dot${i === index ? ' current' : ''}"></span>`).join('');
+    const nextIndex = (index + 1) % kioskRotation.views.length;
+    const nextTab = document.querySelector(`.tab[data-tab="${kioskRotation.views[nextIndex]}"]`);
+    const nextLabel = nextTab ? nextTab.textContent.replace(/\d+$/, '').trim()
+      : kioskRotation.views[nextIndex];
+    const remainS = Math.max(0, Math.ceil(
+      (kioskRotation.everyMs - (now - kioskRotation.lastSwitch)) / 1000));
+    next.textContent = `Next: ${nextLabel} (${remainS}s)`;
   }
 
   let lastKioskDraw = 0;
   function drawKioskBar(now) {
-    if (!state.kiosk || now - lastKioskDraw < 1000) return;
+    if (!state.kiosk) return;
+    if (kioskRotation && now - kioskRotation.lastSwitch >= kioskRotation.everyMs) {
+      kioskRotation.lastSwitch = now;
+      const index = kioskRotation.views.indexOf(state.tab);
+      const next = kioskRotation.views[(index + 1) % kioskRotation.views.length];
+      selectTab(next);
+    }
+    if (now - lastKioskDraw < 1000) return;
     lastKioskDraw = now;
     const tab = document.querySelector(`.tab[data-tab="${state.tab}"]`);
     const label = document.getElementById('kiosk-tab');
     if (label && tab) label.textContent = tab.textContent.replace(/\d+$/, '').trim();
+    drawKioskDots(now);
     const clockEl = document.getElementById('kiosk-clock');
     if (clockEl) clockEl.textContent = clock(now / 1000);
     const sessionEl = document.getElementById('kiosk-session');
@@ -3080,10 +3977,34 @@ const App = (() => {
     return true;
   }
 
+  /* A tab's own top-level subtabs (Nodes' DEVICES/TOPOLOGY/…, Alerts',
+     IPAM's, Settings') are not entity selections — they have no module of
+     their own to hand a route to — so they are matched and clicked here,
+     generically, before the route reaches the module at all. Clicking the
+     button is enough: every module already wires its own subtab buttons to
+     select the pane AND call App.rememberSub, in the same click handler a
+     person's own click would run (nodes.js's selectSub, for one). A route
+     whose first part is not a known subtab name for this tab (an entity id,
+     "device", a numeric alert id) simply matches nothing here and falls
+     through unchanged to the module below. */
+  function applySubtabFromRoute(route) {
+    const name = route.parts[0];
+    if (!name || !/^[a-z0-9_-]+$/i.test(name)) return;
+    const nav = document.querySelector(`#page-${route.tab} > .subtabs`);
+    if (!nav) return;
+    for (const button of nav.querySelectorAll(':scope > .subtab')) {
+      if (button.dataset.subtab === name) {
+        if (!button.classList.contains('active')) button.click();
+        return;
+      }
+    }
+  }
+
   /* Hands the route to the module. The selection half runs after the
      module's first refresh, or nodes.js's own "select the first device if
      none is selected" would overwrite the device the link named. */
   function deliverRoute(route) {
+    applySubtabFromRoute(route);
     const page = pages[route.tab];
     if (!page || !page.activate) return;
     const opts = { route, parts: route.parts, query: route.query };
@@ -3093,6 +4014,29 @@ const App = (() => {
     }
     Promise.resolve(refreshNow(route.tab)).then(() => {
       try { page.activate(opts); } catch (error) { /* a bad link is not fatal */ }
+    });
+  }
+
+  /* The other half: a click on a top-level subtab writes it into the URL,
+     the same "recallSub is the fallback for a route naming none" contract
+     applyRoute/applySubtabFromRoute read back. Delegated on the document so
+     no module has to be touched — a click on the button always runs the
+     module's own onclick (selectSub, rememberSub) first, since that
+     listener lives on the button itself and this one is reached only once
+     the event bubbles past it. Nested subtabs (a device's INTERFACES/…)
+     are deliberately excluded: their parent .subtabs sits inside a pane,
+     not directly inside a .page, and they have no route of their own. */
+  function wireSubtabRouting() {
+    document.addEventListener('click', (event) => {
+      const button = event.target.closest('.subtab');
+      if (!button) return;
+      const nav = button.parentElement;
+      if (!nav || !nav.classList.contains('subtabs')) return;
+      const pageEl = nav.parentElement;
+      if (!pageEl || !pageEl.classList.contains('page')) return;
+      const name = button.dataset.subtab;
+      if (!name) return;
+      setRoute([name]);
     });
   }
 
@@ -3114,6 +4058,11 @@ const App = (() => {
       const current = tab.dataset.tab === name;
       tab.classList.toggle('active', current);
       tab.setAttribute('aria-selected', current ? 'true' : 'false');
+      // Roving tabindex: only the active tab sits in the page's Tab order,
+      // so Tab moves past the strip in one stop instead of twelve. Arrow
+      // keys (wired once in start(), below) move both the tabindex and
+      // focus among the rest.
+      tab.tabIndex = current ? 0 : -1;
     }
     for (const page of document.querySelectorAll('.page')) {
       page.classList.toggle('active', page.id === `page-${name}`);
@@ -3185,6 +4134,10 @@ const App = (() => {
     if (alertsBadge) {
       alertsBadge.textContent = openCount;
       alertsBadge.hidden = openCount === 0;
+      // The badge's digits are folded into the tab's own aria-label below,
+      // so a screen reader is not also handed the bare number as a second,
+      // separate piece of the button's text content ("ALERTS" + "76").
+      alertsBadge.setAttribute('aria-hidden', 'true');
       // Syslog severities: 0-2 are emergency/alert/critical, 3-4 error and
       // warning, the rest informational. The badge takes the tone of the
       // worst one open rather than being permanently amber.
@@ -3195,6 +4148,13 @@ const App = (() => {
       if (!alertsBadge.hidden) {
         alertsBadge.title = `${openCount} open alert(s)`;
       }
+    }
+    // Without this the tab's accessible name was its raw text content —
+    // "ALERTS" run straight into the badge's digits with nothing between
+    // them ("ALERTS76") the moment any alert was open.
+    const alertsTab = document.querySelector('.tab[data-tab="alerts"]');
+    if (alertsTab) {
+      alertsTab.setAttribute('aria-label', openCount > 0 ? `Alerts, ${openCount} open` : 'Alerts');
     }
     // Deliberately not awaited: the title is set synchronously inside, and
     // the (rare) alert fetch behind it must not hold up the poll.
@@ -3359,6 +4319,15 @@ const App = (() => {
         panel.setAttribute('aria-labelledby', tab.id);
       }
     }
+    // ArrowRight/Left/Home/End move focus and switch tabs, the contract
+    // role="tablist" promises and the strip had not implemented at all.
+    if (tabBar) {
+      wireRovingTabs(tabBar,
+        () => [...document.querySelectorAll('.tab')].filter((t) => !t.hidden),
+        (tab) => selectTab(tab.dataset.tab));
+    }
+    wireSubtabGroups();
+    wireSubtabRouting();
     const signout = document.getElementById('signout');
     if (signout) {
       signout.onclick = async () => {
@@ -3370,7 +4339,7 @@ const App = (() => {
       };
     }
     const accountBtn = document.getElementById('account-btn');
-    if (accountBtn) accountBtn.onclick = accountModal;
+    if (accountBtn) accountBtn.onclick = () => accountModal();
     document.getElementById('modal').onclick = (event) => {
       if (event.target.id === 'modal') requestCloseModal();
     };
@@ -3389,29 +4358,22 @@ const App = (() => {
     });
     document.addEventListener('keydown', trapTab);
 
-    /* 1-9 select the first nine visible tabs and '/' focuses the current
-       page's search box. Both are bare keys, so both stand down whenever a
-       field, a dialog or the help panel has the keyboard — which is why the
-       chart shortcuts in netflow.js are Ctrl-modified instead: those have to
-       work while a filter box has focus. */
-    const SEARCH_BOXES = {
-      nodes: '#nd-q', alerts: '#alerts-filter-text', syslog: '#sl-q',
-      snmp: '#sn-q', ipam: '#ipam-search-q', netflow: '#nf-src',
-      configrx: '#cx-q', debug: '#dbg-search', wireless: '#wl-q',
-    };
+    /* 1-9 select the first nine visible tabs and '/' opens the global
+       search — nine independent per-page search boxes used to be the only
+       way in, which meant knowing which tab owned the answer before you
+       could ask. Both are bare keys, so both stand down whenever a field, a
+       dialog or the help panel has the keyboard — which is why the chart
+       shortcuts in netflow.js are Ctrl-modified instead: those have to work
+       while a filter box has focus. */
     document.addEventListener('keydown', (event) => {
       if (event.ctrlKey || event.altKey || event.metaKey) return;
-      if (!document.getElementById('modal').hidden || helpOpen()) return;
+      if (!document.getElementById('modal').hidden || helpOpen() || gsearchIsOpen()) return;
       const active = document.activeElement;
       if (active && (/^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)
                      || active.isContentEditable)) return;
       if (event.key === '/') {
-        const selector = SEARCH_BOXES[state.tab];
-        const box = selector && document.querySelector(selector);
-        if (!box || box.offsetParent === null) return;
-        event.preventDefault();      // or the '/' lands in the box it focuses
-        box.focus();
-        if (box.select) box.select();
+        event.preventDefault();      // or the '/' lands in the box it opens
+        gsearchOpen();
         return;
       }
       if (event.key < '1' || event.key > '9') return;
@@ -3421,12 +4383,15 @@ const App = (() => {
       event.preventDefault();
       selectTab(tab.dataset.tab);
     });
+    const searchBtn = document.getElementById('global-search-btn');
+    if (searchBtn) searchBtn.onclick = () => gsearchOpen();
     document.addEventListener('keydown', (event) => {
-      // Escape peels one layer: the help panel if it is open, else the
-      // dialog under it. Closing both at once would throw away the form
-      // the operator was reading the help for.
+      // Escape peels one layer at a time: the search box, then the help
+      // panel, then the dialog under it. Closing more than one at once
+      // would throw away the form the operator was reading the help for.
       if (event.key !== 'Escape') return;
-      if (helpOpen()) closeHelp();
+      if (gsearchIsOpen()) gsearchClose();
+      else if (helpOpen()) closeHelp();
       else requestCloseModal();
     });
     document.addEventListener('click', (event) => {
@@ -3488,14 +4453,14 @@ const App = (() => {
     });
     if (!applyRoute(true)) {
       // A refresh should land back on whichever module was open, rather than
-      // resetting to NetPath — but only if that tab is one this browser can
-      // actually show: a build could drop it, the account may not be allowed
-      // to read it, or its module may have just failed above.
-      let initialTab = 'netpath';
+      // resetting to Dashboard — but only if that tab is one this browser
+      // can actually show: a build could drop it, the account may not be
+      // allowed to read it, or its module may have just failed above.
+      let initialTab = 'dashboard';
       try {
         const stored = localStorage.getItem(TAB_KEY);
         if (stored) initialTab = stored;
-      } catch (error) { /* private browsing, or storage full: default to netpath */ }
+      } catch (error) { /* private browsing, or storage full: default to dashboard */ }
       if (!usableTab(initialTab)) {
         // Dashboard is the last resort rather than an error page: it is
         // never permission-gated and has no module state of its own to break.
@@ -3534,14 +4499,16 @@ const App = (() => {
   const api = {
     state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
     parseRoute, buildRoute, setRoute, applyRoute,
-    get, post, put, del, saveCsv, exportCsv,
+    get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
-    SEV_COLOR, emptyText, stackedHistogram, filterBar, isMono,
+    SEV_COLOR, emptyText, stackedHistogram, plottedRange, filterBar, isMono,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, fillRanges, RANGES, wheelWindow,
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
+    setText, setHtml, setBg, setHidden,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
+    runJob, emptyRow,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink, showHelp, closeHelp,

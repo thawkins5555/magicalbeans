@@ -1,9 +1,52 @@
 /* The global Settings page. Changes are staged and applied together, because
    applying on every keystroke would restart the resolver constantly. */
 (() => {
-  function load() {
-    const s = App.state.settings;
-    const server = App.state.serverState || {};
+  /* Every field Apply/Revert round-trips through /api/settings: the
+     server key, the input id, and how to read/paint it. Shared by apply(),
+     the range check ahead of it, and the dirty-tracking below, so the three
+     cannot drift the way three separate id lists would. */
+  const APPLY_FIELDS = [
+    ['dns_enabled', 'set-dns-enabled', 'bool'],
+    ['dns_workers', 'set-dns-workers', 'num'],
+    ['dns_timeout_s', 'set-dns-timeout', 'num'],
+    ['dns_cache_days', 'set-dns-cache', 'num'],
+    ['dns_server', 'set-dns-server', 'str'],
+    ['dns_use_nslookup', 'set-dns-nslookup', 'bool'],
+    ['asn_enabled', 'set-asn-enabled', 'bool'],
+    ['asn_cache_days', 'set-asn-cache', 'num'],
+    ['asn_server', 'set-asn-server', 'str'],
+    ['netpath_refresh_s', 'set-refresh-netpath', 'num'],
+    ['nodes_refresh_s', 'set-refresh-nodes', 'num'],
+    ['alerts_refresh_s', 'set-refresh-alerts', 'num'],
+    ['netflow_refresh_s', 'set-refresh-netflow', 'num'],
+    ['snmp_refresh_s', 'set-refresh-snmp', 'num'],
+    ['syslog_refresh_s', 'set-refresh-syslog', 'num'],
+    ['ipam_refresh_s', 'set-refresh-ipam', 'num'],
+    ['debug_refresh_s', 'set-refresh-debug', 'num'],
+    ['dashboard_refresh_s', 'set-refresh-dashboard', 'num'],
+    ['wireless_refresh_s', 'set-refresh-wireless', 'num'],
+    ['configrx_refresh_s', 'set-refresh-configrx', 'num'],
+    ['max_trace_db_mb', 'set-trace-cap', 'num'],
+    ['max_flow_db_mb', 'set-flow-cap', 'num'],
+    ['max_snmp_db_mb', 'set-snmp-cap', 'num'],
+    ['max_syslog_db_mb', 'set-syslog-cap', 'num'],
+    ['max_ipam_db_mb', 'set-ipam-cap', 'num'],
+    ['max_nodes_db_mb', 'set-nodes-cap', 'num'],
+    ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
+    ['session_idle_minutes', 'set-idle-minutes', 'num'],
+    ['session_max_hours', 'set-session-hours', 'num'],
+  ];
+  const APPLY_FIELD_IDS = new Set(APPLY_FIELDS.map(([, id]) => id));
+
+  // Captured at load() and again after a successful apply() — the one point
+  // both agree is "what the server has". Revert repaints from this, not
+  // from the live App.state.settings, which a background poll (another
+  // operator applying their own changes) can move out from under an
+  // operator with a half-edited form open here.
+  let saved = null;
+  let dirty = false;
+
+  function paint(s, server) {
     App.el('set-dns-enabled').checked = !!s.dns_enabled;
     App.el('set-dns-workers').value = s.dns_workers;
     App.el('set-dns-timeout').value = s.dns_timeout_s;
@@ -59,7 +102,59 @@
     App.el('set-alerts-path').value = storage.alerts_path || '';
     showUsage(storage);
     showUpdateInfo(server);
+  }
+
+  function load() {
+    saved = { ...App.state.settings };
+    paint(saved, App.state.serverState || {});
+    dirty = false;
     status('Showing saved settings', 'var(--muted)');
+  }
+
+  // Repaints from the snapshot taken at load()/apply(), not from
+  // App.state.settings — see the note on `saved` above.
+  function revert() {
+    paint(saved || App.state.settings, App.state.serverState || {});
+    dirty = false;
+    status('Reverted — unsaved changes discarded', 'var(--muted)');
+  }
+
+  function markDirty() {
+    if (dirty) return;
+    dirty = true;
+    status('Unsaved changes', 'var(--warn)');
+  }
+
+  /* Compares each number field's own min/max — set per-field in index.html
+     — against what is actually typed in it, since the form is novalidate
+     and these are otherwise only advisory. Marks and focuses the first
+     offender and says why in the status line, the same shape as a refused
+     dialog field. */
+  function checkRanges() {
+    for (const [, id, kind] of APPLY_FIELDS) {
+      if (kind !== 'num') continue;
+      const el = App.el(id);
+      const raw = el.value.trim();
+      const value = Number(raw);
+      const min = el.min !== '' ? Number(el.min) : null;
+      const max = el.max !== '' ? Number(el.max) : null;
+      const bad = raw === '' || Number.isNaN(value)
+        || (min !== null && value < min) || (max !== null && value > max);
+      if (!bad) continue;
+      el.setAttribute('aria-invalid', 'true');
+      el.classList.add('invalid');
+      el.addEventListener('input', () => {
+        el.removeAttribute('aria-invalid');
+        el.classList.remove('invalid');
+      }, { once: true });
+      el.focus();
+      const label = (el.closest('label') || {}).textContent || id;
+      const range = min !== null && max !== null ? `between ${min} and ${max}`
+        : min !== null ? `at least ${min}` : `at most ${max}`;
+      status(`${label.replace(/\s+/g, ' ').trim()} must be ${range}.`, 'var(--fail)');
+      return false;
+    }
+    return true;
   }
 
   /* --------------------------------------------------------------- update */
@@ -228,39 +323,17 @@
   }
 
   async function apply() {
-    const values = {
-      dns_enabled: App.el('set-dns-enabled').checked,
-      dns_workers: Number(App.el('set-dns-workers').value),
-      dns_timeout_s: Number(App.el('set-dns-timeout').value),
-      dns_cache_days: Number(App.el('set-dns-cache').value),
-      dns_server: App.el('set-dns-server').value.trim(),
-      dns_use_nslookup: App.el('set-dns-nslookup').checked,
-      asn_enabled: App.el('set-asn-enabled').checked,
-      asn_cache_days: Number(App.el('set-asn-cache').value),
-      asn_server: App.el('set-asn-server').value.trim(),
-      netpath_refresh_s: Number(App.el('set-refresh-netpath').value),
-      nodes_refresh_s: Number(App.el('set-refresh-nodes').value),
-      alerts_refresh_s: Number(App.el('set-refresh-alerts').value),
-      netflow_refresh_s: Number(App.el('set-refresh-netflow').value),
-      snmp_refresh_s: Number(App.el('set-refresh-snmp').value),
-      syslog_refresh_s: Number(App.el('set-refresh-syslog').value),
-      ipam_refresh_s: Number(App.el('set-refresh-ipam').value),
-      debug_refresh_s: Number(App.el('set-refresh-debug').value),
-      dashboard_refresh_s: Number(App.el('set-refresh-dashboard').value),
-      wireless_refresh_s: Number(App.el('set-refresh-wireless').value),
-      configrx_refresh_s: Number(App.el('set-refresh-configrx').value),
-      max_trace_db_mb: Number(App.el('set-trace-cap').value),
-      max_flow_db_mb: Number(App.el('set-flow-cap').value),
-      max_snmp_db_mb: Number(App.el('set-snmp-cap').value),
-      max_syslog_db_mb: Number(App.el('set-syslog-cap').value),
-      max_ipam_db_mb: Number(App.el('set-ipam-cap').value),
-      max_nodes_db_mb: Number(App.el('set-nodes-cap').value),
-      max_alerts_db_mb: Number(App.el('set-alerts-cap').value),
-      session_idle_minutes: Number(App.el('set-idle-minutes').value),
-      session_max_hours: Number(App.el('set-session-hours').value),
-    };
+    if (!checkRanges()) return;
+    const values = {};
+    for (const [key, id, kind] of APPLY_FIELDS) {
+      const el = App.el(id);
+      values[key] = kind === 'bool' ? el.checked
+        : kind === 'num' ? Number(el.value) : el.value.trim();
+    }
     await App.post('/api/settings', { scope: 'global', values });
     await App.loadState();
+    saved = { ...App.state.settings };
+    dirty = false;
     // The list used to name seven of the eleven refresh rates (IPAM had a
     // field and was left out; three had no field at all).
     status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
@@ -514,9 +587,20 @@
     return grants;
   }
 
-  function editPermissions(user) {
+  function editPermissions(user, allUsers) {
+    const presetHtml = `<div class="row">
+      <label>Role <select id="ep-perm-preset">
+        <option value="custom">Custom</option>
+        <option value="viewer">Viewer — read everything</option>
+        <option value="operator">Operator — write to every module, not Settings</option>
+        <option value="admin">Admin — write to everything</option>
+      </select></label>
+      <label>Copy permissions from <select id="ep-perm-copyfrom">
+        <option value="">— choose an account —</option>
+      </select></label>
+    </div>`;
     const box = App.modal(`Permissions for ${user.username}`,
-      permissionGridHtml('ep', user.permissions || {}), [
+      presetHtml + permissionGridHtml('ep', user.permissions || {}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async () => {
         try {
@@ -530,6 +614,8 @@
         }
       } },
     ]);
+    fillCopyFromPicker(box.querySelector('#ep-perm-copyfrom'), allUsers || [], user.username);
+    wirePresetTools(box, 'ep', 'ep-perm-preset', 'ep-perm-copyfrom');
   }
 
   /* The accounts grid is behind settings:write on the server, so a
@@ -555,6 +641,8 @@
     const payload = await App.get('/api/users');
     modules = payload.modules || [];
     App.el('new-user-grid').innerHTML = permissionGridHtml('nu', {});
+    fillCopyFromPicker(App.el('new-perm-copyfrom'), payload.users || [], null);
+    wirePresetTools(document, 'nu', 'new-perm-preset', 'new-perm-copyfrom');
     const table = App.el('users-table');
     const me = (App.state.session || {}).username;
     table.innerHTML = '<caption class="sr-only">User accounts</caption><thead><tr>' +
@@ -573,7 +661,7 @@
         '<td></td>';
       const edit = document.createElement('button');
       edit.textContent = 'Permissions';
-      edit.onclick = () => editPermissions(user);
+      edit.onclick = () => editPermissions(user, payload.users);
       tr.lastElementChild.appendChild(edit);
       if (!isMe) {
         const remove = document.createElement('button');
@@ -656,10 +744,189 @@
   }
 
   function forcePasswordChange() {
-    App.accountModal(true);
+    App.accountModal({ forced: true });
   }
 
+  /* -------------------------------------------------------------- subtabs
+     Eleven fieldsets used to be one scroll with no way to jump partway
+     down it. Same nav/subpage/recallSub grammar every other multi-section
+     page already uses, so #/settings/users is addressable and Back works. */
+  function selectSub(name) {
+    for (const btn of document.querySelectorAll('#page-settings > .subtabs > .subtab')) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const page of document.querySelectorAll('#page-settings > .subpage')) {
+      page.classList.toggle('active', page.id === `settings-sub-${name}`);
+    }
+  }
+
+  /* -------------------------------------------------------- module pane
+     Module settings otherwise live in two places: a button on each
+     module's own strip, and nowhere else — so "where is the setting for
+     X" has no answer that does not start with already knowing which tab.
+     This lists all nine and opens the same dialog the module's own button
+     does, rather than duplicating it. */
+  const MODULE_DIALOGS = [
+    ['nodes', 'Nodes', 'nd-settings'],
+    ['alerts', 'Alerts', 'alerts-settings'],
+    ['netpath', 'Routes (NetPath)', 'netpath-settings'],
+    ['netflow', 'NetFlow', 'nf-settings'],
+    ['snmp', 'SNMP Trap', 'sn-settings'],
+    ['syslog', 'Syslog', 'sl-settings'],
+    ['ipam', 'IPAM', 'ipam-settings'],
+    ['wireless', 'FortiWireless', 'wl-settings'],
+    ['configrx', 'ConfigRX', 'cx-settings'],
+  ];
+
+  function buildModulesPane() {
+    const host = App.el('settings-modules-list');
+    if (!host) return;
+    host.innerHTML = '';
+    for (const [tab, label, buttonId] of MODULE_DIALOGS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.onclick = () => {
+        App.selectTab(tab);
+        // The target button lives on a page that has just become visible;
+        // its own click handler is the module's, unchanged — this only
+        // reaches it from a page an operator did not have to already know.
+        const target = App.el(buttonId);
+        if (target && !target.disabled) target.click();
+      };
+      host.appendChild(button);
+    }
+  }
+
+  /* --------------------------------------------------------- role presets
+     A 12-module x 3-radio grid with a staged Apply beside it used to be the
+     only way to grant anyone anything. A preset sets the whole grid in one
+     click; picking any individual radio afterwards is still just a radio —
+     it quietly reverts the select to Custom rather than fighting it. */
+  const ROLE_PRESETS = {
+    viewer: (mods) => Object.fromEntries(
+      mods.filter((m) => m !== 'admin' && m !== 'ssh').map((m) => [m, 'read'])),
+    operator: (mods) => Object.fromEntries(
+      mods.filter((m) => !['admin', 'settings', 'debug'].includes(m))
+        .map((m) => [m, 'write'])),
+    admin: (mods) => Object.fromEntries(mods.map((m) => [m, 'write'])),
+  };
+
+  function paintPermissionGrid(box, idPrefix, grants) {
+    for (const m of modules) {
+      const level = grants[m] || 'none';
+      const radio = box.querySelector(`input[name="${idPrefix}-${m}"][value="${level}"]`);
+      if (radio) radio.checked = true;
+    }
+  }
+
+  /* Wired on every radio in the grid, not just the preset select: a preset
+     is a starting point, not a lock, and a single manual change should read
+     as "Custom" rather than silently keeping the label of a preset the
+     grid no longer matches. */
+  function wirePresetTools(box, idPrefix, presetId, copyId) {
+    const preset = box.querySelector(`#${presetId}`);
+    const copyFrom = box.querySelector(`#${copyId}`);
+    if (preset) {
+      preset.onchange = () => {
+        const build = ROLE_PRESETS[preset.value];
+        if (!build) return;
+        paintPermissionGrid(box, idPrefix, build(modules));
+      };
+    }
+    if (copyFrom) {
+      copyFrom.onchange = async () => {
+        const username = copyFrom.value;
+        copyFrom.value = '';
+        if (!username) return;
+        try {
+          const payload = await App.get('/api/users');
+          const user = (payload.users || []).find((u) => u.username === username);
+          if (user) paintPermissionGrid(box, idPrefix, user.permissions || {});
+          if (preset) preset.value = 'custom';
+        } catch (error) { /* the picker just does nothing on a failed read */ }
+      };
+    }
+    for (const radio of box.querySelectorAll(`input[name^="${idPrefix}-"]`)) {
+      radio.addEventListener('change', () => { if (preset) preset.value = 'custom'; });
+    }
+  }
+
+  function fillCopyFromPicker(select, users, excludeUsername) {
+    if (!select) return;
+    select.innerHTML = '<option value="">— choose an account —</option>' +
+      users.filter((u) => u.username !== excludeUsername)
+        .map((u) => `<option value="${escape(u.username)}">${escape(u.username)}</option>`)
+        .join('');
+  }
+
+  /* A random, pronounceable-enough initial password: five groups of four
+     from an alphabet that drops visually confusable characters (0/O, 1/l/I)
+     — nobody types this more than once, since must_change forces a real
+     choice at first sign-in, but a support call reading it aloud still
+     benefits from not guessing which letter a symbol was. */
+  function generatePassword() {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+    const bytes = new Uint32Array(20);
+    crypto.getRandomValues(bytes);
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) {
+      out += alphabet[bytes[i] % alphabet.length];
+      if (i % 4 === 3 && i < bytes.length - 1) out += '-';
+    }
+    return out;
+  }
+
+  /* App.helpLink was called five times in nodes.js and never here, across
+     roughly 250 settings fields carried by .hint paragraphs alone — eight
+     of them over 70 words. These are the three on this page that were: the
+     inline hint now says one sentence, the rest lives behind its "?". */
+  App.registerHelp({
+    'settings.refresh.rates': { title: 'Refresh rates', html: `
+      <p>The route graph is cheap and benefits from feeling live; the flow charts are
+      aggregations over a whole window and barely change in a few seconds, so a slow
+      rate costs nothing and saves a lot of work.</p>
+      <p>The Debug page's elapsed counters advance smoothly ten times a second without
+      asking the server again, so its rate only controls how often new events and
+      worker state are fetched.</p>` },
+    'settings.data.appfile': { title: 'The application data file', html: `
+      <p>Holds settings, accounts, and the shared reverse-DNS and ASN caches — one row
+      per address rather than one row per event, so it stays small on its own; those
+      caches are already bounded by age via the DNS and ASN cache-days settings above,
+      not by a size cap.</p>
+      <p>The other seven database files can all be rebuilt by simply collecting again;
+      this one cannot, which is why it carries no cap.</p>` },
+    'settings.update.risk': { title: 'Updates from GitHub', html: `
+      <p>What it installs is <strong>whatever is at the tip of <code>main</code> right
+      now</strong> — there is no signature, no tag and no checksum in that path, so
+      anyone who can push to that repository chooses the code this host runs at the
+      next press of the button, on a machine holding your SNMP communities and SSH
+      credentials.</p>
+      <p>This is a known, temporary state, recorded as S-B1 in
+      <code>REVIEW-NETWORK-ENGINEER.md</code>. If that is not acceptable here, leave
+      this off and replace the <code>netpath</code> folder by hand.</p>` },
+  });
+
   function init() {
+    selectSub(App.recallSub('settings', 'general'));
+    buildModulesPane();
+    for (const btn of document.querySelectorAll('#page-settings > .subtabs > .subtab')) {
+      btn.onclick = () => {
+        App.rememberSub('settings', btn.dataset.subtab);
+        selectSub(btn.dataset.subtab);
+      };
+    }
+    const appearancePointer = App.el('open-account-appearance');
+    if (appearancePointer) appearancePointer.onclick = () => App.accountModal();
+    App.el('gen-password').onclick = () => {
+      const field = App.el('new-password');
+      field.type = 'text';
+      field.value = generatePassword();
+    };
+    App.el('copy-password').onclick = () => {
+      const value = App.el('new-password').value;
+      if (value) navigator.clipboard.writeText(value).catch(() => {});
+    };
     App.el('add-user').onclick = addUser;
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     App.el('new-auth-local').onchange = updateNewAuthFields;
@@ -676,14 +943,11 @@
         showUsage((App.state.serverState || {}).storage || {});
     }
     App.el('set-apply').onclick = apply;
-    // Client state: applied on change, stored per browser, never sent.
-    const theme = App.el('set-theme');
-    theme.value = App.currentTheme();
-    theme.onchange = () => {
-      App.setTheme(theme.value);
-      App.announce(`Theme: ${theme.options[theme.selectedIndex].text}`);
-    };
-    App.el('set-revert').onclick = load;
+    // Appearance (the theme select, #set-theme) moved to the Account
+    // dialog (app.js's accountModal) — a per-browser choice reachable from
+    // every page, rather than a fieldset leading the server settings ahead
+    // of everything that actually lives on the server.
+    App.el('set-revert').onclick = revert;
     App.el('update-now').onclick = checkForUpdate;
     App.el('set-updates-enabled').onchange = setUpdatesEnabled;
     for (const button of document.querySelectorAll('[data-maint]')) {
@@ -693,6 +957,42 @@
       App.resetLayout();
       status('Panel sizes reset', 'var(--muted)');
     };
+    // A page-wide "dirty" used to discard silently on a tab change while
+    // every dialog already asked first (App.requestCloseModal). Delegated
+    // on the scroll container rather than one listener per field, so a
+    // field added later here is covered for free — scoped to the Apply
+    // fields specifically, not LDAP/tokens/users, which save on their own.
+    // Delegated on the page, not on its first `.scroll`: since Settings was
+    // split into subtabs each subpage has a scroll container of its own, and
+    // listening on the first one covered General alone. Retention's database
+    // caps and Sign-in's idle timeout are Apply fields too, and editing one
+    // of those left the page believing it was clean — so leaving the tab
+    // discarded the edit without asking, which is the exact behaviour this
+    // guard exists to stop.
+    const scroll = document.getElementById('page-settings');
+    if (scroll) {
+      const onEdit = (event) => { if (APPLY_FIELD_IDS.has(event.target.id)) markDirty(); };
+      scroll.addEventListener('input', onEdit);
+      scroll.addEventListener('change', onEdit);
+    }
+    // app.js has no hook to ask before a tab switch discards an unsaved
+    // page — the tab strip's own onclick calls App.selectTab() straight
+    // away (see start() in app.js) — so this listens ahead of it, in the
+    // capture phase, and only while Settings is open and dirty swaps in
+    // the same confirm-then-discard shape used for destructive actions.
+    document.addEventListener('click', (event) => {
+      if (!dirty || App.state.tab !== 'settings') return;
+      const tab = event.target.closest('.tab[data-tab]');
+      if (!tab || tab.dataset.tab === 'settings') return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      App.confirmDestructive('Leave Settings?',
+        '<p>This page has changes that have not been applied. Leaving now ' +
+        'discards them.</p>', 'Discard changes', async () => {},
+        (confirmed) => {
+          if (confirmed) { dirty = false; App.selectTab(tab.dataset.tab); }
+        });
+    }, true);
     load();
   }
 

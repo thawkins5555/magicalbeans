@@ -138,7 +138,7 @@ each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 | `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, Alerts' own settings |
 | `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, Wireless' own settings |
-| `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings and SSH credential, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
+| `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings, SSH credential and optional enable secret, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
 
 ---
 
@@ -3456,16 +3456,26 @@ files) — the same pattern Alerts already established for its own
 change can't erode it by accident): `configrx._pull_config()` is the
 *only* function in the entire module that writes to a device's shell
 channel, and it sends exactly `vendor.pager_off`'s fixed lines followed
-by `vendor.show_config` — both sourced from `configrx_vendors.VENDORS`,
-a hardcoded dict, never from anything the API or UI accepts as free
-text. A device's `vendor_override` field is free text, but it only ever
-selects *which* vendor's fixed commands to use (`configrx_vendors.
-resolve()` does a dict lookup); an unrecognized value simply fails to
-resolve and the backup is skipped with a clear error, never used as
-literal command text. There is no exec-command endpoint, no command
-parameter anywhere in `api.py`'s ConfigRX handlers, and no free-form
-input field anywhere in `configrx.js` — grep for `channel.send` in
-`configrx.py` to confirm this hasn't grown a second call site.
+by `vendor.show_config` — plus, for a vendor whose login shell is not
+already privileged EXEC (`vendor.enable_command` set — currently just
+`cisco-asa`), the fixed `enable` command and the device's own stored
+enable secret, sent back only as the answer to that device's own password
+prompt (`_do_enable`, matched against `vendor.enable_password_re`, never
+built into anything sent). All of it is sourced from
+`configrx_vendors.VENDORS`, a hardcoded dict, never from anything the API
+or UI accepts as free text. A device's `vendor_override` field is free
+text, but it only ever selects *which* vendor's fixed commands to use
+(`configrx_vendors.resolve()` does a dict lookup); an unrecognized value
+simply fails to resolve and the backup is skipped with a clear error,
+never used as literal command text. There is no exec-command endpoint, no
+command parameter anywhere in `api.py`'s ConfigRX handlers, and no
+free-form input field anywhere in `configrx.js` — grep for `channel.send`
+in `configrx.py` to confirm this hasn't grown a call site beyond
+`_pull_config` and `_do_enable`. `VENDORS` currently holds eleven keys:
+`cisco`, `cisco-nxos`, `cisco-iosxr`, `cisco-sb`, `cisco-asa`,
+`cisco-wlc`, `fortinet`, and four more besides — `cisco-asa` is the only
+one carrying `enable_command`, since it is the only login shell here that
+does not already land in privileged EXEC.
 
 **The capture ends on the prompt, not on silence.** `_drain()` returned as
 soon as it had any data and 1.5s passed with none, which is a fine rule for a
@@ -3517,6 +3527,20 @@ restore from history hands someone a fragment. The ceiling itself is the
 constant — a large config over a slow link legitimately takes minutes, and it
 is only a ceiling, since a healthy device ends on its prompt in a second.
 
+**Closing the channel is best-effort, so a device that hung up cannot
+discard the read it already finished.** `_pull_config`'s `finally` block
+closes the channel it opened, and closing one sends a message; when the
+device has already hung up — the exact `"closed"` `ended` value above —
+paramiko's own close handshake raises `EOFError` writing that message
+into a socket that is already gone. Left unguarded, that `EOFError`
+propagated out of the `finally` and replaced whatever `_pull_config` had
+already returned, so the one case `_capture_problem` is careful to report
+as "The device closed the connection before the config finished" instead
+crashed the whole attempt with a bare `EOFError` — cleanup destroying a
+result that had already been computed. The close is wrapped in its own
+`try`/`except Exception: pass`, matching the pattern the SSH terminal's
+own teardown (`sshterm.py`) already used for the identical situation.
+
 **Legacy key exchange is feature-detected, and the version cap is the real
 fix.** `configrx._apply_legacy_algorithms(paramiko)` appends
 `diffie-hellman-group-exchange-sha1` / `-group14-sha1` / `-group1-sha1` and
@@ -3558,7 +3582,14 @@ stored secret in this app does (see `CREDENTIAL-SECURITY.md`):
 `_backup_device()` decrypts the DPAPI blob into a local `password`
 variable immediately before `paramiko.SSHClient.connect()`, and
 reassigns it to `None` in a `finally` block the moment the connection
-attempt finishes, success or failure. `_AcceptAndRecordPolicy` (a
+attempt finishes, success or failure. The optional enable secret
+(`device_config.enable_secret_enc`, its own column, set and cleared
+through `configrxdb.set_credential`'s optional fourth argument or the
+dedicated `set_enable_secret`/`clear_enable_secret`) follows the same
+rule one step later: `_backup_device()` only decrypts it when the
+resolved vendor's `enable_command` is set, into a local `enable_secret`
+passed down to `_pull_config`, cleared in the same `finally` block that
+clears `password`. `_AcceptAndRecordPolicy` (a
 `paramiko.MissingHostKeyPolicy` subclass) never blocks on an
 unrecognized host key — network gear rarely carries a stable
 `known_hosts` entry — but, unlike `AutoAddPolicy`, flags that it
@@ -3576,6 +3607,21 @@ presence of a row *is* the flag. `_clean_output()` strips ANSI escape
 sequences and pager prompts (`--More--` and similar) a device's shell
 may have echoed back even with paging disabled — best-effort display/
 storage hygiene, not a parser, so it never raises.
+
+**A capture much smaller than the last one is stored, but flagged, not
+treated as an ordinary change.** `_backup_device` reads
+`latest_backup_size()` — the byte size of the device's own most recent
+stored backup — *before* `add_backup` inserts the new row, so the
+comparison is against the previous backup rather than the one about to be
+stored. A new capture under `SUSPECT_SHRINK_RATIO` (0.2, a fifth) of that
+size is still stored — refusing it would be worse, the same reasoning
+`_capture_problem`'s own docstring gives for a truncated read that still
+reaches a prompt, since a device really can shed most of its
+configuration in one legitimate change — but recorded with
+`record_backup_attempt(..., status="suspect")` and its own
+`counters["suspect"]` tally rather than the ordinary `"changed"` status
+and counter, because presenting it as a plain diff would read as almost
+the entire configuration having been deleted.
 
 **Device naming** (`_configrx_device_json`) matches `nodes.js`'s own
 `displayName()` precedence exactly: `sys_name` (SNMP hostname) unless
@@ -3687,6 +3733,36 @@ prefix of its siblings'. The 304 goes through `_send` like every other
 response — it used to be three headers written by hand, and since
 revalidation is the steady state for every script, most responses the
 browser received carried no CSP, no `nosniff`, no `Referrer-Policy`.
+
+**A versioned request skips revalidation entirely.** `_static(path,
+versioned)` — `versioned` is `"v" in params`, a bare presence check,
+because the `v` query parameter selects nothing about which file is
+served, only how long the answer may be kept — serves `Cache-Control:
+public, max-age=31536000, immutable` (plus the same `ETag`, unused) in
+place of the `no-cache`/`ETag`/conditional-GET dance above, for anything
+that is not HTML. `no-cache` still means what it always did: a browser
+must ask before reusing a cached response, so a warm reload after an
+update used to be sixteen conditional requests each answered 304 before
+anything could render — cheap on a LAN, sixteen round trips on a NOC's
+VPN link. `immutable` tells the browser not to ask at all, which is only
+honest for a URL that changes when its content does; the unversioned path
+is untouched byte-for-byte, still `no-cache` with its `ETag`, since
+whatever still requests a plain `/app.js` has made no such promise. `/`
+and `/login` stay `no-store` regardless of `?v=`, because the HTML shell
+itself must always be re-fetched.
+
+The markup asks for every asset as `?v=__SW_VERSION__`, and the static
+cache substitutes the running `__version__` as each HTML file is read —
+once per load, before the ETag and the gzip are computed, so both describe
+the bytes that actually go out. It is substituted rather than written into
+the file because a hand-maintained copy of a version number is one that
+drifts, and this one is load-bearing: an asset is served immutable for a
+year, so a static file that changed while the version did not would go on
+being served from every warm cache until the next release. Bumping the one
+line in `netpath/__init__.py` re-versions all seventeen URLs across
+`index.html`, `login.html` and `ssh.html`; `test_design_tokens.py` checks
+each one still carries the placeholder, which is how three vendored files
+that had been missed were found.
 
 **Compression** is negotiated once, in `_send`: text, JSON and SVG bodies
 of 1 KB or more are gzipped when `Accept-Encoding` lists `gzip` with a
@@ -4441,9 +4517,33 @@ with `SEND_TIMEOUT_S = 15` on the socket: a browser that stops reading fails
 the send, marks the socket closed and releases everything waiting on it, so
 `stop()`, the idle watchdog and `SshSessionRegistry.shutdown()` are bounded
 rather than parked behind a peer. `close()` sends its frame under the same
-lock and then shuts the socket down on *every* call, even one that finds the
-socket already marked closed by a failed write — that shutdown is what ends
-a `recv()` parked in the other thread.
+lock, then drains the receive buffer (`_drain()`, below) before it shuts
+the socket down on *every* call, even one that finds the socket already
+marked closed by a failed write — that shutdown is what ends a `recv()`
+parked in the other thread.
+
+**The drain exists because Windows resets a connection closed with unread
+data, and a reset discards whatever was last written in the other
+direction.** `close()`'s own shutdown is deliberate — a half-closed socket
+is what unblocks the parked reader above — but a peer that still has
+unread bytes sitting in its own send buffer (a client mid-keystroke when
+the session cap turns it away, say) means the OS sees data still waiting
+to be delivered at the moment the socket closes, and on Windows that
+produces an RST rather than an orderly FIN. The RST arrives before the
+close frame this same call just wrote, so the close frame — carrying the
+one thing that matters here, the code and the sentence explaining the
+refusal, "There are already 16 SSH sessions" among them — never reaches
+the peer at all; it reads a bare `ConnectionResetError` instead of the
+reason it was disconnected. Linux sends a FIN in the same circumstance
+and the frame survives, which is why this went unnoticed until it was
+chased on Windows specifically. `_drain(rounds=8)` empties the socket's
+receive buffer first — non-blocking throughout, `select.select` gating
+each read so it never waits on a peer that has gone quiet, and bounded to
+eight reads because the point is to empty a buffer, not to keep reading a
+peer that is still talking — turning the reset back into an orderly close
+on both platforms. It is best-effort (`except (OSError, ValueError,
+AttributeError): pass`): every failure inside it ends the same way success
+does, with the socket shut down regardless.
 
 **The protocol.** `GET /api/ssh/devices/<id>/socket`, with the session
 cookie; no subprotocol. Text frames are JSON control messages, binary frames
@@ -4632,13 +4732,16 @@ caller that checked a key and never said it had: an install whose operators
 worked entirely from the terminal showed every key as last seen on the day
 it was pinned.
 
-**The scoped boundary.** "Only `pager_off` + `show_config` are ever sent"
-remains true and is still the point of `configrx_vendors.py`, but it is now
-a property of the **backup path** rather than of the application: the
-terminal in `sshterm.py` is a real shell a person types into, behind its
-own `ssh` permission that nobody holds by default, and it neither uses the
-vendor table nor reaches `_pull_config`. The two features share exactly one
-thing, the host-key store.
+**The scoped boundary.** "Only `pager_off` + `show_config` — plus, for a
+vendor needing it, one fixed `enable` escalation answered with that
+device's own stored secret — are ever sent" remains true and is still the
+point of `configrx_vendors.py`, but it is now a property of the **backup
+path** rather than of the application: the terminal in `sshterm.py` is a
+real shell a person types into, behind its own `ssh` permission that
+nobody holds by default, and it neither uses the vendor table, the enable
+secret, nor `_pull_config` — a person at the terminal who needs privileged
+mode types `enable` themselves. The two features share exactly one thing,
+the host-key store.
 
 ### The SSH window (`static/ssh.html`, `ssh.js`, `ssh.css`)
 

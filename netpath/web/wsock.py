@@ -229,6 +229,12 @@ class WebSocket:
         self._buffer = bytearray(initial)
         self._used = 0
         self.closed = False
+        # The thread inside recv(), and whether a close() from some other
+        # thread has asked it to empty the receive buffer on its way out.
+        # Only one thread ever reads this socket; the drain has to be that
+        # one (see close()).
+        self._reader: threading.Thread | None = None
+        self._drain_pending = False
         # Filled in when the peer closes: the code and reason it gave.
         self.close_code: int | None = None
         self.close_reason: str = ""
@@ -250,6 +256,19 @@ class WebSocket:
         OP_BINARY, with fragments already reassembled — or None once the
         conversation is over (the peer closed, the socket died, or this end
         called close()). Pings are answered here and never surface."""
+        # This thread owns the socket's reads. A close() from anywhere else
+        # leaves the drain to it rather than reading the socket underneath
+        # it, and this is where that debt is paid: on the way out, once the
+        # shutdown has already woken us, with nobody else in the SSL object.
+        self._reader = threading.current_thread()
+        try:
+            return self._recv()
+        finally:
+            if self._drain_pending:
+                self._drain_pending = False
+                self._drain()
+
+    def _recv(self):
         fragments: list[bytes] = []
         pending = 0                       # running length, so no O(n²) concat
         message_op = None
@@ -448,6 +467,31 @@ class WebSocket:
             if not self.closed:
                 self.closed = True
                 self._write(_frame(OP_CLOSE, payload))
+        # Windows resets a connection that is closed with data still unread in
+        # its receive buffer, and a reset discards whatever WE last sent — so
+        # the peer loses the close frame naming the reason, and reads a bare
+        # ConnectionResetError instead of "There are already 16 SSH sessions".
+        # Draining what the peer already sent turns that reset back into an
+        # orderly FIN.
+        #
+        # Only from the thread that owns recv(). close() is called from
+        # elsewhere as a matter of course — the idle watchdog, the registry's
+        # shutdown, the SSH pump reporting the session ended — and the reading
+        # thread is parked in recv() at that moment. On a plain socket two
+        # concurrent recv()s merely split bytes nobody wants; under TLS they
+        # are two threads inside one SSL object, which OpenSSL does not allow
+        # and which corrupts rather than raising something the except clause
+        # below could catch. Everyone else sets the flag and lets the reader
+        # drain on its way out, after the shutdown has woken it.
+        reader = self._reader
+        if reader is None or reader is threading.current_thread():
+            # Nobody else is inside recv(): either no read has started yet
+            # (a handshake refused before the session began) or we ARE the
+            # reader. Safe to empty it here, which is where it does the most
+            # good — before the shutdown below.
+            self._drain()
+        else:
+            self._drain_pending = True
         # No waiting for the peer's answering close: the handler thread is
         # about to let the connection go, and a half-closed socket is what
         # unblocks a recv() parked in another thread.
@@ -455,6 +499,36 @@ class WebSocket:
             self.sock.shutdown(socket.SHUT_RDWR)
         except (OSError, AttributeError):
             pass
+
+    def _drain(self, rounds: int = 8) -> None:
+        """Discard what is already in the receive buffer, without blocking.
+
+        The socket's timeout is set explicitly rather than inherited: it is a
+        property of the socket, not of the thread, and a `_write()` in another
+        thread holds it at SEND_TIMEOUT_S while it pushes to a stalled peer.
+        `select()` promising readable is not quite a promise that `recv()`
+        returns at once — a partial TLS record is readable and still has
+        nothing to hand back — so without this a drain could inherit that
+        fifteen seconds instead of returning immediately.
+        """
+        try:
+            previous = self.sock.gettimeout()
+            self.sock.settimeout(0)
+        except (OSError, AttributeError):
+            return
+        try:
+            for _ in range(rounds):
+                if not select.select([self.sock], [], [], 0)[0]:
+                    return
+                if not self.sock.recv(65536):
+                    return
+        except (OSError, ValueError, AttributeError):
+            pass
+        finally:
+            try:
+                self.sock.settimeout(previous)
+            except (OSError, AttributeError):
+                pass
 
     def unblock(self) -> None:
         """Stop the socket without sending anything and without taking the

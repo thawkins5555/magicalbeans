@@ -130,6 +130,31 @@ try:
     status, _, _ = request("GET", "/app.js", {**auth, "If-None-Match": '"stale"'})
     check("200 on a stale ETag", status == 200, status)
 
+    # ---------------------------------------------------------- versioned
+    print("versioned URL")
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "netpath", "web", "static", "app.js"), "rb") as fh:
+        on_disk = fh.read()
+    status, hdrs_plain, body_plain = request("GET", "/app.js", auth)
+    check("unversioned request unchanged: Cache-Control no-cache",
+          hdrs_plain.get("cache-control") == "no-cache", hdrs_plain.get("cache-control"))
+    check("unversioned request unchanged: ETag still present", "etag" in hdrs_plain)
+    check("unversioned request unchanged: body matches the file on disk", body_plain == on_disk)
+    status, hdrsv, bodyv = request("GET", "/app.js?v=4.47.0", auth)
+    check("versioned 200", status == 200, status)
+    check("versioned Cache-Control is public, max-age=31536000, immutable",
+          hdrsv.get("cache-control") == "public, max-age=31536000, immutable",
+          hdrsv.get("cache-control"))
+    check("versioned body is byte-identical to the unversioned file", bodyv == body_plain)
+    status, hdrsv2, _ = request("GET", "/app.js?v=4.47.0",
+                                {**auth, "If-None-Match": etag})
+    check("a versioned request ignores If-None-Match and still 200s",
+          status == 200 and hdrsv2.get("cache-control") == "public, max-age=31536000, immutable",
+          status)
+    status, hdrs_html, _ = request("GET", "/?v=4.47.0", auth)
+    check("index.html stays no-store even with ?v=", hdrs_html.get("cache-control") == "no-store",
+          hdrs_html.get("cache-control"))
+
     # ---------------------------------------------------------- gzip
     print("compression")
     status, hdrs, body = request("GET", "/app.js", {**auth, "Accept-Encoding": "gzip, deflate"})
@@ -160,9 +185,16 @@ try:
     check("/api/config carries them, compressed",
           hdrs.get("content-encoding") == "gzip" and "nodes_settings" in config
           and config.get("config_version") == payload.get("config_version"))
-    check("live payload is under 5 KB identity",
-          int(request("GET", "/api/state", auth)[1]["content-length"]) < 5000,
-          request("GET", "/api/state", auth)[1]["content-length"])
+    # What this guards is the settings blocks staying out of the poll payload,
+    # so it is measured against the endpoint that does carry them rather than
+    # against a fixed byte count: a bare ceiling drifts with whatever else the
+    # platform reports (Windows adds a platform block, and 5,065 bytes there
+    # failed a 5,000-byte limit while the blocks it exists to catch were absent).
+    state_len = int(request("GET", "/api/state", auth)[1]["content-length"])
+    config_len = int(request("GET", "/api/config", auth)[1]["content-length"])
+    check("the live payload stays smaller than the settings payload, identity",
+          state_len < config_len and state_len < 8000,
+          f"state {state_len} vs config {config_len}")
     # A settings save moves the version, which is how the browser learns
     # to refetch config without polling it.
     before = config["config_version"]

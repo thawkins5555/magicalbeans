@@ -96,10 +96,14 @@ def test_roundtrip_file_source():
     check("configured() true with a passphrase file", ss.configured())
     if os.name != "nt":
         check("dpapi.available() true with a passphrase file", dpapi.available())
-    blob = dpapi.protect(b"s3cret-value")
+    # On Windows dpapi.protect() is real DPAPI whatever this passphrase says,
+    # so the blob it returns is not — and must not be — a portable-store one.
+    # The portable store's own shape is asserted through its own entry point,
+    # which is what this suite is actually about.
+    blob = ss.protect(b"s3cret-value") if os.name == "nt" else dpapi.protect(b"s3cret-value")
     check("the blob is tagged as a portable-store blob", blob.startswith(ss.MAGIC))
     check("...and ss.is_portable_blob() agrees", ss.is_portable_blob(blob))
-    plain = dpapi.unprotect(blob)
+    plain = ss.unprotect(blob) if os.name == "nt" else dpapi.unprotect(blob)
     check("round trip through dpapi.protect/unprotect returns the plaintext",
           plain == b"s3cret-value")
     check("...and through secretstore directly, too",
@@ -211,7 +215,8 @@ def test_blob_tag_discrimination():
     path = passphrase_file("discrimination-test-passphrase\n")
     os.environ[ss.ENV_PASSPHRASE_FILE] = path
 
-    portable_blob = dpapi.protect(b"a portable-store secret")
+    # ss.protect(), not dpapi.protect(): on Windows the latter is real DPAPI.
+    portable_blob = ss.protect(b"a portable-store secret")
     check("a portable blob is recognised as one",
           ss.is_portable_blob(portable_blob))
 

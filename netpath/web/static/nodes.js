@@ -44,6 +44,13 @@
     discSeen: new Set(),
     discSort: App.recallSort('nodes-discovery', { key: 'ip', descending: false }),
     approvalOpenFor: null,  // job id whose approve/deny dialog is on screen
+    // P1-9: the approval dialog auto-opens only for a job THIS page load
+    // itself started (discStartedThisLoad), and only the first time it is
+    // ever seen finished (discAutoOffered) — a job someone else's session
+    // started, or one this page already offered and the operator escaped
+    // out of, gets the dismissible strip line instead, never the popup.
+    discStartedThisLoad: new Set(),
+    discAutoOffered: new Set(),
     mibFiles: [],
     mibSelected: null,
     // Server-side paging (4.47.0): the full-fleet fetch this table always
@@ -96,9 +103,9 @@
     const server = App.state.serverState || {};
     const nodes = server.nodes || { counters: {} };
     const text = nodes.status || 'Poller stopped';
-    App.el('nd-status').textContent = text;
-    App.el('nd-dot').style.background = nodes.running ? 'var(--ok)' : 'var(--line)';
-    App.el('nd-toggle').textContent = nodes.running ? 'Stop poller' : 'Start poller';
+    App.setText(App.el('nd-status'), text);
+    App.setBg(App.el('nd-dot'), nodes.running ? 'var(--ok)' : 'var(--line)');
+    App.setText(App.el('nd-toggle'), nodes.running ? 'Stop poller' : 'Start poller');
     const counts = nodes.device_counts || {};
     const c = nodes.counters || {};
     const parts = [`${counts.total || 0} device(s)`, `${counts.up || 0} up`,
@@ -108,14 +115,14 @@
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
     // On a wall the counts are the point: figures, not a line of prose.
     if (App.state.kiosk) {
-      App.el('nd-counters').innerHTML = App.figures([
+      App.setHtml(App.el('nd-counters'), App.figures([
         { value: counts.total || 0, label: 'devices' },
         { value: counts.up || 0, label: 'up', className: 'ok' },
         { value: counts.down || 0, label: 'down', className: counts.down ? 'fail' : '' },
-      ]);
+      ]));
       return;
     }
-    App.el('nd-counters').textContent = parts.join(' · ');
+    App.setText(App.el('nd-counters'), parts.join(' · '));
   }
 
   /* ----------------------------------------------------------- devices */
@@ -220,8 +227,26 @@
       cell: (r) => escape(r.sys_object_id || '\u2014') },
   ];
 
-  const deviceColumns = () => App.visibleColumns(
-    COLUMNS, (App.state.nodesSettings || {}).table_columns);
+  // The default colgroup (check+status+name+group+devgroup+vendor+response+
+  // last_poll_ts) asks 884px, which the 3/2 pane split still falls short of
+  // below ~1500px wide (~798px at 1366, ~753px at 1280) — the last column
+  // was always cut there before anyone had touched a column checkbox.
+  // Response and Vendor are the two dropped from the DEFAULT to fit; an
+  // explicit column choice (Settings → Columns) is always honoured
+  // regardless of width, since that is a deliberate choice, not a fallback.
+  function narrowDevicePane() {
+    const table = App.el('nodes-table');
+    const pane = table && table.closest('.pane');
+    return !!pane && pane.clientWidth > 0 && pane.clientWidth < 900;
+  }
+
+  const deviceColumns = () => {
+    const stored = (App.state.nodesSettings || {}).table_columns;
+    const all = stored || !narrowDevicePane() ? COLUMNS
+      : COLUMNS.map((c) => (c.key === 'response' || c.key === 'vendor')
+        ? { ...c, on: false } : c);
+    return App.visibleColumns(all, stored);
+  };
 
   function onDeviceSort(key, descending) {
     view.deviceSort = { key, descending };
@@ -331,7 +356,12 @@
       // every draw for the same reason onclick is: a cached <tr> already
       // carries a handler closed over the previous draw's `row`, and a
       // plain property assignment replaces it rather than stacking.
-      tr.ondblclick = () => deviceDialog(row.id);
+      // The row itself, not document.activeElement: selectDevice() above
+      // just ran drawTable(), which (see App.grid) detaches and reattaches
+      // this very <tr> to swap the tbody, so by the time the second click's
+      // dblclick fires, focus has already fallen to <body> and App.modal's
+      // own activeElement fallback would capture that instead of the row.
+      tr.ondblclick = () => deviceDialog(row.id, tr);
       body.appendChild(tr);
     }
     // Drop cache entries for devices no longer in the list (removed, or
@@ -549,14 +579,27 @@
     // does not fill the Back button with forty entries.
     App.setRoute(id != null ? ['device', id] : []);
     drawTable();
-    loadDetail();
+    // Not awaited — selecting a row must not wait on the detail fetch — so it
+    // needs its own rejection handler or the browser reports one. Double-
+    // clicking a row selects it twice in quick succession, and App.get aborts
+    // the first fetch in favour of the second: that abort is a `superseded`
+    // rejection, which is the expected outcome here rather than a fault, and
+    // is ignored exactly as app.js's own refresh path ignores it. Anything
+    // else is a real failure and says so on the connection indicator.
+    loadDetail().catch((error) => {
+      if (!(error && error.superseded)) {
+        App.toast(`Could not load that device: ${(error && error.message) || error}`,
+                  'fail');
+      }
+    });
   }
 
-  /* A route into this tab: #/nodes, #/nodes?status=down,
-     #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>. Called after
-     refresh() has run, so view.devices is populated and the "select the
-     first device if none is selected" rule below has already happened —
-     which is exactly why the selection is applied here and not before. */
+  /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
+     #/nodes?add=<ip>, #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>.
+     Called after refresh() has run, so view.devices is populated and the
+     "select the first device if none is selected" rule below has already
+     happened — which is exactly why the selection is applied here and not
+     before. */
   async function activate(opts) {
     if (!opts) return;
     const parts = opts.parts || [];
@@ -569,6 +612,10 @@
       if (!field) continue;
       field.value = query[key];
       filtered = true;
+      // A link that names a MAC address (IPAM's conflicts, for one) means
+      // the same thing pressing Enter in this field does: run the MAC
+      // search once the filtered device list is in, not just narrow it.
+      if (key === 'q') view.macSearchPending = true;
     }
     if (query.offline !== undefined) {
       App.el('nd-filter-offline').checked = query.offline === '1'
@@ -579,6 +626,9 @@
       view.selected = null;
       await App.refreshNow('nodes');
     }
+    // A Syslog/SNMP source with no device: land here with the address
+    // already in the form rather than making the operator retype it.
+    if (query.add !== undefined && App.canWrite('nodes')) addDevice({ ip: query.add });
     if (parts[0] !== 'device' || parts[1] === undefined) return;
     const deviceId = Number(parts[1]);
     if (!Number.isFinite(deviceId)) return;
@@ -633,6 +683,19 @@
   function drawDetailHeader() {
     App.el('nd-d-name').textContent = displayName(view.detail);
     App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
+    drawWebLink(view.detail);
+  }
+
+  /* P1-4: the WEB button beside SSH, a plain link to the device's own web
+     UI rather than anything this app opens a socket for — IPv6 needs its
+     host bracketed in a URL, IPv4 does not. */
+  function drawWebLink(d) {
+    const link = App.el('nd-web-device');
+    if (!link) return;
+    const ip = d && d.ip;
+    if (!ip) { link.hidden = true; return; }
+    link.href = `http://${ip.includes(':') ? `[${ip}]` : ip}/`;
+    link.hidden = false;
   }
 
   /* The identity line for one device, as markup. Takes the device rather
@@ -703,7 +766,11 @@
                 'nd-v warn-text')
         : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
-      field('error', d.snmp_error, 'nd-err'),
+      // 'snmp', not 'error': the value is the agent's own words, and those
+      // already start with one — "error authorization error" is what the
+      // eyebrow and the message read as together. Naming the source instead
+      // of the severity is true whatever the agent says.
+      field('snmp', d.snmp_error, 'nd-err'),
     ].filter(Boolean);
     return parts.join('');
   }
@@ -809,6 +876,12 @@
     const width = Math.max(box.width, 300);
     const height = Math.max(box.height, 120);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // A line chart has no per-point tab stops (a live one can carry hundreds
+    // of samples); the container itself is the one stop, described from
+    // whatever summary the caller already has for its own header.
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', opts.ariaLabel || 'Chart');
     // No data object at all (nothing has ever loaded — e.g. no metric
     // chosen yet) means there is no window to hand back for zooming
     // either. An empty series list is different: the request window
@@ -932,27 +1005,42 @@
     svg.innerHTML = '';
     App.statusPatternDefs(svg);
     const data = view.timeline;
+    // Room under the bar for start/end tick labels, the same way the
+    // histograms reserve space for theirs — a bare colour strip with no
+    // time axis left "how long ago did this start" to a hover. The CSS
+    // class only reserves 28px; this is the one draw that needs more.
+    el.style.height = '40px';
     const width = el.clientWidth || 400;
-    const height = el.clientHeight || 24;
+    const height = el.clientHeight || 40;
+    const barH = Math.max(height - 12, 14);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     if (!data || !data.segments || !data.segments.length) {
       svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2 + 4, 'text-anchor': 'middle',
+        x: width / 2, y: barH / 2 + 4, 'text-anchor': 'middle',
         fill: 'var(--muted)', 'font-size': 'var(--fs-xs)' }, 'No history in this window'));
       return;
     }
     const { t0, t1, segments } = data;
     const span = Math.max(t1 - t0, 1);
     const x = (ts) => ((ts - t0) / span) * width;
-    for (const seg of segments) {
+    segments.forEach((seg, index) => {
       const x0 = x(seg.ts_start);
       const w = Math.max(x(seg.ts_end) - x0, 1);
+      // device_status_segments (nodesdb.py) only ever reports "unknown" for
+      // the very first segment, and only when it found no event before the
+      // window at all — so this is never a genuinely ambiguous state, it is
+      // the device not having been watched yet. Flat fill, no texture, and
+      // its own label rather than "Unknown  hh:mm – hh:mm", so the absence
+      // reads as absence instead of one more state to decode.
+      const isPreHistory = index === 0 && seg.status === 'unknown' && seg.ts_start <= t0;
       // Two endpoints and how long between them: this label is the only
       // channel a keyboard or screen-reader user has to the timeline, and
       // "Down 14:02 – 14:47" left them doing the subtraction.
-      const label = `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-        `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
-        ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
+      const label = isPreHistory
+        ? `No data before ${App.stamp(seg.ts_end, span)}`
+        : `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
+          ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
       // The segment is a <g> rather than a bare rect so the colour, the
       // texture over it and the keyboard focus are one thing the operator
       // can Tab to and read, instead of a colour with a mouse-only tooltip.
@@ -962,15 +1050,16 @@
       });
       group.appendChild(App.svgNode('title', {}, label));
       group.appendChild(App.svgNode('rect', {
-        x: x0, y: 0, width: w, height,
-        fill: STATUS_COLOR[seg.status] || 'var(--nodata)',
+        x: x0, y: 0, width: w, height: barH,
+        fill: isPreHistory ? 'var(--nodata)' : (STATUS_COLOR[seg.status] || 'var(--nodata)'),
       }));
       // Colour is never the only signal: every non-`up` state carries its
-      // own texture (see App.statusPatternDefs).
-      const pattern = App.statusPatternUrl(seg.status);
+      // own texture (see App.statusPatternDefs) — except pre-history, which
+      // is deliberately plain, the same way `none`/`up`/`ok` are.
+      const pattern = isPreHistory ? null : App.statusPatternUrl(seg.status, svg);
       if (pattern) {
         group.appendChild(App.svgNode('rect', {
-          x: x0, y: 0, width: w, height, fill: pattern,
+          x: x0, y: 0, width: w, height: barH, fill: pattern,
         }));
       }
       group.addEventListener('mousemove', (event) => App.tooltip(label, event));
@@ -981,7 +1070,15 @@
       });
       group.addEventListener('blur', App.hideTooltip);
       svg.appendChild(group);
-    }
+    });
+    svg.appendChild(App.svgNode('text', {
+      x: 0, y: height - 2, 'text-anchor': 'start', fill: 'var(--dim)',
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+    }, App.stamp(t0, span)));
+    svg.appendChild(App.svgNode('text', {
+      x: width, y: height - 2, 'text-anchor': 'end', fill: 'var(--dim)',
+      'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+    }, App.stamp(t1, span)));
   }
 
   const IFACE_COLUMNS = [
@@ -1046,11 +1143,16 @@
      than reading view.ifaces and #nd-if-table directly, because the device
      dialog shows a device that need not be the selected one — the pane and
      the dialog share this renderer instead of growing a second copy that
-     drifts. `onOpen`, when given, replaces what clicking a row does. */
-  function drawIfaceTable(el, rows, deviceId, onOpen) {
+     drifts. `onOpen`, when given, replaces what clicking a row does.
+     `snmpError` names why the list is empty when it is one: a device that
+     has never answered SNMP shows headers over nothing exactly like one
+     with genuinely zero interfaces, and the two used to be indistinguishable. */
+  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError) {
     const target = el || App.el('nd-if-table');
     const list = rows || view.ifaces;
     const id = deviceId != null ? deviceId : view.selected;
+    const error = snmpError !== undefined ? snmpError
+      : (view.detail || {}).snmp_error;
     const columns = ifaceColumns();
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
@@ -1064,7 +1166,9 @@
     App.drawRows(body, sorted, columns, (tr, r) => {
       tr.className = 'clickable';
       tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
-    });
+    }, error
+      ? `No interfaces read — SNMP failed: ${error}. Fix the credential and poll again.`
+      : 'No interfaces on this device.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -1074,8 +1178,9 @@
   /* Everything the detail pane shows about ONE device, in a dialog, for a
      device that need not be the selected one — so it fetches by id rather
      than reading view.detail / view.ifaces / view.events, which always
-     describe the selection. Opened by double-clicking a row. */
-  function deviceDialog(deviceId) {
+     describe the selection. Opened by double-clicking a row; `trigger` is
+     that row, passed explicitly (see the ondblclick assignment above). */
+  function deviceDialog(deviceId, trigger) {
     if (deviceId == null) return;
     // The same ticket idiom the interface and OID dialogs use: App.modal
     // reuses one #modal-box, so a slow fetch must not paint into whatever
@@ -1097,17 +1202,17 @@
     const box = App.modal(escape(displayName(listed || {})) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
       <div class="bar"><span class="section">PACKET LOSS</span>
-        <select id="ndd-loss-range"></select></div>
+        <select id="ndd-loss-range" aria-label="Packet-loss range"></select></div>
       <div id="ndd-loss-chart" class="canvas chart" style="height:150px">
         <svg id="ndd-loss-chart-svg"></svg></div>
       <p class="section">VENDOR IDENTIFICATION</p>
       <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">INTERFACES</p>
-      <div class="table-wrap" style="max-height:34vh"><table id="ndd-if-table"></table></div>
+      <div class="table-wrap scrollbox large"><table id="ndd-if-table"></table></div>
       <p class="section">EVENT LOG</p>
-      <div class="table-wrap" style="max-height:26vh"><table id="ndd-ev-table"></table></div>`, [
-      { label: 'Close', primary: true, onClick: App.closeModal },
-    ], { buttonsTop: true });
+      <div class="table-wrap scrollbox small"><table id="ndd-ev-table"></table></div>`, [
+      { label: 'Close', onClick: App.closeModal },
+    ], { buttonsTop: true, trigger });
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
     box.classList.add('wide');
@@ -1133,6 +1238,9 @@
       const wrap = box.querySelector('#ndd-loss-chart');
       const svg = box.querySelector('#ndd-loss-chart-svg');
       if (!wrap || !svg) return;
+      const points = ((lossData.series || [])[0] || {}).points || [];
+      const last = points.length ? points[points.length - 1] : null;
+      const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
       drawSeriesChart(svg, wrap, lossData, {
         // Pinned, because loss is a percentage of a known whole and an
         // auto-scaled axis lies about a healthy device: a flat 0% series
@@ -1142,6 +1250,8 @@
         emptyText: lossData.notProbed
           ? 'This device is not being ping-probed'
           : 'No packet-loss samples in this window',
+        ariaLabel: lastValue == null ? 'Packet loss chart, no samples in this window'
+          : `Packet loss chart, ${lastValue.toFixed(1)}% most recently`,
       });
     }
 
@@ -1204,7 +1314,8 @@
       // #modal-box — so the port dialog gets a way back to this one.
       drawIfaceTable(box.querySelector('#ndd-if-table'),
         ifaces.interfaces || [], deviceId,
-        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)));
+        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
+        device.snmp_error);
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {
       if (!current()) return;
@@ -1362,11 +1473,21 @@
 
   /* ------------------------------------------- interface drill-down */
 
+  /* A term/value grid, not a table: a plain two-column <table> sizes its
+     first column to fit CONTENT plus whatever slack auto-layout hands it,
+     which on this dialog's own width put up to ~200px of dead air between
+     a short term ("Speed") and its value — a gap wide enough that the eye
+     could not bind the two together. grid-template-columns: max-content 1fr
+     gives the term column exactly the width its widest row needs and no
+     more, with a small fixed gap on top of that. <dl>/<dt>/<dd> is the
+     semantic element for exactly this term/value pairing — no wrapper
+     needed, since dt and dd are already direct children a grid can place. */
   function ifaceStatsHtml(r) {
     const row = (label, val) =>
-      `<tr><td class="hint" style="padding-right:14px">${label}</td><td>${val}</td></tr>`;
+      `<dt class="hint">${label}</dt><dd style="margin:0">${val}</dd>`;
     const num = (v) => v != null ? Number(v).toLocaleString() : '—';
-    return `<table><caption class="sr-only">Interface facts</caption>${[
+    return `<dl style="display:grid;grid-template-columns:max-content 1fr;` +
+      `column-gap:14px;row-gap:4px;margin:0" aria-label="Interface facts">${[
       row('Admin / Oper', `${escape(r.admin_status || '—')} / ${escape(r.oper_status || '—')}`),
       row('Speed', r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—'),
       row('MAC address', escape(r.phys_addr || '—')),
@@ -1376,14 +1497,14 @@
       row('Errors in / out (total)', `${num(r.last_in_errors)} / ${num(r.last_out_errors)}`),
       row('Octets in / out (counter)', `${num(r.last_in_octets)} / ${num(r.last_out_octets)}`),
       row('Last seen', ago(r.last_seen_ts)),
-    ].join('')}</table>`;
+    ].join('')}</dl>`;
   }
 
   function ifaceEventsHtml(ifIndex, payload) {
     const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
-    return `<div class="table-wrap" style="max-height:120px"><table><caption class="sr-only">Recent events on this port</caption>` +
+    return `<div class="table-wrap scrollbox small"><table><caption class="sr-only">Recent events on this port</caption>` +
       events.map((e) => `<tr><td>${App.timeCell(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
       '</table></div>';
@@ -1438,8 +1559,8 @@
         from the MIBs uploaded under Profiles &amp; MIBs — an OID no MIB
         describes is shown as its number rather than guessed at.</p>
       <div id="oid-status" class="hint"></div>
-      <div class="table-wrap" style="max-height:52vh"><table id="oid-table"></table></div>`, [
-      { label: 'Close', primary: true, onClick: App.closeModal },
+      <div class="table-wrap scrollbox large"><table id="oid-table"></table></div>`, [
+      { label: 'Close', onClick: App.closeModal },
     ], { buttonsTop: true });
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
@@ -1722,7 +1843,7 @@
     // starts with no prior peak to remember.
     const axisMemory = {};
 
-    const buttons = [{ label: 'Close', primary: true, onClick: App.closeModal }];
+    const buttons = [{ label: 'Close', onClick: App.closeModal }];
     if (onBack) {
       buttons.unshift({ label: '\u2190 Back to device', onClick: () => {
         App.closeModal();
@@ -1742,7 +1863,7 @@
       <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
       <p class="section">RUNNING CONFIGURATION</p>
       <p class="hint">Stored configurations live in
-        <button type="button" class="linkish" id="ifd-configrx">ConfigRX</button>,
+        <button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button>,
         which backs up this device over SSH and keeps every version it has
         seen. There is no per-port view of a configuration — a config is a
         whole-device thing.</p>
@@ -1779,10 +1900,22 @@
       const svg = box.querySelector('#ifd-chart-svg');
       const wrap = box.querySelector('#ifd-chart');
       if (!svg || !wrap || !lastChart) return;
+      const lastOf = (series) => {
+        const pts = series.points || [];
+        if (!pts.length) return null;
+        const p = pts[pts.length - 1];
+        return p.avg !== undefined ? p.avg : p.value;
+      };
+      const parts = lastChart.series
+        .map((s) => { const v = lastOf(s); return v == null ? null : `${s.label} ${formatMetricValue('bps', v)}`; })
+        .filter(Boolean);
+      const portName = iface.descr || iface.alias || `port ${ifIndex}`;
       drawSeriesChart(svg, wrap, lastChart, {
         emptyText: 'No samples yet — they arrive with each poll',
         smooth,
         axisMemory,
+        ariaLabel: `Bandwidth chart for ${portName}, last hour` +
+          (parts.length ? `, most recently ${parts.join(', ')}` : ', no samples yet'),
       });
     }
 
@@ -2061,8 +2194,15 @@
       { metric_id: metricId, t0, t1 });
     if (!wrap.isConnected || wrap.dataset.requestId !== requestId
         || view.selected !== deviceId) return;
+    const points = result.points || [];
+    const last = points.length ? points[points.length - 1] : null;
+    const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
     drawSeriesChart(svg, wrap, { t0: result.t0, t1: result.t1, unit: metric.unit,
-      series: [{ label: metric.label, color: 'var(--accent)', points: result.points || [] }] });
+      series: [{ label: metric.label, color: 'var(--accent)', points }] }, {
+      ariaLabel: `${metric.label} chart, last hour` +
+        (lastValue == null ? ', no samples yet'
+          : `, most recently ${formatMetricValue(metric.unit, lastValue)}`),
+    });
   }
 
   /* -------------------------------------------------------------- CRUD */
@@ -2469,7 +2609,7 @@
       <p class="hint warn-text" id="nd-import-error" hidden></p>
       <div id="nd-import-result"></div>`;
     const box = App.modal('Import devices', body, [
-      { label: 'Close', onClick: App.closeModal },
+      { label: 'Cancel', onClick: App.closeModal },
       { label: 'Import', primary: true, onClick: async (box, button) => {
         const errorEl = box.querySelector('#nd-import-error');
         errorEl.hidden = true;
@@ -2519,51 +2659,51 @@
     box.querySelector('#nd-import-text').oninput = () => updateImportPreview(box);
   }
 
-  function addDevice() {
-    const box = App.modal('Add device', deviceForm({}), [
+  /* `preset` prefills the form without making it read-only — unlike
+     editDevice's, this id-less form never locks the IP field. Used both by
+     the toolbar button (no preset) and by a #/nodes?add=<ip> route, the way
+     Syslog and SNMP Trap turn "nobody has this address" into one click
+     instead of a copy-paste across two tabs. */
+  function addDevice(preset) {
+    const box = App.modal('Add device', deviceForm(preset || {}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Test', onClick: () => testDevice(box, null) },
-      { label: 'Add', primary: true, onClick: async (box, button) => {
+      { label: 'Add', primary: true, onClick: (box, button) => {
         // Both halves of this used to be silent: a blank address returned
         // without a word, and a refusal from the server (a duplicate, or an
         // address that is not one) rejected into nothing, so the dialog just
-        // sat there and the button looked broken. The form's own status line
-        // is where the Test button already reports, so it reports here too.
-        const status = box.querySelector('#nd-f-test-result');
-        const fail = (message) => {
-          status.textContent = message;
-          status.style.color = 'var(--fail)';
-          box.querySelector('#nd-f-ip').focus();
-        };
+        // sat there and the button looked broken. requireFields announces
+        // and marks the blank field; a server refusal now propagates
+        // instead of being caught here, so App.runJob is the one place
+        // that renders it, in .modal-error, and reports the success that
+        // used to go unsaid — the dialog closed and a new row simply
+        // appeared, with nothing naming which one it was.
+        if (!App.requireFields(box, [['#nd-f-ip', 'IP address']])) return;
         const ip = box.querySelector('#nd-f-ip').value.trim();
-        if (!ip) return fail('An IP address is required.');
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
         const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
-        let result;
-        button.disabled = true;          // a slow add must not run twice
-        try {
-          result = await App.post('/api/nodes/devices',
+        return App.runJob(button, { queued: 'Adding…', done: `Added ${name || ip}` },
+          (async () => {
+          const result = await App.post('/api/nodes/devices',
             { ip, name, group_id, device_group_id, display_name_source, ...overrides });
-        } catch (error) {
-          button.disabled = false;
-          return fail(error.message);
-        }
-        if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
-          await App.post(`/api/nodes/devices/${result.id}/credential`,
-            { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
-              v3_auth_pass: authPass }).catch(() => {});
-        }
-        // Poll it now rather than waiting for the next scheduled tick, and
-        // only after any v3 credential override above has been saved so
-        // the first poll already uses the device's final configuration.
-        await App.post(`/api/nodes/devices/${result.id}/poll`, {}).catch(() => {});
-        App.closeModal();
-        selectDevice(result.id);
-        App.refreshNow('nodes');
+          if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
+            await App.post(`/api/nodes/devices/${result.id}/credential`,
+              { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
+                v3_auth_pass: authPass }).catch(() => {});
+          }
+          // Poll it now rather than waiting for the next scheduled tick, and
+          // only after any v3 credential override above has been saved so
+          // the first poll already uses the device's final configuration.
+          await App.post(`/api/nodes/devices/${result.id}/poll`, {}).catch(() => {});
+          App.closeModal();
+          selectDevice(result.id);
+          App.refreshNow('nodes');
+          return result;
+        })());
       } },
     ]);
     wireInheritHints(box, {});
@@ -2624,9 +2764,10 @@
     if (!view.deviceGroups.length) return '<p class="hint">No groups yet.</p>';
     const rows = view.deviceGroups.map((g) => `
       <tr data-devgroup-id="${g.id}">
-        <td><input type="text" class="devgroup-name" value="${escape(g.name)}"></td>
-        <td><button type="button" class="devgroup-save">Save</button></td>
-        <td><button type="button" class="devgroup-remove">Remove</button></td>
+        <td><input type="text" class="devgroup-name" value="${escape(g.name)}"
+          aria-label="Name for group ${escape(g.name)}"></td>
+        <td><button type="button" class="devgroup-save" aria-label="Save ${escape(g.name)}">Save</button></td>
+        <td><button type="button" class="devgroup-remove" aria-label="Remove ${escape(g.name)}">Remove</button></td>
       </tr>`).join('');
     return `<table><caption class="sr-only">Device groups</caption><thead><tr><th scope="col">Name</th><th scope="col"></th><th scope="col"></th></tr></thead><tbody>${rows}</tbody></table>`;
   }
@@ -2665,22 +2806,25 @@
   }
 
   function manageDeviceGroups() {
+    // Add is the affirmative action and the one Enter should reach — a
+    // plain body button never submits the form (App.modal types every
+    // untyped body button "button"), so it moves into the button row as
+    // the primary; Close, which discards nothing, reads Cancel beside it.
     const box = App.modal('Manage device groups', `
       <div id="nd-devgroups-list">${deviceGroupListHtml()}</div>
-      <label>New group <input id="nd-devgroup-new" placeholder="e.g. Core Switches"></label>
-      <button type="button" id="nd-devgroup-add">Add</button>`, [
-      { label: 'Close', primary: true, onClick: App.closeModal },
+      <label>New group <input id="nd-devgroup-new" placeholder="e.g. Core Switches"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Add', primary: true, onClick: async (box) => {
+        const input = box.querySelector('#nd-devgroup-new');
+        const name = input.value.trim();
+        if (!name) return;
+        await App.post('/api/nodes/device-groups', { name });
+        input.value = '';
+        await refreshDeviceGroupsList(box);
+        App.refreshNow('nodes');
+      } },
     ]);
     wireDeviceGroupRows(box);
-    box.querySelector('#nd-devgroup-add').onclick = async () => {
-      const input = box.querySelector('#nd-devgroup-new');
-      const name = input.value.trim();
-      if (!name) return;
-      await App.post('/api/nodes/device-groups', { name });
-      input.value = '';
-      await refreshDeviceGroupsList(box);
-      App.refreshNow('nodes');
-    };
   }
 
   async function testDevice(box, deviceId) {
@@ -3247,7 +3391,7 @@
     for (const x of view.discResults) {
       if (!view.discSeen.has(x.id)) {
         view.discSeen.add(x.id);
-        if (x.snmp_ok && !x.promoted_device_id) view.discChecked.add(x.id);
+        if (x.snmp_ok && !x.existing_device_id) view.discChecked.add(x.id);
       }
     }
     drawDiscResultsTable();
@@ -3269,31 +3413,39 @@
     return view.discJobs.find((j) => j.id === view.discSelected);
   }
 
-  /* A result can be ticked when nothing has promoted it yet and the scan is
-     allowed to add it: SNMP-identified always, ping-only only when the job
-     was started with that option. */
+  /* A result can be ticked when nothing has already added it: not this
+     job's own promote, not an earlier job's, not one added some other way
+     entirely (existing_device_id covers all three; see
+     api._discovery_result_json). And the scan has to be allowed to add it:
+     SNMP-identified always, ping-only only when the job was started with
+     that option. */
   function discSelectable(r, job) {
-    return !r.promoted_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
+    return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
   /* The first cell of a discovery row: a box for a result that may be
      added, an em dash carrying the reason for one no credential
-     identified, and nothing at all for one already promoted. Shared by the
-     grid and the approval dialog, which differ only in the class on the box
-     and in which set holds the ticks. */
+     identified, and a link to the device it already is for one that is
+     already added, whether by this job, an earlier one, or by hand.
+     Shared by the grid and the approval dialog, which differ only in the
+     class on the box and in which set holds the ticks. */
   function discCheckCell(r, job, checkedSet, cls) {
     if (!discSelectable(r, job)) {
-      return r.promoted_device_id ? ''
-        : '<span class="hint" title="Only devices identified over SNMP can be ' +
-          'added from this scan">\u2014</span>';
+      if (r.existing_device_id) {
+        return `<span class="hint">Already added \u2014 <a href="#/nodes/device/${
+          r.existing_device_id}">${escape(r.existing_device_name || r.ip)}</a></span>`;
+      }
+      return '<span class="hint" title="Only devices identified over SNMP can be ' +
+        'added from this scan">\u2014</span>';
     }
     return `<input type="checkbox" class="${cls}" data-result="${r.id}"` +
       ` aria-label="Select ${escape(r.ip || 'result')}"` +
       `${checkedSet.has(r.id) ? ' checked' : ''}>`;
   }
 
-  /* Vendor with its confidence marker, the "install these MIBs" hint and
-     the "(added)" tag. The arcs tooltip is NOT part of this: hung on a
+  /* Vendor with its confidence marker and the "install these MIBs" hint;
+     an already-added result says so in the check cell now, so this needs
+     no separate "(added)" tag. The arcs tooltip is NOT part of this: hung on a
      <span> around the text it only covered the words, so hovering the rest
      of a wide Vendor column said nothing. It goes on the <td> instead — in
      the grid through App.drawRows' onRow callback, in the approval dialog
@@ -3301,8 +3453,7 @@
   function discVendorCell(r) {
     return `${escape(r.vendor || '\u2014')}${vendorMarker(r)}` +
       (r.suggest_bundle && !r.suggest_bundle_installed
-        ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : '') +
-      (r.promoted_device_id ? ' <span class="hint">(added)</span>' : '');
+        ? ` <span class="hint">(install ${escape(r.suggest_bundle)} MIBs)</span>` : '');
   }
 
   const DISC_COLUMNS = [
@@ -3397,7 +3548,7 @@
     const selectable = view.discResults.filter((r) => discSelectable(r, job));
     const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
     const chosen = ticked();
-    // promoted_device_id and snmp_ok are the only fields the server ever
+    // existing_device_id and snmp_ok are the only fields the server ever
     // changes on a result that already exists; everything else about a row is
     // fixed when the scanner writes it. So an unchanged list under an
     // unchanged sort renders identically, and the only thing that still has
@@ -3405,7 +3556,7 @@
     const signature = [
       view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
       view.discResults.map((r) =>
-        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.promoted_device_id || ''}`).join(','),
+        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}`).join(','),
     ].join('|');
     if (!force && signature === discDrawnSignature) {
       App.refreshSelectAll(table, selectable.length, ticked());
@@ -3586,6 +3737,35 @@
     return s.length > max ? `${s.slice(0, max - 1)}…` : s;
   }
 
+  /* Mirrors the status-timeline segments above: tabindex plus a focus/blur
+     pair that shows the same tooltip a mouse gets, so a hover-only detail on
+     the topology graph is not lost to the keyboard. `onActivate`, when
+     given, also wires Enter/Space to whatever the element's own click does,
+     since a focusable node or edge that only a mouse can act on is still
+     a trap. */
+  function wireHoverTip(element, tipText, onActivate) {
+    element.tabIndex = 0;
+    element.setAttribute('role', onActivate ? 'button' : 'img');
+    element.setAttribute('aria-label', tipText.replace(/\n/g, '; '));
+    element.addEventListener('mousemove', (event) => {
+      if (!topoState.panDrag) App.tooltip(tipText, event);
+    });
+    element.addEventListener('mouseleave', App.hideTooltip);
+    element.addEventListener('focus', () => {
+      if (topoState.panDrag) return;
+      const box = element.getBoundingClientRect();
+      App.tooltip(tipText, { clientX: box.left + box.width / 2, clientY: box.bottom });
+    });
+    element.addEventListener('blur', App.hideTooltip);
+    if (onActivate) {
+      element.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onActivate();
+      });
+    }
+  }
+
   function topoNodeBox(x, y, node) {
     const g = App.svgNode('g', { transform: `translate(${x},${y})` });
     const color = node.unknown ? 'var(--line)' : (STATUS_COLOR[node.status] || 'var(--line)');
@@ -3602,18 +3782,41 @@
     const tipText = node.unknown
       ? `${node.name || 'Unidentified neighbour'} — not in Nodes`
       : `${node.name}${node.ip && node.ip !== node.name ? ` (${node.ip})` : ''} — ${node.status}`;
-    g.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
-    g.addEventListener('mouseleave', App.hideTooltip);
-    if (!node.unknown) {
+    const activate = node.unknown ? null : () => {
+      if (topoState.dragMoved) return;
+      App.rememberSub('nodes', 'devices');
+      selectSub('devices');
+      selectDevice(node.id);
+    };
+    wireHoverTip(g, tipText, activate);
+    if (activate) {
       g.style.cursor = 'pointer';
-      g.addEventListener('click', () => {
-        if (topoState.dragMoved) return;
-        App.rememberSub('nodes', 'devices');
-        selectSub('devices');
-        selectDevice(node.id);
-      });
+      g.addEventListener('click', activate);
     }
     return g;
+  }
+
+  function topologyEmptyState(svg, wrap, message) {
+    // A lattice of every device as its own disconnected box (the isolated
+    // grid in topoLayout) is not a topology — it is 62 identical boxes with
+    // nothing to say about how they relate. When there is nothing to draw
+    // this shows the same plain .empty block every other page uses instead,
+    // rather than filling the canvas with a picture of the absence.
+    // style.display, not the `hidden` property: a bare <svg> root does not
+    // reflect `.hidden` onto the content attribute in every engine, so
+    // [hidden]'s display:none never applied and the box stayed laid out at
+    // its full height with the message pushed below the fold.
+    svg.style.display = 'none';
+    let empty = wrap.querySelector(':scope > .empty');
+    if (!empty) {
+      empty = document.createElement('div');
+      empty.className = 'empty';
+      wrap.appendChild(empty);
+    }
+    empty.textContent = message;
+    wrap.removeAttribute('tabindex');
+    wrap.removeAttribute('role');
+    wrap.removeAttribute('aria-label');
   }
 
   function drawTopology() {
@@ -3621,19 +3824,28 @@
     const wrap = App.el('nd-topo-canvas');
     if (!svg || !wrap) return;
     svg.innerHTML = '';
+    svg.style.display = '';
+    const empty = wrap.querySelector(':scope > .empty');
+    if (empty) empty.remove();
     const box = wrap.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     const topo = view.topology;
-    App.el('nd-topo-count').textContent = topo
-      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : '';
+    const countText = topo
+      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : 'no devices';
+    App.el('nd-topo-count').textContent = topo ? countText : '';
     if (!topo || !topo.nodes.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-size': 'var(--fs-sm)',
-      }, 'No devices yet.'));
+      topologyEmptyState(svg, wrap, 'No devices yet.');
       return;
     }
+    if (!topo.edges.length) {
+      topologyEmptyState(svg, wrap, `${topo.nodes.length} device(s), no links between them yet. ` +
+        'LLDP or CDP has to be enabled and answering on them before a connection can be drawn here.');
+      return;
+    }
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', `Neighbour topology: ${countText}. Tab into it for each device and link.`);
 
     const positions = topoLayout(topo.nodes, topo.edges);
     const group = App.svgNode('g');
@@ -3660,14 +3872,14 @@
         `${(edge.protocols || []).join(', ').toUpperCase()}` +
         `${edge.unknown ? ' — unidentified neighbour' : ''}`;
       line.style.cursor = 'pointer';
-      line.addEventListener('mousemove', (event) => { if (!topoState.panDrag) App.tooltip(tipText, event); });
-      line.addEventListener('mouseleave', App.hideTooltip);
       // click, not just hover, so a touch or keyboard-driven pointer can
       // still get at the local/remote port label the task calls for.
-      line.addEventListener('click', () => {
+      const showLink = () => {
         if (topoState.dragMoved) return;
         App.toast(tipText.replace('\n', ' — '), 'ok');
-      });
+      };
+      wireHoverTip(line, tipText, showLink);
+      line.addEventListener('click', showLink);
       edgeLayer.appendChild(line);
     }
     for (const node of topo.nodes) {
@@ -3833,6 +4045,7 @@
         view.discChecked = new Set();
         view.discSeen = new Set();
         view.discCheckedJob = result.id;
+        view.discStartedThisLoad.add(result.id);
         App.refreshNow('nodes');
       } },
     ]);
@@ -3844,24 +4057,25 @@
     el.className = isError ? 'err' : 'hint';
   }
 
-  /* The approve/deny dialog: pops once per finished scan, listing every
-     discovered device with a checkbox (SNMP-identified ones pre-checked,
-     ping-only ones per the job's own option). Approving promotes the
-     checked ones; dismissing adds nothing. Either answer marks the job
-     reviewed so it never pops again — the RESULTS pane remains for
-     changing one's mind later. */
-  async function maybeShowApproval() {
+  /* The approve/deny dialog: lists everything a finished/cancelled scan
+     found, SNMP-identified ones pre-checked, ping-only ones per the job's
+     own option. Approving promotes the checked ones; dismissing adds
+     nothing. Either answer marks the job reviewed so it never asks again —
+     the RESULTS pane remains for changing one's mind later.
+
+     Opened two ways (P1-9): maybeAutoOpenApproval pops it, unasked, only
+     for a job THIS page load itself started; the strip line's Review
+     button opens this same dialog for any other unreviewed job, on
+     request rather than by ambush. */
+  async function openApprovalDialog(job) {
     if (view.approvalOpenFor !== null) return;
     if (!App.el('modal').hidden) return;   // never clobber an open dialog
-    const job = view.discJobs.find(
-      (j) => (j.state === 'done' || j.state === 'cancelled') && !j.reviewed);
-    if (!job) return;
     const cancelled = job.state === 'cancelled';
     view.approvalOpenFor = job.id;
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    const seed = new Set(results.filter((x) => x.snmp_ok && !x.promoted_device_id)
+    const seed = new Set(results.filter((x) => x.snmp_ok && !x.existing_device_id)
       .map((x) => x.id));
     const finish = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -3890,16 +4104,15 @@
         }, () => {
           // Reopen only if the discard did not happen — its onConfirm
           // clears approvalOpenFor, so a still-set value means "cancelled".
-          // maybeShowApproval bails while that flag is set, so clear it
-          // first and let it re-pick the same unreviewed job.
           if (view.approvalOpenFor !== job.id) return;
           view.approvalOpenFor = null;
-          maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
+          openApprovalDialog(job).catch(() => { view.approvalOpenFor = null; });
         });
     };
     if (!found.length) {   // nothing to approve — don't pop an empty dialog
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
       view.approvalOpenFor = null;
+      App.refreshNow('nodes');
       return;
     }
     const checked = new Set(seed);
@@ -3915,21 +4128,44 @@
       cancelled ? { label: 'Discard scan', onClick: discard }
                 : { label: 'Dismiss', onClick: finish },
       { label: 'Add approved', primary: true, onClick: async () => {
+        // Every already-added row is unselectable (discSelectable), so
+        // `already` is what "found" carries that "checked" cannot: how many
+        // of this scan's hits were monitored before the operator ever
+        // pressed this button, said back so the count of newly-added
+        // devices is never mistaken for the size of the sweep.
+        const already = found.filter((x) => x.existing_device_id).length;
+        const added = checked.size;
         if (checked.size) {
           await App.post(`/api/nodes/discovery/${job.id}/promote`,
             { result_ids: [...checked] }).catch(() => {});
         }
         await finish();
+        App.toast(already ? `Added ${added}; ${already} already monitored.`
+                          : `Added ${added}.`, 'ok');
       } },
     ];
     const box = App.modal(title, `
       <p class="hint">${lead} ${job.allow_ping_only
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
-      <div class="table-wrap" style="max-height:50vh">
+      <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
       </div>`, buttons);
+    // Escape or a backdrop click dismisses this dialog without any button's
+    // onClick running, so nothing else would clear approvalOpenFor — left
+    // stuck, neither a later auto-open nor the strip's own Review could ever
+    // open ANY approval dialog again this session (P1-9 regression: the
+    // strip's Review has to work after an Escape, not just before the
+    // first one). modalToken() still names the generation this box held
+    // even once hidden, which is how a nested confirm (Discard scan)
+    // replacing it first is told apart from a plain dismissal of this
+    // dialog itself — that flow clears/reopens approvalOpenFor on its own.
+    const token = App.modalToken();
+    window.addEventListener('modal-closed', () => {
+      if (App.modalToken() !== token) return;
+      if (view.approvalOpenFor === job.id) view.approvalOpenFor = null;
+    }, { once: true });
     const approveTable = box.querySelector('table');
     const syncApprove = () => {
       for (const cb of approveTable.querySelectorAll('.disc-approve')) {
@@ -3945,6 +4181,68 @@
       };
     }
     syncApprove();
+  }
+
+  /* P1-9: a finished/cancelled scan used to pop the dialog above on every
+     arrival at the Nodes tab, in every session — a 62-row approval dialog
+     ambushing whoever opened the tab next. It now opens itself only for a
+     job THIS page load started, and only the first time it is ever seen
+     finished: discAutoOffered is set before the dialog is even built, so a
+     later Escape (or simply switching tabs and back) can never bring the
+     same job back as a popup. Anything else unreviewed sits in the strip
+     line (drawDiscStrip) instead, offered rather than forced. */
+  async function maybeAutoOpenApproval() {
+    if (view.approvalOpenFor !== null) return;
+    if (!App.el('modal').hidden) return;
+    const job = view.discJobs.find((j) =>
+      (j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+      && view.discStartedThisLoad.has(j.id) && !view.discAutoOffered.has(j.id));
+    if (!job) return;
+    view.discAutoOffered.add(job.id);
+    await openApprovalDialog(job);
+  }
+
+  /* Any unreviewed finished/cancelled job that answered nothing at all —
+     no ping, no SNMP — is marked reviewed on sight rather than surfaced
+     anywhere: openApprovalDialog already refused to pop an empty dialog
+     for one, and a strip line offering to review zero devices would be
+     the same dead end with extra steps. */
+  function reviewEmptyDiscJobs() {
+    for (const j of view.discJobs) {
+      if ((j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+          && !j.responded && !j.identified) {
+        App.post(`/api/nodes/discovery/${j.id}/reviewed`, {}).catch(() => {});
+      }
+    }
+  }
+
+  /* The one line in the Nodes strip for everything reviewEmptyDiscJobs
+     didn't already clear: a job someone else's session started, or one
+     this page already auto-offered and the operator escaped rather than
+     answered. Review opens the identical approval dialog, on request;
+     Dismiss marks the job reviewed exactly as the dialog's own Dismiss
+     does, without ever opening it. */
+  function discStripJob() {
+    return view.discJobs.find((j) =>
+      (j.state === 'done' || j.state === 'cancelled') && !j.reviewed
+      && (j.responded > 0 || j.identified > 0));
+  }
+
+  function drawDiscStrip() {
+    const strip = App.el('nd-disc-strip');
+    if (!strip) return;
+    const job = discStripJob();
+    if (!job) { strip.hidden = true; return; }
+    strip.hidden = false;
+    App.el('nd-disc-strip-text').textContent =
+      `Discovery of ${job.target} found ${job.identified} new device(s).`;
+    App.el('nd-disc-strip-review').onclick = () => {
+      openApprovalDialog(job).catch(() => { view.approvalOpenFor = null; });
+    };
+    App.el('nd-disc-strip-dismiss').onclick = async () => {
+      await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
+      App.refreshNow('nodes');
+    };
   }
 
   function fillDiscGroups() {
@@ -4033,10 +4331,10 @@
         network, download the files yourself and use Upload MIB, which accepts a
         zip.</p>
       <p id="nd-cat-status" class="hint"></p>
-      <div class="table-wrap" style="max-height:50vh"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
+      <div class="table-wrap scrollbox large"><table id="nd-cat-table"><caption class="sr-only">MIB bundles</caption>
         <thead><tr><th scope="col">Bundle</th><th scope="col">State</th><th scope="col"></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`, [
-      { label: 'Close', primary: true, onClick: App.closeModal },
+      { label: 'Close', onClick: App.closeModal },
     ], { buttonsTop: true });
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
@@ -4148,7 +4446,7 @@
             : `<p>${escape(result.module || file.name)}: ` +
             `${result.resolved_count}/${result.object_count} object(s) resolved.</p>` +
             (result.unresolved.length ? `<p class="hint">Unresolved parents: ${escape(result.unresolved.join(', '))} — upload the MIB that defines them, then hit Resolve.</p>` : ''), [
-            { label: 'Close', primary: true, onClick: App.closeModal },
+            { label: 'Close', onClick: App.closeModal },
           ]);
           App.refreshNow('nodes');
         } catch (error) {
@@ -4294,7 +4592,8 @@
           which at the default interval is roughly a week.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         await App.post('/api/settings', { scope: 'nodes', values: {
@@ -4331,7 +4630,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('nodes');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -4537,7 +4836,9 @@
         await loadDiscResults().catch(() => {});
       }
     }
-    maybeShowApproval().catch(() => { view.approvalOpenFor = null; });
+    reviewEmptyDiscJobs();
+    drawDiscStrip();
+    maybeAutoOpenApproval().catch(() => { view.approvalOpenFor = null; });
   }
 
   /* Snap a filter back to "any" and drop the stored value with it: while it
@@ -4741,7 +5042,7 @@
         '<p class="hint">Every stored MIB is re-parsed and resolved against every ' +
         'other, so a file uploaded before the one defining its parent branch ' +
         'finishes resolving here.</p>', [
-        { label: 'Close', primary: true, onClick: App.closeModal },
+        { label: 'Close', onClick: App.closeModal },
       ]);
       App.refreshNow('nodes');
     };
@@ -4757,10 +5058,14 @@
 
     // The timeline is drawn into a viewBox sized from its box, so a
     // resize needs a redraw from the data already loaded — no refetch.
+    // The device table's own redraw is here too: narrowDevicePane() reads
+    // live layout, so crossing the width where Response/Vendor default off
+    // only takes effect once something asks the table to redraw.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
         if (App.state.tab !== 'nodes') return;
         drawStatusTimeline();
+        drawTable();
       });
     }
 

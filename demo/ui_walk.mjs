@@ -6,14 +6,40 @@
  *        --creds demo/out/creds.txt --out demo/out/ui --tag 250
  *
  * Produces, in --out:
- *   tab-<name>-<tag>.png        every top-level tab
- *   sub-<tab>-<name>-<tag>.png  every subtab
- *   dlg-<name>-<tag>.png        every dialog it could open
- *   viewer-<name>-<tag>.png     the same tabs as the read-only `viewer`
- *   console-<tag>.json          console errors/warnings, page errors,
- *                               failed requests and every response >= 400
- *   metrics-<tag>.json          nodes-table fill time, long tasks, payload size
- *   walk-<tag>.json             per-step ok/skipped/failed
+ *   tab-<name>-<tag>.png            every top-level tab, admin pass
+ *   sub-<tab>-<name>-<tag>.png      every subtab (admin pass only), including
+ *                                   Nodes' Topology and the device-detail
+ *                                   pane's four nested subtabs
+ *   dlg-<name>-<tag>.png            every dialog it could open: device
+ *                                   detail/interface, Add device, profile
+ *                                   editor + help, device groups, the MIB
+ *                                   catalog and Upload MIB, alert rule, every
+ *                                   module's Settings, the three loopback
+ *                                   tests, Account, the Users grid, and
+ *                                   ConfigRX's device-settings and
+ *                                   bulk-settings dialogs (both carry the SSH
+ *                                   credential fields — there is no separate
+ *                                   credential dialog to capture)
+ *   feature-<name>-<tag>.png        a MAC search on Nodes, and ConfigRX's
+ *                                   inline config viewer and unified diff
+ *                                   (viewer/diff are panes, not dialogs)
+ *   theme-<theme>-<name>-<tag>.png  every top-level tab under each of the
+ *                                   three themes (dark, light, contrast),
+ *                                   set via localStorage before first paint
+ *   viewport-<WxH>-<name>-<tag>.png every top-level tab at 1920x1080,
+ *                                   1366x768 and 1280x720
+ *   kiosk-<name>-<tag>.png          a kiosk-mode (?kiosk=1) session: a few
+ *                                   tabs, plus proof a non-kioskSafe dialog
+ *                                   degrades to a toast instead of opening
+ *   viewer-<name>-<tag>.png         the same top-level tabs as the read-only
+ *                                   `viewer` account
+ *   console-<tag>.json              console errors/warnings, page errors,
+ *                                   failed requests and every response >= 400
+ *                                   (from every pass above — admin, viewer,
+ *                                   kiosk, theme x3, viewport x3)
+ *   metrics-<tag>.json              nodes-table fill time, long tasks,
+ *                                   payload size
+ *   walk-<tag>.json                 per-step ok/skipped/failed
  *
  * Nothing here fails the whole run: every step is wrapped, recorded and
  * stepped over. Playwright is the globally installed one (`npm root -g`);
@@ -82,12 +108,17 @@ function readCreds(file) {
 const TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
               'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
 
-// Subtabs are `.subtab[data-subtab=...]` inside each page section.
+// Subtabs are `.subtab[data-subtab=...]` inside each page section, in the
+// order the tab strip itself lists them.
 const SUBTABS = {
-  nodes: ['devices', 'discovery', 'profiles'],
+  nodes: ['devices', 'topology', 'discovery', 'profiles'],
   alerts: ['current', 'rules'],
-  ipam: ['dhcp', 'conflicts', 'subnets'],
+  ipam: ['subnets', 'conflicts', 'dhcp'],
 };
+
+// The device-detail pane's own nested subtabs (`#nd-d-subs`), separate from
+// the page-level ones above — walked by walkDialogs' sub:device-detail step.
+const DEVICE_DETAIL_SUBTABS = ['interfaces', 'neighbours', 'capabilities', 'events'];
 
 // The per-module Settings buttons, which are `.module-settings` and live
 // inside their own (otherwise hidden) page, so the tab must be selected first.
@@ -274,16 +305,34 @@ async function walkDialogs(page, dir, tag, recorder) {
   });
   await closeAnyModal(page);
 
-  // ---- Device detail pane subtabs (Interfaces / Events), in the page
+  // ---- Device detail pane subtabs (Interfaces / Neighbours / Bridge & RF /
+  // Events), in the page
   await guarded(recorder, 'sub:device-detail', async () => {
     await page.click('#nodes-table tbody tr:first-child');
     await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 10000 });
-    for (const sub of ['interfaces', 'events']) {
+    for (const sub of DEVICE_DETAIL_SUBTABS) {
       await page.click(`#nd-d-subs .subtab[data-subtab="${sub}"]`).catch(() => {});
       await settle(page, 600);
       await shoot(page, dir, `sub-device-${sub}-${tag}`);
     }
     return '';
+  });
+
+  // ---- MAC search: resolveMacSearch (nodes.js) only runs on a deliberate
+  // Enter in the search box, never on the five-second refresh, so the
+  // walk has to press Enter rather than just filling the field.
+  await guarded(recorder, 'feature:mac-search', async () => {
+    await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
+    await page.fill('#nd-q', 'aa:bb:cc:dd:ee:ff');
+    await page.press('#nd-q', 'Enter');
+    await settle(page, 900);
+    await shoot(page, dir, `feature-mac-search-${tag}`);
+    const noteShown = await page.evaluate(
+      () => !document.getElementById('nd-mac-note').hidden);
+    await page.fill('#nd-q', '');
+    await page.press('#nd-q', 'Enter');
+    await settle(page, 400);
+    return `note shown=${noteShown}`;
   });
 
   // ---- OID browser (needs a selected device; nodes.js:1253 bails without one)
@@ -303,6 +352,16 @@ async function walkDialogs(page, dir, tag, recorder) {
                                { timeout: 10000 });
     await settle(page, 500);
     await shoot(page, dir, `dlg-add-device-${tag}`);
+    return '';
+  });
+  await closeAnyModal(page);
+
+  // ---- Device groups
+  await guarded(recorder, 'dlg:manage-groups', async () => {
+    await page.click('#nd-manage-devgroups', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden]) #nd-devgroups-list', { timeout: 10000 });
+    await settle(page, 400);
+    await shoot(page, dir, `dlg-manage-groups-${tag}`);
     return '';
   });
   await closeAnyModal(page);
@@ -337,6 +396,30 @@ async function walkDialogs(page, dir, tag, recorder) {
   });
   await closeAnyModal(page);
 
+  // ---- Custom MIBs: the catalog (pre-known MIBs the app can install) and
+  // manual upload, both reached from the same Profiles & MIBs subtab.
+  await guarded(recorder, 'dlg:mib-catalog', async () => {
+    await page.click('#page-nodes .subtab[data-subtab="profiles"]').catch(() => {});
+    await settle(page, 400);
+    await page.click('#nd-mib-catalog', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await settle(page, 500);
+    await shoot(page, dir, `dlg-mib-catalog-${tag}`);
+    return '';
+  });
+  await closeAnyModal(page);
+
+  await guarded(recorder, 'dlg:upload-mib', async () => {
+    await page.click('#page-nodes .subtab[data-subtab="profiles"]').catch(() => {});
+    await settle(page, 300);
+    await page.click('#nd-upload-mib', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await settle(page, 400);
+    await shoot(page, dir, `dlg-upload-mib-${tag}`);
+    return '';
+  });
+  await closeAnyModal(page);
+
   // ---- Alert rule editor
   await guarded(recorder, 'dlg:alert-rule', async () => {
     await selectTab(page, 'alerts');
@@ -366,6 +449,84 @@ async function walkDialogs(page, dir, tag, recorder) {
     });
     await closeAnyModal(page);
   }
+
+  // ---- ConfigRX: device settings (the SSH credential fields live in this
+  // same dialog — configrx.js has no separate credential dialog any more,
+  // it was folded in), bulk settings (its own separate credential
+  // fieldset, for several devices at once), the inline stored-config
+  // viewer, and a unified diff between two backups. The viewer and diff
+  // are panes inside the ConfigRX page, not dialogs — data-dependent, so
+  // they record why when no device has a stored backup yet rather than
+  // failing.
+  await guarded(recorder, 'dlg:configrx-device-settings', async () => {
+    await selectTab(page, 'configrx');
+    await settle(page, 600);
+    const rows = await page.locator('#cx-devices tbody tr').count();
+    if (!rows) return 'no ConfigRX devices to select';
+    await page.click('#cx-devices tbody tr:first-child');
+    await page.waitForSelector('#cx-device-settings:not([hidden])', { timeout: 8000 });
+    await page.click('#cx-device-settings', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden]) #cx-port', { timeout: 10000 });
+    await settle(page, 400);
+    await shoot(page, dir, `dlg-configrx-device-settings-${tag}`);
+    return '';
+  });
+  await closeAnyModal(page);
+
+  await guarded(recorder, 'dlg:configrx-bulk-settings', async () => {
+    await selectTab(page, 'configrx');
+    await settle(page, 400);
+    const box = await page.locator('#cx-devices tbody tr:first-child .cx-check').count();
+    if (!box) return 'no ConfigRX devices to select';
+    await page.click('#cx-devices tbody tr:first-child .cx-check');
+    await page.click('#cx-bulk-settings', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden]) #cx-bulk-port', { timeout: 10000 });
+    await settle(page, 400);
+    await shoot(page, dir, `dlg-configrx-bulk-settings-${tag}`);
+    return '';
+  });
+  await closeAnyModal(page);
+
+  await guarded(recorder, 'feature:configrx-config-viewer', async () => {
+    await selectTab(page, 'configrx');
+    await settle(page, 400);
+    const deviceRows = await page.locator('#cx-devices tbody tr').count();
+    for (let i = 0; i < Math.min(deviceRows, 5); i += 1) {
+      await page.click(`#cx-devices tbody tr:nth-child(${i + 1})`);
+      await settle(page, 500);
+      const backupRows = await page.locator('#cx-backups tbody tr').count();
+      if (backupRows) {
+        await page.click('#cx-backups tbody tr:first-child');
+        await settle(page, 500);
+        await shoot(page, dir, `feature-configrx-config-viewer-${tag}`);
+        return `viewed a stored backup (device row ${i + 1})`;
+      }
+    }
+    await shoot(page, dir, `feature-configrx-config-viewer-${tag}`);
+    return 'no device has a stored backup yet';
+  });
+
+  await guarded(recorder, 'feature:configrx-diff', async () => {
+    await selectTab(page, 'configrx');
+    await settle(page, 400);
+    const deviceRows = await page.locator('#cx-devices tbody tr').count();
+    for (let i = 0; i < Math.min(deviceRows, 5); i += 1) {
+      await page.click(`#cx-devices tbody tr:nth-child(${i + 1})`);
+      await settle(page, 500);
+      const backupRows = await page.locator('#cx-backups tbody tr').count();
+      if (backupRows >= 2) {
+        await page.click('#cx-backups tbody tr:first-child');
+        await settle(page, 400);
+        const visible = await page.isVisible('#cx-backup-diff-prev').catch(() => false);
+        if (!visible) continue;
+        await page.click('#cx-backup-diff-prev');
+        await settle(page, 500);
+        await shoot(page, dir, `feature-configrx-diff-${tag}`);
+        return `diffed two backups (device row ${i + 1})`;
+      }
+    }
+    return 'no device has two or more stored backups to diff';
+  });
 
   // ---- The three loopback "send test" dialogs
   for (const [name, tab, selector] of LOOPBACK_TESTS) {
@@ -401,6 +562,88 @@ async function walkDialogs(page, dir, tag, recorder) {
     const rows = await page.locator('#users-table tbody tr').count();
     return `${rows} account row(s)`;
   });
+}
+
+/* --------------------------------------------------------------- kiosk */
+
+/* /?kiosk=1 (app.js initKiosk) is read from location.search once at boot,
+   so it has to be present on the page LOAD, not set after the fact — log in
+   normally first to get a session cookie, then reload onto the kiosk URL. */
+async function loginKiosk(page, base, username, password) {
+  await login(page, base, username, password);
+  await page.goto(`${base}/?kiosk=1`, { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => typeof App !== 'undefined' && App.state,
+                             null, { timeout: 20000 });
+  await settle(page, 1200);
+}
+
+async function walkKiosk(page, dir, tag, recorder) {
+  for (const tab of ['dashboard', 'nodes', 'alerts']) {
+    await guarded(recorder, `kiosk:${tab}`, async () => {
+      // The kiosk tab strip is hidden (no keyboard/mouse at a wall
+      // display), so drive it the same way the app itself does on a
+      // schedule: App.selectTab, not a click on a button nobody can see.
+      await selectTab(page, tab);
+      await settle(page, 900);
+      await shoot(page, dir, `kiosk-${tab}-${tag}`);
+      return '';
+    });
+  }
+  // UI-002: App.modal degrades a non-kioskSafe dialog to a toast so a wall
+  // display can never be left stuck behind one. Add device is a normal
+  // (non-kioskSafe) dialog, so it must never actually open here.
+  await guarded(recorder, 'kiosk:dialog-degrades', async () => {
+    await selectTab(page, 'nodes');
+    await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
+    await page.waitForSelector('#nodes-table tbody tr', { timeout: 15000 });
+    await page.click('#nd-add-device', { timeout: 5000 }).catch(() => {});
+    await settle(page, 700);
+    const modalOpen = await page.evaluate(
+      () => !document.getElementById('modal').hidden);
+    await shoot(page, dir, `kiosk-dialog-degraded-${tag}`);
+    return `modal open=${modalOpen} (expected false: kiosk degrades to a toast)`;
+  });
+}
+
+/* ------------------------------------------------------------ theme pass */
+
+const THEMES = ['dark', 'light', 'contrast'];
+
+/* boot.js reads sappiwhere.theme out of localStorage before <body> exists,
+   so the value has to be in place before the FIRST page of the context
+   loads — an addInitScript, not a page.evaluate after login. */
+async function themePass(browser, args, adminPassword, dir, tag, recorder, theme) {
+  const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+  await context.addInitScript((value) => {
+    try { localStorage.setItem('sappiwhere.theme', value); } catch { /* private mode */ }
+  }, theme);
+  const page = await context.newPage();
+  page.setDefaultTimeout(args.timeout);
+  recorder.attach(page, `theme-${theme}`);
+  await guarded(recorder, `login:theme-${theme}`, async () => {
+    await login(page, args.base, 'admin', adminPassword);
+    return `signed in as admin under theme=${theme}`;
+  });
+  await walkTabs(page, dir, tag, recorder, `theme-${theme}`);
+  await context.close();
+}
+
+/* --------------------------------------------------------- viewport pass */
+
+const VIEWPORTS = [[1920, 1080], [1366, 768], [1280, 720]];
+
+async function viewportPass(browser, args, adminPassword, dir, tag, recorder, width, height) {
+  const context = await browser.newContext({ viewport: { width, height } });
+  const page = await context.newPage();
+  page.setDefaultTimeout(args.timeout);
+  const label = `viewport-${width}x${height}`;
+  recorder.attach(page, label);
+  await guarded(recorder, `login:${label}`, async () => {
+    await login(page, args.base, 'admin', adminPassword);
+    return `signed in as admin at ${width}x${height}`;
+  });
+  await walkTabs(page, dir, tag, recorder, label);
+  await context.close();
 }
 
 /* ---------------------------------------------------------------- metrics */
@@ -553,6 +796,42 @@ async function main() {
       await viewerContext.close();
     } else {
       recorder.step('login:viewer', 'skipped', 'no viewer_password in creds file');
+    }
+
+    // ---- kiosk pass: a wall-display session (?kiosk=1) — no tab strip,
+    // dialogs degrade to a toast
+    try {
+      const kioskContext = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+      const kioskPage = await kioskContext.newPage();
+      kioskPage.setDefaultTimeout(args.timeout);
+      recorder.attach(kioskPage, 'kiosk');
+      await guarded(recorder, 'login:kiosk', async () => {
+        await loginKiosk(kioskPage, args.base, 'admin', adminPassword);
+        return 'signed in as admin under ?kiosk=1';
+      });
+      await walkKiosk(kioskPage, dir, tag, recorder);
+      await kioskContext.close();
+    } catch (error) {
+      recorder.step('kiosk:pass', 'failed', error && error.message || String(error));
+    }
+
+    // ---- theme pass: every top-level tab under each of the three themes
+    for (const theme of THEMES) {
+      try {
+        await themePass(browser, args, adminPassword, dir, tag, recorder, theme);
+      } catch (error) {
+        recorder.step(`theme:${theme}`, 'failed', error && error.message || String(error));
+      }
+    }
+
+    // ---- viewport pass: every top-level tab at three common screen sizes
+    for (const [width, height] of VIEWPORTS) {
+      try {
+        await viewportPass(browser, args, adminPassword, dir, tag, recorder, width, height);
+      } catch (error) {
+        recorder.step(`viewport:${width}x${height}`, 'failed',
+                      error && error.message || String(error));
+      }
     }
   } finally {
     await browser.close().catch(() => {});

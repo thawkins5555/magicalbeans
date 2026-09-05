@@ -23,7 +23,7 @@ TEXT = QColor("#DCE3EA")
 TEXT_MUTED = QColor("#8F9AA7")
 # The dimmest tone text may be set in: 4.6:1 on PANEL_RAISED. There is no
 # TEXT_FAINT any more — it was 2.5:1 and was being used for prose.
-TEXT_DIM = QColor("#808B98")
+TEXT_DIM = QColor("#848F9C")
 # Not text: dividers, grips, the dot of a stopped collector. 3.1:1 on RAISED.
 LINE = QColor("#646E7C")
 # The fill for "none of this yet" in a chart. 3.05:1 on PANEL.
@@ -50,7 +50,7 @@ CANVAS_BLOCKED = QColor("#A63D10")
 
 OK = QColor("#3FB950")
 WARN = QColor("#E3B341")
-FAIL = QColor("#F85149")
+FAIL = QColor("#F8544C")
 ERROR = QColor("#A371F7")
 BLOCKED = QColor("#FF8A65")
 OVERRUN = QColor("#4DB6AC")

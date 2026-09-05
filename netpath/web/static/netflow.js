@@ -38,6 +38,13 @@
                      ['GRE', 47], ['ESP', 50], ['OSPF', 89]];
   const PAD = { left: 62, right: 12, top: 14, bottom: 26 };
 
+  // One sentence for "nothing matched the window/filters" — the chart, the
+  // top-talker bars and the record table used to each say this their own
+  // way (an SVG text node, a bare <p class="hint">, and a table silently
+  // rendering its header over an empty tbody with no word said at all).
+  const NO_FLOWS_TEXT = 'No flows match this window and filters. Widen the ' +
+    'time window or clear a filter.';
+
   const view = {
     t0: Date.now() / 1000 - 3600,
     t1: Date.now() / 1000,
@@ -59,6 +66,7 @@
 
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
+
   // How many flow records the table asks the server for. The select's three
   // labels and its title are written from this in init(), so the number
   // lives in one place instead of four copies of "250" in the markup.
@@ -161,11 +169,44 @@
     return `${Math.round(bits)} Tbps`;
   }
 
+  /* The chart carries too many time buckets for one tab stop each (a wide
+     window is hundreds of them), so the container is the one stop and the
+     same keys the pan/zoom/reset buttons already run answer to it directly
+     — panning IS how a keyboard user moves between buckets here, and
+     showFocusTip re-announces the totals after every move. A discrete
+     per-bucket walk would only fight those keys for the arrows. */
+  function showFocusTip(container) {
+    if (document.activeElement !== container) return;
+    const box = container.getBoundingClientRect();
+    App.tooltip(App.el('nf-totals').textContent || NO_FLOWS_TEXT,
+      { clientX: box.left + box.width / 2, clientY: box.top + 24 });
+  }
+
   function drawChart() {
+    const container = App.el('nf-chart');
     const svg = App.el('nf-chart-svg');
-    const box = App.el('nf-chart').getBoundingClientRect();
+    const box = container.getBoundingClientRect();
     const width = Math.max(box.width, 300), height = Math.max(box.height, 160);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    container.tabIndex = 0;
+    container.setAttribute('role', 'img');
+    container.setAttribute('aria-label', `Traffic over time chart. ` +
+      `${App.el('nf-totals').textContent || NO_FLOWS_TEXT}. Focus and use ` +
+      `left/right to pan, plus/minus to zoom, Home to reset.`);
+    if (!container.dataset.keyboardWired) {
+      container.dataset.keyboardWired = '1';
+      container.addEventListener('keydown', (event) => {
+        const zoomIn = event.key === '=' || event.key === '+';
+        const zoomOut = event.key === '-' || event.key === '_';
+        if (event.key === 'ArrowLeft') { event.preventDefault(); pan(-0.25); }
+        else if (event.key === 'ArrowRight') { event.preventDefault(); pan(0.25); }
+        else if (zoomIn) { event.preventDefault(); zoom(0.5); }
+        else if (zoomOut) { event.preventDefault(); zoom(2); }
+        else if (event.key === 'Home') { event.preventDefault(); resetWindow(); }
+      });
+      container.addEventListener('focus', () => showFocusTip(container));
+      container.addEventListener('blur', App.hideTooltip);
+    }
     // Redrawn only when the data or the drawing area changed: this ran on
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
@@ -184,10 +225,8 @@
     };
 
     if (!data || !data.times.length || !data.series.length) {
-      svg.appendChild(App.svgNode('text', {
-        x: width / 2, y: height / 2, 'text-anchor': 'middle',
-        fill: 'var(--muted)', 'font-family': 'var(--ui)', 'font-size': 'var(--fs-xs)',
-      }, 'No flows in this window'));
+      App.emptyText(svg, width, height, NO_FLOWS_TEXT);
+      showFocusTip(container);
       return;
     }
 
@@ -331,6 +370,7 @@
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
       setWindow(start, end, false, true);
     };
+    showFocusTip(container);
   }
 
   function slotTip(data, slot) {
@@ -363,10 +403,11 @@
     wrap.innerHTML = '';
     const rows = view.data ? view.data.top : [];
     if (!rows.length) {
-      wrap.innerHTML = '<p class="hint">No flows in this window</p>';
+      wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
       return;
     }
     const peak = Math.max(...rows.map((r) => r.bytes), 1);
+    const bars = [];
     rows.forEach((row, index) => {
       const div = document.createElement('div');
       div.className = 'bar-row';
@@ -375,7 +416,12 @@
         `background:${SERIES[index % SERIES.length]}"></div>` +
         `<span class="bar-label">${escape(row.label)}</span>` +
         `<span class="bar-value">${row.bytes_text} · ${row.rate_text}</span>`;
-      div.onclick = () => filterByBar(row);
+      div.onclick = () => {
+        // A bar picked with the mouse becomes the one the keyboard returns
+        // to, same as a table row's own click already does.
+        for (const other of bars) other.tabIndex = other === div ? 0 : -1;
+        filterByBar(row);
+      };
       div.style.cursor = 'pointer';
       // Swatched to match its own bar, and to match the band of the same
       // name in the chart above it.
@@ -384,9 +430,39 @@
         { text: `${row.bytes_text} · ${row.rate_text}` },
         { text: `${row.flows} flow records` },
       ];
+      div.setAttribute('role', 'button');
+      div.setAttribute('aria-label',
+        `${row.label}: ${row.bytes_text}, ${row.rate_text}, ${row.flows} flow records`);
       div.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       div.addEventListener('mouseleave', App.hideTooltip);
+      div.addEventListener('focus', () => {
+        const box = div.getBoundingClientRect();
+        App.tooltip(tip, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      div.addEventListener('blur', App.hideTooltip);
       wrap.appendChild(div);
+      bars.push(div);
+    });
+    // A short list (App.el('n-topn') caps it at 25) so every bar gets its
+    // own tab stop, roving the way wireRowKeyboard does for table rows
+    // rather than making the operator step through all of them on Tab alone.
+    bars.forEach((div, index) => {
+      div.tabIndex = index === 0 ? 0 : -1;
+      div.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          div.click();
+          return;
+        }
+        const step = event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0;
+        if (!step) return;
+        const next = bars[index + step];
+        if (!next) return;
+        event.preventDefault();
+        div.tabIndex = -1;
+        next.tabIndex = 0;
+        next.focus();
+      });
     });
   }
 
@@ -518,7 +594,14 @@
       const text = tip.join('\n');
       tr.addEventListener('mousemove', (event) => App.tooltip(text, event));
       tr.addEventListener('mouseleave', App.hideTooltip);
-    });
+      // wireRowKeyboard below gives the row the keyboard; this is what a
+      // mouse hover already shows it once it lands there.
+      tr.addEventListener('focus', () => {
+        const box = tr.getBoundingClientRect();
+        App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      tr.addEventListener('blur', App.hideTooltip);
+    }, NO_FLOWS_TEXT);
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -571,7 +654,8 @@
       ${App.columnPickerFieldset('FLOW LIST COLUMNS', 'netflow', COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -591,10 +675,9 @@
             box.querySelector('#cols-netflow'), COLUMNS),
         } });
         await App.loadState();
-        App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
         App.closeModal();
         App.refreshNow('netflow');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(settingsBox);
   }
@@ -658,20 +741,25 @@
     const text = collector.status || 'Collector stopped';
     const failed = /^Could not bind/.test(text);
     const status = App.el('nf-status');
-    status.textContent = text;
-    status.title = text;
-    status.classList.toggle('error', failed);
+    App.setText(status, text);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
+      status.tabIndex = 0;
       status.onmousemove = (event) => App.tooltip(status.title, event);
       status.onmouseleave = App.hideTooltip;
+      status.onfocus = () => {
+        const box = status.getBoundingClientRect();
+        App.tooltip(status.title, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      };
+      status.onblur = App.hideTooltip;
     }
 
-    App.el('nf-dot').style.background = collector.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('nf-toggle').textContent = collector.running
-      ? 'Stop collector' : 'Start collector';
+    App.setBg(App.el('nf-dot'), collector.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    App.setText(App.el('nf-toggle'), collector.running ? 'Stop collector' : 'Start collector');
 
     const counters = collector.counters || {};
     const decoder = collector.decoder || {};
@@ -692,7 +780,7 @@
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);
     }
-    App.el('nf-counters').textContent = parts.join(' · ');
+    App.setText(App.el('nf-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -850,14 +938,12 @@
       clears: ['nf-src', 'nf-dst', 'nf-port', 'nf-protocol', 'nf-exporter'],
     });
     App.el('nf-export-csv').onclick = exportFlowsCsv;
-    App.el('nf-resolve').checked = !!(App.state.flowSettings || {}).resolve_addresses;
-    App.el('nf-resolve').onchange = async (event) => {
-      await App.post('/api/settings', {
-        scope: 'netflow', values: { resolve_addresses: event.target.checked },
-      });
-      await App.loadState();
-      App.refreshNow('netflow');
-    };
+    // "Resolve names" used to sit here, in the filter bar beside per-view
+    // controls (source/dest/port), silently writing a server-wide setting
+    // — one operator ticking it changed every operator's flow table. The
+    // same setting (resolve_addresses) now lives only in its
+    // correctly-scoped control in Settings ("Reverse-resolve addresses in
+    // the flow table").
     App.el('nf-settings').onclick = settingsDialog;
     App.el('nf-test').onclick = sendTestPacket;
     App.el('nf-toggle').onclick = async () => {

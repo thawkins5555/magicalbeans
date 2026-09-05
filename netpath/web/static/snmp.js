@@ -21,6 +21,26 @@
   // character while the others were not.
   const escape = App.escapeHtml;
 
+  /* Upgrades the plain address a placeholder span carries into either a
+     link to the matching Nodes device, or an "Add as a device" link that
+     opens Nodes with the address already in the Add form — turning "no
+     device sent this trap" into one click instead of a copy-paste across
+     two tabs. Enhanced after the pane is already on screen, so opening a
+     trap never waits on a Nodes fetch; `stillCurrent` guards against a
+     slow lookup landing after the operator moved to a different trap. */
+  async function linkSourceIp(spanId, ip, stillCurrent) {
+    if (!ip) return;
+    const { byIp: map } = await App.deviceIndex();
+    if (!stillCurrent()) return;
+    const span = document.getElementById(spanId);
+    if (!span) return;
+    const device = map.get(ip);
+    span.outerHTML = device
+      ? `<a class="linkish inline" href="${App.buildRoute('nodes', ['device', device.id])}">${escape(ip)}</a>`
+      : `${escape(ip)} — <a class="linkish inline" href="${
+          App.buildRoute('nodes', [], { add: ip })}">Add as a device</a>`;
+  }
+
   /* Long status lines need breaking for the hover panel, which does not wrap. */
   function wrap(text, width = 72) {
     const out = [];
@@ -60,9 +80,10 @@
   /* ---------------------------------------------------------- histogram */
 
   function drawHistogram() {
+    const plot = view.histPlot || { buckets: (view.hist || {}).buckets || [], span: view.t1 - view.t0 };
     App.stackedHistogram(App.el('sn-hist-svg'), App.el('sn-hist'), {
-      buckets: (view.hist || {}).buckets || [],
-      unit: 'traps', span: view.t1 - view.t0,
+      buckets: plot.buckets,
+      unit: 'traps', span: plot.span,
       empty: 'No traps in this window',
       onBucket: (bucket) => pinWindow(bucket.t0, bucket.t1),
     });
@@ -131,6 +152,13 @@
     drawTable();
   }
 
+  // Names the window, since widening it is usually the answer — a bare
+  // "no traps" said nothing about why, over a header with nothing under it.
+  function noTrapsText() {
+    return `No traps between ${App.when(view.t0)} and ${App.when(view.t1)}. ` +
+      'Widen the time window or clear a filter.';
+  }
+
   function drawTable() {
     const columns = trapColumns();
     const table = App.grid(App.el('snmp-table'),
@@ -147,41 +175,43 @@
         showDetail(row);
         drawTable();
       };
-    });
+    }, noTrapsText());
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
 
   function showDetail(row) {
     const lines = [
-      App.when(row.ts),
+      escape(App.when(row.ts)),
       '',
-      `severity    ${row.severity_name} (${row.severity})`,
-      `source      ${row.source}${row.source_name ? `  (${row.source_name})` : ''}`,
-      `version     SNMP${row.version_name}${row.is_inform ? '  (InformRequest)' : ''}`,
+      `severity    ${escape(row.severity_name)} (${row.severity})`,
+      `source      <span id="sn-d-source">${escape(row.source)}</span>` +
+        (row.source_name ? `  (${escape(row.source_name)})` : ''),
+      `version     SNMP${escape(row.version_name)}${row.is_inform ? '  (InformRequest)' : ''}`,
     ];
     if (row.version === 3) {
-      lines.push(`user        ${row.community || '—'}`,
-                 `engine id   ${row.engine_id || '—'}`,
-                 `security    ${row.security || '—'}`,
-                 `auth        ${row.auth_state || '—'}`);
+      lines.push(`user        ${escape(row.community || '—')}`,
+                 `engine id   ${escape(row.engine_id || '—')}`,
+                 `security    ${escape(row.security || '—')}`,
+                 `auth        ${escape(row.auth_state || '—')}`);
     } else {
-      lines.push(`community   ${row.community || '—'}`);
+      lines.push(`community   ${escape(row.community || '—')}`);
     }
-    lines.push(`trap        ${row.trap_name || '—'}`,
-               `trap OID    ${row.trap_oid || '—'}`,
-               `kind        ${row.trap_kind || '—'}`,
-               `agent up    ${row.uptime_text} (${row.uptime} ticks)`);
+    lines.push(`trap        ${escape(row.trap_name || '—')}`,
+               `trap OID    ${escape(row.trap_oid || '—')}`,
+               `kind        ${escape(row.trap_kind || '—')}`,
+               `agent up    ${escape(row.uptime_text)} (${row.uptime} ticks)`);
     if (row.version === 0) {
       lines.push('',
-                 `enterprise  ${row.enterprise || '—'}`,
-                 `agent addr  ${row.agent_addr || '—'}`,
-                 `generic     ${row.generic_name || '—'} (${row.generic})`,
+                 `enterprise  ${escape(row.enterprise || '—')}`,
+                 `agent addr  ${escape(row.agent_addr || '—')}`,
+                 `generic     ${escape(row.generic_name || '—')} (${row.generic})`,
                  `specific    ${row.specific}`);
     }
     lines.push('', `varbinds (${row.varbind_n})`, '-'.repeat(52));
     for (const vb of row.varbinds) {
-      lines.push(`${vb.name}`, `  ${vb.oid}`, `  ${vb.type}: ${vb.text}`, '');
+      lines.push(`${escape(vb.name)}`, `  ${escape(vb.oid)}`,
+                 `  ${escape(vb.type)}: ${escape(vb.text)}`, '');
     }
     if (row.auth_state === 'encrypted') {
       lines.push('-'.repeat(52),
@@ -189,7 +219,8 @@
                  'SappiWhere does not decrypt it. Everything above came from',
                  'the message header, which is sent in the clear.');
     }
-    App.el('sn-detail').textContent = lines.join('\n');
+    App.el('sn-detail').innerHTML = lines.join('\n');
+    linkSourceIp('sn-d-source', row.source, () => view.selected === row.id);
   }
 
   /* ---------------------------------------------------------- settings */
@@ -270,7 +301,8 @@
       ${App.columnPickerFieldset('TRAP LIST COLUMNS', 'snmp', COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
-      { label: 'Save', primary: true, onClick: async (box) => {
+      { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
+        { queued: 'Saving…', done: 'Saved' }, (async () => {
         const on = (id) => box.querySelector(id).checked;
         const num = (id) => Number(box.querySelector(id).value);
         const text = (id) => box.querySelector(id).value.trim();
@@ -294,7 +326,7 @@
         await App.loadState();
         App.closeModal();
         App.refreshNow('snmp');
-      } },
+        })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
 
@@ -367,20 +399,25 @@
     const failed = /^Could not bind/.test(text);
 
     const status = App.el('sn-status');
-    status.textContent = text;
-    status.title = text;
-    status.classList.toggle('error', failed);
+    App.setText(status, text);
+    if (status.title !== text) status.title = text;
+    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
     // Wired once, reading the live title, rather than a fresh closure ten
     // times a second from fastTick.
     if (!status.onmousemove) {
+      status.tabIndex = 0;
       status.onmousemove = (event) => App.tooltip(wrap(status.title), event);
       status.onmouseleave = App.hideTooltip;
+      status.onfocus = () => {
+        const box = status.getBoundingClientRect();
+        App.tooltip(wrap(status.title), { clientX: box.left + box.width / 2, clientY: box.bottom });
+      };
+      status.onblur = App.hideTooltip;
     }
 
-    App.el('sn-dot').style.background = snmp.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)');
-    App.el('sn-toggle').textContent = snmp.running
-      ? 'Stop receiver' : 'Start receiver';
+    App.setBg(App.el('sn-dot'), snmp.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    App.setText(App.el('sn-toggle'), snmp.running ? 'Stop receiver' : 'Start receiver');
 
     const c = snmp.counters || {};
     const d = snmp.decoder || {};
@@ -394,7 +431,7 @@
     if (d.v3_encrypted) parts.push(`${d.v3_encrypted} authPriv (not decoded)`);
     if (d.v3_auth_failed) parts.push(`${d.v3_auth_failed} failed authentication`);
     parts.push(...extraCounterParts(c));
-    App.el('sn-counters').textContent = parts.join(' · ');
+    App.setText(App.el('sn-counters'), parts.join(' · '));
   }
 
   async function refresh() {
@@ -414,8 +451,11 @@
     view.hist = overview;
     view.traps = search.traps;
     const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
+    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
+    const p = view.histPlot;
     App.el('sn-hist-summary').textContent =
-      `${total.toLocaleString()} traps · ${App.stamp(t0, span)} – ${App.stamp(t1, span)}` +
+      `${total.toLocaleString()} traps · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
+      (p.narrowed ? ` (of a ${App.duration(span)} window)` : '') +
       ` · ${overview.stats.rows.toLocaleString()} stored in total`;
     // "300 of 4,120 shown": the total is the histogram's own sum over the
     // same window and filters, already in hand on this tick.
@@ -504,10 +544,23 @@
      filled the list it lives in. A row that is not in the current
      window is simply not selected — these three tables are live
      tails, and silently widening the window to find one row would
-     change what the operator asked to see. */
-  function activate(opts) {
-    if (!opts || !opts.parts || opts.parts[0] === undefined) return;
-    const id = Number(opts.parts[0]);
+     change what the operator asked to see.
+
+     #/snmp?source=<ip> (Alerts' "Recent traps", and any other
+     cross-module link naming an address) sets the filter and
+     re-searches, the same way a typed address and Apply would. */
+  async function activate(opts) {
+    if (!opts) return;
+    const query = opts.query || {};
+    let filtered = false;
+    if (query.source !== undefined) {
+      const field = App.el('sn-source');
+      if (field) { field.value = query.source; filtered = true; }
+    }
+    if (filtered) await App.refreshNow('snmp');
+    const parts = opts.parts || [];
+    if (parts[0] === undefined) return;
+    const id = Number(parts[0]);
     if (!Number.isFinite(id)) return;
     const row = (view.traps || []).find((r) => r.id === id);
     if (!row) return;
