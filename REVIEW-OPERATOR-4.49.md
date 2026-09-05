@@ -144,6 +144,42 @@ addresses in a switch's forwarding table.
 | B | 1,000 | Performance only |
 | C | 2,000 | Performance only — the operator's real scale |
 
+### 2.4 How the findings were established, and how three of them were withdrawn
+
+Two habits did most of the work here, and they are worth stating because they changed
+what several findings turned out to *be*.
+
+**Every timing claim was paired with a control that isolates the mechanism.** Showing
+that a syslog message with 240,000 structured-data elements takes 2.34 seconds is a
+number; showing that an *unterminated* bracket and a 250,000-level *balanced* nesting of
+the same field both stay linear is what proves it is the reslicing loop rather than a
+regular expression. Running 4,000,000 elements and getting the same time as 500,000 is
+what proves a cap rather than a speed-up. Running ten 500 KB elements is what proves the
+cap is on count and not on length. Three of this review's findings changed shape because
+of a control case, and one changed from "a quadratic denial of service" to "a quadratic
+whose input nobody can reach" — which is a different sentence entirely.
+
+**Nothing self-reported was taken on trust.** Every fix in section 7 was checked by
+somebody who did not write it, and the checks found things: that a complexity claim held
+under the cap being disabled, that a cycle-detection claim held for the hard case
+constructed independently, that a "before" state was really as described (read out of
+`git log -p`, because half the claims in any review are about a state nobody can see any
+more) — and, twice, that a claim was wrong.
+
+**Three findings were withdrawn.** One of mine: I read two HTTP 403s in a console log
+and concluded the interface was offering controls the server then refused. It was not —
+they were the test harness deliberately probing the permission boundary, a write
+attempted as a read-only account (must fail) and the same write as an operator account
+(must succeed), both recorded as passing. The agent I asked to fix it traced every path,
+could not reproduce it, and declined — which was correct, and is why it is withdrawn
+rather than "fixed" by a change that would have done nothing. **A console log records
+what happened, not what was offered.** Two more were withdrawn as already fixed since the
+last review, and are recorded in section 5.9.
+
+The point of saying this in the report is not modesty. It is that a review which reports
+only what it found, and never what it got wrong, gives an operator no way to calibrate
+the rest.
+
 ---
 
 ## 3. What had to change before the product could be evaluated on Windows
@@ -687,6 +723,52 @@ The device list is 423 KB for 250 devices — about 1.7 KB each — which at a 5
 is around 845 KB per page on a 2,000-device fleet. It is server-side paged, so that is
 the ceiling rather than the total, but it is a large page for a tablet.
 
+#### What the collectors did, at the end of Tier A
+
+| Collector | Counters |
+| --- | --- |
+| NetFlow | 12,000 packets → **107,067 flows**, 0 dropped, 0 rejected, 0 errors |
+| Syslog | 35,997 messages, 35,687 stored, 0 dropped, 0 rejected, 0 throttled, 0 errors, 20 TCP clients |
+| Nodes poller | 5,261 polls · 4,742 ok · 447 timeout · 71 auth-fail · **5 overruns** · 488 MAC walks · 247 identifications · **0 LLDP walks, 0 PoE polls, 0 STP polls** |
+| Alert engine | **122,425 evaluated** · 1,475 opened · 560 resolved · **6,587 rolled up** · 79 emails · 0 backlog · 0 apply errors |
+| Wireless | 21 polls, 21 ok, 0 errors |
+| ConfigRX | 6 backups · 3 changed · 1 suspect · 0 errors |
+
+Not one packet dropped, rejected or errored in either collector, across 107,000 flows
+and 36,000 syslog messages including a deliberate burst over both UDP and TCP framings.
+The alert engine evaluated 122,425 occurrences with zero backlog and zero apply errors.
+
+**And 6,587 rolled up against 1,475 opened, which puts O-25 in proportion.** The rollup
+is not broken — it suppressed four and a half times more alerts than it let through. What
+it cannot do is retract a child that was already open when its parent arrived, and on the
+shipped configuration that case is guaranteed for the metric rules, because a metric
+degrades before a device is declared down. So the rollup works hard and misses precisely
+the 108 that mattered most.
+
+**The three zeros are a finding of their own — see O-27.** After 5,261 polls, no LLDP
+walk, no PoE poll and no STP poll has ever happened, because no persona in the demo fleet
+implements any of those tables.
+
+**O-31 — the syslog counters do not balance, so an operator cannot tell deduplication
+from data loss. CONFIRMED (three samples six seconds apart, then traced).** 35,997
+messages arrived; 35,687 are recorded as stored; `dropped`, `rejected`, `filtered`,
+`throttled` and `errors` are all zero. 310 messages are accounted for by nothing, and
+every counter whose job is to explain a shortfall reads zero.
+
+They are not lost. `syslogd.py:453` does `counters["stored"] += self.db.insert(pending)`,
+and `syslogdb.insert` collapses repeated identical messages into a `repeat_count` bump
+rather than a new row, returning the number of **rows** written. The hourly timeline
+still counts every message, with a good comment saying why: *"a storm that collapses to
+one row is still a storm."*
+
+The behaviour is right; the instrument is wrong, about the one question these counters
+exist to answer. An operator asking "is my syslog collector dropping messages" sees a
+310-message shortfall with every explanatory counter at zero and cannot reach the correct
+conclusion from the screen. On a plant where a failing switch repeats the same message a
+thousand times a minute, that gap becomes enormous and looks exactly like loss. The
+number is already computed — `insert()` has `bumps` — so exposing a `collapsed` counter
+beside `stored` closes the arithmetic and makes a real shortfall mean something again.
+
 ⏳ Tier B (1,000) and Tier C (2,000) land here.
 
 **O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
@@ -792,6 +874,25 @@ This is also the third instance of one bug class in a file whose own docstring r
 the first two being fixed — the macro-clause `::=` scan and the IMPORTS symbol-list
 scan. All three are "scan forward for a terminator that may not be there". The class was
 fixed twice by patching instances.
+
+**And a fourth phase has the same exposure, bounded. CONFIRMED by independent check.**
+The agent who fixed the above reported that `_strip_comments_and_strings` was the *only*
+phase called without internal checkpointing. Verification refuted that:
+`_iter_macro_clauses` is a generator whose per-header work is invisible to the caller's
+`if not index % 256: check_budget()`, because that check fires only on *yielded* clauses.
+A MIB of 2,000,000 `OBJECT-TYPE` headers that never close with `::= { }` yields nothing,
+so the budget is never consulted — measured at a **16× overshoot** of a 0.2 second budget.
+
+It is bounded, and the bound is why this is a note rather than a defect: at the enforced
+default `max_mib_bytes` of 8 MB the same shape completes in about 2.1 seconds, inside the
+5.0 second budget, `max_mib_bytes` is an operator setting rather than attacker input, and
+`MACRO_CLAUSE_LIMIT`'s windowing keeps the work linear regardless. Reachable only by an
+administrator who has raised that cap far past its default, for a file they chose to
+upload.
+
+Recorded because the general lesson is now twice-proved in this one file: **a budget
+checked between units of work cannot bound a unit of work**, and "unit" includes the
+invisible interior of a generator.
 
 **PLAUSIBLE, deliberately not changed: SNMPv3 trap key-derivation amplification.**
 `netpath/trapdecode.py:328`'s `localized_key` hashes a 1 MiB buffer per cache miss,

@@ -26,29 +26,50 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 - [Data](#data)
 - [Deliberate limits](#deliberate-limits)
 
-The twelve tabs sit in four labelled groups, in frequency order: **Now**
-(**Dashboard**, **Alerts**), **Inventory** (**Nodes**, **IPAM**,
-**FortiWireless**, **ConfigRX**), **Telemetry** (**Routes**, **NetFlow**,
-**Syslog**, **SNMP Trap**) and **Admin** (**Settings**, **Debug**) — Admin
-stays rightmost so adding a module never moves it. The grouping is purely
-presentational: there is one tab list underneath it, and who is signed in,
-the way to the **Account** dialog, Sign out and the connection indicator
-sit outside the scrolling strip entirely, so narrowing the window can
-shrink the tabs but never scroll those out of reach. Routes is the NetPath
-module — the tab says what it shows, the package, database and settings
-keep the name they have always had. Dashboard aggregates whatever other
-modules the signed-in account can read — see Permissions, under Settings —
-rather than holding data of its own; from 4.39.0 it is a real page rather
-than a placeholder, and it is described under **Dashboard** below. A tab
-the signed-in account has no read access to is hidden from the tab bar
-entirely.
+The twelve tabs sit flat in one strip, in frequency order — **Dashboard**,
+**Alerts** · **Nodes**, **IPAM**, **FortiWireless**, **ConfigRX** ·
+**Routes**, **NetFlow**, **Syslog**, **SNMP Trap** · **Settings**, **Debug**
+— with a hairline before the first tab of each group after the first,
+standing in for the four labelled sections (Now/Inventory/Telemetry/Admin)
+an earlier revision drew as wrapped, named groups; Admin stays rightmost so
+adding a module never moves it. The grouping is purely presentational either
+way: there is one tab list underneath it, and who is signed in, the way to
+the **Account** dialog, Sign out and the connection indicator sit outside
+the scrolling strip entirely, so narrowing the window can shrink the tabs but
+never scroll those out of reach — and below about 480 px, Search, Account and
+Sign out collapse from a text label to an icon so they go on fitting beside
+the tabs rather than crowding them out (each keeps its accessible name, so
+nothing a screen reader announces changes). A tab that becomes current while
+the strip is scrolled elsewhere — a digit shortcut, a pasted link, kiosk
+rotation — scrolls itself into view. Routes is the NetPath module — the tab
+says what it shows, the package, database and settings keep the name they
+have always had. Dashboard aggregates whatever other modules the signed-in
+account can read — see Permissions, under Settings — rather than holding data
+of its own; from 4.39.0 it is a real page rather than a placeholder, and it
+is described under **Dashboard** below. A tab the signed-in account has no
+read access to is hidden from the tab bar entirely.
+
+**Only Dashboard's own script loads before the page is usable.** Each of the
+other eleven modules — 1.17 MB uncompressed between them, around 324 KB
+gzipped, before 4.49.0 — now loads the first time its tab is actually
+selected rather than unconditionally on every visit, at no cost to what
+opening a tab for the first time looks like: the tab reads as still-working,
+the same way an ordinary slow refresh already does, until its script and
+first render are ready.
 
 **A global search, on `/`,** looks across devices, MAC addresses,
-interfaces, alerts and NetPath destinations at once and opens whatever is
-picked at that record's own URL — the same link a colleague could be sent
-instead. It stands down whenever a field, a dialog or the help panel
-already has the keyboard, and the **Search** button beside Account and
-Sign out opens it for a mouse.
+interfaces, alerts and NetPath destinations, and — from 4.49.0 — IPAM hosts
+and subnets, syslog messages and wireless access points, at once, and opens
+whatever is picked at that record's own URL — the same link a colleague
+could be sent instead. It stands down whenever a field, a dialog or the help
+panel already has the keyboard, and the **Search** button beside Account and
+Sign out opens it for a mouse. Each group of results is its own independent
+lookup with its own failure handling: one group's endpoint being slow or
+erroring drops that group from the results rather than the ones after it —
+before 4.49.0 a single shared `try` meant one failing lookup silently emptied
+every group queried after it, in whatever order they happened to run. Not yet
+covered: an interface's own description or alias, and text inside a stored
+ConfigRX backup.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -300,11 +321,45 @@ own subtabs.
   (`cpmCPUTotal5minRev`, `ciscoMemoryPool`), Fortinet (`fgSysCpuUsage`,
   `fgSysMemUsage`, `fgSysSesCount`) and Juniper (`jnxOperatingCPU`,
   `jnxOperatingTemp`) health objects chosen by the device's detected
-  enterprise arc. They are recorded as `cpu_pct`, `mem_pct`, `disk_pct`,
-  `session_count` and `temp_c`, which is what makes the shipped
+  enterprise arc. They are recorded as `cpu_pct`, `mem_pct`,
+  `disk_pct` and `session_count`, which is what makes the shipped
   `cpu_high`, `mem_high` and `disk_high` rules live on a switch or a
   firewall rather than only on a Linux host. Thresholds are unchanged, so
   a device that was silent may start alerting once it starts reporting.
+  From 4.49.0, `mem_pct` also falls back to the same `hrStorageTable`
+  walk's physical-memory row when none of the three above answers it —
+  a Windows PC, a printer, most appliances — so a device whose CPU and
+  disk already worked through HOST-RESOURCES-MIB gets memory too, at no
+  extra cost to a device that already had a working `mem_pct`.
+- **A UPS wired to SNMP is asked how it is, not just left to shout.**
+  Battery status, seconds on battery, estimated runtime and charge,
+  battery voltage and temperature, input voltage, output load and active
+  alarms (UPS-MIB, RFC 1628) are tried on every device — not gated by
+  vendor arc the way the health probe above is, since a UPS's maker
+  varies far more than a switch's does and UPS-MIB is the one object
+  tree nearly all of them answer regardless. A non-UPS device costs one
+  extra scalar GET a poll and nothing more: the two table walks (input
+  line, output line) are only attempted once that GET shows the device
+  is a UPS at all. A unit whose firmware doesn't populate the standard
+  runtime figure falls back to APC's own PowerNet-MIB object, tried only
+  on APC's arc. Four built-in rules read it: UPS running on battery,
+  battery low, battery depleted (replace it), and output load high.
+- **A device's own temperature and humidity are polled from
+  ENTITY-SENSOR-MIB, not just an interface's SFP.** A dedicated
+  environmental monitor (an AVTECH Room Alert, or any switch, router or
+  PDU exposing chassis sensors through the standard MIB) is walked once
+  every five minutes for a device-level reading, in addition to the
+  on-demand per-port DOM/SFP read the interface dialog already offers.
+  Temperature is stored as one of three separate metric keys —
+  `temp_optic_c` for a sensor that maps to a port, `temp_ambient_c` for
+  one that maps to no port on a device that also reports a humidity
+  sensor, `temp_chassis_c` for everything else — because a comms room, a
+  switch's own board and an optic's DOM reading have entirely different
+  normal ranges (a healthy transceiver commonly runs 40–55 °C by design)
+  and one key with one threshold cannot tell a healthy switch from an
+  overheating room. Three built-in rules replace the one this briefly
+  shipped as, each tuned to its own kind of reading, plus a humidity-high
+  rule for the one metric that never needed splitting.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -877,6 +932,9 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   milliwatt object where present — appears on the interface table for a
   device that answers POWER-ETHERNET-MIB. A device is asked for any of
   these tables once and remembered rather than re-asked every poll.
+- **From 4.49.0, the neighbours this walk collects can be reviewed and
+  turned into an upstream device in one batch**, rather than one Edit
+  dialog at a time — see **One outage, one alert**, under Alerts.
 
 ---
 
@@ -1038,21 +1096,28 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **35 built-in rules** ship enabled: a device not responding, a device
+- **43 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
-  down/up/flapping, eleven CPU/memory/interface-utilization/
-  error-and-discard-rate/disk/ping-latency/packet-loss thresholds, a
-  critical or cold-start SNMP trap, a linkDown trap from a device Nodes
-  is not itself polling, a critical syslog line, a new IPAM address
-  conflict, an access point removed from its controller or gone offline, a
-  DHCP scope running out of leases, and three NetPath path rules (below).
-  Seven of the interface and disk thresholds among those could never fire
-  before 4.39.0, because nothing wrote the metric key they read: the poller
-  now records `if_in_util_pct`, `if_out_util_pct`, `if_in_error_rate`,
-  `if_out_error_rate`, `if_in_discard_rate`, `if_out_discard_rate` and
-  `disk_pct`, both per port and as a device-level maximum, so they are live.
+  down/up/flapping, nineteen CPU/memory/interface-utilization/
+  error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
+  environmental thresholds, a critical or cold-start SNMP trap, a
+  linkDown trap from a device Nodes is not itself polling, a critical
+  syslog line, a new IPAM address conflict, an access point removed from
+  its controller or gone offline, a DHCP scope running out of leases, and
+  three NetPath path rules (below). Seven of the interface and disk
+  thresholds among those could never fire before 4.39.0, because nothing
+  wrote the metric key they read: the poller now records `if_in_util_pct`,
+  `if_out_util_pct`, `if_in_error_rate`, `if_out_error_rate`,
+  `if_in_discard_rate`, `if_out_discard_rate` and `disk_pct`, both per
+  port and as a device-level maximum, so they are live. Eight more, new in
+  4.49.0, read the UPS and environmental metrics described under Nodes:
+  UPS on battery, battery low, battery depleted, output load high, and
+  ambient/chassis/optic temperature high plus humidity high — three
+  separate temperature rules rather than one, because a comms room, a
+  switch chassis and an SFP's DOM reading have different normal ranges
+  entirely (see Nodes → Devices and polling).
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
@@ -1143,9 +1208,28 @@ alerts and optionally emailing about them.
 ### One outage, one alert
 
 A device can be given an **upstream device** on its own form: the switch,
-router or firewall it sits behind. It is one optional field and nothing infers
-it for you — there is no LLDP or CDP discovery in this release — but it is what
-turns a site outage into a single alert.
+router or firewall it sits behind. It is what turns a site outage into a
+single alert, and it is the *only* thing the rollup below trusts — nothing
+here is ever inferred and applied for you, on purpose. Nodes has collected
+LLDP/CDP neighbours since 4.47.0, and each neighbour is best-effort matched
+to a known device, but a neighbour row can go stale between walks and a
+name can collide (two sites both naming a switch "core-sw-1"); suppressing a
+real, unrelated fault because of a guess is the one failure this feature must
+never have, so the neighbour table alone never sets `upstream_id`.
+
+**From 4.49.0, reviewing that guess is no longer one Edit dialog per
+device.** `GET /api/nodes/upstream-suggestions` lists every device with no
+`upstream_id` set whose own collected neighbours matched another monitored
+device, ranked by evidence — a chassis-MAC match rated above a sysName match,
+a neighbour nothing has confirmed recently rated down regardless of match
+kind — and flags a device with more than one plausible match rather than
+picking one for you. An operator reviews the list and accepts a batch in one
+call; the whole proposed graph is checked for a cycle no single pair could
+show before anything is written, and a batch that would create one is
+refused outright, naming the devices involved. This is still a proposal an
+operator confirms, never something the rollup applies on its own — the
+review is the fix for "two thousand manual edits", not a reason to stop
+requiring one.
 
 When a device stops answering and its upstream is also down, the alert rolls up
 under the upstream's rather than opening on its own, with a note saying which

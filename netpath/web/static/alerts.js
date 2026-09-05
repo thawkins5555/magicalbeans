@@ -231,6 +231,15 @@
     drawTable();
   }
 
+  // Same shape and wording as Syslog's/SNMP's own noMessagesText/noTrapsText:
+  // what is empty, and what would change it. Missing here until now — a
+  // filter that matched nothing (Device, in particular: a cross-module link
+  // naming a device with no alerts at all) left a bare header over an empty
+  // tbody instead of saying so.
+  function noAlertsText() {
+    return 'No alerts match these filters. Widen the time window or clear a filter.';
+  }
+
   function drawTable() {
     const columns = alertColumns();
     const checked = view.checked;
@@ -276,7 +285,7 @@
         drawTable();
         showDetail(row);
       };
-    });
+    }, noAlertsText());
     table.appendChild(body);
     App.wireRowKeyboard(body);
     App.el('alerts-count').textContent = countLabel();

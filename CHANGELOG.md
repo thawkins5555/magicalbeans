@@ -117,6 +117,251 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 4.49.0 — The estate it couldn't see
+
+A network engineer evaluated the product from the seat of a real plant: one
+site, roughly 2,000 endpoints, one person to run it. `REVIEW-OPERATOR-4.49.md`
+is the record, run against a simulated estate rebuilt to match — access
+switches, industrial switches, PLCs, wireless bridges, and, new this pass,
+UPSs, an environmental monitor, printers and Windows hosts, because a plant is
+mostly things plugged *into* the network rather than things with a routing
+table of their own. The campaign is still running; this is what has landed
+from it so far, not its conclusion.
+
+**The product could not see a UPS, and now it can.** Nothing before this
+release ever polled `1.3.6.1.2.1.33` (UPS-MIB, RFC 1628) — a UPS's own traps
+were decoded and its enterprise arc was named, so a UPS could shout but was
+never asked how it was. Battery status, charge, runtime, input/output voltage,
+output load and active alarms now ride the ordinary poll, tried on every
+device rather than gated by vendor arc the way CPU/memory health is — a UPS's
+maker varies far more than a switch's does, and UPS-MIB is the one object tree
+nearly all of them answer regardless. Cost is still controlled: one scalar GET
+first, and the two table walks (input line, output line) only when that GET
+shows the device is a UPS at all, so a non-UPS device pays for exactly one
+extra GET a poll, the same one the UCD-SNMP probe already costs it. A UPS
+whose firmware doesn't populate the standard runtime figure (some real APC
+units don't) falls back to APC's own PowerNet-MIB TimeTicks object, tried only
+on APC's arc and only once the standard scalar has failed. Four new rules ship
+with it — on-battery, battery-low, battery-replace, output-load-high — and on
+a simulated APC running low, the product now reports exactly what an operator
+needs: 15% charge, six minutes of runtime, `batteryDepleted`, mains gone.
+
+**Environmental sensors were readable only through a single port's DOM
+dialog, and only if the sensor happened to be wired to one.**
+ENTITY-SENSOR-MIB (RFC 3433) was decoded solely by the on-demand SFP/DDM read,
+gated on `entAliasMappingIdentifier` mapping the sensor to an interface — which
+a Room Alert's chassis temperature and humidity probes never do, so a
+dedicated environmental monitor returned "no sensors" for a device that had
+plenty. The same decode is now promoted to a whole-device, cadenced poll (once
+every five minutes, well inside the 900-second staleness window a threshold
+rule tolerates) that no longer requires a port mapping to be worth reading —
+it uses that mapping only to decide *which* metric key a reading becomes.
+AVTECH joins the vendor list for identification, though its own scalar OIDs
+are deliberately not decoded as a fallback: the Room Alert line's object
+layout differs by model (3E, 4E, 32S, 26W…) with no way to tell from
+`sysObjectID` alone which generation a given unit is, and a unit that answers
+the standard MIB instead — most current ones do — already gets full support
+without it.
+
+**One `temp_c` key for a room, a chassis and an optic was the campaign's most
+instructive defect.** It shipped for about a day of this pass before a running
+instance caught it: a comms room at 41.8 °C is an emergency, and a switch's
+SFP transceiver at 40–55 °C is the reason DOM exists — normal by design. One
+metric, one threshold, read as ten false "Temperature high" alerts on a
+25-device fleet with a single real Room Alert in it, the identical shape of
+email-storm the product's own `mib_missing` rule burned an operator's trust on
+once already. Temperature is now three metric keys, classified before storage
+by the same containment walk the DOM dialog already does — `temp_optic_c`
+when the sensor maps to a port, `temp_ambient_c` when it maps to no port on a
+device that also answers a humidity sensor (a chassis essentially never
+carries one; a dedicated environmental monitor, on any vendor's arc, always
+does), and `temp_chassis_c` as the default for everything else, deliberately
+the fallback rather than the ambient key so a device this can't positively
+identify as an environmental monitor never has its ordinary board warmth read
+as a room getting hot. Three separate rules replace the one, each with a
+threshold that kind of reading actually means something at (ambient 30/25 °C
+off ASHRAE's own allowable ceiling; chassis 75/65 °C, in line with what
+vendors themselves alarm at; optic 80/70 °C, above the ordinary DOM range) plus
+a new `humidity_high` rule at 80/70% RH. An install that already has the
+retired `temp_high` rule gets it disabled and renamed on upgrade, with every
+open alert against it resolved and noted rather than left to fire forever
+against a key nothing produces any more — and a customized copy of that rule
+is left alone rather than silently touched.
+
+**A Windows PC's memory was invisible, on a fleet where its CPU and disk
+already worked.** `mem_pct` came only from UCD-SNMP, a Fortinet scalar or the
+Cisco memory pool — none of which a Windows host, a printer or most
+appliances answer — while `cpu_pct` and `disk_pct` for the same devices
+already rode a HOST-RESOURCES-MIB fallback. The same `hrStorageTable` walk
+that fallback already reads for disk now also reads it for the physical-memory
+row (`hrStorageRam`, never the virtual-memory row, for the same reason the
+disk reader excludes page-cache-adjacent rows), tried only once neither of the
+other three has answered, so a device that already had a working `mem_pct`
+costs nothing extra.
+
+**Two ways to stop the monitoring system with one packet, both found by
+fuzzing the decoders directly and both fixed.** `syslogparse.py`'s
+structured-data walk rebuilt a fresh copy of the remaining message on every
+`[...]` element it stripped — O(n²) in element count on port 514/udp+tcp,
+unauthenticated by design. Measured before the fix: 240,000 elements
+(~720 KB) took 2.34 s; 500,000 (~1.5 MB) did not finish in 8 s. It now walks
+the string with an index instead of reslicing it, and a message is capped at
+64 parsed elements regardless — past the cap, whatever remains is kept
+verbatim as message text rather than parsed further or dropped, so a real,
+oversized message is still stored, just with some of its structured data
+sitting in the message column instead of behind its own label.
+`mibparse.py`'s comment/string masking pass scanned to end-of-file for a
+newline on every ASN.1 `--` comment marker when none was ahead — a real shape
+for a minified or half-downloaded MIB — costing O(markers × length): 600,000
+markers (~1.8 MB) took 5.25 s, already past the file's own five-second parse
+budget, and 700,000 (~2.1 MB) took 7.21 s. Worse, that budget was checked only
+*between* phases, and the masking pass is one phase — so the one ceiling that
+exists to cap a hostile upload's cost never got the chance to fire on the
+exact input that most needed it. The scan now remembers once a search for the
+next newline has come up empty (no later search, starting further along the
+same string, can find one either), and the masking loop takes the deadline
+directly, checking it from inside itself every 4,096 iterations, so a phase
+slow enough to blow the whole budget on its own is now cut off during it
+rather than needing to finish first. This is the third instance of one bug
+class in a file whose own docstring already named two earlier ones fixed by
+patching a single call site each time; the fuzzing that found it also
+confirmed both earlier fixes still hold, and left the two most obvious
+levers — trap decoding and the permission gate on every route — checked and
+clean (see below).
+
+**Twelve modules loaded before the Dashboard painted, on every visit,
+regardless of which of them anyone opened.** `app.js` 220 KB, `nodes.js`
+264 KB, `alerts.js` 90 KB and nine more — 1.17 MB uncompressed, roughly
+324 KB gzipped, most of it for tabs an operator may never look at, heaviest
+where it's least affordable: a tablet on plant Wi-Fi. Every module but
+Dashboard's own script tag is gone from `index.html` now; each one loads the
+first time its tab is actually selected, through the same `init()` every
+module already had, with the tab reading as still-working (the same accent
+line an ordinary slow refresh already draws) rather than a blank pane while
+its script is in flight. A module whose fetch fails degrades exactly like one
+that failed during eager startup always has: the tab hides, the failure is
+logged once, and an operator looking at it is moved off automatically.
+
+**The tab bar went back to twelve flat tabs, with the labelled groups
+replaced by a hairline.** Four named groups (Now/Inventory/Telemetry/Admin,
+new in 4.48.0) are gone; a thin rule before the first tab of each group after
+the first stands in for the label a wrapping `<div data-label>` used to draw.
+Two real bugs came with the four-group markup and are fixed regardless of the
+layout choice: the overflow fade — the gradient that tells you the strip has
+more to scroll to — was drawn as part of the scrolling content itself, so
+scrolling the strip dragged the fade into the middle of it, washing out
+whichever tab sat underneath while the real right edge went un-faded; it now
+lives on the utility group, which never scrolls, and reads the strip's real
+edge regardless of scroll position. And a tab that becomes current while the
+strip is scrolled elsewhere — a digit shortcut, a pasted hash route, kiosk
+rotation — now scrolls itself into view rather than leaving the highlighted
+tab off-screen. Below 480 px, Search/Account/Sign out collapse from text
+buttons to icon-only ones (the accessible name is unchanged, so nothing a
+screen reader announces changes) rather than crowding out the tabs beside
+them.
+
+**The rollup that stops a site outage becoming a mailbox full of alerts
+depended on a field an operator had to set by hand, once per device.**
+4.47.0's alert rollup only ever trusted `upstream_id`, deliberately never an
+unconfirmed LLDP/CDP neighbour match — suppressing a real port fault on a
+wrong guess is the one failure an alert system must not have, and that
+reasoning is unchanged. What was missing was the means: the neighbour data
+and the product's own best-effort device match already existed and nothing
+ever offered it to an operator to review. `GET /api/nodes/upstream-suggestions`
+now lists, per device with no `upstream_id` set, every neighbour-matched
+candidate with its evidence — a chassis-MAC match ranked over a sysName one
+(a name can collide across two sites' switches both called "core-sw-1"; a MAC
+collision is far rarer), a stale neighbour row ranked down regardless of match
+kind — and a device with more than one plausible match comes back flagged
+rather than one candidate being silently chosen for it.
+`POST /api/nodes/upstream-suggestions/apply` takes a batch of accepted
+device/upstream pairs and applies them in one transaction, after checking the
+*whole proposed graph* for a cycle no single pair could show on its own — two
+assignments in the same batch, each valid alone, that together point two
+devices at each other — and refuses the batch outright, naming the devices
+involved, rather than applying whatever isn't part of it. Nothing here ever
+picks a suggestion for an operator; the review is still what turns a guess
+into something the rollup may trust.
+
+**A dozen interface defects, one of them a real functional break.** Bulk mute
+failed for every selection, silently: the bulk-mute and maintenance-window
+dialogs share one scope picker, and the picker answers in the window's own
+field shape (`scope_kind`/`scope_group_id`/`scope_device_ids`) that the older
+bulk-mute route never grew — so every bulk mute reached the server as fields
+it does not read and failed regardless of what was selected, with the
+resulting error the only part behaving as intended. Fixed by translating at
+the call site, since the windows dialog is right to keep the shape it has.
+Template Preview read the stored row rather than the request body, so
+previewing an edit had always saved it first — an operator who previewed a
+change and thought better of it had already overwritten the template with no
+way back; Preview now snapshots the server's version when the dialog opens and
+restores it on Cancel. A device-count label with nothing to compare against
+("500 device(s)", on a list now server-paged and possibly showing a fraction
+of what matched) moved onto the same shared count label the rest of the
+product already uses. Destructive actions that shared a button row with Save
+looking identical to it — clearing a stored enable secret, forgetting an SSH
+host key, removing a subnet or a DHCP server, clearing IPAM stats, removing a
+device, discarding a scan — now carry the `danger` styling every other
+trust-destroying action in the product already used, peeled away from Save
+rather than sitting beside it. `resolveMacSearch` said nothing when a search
+box held something that wasn't a MAC at all, rather than distinguishing "not a
+MAC" from "the server refused this MAC" — the far more common reason to type
+digits and dots into that box is an IP address, whose octets are valid hex
+too. And ConfigRX's Diff buttons were gated `configrx: write`, left over from
+before 4.48.0 moved reading a single stored backup to `configrx: read`;
+comparing two backups a reader can already open one at a time is not a write,
+and it's the single most common thing anyone does with a config backup.
+
+**Started under a service manager, the application printed nothing at all —
+including the one line that warns a sign-in is travelling in the clear.**
+CPython only line-buffers a stream attached to a terminal; redirected to a
+file or a pipe, exactly what a service manager gives it, it block-buffers,
+holding output in an 8 KB buffer until it fills or the process exits.
+Measured: started headless with stdout redirected to a file, the log was
+still completely empty after 120 seconds, while the server had been answering
+requests the whole time; the same command with `-u` printed its banner in
+1.2 s. `demo/scenario.py` already passed `-u`, which is how this stayed
+hidden. Fixed once, in `main()`, by reconfiguring stdout and stderr for line
+buffering before anything prints — verified: the banner now arrives in
+1.58 s with no `-u` needed.
+
+**A mechanical, exhaustive check of the permission model, and a fuzz pass
+over every decoder that takes unauthenticated or uploaded input.** Every one
+of 213 routes in `web/server.py` was parsed and every handler's write
+behaviour traced up to four calls deep; the seven flagged as possible
+mismatches were all false positives on reading, and the two routes whose gate
+depends on the request body were confirmed correct by hand. `trapdecode`,
+`nfdecode`, and both regular expressions in `syslogparse` were fuzzed to 1 MB
+and came back clean — truncation at every one of the 84 byte boundaries of a
+valid v2c trap, a template that redefines itself mid-packet, a 60,000-byte
+field claimed in a 10-byte record, all rejected or handled with no unhandled
+exception. `demo/selftest.py`, the offline wire-format conformance check every
+persona is driven through, went from 623 checks to 897 as the new device
+classes were added, all passing.
+
+**The harness could not run this campaign on Windows at all, and now it
+can.** Two callers of the same `ping` binary resolved it two different ways —
+one honoured `PATH`, one always landed on `C:\WINDOWS\system32\ping.EXE` — so
+a device the demo harness had taken down for a test kept reading as reachable
+regardless; both now resolve it identically. The fleet simulator registered
+every device socket on one selector, which on Windows is capped at
+`FD_SETSIZE` (512) file descriptors and simply cannot hold a 1,000- or
+2,000-device fleet; devices are now sharded across several selector instances,
+one loop per shard, and a 2,000-device fleet binds in 0.85 s across five
+shards at 8.8 MB RSS idle. And the campaign conductor read `/proc/<pid>/stat`
+for CPU and memory, which does not exist on Windows and silently returned
+nothing; it now reads the same figures through `GetProcessTimes` and
+`GetProcessMemoryInfo` on Windows, with no new dependency.
+
+Still open, and part of why this campaign keeps running rather than closing
+here: no report of device availability or link utilisation over any stored
+history, though the samples to build one already exist; no way to search or
+check compliance across two thousand stored ConfigRX backups; an audit trail
+that still cannot be read from the interface and does not yet cover adding a
+device, editing an alert rule or pushing a ConfigRX backup; and a printer,
+identified correctly, that still answers with nothing but an interface
+counter and a ping time.
+
 ### 4.48.0 — The interface, reviewed
 
 Two specialist reviews of 4.47.0 — one graphic and typographic, one on

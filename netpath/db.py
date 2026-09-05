@@ -116,6 +116,85 @@ NETPATH_DEFAULTS = {
 # and appdb.py each filter a merged dict down to the keys they own.
 APP_DEFAULTS = NETPATH_DEFAULTS
 
+# Bounds on the numbers a target row (add_target/update_target) or the
+# matching global defaults (save_settings) may carry. Neither route validated
+# these before now -- coerce_settings (settingsutil.py) only checks that a
+# value is *a number*, never that it is a sane one -- and four of them are not
+# cosmetic: they are handed straight to a subprocess argument, a per-run
+# time budget, or a thread pool size.
+#
+#   max_hops  -> tracer._build_command's "-h"/"-m": a raw CLI argument to the
+#                traceroute/tracert binary, and a term in expected_budget's
+#                worst-case-runtime arithmetic. TTL is one byte on the wire,
+#                so no path is ever more than 255 hops regardless of what a
+#                target claims.
+#   probes    -> tracer._build_command's "-q" (Linux only; Windows tracert
+#                always sends exactly 3 and ignores this): how many probe
+#                packets go out at *every* hop, and also a term in
+#                expected_budget. An unbounded value is both a probe flood
+#                against every router on the path and a way to stretch one
+#                trace's worst-case runtime arbitrarily far.
+#   timeout_s -> tracer._build_command's "-w": too low starves every probe
+#                before a reply can arrive; too high multiplies through
+#                expected_budget the same way an inflated probes count does.
+#   interval_s -> monitor.py's scheduler: `next_run = last_run + interval_s`.
+#                At or below zero a target is perpetually "due", so the
+#                scheduler launches a fresh traceroute subprocess against it
+#                as fast as the worker pool can turn them over -- a spawn
+#                storm and a probe flood aimed at one destination, the same
+#                shape ipam_scan.py's own docstring already describes for an
+#                unpaced ping sweep.
+#   trace_workers -> service.py hands this straight to
+#                ThreadPoolExecutor(max_workers=...); it is a settings-level
+#                default, not a per-target field, but the same "never
+#                checked past being a number" gap.
+#
+# warn_rtt_ms/warn_loss reach neither a subprocess, a loop bound nor an
+# allocation -- only classify()'s comparison in monitor.py -- so they are
+# clamped to what is merely sane (non-negative; a percentage) rather than
+# to a mechanism-driven ceiling.
+MIN_INTERVAL_S, MAX_INTERVAL_S = 5.0, 30 * 24 * 3600.0
+MIN_MAX_HOPS, MAX_MAX_HOPS = 1, 255
+MIN_PROBES, MAX_PROBES = 1, 20
+MIN_TIMEOUT_S, MAX_TIMEOUT_S = 0.1, 30.0
+MIN_TRACE_WORKERS, MAX_TRACE_WORKERS = 1, 64
+
+
+def _clamp(value, lo, hi, kind=float):
+    try:
+        value = kind(value)
+    except (TypeError, ValueError):
+        return lo
+    return min(max(value, lo), hi)
+
+
+def _clamp_target_fields(fields: dict) -> dict:
+    """Bounds-check the numeric target fields present in `fields`, in place.
+
+    Applied by both add_target and update_target so a target can never be
+    written -- however it got here -- with a value that turns the next
+    traceroute run against it into an unbounded subprocess argument or an
+    unpaced spawn loop. Fields not present are left untouched; update_target
+    already filters to its own allow-list before this runs.
+    """
+    if "interval_s" in fields:
+        fields["interval_s"] = _clamp(fields["interval_s"], MIN_INTERVAL_S,
+                                      MAX_INTERVAL_S, int)
+    if "max_hops" in fields:
+        fields["max_hops"] = _clamp(fields["max_hops"], MIN_MAX_HOPS,
+                                    MAX_MAX_HOPS, int)
+    if "probes" in fields:
+        fields["probes"] = _clamp(fields["probes"], MIN_PROBES, MAX_PROBES, int)
+    if "timeout_s" in fields:
+        fields["timeout_s"] = _clamp(fields["timeout_s"], MIN_TIMEOUT_S,
+                                     MAX_TIMEOUT_S, float)
+    if "warn_rtt_ms" in fields:
+        fields["warn_rtt_ms"] = _clamp(fields["warn_rtt_ms"], 0.0,
+                                       float("inf"), float)
+    if "warn_loss" in fields:
+        fields["warn_loss"] = _clamp(fields["warn_loss"], 0.0, 100.0, float)
+    return fields
+
 
 class Database:
     def __init__(self, path: str):
@@ -173,6 +252,21 @@ class Database:
         return settingsutil.coerce_settings(NETPATH_DEFAULTS, values, strict=False)
 
     def save_settings(self, values: dict) -> None:
+        values = dict(values)
+        if "trace_workers" in values:
+            values["trace_workers"] = _clamp(
+                values["trace_workers"], MIN_TRACE_WORKERS, MAX_TRACE_WORKERS, int)
+        # The five default_* keys are exactly the target fields under a
+        # prefix -- new targets are created from them (post_target's
+        # `defaults["default_probes"]` etc., api.py) -- so they get the
+        # identical clamp add_target/update_target apply to a target's own
+        # values, by stripping and restoring the prefix around the same
+        # helper rather than duplicating its bounds.
+        defaulted = {k[len("default_"):]: v for k, v in values.items()
+                    if k.startswith("default_") and k in APP_DEFAULTS}
+        _clamp_target_fields(defaulted)
+        for key, value in defaulted.items():
+            values[f"default_{key}"] = value
         with self._lock:
             for key, value in values.items():
                 if key not in APP_DEFAULTS:
@@ -197,13 +291,19 @@ class Database:
         warn_loss: float = 10.0,
         timeout_s: float = 2.0,
     ) -> int:
+        fields = _clamp_target_fields({
+            "interval_s": interval_s, "max_hops": max_hops, "probes": probes,
+            "warn_rtt_ms": warn_rtt_ms, "warn_loss": warn_loss,
+            "timeout_s": timeout_s,
+        })
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO targets(host, label, interval_s, max_hops, probes,"
                 " warn_rtt_ms, warn_loss, timeout_s, enabled, created_ts)"
                 " VALUES (?,?,?,?,?,?,?,?,1,?)",
-                (host, label or host, interval_s, max_hops, probes,
-                 warn_rtt_ms, warn_loss, timeout_s, time.time()),
+                (host, label or host, fields["interval_s"], fields["max_hops"],
+                 fields["probes"], fields["warn_rtt_ms"], fields["warn_loss"],
+                 fields["timeout_s"], time.time()),
             )
             self._conn.commit()
             return int(cur.lastrowid)
@@ -217,6 +317,7 @@ class Database:
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
+        _clamp_target_fields(sets)
         clause = ", ".join(f"{k}=?" for k in sets)
         with self._lock:
             self._conn.execute(
