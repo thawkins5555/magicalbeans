@@ -16,8 +16,11 @@
  * Produces, in --out:
  *   tab-<name>-<tag>.png             every top-level tab, admin pass
  *   sub-<tab>-<name>-<tag>.png       every subtab (admin pass), including
- *                                    Nodes' Topology and the device-detail
- *                                    pane's four nested subtabs
+ *                                    Nodes' Topology, the device-detail
+ *                                    pane's four nested subtabs, and
+ *                                    Settings' eight (general/retention/
+ *                                    signin/users/directory/maintenance/
+ *                                    modules/audit)
  *   sub-viewer-<tab>-<name>-<tag>.png  the same subtabs under `viewer`, and
  *   sub-noc-<tab>-<name>-<tag>.png     under `noc` - subtabs used to be
  *                                    walked on the admin pass only
@@ -30,12 +33,16 @@
  *                                   ConfigRX's device-settings and
  *                                   bulk-settings dialogs (both carry the SSH
  *                                   credential fields — there is no separate
- *                                   credential dialog to capture), and an
+ *                                   credential dialog to capture), an
  *                                   actual SSH terminal session (a real
  *                                   popup window, not a #modal dialog —
  *                                   gated on a module ("ssh") seed.py never
  *                                   grants viewer or noc at all, so only
- *                                   admin ever opens it)
+ *                                   admin ever opens it), and the Nodes
+ *                                   Topology bar's upstream-suggestions
+ *                                   review dialog (nodes:read only — the
+ *                                   dialog itself hides Apply for an
+ *                                   account that cannot use it)
  *   dlg-viewer-<name>-<tag>.png      the same dialog walk run under `viewer`,
  *   dlg-noc-<name>-<tag>.png         and under `noc`. A screenshot exists
  *                                    only for a dialog that actually OPENED;
@@ -103,7 +110,15 @@
  *                                   failed requests and every response >= 400
  *                                   (from every pass above — admin, viewer,
  *                                   noc, kiosk, theme x3, viewport x3)
- *   metrics-<tag>.json              nodes-table fill time, long tasks,
+ *   metrics-<tag>.json              nodes-table fill time, long tasks (a
+ *                                   count and longest duration overall,
+ *                                   plus longtasks_by_tab and
+ *                                   longtasks_by_phase — coarse attribution
+ *                                   to which of the twelve tabs or which of
+ *                                   walkDialogs/driveSafeControls/census was
+ *                                   running when each one landed, admin
+ *                                   pass only, since that is the only
+ *                                   context with the PerformanceObserver),
  *                                   payload size, each account's visible
  *                                   tabs/write-controls/permissions, and —
  *                                   when demo/out/ping_state.json exists —
@@ -206,6 +221,8 @@ const SUBTABS = {
   nodes: ['devices', 'topology', 'discovery', 'profiles'],
   alerts: ['current', 'rules'],
   ipam: ['subnets', 'conflicts', 'dhcp'],
+  settings: ['general', 'retention', 'signin', 'users', 'directory', 'maintenance',
+             'modules', 'audit'],
 };
 
 // The device-detail pane's own nested subtabs (`#nd-d-subs`), separate from
@@ -500,7 +517,7 @@ async function rawApi(page, method, url, body) {
 
 /* ------------------------------------------------------------------- walk */
 
-async function walkTabs(page, dir, tag, recorder, prefix = 'tab') {
+async function walkTabs(page, dir, tag, recorder, prefix = 'tab', longtaskSink = null) {
   // Theme and viewport passes stay admin-only-and-fast, exactly as before;
   // the account passes (admin/'tab', 'viewer', 'noc') now all walk subtabs
   // too — that used to be admin-only, which meant "every subtab" was never
@@ -508,6 +525,15 @@ async function walkTabs(page, dir, tag, recorder, prefix = 'tab') {
   const walksSubtabs = !prefix.startsWith('theme-') && !prefix.startsWith('viewport-');
   const seen = [];
   for (const tab of TABS) {
+    // window.__longtasks only exists where main()'s admin context installed
+    // the PerformanceObserver (see there) — nowhere else, so this is a
+    // no-op (both reads return 0-length) for every other pass. Diffing the
+    // array's length rather than its contents is enough to attribute a
+    // COUNT and a max duration to "while this tab was being walked"; it
+    // does not claim the task ran because of this tab specifically, only
+    // that it landed inside this window.
+    const before = longtaskSink
+      ? await page.evaluate(() => (window.__longtasks || []).length).catch(() => 0) : 0;
     const done = await guarded(recorder, `${prefix}:${tab}`, async () => {
       const visible = await page.isVisible(`.tab[data-tab="${tab}"]`).catch(() => false);
       if (!visible) return 'tab button not visible';
@@ -517,6 +543,12 @@ async function walkTabs(page, dir, tag, recorder, prefix = 'tab') {
       return '';
     });
     if (done) seen.push(tab);
+    if (longtaskSink) {
+      const after = await page.evaluate(() => window.__longtasks || []).catch(() => []);
+      const delta = after.slice(before);
+      longtaskSink[tab] = { count: delta.length,
+        longest_ms: delta.length ? Math.round(Math.max(...delta)) : 0 };
+    }
 
     for (const sub of SUBTABS[tab] || []) {
       if (!walksSubtabs) break;
@@ -623,6 +655,26 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     await popup.close().catch(() => {});
     return `opened popup "${title}"`;
   });
+
+  // ---- Upstream suggestions (Nodes/Topology bar — nodes.js:5060). Not
+  // write-gated: reading suggestions only needs nodes:read, and the dialog
+  // itself hides its own Apply button for an account that cannot use it,
+  // so this is one dialog every account can at least open.
+  await guarded(recorder, step('dlg:upstream-suggestions'), async () => {
+    await selectTab(page, 'nodes');
+    await page.click('#page-nodes .subtab[data-subtab="topology"]').catch(() => {});
+    await settle(page, 600);
+    const gate = await gateState(page, '#nd-topo-upstream-suggestions');
+    if (!gate.present || !gate.visible) {
+      return 'absent — #nd-topo-upstream-suggestions not visible';
+    }
+    await page.click('#nd-topo-upstream-suggestions', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await settle(page, 500);
+    await shoot(page, dir, shot('dlg', 'upstream-suggestions'));
+    return 'opened';
+  });
+  await closeAnyModal(page);
 
   // ---- MAC search: resolveMacSearch (nodes.js) only runs on a deliberate
   // Enter in the search box, never on the five-second refresh, so the
@@ -1175,21 +1227,33 @@ async function censusAccount(page, dir, tag, recorder, account) {
     for (const tab of TABS) {
       await selectTab(page, tab);
       await settle(page, 500);
-      if (SUBTABS[tab]) {
-        await page.click(`#page-${tab} .subtab[data-subtab="${SUBTABS[tab][0]}"]`)
-          .catch(() => {});
-        await settle(page, 300);
+      // Visit every subtab, not just the first (Settings alone has eight —
+      // general/retention/signin/users/directory/maintenance/modules/audit —
+      // and a control that only renders inside one of them, Audit's own
+      // controls included, used to never be enumerated at all because
+      // nothing here ever looked). Merged by id (or tag+label, same
+      // dedup key harvestControls itself uses) since the same control can
+      // legitimately show up from more than one subtab pass.
+      const merged = new Map();
+      const subtabs = SUBTABS[tab] && SUBTABS[tab].length ? SUBTABS[tab] : [null];
+      for (const sub of subtabs) {
+        if (sub) {
+          await page.click(`#page-${tab} .subtab[data-subtab="${sub}"]`).catch(() => {});
+          await settle(page, 300);
+        }
+        if (tab === 'nodes' && sub === 'devices') {
+          await page.click('#nodes-table tbody tr:first-child').catch(() => {});
+          await settle(page, 400);
+        } else if (tab === 'configrx') {
+          await page.click('#cx-devices tbody tr:first-child').catch(() => {});
+          await settle(page, 400);
+        }
+        for (const c of await harvestControls(page, `#page-${tab}`, tab)) {
+          const key = c.id || `${c.tag}|${c.label}`;
+          if (!merged.has(key)) merged.set(key, c);
+        }
       }
-      if (tab === 'nodes') {
-        await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
-        await settle(page, 300);
-        await page.click('#nodes-table tbody tr:first-child').catch(() => {});
-        await settle(page, 400);
-      } else if (tab === 'configrx') {
-        await page.click('#cx-devices tbody tr:first-child').catch(() => {});
-        await settle(page, 400);
-      }
-      buttonsByTab[tab] = await harvestControls(page, `#page-${tab}`, tab);
+      buttonsByTab[tab] = [...merged.values()];
     }
     const chrome = [
       ...(await harvestControls(page, '#tabs', 'chrome')),
@@ -1511,11 +1575,31 @@ async function main() {
       return `signed in as admin at ${args.base}`;
     });
 
-    adminTabs = await walkTabs(page, dir, tag, recorder, 'tab');
+    // Coarse long-task attribution: window.__longtasks (installed just above)
+    // is one running array for the whole admin context, so this snapshots
+    // its length around each phase and around each tab inside walkTabs
+    // (that function's own longtaskSink param) to turn "40 long tasks this
+    // session" into "which part of the session" — still not "which line of
+    // code", but a phase or a tab is a real answer where a bare count is not.
+    const longtaskCount = () => page.evaluate(() => (window.__longtasks || []).length)
+      .catch(() => 0);
+    const longtasksByTab = {};
+    adminTabs = await walkTabs(page, dir, tag, recorder, 'tab', longtasksByTab);
+    let phaseStart = await longtaskCount();
     await walkDialogs(page, dir, tag, recorder, 'admin');
+    let phaseEnd = await longtaskCount();
+    const longtasksByPhase = { dialogs: phaseEnd - phaseStart };
     metrics = await measure(page, recorder);
+    phaseStart = phaseEnd;
     await driveSafeControls(page, dir, tag, recorder, 'admin');
+    phaseEnd = await longtaskCount();
+    longtasksByPhase.safe_controls = phaseEnd - phaseStart;
+    phaseStart = phaseEnd;
     await censusAccount(page, dir, tag, recorder, 'admin');
+    phaseEnd = await longtaskCount();
+    longtasksByPhase.census = phaseEnd - phaseStart;
+    metrics.longtasks_by_tab = longtasksByTab;
+    metrics.longtasks_by_phase = longtasksByPhase;
     await context.close();
 
     // ---- viewer pass: which tabs a read-only account actually sees, every
