@@ -947,6 +947,17 @@ class NodesDatabase:
         for column in ("poe_capable", "stp_capable"):
             if column not in devices:
                 self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
+        # Same capability memory, same reasoning, for UPS-MIB and the
+        # device-level ENTITY-SENSOR-MIB scan: added after poe_capable/
+        # stp_capable, and NOT alongside them above, because those two
+        # shipped gated on exactly this pattern from the start while
+        # ups_capable/sensor_capable did not — see nodepoll._poll_ups_health
+        # and _poll_environment for what closed that gap and why a device
+        # confirmed neither should stop paying for either, forever, rather
+        # than once.
+        for column in ("ups_capable", "sensor_capable"):
+            if column not in devices:
+                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
         # Bridge-wide STP state (BRIDGE-MIB dot1dStp), refreshed every poll
         # once stp_capable is known true. Descriptive device state, the same
         # shape sys_name/vendor already are, not a time series — the one
@@ -2237,6 +2248,32 @@ class NodesDatabase:
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET stp_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    # ------------------------------------------------------ UPS / sensors
+
+    def set_ups_capable(self, device_id: int, capable: bool | None) -> None:
+        """set_poe_capable's own counterpart for UPS-MIB: True once its
+        scalar batch has answered anything, False once it has answered
+        nothing, so a device confirmed not a UPS stops paying for even the
+        one small scalar GET nodepoll._poll_ups_health otherwise sends
+        every poll forever."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET ups_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    def set_sensor_capable(self, device_id: int, capable: bool | None) -> None:
+        """set_poe_capable's own counterpart for the device-level ENTITY-
+        SENSOR-MIB scan: True once entPhySensorValue has answered anything,
+        False once it has answered nothing, so a device confirmed to have
+        no sensors stops paying for the walk nodepoll._poll_environment
+        otherwise retries every _SENSOR_REFRESH_S forever."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET sensor_capable = ? WHERE id = ?",
                 (None if capable is None else (1 if capable else 0), device_id))
             self._conn.commit()
 

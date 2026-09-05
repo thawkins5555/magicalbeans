@@ -2160,7 +2160,10 @@ class AlertEngine:
         SUPPRESSED answer represents, which has no open row to write a note
         onto either — the same asymmetry _apply's own SUPPRESSED branch
         already has for the device_down alert itself, reused here via
-        _ROLLUP_NO_ROW_REASON.
+        _ROLLUP_NO_ROW_REASON. Doubles as resolve_by_dedup's rolled_up_into:
+        the alert a screen would fold a child under is exactly the alert an
+        operator would find the rollup note on, so the same "None means no
+        open row to point at" rule serves both.
         """
         probe = Occurrence(kind="device_event", source_kind="down",
                            entity_kind="device", entity_id=device_id,

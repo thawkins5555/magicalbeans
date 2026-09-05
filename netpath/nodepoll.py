@@ -2245,17 +2245,30 @@ class NodePoller:
         why keying this to a vendor list would not work for a UPS the way
         it does for a switch or router.
 
-        Cost is still controlled, just not by an arc lookup: the first
-        read is one GET of every scalar in the table, which is no more
-        expensive than the UCD-SNMP read every device already gets, and
-        the two per-line TABLE reads (upsInputVoltage, upsOutputPercent-
-        Load — each its own GETBULK walk) are only attempted once that
-        GET shows at least one scalar answered. A device that is not a
-        UPS answers none of them and is never asked for the tables at
-        all, so a non-UPS device in the fleet pays for exactly one extra
-        GET per poll, the same one UCD_SNMP already costs it.
+        Cost is controlled two ways, one per poll and one forever. Within
+        a single poll: the first read is one GET of every scalar in the
+        table, no more expensive than the UCD-SNMP read every device
+        already gets, and the two per-line TABLE reads (upsInputVoltage,
+        upsOutputPercentLoad — each its own GETBULK walk) are only
+        attempted once that GET shows at least one scalar answered.
+        Across polls: devices.ups_capable is the same probe-once-remember
+        memory _poll_poe/_poll_stp already use for their own tables — NULL
+        until the first attempt, then True or False, persisted, so a
+        confirmed-not-a-UPS device is skipped entirely (not even the one
+        scalar GET) on every later poll rather than paying that GET
+        forever. Without this a fleet of 2,000 devices with 100 real UPSs
+        sent 1,900 pointless GETs every poll, indefinitely — one extra
+        request on a device that cannot answer is fine; the same request
+        forever is the regression this guards against. Recorded only on
+        the FIRST probe (capable is None), the same "a miss on the first
+        probe is a verdict, a miss later is just a miss" rule _poll_poe's
+        own docstring states — a UPS that times out one poll must not be
+        relabelled incapable off that alone.
         """
         metrics: list[tuple] = []
+        capable = device["ups_capable"] if "ups_capable" in device.keys() else None
+        if capable == 0:
+            return metrics
         scalars = [probe for probe in nodeoids.UPS_HEALTH if probe[4] == "scalar"]
         try:
             response = self._snmp_get(device, config, [probe[3] for probe in scalars])
@@ -2277,7 +2290,11 @@ class NodePoller:
             # that does not implement UPS-MIB at all), so the two column
             # walks below are skipped rather than sent to every non-UPS
             # device in the fleet on every poll.
+            if capable is None:
+                self.db.set_ups_capable(device["id"], False)
             return metrics
+        if capable is None:
+            self.db.set_ups_capable(device["id"], True)
         for key, label, unit, oid, how, scale in nodeoids.UPS_HEALTH:
             if how == "scalar" or key in already:
                 continue
