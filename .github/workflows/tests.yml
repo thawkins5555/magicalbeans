@@ -175,6 +175,15 @@ jobs:
           node tests/ui/walk.mjs --base "http://127.0.0.1:$APP_PORT" \
               --creds demo/out/creds.txt --out demo/out/ui --tag ci
 
+      - name: Check a failed job leaves no unhandled rejection
+        if: hashFiles('tests/ui/failed_job_no_pageerror.mjs') != ''
+        run: |
+          # Deliberately provokes a server refusal, so it cannot live in
+          # walk.mjs — that walk asserts an admin session sees no console error
+          # and no response >= 400, which this would trip on purpose.
+          node tests/ui/failed_job_no_pageerror.mjs \
+              --base "http://127.0.0.1:$APP_PORT" --creds demo/out/creds.txt
+
       - name: No browser walk in this tree
         if: hashFiles('tests/ui/walk.mjs') == ''
         run: |

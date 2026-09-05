@@ -5597,12 +5597,18 @@
     App.el('nd-rep-avail-30d').onclick = () => setPeriodDays('nd-rep-avail', 30);
     App.el('nd-rep-avail-90d').onclick = () => setPeriodDays('nd-rep-avail', 90);
     App.el('nd-rep-avail-lastmonth').onclick = () => setPeriodLastMonth('nd-rep-avail');
-    App.el('nd-rep-avail-run').onclick = runAvailabilityReport;
+    // App.runJob has already toasted and announced a failure by the time it
+    // rethrows, so the throw is only there for a caller that wants to know.
+    // An onclick is not one, and letting it escape leaves an unhandled
+    // rejection: a refused report (the whole-fleet Top-N window guard being
+    // the one an operator will actually hit) reached the page as a real
+    // pageerror while the toast said the right thing.
+    App.el('nd-rep-avail-run').onclick = () => { runAvailabilityReport()?.catch(() => {}); };
     App.el('nd-rep-avail-export-csv').onclick = exportAvailReportCsv;
     App.el('nd-rep-topn-7d').onclick = () => setPeriodDays('nd-rep-topn', 7);
     App.el('nd-rep-topn-30d').onclick = () => setPeriodDays('nd-rep-topn', 30);
     App.el('nd-rep-topn-90d').onclick = () => setPeriodDays('nd-rep-topn', 90);
-    App.el('nd-rep-topn-run').onclick = runTopMetricsReport;
+    App.el('nd-rep-topn-run').onclick = () => { runTopMetricsReport()?.catch(() => {}); };
     App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv;
     drawAvailReportTable();
     drawTopnReportTable();
