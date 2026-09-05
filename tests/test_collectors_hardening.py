@@ -1245,6 +1245,70 @@ def test_c9_netpath_probing_tracing_and_v6_listeners() -> None:
     removed = netpath_db.prune(older_than_days=3650)
     check(removed == 0, "prune of an empty window removes nothing (and so "
                         "does no reclamation work)")
+
+    # O-58: prune() used to be one unbatched DELETE across whatever the
+    # whole cutoff window covered, holding the write lock (and so the
+    # trace scheduler, and an HTTP thread that reached it via a settings
+    # save) for as long as the sweep took -- trim_to_size, thirty lines
+    # away in db.py, already batches for exactly this reason. Verifies
+    # prune() now does the same: several old traces and a few recent ones,
+    # a small forced chunk size, and a count of how many DELETE-from-
+    # traces batches actually ran.
+    from netpath.tracer import Hop, TraceResult
+    import netpath.db as netpath_db_mod
+
+    old_chunk = (netpath_db_mod.TRIM_CHUNK, netpath_db_mod.TRIM_CHUNK_MIN,
+                netpath_db_mod.TRIM_CHUNK_MAX)
+    netpath_db_mod.TRIM_CHUNK = 20
+    netpath_db_mod.TRIM_CHUNK_MIN = 5
+    netpath_db_mod.TRIM_CHUNK_MAX = 80
+    now = time.time()
+    OLD_N, NEW_N, CUTOFF_DAYS = 120, 15, 30
+    for i in range(OLD_N):
+        hop = Hop(ttl=1, addrs={"10.0.0.2": [1.0]}, sent=1, lost=0)
+        result = TraceResult(host="10.0.0.1", dest_ip="10.0.0.1", hops=[hop],
+                             reached=True,
+                             started_ts=now - (CUTOFF_DAYS + 5) * 86400 - i,
+                             duration_s=1.0)
+        netpath_db.record_trace(target_id, result, "ok")
+    for i in range(NEW_N):
+        hop = Hop(ttl=1, addrs={"10.0.0.2": [1.0]}, sent=1, lost=0)
+        result = TraceResult(host="10.0.0.1", dest_ip="10.0.0.1", hops=[hop],
+                             reached=True, started_ts=now - i, duration_s=1.0)
+        netpath_db.record_trace(target_id, result, "ok")
+
+    class DeleteCountingConn:
+        def __init__(self, conn):
+            self._conn = conn
+            self.delete_batches = 0
+
+        def execute(self, sql, *a, **k):
+            if sql.strip().upper().startswith("DELETE FROM TRACES"):
+                self.delete_batches += 1
+            return self._conn.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    real_conn = netpath_db._conn
+    counting = DeleteCountingConn(real_conn)
+    netpath_db._conn = counting
+    removed = netpath_db.prune(older_than_days=CUTOFF_DAYS)
+    netpath_db._conn = real_conn
+    check(removed == OLD_N,
+         f"prune removes exactly the traces past the cutoff, no more and no "
+         f"less ({removed} of {OLD_N})")
+    check(counting.delete_batches > 1,
+         f"...across more than one batch, not one unbatched DELETE "
+         f"({counting.delete_batches} batch(es))")
+    surviving = netpath_db._conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+    check(surviving == NEW_N,
+         f"every trace inside the retention window survives ({surviving} of {NEW_N})")
+    check(netpath_db.prune(older_than_days=CUTOFF_DAYS) == 0,
+         "a second prune over the same cutoff removes nothing further")
+    (netpath_db_mod.TRIM_CHUNK, netpath_db_mod.TRIM_CHUNK_MIN,
+    netpath_db_mod.TRIM_CHUNK_MAX) = old_chunk
+
     netpath_db.close()
 
     # --- the traceroute budget matches the binary's own parallelism -------

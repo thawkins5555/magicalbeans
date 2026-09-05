@@ -768,19 +768,73 @@ class Database:
                         "netpath.db", self.size_bytes(), removed, max_bytes)
         return removed
     def prune(self, older_than_days: float) -> int:
+        """Delete every trace (and its hops) older than `older_than_days`.
+
+        Batched in the same adaptive, lock-bounded chunks trim_to_size uses
+        thirty lines above, for the same reason: one DELETE spanning months
+        of per-hop rows held the write lock — and so the trace scheduler and
+        anything else on this connection, including a request on the HTTP
+        thread that triggered this via a settings save — for as long as the
+        whole sweep took. TRIM_LOCK_TARGET_S's own comment has the
+        measurement (4.1s stalled) that shape was fixed for; prune() simply
+        never got the same fix, since it sits beside a comment about the
+        VACUUM it used to call rather than the DELETE beside that comment.
+
+        The id range a batch touches is only how the sweep is chunked, not
+        what it deletes — each batch's own DELETE still filters on
+        started_ts, so a device with a wrong clock (trim_to_size's own
+        reason for preferring id ordering there) cannot make prune() keep or
+        drop the wrong rows here.
+        """
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
-            self._conn.execute(
-                "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces WHERE started_ts < ?)",
-                (cutoff,),
-            )
-            cur = self._conn.execute("DELETE FROM traces WHERE started_ts < ?", (cutoff,))
-            self._conn.commit()
-            removed = cur.rowcount
+            bounds = self._conn.execute(
+                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traces"
+                " WHERE started_ts < ?", (cutoff,)).fetchone()
+        low, high = bounds["lo"], bounds["hi"]
+        if low is None:
+            return 0
+        removed = 0
+        deadline = time.monotonic() + TRIM_BUDGET_S
+        chunk = TRIM_CHUNK
+        cut = high + 1   # exclusive: every id in [low, cut) is a candidate
+        while low < cut and time.monotonic() < deadline:
+            upper = min(low + chunk, cut)
+            started = time.monotonic()
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces"
+                    " WHERE id >= ? AND id < ? AND started_ts < ?)",
+                    (low, upper, cutoff))
+                cursor = self._conn.execute(
+                    "DELETE FROM traces"
+                    " WHERE id >= ? AND id < ? AND started_ts < ?",
+                    (low, upper, cutoff))
+                removed += cursor.rowcount or 0
+                self._conn.commit()
+            held = time.monotonic() - started
+            low = upper
+            # Same target, same adaptation as trim_to_size: a trace with its
+            # raw frame stored costs far more per row than a bare hop.
+            if held > TRIM_LOCK_TARGET_S:
+                chunk = max(TRIM_CHUNK_MIN, chunk // 2)
+            elif held < TRIM_LOCK_TARGET_S / 4:
+                chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+        if low < cut:
+            log.warning("netpath.db: prune of traces older than %.1f days did "
+                        "not finish within its budget; continuing at the next "
+                        "maintenance pass", older_than_days)
         if removed:
-            # Nothing deleted means nothing to give back. The old code rewrote
-            # the whole file with VACUUM on every call regardless, which on a
-            # netpath.db holding months of per-hop rows froze the trace
-            # scheduler and the UI for seconds at a time.
-            dbmaint.reclaim(self._conn, self._lock, label="netpath.db")
+            # Nothing deleted means nothing to give back. The old code
+            # rewrote the whole file with VACUUM on every call regardless,
+            # which on a netpath.db holding months of per-hop rows froze the
+            # trace scheduler and the UI for seconds at a time. Handed back
+            # in the same short, lock-releasing slices trim_to_size uses,
+            # rather than one longer reclaim() call at whatever its own
+            # defaults are, for the same reason the deletes above are
+            # chunked: this can now run under a settings-save request too.
+            while time.monotonic() < deadline:
+                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
+                                       budget_s=0.2, label="netpath.db"):
+                    break
         return removed

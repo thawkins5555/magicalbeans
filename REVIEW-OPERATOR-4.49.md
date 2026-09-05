@@ -1811,8 +1811,10 @@ on a live device and about 3.0 s on a dead one. **Tier C2 runs the identical 2,0
 scenario with `--ping-interval 300` and nothing else changed**, which isolates that
 hypothesis: if C2's first full poll cycle comes back near the linear projection of
 ~100 s, ping is the cliff and the fix is a default, not a rewrite. If C2 lands near C1's
-238.7 s, the ceiling is somewhere else and this stays open. ⏳ C2's own number lands here
-once it completes.
+238.7 s, the ceiling is somewhere else. That run had not been carried out as this document
+was finished, so the hypothesis is reported as one the numbers are consistent with rather
+than one confirmed — the honest state of an open question is stated once, here, rather
+than left as a mark implying an answer is still being assembled.
 
 **O-66, addendum — the cliff is not CPU, and that narrows it usefully.** Baseline-step
 CPU across the three tiers: 23.8% at 250, 123.1% at 1,000, 141.0% at 2,000. Between the
@@ -2584,7 +2586,9 @@ reconstructed after the fact.
 `results-250.json` and `.md`, `seed_summary.json`, `mail-250.log`, the app, fleet and
 generator logs, and `ui/` holding the browser walk's screenshots, console capture,
 metrics and per-step results. `rehearsal/` holds the 25-device proving run that found the
-`FLEET_CONTROL_PORT` defect. ⏳ Tier B and Tier C directories land beside them.
+`FLEET_CONTROL_PORT` defect. `tierB/` for the 1,000-device run and `tierC1/` for the
+2,000-device run sit beside it, in the same shape; `tierC2/` (the ping-interval
+discriminator for O-66) was created for the run isolating that hypothesis.
 
 **The button census**, `demo/out/*/ui/buttons-<account>-<tag>.json` — per account, every
 control enumerated with its label, disabled state and disabled reason, and the
