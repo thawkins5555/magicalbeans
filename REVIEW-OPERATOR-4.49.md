@@ -615,7 +615,62 @@ the ten minutes that matter most. It was also not on anybody's list: it came fro
 agent that had spent two hours correlating exactly this information by hand, across all
 twelve modules, in order to verify other fixes — which is its own argument.
 
-### 5.5 Finding things
+### 5.5 The terminal, and whether it earns its place
+
+Nothing in this campaign had touched the SSH terminal or the sign-in page — the two
+things an operator meets first and reaches for at 2 a.m. Both were driven properly:
+twelve simulated SSH devices, an escalation flow, a forced mid-session disconnect, both
+session caps under real pressure, and a genuinely pristine first-run instance.
+
+**The infrastructure holds under direct pressure, verified at the wire protocol.** Both
+refusal sentences arrive in full *before* the close frame: "You already have 4 SSH
+sessions open" at the per-user cap of four, and "There are already 16 SSH sessions open"
+at the app-wide cap of sixteen, each followed by close code 4429. **That is the Windows
+connection-reset fix confirmed alive in a real socket** rather than in a unit test — the
+bug where a refused WebSocket's explanatory sentence was discarded by the reset that
+followed its shutdown, leaving the operator with a bare disconnection.
+
+Also confirmed live: an abruptly killed connection with no close frame — the
+laptop-lid-shut case — frees its slot inside half a second; the handshake timeout closes
+at 15.1 seconds with a named reason; signing out kills a live shell in about a second
+with "You were signed out"; and the auth-failure cooldown locks a device-and-account pair
+after five wrong passwords, which the reviewer hit for real mid-testing. All twelve
+personas connected cleanly with no console errors, including the device stuck at an
+unprivileged prompt, which answers `% Invalid input detected` and stays usable.
+
+**The verdict, in the reviewer's own words:**
+
+> Yes, it earns its place, but narrowly, on infrastructure rather than on the terminal
+> experience itself. What justifies it over PuTTY isn't anything about typing into it —
+> it's everything around the typing: one click from the device you're already looking at
+> rather than a saved session profile you have to go find, the credential already there
+> so you're not pasting a password into a terminal emulator's config dialog, the host key
+> already pinned with a real, specific "this changed and nothing was sent" warning instead
+> of PuTTY's easy-to-click-through prompt, and a set of limits that are actually enforced
+> server-side and that I watched hold under direct pressure. That's real operational value
+> a standalone client can't give you, especially the bit where signing out of the web app
+> can't leave an orphaned shell into a switch.
+>
+> Where it doesn't yet earn its place is as a *tool*: no command history, and no session
+> transcript — so the audit trail says a session happened, by whom, for how long, but not
+> what was done in it, which is the thing an incident review actually wants. An operator
+> who already has PuTTY open won't switch for the terminal; they'll reach for this one
+> anyway the first time they're already staring at a flapping interface in the device pane
+> and don't want to go find the host and copy an IP. Command history and a session log are
+> the two additions that would turn "reasonable enough not to avoid" into "the one I open
+> on purpose."
+
+**O-49 — and the accessibility gap found on the way. CONFIRMED, fixed.** `ssh.js`'s
+`#ssh-log`, the live region mirroring terminal output to a screen reader, flushed a line
+only on `\n`. Almost every device prompt arrives *without* one, because the device has
+finished talking and is waiting for a keystroke: `acc-sw-001#`, `Password: `, `Select an
+option:`. So the single most important line for a screen-reader user — the device is
+ready, and here is what it said — was silently dropped, for the rest of the session, on
+every persona. Confirmed empty before the fix across twelve connections and populated
+after. As the reviewer put it: that gap says accessibility had not been sat in front of a
+device yet either.
+
+### 5.6 Finding things
 
 **O-1 — global search drops every group after the first failure. CONFIRMED (source,
 exhaustive).** `netpath/web/static/app.js:1876-1932`. One `try` wraps all four lookups
@@ -667,7 +722,7 @@ and an alert rule for a device that falls out of compliance. This is the differe
 between a backup tool and a configuration management tool, and it is the most common
 reason an operator keeps paying for a second product.
 
-### 5.6 Being told about it
+### 5.7 Being told about it
 
 **O-4 — the rollup that stops a site outage becoming three hundred alerts depends on a
 field you must set by hand, two thousand times, and the data to propose it is already
@@ -839,7 +894,7 @@ This was only visible because the fleet gained personas with real sensors. A
 network-only fleet would never have shown it, which is the argument for the persona
 work in section 2.2.
 
-### 5.7 Answering for it afterwards
+### 5.8 Answering for it afterwards
 
 **O-10 — the audit trail is written, is served, and cannot be seen. CONFIRMED
 (exhaustive).** `netpath/appdb.py:107-116` defines the `audit` table, whose own comment
@@ -865,7 +920,7 @@ On a site under an ISO, food-safety or pharmaceutical regime that is a complianc
 blocker rather than a nicety. The mechanism is already there: `_audit` is one line per
 handler.
 
-### 5.8 Showing somebody else
+### 5.9 Showing somebody else
 
 **O-12 — the data for a report is kept for four hundred days and there is no report.
 CONFIRMED.** `netpath/nodesdb.py:427-437` keeps three days of raw samples and **400
@@ -933,7 +988,7 @@ correctly; the original fault was a query letting SQLite reorder away from it. S
 with its numbers rather than applied, because a schema migration on a populated table is
 not a thing to slip into a review.
 
-### 5.9 Performance and scale
+### 5.10 Performance and scale
 
 #### Tier A — 250 devices, all nine incidents
 
@@ -1097,7 +1152,7 @@ tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previou
 review declined minification (PERF-004) with reasons; this is a different and larger
 lever, and it makes the source no harder to read.
 
-### 5.10 Security and permissions
+### 5.11 Security and permissions
 
 #### Two ways to stop the monitoring system with one packet
 
@@ -1404,6 +1459,61 @@ network engineer does not use them.
 ## 7. What was fixed in this pass
 
 ⏳ Assembled as the work lands. Confirmed so far:
+
+### The one this review broke itself
+
+**O-48 — the forced password change stopped firing on a fresh install, because of a
+performance improvement made in this same pass. CONFIRMED on a pristine instance,
+root-caused, fixed.**
+
+On a genuinely fresh database, `admin`/`admin` signs in, lands on the Dashboard, and the
+**entire application renders normally — all twelve tabs visible and clickable** — with
+nothing but a one-line orange message under the Dashboard title: "The dashboard could not
+be read: password change required". No modal, ever. Not after four seconds, not after
+visiting other tabs, and not by opening Account by hand, which yields the ordinary
+non-forced dialog with a live Settings page interactive behind it, refusing every read.
+
+`login.html`'s own first-run note promises: *"You will be asked to choose a new password
+before anything else."*
+
+The cause is this campaign's own work. `app.js:4447-4451` runs on the first state poll
+after sign-in, before the operator has clicked anything:
+
+```js
+if (payload.session.must_change && !state.promptedChange) {
+  state.promptedChange = true;
+  if (pages.settings && pages.settings.forcePasswordChange) { … }
+}
+```
+
+**Settings is now a lazy module** — introduced by the cold-load work that took the first
+paint from 297 KB to 80 KB gzipped — so `pages.settings` does not exist yet, the branch is
+skipped silently, and `state.promptedChange = true` is set **unconditionally**, so it
+never retries for the rest of the session.
+
+Two faults. A lazy module consulted before it can exist; and a sentinel that records "we
+tried once" where it should record "we prompted" — which was wrong before lazy loading
+and only became reachable because of it.
+
+**Three things make this worth putting at the top of the section rather than buried in
+it.**
+
+The consequence is the worst available: a fresh installation leaves an administrator on
+the default password, in an application that looks entirely normal, with no forced path
+off it and one line of orange text as the only signal. And as the agent who found it
+observed, the whole sign-in page's security story — host-key pinning included — is
+undercut by an operator who was never forced off `admin`/`admin`.
+
+**A performance change moved a security control's precondition.** That is the class of
+regression which appears in neither the performance review nor the security review,
+because it belongs to neither. Nothing about the lazy-loading work was wrong on its own
+terms; it was measured, tested, and verified at 58 of 58 browser checks.
+
+**And it was findable only because somebody drove a pristine instance.** Every other test
+in this campaign — every walk, every tier, every screenshot — ran against a seeded
+database whose admin password had already been changed. The one scenario nobody had
+exercised was the first thirty seconds of a new installation, which is the only scenario
+every single customer experiences.
 
 **Bulk mute was not leaking an error message — it was broken outright. CONFIRMED.**
 This went in as a cosmetic item ("the server's `device_ids and/or group_id is

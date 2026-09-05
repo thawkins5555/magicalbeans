@@ -714,6 +714,134 @@ def wire_test() -> None:
         sock.close()
 
 
+def test_live_lldp_poll() -> None:
+    """The end-to-end proof static table inspection cannot give: a REAL
+    netpath.nodepoll.NodePoller, against a REAL netpath.nodesdb.
+    NodesDatabase, running the actual scheduled-poll methods
+    (_poll_device then _run_lldp_table) over real sockets against
+    core-sw-01 and acc-sw-001 — not hand-inserted rows, which cannot make
+    NodePoller.counters['lldp_walks'] believe it walked anything, and not
+    a synthetic neighbours row, which cannot exercise nodesdb.
+    upstream_suggestions()'s own confidence-tier scoring.
+
+    Two different loopback addresses from wire_test()'s (127.0.0.250), so
+    a bind failure there does not also take this out."""
+    core_ip, acc_ip = "127.0.0.252", "127.0.0.253"
+    tmp_db = os.path.join(tempfile.mkdtemp(prefix="selftest_nodesdb_"), "nodes.db")
+    nodes_db = NodesDatabase(tmp_db)
+    group_id = nodes_db.ensure_default_group()
+    sockets: list[socket.socket] = []
+    stop = threading.Event()
+    threads: list[threading.Thread] = []
+
+    def serve_one(ip: str, dev) -> socket.socket | None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((ip, 161))
+        except OSError as exc:
+            check(False, f"live LLDP poll: could not bind {ip}:161 ({exc}) — root is needed")
+            sock.close()
+            return None
+        sockets.append(sock)
+
+        def serve():
+            sock.settimeout(0.25)
+            deadline = time.time() + 10.0
+            while not stop.is_set() and time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except (socket.timeout, OSError):
+                    continue
+                reply = fleetmod.handle_packet(dev, data)
+                if reply:
+                    try:
+                        sock.sendto(reply, addr)
+                    except OSError:
+                        pass
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        threads.append(thread)
+        return sock
+
+    def register(name: str, persona_key: str, ip: str):
+        device_id = nodes_db.add_device(ip, name=name, group_id=group_id)
+        entry = {"index": device_id, "ip": ip, "name": name, "persona": persona_key,
+                 "site": "Site-A", "snmp_version": 1, "community": "public",
+                 "profile": "v2c-public", "knobs": {}}
+        dev = personas.build_device(entry)
+        return device_id, dev
+
+    core_id, core_dev = register("core-sw-01", "cisco_core", core_ip)
+    acc_id, acc_dev = register("acc-sw-001", "cisco_access", acc_ip)
+    if serve_one(core_ip, core_dev) is None or serve_one(acc_ip, acc_dev) is None:
+        stop.set()
+        for t in threads:
+            t.join(timeout=2)
+        for s in sockets:
+            s.close()
+        return
+
+    poller = NodePoller(nodes_db)
+    try:
+        before = poller.counters["lldp_walks"]
+        # _poll_device first: the chassis-MAC join needs interfaces.
+        # phys_addr, which only a real interface-table poll populates —
+        # the LLDP walk alone never touches that table.
+        for device_id in (core_id, acc_id):
+            device = nodes_db.device(device_id)
+            config = poller.working_config(device)
+            poller._poll_device(device, config)
+        poller._run_lldp_table(core_id)
+        poller._run_lldp_table(acc_id)
+        check(poller.counters["lldp_walks"] == before + 2,
+              f"live LLDP poll: lldp_walks should have incremented by 2, "
+              f"went from {before} to {poller.counters['lldp_walks']}")
+
+        suggestions = {s["device_id"]: s for s in nodes_db.upstream_suggestions()}
+        core_suggestion = suggestions.get(core_id)
+        acc_suggestion = suggestions.get(acc_id)
+        check(core_suggestion is not None and not core_suggestion["ambiguous"]
+              and len(core_suggestion["candidates"]) == 1,
+              f"live LLDP poll: core-sw-01 should have exactly one, "
+              f"unambiguous upstream candidate: {core_suggestion}")
+        check(acc_suggestion is not None and not acc_suggestion["ambiguous"]
+              and len(acc_suggestion["candidates"]) == 1,
+              f"live LLDP poll: acc-sw-001 should have exactly one, "
+              f"unambiguous upstream candidate: {acc_suggestion}")
+        if core_suggestion and acc_suggestion:
+            core_candidate = core_suggestion["candidates"][0]
+            acc_candidate = acc_suggestion["candidates"][0]
+            check(core_candidate["matched_device_name"] == "acc-sw-001"
+                  and acc_candidate["matched_device_name"] == "core-sw-01",
+                  f"live LLDP poll: each device's candidate names the "
+                  f"other: {core_candidate['matched_device_name']!r} / "
+                  f"{acc_candidate['matched_device_name']!r}")
+            # The one this whole check exists for: a real chassis-MAC
+            # agreement, freshly walked, must score 'high' — not merely
+            # resolvable by sysName at 'medium'.
+            check(core_candidate["match_kind"] == "chassis_mac"
+                  and core_candidate["confidence"] == "high",
+                  f"live LLDP poll: core-sw-01's candidate should be "
+                  f"chassis_mac/high, got {core_candidate['match_kind']}/"
+                  f"{core_candidate['confidence']}")
+            check(acc_candidate["match_kind"] == "chassis_mac"
+                  and acc_candidate["confidence"] == "high",
+                  f"live LLDP poll: acc-sw-001's candidate should be "
+                  f"chassis_mac/high, got {acc_candidate['match_kind']}/"
+                  f"{acc_candidate['confidence']}")
+            print(f"  live LLDP poll: core-sw-01 <-> acc-sw-001, "
+                  f"match_kind={core_candidate['match_kind']}, "
+                  f"confidence={core_candidate['confidence']}")
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=3)
+        for s in sockets:
+            s.close()
+        nodes_db.close()
+
+
 # ------------------------------------------------------- L2 topology (4.49.0)
 #
 # LLDP/CDP neighbours, PoE and STP were three of 4.47.0's Tier 1 features
@@ -896,6 +1024,8 @@ def main() -> int:
     test_topology_consistency()
     print("wire path on 127.0.0.250:161 ...")
     wire_test()
+    print("live LLDP poll on 127.0.0.252/127.0.0.253 (real NodePoller + NodesDatabase) ...")
+    test_live_lldp_poll()
 
     elapsed = time.time() - started
     if FAILURES:

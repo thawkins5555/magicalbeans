@@ -2062,7 +2062,8 @@ class AlertEngine:
             if child_rule is None:
                 continue
             resolved = self.db.resolve_by_dedup(
-                dedup_key(child_rule, occurrence), by="")
+                dedup_key(child_rule, occurrence), by="",
+                rolled_up_into=parent_row["id"])
             if resolved:
                 self.counters["resolved"] += 1
                 self.db.add_rollup_note(
@@ -2103,7 +2104,8 @@ class AlertEngine:
             return
         for child_id in ids_of(device_id):
             resolved = self.db.resolve_by_dedup(
-                f"{rule['key']}:device:{child_id}", by="")
+                f"{rule['key']}:device:{child_id}", by="",
+                rolled_up_into=parent_row["id"])
             if resolved:
                 self.counters["resolved"] += 1
                 self.db.add_rollup_note(
@@ -2168,7 +2170,8 @@ class AlertEngine:
             if child_rule is None:
                 continue
             resolved = self.db.resolve_by_dedup(
-                dedup_key(child_rule, probe), by="")
+                dedup_key(child_rule, probe), by="",
+                rolled_up_into=note_alert_id)
             if resolved is None:
                 continue
             self.counters["resolved"] += 1

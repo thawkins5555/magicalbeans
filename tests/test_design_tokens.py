@@ -245,6 +245,14 @@ check("table { width: 100%; border-collapse: collapse; font-family: var(--ui);" 
 space_uses = sum(APP_CSS.count("var(%s)" % name) for name in SPACE_STEPS)
 check(space_uses > 50, "app.css actually uses the spacing scale (%d references)" % space_uses)
 check("var(--radius-pill)" in APP_CSS, "app.css uses --radius-pill for the half-height shapes")
+check(".row.start { justify-content: flex-start; gap: 14px; }" in APP_CSS,
+      "one .row.start modifier (nodes.js/netflow.js/syslog.js/snmp.js no longer "
+      "each carry this as an identical inline style)")
+check(".status-fg { color: var(--ok); }" in APP_CSS
+      and all(".status-fg.%s {" % tone in APP_CSS
+              for tone in ("warn", "bad", "blocked", "err", "muted", "line")),
+      "the .status-fg base+modifier pattern exists with the full tone vocabulary "
+      "nodes.js's oper-status/STP-state text and debug.js's worker-status text need")
 
 for name in sorted(os.listdir(STATIC)):
     if name.endswith((".js", ".html")):
