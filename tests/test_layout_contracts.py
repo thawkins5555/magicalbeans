@@ -156,6 +156,34 @@ narrow360 = css.split("@media (max-width: 360px)")[1]
 check("#whoami { display: none; }" in narrow360,
       "#whoami is hidden, not just truncated, below 360px")
 
+# --------------------------------------------------------------------------
+# 6. Below ~480px, Search/Account/Sign out collapse to icons rather than
+#    starving the tab strip beside them.
+#
+# At 360px the three text buttons plus #conn used to run to more than half
+# the bar, leaving DASHBOARD and a sliver of ALERTS the only tabs with any
+# room — hiding #whoami and the wordmark (section 5) was not enough on its
+# own. The icon carries the same accessible name (aria-label/title), so
+# nothing a screen reader or a tooltip says changes, only how much of the
+# bar the button costs. #conn must be untouched: it is the one thing in
+# this group that earns its place.
+check("icon-toggle" in index, "Search/Account/Sign out are .icon-toggle buttons")
+check(index.count('class="ico"') == 3,
+      "each of the three utility buttons carries its own icon")
+check('id="account-btn"' in index and 'aria-label="Account"' in index,
+      "the Account button has an accessible name beyond its (now hideable) text")
+check('id="signout"' in index and 'aria-label="Sign out"' in index,
+      "the Sign out button has an accessible name beyond its (now hideable) text")
+# Just the block's own declarations, not the unrelated comment that happens
+# to sit between this block and the next @media (it mentions #conn too, in
+# a different context, and would otherwise false-negative the check below).
+narrow480 = css.split("@media (max-width: 480px) {")[1].split("\n}\n")[0]
+check(".icon-toggle .label { display: none; }" in narrow480,
+      "the text label is hidden below 480px")
+check(".icon-toggle .ico { display: block; }" in narrow480,
+      "the icon is shown below 480px")
+check("#conn" not in narrow480, "the 480px breakpoint does not touch #conn")
+
 print()
 if failures:
     print("FAILED %d check(s):" % len(failures))

@@ -59,7 +59,53 @@ change, because "can a Windows shop evaluate this product" is itself an answer.
 
 ### 2.2 The simulated estate
 
-⏳ Persona mix, per tier.
+The harness that shipped with this product simulated a *network*: switches,
+firewalls, point-to-point bridges, two PLCs and a Linux host — fifteen personas, all
+of them things with a routing table. A plant is not that. A plant is mostly things
+plugged *into* the network, and none of them had a persona, so the product had never
+been shown them.
+
+Five were added for this campaign — an APC Smart-UPS answering RFC 1628 UPS-MIB and
+the PowerNet enterprise arc, an Eaton UPS answering the standard MIB only (so a
+finding about UPS support cannot be dismissed as vendor-specific), an AVTECH Room
+Alert answering ENTITY-SENSOR-MIB and its own arc, an RFC 3805 multifunction printer,
+and Windows server and endpoint personas answering HOST-RESOURCES-MIB properly. The
+mix was then rebalanced so the roles a site has a fixed handful of stay fixed as the
+count grows, because a plant does not acquire more firewalls when it acquires more
+access switches.
+
+`demo/selftest.py` — the offline wire-format conformance check that drives every
+persona through the application's own SNMP codec — went from **623 checks to 897**,
+all passing.
+
+At the 2,000-device tier the estate is:
+
+| Count | Devices |
+| ---: | --- |
+| 862 | Cisco 2960X access switches |
+| 333 | Windows endpoints (PCs and tablets) |
+| 138 | industrial switches — 78 Siemens SCALANCE, 59 Moxa |
+| 122 | UPSs — 81 APC, 41 Eaton |
+| 119 | Aruba 2930F switches |
+| 119 | point-to-point wireless bridges — 79 Ubiquiti airFiber, 40 Cambium PTP |
+| 100 | PLCs — 60 Rockwell 1756-EN2T, 40 Siemens S7-1500 |
+| 60 | Windows servers |
+| 59 | printers |
+| 41 | Room Alert environmental monitors |
+| 38 | Linux hosts |
+| 13 | fixed infrastructure — 2 core switches, 2 FortiGates, 2 Palo Altos, 1 wireless controller, 3 Juniper, 3 MikroTik |
+
+Plus the scripted awkward cases the harness already had, which are worth naming
+because they are what a real fleet actually looks like: a device that answers SNMPv1
+framing only, one whose community does not match the profile, one that returns
+`authorizationError`, one that replies 2.6 seconds late, one that refuses a GETBULK
+with `tooBig`, one with no `ifXTable` at all whose 32-bit counters lap, a 500-port
+chassis, v3 with and without authentication, a device that goes dark on a schedule and
+one that reboots periodically.
+
+Tablets deliberately have no persona, because a tablet does not run an SNMP agent and
+inventing one would fake the answer. They appear the way they really do — as MAC
+addresses in a switch's forwarding table.
 
 ### 2.3 The tiers
 
@@ -514,7 +560,72 @@ network engineer does not use them.
 
 ## 7. What was fixed in this pass
 
-⏳
+⏳ Assembled as the work lands. Confirmed so far:
+
+**Bulk mute was not leaking an error message — it was broken outright. CONFIRMED.**
+This went in as a cosmetic item ("the server's `device_ids and/or group_id is
+required` reaches the operator verbatim") and turned out to be the symptom of a real
+fault. The bulk-mute dialog and the maintenance-window dialog share one scope picker,
+and `readScopeFields` answers in the *window* shape — `scope_kind`,
+`scope_group_id`, `scope_device_ids`. The bulk-mute route is the older of the two and
+never grew that shape; `_bulk_mute_device_ids` in `api.py` reads `device_ids` and
+`group_id`. So **every** bulk mute reached the server as fields it does not read, and
+**every** bulk mute failed, whatever the operator selected. The error message was the
+only part working as intended. Fixed by translating at the call site rather than
+reshaping the shared picker, since the windows dialog is right to keep the shape it
+has.
+
+**Template Preview silently committed the edit it was previewing. CONFIRMED.** The
+preview route reads the stored row rather than the request body, so Preview had always
+had to save first — meaning an operator who previewed a change and then thought better
+of it had already overwritten the template with no way back. Fixed by snapshotting the
+server's version when the dialog opens and restoring it on Cancel, but only if Preview
+actually saved. The honest limit is recorded in the code: Escape and a backdrop click
+go through `app.js`'s own discard prompt, which has no per-dialog cleanup hook, so a
+complete fix is either `app.js`'s to make or belongs on the server, by letting the
+preview route accept an unsaved subject and body.
+
+**The "N shown with no denominator" the previous review could not locate.
+CONFIRMED — it was the Nodes device count.** `nd-count` read `500 device(s)` with
+nothing to compare against, on a list that is now server-side paged and can genuinely
+be showing a fraction of what matched. It now uses the same `App.countLabel` the rest
+of the application moved to.
+
+**Destructive verbs shared a button row with Save, with no visual weight.** Remove
+device, Clear credential, Discard scan and Reset template to default all sat beside
+Save looking identical to it. Each now carries the `danger` tier, which `app.js`'s
+`modal()` also peels to the start of the row, away from Save.
+
+**O-16 — under a service manager the application printed nothing at all, including
+its "you are running without TLS" warning. CONFIRMED, measured both ways, and fixed.**
+`netpath/__main__.py` had seven `print()` calls and not one passed `flush=True`;
+nothing reconfigured stdout. CPython only line-buffers a stream attached to a
+terminal, and a service manager gives it a file or a pipe, so a handful of short lines
+sat in an 8 KB buffer indefinitely.
+
+Started as `py -m netpath --headless --port 8490` with stdout redirected to a file:
+**after 120 seconds the log was still completely empty**, while the server had been
+answering HTTP 200 the whole time. The same command with `-u`: banner in **1.2
+seconds**. `demo/scenario.py` already passed `-u`, which is how the workaround stayed
+hidden.
+
+Three consequences, worst last. Any script waiting for the documented "serving" line
+hangs. `RUNBOOK.md` sends an operator to the log at 02:00, the log is empty, and they
+conclude the process never started. And the line that never arrived includes
+`WARNING: serving on <host> without TLS. Sign-ins … travel in the clear`
+(`__main__.py:199`) — the one warning whose entire job is to reach somebody before
+they put a password on an unencrypted page is the one a service-managed install was
+guaranteed never to see.
+
+Fixed by reconfiguring both streams for line buffering once, before anything prints,
+rather than chasing `flush=True` through each call site. Verified: with no `-u`, the
+banner now arrives in **1.58 s**.
+
+**`resolveMacSearch` said nothing when the search was not a MAC at all.** It now
+distinguishes "you typed something that is not a MAC" from "the server refused this
+MAC", using a client-side mirror of `nodesdb`'s own `looks_like_mac_search` carve-out
+for digits and dots — because an IP address's octets are valid hex too, and searching
+by address is the far more common reason to type digits and dots into that box.
 
 ## 8. What was deliberately not built
 

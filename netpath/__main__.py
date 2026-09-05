@@ -246,7 +246,40 @@ def run_console(args) -> int:
     return app.exec()
 
 
+def _line_buffer_stdio() -> None:
+    """Make stdout and stderr flush on every newline, not just when full.
+
+    CPython only line-buffers a stream connected to a terminal; redirected to
+    a file or a pipe — exactly what a service manager gives it — it switches
+    to block buffering, and holds output in an 8 KB buffer until that fills
+    or the process exits. That is invisible in a console window, where every
+    print appears to work, and it is exactly how this went unnoticed: nothing
+    here is wrong until something downstream is watching the log rather than
+    the terminal. Measured on this machine: run_headless's banner sat in the
+    buffer for the full two minutes a redirected run was left running, with
+    the server already answering requests the whole time. Whoever is
+    watching that log concludes the process never started when it is
+    actually up, but the worse case is the line right below this one -
+    the "serving ... without TLS" warning exists to reach someone before
+    they type a password into an unencrypted page, and a buffered process
+    can run for hours without ever printing it. Reconfiguring both streams
+    once, here, before run_headless or run_console prints anything, fixes
+    every print in the process rather than chasing flush=True through each
+    call site one at a time.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue          # pythonw.exe leaves this None; nothing to buffer
+        try:
+            reconfigure(line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass               # already detached or replaced; leave it alone
+
+
 def main(argv=None) -> int:
+    _line_buffer_stdio()
     args = build_parser().parse_args(argv)
     return run_headless(args) if args.headless else run_console(args)
 

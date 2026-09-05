@@ -481,6 +481,17 @@ class Scenario:
         # answers, so a "down" device would look up. Force the subprocess
         # path so the shim keeps deciding.
         env["NETPATH_PING_MODE"] = "subprocess"
+        # ...and the shim has to be told where the fleet is. It defaults to
+        # 8099 (demo/bin/ping's fleet_alive), which is this file's own
+        # default control port, so at default settings everything worked and
+        # nothing revealed the omission. Pass --control-port anything else --
+        # which any run sharing a machine with another fleet must do -- and
+        # the shim asked port 8099, found nothing, and fell through to
+        # "assume alive". A device the fleet had been told to take down then
+        # answered ping perfectly while its SNMP stayed dark, so the outage
+        # steps raised `snmp_failing_ping_ok` instead of `device_down` and
+        # the run measured the wrong rule without ever failing.
+        env["FLEET_CONTROL_PORT"] = str(self.args.control_port)
         env.setdefault("PYTHONUNBUFFERED", "1")
         process = self.spawn(
             "app", [sys.executable, "-u", "-m", "netpath", "--headless",
