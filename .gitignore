@@ -13,3 +13,6 @@ netpath.bak-*/
 
 # Claude Code agent worktrees (tool state, never source)
 .claude/
+
+# The demo SSH double keeps one host key per machine so a restart is not a MITM
+demo/fake_ssh_host_key

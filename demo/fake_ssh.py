@@ -14,7 +14,7 @@ rejects its own pager-off and pages instead), a WLC whose privileged
 prompt ends '>' with no enable step, and an ASA that must escalate via
 `enable` + a stored secret before it will do anything at all.
 
-    python3 demo/fake_ssh.py [--base-port 2201]
+    python3 demo/fake_ssh.py [--base-port 2201] [--host-key PATH]
 
 Accepts any username with password "demo". Needs paramiko (not a
 SappiWhere dependency for anything but ConfigRX). Never used by the app
@@ -23,6 +23,7 @@ itself; demo/configrx_probe.py drives it.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import socket
 import sys
 import threading
@@ -132,7 +133,30 @@ PERSONAS = {
                       "config": WLC_CONFIG, "mode": "normal"},
 }
 
-HOST_KEY = paramiko.RSAKey.generate(2048)
+DEFAULT_HOST_KEY_PATH = pathlib.Path(__file__).with_name("fake_ssh_host_key")
+# Resolved by main(), not at import: importing this module for its PERSONAS
+# (tests/test_configrx_cisco_platforms.py does) must not write a key file.
+HOST_KEY = None
+
+
+def load_host_key(path) -> paramiko.RSAKey:
+    """One key per machine, kept on disk. A fresh key every start made every
+    restart of these personas look to ConfigRX exactly like a MITM — which is
+    the host-key check working, but it left the demo unable to back anything
+    up a second time without an operator forgetting the key by hand."""
+    path = pathlib.Path(path)
+    try:
+        return paramiko.RSAKey(filename=str(path))
+    except (FileNotFoundError, paramiko.SSHException):
+        key = paramiko.RSAKey.generate(2048)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            key.write_private_key_file(str(path))
+        except OSError as exc:
+            print(f"cannot keep the host key at {path} ({exc}); using a fresh "
+                  "one, so ConfigRX will report it as changed", file=sys.stderr,
+                  flush=True)
+        return key
 
 
 class _Server(paramiko.ServerInterface):
@@ -201,7 +225,7 @@ def _send_config(chan, persona, prompt):
 
 def _session(client_sock, persona):
     t = paramiko.Transport(client_sock)
-    t.add_server_key(HOST_KEY)
+    t.add_server_key(HOST_KEY or load_host_key(DEFAULT_HOST_KEY_PATH))
     server = _Server()
     try:
         t.start_server(server=server)
@@ -292,7 +316,12 @@ def serve(srv, persona):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base-port", type=int, default=2201)
+    ap.add_argument("--host-key", default=DEFAULT_HOST_KEY_PATH,
+                    help="where to keep the persistent host key "
+                         "(default: beside this script)")
     args = ap.parse_args()
+    global HOST_KEY
+    HOST_KEY = load_host_key(args.host_key)
     bound = []
     for i, (name, persona) in enumerate(PERSONAS.items()):
         port = args.base_port + i
