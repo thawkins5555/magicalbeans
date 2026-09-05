@@ -238,6 +238,24 @@ route rather than left implicit. It also found an enable secret surviving a
 credential delete, and a drain that could borrow another thread's send timeout.
 All three are fixed.
 
+**The cost of one file per reviewer, paid back.** Dividing the work by file
+kept forty commits from colliding, and left the same logic written out three,
+five and seven times. A device-by-address lookup existed in five modules, each
+fetching the whole device list on its own thirty-second clock and each giving a
+slightly different answer to the same question; the histogram range narrower in
+three, every copy carrying a comment admitting it had been written
+"independently in each owned module rather than a shared one in app.js"; the
+write-only-if-changed guard in seven. All three are one implementation now,
+with a contract check apiece written against the shape of the duplication
+rather than its name, since a rule that only catches `loadDeviceByIp` is
+defeated by the next person writing `deviceForIp`. Two more copies fell in the
+same read: ConfigRX kept a hand-maintained duplicate of the vendor table, which
+is now served by the API that owns it, and a stored enable secret could not be
+dropped without re-typing an SSH password that is never shown again — there is
+a route for just the secret now, and it leaves the username and password
+alone. A NetFlow filter checkbox that no code had read since resolution became
+a Settings option is gone rather than left to look like a control.
+
 Test and release plumbing: `run_all.py` died on Windows rather than reporting a
 result, three suites only passed on the machine they were written on, one
 crashed on its own tick mark, and the screenshot collector the previous review
@@ -246,7 +264,10 @@ light-theme contrast failure and a tab bar that clips its own connection
 indicator both survived it. Every asset URL now carries the version,
 substituted as the file is read rather than maintained by hand, because an
 immutable year-long cache turns a forgotten version bump into a release that
-ships invisibly.
+ships invisibly. The demo's fake SSH switches generated a fresh host key at
+every start, so the second run of the demo environment always ended with
+ConfigRX refusing to back anything up — the host-key check doing exactly its
+job against a double that was misbehaving; they keep one key per machine now.
 
 ### 4.47.0 — A fleet operator's list, answered
 
