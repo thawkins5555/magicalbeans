@@ -22,21 +22,48 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from urllib.parse import urlparse
 
+# O-60: severity used to live only in the sign-off, "-- SappiWhere, error",
+# where it cost a tap to see. Invisible at rehearsal scale (a handful of
+# emails an hour) and obvious at real scale: Tier B's single site outage
+# produced 29 near-identical subjects differing only by device name, and the
+# one fact that decides whether an operator gets out of bed — is this
+# critical or informational — sat at the bottom of the body. Every subject
+# below now leads with {{severity_tag}} (see build_context — a bracketed,
+# upper-case severity name, "[CRITICAL]") instead. The sign-off drops
+# {{severity_name}} in the same change: once it is in the subject, a
+# sign-off ending in a bare severity word ("-- SappiWhere, error") reads as
+# a truncation, not information, so it is just "-- SappiWhere" now.
+#
+# This does not reopen the mail-threading question it looks like it would.
+# A renotify of a still-open alert reuses this same template against the
+# SAME alert row, whose severity does not change while it stays open, so
+# every "still open" email for one alert carries the same tag. A clear
+# renders a DIFFERENT template (device_up, unconditionally — see
+# alertengine._notify_clear) with different subject wording already, so an
+# open notice and its eventual recovery notice were never going to thread
+# together by subject text, tag or no tag.
+#
+# Existing installs: changing the dict here only seeds a NEW alerts.db
+# (_seed_templates is INSERT OR IGNORE). Reaching an existing, unedited
+# install is alertsdb._PREVIOUS_BUILTIN_TEMPLATES/_migrate_templates's job —
+# every template below has its pre-this-change text added there so the
+# upgrade is not silently new-installs-only, the same discipline 4.32.0's
+# device_up wording change already established.
 BUILTIN_TEMPLATES = {
     "device_down": {
         "name": "Device not responding",
-        "subject": "SappiWhere: {{device_name}} is not responding",
+        "subject": "{{severity_tag}} SappiWhere: {{device_name}} is not responding",
         "body": (
             "{{device_name}} ({{device_ip}}) stopped responding at {{opened_time}}.\n\n"
             "{{message}}\n\n"
             "This alert has occurred {{count}} time(s). It will clear "
             "automatically once the device responds again.\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
     "device_up": {
         "name": "Device recovered",
-        "subject": "SappiWhere: {{device_name}} has recovered",
+        "subject": "{{severity_tag}} SappiWhere: {{device_name}} has recovered",
         # "has recovered" rather than "is responding again": _notify_clear
         # renders this one template for every kind of resolution, including a
         # port coming back and a threshold dropping below its clear value, and
@@ -51,23 +78,23 @@ BUILTIN_TEMPLATES = {
             # is nothing honest to say.
             "{{downtime_line}}"
             "{{message}}\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
     "device_rebooted": {
         "name": "Device rebooted",
-        "subject": "SappiWhere: {{device_name}} rebooted",
+        "subject": "{{severity_tag}} SappiWhere: {{device_name}} rebooted",
         "body": (
             "{{device_name}} ({{device_ip}}) appears to have rebooted at {{last_time}}.\n\n"
             "Previous reported uptime: {{previous_uptime}}\n"
             "Current reported uptime: {{current_uptime}}\n\n"
             "{{message}}\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
     "threshold_breach": {
         "name": "Threshold breach",
-        "subject": "SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
+        "subject": "{{severity_tag}} SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
         "body": (
             "{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
             "Metric: {{metric_label}}\n"
@@ -76,7 +103,7 @@ BUILTIN_TEMPLATES = {
             "{{message}}\n\n"
             "This alert has occurred {{count}} time(s). It will clear "
             "automatically once the value drops back below the clear threshold.\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
     # The generic non-outage notice. Six rules used to borrow "device_down",
@@ -91,19 +118,19 @@ BUILTIN_TEMPLATES = {
     # rather than a short one.
     "event_notice": {
         "name": "Event notice",
-        "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
+        "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
         "body": (
             "{{rule_name}} — {{entity_label}}\n\n"
             "{{message}}\n\n"
             "{{detail}}\n"
             "First seen {{opened_time}}; most recently {{last_time}}.\n"
             "This alert has occurred {{count}} time(s).\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
     "trap_forwarded": {
         "name": "Forwarded event",
-        "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
+        "subject": "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}",
         "body": (
             "{{rule_name}} matched at {{last_time}}.\n\n"
             "Source: {{entity_label}}\n"
@@ -112,7 +139,7 @@ BUILTIN_TEMPLATES = {
             "Trap OID: {{trap_oid}}\n"
             "Varbinds: {{varbinds}}\n\n"
             "This alert has occurred {{count}} time(s).\n\n"
-            "-- SappiWhere, {{severity_name}}"
+            "-- SappiWhere"
         ),
     },
 }
@@ -201,6 +228,12 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "detail": alert_row["detail"] or "",
         "severity": severity,
         "severity_name": SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity),
+        # A bracketed, upper-case tag for the front of a subject line —
+        # "[CRITICAL]" — so severity is legible in a notification preview
+        # without opening the message. See O-60: the same fact severity_name
+        # already carries, just where it is actually read first.
+        "severity_tag": "[{}]".format(
+            (SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity)).upper()),
         "count": alert_row["count"],
         "opened_time": _clock(alert_row["opened_ts"]),
         "last_time": _clock(alert_row["last_ts"]),
@@ -251,6 +284,7 @@ def token_reference() -> list[dict]:
         {"token": "detail", "description": "Extra detail text, if any"},
         {"token": "severity", "description": "Severity number, 0 (emergency) to 7 (debug)"},
         {"token": "severity_name", "description": "Severity name, e.g. 'critical'"},
+        {"token": "severity_tag", "description": "Severity as a bracketed, upper-case subject tag, e.g. '[CRITICAL]'"},
         {"token": "count", "description": "How many times this alert has occurred"},
         {"token": "opened_time", "description": "When the alert first opened"},
         {"token": "last_time", "description": "When the alert most recently recurred"},

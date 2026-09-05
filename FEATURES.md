@@ -938,6 +938,24 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   turned into an upstream device in one batch**, rather than one Edit
   dialog at a time — see **One outage, one alert**, under Alerts.
 
+### Reporting — reachable through the API, no page yet
+
+The two figures an operator is asked for by name every month, computed from
+history the poller already keeps rather than requiring a query written by
+hand: **device availability** — per device or the whole fleet, over any
+window — with outage count, longest outage and mean time to recovery, and
+**a top-N ranking** of any metric the poller records by peak or mean over
+the same kind of window, which is how "which twenty links came closest to
+saturation" gets answered. Availability is built on the same status-segment
+history the device pane's own timeline reads, with four different ways a
+gap in it is deliberately *not* counted as downtime — the device not having
+existed yet, a maintenance window, a mute still on file, the poller itself
+having gone quiet — each accounted for explicitly rather than silently
+assumed. A whole-fleet top-N ranking over more than a week is refused
+outright rather than left to answer slowly; a shorter window or a narrower
+device list gets an answer. No tab or dialog reads either report yet — both
+are reachable through the API today.
+
 ---
 
 ## Alerts — rule-based alerting and email notification
@@ -2283,6 +2301,21 @@ to a manual name in Nodes.
   either can be set to 0 to disable that particular cap. A device whose
   config never changes stays at one stored backup regardless of either
   cap, since an unchanged pull never creates a new row to begin with.
+- **From 4.49.0, every device's stored configuration can be searched and
+  checked against a named compliance rule set — reachable through the
+  API today, with no page in the interface yet.** A search is a plain
+  substring or a regular expression run across every device's latest
+  capture, redacted text only, ever, regardless of a device's own "keep
+  secrets in backups" setting — a search box is probed with arbitrary
+  text by anyone who can reach it, which is a stricter situation than
+  opening a single backup. A rule set is named must-match/must-not-match
+  patterns, evaluated on a schedule and whenever a device's capture
+  changes rather than recomputed on every view, scoped to a device group
+  or left open to all of them; a device with no stored capture at all
+  reads `not_assessed`, never a silent pass. This is the "which of my
+  switches has the wrong NTP server, the wrong SNMP community, the wrong
+  VLAN on the spare port" question ConfigRX could not answer at all
+  before.
 
 ---
 
@@ -2348,15 +2381,29 @@ endpoints. ASN/owner lookup sits beside it for the same reason and can name a
 different query server, since a resolver good enough for internal reverse DNS
 may not be able to reach the public internet, which the ASN lookup needs.
 
-**The Settings tab has seven subtabs of its own** — General, Data &
-retention, Sign-in, Users, Tokens & directory, Maintenance and Modules —
-addressable in the URL (`#/settings/users`) the same way every other
-module's subtabs are. **Modules** is one list linking to all nine
-per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow, SNMP
-Trap, Syslog, IPAM, FortiWireless, ConfigRX) rather than each module's own
-Settings button being the only way to reach it — one place that answers
-"where is the setting for X" without already knowing which tab it lives
-on.
+**The Settings tab has subtabs of its own** — General, Data & retention,
+Sign-in, Users, Tokens & directory, Maintenance, Modules and, from
+4.49.0, Audit — addressable in the URL (`#/settings/users`) the same way
+every other module's subtabs are. **Modules** is one list linking to all
+nine per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
+SNMP Trap, Syslog, IPAM, FortiWireless, ConfigRX) rather than each
+module's own Settings button being the only way to reach it — one place
+that answers "where is the setting for X" without already knowing which
+tab it lives on.
+
+**Audit, administrator-only, is a filterable, paged view of the on-disk
+audit log** — by time window, username, action, target or free text, with
+the username and action dropdowns built from whatever the log actually
+contains rather than a fixed list. It covers, today, every account,
+token, password, LDAP, credential, settings, self-update and alert
+action; it does not yet cover adding or editing a device, an alert rule's
+own threshold, or a ConfigRX backup, which is on its way but not yet
+here. If the page ever reads as an empty audit trail with no rows at all
+under a real filter, that is worth a second look rather than trust at
+face value — it may mean the server has not yet been updated to answer
+the exact query the page is asking, in which case the page says so
+directly rather than leaving an empty table to be misread as "nothing
+happened."
 
 **Database size caps** — one per database, defaulting to 512 MB for traces,
 2 GB for flows, 256 MB for SNMP traps, 1 GB for syslog, 256 MB for IPAM,

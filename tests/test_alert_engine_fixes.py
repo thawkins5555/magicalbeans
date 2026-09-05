@@ -797,7 +797,12 @@ ok(f"a fresh install binds {len(REBOUND)} non-outage rules to event_notice "
    f"and leaves the outage and recovery rules alone")
 
 event_tpl = alerts.template_by_key("event_notice")
-assert event_tpl["subject"] == "SappiWhere: {{rule_name}} — {{entity_label}}", \
+# O-60: every built-in subject now leads with {{severity_tag}} ("[CRITICAL]"),
+# so severity is legible in a notification preview without opening the
+# message — the rule-name/entity-label part this assertion is actually about
+# is unchanged.
+assert event_tpl["subject"] == \
+    "{{severity_tag}} SappiWhere: {{rule_name}} — {{entity_label}}", \
     event_tpl["subject"]
 ok("the generic template's subject names the rule, not the device's health")
 

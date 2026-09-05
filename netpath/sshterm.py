@@ -67,6 +67,21 @@ HANDSHAKE_TIMEOUT_S = 15
 # the web session's own "presence, not the tab being open" rule (auth.py's
 # SessionStore.touch). A shell left open on a switch overnight is a real
 # risk; a shell being watched is never idle for a quarter of an hour.
+#
+# This is a ceiling, not a promise: a keystroke both refreshes this and
+# touches the web session (see _touch_web_session), so the two clocks are
+# reset together and then run in parallel. The web session's own idle
+# timeout (session_idle_minutes, ten by default) is shorter than this, so
+# without capping, this branch of _watch_tick was dead code at every
+# default install — the web session always expired five minutes before a
+# shell could ever be idle long enough to say so itself, and the operator
+# was told "you were signed out" instead of the truer, gentler "your
+# terminal timed out". _watch_tick reads this against
+# service.sessions.idle_seconds (the live, reconfigurable value the web
+# layer actually enforces) and uses whichever is smaller, so the more
+# specific reason wins whenever it is the one that is actually true, and an
+# administrator who raises session_idle_minutes past this gets the full
+# fifteen minutes they'd expect.
 IDLE_TIMEOUT_S = 900
 # Concurrent sessions across the whole application. Each one costs a socket,
 # a paramiko transport and three threads; sixteen is far past what a team of
@@ -763,9 +778,45 @@ class SshSession:
                                   "failed a tick; it keeps running",
                                   self.device_id)
 
+    def _effective_idle_s(self) -> float:
+        """IDLE_TIMEOUT_S, capped to whatever the web session actually
+        survives on its own (service.sessions.idle_seconds — live and
+        reconfigurable, not the constant this module started with). A shell
+        must not advertise a window longer than the login that contains it:
+        past that cap the "you were signed out" check below would fire
+        first regardless, for a less specific reason than the true one."""
+        if not self.token:
+            return IDLE_TIMEOUT_S
+        return min(IDLE_TIMEOUT_S, self.service.sessions.idle_seconds)
+
     def _watch_tick(self, ticks: int) -> bool:
         """One beat of the watchdog. True when the session is over and the
         loop should end."""
+        # Read the module globals each time: the tests shorten them, and
+        # operator-facing constants are worth being able to change.
+        if not self._open_seen:
+            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
+                return False
+            self._status("closed", f"No terminal was opened within "
+                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
+            self.ws.close(CLOSE_IDLE, "Handshake timeout")
+            self.stop()
+            return True
+        # Checked before the sign-out/permission checks below: at a default
+        # install the web session's own idle timeout is shorter than
+        # IDLE_TIMEOUT_S, so "no keystrokes for the effective window" and
+        # "the web session has expired" become true within the same tick.
+        # When they do, the more specific, more informative reason — the
+        # terminal itself timed out, not "you were signed out" — is the one
+        # that should reach the operator, since it is the one actually true
+        # of what they did (or didn't do) in this shell.
+        effective_idle_s = self._effective_idle_s()
+        if time.time() - self._last_input >= effective_idle_s:
+            minutes = max(1, round(effective_idle_s / 60))
+            self._status("closed", f"Closed after {minutes} minute(s) idle")
+            self.ws.close(CLOSE_IDLE, f"Idle timeout ({minutes}m)")
+            self.stop()
+            return True
         if self.token and self.service.sessions.get(self.token) is None:
             self._end_unauthorized(
                 "You were signed out",
@@ -777,23 +828,7 @@ class SshSession:
                 f"SSH session closed: {self.app_user} no longer holds "
                 f"SSH write access")
             return True
-        # Read the module globals each time: the tests shorten them, and
-        # operator-facing constants are worth being able to change.
-        if not self._open_seen:
-            if time.time() - self._started_at < HANDSHAKE_TIMEOUT_S:
-                return False
-            self._status("closed", f"No terminal was opened within "
-                                   f"{int(HANDSHAKE_TIMEOUT_S)} seconds")
-            self.ws.close(CLOSE_IDLE, "Handshake timeout")
-            self.stop()
-            return True
-        if time.time() - self._last_input < IDLE_TIMEOUT_S:
-            return False
-        minutes = int(IDLE_TIMEOUT_S // 60) or 1
-        self._status("closed", f"Closed after {minutes} minute(s) idle")
-        self.ws.close(CLOSE_IDLE, "Idle timeout")
-        self.stop()
-        return True
+        return False
 
     def _has_ssh_write(self) -> bool:
         try:

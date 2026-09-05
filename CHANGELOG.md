@@ -328,7 +328,7 @@ fixed list, never a scan of the alerts table. Exercising it needs
 `upstream_id` actually set on real devices, which is exactly what the
 suggestions API above supplies.
 
-**Over a dozen interface defects, one of them a real functional break every
+**Roughly two dozen interface defects, one of them a real functional break every
 time it was used.** Bulk mute failed for every selection, loudly rather than
 silently: the bulk-mute and maintenance-window dialogs share one scope
 picker, and the picker answers in the window's own field shape
@@ -564,6 +564,33 @@ detects the shape mismatch and says so in as many words — "the server has
 not been updated to answer this search yet... this is not an empty audit
 trail" — because a real gap between two halves of the same feature must
 never read as "nothing happened here."
+
+**A restart or a hot reload could close a database out from under a poll
+still writing to it.** `Service.shutdown()` called `.stop()` on the node
+poller and the wireless poller, where every other worker it shuts down
+calls `.shutdown()` — and `NodePoller.shutdown()` was itself only
+`self.stop()` under a different name; `WirelessPoller` had no `shutdown()`
+to call at all. Neither poller's in-flight work was ever drained before
+the databases underneath it closed. Both now compute a real drain window
+per call — the longest any currently in-flight poll could still
+legitimately run, from that specific device's own configured ping/SNMP
+timeouts, retries and (for a profile with several) how many stored
+credentials it might still have to try, capped at 30 seconds so one
+misconfigured device cannot hang a restart indefinitely — and wait that
+long for it to land before returning.
+
+**Building a fresh date formatter on every call was the single hottest
+function on the busiest page in the product.** Found profiling the Debug
+page's event log (up to 2,000 uncapped rows on first render):
+`date.toLocaleDateString(locale, options)` builds an entire
+`Intl.DateTimeFormat` internally on every call, and a formatter invoked
+once per row across a few thousand rows — for exactly one of two possible
+formats — turned into a few thousand formatter builds, ahead of the
+row-building code that was calling it, because a row's tooltip title
+called it regardless of whether the row's own visible text needed a date
+at all. Two formatters are now built once, module-level, and reused;
+`.format()` is what `toLocaleDateString` already called internally, so the
+output is identical.
 
 Still open, and part of why this campaign keeps running rather than
 closing here: a printer, identified correctly, that still answers with

@@ -433,6 +433,57 @@ check(not any("toLocaleDateString" in line for line in code_lines),
       "no toLocaleDateString call remains in the formatting functions' own code "
       "(the explanatory comment above the fix still legitimately names it)")
 
+# ---------------------------------------------------------------------------
+# 19. No lazy module reaches into another lazy module's App.pages.<name>
+#     object directly.
+#
+# Found during the lazy-loading regression hunt prompted by #17's
+# forcePasswordChange defect: NetFlow's "→ Route" button called
+# App.pages.netpath.activate(...) straight into an object that is undefined
+# until netpath.js's own script has run — a fresh session's first click on
+# it, before the NetPath tab had ever been opened, threw out of the click
+# handler, and the App.selectTab call right after it (meant to load and
+# switch to the tab) never ran either, so the click did nothing visible.
+# The fix routes the jump through a real hash change instead (see
+# netflow.js/netpath.js), the same path every other cross-tab link already
+# uses, which goes through app.js's own ensureModuleReady gate before the
+# target module's activate() is ever called — a lazy module's App.pages
+# entry should never be read from outside app.js itself.
+cross_module_pages_access = []
+for _name in LAZY_MODULES:
+    _text = read("%s.js" % _name)
+    for _match in re.finditer(r"App\.pages\.(\w+)\.", _text):
+        if _match.group(1) != _name:
+            cross_module_pages_access.append(
+                "%s.js reaches into App.pages.%s" % (_name, _match.group(1)))
+check(not cross_module_pages_access,
+      "no lazy module reaches into another module's App.pages object directly "
+      "(found: %s)" % "; ".join(cross_module_pages_access))
+
+# ---------------------------------------------------------------------------
+# 20. ConfigRX's diff view tells "genuinely identical" apart from "differs
+#     only in a redacted value" (O-57).
+#
+# GET /api/configrx/diff redacts both backups a second time unconditionally,
+# so a secret that only changed VALUE (a rotated enable secret, a new SNMP
+# community) maps to the identical "<redacted>" token on both sides and no
+# line differs — the same empty diff a genuinely identical pair produces.
+# `identical` and `redacted_only_change` are the two backups' own sha256
+# (never redacted) telling those apart; a UI that renders an empty diff off
+# `result.diff` alone shows "no differences" for a config that quietly
+# changed. And once that distinction is drawn, it must stop there — no
+# masked before/after, no hint at the old or new value, nothing that invites
+# turning redaction off to go look.
+CONFIGRX = read("configrx.js")
+check("redacted_only_change" in CONFIGRX,
+      "configrx.js reads the redacted_only_change field the diff route sends")
+_diff_render = CONFIGRX[CONFIGRX.index("async function showDiff("):CONFIGRX.index("function closeDiff(")]
+check("result.identical" in _diff_render and "result.redacted_only_change" in _diff_render,
+      "showDiff branches on both identical and redacted_only_change, not just on an empty diff string")
+check(not re.search(r"redacted[\s\S]{0,200}(old value|new value|previous value|became|now reads)",
+                    _diff_render, re.I),
+      "the redacted-diff message does not hint at the old or new value")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

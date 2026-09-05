@@ -111,6 +111,23 @@ there, and any `AttributeError`/`ValueError`/`OSError` — a stream already
 detached or replaced — is swallowed rather than crashing startup over a
 cosmetic improvement.
 
+**`Service.shutdown()` now actually drains the node poller and the
+wireless poller before closing their databases — 4.49.0.** Both were
+called with `.stop()`, where every other worker on the list is called with
+`.shutdown()`; `NodePoller.shutdown()` existed but was itself only
+`self.stop()` under a different name, and `WirelessPoller` had no
+`shutdown()` at all. Neither poller's in-flight work was ever given a
+chance to finish before the database underneath it closed. Both now
+compute `_inflight_budget_s()` — for every device the poller is currently
+mid-poll on, the longest that specific poll could still legitimately run
+given that device's own configured ping/SNMP timeouts and retries (and, if
+it has more than one stored credential to try, one more probe budget on
+top), capped at a 30-second ceiling so one misconfigured device cannot
+hang a restart indefinitely — and `shutdown(drain_s=0.0)` waits
+`max(drain_s, self._inflight_budget_s())` for it, mirroring
+`Monitor._inflight_budget_s`, the identical idea already in place for the
+trace scheduler this class was copied from.
+
 ## Data layer
 
 Ten SQLite files, each opened with `PRAGMA journal_mode=WAL` and (for
@@ -2382,6 +2399,71 @@ regardless of whether email is enabled or currently rate-limited;
 misconfigured or over-quota mail server never blinds the Alerts page
 itself.
 
+### Reports (`report.py`, `web/api.py`) — 4.49.0
+
+Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads
+`device_status_segments` and `samples_hourly` (both already public methods)
+and reaches into their SQLite connections directly only for the handful of
+aggregate queries neither module exposes, rather than adding methods to
+files other agents were editing the same hour.
+
+**Availability is built on `device_status_segments`, never on
+`devices.status`/`last_up_ts`/`last_down_ts`**, because the device row only
+ever holds the *current* status and when it last changed — there is no
+column holding "how long was it down last Tuesday", only the sequence of
+`device_events` rows that method already turns into ordered,
+non-overlapping segments over an arbitrary window. Four ways a gap in that
+history is deliberately *not* counted as downtime, each handled rather than
+assumed: the window is clipped to `[max(t0, created_ts), t1]` for a device
+that did not exist yet, with how much was cut off reported rather than
+silently shrunk; a maintenance window's occurrences (including a weekly
+recurrence spanning the report window, generalising `is_window_active`'s
+own arithmetic to "any past span" rather than only "right now") are
+excluded for their full retroactive span; an *active* mute's own
+`created_ts`/`until_ts` is excluded the same way, with the caveat that
+`alertsdb.purge_expired_mutes` deletes a lapsed mute's row, so one that
+already expired and was purged is invisible here and its downtime, if any,
+reads as ordinary down time; and a segment longer than `GAP_FLAG_S` (3
+hours) — which can only ever carry the *last known* status forward through
+silence, never invent a down segment nothing recorded — is flagged in the
+device's own `caveats` with its span, since a stopped poller and a boring
+month look identical to this method and only a human cross-checking
+`RUNBOOK.md` can tell them apart.
+
+**`top_metric_ranking` reads `samples_hourly`, never raw `samples`** — three
+days of raw samples is not a month at fleet scale — as one CTE-based query
+rather than resolving candidate metric ids in Python first and passing them
+back as an `IN (...)` list, which at 2,000 devices × 48 ports already blows
+past SQLite's own bound-parameter ceiling for one interface-metric family.
+The join from the small `candidates` CTE to the huge `samples_hourly` is a
+`CROSS JOIN` deliberately, not a plain `JOIN`: a plain join leaves SQLite
+free to reorder the two tables, and against a realistic fleet-sized
+`samples_hourly` (several metric families mixed together, not just the one
+queried) it chooses to start from the hour index and filter every row in
+range by a per-row lookup into `candidates` — scanning every *other*
+family's rows too. `CROSS JOIN` disables that reordering, forcing the small
+table to drive the loop. Measured, 2,000 devices × 48 ports × one
+interface-metric family (96,000 series) against a 97M-row `samples_hourly`
+built from six metric families, one week of hourly rows: the plain-join
+plan took 45.8s; the `CROSS JOIN` plan, 14.2s, and — unlike the plain-join
+plan, whose cost scales with the *whole* table — stayed flat whether the
+decoy families were present or not. A month projects to roughly 60-100s at
+this scale, still too slow for an interactive request; the API route
+(`get_nodes_reports_top_metrics`) refuses a whole-fleet-equivalent request
+over `REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S` (7 days) outright,
+scaled by how many devices the request actually resolves to (so a caller
+who happens to enumerate every device explicitly cannot walk around the
+same check omitting `device_ids` would trigger) rather than serve it slowly
+on a request thread. `device_availability_report` has no equivalent
+documented cost at fleet scale and so carries no cap of its own yet — a
+real number should replace that gap if a fleet-wide availability report
+turns out to be slow too, not a guess.
+
+Both routes are thin dispatch over `report.py`'s own functions: query-string
+parsing, resolving an omitted `device_ids` to the whole fleet, and, for
+top-N, the refusal above. Neither has a page in the interface reading it
+yet.
+
 ---
 
 ## NetPath
@@ -2397,7 +2479,27 @@ Windows (which always sends 3 probes per hop; there's no equivalent flag).
 Run via `subprocess.run` with a timeout equal to `expected_budget() =
 max_hops * probes * timeout_s + 15` — the same formula `Monitor` uses to
 detect an overrun, so the two can never disagree about what "too long"
-means.
+means. From 4.49.0 that figure is capped at `MAX_EXPECTED_BUDGET_S` (600 s):
+`max_hops`, `probes` and `timeout_s` all feed straight into this arithmetic
+as well as into the traceroute/tracert command line itself, and until this
+release none of the three (nor `interval_s`, nor the settings-level
+`trace_workers`) was checked for being anything past *a number* —
+`coerce_settings` (`settingsutil.py`) only ever confirms the type.
+`db.py`'s `_clamp_target_fields()` now bounds all five on `add_target`/
+`update_target`/`save_settings` (`interval_s` 5 s–30 days, `max_hops`
+1–255 — one byte on the wire, so no path is ever longer regardless of what
+a target claims, `probes` 1–20, `timeout_s` 0.1–30 s, `trace_workers`
+1–64), each a mechanism-driven ceiling rather than a round number:
+`max_hops`/`probes`/`timeout_s` bound both the subprocess argument and this
+budget arithmetic; `interval_s` bounds `monitor.py`'s own `next_run =
+last_run + interval_s` — at or below zero a target is perpetually due, and
+the scheduler launches a fresh subprocess against it as fast as the worker
+pool turns them over, the exact spawn-storm shape `ipam_scan.py`'s own
+docstring already names for an unpaced ping sweep; `trace_workers` bounds
+the size `ThreadPoolExecutor(max_workers=...)` is built with in
+`service.py`. `warn_rtt_ms`/`warn_loss` are clamped too, but only to what
+is sane (non-negative; a percentage), since neither reaches a subprocess, a
+loop bound or an allocation — only `classify()`'s comparison.
 
 Output parsing is two separate functions, `_parse_unix()` and
 `_parse_windows()`, because the shapes differ enough that a shared parser
@@ -2942,8 +3044,24 @@ length, a space, then exactly that many bytes) is detected by checking
 whether the text before the first space is all-digits and no longer than
 10 characters; otherwise it falls back to newline-separated framing,
 which is what most devices actually send regardless of what the RFC
-says. A buffer that grows past 1 MB with no newline in sight is dropped
-rather than retained forever, against a device stuck writing garbage.
+says.
+
+**`MAX_TCP_MESSAGE_BYTES` (1 MB) bounds both framings identically —
+4.49.0.** The newline-framed path always had a cutoff for "no newline in
+sight, and this has gone on too long"; the octet-counted path did not,
+because its own length prefix reads up to ten digits — up to
+9,999,999,999 — and nothing checked that number against anything before
+buffering toward it. Measured directly before the fix: a connection that
+declared a 2 GB octet count and trickled data toward it at 1 MB/s held the
+collector's own traced memory at 42 MB after 50 MB sent (peaking at
+82.5 MB, since `buffer += chunk` briefly holds the old and new buffer at
+once), every counter — messages, errors, rejected, dropped — still at
+zero, for as long as the connection stayed open, unauthenticated, on
+514/tcp; `_max_tcp_clients` (default 64) bounds how many connections can
+each do this at once, but nothing bounded any single one of them on its
+own. The two framings now share one ceiling rather than the newline path
+alone having one — no real syslog message, even one carrying a sizeable
+RFC 5424 structured-data block, comes close to 1 MB.
 
 Volume limiting happens in `_enqueue()`, before the queue: a message
 whose severity number is numerically greater than `min_severity` (lower
@@ -3948,6 +4066,72 @@ for de-duplicating concurrent triggers of the same device) rather than
 `nodepoll.py`'s larger multi-candidate-credential machinery, since a
 device here has exactly one fixed SSH credential rather than a
 group/profile fallback chain.
+
+### Cross-device search and compliance (`configrx_search.py`, `configrx_compliance.py`) — 4.49.0
+
+The query nothing before this pass could answer: `configrx.diff_texts`
+compares two backups of the *same* device; nothing kept a searchable copy
+of more than one device's capture at once. `configrx_search.py` builds one
+— `configrxdb.config_lines`, one row per device's latest capture, FTS5
+trigram-indexed the same way syslog search already is, falling back to a
+full scan for a query too short to index — and it is built **only from
+redacted text**, written once when a new capture lands
+(`replace_search_lines`), never from the verbatim row `backups.content_gz`
+may also hold: `get_configrx_diff` already treats a cross-backup view as
+needing stricter handling than a single backup's own download, and a
+search box is a strictly worse place to leak a secret than a diff — a
+diff only ever shows two specific backups an authorised caller already
+chose to open, where a search box is *probed*, on purpose, with arbitrary
+substrings, by anyone who can reach it.
+
+**An operator-supplied regular expression is a harder problem than the two
+quadratic bugs fixed elsewhere this pass.** Those were this application's
+own regexes misbehaving on ordinary input, fixable by rewriting them; a
+search or compliance pattern may itself be the thing that misbehaves, on
+input that is not otherwise unusual at all, and telling a genuinely
+dangerous pattern apart from a safe one in general is an open problem.
+Three independent, deliberately over-inclusive bounds apply instead of
+proof: `compile_bounded()` refuses, before ever running a pattern, either
+of two shapes measured on this machine to blow up regardless of input — a
+self-repeating group quantified again (`(a+)+`, `(a|aa)+`, `2.6s` at 35
+characters for the latter), or more than `MAX_ADJACENT_QUANTIFIER_RUN`
+(3) quantified atoms chained back to back with nothing to disambiguate
+between them (`a+a+a+a+`, `13ms` at four chained atoms against 60
+characters, `36s` at ten against 40) — while a fixed-count outer repeat
+(`(\d{1,3}\.){3}\d{1,3}`) or a literal breaking the chain (`a+b+`, a
+dotted-quad IP pattern) is exempt, since neither can grow exponentially
+with input length. Every line actually tested is capped at
+`MAX_LINE_CHARS_FOR_MATCH` (250 characters) — the worst shape the first
+bound still lets through costs 0.22s at that size and grows roughly
+cubically past it, and there is no `signal.alarm` on Windows (this
+product's own deployment target) to preempt a `re` call already running,
+so the only real bound on one match's worst case is bounding what it is
+handed. And `SEARCH_BUDGET_S` (2.0s) is a wall-clock ceiling on the whole
+search, checked before every line; a search that hits it returns what it
+found so far with `truncated=True` rather than pretending to be complete.
+
+`configrx_compliance.py` evaluates a rule (`must_match`/`must_not_match`,
+validated through the identical `compile_bounded()` at `add_rule` time so
+a rule set can never be *saved* with something that would hang an
+evaluation later) the same way, line by line against a device's latest
+capture rather than as one whole-document match — the same per-line cap
+applied to a document that can run tens of thousands of characters would
+otherwise cost minutes, not milliseconds, and there is no smaller bound to
+give a whole-document match the way there is for one line; the real but
+narrow cost is that a rule cannot span more than one line, which every
+realistic example this feature's own brief names (an NTP server, an SNMP
+community, port security, a VLAN) does not need to. A `must_not_match`
+rule that legitimately never matches is the expensive case — proving no
+match means checking every line, not stopping at the first — so
+`COMPLIANCE_SWEEP_BUDGET_S` (10.0s) bounds a whole sweep the same way
+`SEARCH_BUDGET_S` bounds a search; `evaluate_all()` runs on the same
+thread `ConfigRxWorker._loop` uses to schedule every device's own backup,
+so a sweep that ran long uncapped would silently stop that scheduling
+from being checked for the fleet, not just cost this one feature time.
+Results are stored one per (device, rule set) — `not_assessed` for a
+device with no capture at all, never a silent pass — so a device list can
+show a compliance column without re-running every rule on every page
+view.
 
 ---
 

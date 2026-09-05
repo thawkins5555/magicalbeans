@@ -356,6 +356,16 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
 5. **If it is steady-state saturation at your fleet size**, you are at the
    capacity of one instance. `NETWORK-AND-STORAGE-REQUIREMENTS.md` has
    measured figures. There are no remote pollers in this release.
+6. **On Windows, check whether ping is the reason.** There is no
+   unprivileged raw ICMP socket on Windows, so every ping probe forks a real
+   `ping.exe` — measured at 15.6 ms per probe, so a 2,000-device fleet at the
+   shipped defaults (ping enabled, three probes, every 60-second poll) is
+   about 94 seconds of process-creation work the machine has to fit inside
+   every 60-second window, on top of whatever SNMP itself costs. If the pool
+   is saturated on Windows and devices are otherwise healthy, raise
+   `ping_interval_s` (ping does not need to run every poll) or disable ping
+   for profiles where SNMP failing already counts as down — both settings
+   are easy to miss because nothing on screen points at them.
 
 ---
 

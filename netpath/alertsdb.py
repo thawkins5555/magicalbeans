@@ -709,13 +709,88 @@ _BUILTIN_NOTIFY_OFF = ("mib_missing",)
 # and last_time on a resolution notification is when the OUTAGE last recurred —
 # a moment before the recovery, not the recovery. It now names the recovery
 # time and how long the outage lasted.
+#
+# O-60 (this release): severity moved from the sign-off into the subject —
+# every subject now leads with {{severity_tag}}, and the sign-off drops the
+# now-redundant {{severity_name}} down to a bare "-- SappiWhere". All six
+# built-ins changed, not just device_up, which is why this list grew from one
+# entry to six.
+#
+# Each key's value is a LIST of every wording a previous release shipped,
+# tried in the order given — not just the one immediately before this
+# release. device_up alone has carried two: the original text, and the
+# 4.32.0 rewording above. An install that skipped several releases (or
+# whose upgrade path missed a migration for some other reason) may still be
+# sitting on either one, and a single-entry dict here would only ever catch
+# whichever version happened to be most recent, silently stranding anyone
+# further back. Each entry is tried independently against the live
+# subject/body; at most one can ever match, since a template can only hold
+# one piece of text at a time.
 _PREVIOUS_BUILTIN_TEMPLATES = {
-    "device_up": {
-        "subject": "SappiWhere: {{device_name}} has recovered",
-        "body": ("{{device_name}} ({{device_ip}}) is responding again as of "
-                 "{{last_time}}.\n\n{{message}}\n\n"
-                 "-- SappiWhere, {{severity_name}}"),
-    },
+    "device_down": [
+        {   # as shipped through 4.48.0, before severity moved into the subject
+            "subject": "SappiWhere: {{device_name}} is not responding",
+            "body": ("{{device_name}} ({{device_ip}}) stopped responding at "
+                     "{{opened_time}}.\n\n{{message}}\n\n"
+                     "This alert has occurred {{count}} time(s). It will clear "
+                     "automatically once the device responds again.\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+    ],
+    "device_up": [
+        {   # as shipped before 4.32.0
+            "subject": "SappiWhere: {{device_name}} has recovered",
+            "body": ("{{device_name}} ({{device_ip}}) is responding again as of "
+                     "{{last_time}}.\n\n{{message}}\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+        {   # as shipped from 4.32.0 through 4.48.0
+            "subject": "SappiWhere: {{device_name}} has recovered",
+            "body": ("{{device_name}} ({{device_ip}}) has recovered as of "
+                     "{{recovered_time}}.\n\n{{downtime_line}}{{message}}\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+    ],
+    "device_rebooted": [
+        {
+            "subject": "SappiWhere: {{device_name}} rebooted",
+            "body": ("{{device_name}} ({{device_ip}}) appears to have rebooted at "
+                     "{{last_time}}.\n\nPrevious reported uptime: {{previous_uptime}}\n"
+                     "Current reported uptime: {{current_uptime}}\n\n{{message}}\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+    ],
+    "threshold_breach": [
+        {
+            "subject": "SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
+            "body": ("{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
+                     "Metric: {{metric_label}}\nCurrent value: {{value}}\n"
+                     "Threshold: {{threshold}}\n\n{{message}}\n\n"
+                     "This alert has occurred {{count}} time(s). It will clear "
+                     "automatically once the value drops back below the clear "
+                     "threshold.\n\n-- SappiWhere, {{severity_name}}"),
+        },
+    ],
+    "event_notice": [
+        {
+            "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
+            "body": ("{{rule_name}} — {{entity_label}}\n\n{{message}}\n\n{{detail}}\n"
+                     "First seen {{opened_time}}; most recently {{last_time}}.\n"
+                     "This alert has occurred {{count}} time(s).\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+    ],
+    "trap_forwarded": [
+        {
+            "subject": "SappiWhere: {{rule_name}} — {{entity_label}}",
+            "body": ("{{rule_name}} matched at {{last_time}}.\n\n"
+                     "Source: {{entity_label}}\n{{message}}\n\n"
+                     "Trap name: {{trap_name}}\nTrap OID: {{trap_oid}}\n"
+                     "Varbinds: {{varbinds}}\n\n"
+                     "This alert has occurred {{count}} time(s).\n\n"
+                     "-- SappiWhere, {{severity_name}}"),
+        },
+    ],
 }
 
 
@@ -1073,18 +1148,25 @@ class AlertsDatabase:
         """
         from . import alertmail
         now = time.time()
-        for key, previous in _PREVIOUS_BUILTIN_TEMPLATES.items():
+        for key, previous_versions in _PREVIOUS_BUILTIN_TEMPLATES.items():
             current = alertmail.BUILTIN_TEMPLATES.get(key)
             if not current:
                 continue
             self._conn.execute(
                 "UPDATE templates SET builtin_subject = ?, builtin_body = ?"
                 " WHERE key = ?", (current["subject"], current["body"], key))
-            self._conn.execute(
-                "UPDATE templates SET subject = ?, body = ?, updated_ts = ?"
-                " WHERE key = ? AND subject = ? AND body = ?",
-                (current["subject"], current["body"], now, key,
-                 previous["subject"], previous["body"]))
+            # Every wording this key has EVER shipped, not just the one
+            # immediately before this release — see _PREVIOUS_BUILTIN_
+            # TEMPLATES' own comment. At most one can match, since a
+            # template holds one subject/body at a time; the loop just
+            # tries each candidate rather than assuming which release an
+            # install last upgraded from.
+            for previous in previous_versions:
+                self._conn.execute(
+                    "UPDATE templates SET subject = ?, body = ?, updated_ts = ?"
+                    " WHERE key = ? AND subject = ? AND body = ?",
+                    (current["subject"], current["body"], now, key,
+                     previous["subject"], previous["body"]))
 
     def close(self) -> None:
         with self._lock:

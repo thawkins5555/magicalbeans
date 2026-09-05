@@ -616,9 +616,31 @@
       `${App.stamp(result.from.ts)} → ${App.stamp(result.to.ts)}` +
       ` — +${result.additions} / −${result.removals}` +
       (result.identical ? ' — no differences' : '');
-    App.el('cx-diff').innerHTML = result.diff
-      ? renderDiffHtml(result.diff)
-      : '<span class="hint">No differences between these two backups.</span>';
+    // An empty diff is ambiguous on its own (O-57): this route redacts both
+    // sides a second time no matter what each backup's own stored flag
+    // says, so a secret that only changed VALUE — a rotated enable secret,
+    // a new SNMP community, a changed local password — renders as the
+    // identical "<redacted>" token on both sides and no line differs,
+    // exactly like two backups that are genuinely the same. `identical`
+    // and `redacted_only_change` are the two backups' own sha256 (never
+    // redacted, always distinct here) telling those apart, so this says
+    // which one actually happened rather than showing "no differences"
+    // for both. Deliberately says only THAT something changed, never what:
+    // no masked before/after, no hint at the old or new value, nothing
+    // suggesting redaction can be turned off to see it — the whole point
+    // of redacting a diff is that this view must not be the way to find
+    // out. (A device with "keep secrets in backups" on does still store
+    // the value verbatim, readable by a write account through the single
+    // backup itself — this view simply is not that view.)
+    App.el('cx-diff').innerHTML = result.identical
+      ? '<span class="hint">No differences between these two backups.</span>'
+      : result.diff
+        ? renderDiffHtml(result.diff)
+        : result.redacted_only_change
+          ? '<span class="hint">These two backups differ, but only in a value this ' +
+            'view redacts — an enable secret, an SNMP community, a local password. ' +
+            'This view does not show what changed.</span>'
+          : '<span class="hint">No differences between these two backups.</span>';
   }
 
   function closeDiff() {

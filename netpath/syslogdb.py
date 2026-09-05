@@ -28,6 +28,7 @@ import threading
 import time
 
 from . import dbmaint, dbopen, settingsutil
+from .eventlog import ERROR, NullLog, SYSTEM
 
 log = logging.getLogger(__name__)
 
@@ -121,9 +122,20 @@ DEFAULTS = {
 
 class SyslogDatabase:
     BACKFILL_CHUNK = 20_000
+    # How long close() waits for a chunk already in progress to notice the
+    # stop event and land before the connection underneath it is closed —
+    # generous for one bulk INSERT of at most BACKFILL_CHUNK rows.
+    BACKFILL_STOP_TIMEOUT_S = 10.0
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, log=None):
         self.path = path
+        # Optional and defaulted, unlike its siblings in nodesdb.py/
+        # ipamdb.py/alertsdb.py, none of which take the application's
+        # EventLog at all: a dropped-index rebuild silently downgrading
+        # search to scanning for the rest of the process, with nothing
+        # anywhere saying so, is exactly the kind of fact an operator needs
+        # and the module logger (below) never reaches the UI to tell them.
+        self.log = log or NullLog()
         self._lock = threading.RLock()
         self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
@@ -133,9 +145,16 @@ class SyslogDatabase:
         # Keyed on a spoofable source address, so bounded and LRU.
         self._last_row: collections.OrderedDict = collections.OrderedDict()
         self.collapse_repeats_s = 0.0
-        # Set when an index from an older build had to be dropped; the refill
-        # runs on a thread so opening the database stays instant.
+        # Set when an index from an older build had to be dropped, or a
+        # previous run's backfill was cut short by shutdown (see
+        # _read_backfill_cursor); the refill runs on a thread so opening
+        # the database stays instant.
         self._backfill_wanted = False
+        # Row id to resume from — 0 for a fresh rebuild, or wherever a
+        # prior run's interrupted backfill persisted having reached.
+        self._backfill_start_cursor = 0
+        self._backfill_stop = threading.Event()
+        self._backfill_thread: threading.Thread | None = None
         self.index_ready = True
         self.index_progress = (0, 0)
         with self._lock:
@@ -187,11 +206,28 @@ class SyslogDatabase:
                 self._conn.execute("DROP TABLE logs_fts")
                 existing = None
                 self._backfill_wanted = True
+                self._backfill_start_cursor = 0
+                # Whatever an earlier, unrelated interruption had persisted
+                # (see _read_backfill_cursor) is against a table this drop
+                # just erased — stale, and superseded by the fresh rebuild
+                # this migration is about to start anyway.
+                self._write_backfill_cursor(None)
             self._conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5("
                 " message, app, host, source, content='logs',"
                 " content_rowid='id', tokenize='trigram')")
             self.fts = True
+            if not self._backfill_wanted:
+                # Not a schema migration, but a previous run's backfill may
+                # still have unfinished business: shutdown can cut one short
+                # (see _backfill), and unlike the migration case above the
+                # table it was filling is still exactly the one just
+                # confirmed to exist, so resuming means picking the row id
+                # it had reached, not starting over from 0.
+                resume_cursor = self._read_backfill_cursor()
+                if resume_cursor is not None:
+                    self._backfill_wanted = True
+                    self._backfill_start_cursor = resume_cursor
         except sqlite3.OperationalError:
             # No FTS5, or an SQLite too old for the trigram tokenizer
             # (3.34, December 2020). Search still works, by scanning.
@@ -202,8 +238,50 @@ class SyslogDatabase:
         text = (sql or "").lower()
         return "trigram" in text and "source" in text
 
+    # --------------------------------------------------- backfill persistence
+    #
+    # A row id in the generic `settings` table under a key of its own, not in
+    # DEFAULTS: this is bookkeeping about the index, not a user-facing
+    # preference, and settings()/save_settings() only ever look at DEFAULTS'
+    # own keys, so it stays invisible to the API and the Settings page.
+    _BACKFILL_CURSOR_KEY = "_fts_backfill_cursor"
+
+    def _read_backfill_cursor(self) -> int | None:
+        """The row id an earlier, shutdown-interrupted backfill had reached,
+        or None if there is nothing to resume (never started one, or the
+        last one ran to completion). Caller holds no lock of its own — this
+        one does, and is only ever called from inside __init__/_enable_fts,
+        which hold the same RLock and so re-enter it rather than blocking."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (self._BACKFILL_CURSOR_KEY,)).fetchone()
+        if row is None or row["value"] is None:
+            return None
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return None
+
+    def _write_backfill_cursor(self, cursor: int | None) -> None:
+        """cursor=None clears the marker (nothing to resume) rather than a
+        second done flag standing for the same fact. Caller holds the lock
+        and commits — this never does either on its own, so it can share a
+        transaction with the chunk it is persisting progress for."""
+        if cursor is None:
+            self._conn.execute(
+                "DELETE FROM settings WHERE key = ?", (self._BACKFILL_CURSOR_KEY,))
+        else:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._BACKFILL_CURSOR_KEY, str(cursor)))
+
+    # ------------------------------------------------------------ backfill
+
     def start_index_backfill(self) -> None:
-        """Refill a dropped index without holding the write lock.
+        """Refill a dropped or previously-interrupted index without holding
+        the write lock.
 
         Done in chunks on a background thread rather than with FTS5's own
         `rebuild`, which is a single statement: on a database with millions of
@@ -213,25 +291,46 @@ class SyslogDatabase:
         if not self.fts or not self._backfill_wanted:
             return
         self._backfill_wanted = False
+        cursor = self._backfill_start_cursor
         with self._lock:
             row = self._conn.execute(
                 "SELECT MAX(id) AS hi, COUNT(*) AS n FROM logs").fetchone()
         watermark, total = row["hi"] or 0, row["n"] or 0
-        if not total:
+        if not total or watermark <= cursor:
             self.index_ready = True
+            with self._lock:
+                self._write_backfill_cursor(None)
+                self._conn.commit()
             return
         self.index_ready = False
-        self.index_progress = (0, total)
-        thread = threading.Thread(target=self._backfill, args=(watermark, total),
-                                  name="syslog-index", daemon=True)
-        thread.start()
+        self.index_progress = (cursor, total)
+        self._backfill_stop.clear()
+        self._backfill_thread = threading.Thread(
+            target=self._backfill, args=(cursor, watermark, total),
+            name="syslog-index", daemon=True)
+        self._backfill_thread.start()
 
-    def _backfill(self, watermark: int, total: int) -> None:
+    def _backfill(self, cursor: int, watermark: int, total: int) -> None:
         """Messages newer than the watermark are indexed as they arrive, so
-        only what was already stored has to be walked."""
-        cursor, done = 0, 0
+        only what was already stored has to be walked. `cursor` may be
+        greater than 0 when resuming a backfill a previous run's shutdown
+        cut short (see start_index_backfill/_read_backfill_cursor); rows at
+        or below it are already indexed and are not walked again.
+
+        Three ways out, each recorded so the next start knows which one
+        happened: finishes on its own (the common case — index_ready=True,
+        nothing to resume); is stopped by close() (index_ready is left
+        exactly as it was, and the row id reached is persisted to resume
+        from); or hits a genuine sqlite3.Error unrelated to being stopped
+        (fts=False, logged, nothing to resume — rebuilding an index that
+        keeps failing on every restart would just fail the same way again).
+        """
+        outcome = "done"
         try:
             while cursor < watermark:
+                if self._backfill_stop.is_set():
+                    outcome = "interrupted"
+                    break
                 with self._lock:
                     self._conn.execute(
                         "INSERT INTO logs_fts(rowid, message, app, host, source)"
@@ -242,21 +341,56 @@ class SyslogDatabase:
                         "SELECT MAX(id) AS hi FROM (SELECT id FROM logs"
                         " WHERE id > ? AND id <= ? ORDER BY id LIMIT ?)",
                         (cursor, watermark, self.BACKFILL_CHUNK)).fetchone()
+                    if row and row["hi"] is not None:
+                        cursor = row["hi"]
                     self._conn.commit()
                 if not row or row["hi"] is None:
                     break
-                done += self.BACKFILL_CHUNK
-                cursor = row["hi"]
-                self.index_progress = (min(done, total), total)
+                self.index_progress = (min(cursor, total), total)
                 # Let the collector and any reader in between chunks.
                 time.sleep(0.02)
+        except sqlite3.Error as exc:
+            if self._backfill_stop.is_set():
+                # The database closing under this chunk is close()'s own
+                # doing, not a genuine failure — the same non-bug shape as
+                # the check at the top of the loop, just caught here
+                # instead, because the stop landed mid-chunk rather than
+                # between them.
+                outcome = "interrupted"
+            else:
+                outcome = "failed"
+                self.fts = False    # fall back to scanning rather than lie
+                self.log.add(ERROR, "Full-text search unavailable, falling "
+                                    f"back to scanning: {exc}")
+
+        if outcome == "interrupted":
+            try:
+                with self._lock:
+                    self._write_backfill_cursor(cursor)
+                    self._conn.commit()
+            except sqlite3.Error:
+                pass
+            self.log.add(SYSTEM, "Syslog search index backfill paused for "
+                                 f"shutdown at {min(cursor, total):,} of "
+                                 f"{total:,} messages; it will resume from "
+                                 f"there next start")
+            return
+
+        # done or failed: either way there is nothing left to resume.
+        try:
+            with self._lock:
+                self._write_backfill_cursor(None)
+                self._conn.commit()
         except sqlite3.Error:
-            self.fts = False        # fall back to scanning rather than lie
-        finally:
-            self.index_ready = True
-            self.index_progress = (total, total)
+            pass
+        self.index_ready = True
+        self.index_progress = (total, total)
 
     def close(self) -> None:
+        self._backfill_stop.set()
+        thread = self._backfill_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.BACKFILL_STOP_TIMEOUT_S)
         with self._lock:
             self._conn.close()
 

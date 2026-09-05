@@ -72,7 +72,7 @@ class Service:
 
         self.db = Database(db_path)
         self.flow_db = FlowDatabase(flow_db_path)
-        self.syslog_db = SyslogDatabase(syslog_db_path)
+        self.syslog_db = SyslogDatabase(syslog_db_path, log=self.log)
         self.ipam_db = IpamDatabase(ipam_db_path)
         self.snmp_db = SnmpTrapDatabase(snmp_db_path)
         self.nodes_db = NodesDatabase(nodes_db_path)
@@ -424,16 +424,6 @@ class Service:
     def apply_netflow_settings(self, values: dict) -> dict:
         self.flow_settings.update(values)
         self.flow_db.save_settings(self.flow_settings)
-        # After the collectors are up: an index refill is background work and
-        # must not delay the service being reachable.
-        self.syslog_db.start_index_backfill()
-        if not self.syslog_db.index_ready:
-            _, total = self.syslog_db.index_progress
-            self.log.add(SYSTEM, f"Rebuilding the syslog search index over "
-                                 f"{total:,} stored messages so that searches "
-                                 f"match anywhere in a word. Searching still "
-                                 f"works meanwhile, by scanning.")
-
         self._apply_interface_names()
         self._apply_port_names()
         self.collector.stop()

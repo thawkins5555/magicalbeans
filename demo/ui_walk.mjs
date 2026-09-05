@@ -303,6 +303,12 @@ const SAFE_CLICKS = [
   ['netpath', null, 'route-expand'], ['netpath', null, 'route-fit'],
   ['netpath', null, 'tl-in'], ['netpath', null, 'tl-out'],
   ['netpath', null, 'tl-back'], ['netpath', null, 'tl-fwd'], ['netpath', null, 'tl-reset'],
+  // netpath.js:1416 and ipam.js:323/1246 both auto-select the first target/
+  // subnet the moment their list loads with nothing already chosen, so
+  // seed.py's data is enough for these two to have something to act on
+  // without this walk ever clicking a row itself.
+  ['netpath', null, 'target-trace'],
+  ['ipam', 'subnets', 'ipam-scan-now'],
   ['netflow', null, 'nf-apply'], ['netflow', null, 'nf-clear'],
   ['netflow', null, 'nf-in'], ['netflow', null, 'nf-out'],
   ['netflow', null, 'nf-back'], ['netflow', null, 'nf-fwd'], ['netflow', null, 'nf-reset'],
@@ -312,6 +318,14 @@ const SAFE_CLICKS = [
   ['wireless', null, 'wl-apply'], ['wireless', null, 'wl-clear'],
   ['configrx', null, 'cx-apply'],
   ['debug', null, 'dbg-cats-all'], ['debug', null, 'dbg-cats-none'],
+  // Settings' Revert/Apply footer is fixed across every subtab (see the
+  // comment above index.html's own fieldsets), and this walk never dirties
+  // any field, so Revert is a pure no-op read and Apply submits nothing
+  // that differs from what the server already has — safe, per team-lead's
+  // go-ahead, specifically because nothing here changes any input first.
+  // Revert before Apply so a stray dirty flag from an earlier step is
+  // cleared rather than (safely) resubmitted.
+  ['settings', null, 'set-revert'], ['settings', null, 'set-apply'],
 ];
 
 // Export-CSV buttons: read-only, client-side Blob downloads — safe to click,
@@ -684,6 +698,27 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     await settle(page, 500);
     await shoot(page, dir, shot('dlg', 'upstream-suggestions'));
     return 'opened';
+  });
+  await closeAnyModal(page);
+
+  // ---- Edit device (data-requires-write="nodes"), opened and immediately
+  // Cancelled — nodes.js:2800 bails without a selected device, so this
+  // needs the same row-selected state sub:device-detail already leaves
+  // behind. Proves the form renders without ever submitting a change.
+  await guarded(recorder, step('dlg:edit-device'), async () => {
+    await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
+    const rows = await page.locator('#nodes-table tbody tr').count();
+    if (!rows) return 'absent — no devices seeded';
+    await page.click('#nodes-table tbody tr:first-child').catch(() => {});
+    await settle(page, 400);
+    const gate = await gateState(page, '#nd-edit-device');
+    if (!gate.present || !gate.visible) return 'absent — #nd-edit-device not visible';
+    if (gate.disabled && gate.denied) return `refused — ${gate.reason}`;
+    await page.click('#nd-edit-device', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
+    await settle(page, 400);
+    await shoot(page, dir, shot('dlg', 'edit-device'));
+    return 'opened, then cancelled';
   });
   await closeAnyModal(page);
 
@@ -1160,6 +1195,19 @@ async function driveSafeControls(page, dir, tag, recorder, account) {
       return 'clicked';
     });
   }
+
+  // The global search overlay (app.js gsearchOpen/gsearchClose) is chrome,
+  // not tied to any tab, so it does not fit the visit()-based loop above.
+  // Escape closes it the same way it closes everything else here
+  // (app.js:4702 peels the search box first, before help or a modal).
+  await guarded(recorder, `${account}:safe:global-search-btn`, async () => {
+    const gate = await gateState(page, '#global-search-btn');
+    if (!gate.present || !gate.visible) return 'absent — #global-search-btn not visible';
+    await page.click('#global-search-btn', { timeout: 5000 });
+    await settle(page, 300);
+    await closeAnyModal(page);
+    return 'clicked';
+  });
 
   for (const [tab, subtab, id] of SAFE_EXPORTS) {
     await guarded(recorder, `${account}:safe:${id}`, async () => {
