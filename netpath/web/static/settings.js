@@ -965,10 +965,6 @@
     }
   }
 
-  function forcePasswordChange() {
-    App.accountModal({ forced: true });
-  }
-
   /* -------------------------------------------------------------- subtabs
      Eleven fieldsets used to be one scroll with no way to jump partway
      down it. Same nav/subpage/recallSub grammar every other multi-section
@@ -1261,6 +1257,5 @@
       auditLoad();
     },
     refresh: () => {},
-    forcePasswordChange,
   };
 })();

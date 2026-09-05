@@ -99,9 +99,18 @@ def _audit(service, params, action: str, target: str = "",
     Written alongside the event-log line most of these actions already
     produce, not instead of it: the ring is for watching the application
     work and is gone on the next restart, this is the record that answers
-    "who changed that" a month later. Only authentication, authorization,
-    credential and destructive-administration actions come here — this is
-    not a second copy of the event log.
+    "who changed that" a month later.
+
+    Originally scoped to authentication, authorization, credential and
+    destructive-administration actions only; widened in 4.49.0 to cover
+    configuration changes an operator needs to answer for after the fact —
+    NetPath destinations, devices and their bulk operations, device groups,
+    polling profiles (including the literal "who changed the threshold"
+    case), MIBs, alert rule definitions, IPAM subnets, and ConfigRX backup
+    deletion — because "who changed the CPU threshold from 90 to 99 last
+    March" was unanswerable before this, which is a compliance blocker on
+    a site under an ISO or food-safety regime. Still not a second copy of
+    the event log: this is the durable record, that is the live ring.
     """
     service.app_db.audit(params.get("_username", ""), params.get("_client", ""),
                          action, target, detail)
@@ -517,10 +526,16 @@ def post_target(service, params, body) -> dict:
     target_id = service.db.add_target(
         host=host, label=str(body.get("label") or host).strip(), **fields)
     service.monitor.trace_now(target_id)
+    _audit(service, params, "target.create", target=str(target_id),
+          detail=f"host={host}")
     return {"id": target_id}
 
 
 def put_target(service, params, body, target_id: int) -> dict:
+    # Fetched before anything changes — the only way to name what actually
+    # changed afterward; update_target itself never reads the row it is
+    # about to overwrite.
+    before = service.db.target(target_id)
     fields = {k: v for k, v in body.items()
               if k in {"host", "label", "interval_s", "max_hops", "probes",
                        "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
@@ -539,11 +554,21 @@ def put_target(service, params, body, target_id: int) -> dict:
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))
+    if before is not None and fields:
+        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
+                           if before[k] != v) or "no change"
+        _audit(service, params, "target.update", target=str(target_id), detail=detail)
     return {"ok": True}
 
 
 def delete_target(service, params, body, target_id: int) -> dict:
+    # Fetched before the delete — afterward there is nothing left to name
+    # this by at all.
+    before = service.db.target(target_id)
     service.db.remove_target(target_id)
+    if before is not None:
+        _audit(service, params, "target.delete", target=str(target_id),
+              detail=f"host={before['host']}")
     return {"ok": True}
 
 
@@ -1920,19 +1945,32 @@ def post_ipam_subnet(service, params, body) -> dict:
     subnet_id = service.ipam_db.add_subnet(
         cidr, label=body.get("label") or cidr, vlan=body.get("vlan") or None)
     service.log.add(IPAM_CATEGORY, f"Added subnet {cidr}")
+    _audit(service, params, "ipam_subnet.create", target=cidr)
     return {"id": subnet_id}
 
 
 def put_ipam_subnet(service, params, body, subnet_id) -> dict:
+    # Fetched before the update — update_subnet itself never reads the row
+    # it is about to change, so this is the only "before" available.
+    before = service.ipam_db.subnet(subnet_id)
     fields = {k: v for k, v in body.items() if k in
              ("cidr", "label", "vlan", "enabled")}
     service.ipam_db.update_subnet(subnet_id, **fields)
+    if before is not None and fields:
+        detail = "; ".join(f"{k}: {before[k]} -> {v}" for k, v in fields.items()
+                           if before[k] != v) or "no change"
+        _audit(service, params, "ipam_subnet.update", target=str(subnet_id), detail=detail)
     return {"ok": True}
 
 
 def delete_ipam_subnet(service, params, body, subnet_id) -> dict:
+    # Fetched before the delete — afterward there is no cidr left to name
+    # this by at all.
+    before = service.ipam_db.subnet(subnet_id)
     service.ipam_db.remove_subnet(subnet_id)
     service.log.add(IPAM_CATEGORY, f"Removed subnet #{subnet_id}")
+    _audit(service, params, "ipam_subnet.delete", target=str(subnet_id),
+          detail=f"cidr={before['cidr']}" if before is not None else "")
     return {"ok": True}
 
 

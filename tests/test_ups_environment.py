@@ -143,6 +143,15 @@ try:
           metrics == [], metrics)
     check("...and cost exactly the one scalar GET, not a walk on top of it",
           requests == 1, requests)
+    check("that first probe recorded ups_capable=False on the device row",
+          db.device(did)["ups_capable"] == 0, db.device(did))
+
+    reset_count(port)
+    poller._poll_ups_health(db.device(did), config, identity={}, already=set())
+    check("a device already known incapable is never probed again -- not "
+          "even the one scalar GET -- so a fleet of non-UPS devices stops "
+          "paying for this every poll, forever",
+          request_count(port) == 0, request_count(port))
     db.close()
 finally:
     stub.kill()
@@ -289,6 +298,38 @@ try:
           dev_metrics.get("temp_optic_c"))
     check("no humidity_pct at all when nothing on the device reports one",
           "humidity_pct" not in dev_metrics, dev_metrics)
+    db.close()
+finally:
+    stub.kill()
+
+# ------------------------ no ENTITY-SENSOR-MIB at all: never probed again
+
+stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")   # no sensor OIDs either
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("no_sensors")
+    did = device_against(db, "plain-switch")
+    poller = NodePoller(db)
+    device = db.device(did)
+    config = db.effective_config(device)
+
+    now = time.time()
+    poller._poll_environment(did, device, config, set(), now)
+    check("a device with no ENTITY-SENSOR-MIB support records "
+          "sensor_capable=False on its first (and only necessary) walk",
+          db.device(did)["sensor_capable"] == 0, db.device(did))
+
+    reset_count(port)
+    # Well past the cadence window -- if capability memory were not
+    # checked FIRST, this alone would re-walk the device.
+    poller._poll_environment(did, db.device(did), config, set(),
+                            now + NodePoller._SENSOR_REFRESH_S + 1.0)
+    check("...and a confirmed-incapable device is never walked again, even "
+          "once its cadence window has long since passed -- the fix for a "
+          "switch that would otherwise cost one wasted GETBULK every "
+          "_SENSOR_REFRESH_S, forever, across a fleet where most devices "
+          "are not environmental monitors",
+          request_count(port) == 0, request_count(port))
     db.close()
 finally:
     stub.kill()

@@ -2266,7 +2266,7 @@ class NodePoller:
         relabelled incapable off that alone.
         """
         metrics: list[tuple] = []
-        capable = device["ups_capable"] if "ups_capable" in device.keys() else None
+        capable = device["ups_capable"]
         if capable == 0:
             return metrics
         scalars = [probe for probe in nodeoids.UPS_HEALTH if probe[4] == "scalar"]
@@ -2274,7 +2274,12 @@ class NodePoller:
             response = self._snmp_get(device, config, [probe[3] for probe in scalars])
             values = {vb["oid"]: vb for vb in response.varbinds}
         except SnmpError:
-            return metrics
+            # No answer at all, same as every scalar coming back
+            # noSuchObject — folded into the `answered = False` path below
+            # (same as _poll_poe/_poll_stp do for their own tables) so an
+            # outright timeout on the first-ever probe still gets recorded
+            # rather than silently retried forever.
+            values = {}
         answered = False
         for key, label, unit, oid, _how, scale in scalars:
             vb = values.get(oid)
@@ -3231,20 +3236,44 @@ class NodePoller:
           VENDOR_HEALTH), so a device answering both never reports two
           disagreeing chassis temperatures.
 
-        Best-effort and gated by _SENSOR_REFRESH_S rather than run every
-        poll — see that constant's comment. A device with no ENTITY-MIB
-        support (or nothing currently past its cadence) costs one failed
-        GETBULK and returns; nothing here counts as a poll failure.
+        Best-effort and gated two ways. Within the cadence window
+        (_SENSOR_REFRESH_S — see that constant's comment) nothing runs at
+        all. Across polls, once the cadence lets a walk through:
+        devices.sensor_capable is the same probe-once-remember memory
+        _poll_poe/_poll_stp/_poll_ups_health use for their own tables —
+        NULL until the first attempt, then True or False, persisted, so a
+        device confirmed to have no ENTITY-SENSOR-MIB support is skipped
+        entirely rather than retried every _SENSOR_REFRESH_S forever. That
+        distinction is the whole difference between "one wasted walk on a
+        switch that will never answer it" and "one wasted walk every five
+        minutes, indefinitely, on every such switch in a 2,000-device
+        fleet" — the second is a real, compounding cost the first is not.
+        Recorded only on the FIRST probe (capable is None), the same rule
+        every other capability memory in this file already follows: a
+        device already confirmed capable that simply times out once must
+        not be relabelled incapable off that alone.
         """
+        capable = device["sensor_capable"]
+        if capable == 0:
+            return
         if now - self._sensor_read.get(device_id, 0.0) < self._SENSOR_REFRESH_S:
             return
         self._sensor_read[device_id] = now
         try:
             sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
         except SnmpError:
-            return
+            sensor_values = {}
         if not sensor_values:
+            # No answer at all and an outright SnmpError are folded
+            # together on purpose here, same as _poll_poe/_poll_stp do for
+            # their own tables: either way this poll learned nothing from
+            # the device, and "empty" is the only verdict there is to
+            # record.
+            if capable is None:
+                self.db.set_sensor_capable(device_id, False)
             return
+        if capable is None:
+            self.db.set_sensor_capable(device_id, True)
         types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
         scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
         precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)

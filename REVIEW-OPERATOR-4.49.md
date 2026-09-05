@@ -537,8 +537,17 @@ all leave it off-screen; every tab was a tab stop until the first `selectTab` ra
 very end of `start()`; the wordmark was a focusable non-tab inside `role="tablist"`,
 making arrow keys a silent no-op when it held focus; and at 360 px the utility group's
 three text labels took 55% of the bar, leaving the strip 33%. Search, Account and Sign
-out became icons below 480 px: **the strip went from 119 px to 194 px, the utility group
-from 198 px to 123 px**, measured before and after in the same live session.
+out became icons below 480 px, moving **75 px from the utility group to the strip** —
+better than doubling what the strip had.
+
+That figure is worth a note on how it was arrived at, because it is a small lesson in
+measurement. Two people measured it independently and got different absolute numbers:
+198 → 123 px and 119 → 194 px in one harness, 257.5 → 182.4 and 59.5 → 134.6 in the
+other. But **both shifted by exactly 75 px, and in both the two widths summed to exactly
+317 px before and after.** The mechanism, the direction and the magnitude agree
+completely; only the starting split differs, for an identified reason — a different
+placeholder username in `#whoami`. So the claim is the delta, not the absolutes, and the
+invariant sum is what shows the fix moves width rather than growing or shrinking the bar.
 
 **One thing my brief got wrong, and the correction is a better finding.** I reported the
 kiosk help text as promising digit shortcuts the handler did not implement. It did not —
@@ -1548,6 +1557,50 @@ of the application moved to.
 device, Clear credential, Discard scan and Reset template to default all sat beside
 Save looking identical to it. Each now carries the `danger` tier, which `app.js`'s
 `modal()` also peels to the start of the row, away from Save.
+
+### The unbounded commitments
+
+Four of them, all found by the same question — *what does this allocate, loop over or
+wait for, on the strength of a number a stranger supplied?* — and all fixed.
+
+**O-50 — one TCP connection could hold unbounded memory on the unauthenticated syslog
+port, with every counter reading zero. CONFIRMED (measured before and after).** The RFC
+6587 octet-counting framer read a declared length of up to ten digits — 9,999,999,999 —
+and waited for `recv()` to satisfy it. `settimeout(30)` bounds each individual read, not
+the connection's lifetime, so a sender trickling a few bytes every 25 seconds keeps the
+timeout from ever firing while the buffer grows.
+
+Measured with `tracemalloc` against the unfixed code: one connection, 2 GB declared,
+1 MB/s fed in. After 50 MB sent — **42 MB current, 82.5 MB peak** (the peak roughly
+double because `buffer += chunk` briefly holds both copies during the grow), with
+`messages`, `errors`, `rejected` and `dropped` all at **zero** throughout. Unbounded, and
+completely invisible.
+
+The gap was an asymmetry rather than an oversight: the *newline* framing path already had
+a one-megabyte runaway cutoff — silent, with no counter — and the octet path had no
+equivalent. `_max_tcp_clients` at 64 already bounded how *many* connections could do this,
+so the honest statement is that 64 × unbounded became 64 × one megabyte.
+
+Fixed differently per framing, because they recover differently. Octet counting refuses on
+the **declared length alone**, before a byte of body is buffered, and closes the
+connection — there is no honest resynchronisation past a bad declared length, since
+finding the next frame means reading past exactly the commitment being refused, and
+refusing on the prefix kills the slow drip at its root. Newline framing keeps
+discard-and-continue, since the next `\n` is findable without trusting the sender, but is
+now counted rather than silently vanishing. After: **0.14 MB current, 0.25 MB peak**,
+connection closed within one read cycle, counter at 1 and staying at 1 through five
+further trickled chunks, with a legitimate 500 KB octet-framed message still parsing.
+
+**O-36 — a NetPath destination with a non-positive interval turned the scheduler into a
+spawn storm against its own host** (section 5.11).
+
+**And the two quadratic parsers** (section 5.11), both reachable from unauthenticated
+ports.
+
+The counter placement in O-50 is the detail worth keeping: it was put where an operator
+already looks *because of* O-31 earlier the same night. A collector that refuses silently
+is exactly how the previous counter gap happened, and the campaign did not repeat it three
+hours later.
 
 **O-16 — under a service manager the application printed nothing at all, including
 its "you are running without TLS" warning. CONFIRMED, measured both ways, and fixed.**

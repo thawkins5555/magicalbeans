@@ -4444,11 +4444,27 @@ const App = (() => {
       applySessionIdle(payload.session);
       const who = document.getElementById('whoami');
       if (who) who.textContent = payload.session.username;
+      // Forced, this dialog is the one thing standing between a fresh
+      // install's default admin/admin and every other control in the
+      // application, so it must not depend on anything lazy loading can
+      // leave not-yet-registered: it used to run through
+      // pages.settings.forcePasswordChange, a one-line delegate to exactly
+      // the call below, and since Settings became a lazy module (loaded on
+      // first selection, not before) that object was never there on the
+      // very first poll after login — this ran silently as a no-op, the
+      // sentinel below was still set as though it had, and the operator
+      // was left on the default password with no dialog and no second
+      // chance for the rest of the session. accountModal lives in this
+      // file and needs nothing from settings.js, so it is called directly.
+      // The sentinel is set only once the call has actually run (not
+      // merely attempted), so a genuine failure here — the #modal element
+      // gone from the DOM, say — gets retried on the next poll instead of
+      // never prompting again.
       if (payload.session.must_change && !state.promptedChange) {
-        state.promptedChange = true;
-        if (pages.settings && pages.settings.forcePasswordChange) {
-          pages.settings.forcePasswordChange();
-        }
+        try {
+          accountModal({ forced: true });
+          state.promptedChange = true;
+        } catch (error) { /* retry on the next poll rather than never again */ }
       }
     }
     return payload;

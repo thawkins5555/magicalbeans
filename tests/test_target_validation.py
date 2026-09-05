@@ -24,18 +24,44 @@ Bounds under test (netpath/db.py's own MIN_*/MAX_* constants):
   warn_loss    0 .. 100
   trace_workers, default_interval_s/max_hops/probes/timeout_s: the same
   bounds, via POST /api/settings (scope=netpath).
+
+post_target calls service.monitor.trace_now() on every successful create,
+which would otherwise spawn a REAL tracert/traceroute subprocess against
+whatever host this test uses — against an address nothing answers, at the
+very max_hops=255/timeout_s=30.0 bounds this suite specifically creates
+targets at, that is minutes of real subprocess time per target, exactly
+the kind of shared-machine resource contention this campaign's coordination
+rules exist to avoid (measured hitting this the slow way once while writing
+this suite: 174s and climbing). netpath.monitor.run_trace is monkeypatched
+to an instant stub for this whole file, the same technique
+test_service_shutdown.py already uses for the same reason — this suite is
+about the route's field validation, not the tracer subprocess, which has
+its own coverage elsewhere.
 """
 import http.client
 import json
 import os
+import time
 
 import _paths  # noqa: F401
 
+import netpath.monitor as monitor_mod
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
+from netpath.tracer import TraceResult
 from netpath.web import Service, WebServer
 
 TMPDIR = _paths.tmpdir("target_validation_")
 FAILS = []
+
+_real_run_trace = monitor_mod.run_trace
+
+
+def _instant_run_trace(host, **kwargs):
+    return TraceResult(host=host, dest_ip=host, hops=[], reached=True,
+                       started_ts=time.time(), duration_s=0.0)
+
+
+monitor_mod.run_trace = _instant_run_trace
 
 
 def check(name, ok, detail=""):
@@ -122,8 +148,9 @@ try:
                 ("probes", 1), ("probes", 20),
                 ("timeout_s", 0.1), ("timeout_s", 30.0),
                 ("warn_rtt_ms", 0.0), ("warn_loss", 0.0), ("warn_loss", 100.0)]
-    for field, edge_value in AT_BOUNDS:
-        body = {"host": "10.90.9.4", field: edge_value}
+    for index, (field, edge_value) in enumerate(AT_BOUNDS):
+        # targets.host is UNIQUE — a distinct host per case, not shared.
+        body = {"host": f"10.90.10.{index}", field: edge_value}
         status, payload = call("POST", "/api/netpath/targets", body, token=admin)
         check(f"{field}={edge_value} (a bound itself) -> 200", status == 200, (status, payload))
 
@@ -171,6 +198,7 @@ try:
     print()
     print("FAILURES:", FAILS if FAILS else "none")
 finally:
+    monitor_mod.run_trace = _real_run_trace
     server.stop()
 
 raise SystemExit(1 if FAILS else 0)
