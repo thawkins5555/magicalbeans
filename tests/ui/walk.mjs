@@ -869,6 +869,37 @@ async function checkMisc(page) {
     return '';
   });
 
+  // Two tables can share a column set — the interface list is drawn in the
+  // Nodes pane and again inside the device dialog — and a reused <tr> is
+  // MOVED when it is appended, not copied. A row cache keyed on the columns
+  // alone therefore had the two tables taking rows off each other: opening
+  // the dialog emptied the pane, and the next poll emptied the dialog.
+  await check('the device dialog does not take the pane\'s interface rows', async () => {
+    await page.evaluate(() => window.App.selectTab('nodes'));
+    await page.waitForTimeout(1200);
+    const row = await page.$('#nodes-table tbody tr');
+    assert(row, 'no device rows to open');
+    await row.click();
+    await page.waitForTimeout(1500);
+    const count = (sel) => page.evaluate((s) => {
+      const table = document.querySelector(s);
+      return table ? table.querySelectorAll('tbody tr').length : -1;
+    }, sel);
+    const before = await count('#nd-if-table');
+    if (before < 1) return 'skipped: the selected device lists no interfaces';
+    await row.dblclick();
+    await page.waitForTimeout(1500);
+    const pane = await count('#nd-if-table');
+    const dialog = await count('#ndd-if-table');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
+    assert(pane === before,
+           `the pane held ${before} interfaces and has ${pane} with the dialog open`);
+    assert(dialog === before,
+           `the dialog shows ${dialog} interfaces where the pane shows ${before}`);
+    return `${before} in both`;
+  });
+
   await check('the favicon is served, and the title carries the alert count (E5)',
     async () => {
       const icon = await page.evaluate(

@@ -962,7 +962,14 @@
     // on the scroll container rather than one listener per field, so a
     // field added later here is covered for free — scoped to the Apply
     // fields specifically, not LDAP/tokens/users, which save on their own.
-    const scroll = document.querySelector('#page-settings .scroll');
+    // Delegated on the page, not on its first `.scroll`: since Settings was
+    // split into subtabs each subpage has a scroll container of its own, and
+    // listening on the first one covered General alone. Retention's database
+    // caps and Sign-in's idle timeout are Apply fields too, and editing one
+    // of those left the page believing it was clean — so leaving the tab
+    // discarded the edit without asking, which is the exact behaviour this
+    // guard exists to stop.
+    const scroll = document.getElementById('page-settings');
     if (scroll) {
       const onEdit = (event) => { if (APPLY_FIELD_IDS.has(event.target.id)) markDirty(); };
       scroll.addEventListener('input', onEdit);

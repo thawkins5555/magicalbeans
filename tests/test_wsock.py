@@ -467,4 +467,28 @@ assert b"already 16 SSH sessions" in payload[2:], payload
 print("PASS: the close frame and its reason survive the drain")
 sock.close()
 
+# close() from another thread must NOT read the socket itself: the reader is
+# parked in recv() at that moment, and under TLS two threads inside one SSL
+# object corrupt rather than raise. The drain is handed to the reader, which
+# performs it on its way out — so the buffer is still emptied, by the only
+# thread allowed to touch it.
+sock, ws = pair()
+parked = []
+# Nothing is sent: the reader must still BE in recv() when close() lands, and
+# any bytes on the wire here would be parsed as a frame and end it early —
+# which is what a first draft of this test did, and why it caught itself.
+reader = threading.Thread(target=lambda: parked.append(ws.recv()), daemon=True)
+reader.start()
+time.sleep(0.3)                       # let it reach recv()
+assert ws._reader is reader, ws._reader
+closer = threading.Thread(target=lambda: ws.close(wsock.CLOSE_NORMAL), daemon=True)
+closer.start()
+closer.join(timeout=5)
+assert not closer.is_alive(), "close() from another thread did not return"
+reader.join(timeout=5)
+assert not reader.is_alive(), "the parked reader was never released"
+assert not ws._drain_pending, "the reader did not take over the drain"
+print("PASS: close() from another thread defers the drain to the parked reader")
+sock.close()
+
 print("ALL WSOCK ASSERTIONS PASSED")

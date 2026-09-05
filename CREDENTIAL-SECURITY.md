@@ -491,10 +491,17 @@ replaces it), and the device's own API response carries only
 distinguish "this device's vendor has no enable step at all" from "it
 does, and nothing has been stored for it yet" — both read `false`, the
 same way `has_credential` does not distinguish "no SSH credential" from
-"nothing about this device uses SSH." **`DELETE .../credential` clears
-only the SSH password, not this secret** — the two are cleared
-independently, by design, since replacing a device's SSH login has no
-bearing on whether its enable secret is still correct. `_backup_device()`
+"nothing about this device uses SSH." **`DELETE .../credential` clears both
+secrets.** It clears only the SSH password in an earlier draft of this
+release, and a security review of the branch called that what it was: an
+operator clearing a device's credential is decommissioning it, or clearing
+up after an exposure, and either way means "hold nothing for this device."
+What was left behind was unreachable — a backup needs the SSH password to
+get as far as an enable prompt — but it was still a stored secret the
+operator believed they had deleted, with `has_enable_secret` still
+reporting it. To replace an SSH login without touching the enable secret,
+POST a credential without the `enable_secret` key; an absent key leaves a
+stored one alone. `_backup_device()`
 only ever decrypts it when the resolved vendor's `enable_command` is set,
 into a local variable immediately before the connection that needs it,
 cleared by a `finally` block the moment the pull ends — the same

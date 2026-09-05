@@ -74,8 +74,8 @@
         const user = document.getElementById('username');
         if (user && !user.value) user.value = 'admin';
       }
-      // d.version is not sent by every build (/api/session has to gain it
-      // first — see WORKER-BRIEF); this only ever draws once it does.
+      // Not every build sends d.version — /api/session gained it in 4.48.0 —
+      // so this draws only once something supplies one.
       const versionEl = document.getElementById('login-version');
       if (versionEl && d.version) {
         versionEl.textContent = `v${d.version}`;

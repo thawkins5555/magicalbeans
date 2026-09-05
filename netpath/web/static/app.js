@@ -256,19 +256,24 @@ const App = (() => {
     for (const el of denied) {
       const pageEl = el.closest('.page');
       if (!pageEl) continue;
-      if (!byPage.has(pageEl)) byPage.set(pageEl, new Set());
-      byPage.get(pageEl).add(el.dataset.requiresWrite);
+      // The subpage the control is actually on, where there is one. Settings
+      // is seven subtabs now, only one of them visible at a time, so a note
+      // written to the page's first scroll container explained the Users
+      // subtab's disabled controls from inside a hidden General subtab.
+      const host = el.closest('.subpage') || writeDeniedHost(pageEl);
+      if (!byPage.has(host)) byPage.set(host, new Set());
+      byPage.get(host).add(el.dataset.requiresWrite);
     }
     const signature = [...byPage.entries()]
-      .map(([pageEl, modules]) => `${pageEl.id}:${[...modules].sort().join(',')}`)
+      .map(([host, modules]) =>
+        `${host.id || (host.closest('.page') || {}).id}:${[...modules].sort().join(',')}`)
       .sort().join('|');
     if (signature === deniedSignature) return;
     deniedSignature = signature;
     for (const stale of document.querySelectorAll('.write-denied-why')) {
       stale.remove();
     }
-    for (const [pageEl, modules] of byPage) {
-      const host = writeDeniedHost(pageEl);
+    for (const [host, modules] of byPage) {
       for (const module of [...modules].sort()) {
         const note = document.createElement('p');
         note.className = 'hint write-denied-why';
@@ -1220,7 +1225,11 @@ const App = (() => {
      implied visually — Tab could still reach controls the operator cannot
      see. */
   function setBackgroundInert(on) {
-    for (const el of document.querySelectorAll('#tabs, section.page')) {
+    // `.tabs-utility` as well as `#tabs`: Search, Account, Sign out and the
+    // connection indicator moved out of the scrolling strip when the tab bar
+    // was grouped, which left them reachable by assistive technology behind
+    // an open dialog — the scrim stops a pointer, not a screen reader.
+    for (const el of document.querySelectorAll('#tabs, .tabs-utility, section.page')) {
       el.inert = on;
     }
   }
@@ -2617,7 +2626,15 @@ const App = (() => {
      never another table's — the app's dozen column lists share no key set
      with each other, not even the two shaped alike (SNMP traps and Syslog
      both start ts/severity/source and diverge from there). */
-  const rowDrawCaches = new Map();
+  /* Reused <tr>s, per table and then per column set.
+     Keyed by the table element, not by the column set alone: two tables can
+     legitimately share columns — the interface list appears both in the Nodes
+     detail pane and inside the device dialog, drawn from the same descriptors
+     — and appending a cached node MOVES it, so a single shared bucket had the
+     two tables stealing rows from each other. Opening the dialog emptied the
+     pane; the next poll emptied the dialog. A WeakMap so a table that goes
+     away takes its rows with it. */
+  const rowDrawCaches = new WeakMap();
 
   const COLUMN_KEY = 'sappiwhere.columns';
 
@@ -3350,26 +3367,39 @@ const App = (() => {
      for free; the sentence is still the caller's to write. */
   function drawRows(tbody, rows, columns, onRow, emptyMessage) {
     const columnsKey = columns.map((c) => c.key).join(',');
+    // This table's own rows. `tbody` is rebuilt by some callers, so the table
+    // is the stable identity to hang them on.
+    const table = tbody.closest('table') || tbody;
+    let byColumns = rowDrawCaches.get(table);
+    if (!byColumns) rowDrawCaches.set(table, byColumns = new Map());
+    // A table whose columns changed — Nodes drops two of them in a narrow
+    // pane — has no use for the rows drawn under the old set.
+    for (const key of [...byColumns.keys()]) {
+      if (key !== columnsKey) byColumns.delete(key);
+    }
     if (!rows.length && emptyMessage) {
       // Nothing left to key against; drop the bucket rather than hold rows
       // that no longer exist until the same column set happens to return.
-      rowDrawCaches.delete(columnsKey);
+      byColumns.delete(columnsKey);
       emptyRow(tbody, columns, emptyMessage);
       return tbody;
     }
-    // A Nodes-sized refresh (61 rows) measured 154ms median of main thread
-    // here, on a full teardown and rebuild every poll whether or not
-    // anything had changed — the cost is building each cell's HTML fresh
-    // and throwing the old <tr> away, not the DOM insertion itself (a
-    // reorder-only redraw, as a column sort is, cost 23ms for the same
-    // table). Rows are now keyed by id: an unchanged row's <tr> is reused
-    // outright, and a changed row only has the cells whose text actually
-    // differs touched. The caller's own <tbody> is still built fresh every
-    // call — that part of the contract has not changed, and is what keeps
-    // this a drop-in replacement for the nine call sites elsewhere that a
-    // different worker owns this pass.
-    let cache = rowDrawCaches.get(columnsKey);
-    if (!cache) rowDrawCaches.set(columnsKey, cache = new Map());
+    // Rows are keyed by id: an unchanged row's <tr> is reused outright, and a
+    // changed row only has the cells whose text actually differs touched. The
+    // cost this avoids is building each cell's HTML fresh and throwing the old
+    // <tr> away on every poll, whether or not anything moved.
+    //
+    // The 154ms-per-refresh figure quoted for this was measured on the Nodes
+    // DEVICE table, which does not come through here — it has kept its own
+    // row cache since before that measurement. What this helps is every table
+    // that does: the interface lists, discovery results, syslog, traps, flow
+    // records. Stated because a comment claiming someone else's number is
+    // the kind of thing this file exists not to do.
+    //
+    // `onRow` runs again on a reused <tr>, so it must be idempotent —
+    // assigning handlers is fine, `addEventListener` and appendChild are not.
+    let cache = byColumns.get(columnsKey);
+    if (!cache) byColumns.set(columnsKey, cache = new Map());
     const seen = new Set();
     const fragment = document.createDocumentFragment();
     for (const row of rows) {

@@ -536,7 +536,11 @@ button.danger:disabled:hover { background: var(--grid); filter: none; }
    buttons to the end (.modal-box .row); this peels a danger button to the
    opposite one, the way a destructive action sits apart in a dialog that
    takes the tiering seriously. */
-.modal-box .row button.danger { margin-right: auto; }
+   Only where something follows it. A two-button confirm is Cancel and the
+   destructive action and nothing else, and pushing the pair to the left of
+   a wide dialog just leaves them adrift in the middle of it — the tiering
+   is already carried by the colour there. */
+.modal-box .row button.danger:not(:last-child) { margin-right: auto; }
 
 /* A control the account may not use (App.applyPermissions). It is disabled
    and carries the reason in its title; one line under the bar says the same
@@ -1573,7 +1577,12 @@ body.login-page {
   background: transparent;
   color: var(--text);
 }
-.gsearch-input:focus { outline: none; }
+/* No `outline: none` here. The search box takes focus the moment the dialog
+   opens and is the only control in it, so a ring looked redundant — but this
+   release removed exactly that reasoning from the dashboard figures, and a
+   keyboard user returning to the box after arrowing through results has
+   nothing else to tell them where they are. */
+.gsearch-input:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .gsearch-results { overflow: auto; padding: 6px; }
 .gsearch-group { padding: 6px 10px 2px; }
 .gsearch-hit {

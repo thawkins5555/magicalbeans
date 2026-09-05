@@ -445,7 +445,11 @@ def put_target(service, params, body, target_id: int) -> dict:
     # failing against a name that cannot exist — which is the state this
     # release added that validation to stop.
     if "host" in fields:
-        fields["host"] = _validate_target_host(fields["host"])
+        # str() first, the way the add route does it: `ip_address(123)` is a
+        # perfectly valid address object, so an integer would be stored as
+        # 0.0.0.123, and a null would raise AttributeError as a 500 rather
+        # than a refusal.
+        fields["host"] = _validate_target_host(str(fields["host"] or "").strip())
     service.db.update_target(target_id, **fields)
     if "hop_probe_enabled" in body:
         service.set_hop_probe_enabled(target_id, bool(body["hop_probe_enabled"]))

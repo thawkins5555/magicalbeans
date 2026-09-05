@@ -50,8 +50,13 @@ CREATE TABLE IF NOT EXISTS device_config (
     -- DPAPI-encrypted exactly like ssh_password_enc, for the handful of
     -- vendors (configrx_vendors.Vendor.enable_command) whose login shell
     -- is not already privileged EXEC. NULL for every other device, and
-    -- for one of these vendors with no secret stored yet — the worker
-    -- then reports that plainly rather than guessing an empty password.
+    -- for one of these vendors with no secret stored yet: the escalation
+    -- is still attempted, answering the device's password prompt with an
+    -- empty line, because a device with no enable password set accepts
+    -- exactly that and there is no way to tell the two apart from here.
+    -- One that does want a password re-prompts, the prompt is not a
+    -- prompt this code recognises, and the capture ends as
+    -- "enable-failed" without a show-config ever being sent.
     enable_secret_enc     BLOB,
     vendor_override       TEXT,
     last_backup_ts        REAL,

@@ -3749,12 +3749,20 @@ honest for a URL that changes when its content does; the unversioned path
 is untouched byte-for-byte, still `no-cache` with its `ETag`, since
 whatever still requests a plain `/app.js` has made no such promise. `/`
 and `/login` stay `no-store` regardless of `?v=`, because the HTML shell
-itself must always be re-fetched. Nothing in the shipped markup appends
-`?v=` yet — `index.html`'s script and stylesheet tags are still bare paths
-— so today every request takes the unversioned branch; the query-string
-change that actually exercises this path ships with the version bump, and
-`test_static_headers.py` drives the versioned branch directly against the
-route rather than waiting for that markup.
+itself must always be re-fetched.
+
+The markup asks for every asset as `?v=__SW_VERSION__`, and the static
+cache substitutes the running `__version__` as each HTML file is read —
+once per load, before the ETag and the gzip are computed, so both describe
+the bytes that actually go out. It is substituted rather than written into
+the file because a hand-maintained copy of a version number is one that
+drifts, and this one is load-bearing: an asset is served immutable for a
+year, so a static file that changed while the version did not would go on
+being served from every warm cache until the next release. Bumping the one
+line in `netpath/__init__.py` re-versions all seventeen URLs across
+`index.html`, `login.html` and `ssh.html`; `test_design_tokens.py` checks
+each one still carries the placeholder, which is how three vendored files
+that had been missed were found.
 
 **Compression** is negotiated once, in `_send`: text, JSON and SVG bodies
 of 1 KB or more are gzipped when `Accept-Encoding` lists `gzip` with a

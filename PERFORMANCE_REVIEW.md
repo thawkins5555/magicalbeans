@@ -398,12 +398,14 @@ in as admin): `GET /app.js` returns `Cache-Control: no-cache` with an ETag;
 immutable` with the same ETag and the same body. The mechanism works exactly
 as described.
 
-It is also not yet in use anywhere a browser would benefit from it:
-`index.html` requests no `?v=`-qualified URL (checked directly — zero
-matches), and `netpath/__init__.py` still reports `__version__ = "4.47.0"`, so
-no ordinary page load actually gets the immutable response. Wiring the markup
-to the version string is tracked as remaining Phase 8 work, not part of this
-fix.
+That wiring has since landed. `__version__` is `4.48.0`, and the markup asks
+for its assets as `?v=__SW_VERSION__`, substituted with the running version
+as each HTML file is read into the static cache. Measured in a browser
+against the finished branch: seventeen asset requests on an ordinary page
+load, all seventeen carrying `?v=4.48.0`, all seventeen answered
+`public, max-age=31536000, immutable`, and no placeholder surviving into the
+markup a browser receives. A warm reload no longer spends sixteen
+conditional requests before anything renders.
 
 ### Minification: declined
 
