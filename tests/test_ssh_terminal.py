@@ -592,6 +592,55 @@ try:
     finally:
         sshterm.IDLE_TIMEOUT_S = original_idle
 
+    # ---------------------------------- idle timeout, capped by the web session
+
+    # A shell must not advertise an idle window longer than the login that
+    # contains it: IDLE_TIMEOUT_S is capped to whatever the web session
+    # itself survives on (service.sessions.idle_seconds), so the more
+    # specific "your terminal timed out" reason wins whenever the
+    # terminal's own idleness is what actually ended it, rather than a
+    # bare "you were signed out" a few minutes early. Proven by making the
+    # two numbers different and different from 1 minute, and checking both
+    # the elapsed time and the number named in the close message -- a test
+    # that only asserted the close code would have passed before this cap
+    # existed too, since 4408 already fired eventually (for the wrong
+    # reason: "no keystrokes for 900s" collapsing into "the web session
+    # died at 600s", 4401, not 4408).
+    original_idle = sshterm.IDLE_TIMEOUT_S
+    original_web_idle = service.sessions.idle_seconds
+    sshterm.IDLE_TIMEOUT_S = 100           # deliberately the larger of the two
+    # A fresh token, touched right now: service.sessions.idle_seconds is
+    # about to shrink to less than this whole connect handshake could
+    # plausibly take, and `token` (shared with every other block in this
+    # script) may already be older than that by the time we get here.
+    fresh_token = login(DEFAULT_USER, DEFAULT_PASSWORD)
+    service.sessions.idle_seconds = 8      # deliberately the smaller
+    try:
+        capped = WsClient(web_port, f"/api/ssh/devices/{device}/socket", fresh_token)
+        capped.send_json({"type": "open", "cols": 80, "rows": 24})
+        until_connected(capped)
+        t0 = time.time()
+        message = capped.next_control("status", timeout=20)
+        elapsed = time.time() - t0
+        assert message.get("state") == "closed", message
+        assert "minute(s) idle" in message["message"], message
+        assert capped.wait_closed(10) == 4408, capped.close_code
+        # Closed near the web session's 8s ceiling, nowhere near
+        # IDLE_TIMEOUT_S's 100s -- proof the smaller number governed, not
+        # just that *some* 4408 eventually arrived. And 4408, not 4401: the
+        # web session (whose own idle check would otherwise fire here) is
+        # what actually lapsed, but the more specific reason is the one
+        # that reached the operator.
+        assert elapsed < 30, elapsed
+        print("PASS: the SSH idle timeout is capped to the web session's own "
+              "idle timeout when that is the shorter of the two, closes with "
+              "4408 (not 4401), and does so near the shorter number")
+        capped.close()
+    finally:
+        sshterm.IDLE_TIMEOUT_S = original_idle
+        service.sessions.idle_seconds = original_web_idle
+    wait_idle()
+
     # ------------------------------------------------ failed logins are capped
 
     def wait_for_event(device_id, needle: str, timeout: float = 10.0) -> list:

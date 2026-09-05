@@ -875,13 +875,28 @@
         `<td>${when(user.last_login)}</td>` +
         `<td>${user.must_change ? 'must change password' : 'active'}</td>` +
         '<td></td>';
+      // "Remove" alone is dangerously ambiguous the moment more than one
+      // row is on screen, which every install past its first user already
+      // has — position is the only thing that would say whose account is
+      // about to go, and position is exactly what a screen reader does not
+      // announce. The visible label stays the short verb every other
+      // destructive button in this app uses; the account name goes into
+      // the accessible name instead, plus a stable id (built from the
+      // username, not the row's position) so an automated check can find
+      // and keep finding this exact row across a reload that changes the
+      // sort order.
+      const slug = user.username.replace(/[^A-Za-z0-9_-]/g, '-');
       const edit = document.createElement('button');
       edit.textContent = 'Permissions';
+      edit.id = `user-permissions-${slug}`;
+      edit.setAttribute('aria-label', `Permissions for ${user.username}`);
       edit.onclick = () => editPermissions(user, payload.users);
       tr.lastElementChild.appendChild(edit);
       if (!isMe) {
         const remove = document.createElement('button');
         remove.textContent = 'Remove';
+        remove.id = `user-remove-${slug}`;
+        remove.setAttribute('aria-label', `Remove ${user.username}`);
         remove.onclick = () => confirmRemove(user.username);
         tr.lastElementChild.appendChild(remove);
       }

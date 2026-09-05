@@ -223,6 +223,35 @@ header now records that they were widened once, why, and what the flake actually
 A comment claiming a generous margin without the episode that tested it is aspirational;
 one with the numbers is evidence.
 
+**O-47 — the campaign's own generated report stated something untrue about the product,
+and it would have been published that way. CONFIRMED (trivial to check, easy to miss),
+fixed.** `results-250.md`, produced by `demo/scenario.py`, said *"250 devices added in
+0.661s ... via one `POST /api/nodes/devices` each — there is no bulk-add endpoint."*
+There is: `POST /api/nodes/devices/bulk-import` has been registered since 4.47.0, gated
+`nodes: write`, with a row cap and a created/duplicate/invalid breakdown. The harness
+simply never adopted it, and the note describing why it measured the slow path was
+stale. Recorded because of where it lived rather than what it said: that sentence sits in
+the generated output this review's own numbers are quoted from. A harness that narrates
+the product has to be as accurate as the product, or it launders a stale assumption into
+the report as a measurement. Fixed by correcting the generated line to say what actually
+happened — the per-device path was measured deliberately, because the harness was not
+updated to use the bulk route that exists — rather than asserting the route is absent.
+
+**O-37 — the test runner reported a passing suite as FAILED because its own console
+output contained a character Windows' console encoding could not print. CONFIRMED.**
+`tests/run_all.py --only syslog` reported the DoS-fixes suite as FAIL; running the exact
+same file directly, at the same moment, exited 0 with all twelve checks passing, and
+`--only mib` had picked up the identical file cleanly seconds earlier. The cause is the
+runner's own tail-printing of a child's output raising `UnicodeEncodeError` on cp1252 for
+an em-dash-adjacent character. `run_all.py:45-50` already documents having been bitten by
+exactly this class once — decoding the child's output as `errors="replace"` rather than
+the platform default, because cp1252 decoding of an em dash used to kill the runner — but
+that fixed the *decode* of the child's output, not the *encode* when the runner prints it
+back out to its own (also cp1252) console. A test runner that reports a false failure is
+worse than a slow one: it trains people to disbelieve it, and the day it is genuinely
+right, nobody looks. It is also the same defect class as the `__main__.py` stdout finding
+in this same review — Windows console encoding, met from two directions in one day.
+
 ---
 
 ## 3. What had to change before the product could be evaluated on Windows
@@ -811,6 +840,60 @@ and an alert rule for a device that falls out of compliance. This is the differe
 between a backup tool and a configuration management tool, and it is the most common
 reason an operator keeps paying for a second product.
 
+**O-56 / O-57 — redaction is correct, and it silently removes the tool's ability to
+answer the question a security-conscious operator is asking. One half fixed, one half
+inherent.** Surfaced building the compliance sweep above, against real rule sets on real
+captures, by two different people not looking for either.
+
+O-56: a compliance rule that checks a secret's *value* — "is this SNMP community
+`public`" — cannot fire on a device whose captures are redacted, because redaction
+replaces the value with the literal token `<redacted>` regardless of what it actually
+was: `public` and a good community become the same six characters. A rule checking
+whether a risky *directive* exists at all — Telnet enabled, a plaintext `password 0`
+line — is unaffected, since redaction preserves a directive's shape and removes only its
+content. Demonstrated both ways on the same real capture: the SNMP-default rule fires
+against the verbatim text and silently does not fire against the same text redacted,
+while the plaintext-password rule fires either way. Not a bug and not fixable by
+changing the redaction — it is the direct cost of storing less — but it is exactly the
+shape of a confusing support call ("why didn't this catch our default community?") whose
+answer is a setting on a different page, and it belongs in the rule editor itself,
+where a value-dependent rule could say so.
+
+O-57 is the same defeat in the diff view, and this half **is fixed**. `get_configrx_diff`
+redacts both sides of a comparison unconditionally — the right call, since a comparison
+view must not hand out a secret the single-backup route would withhold — but the old
+response then contradicted itself: it carried `from.sha256`/`to.sha256` that visibly
+differed, alongside `diff: ""`, `additions: 0`, `removals: 0`. An operator asking "did a
+changed enable secret or a rotated community show up" got a clean, reassuring, empty
+diff — the one case where the truth mattered most. Fixed by adding a
+`redacted_only_change` field the route can compute from hashes and redacted text it
+already has, with no new read; `configrx.js` now renders it as a line saying the
+configurations differ only in values that were redacted, rather than staying silent.
+Pinned by `tests/test_security_fixes.py`'s D11 block so a regression here is a visible
+test failure, not a silent one.
+
+**O-58 — the retention prune for `netpath.db` is the one place that did not learn the
+lesson its own sibling function is named for, and it runs synchronously off an unrelated
+settings save. CONFIRMED.** `db.py:770`'s `prune()` does two unbatched `DELETE`s — every
+hop row belonging to an expired trace, then the traces themselves — inside a single
+`with self._lock:` transaction, so nothing else on that connection (not the trace
+scheduler, not the timeline an operator is looking at) runs until it finishes. Thirty
+lines above it, `trim_to_size()` deletes in adaptive batches of 500–50,000 rows, each in
+its own short transaction bounded by `TRIM_LOCK_TARGET_S = 0.15`, with the comment at
+`db.py:24-32` recording exactly why: the old unbatched shape measured a 4.1-second stall
+on a 232 MB file. `prune()` was never given the same treatment — its own comment
+discusses only the VACUUM it used to call, and the delete beside it was never what
+anyone looked at.
+
+The trigger is what makes this worth more than a note: `service.py:405`'s
+`apply_global_settings` calls `run_maintenance(force=True)` synchronously on the HTTP
+thread that just saved the settings. So an operator changing an unrelated field — a
+refresh interval, say — starts a full retention sweep of every database, including this
+unbatched one, and the browser waits for it. At 2,000 endpoints with months of per-hop
+rows against the shipped 512 MB cap, that is a multi-second freeze of the whole
+application produced by saving a setting on an unrelated page. The fix is to batch it the
+way `trim_to_size` already does, in the same file, with the same constant.
+
 ### 5.7 Being told about it
 
 **O-4 — the rollup that stops a site outage becoming three hundred alerts depends on a
@@ -872,6 +955,29 @@ rule-scoped setting takes here.
 escalation when nobody acknowledges, no on-call rota, no ticket or runbook link on a
 rule, no per-recipient digest. `renotify_minutes` exists, so the product already
 understands "still happening" — it simply has nowhere else to send it.
+
+**O-60 — the alert email put severity in the signature and left it out of the subject,
+so a mailbox full of one outage could not be triaged without opening every message.
+CONFIRMED (read from the 61 messages Tier B's own SMTP sink captured), fixed.** Every
+built-in template ended `-- SappiWhere, {{severity_name}}` and no subject line carried
+severity at all — `"SappiWhere: {{device_name}} is not responding"`. The consequence only
+appears at scale, which is why a small rehearsal never showed it: Tier B's single site
+outage produced 29 near-identical notifications, and an operator's phone showed a column
+of subjects differing only by device name, with the one fact that decides whether to get
+out of bed sitting at the bottom of each body. Fixed by moving `{{severity_tag}}` into
+every subject line — one field already computed and already in the template context, now
+also read where it is actually needed first.
+
+**O-61 — two rules describing one condition on one device sent two near-identical
+emails. CONFIRMED (same capture).** `ups-01` produced two "has recovered" messages eleven
+seconds apart, with different outage-start timestamps and different severities: one from
+`ups_battery_low` (severity 3), one from `ups_battery_replace` (severity 2) — two tiers
+of the same underlying battery state, each with its own rule and its own notification.
+The rollup handles a parent device suppressing its children; it does not handle two rules
+on the *same* device describing the *same* physical fact, so an operator reads the second
+message as a second, unrelated event. The tiering itself is right — "low" and "needs
+replacing" are genuinely different actions worth telling someone about — what is wrong is
+that both arrive as independent incidents rather than as one alert whose severity moved.
 
 **O-25 — a finding of mine, withdrawn, and the better one that replaced it.**
 
@@ -1098,6 +1204,21 @@ and trust.
 This was only visible because the fleet gained personas with real sensors. A
 network-only fleet would never have shown it, which is the argument for the persona
 work in section 2.2.
+
+**O-26 — a quarter of a fresh install's alerts are housekeeping, at the same visual
+weight as a real fault. CONFIRMED (Tier A, 250 devices).** Alert composition mid-run: 237
+of 712 rows (33%) are `mib_missing` — one per device with a recognised enterprise arc and
+no uploaded MIB. It ships at severity 6 with `notify` off, `alertsdb.py:41-45` explaining
+exactly why, so nobody is emailed about it. But it is a third of what an operator sees on
+the Alerts page on their first morning, mixed in with `device_down` and
+`packet_loss_high` at the same visual weight, and the Severity filter defaults to "any".
+`mib_missing` is not an event — nothing happened. It is a to-do about the installation.
+A "setup" or "housekeeping" classification, excluded from the default view and counted on
+a Settings page instead, would remove a third of the noise without hiding anything and
+without resorting to a severity floor that would also hide genuine info-level alerts.
+(CPU and memory in that same run are inflated by `demo/seed.py`'s deliberately lowered
+thresholds for a loopback fleet; that is harness tuning, not a product fault, and is not
+part of this finding.)
 
 ### 5.8 Answering for it afterwards
 
@@ -1374,6 +1495,34 @@ what the topology feature is worth is: it halves the noise today, and it would c
 site outage to one alert if devices were detected down promptly. The upstream-suggestion
 work built in this pass makes the topology reachable at all; the detection floor decides
 how much good that does.
+
+**O-59 — and on the chained run's own numbers, "halves the noise" is generous: it also
+sent more emails than the un-chained one, in the exact scenario the feature exists for.
+CONFIRMED (direct query against `alerts.db`, not the scenario log).** Half the alert count
+is not half the operator's inbox. Tier T2's own row above — 139 alerts, **14 emails** —
+sent *three more* emails than Tier A's un-chained 228-alert, 11-email run. Fewer incidents
+opened, and more notifications went out. That is not what "the rollup halved the noise"
+predicts, and it does not show up by reading the alert count alone.
+
+The mechanism, from the alert timestamps rather than inference: 96 `device_down` alerts
+opened on the chained run. Nine were rolled up into the core's alert (id 614) and their
+`rollup_note` shows the sweep working exactly as designed. Of the remaining 87, one is the
+core's own alert and **86 are downstream devices that opened with `rolled_up_into IS
+NULL`** — never absorbed at all. The core's own alert opened at T+0 and resolved at
+T+119.6 s; all 86 stragglers opened at T+119.7 s, one tick after the ancestor's alert had
+already closed. There was no open ancestor left to roll them into, so each of the 86 sent
+its own notification instead of being caught by the digest that already covers the parent
+— which is where the extra emails come from.
+
+So the rollup itself is not broken twice over — it correctly suppressed the nine it saw in
+time — but its window only ever asks "is an ancestor down *right now*", where the question
+it needs to answer is "was an ancestor down *during the span this child was failing in*".
+[[O-52]]'s six-minute detection floor is why the window closes before most descendants are
+even confirmed down; this is the sharper consequence of that same floor, stated in the
+currency that actually reaches an operator's inbox rather than in alert rows. It gets
+*worse*, not better, as the core recovers faster: the faster the outage clears, the more
+descendants miss the window entirely. A brief outage — the ordinary case, not the
+worst one — is the one this suppresses least.
 
 ⏳ Tier B (1,000) and Tier C (2,000) land here.
 
@@ -1690,8 +1839,12 @@ deliberately, in the knowledge of what they multiply to, on the first day — an
    `configrx.js` catches up with the work already sitting behind it.
 3. **Alert routing is one mailing list.** O-6, O-7. Every recipient gets everything,
    so within a month nobody reads any of it.
-4. **The rollup needs two thousand manual edits before it works.** O-4. Until then a
-   site outage is a mailbox full of alerts, which is the same as no alerts.
+4. **The rollup needs two thousand manual edits before it works — and even configured,
+   it currently sends more email for a fast outage than an unconfigured install does.**
+   O-4, O-52, O-59. Until the upstream field is set a site outage is a mailbox full of
+   alerts; once it is set, the six-minute detection floor means most descendants miss
+   the ancestor's window entirely and notify on their own, which is the same problem
+   in a more expensive shape.
 
 **Would cost me real time every week**
 
@@ -1844,7 +1997,7 @@ Save looking identical to it. Each now carries the `danger` tier, which `app.js`
 
 ### The unbounded commitments
 
-Four of them, all found by the same question — *what does this allocate, loop over or
+Six of them, all found by the same question — *what does this allocate, loop over or
 wait for, on the strength of a number a stranger supplied?* — and all fixed.
 
 **O-50 — one TCP connection could hold unbounded memory on the unauthenticated syslog
@@ -1880,6 +2033,40 @@ spawn storm against its own host** (section 5.11).
 
 **And the two quadratic parsers** (section 5.11), both reachable from unauthenticated
 ports.
+
+**O-53 — the ConfigRX compliance sweep had no wall-clock budget, and it runs on the same
+thread that schedules every device's backup. CONFIRMED (measured), fixed.**
+`configrx_compliance.py`'s `evaluate_all()` had no ceiling, while its sibling
+`configrx_search.py` has one and its own docstring explains why it is needed. The
+triggering pattern is not exotic: `compile_bounded(r"a+a+a+c")` is an *allowed* pattern —
+three quantified atoms, right at the permitted boundary — and reads as a typo, not an
+attack. One 250-character line with no `c` cost 0.2303 s against it; 200 devices × 200
+such lines through the real database and evaluator did not finish in 120 seconds, and the
+arithmetic projects to about two and a half hours. A normal fleet (2,000 devices, 800
+realistic lines, four realistic rules) finishes in 0.4 s, so this was never about slowness
+in the ordinary case — it was an absent ceiling. The severity is in where it runs:
+`evaluate_all()` is called from `ConfigRxWorker._loop()`, the same loop iteration that
+checks which devices are due for a backup, so a sweep that never returns silently switches
+off configuration backups for the whole fleet, with nothing timed, logged or counted to
+say so. Fixed with `COMPLIANCE_SWEEP_BUDGET_S = 10.0`, checked before each rule set,
+before each device, and inside `evaluate_device` itself before each rule and each line —
+the last of those is what bounds a single bad must-not-match rule, since proving "never
+matches" means scanning every line.
+
+**O-54 — the whole-fleet report guard tested the shape of the request rather than the
+size of the work, and any caller who named every device explicitly walked straight past
+it. CONFIRMED (logic, unambiguous), fixed.** The month-wide top-metrics report route
+refused a whole-fleet-equivalent query only when `device_ids` was *absent*, on the
+reasoning that an explicit list means a narrower ask. It does not: `device_ids` naming
+every device in the fleet produces the identical query, the identical candidate count and
+the identical ~100-second cost (§5.10, O-39) as the case being refused, and a dashboard
+that builds its device list explicitly rather than omitting the parameter to mean
+"everything" is an ordinary thing to write, not a contrived caller. Fixed by measuring how
+many devices the request actually resolves to — `device_ids` omitted counts as every
+device on file, the same as `device_ids` naming every one explicitly, since they produce
+the same query — and scaling that count against the requested window before the guard
+decides, so half the fleet over fourteen days costs the same as the whole fleet over
+seven and is refused the same way.
 
 The counter placement in O-50 is the detail worth keeping: it was put where an operator
 already looks *because of* O-31 earlier the same night. A collector that refuses silently
@@ -1955,13 +2142,65 @@ fallback so the two halves could land in either order. The kiosk wall-display fi
 deliberately left on the narrower number, because "what has nobody looked at yet" is a
 different and also useful question, and an acknowledged alert has been looked at.
 
-**A read-only account could open two configurations and not diff them.** `server.py:479`
-gated `get_configrx_diff` on ConfigRX *write*, while `server.py:470` — the deliberate
-4.48.0 change — gates fetching a stored backup on *read*. Diffing two things you are
-already permitted to read is not a write, and it is the most common thing anyone does
-with configuration backups: the person asking "what changed on that switch before the
-line stopped" needed the same grant as the person who can push a credential. Now `read`,
-with the test that asserted the old behaviour updated to assert the new one.
+**O-20 — a read-only account could open two configurations and not diff them.**
+`server.py:479` gated `get_configrx_diff` on ConfigRX *write*, while `server.py:470` — the
+deliberate 4.48.0 change — gates fetching a stored backup on *read*. Diffing two things
+you are already permitted to read is not a write, and it is the most common thing anyone
+does with configuration backups: the person asking "what changed on that switch before
+the line stopped" needed the same grant as the person who can push a credential. Now
+`read`, with the test that asserted the old behaviour updated to assert the new one.
+Found on a browser walk under both non-admin roles, each timing out on the same disabled
+diff button with `title="Your account can read ConfigRX but not change it."`
+
+**O-33 — a background worker wrote to a closed database at shutdown, printing a
+traceback into the log an operator is told to read at 2 a.m. CONFIRMED (reproduced in a
+test run's teardown), fixed.** `monitor.py:222`'s `record_trace` raised
+`sqlite3.ProgrammingError: Cannot operate on a closed database`, the trace scheduler
+thread racing the database close during shutdown. The exit code was unaffected, which is
+exactly why it survived unnoticed — a test runner and an operator read the same log
+differently, and a service stop that ends in a Python traceback is indistinguishable, at
+2 a.m., from a service that crashed. The file already documented an analogous shutdown
+race for the node poller and waited it out; this was the same class on a different
+worker, not covered by that wait. Fixed the same way: `monitor.Scheduler.shutdown()` now
+stops accepting new work and drains in-flight traces — scaled to the slowest in-flight
+target's own worst-case budget rather than a flat guess — before the executor and its
+connection close, and `service.py`'s own shutdown path calls it.
+
+**O-51 — this campaign's own new UPS and environmental polling made 1,900 devices pay
+for a probe forever. CONFIRMED by its own author, fixed.** PoE and STP already use a
+persisted capability flag — NULL until the first probe, then true or false forever,
+precisely so a device confirmed not to support something is never asked again. The new
+UPS-MIB probe and the device-level environmental sensor scan had no such memory: they
+followed UCD-SNMP's "ask every device every poll" model instead, on the reasoning that
+one small GET is cheap. It is cheap for one device and not for a fleet — at 2,000 devices
+with perhaps 100 real UPSs, the other 1,900 paid a UPS-MIB scalar GET every poll
+indefinitely, and the environmental scan (a GETBULK walk, not a scalar) retried every
+300 seconds indefinitely on every device that is not an environmental monitor. Fixed by
+matching the existing pattern exactly: `ups_capable`/`sensor_capable` persisted columns,
+checked before probing, recorded only on the first probe. Tested for the thing that
+matters rather than the thing that is easy — not that the feature works, but that the
+*second* call costs zero requests. Found when its own author was asked what in their work
+they were least sure of; the question "could this cost a device that is neither"
+produced a real regression no test would have failed on and no review would have seen,
+because nothing was wrong — it was merely expensive, forever, invisibly.
+
+**O-62 — the SSH terminal's own 900-second idle timeout was unreachable at shipped
+defaults, and an idle operator was bounced to the sign-in page instead of being told the
+terminal timed out. CONFIRMED (measured: closed at 600.3 s with the wrong close code, not
+900 s with the right one), fixed.** `sshterm.py`'s watchdog checked two clocks every
+second — the web login session, then the terminal's own `IDLE_TIMEOUT_S` (900 s) — both
+reset by the same keystroke. The web session's own default idle window
+(`session_idle_minutes: 10` = 600 s) is always shorter, so the web clock always expired
+first: the dedicated SSH idle branch and its specific message ("Closed after 15
+minute(s) idle") could never fire at shipped settings, and the operator got redirected to
+`/login` instead — a more generic, less reassuring explanation than the true one. Fixed
+by computing an effective idle window as the minimum of the two clocks and checking *that*
+first, with the message naming the real, capped number of minutes rather than the
+constant the module started with — so the terminal now correctly reports its own timeout
+rather than deferring to a less specific one that would have fired first anyway. Found by
+running it, not by reading it: an earlier read of the same file correctly concluded the
+idle timer is keyed only to keystrokes and ignores resize traffic — both true, and both
+missing the interaction that made the specific timer moot.
 
 ## 8. What was deliberately not built
 

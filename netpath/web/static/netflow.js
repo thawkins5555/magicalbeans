@@ -398,6 +398,17 @@
 
   /* -------------------------------------------------------------- bars */
 
+  // A stable, position-independent id fragment for one top-N row: derived
+  // from the dimension's own key (a port, an address, an exporter) rather
+  // than its rank, which reorders on every refresh as traffic shifts — a
+  // fragment identifier has to survive that reorder to identify anything.
+  // Non-identifier characters (an IPv6 colon, a dotted address) become
+  // dashes rather than being dropped, so two keys that differ only in
+  // punctuation cannot collide onto the same id.
+  function barRowId(dimension, key) {
+    return `nf-bar-${dimension}-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`;
+  }
+
   function drawBars() {
     const wrap = App.el('nf-bars');
     wrap.innerHTML = '';
@@ -406,16 +417,25 @@
       wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
       return;
     }
+    const dimension = App.el('nf-dimension').value;
     const peak = Math.max(...rows.map((r) => r.bytes), 1);
     const bars = [];
     rows.forEach((row, index) => {
       const div = document.createElement('div');
       div.className = 'bar-row';
+      // id carries the row's real identity (row.key: a port, an address, an
+      // exporter — see barRowId); it must never rest on `index` when a rank
+      // itself reorders across refreshes. The value span gets its own id so
+      // the traffic figures — the part that DOES change every refresh — can
+      // still reach assistive tech, through aria-describedby below, without
+      // being the thing the row's accessible NAME is built from.
+      div.id = barRowId(dimension, row.key);
+      const valueId = `${div.id}-value`;
       div.innerHTML =
         `<div class="bar-fill" style="width:${(row.bytes / peak) * 100}%;` +
         `background:${SERIES[index % SERIES.length]}"></div>` +
         `<span class="bar-label">${escape(row.label)}</span>` +
-        `<span class="bar-value">${row.bytes_text} · ${row.rate_text}</span>`;
+        `<span class="bar-value" id="${valueId}">${row.bytes_text} · ${row.rate_text}</span>`;
       div.onclick = () => {
         // A bar picked with the mouse becomes the one the keyboard returns
         // to, same as a table row's own click already does.
@@ -431,8 +451,15 @@
         { text: `${row.flows} flow records` },
       ];
       div.setAttribute('role', 'button');
-      div.setAttribute('aria-label',
-        `${row.label}: ${row.bytes_text}, ${row.rate_text}, ${row.flows} flow records`);
+      // The accessible NAME is what the row IS — this port, this address,
+      // this exporter — and nothing else, precisely because that is the one
+      // thing here that does NOT change out from under a screen-reader user
+      // between refreshes; the traffic figures a sighted operator reads off
+      // the bar itself are still announced, as the row's DESCRIPTION via
+      // aria-describedby, just not folded into the name a repeat visitor or
+      // a future automated check would use to find this exact row again.
+      div.setAttribute('aria-label', row.label);
+      div.setAttribute('aria-describedby', valueId);
       div.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       div.addEventListener('mouseleave', App.hideTooltip);
       div.addEventListener('focus', () => {

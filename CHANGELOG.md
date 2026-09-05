@@ -230,17 +230,24 @@ other two decoders that take input straight off the wire — checked and clean
 (see below).
 
 **Twelve modules loaded before the Dashboard painted, on every visit,
-regardless of which of them anyone opened.** `app.js` 220 KB, `nodes.js`
-264 KB, `alerts.js` 90 KB and nine more — 1.17 MB uncompressed, roughly
-324 KB gzipped, most of it for tabs an operator may never look at, heaviest
-where it's least affordable: a tablet on plant Wi-Fi. Every module but
-Dashboard's own script tag is gone from `index.html` now; each one loads the
-first time its tab is actually selected, through the same `init()` every
-module already had, with the tab reading as still-working (the same accent
-line an ordinary slow refresh already draws) rather than a blank pane while
-its script is in flight. A module whose fetch fails degrades exactly like one
-that failed during eager startup always has: the tab hides, the failure is
-logged once, and an operator looking at it is moved off automatically.
+regardless of which of them anyone opened.** Measured when this was found:
+`app.js` 220 KB, `nodes.js` 264 KB, `alerts.js` 90 KB and nine more —
+1.17 MB uncompressed, roughly 324 KB gzipped, most of it for tabs an
+operator may never look at, heaviest where it's least affordable: a tablet
+on plant Wi-Fi. Every module's own script tag but Dashboard's — the tab
+everyone lands on — and this file's own is now gone from `index.html`;
+each module's script loads the first time its own tab is actually
+selected, through the same `init()` every module already had, with the
+tab reading as still-working (the same accent line an ordinary slow
+refresh already draws) rather than a blank pane while its script is in
+flight. A module whose fetch fails degrades exactly like one that failed
+during eager startup always has: the tab hides, the failure is logged
+once, and an operator looking at it is moved off automatically. Every
+module has grown since this was measured — real work landing in the same
+files this fixes — so the exact figures above are a snapshot of the
+problem's scale rather than a number to re-check today; the fix itself is
+structural (which files load, and when) rather than a size target, and
+holds regardless of how large any one module gets from here.
 
 **The tab bar went back to twelve flat tabs, with the labelled groups
 replaced by a hairline.** Four named groups (Now/Inventory/Telemetry/Admin,
@@ -401,20 +408,29 @@ buffering before anything prints — verified: the banner now arrives in
 **A mechanical, exhaustive check of the permission model, and a fuzz pass
 over every decoder that takes unauthenticated or uploaded input.** Every one
 of 213 routes in `web/server.py` was parsed and every handler's write
-behaviour traced up to four calls deep; the seven flagged as possible
-mismatches were all false positives on reading, and the two routes whose gate
-depends on the request body were confirmed correct by hand. That
-cross-reference now runs at test time, against a seven-entry allow-list of
-the named false positives, so a new mismatch has to be justified rather than
-silently absorbed — "we checked once" and "it cannot regress" are different
-claims, and only the second is durable. `trapdecode`, `nfdecode`, and both
+behaviour traced up to four calls deep, at the time this pass audited it;
+the seven flagged as possible mismatches were all false positives on
+reading, and the two routes whose gate depends on the request body were
+confirmed correct by hand. That cross-reference now runs at test time,
+against a seven-entry allow-list of the named false positives, so a new
+mismatch has to be justified rather than silently absorbed — "we checked
+once" and "it cannot regress" are different claims, and only the second is
+durable, which is exactly what let the fourteen routes ConfigRX search,
+compliance and reporting added later in this same pass (below) pass the
+identical check with no new exemption needed rather than needing a second
+by-hand audit: the table stands at 227 routes now, and the check is what
+kept the difference honest. `trapdecode`, `nfdecode`, and both
 regular expressions in `syslogparse` were fuzzed to 1 MB and came back clean
 — truncation at every one of the 84 byte boundaries of a valid v2c trap, a
 template that redefines itself mid-packet, a 60,000-byte field claimed in a
 10-byte record, all rejected or handled with no unhandled exception.
 `demo/selftest.py`, the offline wire-format conformance check every persona
-is driven through, went from 623 checks to 897 as the new device classes
-were added, all passing.
+is driven through, went from 623 checks before this campaign to 897 once
+the UPS/environmental/printer/Windows personas landed, and grew further as
+the personas gained LLDP/CDP neighbours and a real topology (1,051 at last
+count) — the number keeps moving as personas gain capabilities, and the
+substance is that it keeps passing as it grows, not any single count along
+the way.
 
 A related residual, found by the same fuzzing and left as a stated
 observation rather than a third fix: `mibparse._iter_macro_clauses`, the

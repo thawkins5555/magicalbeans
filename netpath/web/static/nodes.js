@@ -72,6 +72,21 @@
   // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
+  /* App.helpLink's own accessible name is the bare word "Help", the same on
+     every "?" in the application — fine wherever only one appears on a
+     view, which is why the SSH one below still calls App.helpLink directly.
+     It stops being fine the moment two share a view, which nodes.profile.
+     ping and nodes.profile.snmp always do: the device-override form and the
+     profile form each put them side by side, so a screen reader announcing
+     "Help" twice in a row leaves no way to tell which control either one is
+     about. Same button, same class/data-help the delegated click handler in
+     app.js reads (App.helpLink's own markup, reproduced here) — only the
+     name is specific instead of generic. */
+  function helpLinkNamed(key, label) {
+    return `<button type="button" class="help-link" data-help="${key}"` +
+           ` title="What does this control?" aria-label="Help: ${escape(label)}">?</button>`;
+  }
+
   const STATUS_COLOR = { up: 'var(--ok)', down: 'var(--fail)',
     unsupported: 'var(--warn)', auth: 'var(--warn)', unknown: 'var(--line)' };
   /* This module's vocabulary mapped onto the five tones App.statusMark
@@ -2433,8 +2448,8 @@
           : App.credentialUnavailableHtml('An SNMPv3 auth password')}
         <label>Poll interval <input id="nd-f-interval" type="number" min="10" value="${d.poll_interval_s || ''}"> s</label>
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
-        <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${App.helpLink('nodes.profile.ping')}
-        <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>${App.helpLink('nodes.profile.snmp')}
+        <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${helpLinkNamed('nodes.profile.ping', 'Ping')}
+        <label>SNMP <select id="nd-f-snmp">${triOptions(d.snmp_enabled)}</select></label>${helpLinkNamed('nodes.profile.snmp', 'SNMP')}
         <label>Ping probes per poll <input id="nd-f-pingcount" type="number" min="1" max="20"
           value="${d.ping_count ?? ''}"></label>
         <label>Ping timeout <input id="nd-f-pingtimeout" type="number" min="100" step="100"
@@ -3167,8 +3182,8 @@
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
       <div style="display:flex;justify-content:flex-start;gap:14px">
-        <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>${App.helpLink('nodes.profile.ping')}
-        <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>${App.helpLink('nodes.profile.snmp')}
+        <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>${helpLinkNamed('nodes.profile.ping', 'Ping')}
+        <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>${helpLinkNamed('nodes.profile.snmp', 'SNMP')}
       </div>
       <label>Ping probes per poll <input id="nd-p-pingcount" type="number" min="1" max="20"
         placeholder="inherit" value="${p.ping_count ?? ''}"></label>
