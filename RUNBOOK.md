@@ -46,18 +46,31 @@ show the message.
    nothing useful — go to step 2.
 2. **Debug tab**, filter to Nodes. Look for a traceback. The last event before
    polling stopped is the interesting one, not the newest.
-3. **The service log** — `journalctl -u sappiwhere --since "1 hour ago"`, or
-   the service console's Console output pane.
+3. **The service log.** On Linux running as a systemd unit:
+   `journalctl -u sappiwhere --since "1 hour ago"`. On Windows running
+   headless under NSSM, it is whichever file `nssm set SappiWhere AppStdout`
+   points at (`nssm dump SappiWhere` shows the current settings if you did
+   not set them yourself); running from the service console instead, it is
+   the console's own Console output pane, on either platform.
 4. **Act on the error.**
    - *"database is locked" or "disk I/O error"* — the disk, or a network share
      under the data directory. Check free space, check the mount. SQLite over
      NFS or SMB is a bad idea and this is how it announces itself.
-   - *"unable to open database file"* — permissions. The data directory is
-     `0700` and its files `0600` from 4.39.0; if the service account changed,
-     it no longer owns them.
+   - *"unable to open database file"* — permissions. On Linux, macOS or BSD
+     the data directory is `0700` and its files `0600` from 4.39.0; if the
+     service account changed, it no longer owns them. On Windows there is no
+     mode to check — the folder inherited its ACL from whichever account's
+     `%APPDATA%` it was first created under (`netpath/__main__.py`'s
+     `default_db_path()`), so this error there means the service is now
+     running as a *different* account than the one the folder belongs to;
+     point `--db`/`--app-db` (and the others) at the right folder, or grant
+     the new account access to the old one, rather than assuming a mode bit.
    - *A traceback in the polling code* — capture it, then restart.
 5. **Restart the service.** The poller re-seeds each device's due time from its
-   own last poll, so a restart does not fire the whole fleet at once.
+   own last poll, so a restart does not fire the whole fleet at once. On
+   Linux, `systemctl restart sappiwhere`; on Windows under NSSM, `nssm
+   restart SappiWhere` (or the Services console); running from the service
+   console on either platform, close the window and reopen it.
 
 **Confirm it recovered:** the poller status line shows busy workers, and a
 device you select drops to the fast cadence and updates.
@@ -114,13 +127,23 @@ reported zero dropped.
 2. **What is sending?** Syslog tab, group by host over the last hour. One
    device in a debug loop is by far the most common cause and is worth fixing
    at the device.
-3. **Raise the receive buffer** if the volume is legitimate. On Linux:
+3. **Raise the receive buffer** if the volume is legitimate. Each collector
+   asks for a buffer sized from its own `socket_buffer_kb` setting, and
+   `collector.py` reads back what the kernel actually granted, logging an
+   error the moment the readback comes in short of the request — that
+   comparison is how `net.core.rmem_max` clamping the buffer gets caught
+   at all, rather than silently dropping datagrams with no explanation. On
+   Linux:
    ```
    sysctl -w net.core.rmem_max=16777216
    sysctl -w net.core.rmem_default=4194304
    ```
    and restart the service so the sockets pick it up. Make it permanent in
-   `/etc/sysctl.d/`.
+   `/etc/sysctl.d/`. **On Windows there is no equivalent sysctl and nothing
+   to raise system-wide** — Windows does not clamp `SO_RCVBUF` the way
+   Linux does, so raising the Settings-tab buffer value itself is the whole
+   fix there; if the readback still comes in short on Windows, that is
+   memory pressure on the box, not a tunable ceiling to look for.
 4. **Turn on per-source rate limiting.** The syslog collector's
    `per_source_rate`, in Syslog settings, is 200 messages a second per source
    by default; traffic above it is counted as `throttled` rather than dropped
@@ -178,9 +201,13 @@ minutes, or a window wider than a few days is blank.
    that is about a week per metric. If you have lowered it, that is your
    window.
 3. **`rollup_retention_days`**, default 400, and whether `samples_hourly` has
-   rows: `sqlite3 nodes.db "SELECT COUNT(*) FROM samples_hourly;"`. It fills on
-   the first maintenance pass after an hour has completed, so a freshly
-   installed system legitimately has none yet.
+   rows: `sqlite3 nodes.db "SELECT COUNT(*) FROM samples_hourly;"` (no
+   `sqlite3` shell on Windows by default — `py -c "import sqlite3;
+   print(sqlite3.connect('nodes.db').execute('SELECT COUNT(*) FROM
+   samples_hourly').fetchone())"` reads the same thing without installing
+   anything, same substitution as the password-recovery step below). It
+   fills on the first maintenance pass after an hour has completed, so a
+   freshly installed system legitimately has none yet.
 4. **Whether the metric is being written at all.** A blank CPU chart on a
    switch may simply mean the device does not answer any CPU object this
    application asks for. The device's metric list shows what it does answer.
@@ -249,13 +276,13 @@ raised in the application instead.
    `notify_rollup_delay_s` under **A flood of alerts nobody asked for**
    below; a cap still being hit after that usually means the cap itself is
    too low for the fleet, not that the coalescing failed.
-4. **On Linux, check whether a passphrase is configured for the portable
-   secret store.** From 4.47.0 an SMTP password can be stored off Windows
-   too, once `NETPATH_SECRET_PASSPHRASE_FILE` or `NETPATH_SECRET_PASSPHRASE`
-   is set — see `CREDENTIAL-SECURITY.md` §10. With neither configured, the
-   old limit still applies: no SMTP password can be stored on this host at
-   all, and if the relay has started demanding authentication, it can no
-   longer send through it.
+4. **On Linux, macOS or BSD, check whether a passphrase is configured for
+   the portable secret store.** From 4.47.0 an SMTP password can be stored
+   off Windows too, once `NETPATH_SECRET_PASSPHRASE_FILE` or
+   `NETPATH_SECRET_PASSPHRASE` is set — see `CREDENTIAL-SECURITY.md` §10.
+   With neither configured, the old limit still applies: no SMTP password
+   can be stored on this host at all, and if the relay has started
+   demanding authentication, it can no longer send through it.
 5. **The breaker closes itself.** The first job after the cooldown is the
    probe; if it succeeds the alert resolves on its own. You do not need to
    restart anything.
@@ -402,8 +429,13 @@ mechanism built for this.
 
 ## Nobody can sign in
 
-1. **Is the service running?** `systemctl status sappiwhere`. If the browser
-   shows a connection error rather than a sign-in page, this is the answer.
+1. **Is the service running?** `systemctl status sappiwhere` on Linux;
+   `Get-Service SappiWhere` on Windows if it is running as a service (NSSM or
+   a plain `sc`-registered one — either shows up there), or check Task
+   Manager for a `pythonw.exe`/`python.exe` process, or whether the service
+   console window is even still open, if it is not running as a service at
+   all. If the browser shows a connection error rather than a sign-in page,
+   this is the answer.
 2. **Locked out after failed attempts?** From 4.39.0 an account is locked for a
    period after twenty failures in fifteen minutes and returns 429. It clears
    itself; wait, or restart the service.
@@ -412,12 +444,28 @@ mechanism built for this.
 4. **The last admin password is genuinely lost.** Stop the service, delete the
    `users` table from `app.db`, start it: the default `admin`/`admin` account
    is recreated with full access and must change its password immediately.
+   On Linux:
    ```
    systemctl stop sappiwhere
    sqlite3 ~/.local/share/netpath-monitor/app.db "DROP TABLE users;"
    systemctl start sappiwhere
    ```
-   This is a real recovery path and it is also why file permissions on the data
+   On Windows, stop it the way you run it (`nssm stop SappiWhere`, the
+   Services console, or closing the service console window), then drop the
+   table. Windows has no `sqlite3` command-line tool installed anywhere by
+   default — Linux gets it from a distro package, Windows gets nothing —
+   and this application does not carry a copy either, so reach for the
+   standard library's own binding instead of installing anything just for
+   one command:
+   ```powershell
+   py -c "import sqlite3; c = sqlite3.connect(r'$env:APPDATA\netpath-monitor\app.db'); c.execute('DROP TABLE users'); c.commit()"
+   ```
+   then start the service again the same way you stopped it. (If you would
+   rather have the real `sqlite3.exe` shell for this and future recoveries,
+   the precompiled `sqlite-tools` zip on sqlite.org's download page is the
+   Windows equivalent of the package a Linux distro installs it from.)
+   This is a real recovery path and it is also why file permissions — or,
+   on Windows, the account owning `%APPDATA%\netpath-monitor\` — on the data
    directory matter: anyone who can write `app.db` can do this.
 5. **After it is back**, check the audit log (Settings → Audit, `admin`
    capability) for what happened before the lockout.
@@ -440,12 +488,23 @@ returning anything but `ok`.
 
 1. **Stop the service.** Every further write makes it worse.
 2. **Copy the file, its `-wal` and its `-shm`** somewhere safe before touching
-   anything.
+   anything — `cp nodes.db nodes.db-wal nodes.db-shm /somewhere/safe/` on
+   Linux, `Copy-Item nodes.db,nodes.db-wal,nodes.db-shm -Destination
+   D:\safe\ -ErrorAction SilentlyContinue` on Windows (the `-wal`/`-shm`
+   files only exist while the service is running or if it stopped mid-write,
+   hence swallowing the error).
 3. **Try the dump-and-reload**, which recovers more often than people expect:
    ```
    sqlite3 nodes.db ".recover" | sqlite3 nodes-recovered.db
    sqlite3 nodes-recovered.db "PRAGMA integrity_check;"
    ```
+   `.recover` is a feature of the `sqlite3` command-line shell itself, not of
+   the SQLite library — Python's stdlib `sqlite3` module wraps the library,
+   not the shell, so there is no `py -c` substitute for this one the way
+   there is elsewhere in this document. Windows does not ship the shell the
+   way a Linux distro packages it, so get it from the `sqlite-tools`
+   precompiled zip on sqlite.org's download page first, then run the same
+   two commands from wherever you unzipped it.
    If that returns `ok`, move it into place and start the service. Schemas
    migrate forward on open, so a recovered file from an older release is fine.
 4. **Otherwise restore from backup** — `BACKUP-RESTORE.md`, and note the DPAPI
@@ -456,5 +515,12 @@ returning anything but `ok`.
    `configrx.db` without a backup — those hold configuration, not just records.
 6. **Then find out why.** Corruption in SQLite is almost always the storage
    underneath: a database on an NFS or SMB share, a volume that lies about
-   flushes, or a disk that is failing. Check `dmesg` and SMART before putting
-   it back on the same volume.
+   flushes, or a disk that is failing. On Linux, check `dmesg` and SMART
+   (`smartctl -a /dev/sdX`) before putting it back on the same volume. On
+   Windows, the equivalent first stop is Event Viewer's **Windows Logs →
+   System**, filtered to source `disk` or `ntfs`, and `Get-PhysicalDisk |
+   Get-StorageReliabilityCounter` for the SMART-derived counters Storage
+   Spaces already tracks — it needs an administrative prompt, refusing with
+   "Access to a CIM resource was not available" otherwise (verified). `wmic
+   diskdrive get status` is the quicker, cruder version of the same question
+   and needs no elevation.

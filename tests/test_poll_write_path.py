@@ -570,8 +570,16 @@ def interface_reads():
 
     # ------------------------------------------- a device that goes quiet
     print("\n-- a device that stops answering mid-table")
+    # --dark-after counts plain GETs answered before the agent goes silent:
+    # the identity read and the UCD-SNMP read (2), plus, since nodepoll grew
+    # a UPS-MIB probe tried on every device exactly like UCD-SNMP is
+    # (nodepoll._poll_ups_health), one more (3) — all three land before the
+    # interface walk even starts. 4 is what leaves interface 1's own GET
+    # (the first one issued once the per-interface loop begins) as the last
+    # one this agent still answers, which is the scenario this section is
+    # for: one interface read before the device goes dark, none after.
     proc, port = spawn_stub("stub_agent_iftable.py", "dark_after_walk",
-                            "--interfaces", "40", "--dark-after", "3")
+                            "--interfaces", "40", "--dark-after", "4")
     try:
         nodepoll_mod.DEFAULT_SNMP_PORT = port
         db = NodesDatabase(os.path.join(TMPDIR, "dark.db"))

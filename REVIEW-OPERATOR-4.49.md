@@ -428,13 +428,33 @@ availability of these thirty devices" and "which twenty links came closest to
 saturation". Both are a `GROUP BY` away from data already on disk. This is the cheapest
 large win in the product.
 
-### 5.4 Performance and scale
+### 5.8 Performance and scale
+
+⏳ The tier numbers land here.
+
+**O-13 — every one of the twelve modules is downloaded, parsed and compiled before the
+Dashboard paints. CONFIRMED (`index.html:1335-1347`, byte counts measured).** Thirteen
+`<script defer>` tags load `app.js` and every module unconditionally. Measured:
+`nodes.js` 264 KB, `app.js` 220 KB, `alerts.js` 90 KB, `app.css` 79 KB, `index.html`
+76 KB, `ipam.js` 61 KB, `netpath.js` 60 KB, `configrx.js` 55 KB — **1.17 MB
+uncompressed**, roughly 324 KB gzipped, on every load.
+
+`defer` means this is not a rendering stall; it is bandwidth, parse time and memory,
+for eleven modules the operator may never open, and it is most visible where it is
+least affordable — a tablet on plant Wi-Fi. The fix is contained because the structure
+is already right: `selectTab` exists, each module has its own `init()`, and the assets
+are already versioned and immutably cached. Load a module's script the first time its
+tab is selected, keeping `app.js`, `boot.js` and `dashboard.js` eager. A previous
+review declined minification (PERF-004) with reasons; this is a different and larger
+lever, and it makes the source no harder to read.
+
+### 5.9 Security and permissions
 
 ⏳
 
-### 5.5 Security and permissions
-
-⏳
+**The self-update path, reported and deliberately not changed.** By the operator's own
+instruction this pass documents rather than alters it. ⏳ The exact description, and
+the bounds of the exposure, land here once verified against the current code.
 
 ---
 

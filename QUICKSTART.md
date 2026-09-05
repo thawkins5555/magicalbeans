@@ -61,6 +61,11 @@ cd /opt/netpath
 python3 -m netpath --web --host 127.0.0.1 --port 8443
 ```
 
+```powershell
+cd C:\apps\sappiwhere
+py -m netpath --web --host 127.0.0.1 --port 8443
+```
+
 `--host 127.0.0.1` binds to loopback only. Do that first, and open it up
 deliberately once you have changed the admin password and, ideally, put a
 certificate on it:
@@ -69,12 +74,21 @@ certificate on it:
 python3 -m netpath --web --host 0.0.0.0 --port 8443 --cert server.crt --key server.key
 ```
 
+```powershell
+py -m netpath --web --host 0.0.0.0 --port 8443 --cert server.crt --key server.key
+```
+
 Without `--cert`/`--key` the interface is plain HTTP and session cookies travel
 in the clear.
 
 The databases are created on first start, ten of them, in
 `~/.local/share/netpath-monitor/` (or `%APPDATA%\netpath-monitor\` on Windows).
-From 4.39.0 that directory is created mode `0700` and each database `0600`.
+From 4.39.0 that directory is created mode `0700` and each database `0600` —
+**on Linux, macOS and BSD.** Windows has no POSIX mode to set, so on Windows
+the folder instead inherits whatever ACL already protects your profile
+directory (`%APPDATA%`) rather than getting a mode of its own; if that
+profile is itself locked to you, so is the data folder, and if it is not,
+nothing here narrows it (`netpath/__main__.py`'s `default_db_path()`).
 
 Leave it running in a terminal for now. `README.md` covers running it as a
 systemd unit or a Windows service, which is what you want before you rely on

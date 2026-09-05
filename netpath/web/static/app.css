@@ -264,6 +264,13 @@ body.tiny .brand span { display: none; }
   border-left: 1px solid var(--hairline);
   position: relative;
 }
+/* Search/Account/Sign out each carry an icon and a text label; the icon is
+   drawn (currentColor, so it takes the button's own resting/hover colour
+   with no token of its own to keep in step) but hidden at rest — only the
+   text shows, same as before. Below ~480px (breakpoints, further down)
+   that flips: see there for why. */
+.icon-toggle { display: inline-flex; align-items: center; gap: 4px; }
+.icon-toggle .ico { display: none; width: 16px; height: 16px; flex: none; }
 /* The overflow fade, moved off #tabs itself (app.css used to draw it as
    #tabs::after, an absolutely positioned child of the scroll container —
    which meant it scrolled WITH scrollLeft, sitting at the visible right
@@ -1696,6 +1703,20 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   .tile.wide { grid-column: span 1; }
   .card.strip { flex-wrap: wrap; row-gap: 6px; }
   .card.strip > .stat, .card.strip > .hint { white-space: normal; }
+}
+/* Below ~480px the utility group's three text buttons — Search, Account,
+   Sign out — cost more width than the twelve-tab strip sitting beside them:
+   at 360px they, plus #conn, ran to roughly two thirds of the whole bar,
+   leaving DASHBOARD and a sliver of ALERTS the only tabs with any room at
+   all. Collapsed to icon buttons (index.html's .icon-toggle) they cost a
+   fixed ~20px each instead of a name's width — nothing a screen reader
+   announces or a tooltip shows changes, since the accessible name was
+   always aria-label/title, never the visible text. #conn keeps its exact
+   place: it is the one thing in this bar that earns it, unlike the three
+   buttons beside it. */
+@media (max-width: 480px) {
+  .icon-toggle .label { display: none; }
+  .icon-toggle .ico { display: block; }
 }
 /* The tab strip is the one piece of this breakpoint owned here: it must
    absorb its own overflow rather than pushing the body wider, whatever a

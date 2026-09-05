@@ -752,6 +752,12 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
   // needs settings:read, which every seeded account has.
   await guarded(recorder, step('dlg:users-grid'), async () => {
     await selectTab(page, 'settings');
+    // Settings carries its own subtabs (general/retention/signin/users/...),
+    // not in the SUBTABS map above since only one of them (users) matters to
+    // this walk — #users-table lives inside it, not on Settings' landing
+    // subtab, so without this click the wait below timed out for every
+    // account, always, a pre-existing gap this fixes rather than a new one.
+    await page.click('#page-settings .subtab[data-subtab="users"]').catch(() => {});
     await page.waitForSelector('#users-table', { timeout: 10000 });
     await settle(page, 800);
     await page.locator('#users-table').scrollIntoViewIfNeeded().catch(() => {});

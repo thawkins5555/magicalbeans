@@ -48,21 +48,40 @@ noAuthNoPriv and an unauthenticated relay, or run the service on Windows. See
 
 The collector port is set under **Settings** on the NetFlow tab. Common
 alternatives are 2056, 4739 (the IPFIX default) and 9995. Ports below 1024
-require administrator rights to bind.
+require root, or `CAP_NET_BIND_SERVICE`, to bind on Linux, macOS or BSD.
+
+**Windows has no such restriction — this is worth being explicit about, not
+just silent by omission, because it changes real deployment advice below.**
+The <1024-needs-a-privileged-process rule is a POSIX convention; Windows
+binds a low port from an ordinary, non-elevated account the same as any
+other port. Verified on this machine: binding UDP 80, 443, 25 and 21 all
+succeeded from a process whose token was confirmed *not* administrator
+(`([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)`
+returned `False`), with no UAC prompt and no error. So on Windows, running
+this application as a dedicated low-privilege service account — the right
+choice for the DPAPI reasons `CREDENTIAL-SECURITY.md` and `README.md`
+already give — costs nothing on the port side either; there is no "give it
+one more privilege just to bind 162" step the way there is on Linux.
 
 The web port is set with `--port`. It carries no authentication yet, so bind it
 to an interface you trust with `--host`, or to `127.0.0.1` and reach it through
 something that does authenticate. TLS is used when `--cert` and `--key` are
 given and plain HTTP otherwise; the port number does not change that.
 
-Syslog's standard port is 514, but binding below 1024 needs administrator or
-root rights. Running the collector on 5140 and pointing devices at that avoids
-the privilege entirely, which is usually the better answer on Windows.
+Syslog's standard port is 514: root or `CAP_NET_BIND_SERVICE` on Linux, macOS
+or BSD, nothing extra on Windows (above). Running the collector on 5140 and
+pointing devices at that still avoids the privilege on POSIX if you would
+rather not grant it, which was the only reason to prefer 5140 in the first
+place — on Windows there is no privilege question either way, so picking
+5140 there is purely about avoiding a collision with something else already
+using 514, not about avoiding an elevation requirement.
 
-SNMP's standard trap port is 162, with the same privilege requirement below
-1024; 1162 avoids it. On Windows, the built-in "SNMP Trap" service also binds
-162 by default and will silently take traps meant for this app — stop that
-service first, or use a different port.
+SNMP's standard trap port is 162, with the same POSIX privilege requirement
+below 1024 and the same absence of one on Windows; 1162 avoids the POSIX
+case. On Windows, the built-in "SNMP Trap" service also binds 162 by
+default (as a genuinely separate, non-privilege-related collision, not the
+low-port issue above) and will silently take traps meant for this app —
+stop that service first, or use a different port.
 
 On Windows each listening port needs an inbound firewall rule:
 
@@ -229,12 +248,20 @@ All ten sit in one folder, chosen at first run:
 
 Override any of them individually:
 
+```bash
+python -m netpath --db /data/netpath.db --flow-db /data/flows.db \
+                  --syslog-db /data/syslog.db --app-db /data/app.db \
+                  --ipam-db /data/ipam.db --snmp-db /data/snmptraps.db \
+                  --nodes-db /data/nodes.db --alerts-db /data/alerts.db \
+                  --wireless-db /data/wireless.db --configrx-db /data/configrx.db
 ```
-python -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db \
-                  --syslog-db D:\data\syslog.db --app-db D:\data\app.db \
-                  --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db \
-                  --nodes-db D:\data\nodes.db --alerts-db D:\data\alerts.db \
-                  --wireless-db D:\data\wireless.db --configrx-db D:\data\configrx.db
+
+```powershell
+py -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db `
+              --syslog-db D:\data\syslog.db --app-db D:\data\app.db `
+              --ipam-db D:\data\ipam.db --snmp-db D:\data\snmptraps.db `
+              --nodes-db D:\data\nodes.db --alerts-db D:\data\alerts.db `
+              --wireless-db D:\data\wireless.db --configrx-db D:\data\configrx.db
 ```
 
 Running as a service, set these explicitly. The default resolves against the

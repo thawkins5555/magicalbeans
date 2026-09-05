@@ -430,10 +430,19 @@ def _decode_entity_sensor(dev, entity: int) -> float:
 
 
 def test_room_alert_dom() -> None:
-    """entPhySensorValue must decode to a sensible °C and %RH — the point
-    of the whole persona — on a plain device and on the temp_hot SPECIALS
-    variant (index 15)."""
+    """nodepoll._poll_environment (nodepoll.py:3081) is a whole-device
+    ENTITY-SENSOR-MIB walk that deliberately does NOT require
+    entAliasMappingIdentifier — added specifically because an environmental
+    monitor's sensors belong to no port. This persona proves both halves:
+    no port mapping exists at all (so nodepoll.read_dom(), which still
+    gates on that mapping, correctly finds nothing here), while the raw
+    ENTITY-SENSOR values decode to a sensible °C/%RH on a plain device, and
+    the temp_hot SPECIALS variant (index 15) clears alertsdb's temp_high
+    threshold (35°C)."""
     normal = make_device("room_alert", index=930)
+    alias, _reason, _ = bulk_walk(normal, "1.3.6.1.2.1.47.1.3.2.1.2")
+    check(not alias, "room_alert: entAliasMappingIdentifier should be empty "
+                      "— its sensors belong to no port")
     temp = _decode_entity_sensor(normal, 10011)   # if_index 1, slot 1
     humidity = _decode_entity_sensor(normal, 10012)               # slot 2
     check(15.0 <= temp <= 30.0,
@@ -443,33 +452,87 @@ def test_room_alert_dom() -> None:
 
     hot = make_device("room_alert", index=931, temp_hot=True)
     hot_temp = _decode_entity_sensor(hot, 10011)
-    check(hot_temp > 38.0,
-          f"room_alert: temp_hot did not push the decoded reading up "
-          f"({hot_temp}°C)")
+    check(hot_temp > 35.0,
+          f"room_alert: temp_hot did not clear alertsdb's temp_high "
+          f"threshold (35°C), got {hot_temp}°C")
 
 
 def test_apc_ups() -> None:
-    """RFC 1628 scalars answer, typed as INTEGER, and on_battery (SPECIALS
-    index 14) flips upsOutputSource from normal(3) to battery(5)."""
+    """RFC 1628 scalars matching nodeoids.UPS_HEALTH answer, typed as
+    INTEGER; on_battery (SPECIALS index 14) flips upsOutputSource from
+    normal(3) to battery(5) and, given a few minutes, drains
+    upsBatteryStatus through batteryLow(3) to batteryDepleted(4) — the
+    three-alert arc (ups_on_battery, ups_battery_low, ups_battery_replace)
+    alertsdb.py:493-501 defines. upsEstimatedMinutesRemaining (.1.2.3.0) is
+    deliberately absent, so nodepoll._apc_runtime_fallback's PowerNet-arc
+    read is what actually answers ups_runtime_min for this persona."""
     dev = make_device("apc_ups", index=932)
     packet = build_request(V2C, "public", PDU_GET, 1,
-                           [f"{personas.UPS_MIB}.1.2.4.0",    # charge remaining
-                            f"{personas.UPS_MIB}.1.4.1.0"])   # output source
+                           [f"{personas.UPS_MIB}.1.2.3.0",    # minutes remaining
+                            f"{personas.UPS_MIB}.1.2.4.0",    # charge remaining
+                            f"{personas.UPS_MIB}.1.4.1.0",    # output source
+                            "1.3.6.1.4.1.318.1.1.1.2.2.3.0"]) # PowerNet runtime
     response = ask(dev, packet)
-    if not check(response is not None and len(response.varbinds) == 2,
+    if not check(response is not None and len(response.varbinds) == 4,
                  "apc_ups: RFC 1628 scalars did not answer"):
         return
-    charge, source = response.varbinds
+    minutes, charge, source, powernet_runtime = response.varbinds
+    check(minutes["type"] in ("noSuchObject", "noSuchInstance"),
+          f"apc_ups: upsEstimatedMinutesRemaining should be absent, "
+          f"got {minutes}")
     check(charge["type"] == "INTEGER" and 0 <= int(charge["value"]) <= 100,
           f"apc_ups: upsEstimatedChargeRemaining decoded as {charge}")
     check(source["type"] == "INTEGER" and int(source["value"]) == 3,
           f"apc_ups: upsOutputSource should read normal(3) on mains, got {source}")
+    check(powernet_runtime["type"] == "TimeTicks",
+          f"apc_ups: PowerNet upsAdvBatteryRunTimeRemaining is "
+          f"{powernet_runtime['type']}, expected TimeTicks")
 
     battery = make_device("apc_ups", index=933, on_battery=True)
     response = ask(battery, build_request(
         V2C, "public", PDU_GET, 1, [f"{personas.UPS_MIB}.1.4.1.0"]))
     check(response is not None and int(response.varbinds[0]["value"]) == 5,
           "apc_ups: on_battery did not flip upsOutputSource to battery(5)")
+    # Fast-forward the same knob far enough on battery to watch
+    # upsBatteryStatus drain through batteryLow to batteryDepleted.
+    status_field = battery.table(None).entries[f"{personas.UPS_MIB}.1.2.1.0"][1]
+    now = battery.start_ts
+    early = status_field(battery, now + 10)
+    low = status_field(battery, now + 250)
+    depleted = status_field(battery, now + 300)
+    check(early == 2, f"apc_ups: battery status should start normal(2), got {early}")
+    check(low == 3, f"apc_ups: battery status should read batteryLow(3) "
+                    f"partway through the drain, got {low}")
+    check(depleted == 4, f"apc_ups: battery status should reach "
+                         f"batteryDepleted(4) once fully drained, got {depleted}")
+
+
+def test_eaton_ups() -> None:
+    """A second UPS vendor answering only the standard scalars (including
+    upsEstimatedMinutesRemaining, unlike apc_ups) — proves
+    nodepoll._poll_ups_health's per-device design is not APC-specific, and
+    that Eaton's arc (534) identifies the device on its own."""
+    dev = make_device("eaton_ups", index=938)
+    table = dev.table(None)
+    descr = table.entries["1.3.6.1.2.1.1.1.0"][1]
+    oid = table.entries["1.3.6.1.2.1.1.2.0"][1]
+    vendor, how = nodeoids.identify_vendor(oid, descr)
+    check(vendor == "eaton", f"eaton_ups: expected vendor 'eaton', got {vendor!r}")
+    check(how == "sysObjectID", f"eaton_ups: expected sysObjectID identification, got {how}")
+    packet = build_request(V2C, "public", PDU_GET, 1,
+                           [f"{personas.UPS_MIB}.1.2.3.0",    # minutes remaining
+                            f"{personas.UPS_MIB}.1.2.4.0"])   # charge remaining
+    response = ask(dev, packet)
+    if not check(response is not None and len(response.varbinds) == 2,
+                 "eaton_ups: RFC 1628 scalars did not answer"):
+        return
+    minutes, charge = response.varbinds
+    check(minutes["type"] == "INTEGER" and int(minutes["value"]) > 0,
+          f"eaton_ups: upsEstimatedMinutesRemaining decoded as {minutes}")
+    check(charge["type"] == "INTEGER" and int(charge["value"]) == 100,
+          f"eaton_ups: upsEstimatedChargeRemaining decoded as {charge}")
+    check(not table.has("1.3.6.1.4.1.318.1.1.1.2.2.1.0"),
+          "eaton_ups: should answer nothing under APC's PowerNet arc")
 
 
 def test_printer_mfp() -> None:
@@ -490,10 +553,42 @@ def test_printer_mfp() -> None:
           f"printer_mfp: supply level read as {level}")
 
 
+_NO_MEM_PCT_OIDS = (
+    # Every OID any nodepoll.py code path reads on the way to a mem_pct
+    # metric: UCD-SNMP-MIB (the generic fallback everything else beats),
+    # the Cisco memory-pool pair (arc 9 only, via _cisco_memory_pct), and
+    # Fortinet's VENDOR_HEALTH mem scalar (nodeoids.py:97-102) — the only
+    # vendor arc besides Cisco's that names one at all; Juniper's entry in
+    # that same table is cpu_pct/temp_c only, no memory. None of these
+    # should be present on a Windows persona — that absence is
+    # _host_resources_no_memory's whole point.
+    personas.UCD_MEM_TOTAL, personas.UCD_MEM_AVAIL,
+    "1.3.6.1.4.1.9.9.48.1.1.1.5.1", "1.3.6.1.4.1.9.9.48.1.1.1.6.1",
+    "1.3.6.1.4.1.12356.101.4.1.4.0",
+)
+
+
+def _host_resources_no_memory(key: str, dev) -> None:
+    """CPU and disk populate for a Windows persona (GENERIC_HEALTH's
+    hrProcessorLoad column_avg, _host_resources_disk_pct's
+    hrStorageFixedDisk filter — both confirmed by reading nodepoll.py, not
+    guessed), but no path in nodepoll.py produces mem_pct for one — also
+    confirmed by reading nodepoll.py rather than inferred. Shared by
+    test_windows_server and test_windows_endpoint."""
+    table = dev.table(None)
+    check(table.has("1.3.6.1.2.1.25.3.3.1.2.1"),
+          f"{key}: hrProcessorLoad is missing — cpu_pct would not populate")
+    for oid in _NO_MEM_PCT_OIDS:
+        check(not table.has(oid),
+              f"{key}: answers {oid}, which would give it a memory metric "
+              f"nodepoll.py has no path to produce for a Windows host")
+
+
 def test_windows_server() -> None:
-    """hrStorageTable types matter: exactly one row reads as
-    hrStorageFixedDisk (the RAM and virtual-memory rows must not), and
-    hrSystemUptime/hrSWRunTable both answer."""
+    """hrStorageTable types matter: exactly two rows read as
+    hrStorageFixedDisk and exactly one as hrStorageRam (nothing else),
+    hrSystemUptime/hrSWRunTable both answer, and the CPU/disk-but-no-memory
+    asymmetry (SPECIALS index 17) holds."""
     dev = make_device("windows_server", index=935)
     table = dev.table(None)
     types, sizes, used = {}, {}, {}
@@ -505,25 +600,28 @@ def test_windows_server() -> None:
         elif oid.startswith("1.3.6.1.2.1.25.2.3.1.6."):
             used[oid.rsplit(".", 1)[-1]] = value(dev, time.time())
     fixed = [i for i, t in types.items() if t == personas.HR_STORAGE_FIXED_DISK]
-    other = [i for i, t in types.items() if t != personas.HR_STORAGE_FIXED_DISK]
-    check(len(fixed) == 1,
-          f"windows_server: expected exactly one hrStorageFixedDisk row, "
+    ram = [i for i, t in types.items() if t == personas.HR_STORAGE_RAM]
+    check(len(fixed) == 2,
+          f"windows_server: expected exactly two hrStorageFixedDisk rows, "
           f"found {len(fixed)}")
-    check(len(other) == 2,
-          f"windows_server: expected a RAM row and a virtual-memory row "
-          f"alongside the disk, found {len(other)}")
-    if fixed:
-        pct = 100.0 * used[fixed[0]] / sizes[fixed[0]]
+    check(len(ram) == 1,
+          f"windows_server: expected exactly one hrStorageRam row, "
+          f"found {len(ram)}")
+    for i in fixed:
+        pct = 100.0 * used[i] / sizes[i]
         check(0 < pct < 100, f"windows_server: disk-used percentage is {pct}")
     check(table.has(f"{personas.HR_SW_RUN}.2.1"),
           "windows_server: hrSWRunTable is empty")
     check(table.has(personas.HR_SYSTEM_UPTIME),
           "windows_server: hrSystemUptime is missing")
+    _host_resources_no_memory("windows_server", dev)
 
 
 def test_windows_endpoint() -> None:
-    """The cheap, single-interface shape: one wireless-looking adapter and
-    still exactly one hrStorageFixedDisk row."""
+    """The cheap, single-interface shape: one wireless-looking adapter,
+    still two hrStorageFixedDisk rows and one hrStorageRam row, and the
+    same CPU/disk-but-no-memory asymmetry as windows_server (SPECIALS
+    index 18)."""
     dev = make_device("windows_endpoint", index=936)
     table = dev.table(None)
     check(port_count(dev) == 1,
@@ -536,9 +634,24 @@ def test_windows_endpoint() -> None:
     fixed = [oid for oid, (_tag, v) in table.entries.items()
              if oid.startswith("1.3.6.1.2.1.25.2.3.1.2.")
              and v == personas.HR_STORAGE_FIXED_DISK]
-    check(len(fixed) == 1,
-          f"windows_endpoint: expected exactly one fixed-disk storage row, "
+    check(len(fixed) == 2,
+          f"windows_endpoint: expected exactly two fixed-disk storage rows, "
           f"found {len(fixed)}")
+    _host_resources_no_memory("windows_endpoint", dev)
+
+
+def test_tablet_ouis() -> None:
+    """A tablet/phone has no SNMP agent of its own — the only honest way
+    this fleet represents one is as a leaf MAC in an access switch's
+    forwarding table, under a real phone/tablet vendor's OUI, so a report
+    can point at it in the FDB the way a real switch would show it."""
+    dev = make_device("cisco_access", index=937)
+    fdb, _reason, _ = bulk_walk(dev, "1.3.6.1.2.1.17.7.1.2.2.1.2")
+    ouis = {tuple(int(a) for a in suffix.split(".")[1:4]) for suffix in fdb}
+    check(personas.APPLE_OUI in ouis,
+          "cisco_access: no Apple-OUI MAC in the FDB")
+    check(personas.SAMSUNG_OUI in ouis,
+          "cisco_access: no Samsung-OUI MAC in the FDB")
 
 
 # ----------------------------------------------------------- the wire path
@@ -626,9 +739,11 @@ def main() -> int:
     print("estate device personas (UPS, Room Alert, printer, Windows) ...")
     test_room_alert_dom()
     test_apc_ups()
+    test_eaton_ups()
     test_printer_mfp()
     test_windows_server()
     test_windows_endpoint()
+    test_tablet_ouis()
     print("wire path on 127.0.0.250:161 ...")
     wire_test()
 

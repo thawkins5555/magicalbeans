@@ -23,8 +23,8 @@ Public surface the seed script depends on (keep stable)::
         [{index, ip, name, persona, site, snmp_version, community,
           profile, knobs}, ...]
         index 0 is the core switch, index 1 the wireless controller, and
-        indices 2..15 are the fixed SPECIALS below (13 is the ConfigRX SSH
-        demo device, pinned to 127.0.0.1). Everything from 16 on is a
+        indices 2..29 are the fixed SPECIALS below (13 is the ConfigRX SSH
+        demo device, pinned to 127.0.0.1). Everything from 30 on is a
         deterministic weighted mix.
 
     SPECIALS -> dict[int, dict]
@@ -1108,12 +1108,33 @@ def printer_supplies(supplies, trays) -> dict:
 
 def _build_apc_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # RFC 1628 UPS-MIB (1.3.6.1.2.1.33) is small and precisely specified, so
-    # every upsMIB OID below is real. The PowerNet-MIB objects further down
-    # (APC's own enterprise arc, 318 — VERIFIED as "apc" in
-    # netpath/enterprises.py) are reconstructed from public monitoring-tool
-    # templates rather than a MIB file this tree carries a copy of, so their
-    # exact sub-arc numbering is plausible, not cross-checked against the
-    # vendor MIB itself the way the RFC objects are.
+    # every upsMIB OID below is real, and every one of them matches
+    # nodeoids.UPS_HEALTH (nodeoids.py:324-351) — nodepoll._poll_ups_health
+    # now reads this table on every device, not gated by vendor arc, so this
+    # persona is really polled: ups_battery_status, ups_on_battery_s,
+    # ups_battery_charge_pct etc. all become real metrics, and alertsdb's
+    # ups_on_battery/ups_battery_low/ups_battery_replace rules can actually
+    # fire off them (see the on_battery SPECIALS knob, index 14).
+    #
+    # Deliberately does NOT answer upsEstimatedMinutesRemaining (.1.2.3.0) —
+    # some real APC firmware leaves it at 0 or unset and only populates the
+    # PowerNet-MIB equivalent, which is exactly the gap
+    # nodepoll._apc_runtime_fallback (nodepoll.py:2242) exists to cover: it
+    # is tried only when the standard scalar did not answer, and only on
+    # APC's own arc. This persona is what exercises that fallback rather
+    # than only the ordinary path — see eaton_ups for the ordinary path on a
+    # vendor with no such fallback available.
+    #
+    # The PowerNet-MIB objects below (APC's own enterprise arc, 318 —
+    # VERIFIED as "apc" in netpath/enterprises.py) are reconstructed from
+    # public monitoring-tool templates rather than a MIB file this tree
+    # carries a copy of, so their exact sub-arc numbering is plausible, not
+    # cross-checked the way the RFC objects are — except
+    # upsAdvBatteryRunTimeRemaining (.2.2.3.0), which matches
+    # nodeoids.APC_BATTERY_RUNTIME_TIMETICKS exactly (both this file and
+    # nodeoids.py derived it independently from the same real-world
+    # monitoring convention, which is about as much cross-checking as an
+    # unbundled vendor MIB gets here).
     entries = system_scalars(
         "APC Web/SNMP Management Card (AP9631) *PMDU: SMTe, Firmware "
         "v3.9.2, hardware rev 05 — Smart-UPS SMT3000RM2U",
@@ -1190,7 +1211,9 @@ def _build_apc_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
             T_INTEGER, lambda st, now: 1 if st.on_battery else 0),
         # PowerNet-MIB — the same readings a real APC card also answers
         # under its own arc, which is the one its own management software
-        # actually polls.
+        # actually polls, and (for upsAdvBatteryRunTimeRemaining alone) the
+        # one nodepoll._apc_runtime_fallback reads in place of the standard
+        # scalar this persona omits.
         "1.3.6.1.4.1.318.1.1.1.2.1.1.0": (T_INTEGER, battery_status),
         "1.3.6.1.4.1.318.1.1.1.2.2.1.0": (T_INTEGER, charge_remaining),
         "1.3.6.1.4.1.318.1.1.1.2.2.3.0": (
@@ -1204,6 +1227,51 @@ def _build_apc_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
     return entries
 
 
+def _build_eaton_ups(wrap32: bool, ports: int, vlan: str | None) -> dict:
+    # A second UPS vendor, answering nothing but the standard RFC 1628
+    # scalars — no enterprise-arc extras, and (unlike apc_ups)
+    # upsEstimatedMinutesRemaining IS answered — to prove
+    # nodepoll._poll_ups_health's "tried on every device, not gated by
+    # enterprise arc" design (nodeoids.py:283-292) actually holds for a UPS
+    # that is not APC. Eaton's arc (534, VERIFIED as "eaton" in
+    # enterprises.py) identifies the vendor; nothing under it is read by
+    # this MIB or answered by this persona.
+    entries = system_scalars(
+        "Eaton 5PX 3000VA Network Card-MS, firmware 3.5.11",
+        "1.3.6.1.4.1.534.1.9.5")
+    entries.update(if_table(["eth0"], 6, 100_000_000, hc=not wrap32,
+                            alias=lambda i, d: "management"))
+    entries.update({
+        f"{UPS_MIB}.1.1.1.0": (T_OCTET_STRING, "Eaton"),
+        f"{UPS_MIB}.1.1.2.0": (T_OCTET_STRING, "5PX3000RT"),
+        f"{UPS_MIB}.1.1.3.0": (T_OCTET_STRING, "01"),
+        f"{UPS_MIB}.1.1.4.0": (T_OCTET_STRING, "3.5.11"),
+        f"{UPS_MIB}.1.2.1.0": (T_INTEGER, 2),                       # batteryNormal
+        f"{UPS_MIB}.1.2.2.0": (T_INTEGER, 0),
+        f"{UPS_MIB}.1.2.3.0": (T_INTEGER,
+            lambda st, now: 58 + (h("eamin", st.name) % 8)),
+        f"{UPS_MIB}.1.2.4.0": (T_INTEGER, 100),
+        f"{UPS_MIB}.1.2.5.0": (T_INTEGER, 480),                     # 48.0 VDC
+        f"{UPS_MIB}.1.2.7.0": (
+            T_INTEGER, lambda st, now: 24 + (h("eatemp", st.name) % 5)),
+        f"{UPS_MIB}.1.3.2.0": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.3.3.1.1.1": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.3.3.1.2.1": (T_INTEGER, 600),
+        f"{UPS_MIB}.1.3.3.1.3.1": (
+            T_INTEGER, lambda st, now: 118 + (h("eavin", st.name) % 5)),
+        f"{UPS_MIB}.1.4.1.0": (T_INTEGER, 3),                       # normal
+        f"{UPS_MIB}.1.4.2.0": (T_INTEGER, 600),
+        f"{UPS_MIB}.1.4.3.0": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.4.4.1.1.1": (T_INTEGER, 1),
+        f"{UPS_MIB}.1.4.4.1.2.1": (
+            T_INTEGER, lambda st, now: 118 + (h("eavout", st.name) % 5)),
+        f"{UPS_MIB}.1.4.4.1.5.1": (
+            T_INTEGER, lambda st, now: 22 + (h("eaload", st.name) % 12)),
+        f"{UPS_MIB}.1.6.1.0": (T_INTEGER, 0),
+    })
+    return entries
+
+
 def _room_temp_c(st, now):
     if st.temp_hot:
         return 42.0 + 1.2 * math.sin(now / 29.0 + (h("roomhot", st.name) % 628) / 100.0)
@@ -1212,13 +1280,22 @@ def _room_temp_c(st, now):
 
 def _build_room_alert(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # ENTITY-SENSOR-MIB (RFC 3433) is the standards-based half of this
-    # persona, and the half nodepoll.read_dom() actually decodes — see its
-    # _SENSOR_TYPE_UNITS/_SENSOR_STATUS maps (nodepoll.py:2822-2825): type 8
-    # is temperature in °C, type 9 is %RH, exactly the two readings an
-    # AVTECH Room Alert exposes. read_dom() finds sensors by walking from a
-    # device's own ifIndex, so entity_sensors() below ties both readings to
-    # this device's one management interface, same as it ties a DOM sensor
-    # to the SFP+ port it lives on.
+    # persona: type 8 is temperature in °C, type 9 is %RH, exactly the two
+    # readings an AVTECH Room Alert exposes (nodepoll's own
+    # _SENSOR_TYPE_UNITS agrees, nodepoll.py:2926-2928).
+    #
+    # entity_sensors() is called with link_to_if=False on purpose: a Room
+    # Alert's temperature/humidity probes belong to the chassis, not to any
+    # port, so no entAliasMappingIdentifier row is published for them. That
+    # means nodepoll.read_dom() (the interface dialog's on-demand DOM read,
+    # which still gates on that mapping) correctly finds nothing here — but
+    # nodepoll._poll_environment (nodepoll.py:3081), the whole-device
+    # ENTITY-SENSOR-MIB walk added specifically because a chassis sensor has
+    # no port to be "on", finds and polls them regardless: temp_c and
+    # humidity_pct become real metrics, and alertsdb's temp_high/
+    # humidity_high thresholds (35°C/30°C, 80%/70%RH) evaluate against them.
+    # The temp_hot SPECIALS knob (index 15) pushes the reading past 35°C —
+    # see selftest.test_room_alert_dom for both halves proven together.
     #
     # AVTECH's own enterprise arc (20916, CURATED — medium confidence, see
     # enterprises.py's own docstring — as "avtech" in netpath/enterprises.py)
@@ -1234,7 +1311,7 @@ def _build_room_alert(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(entity_sensors(
         {1: [("Room temperature", 8, "°C", _room_temp_c, 0),
              ("Room humidity", 9, "%RH", 45.0, 8.0)]},
-        parent_label="Room Alert sensor bank"))
+        parent_label="Room Alert sensor bank", link_to_if=False))
     entries.update(arc_objects(20916, {
         # Native tenths-of-a-unit scalars mirroring the two ENTITY-SENSOR
         # readings above, plus a couple of dry-contact digital inputs (a
@@ -1289,13 +1366,21 @@ def _build_printer_mfp(wrap32: bool, ports: int, vlan: str | None) -> dict:
 
 
 def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
-    # HOST-RESOURCES-MIB, answered in full. nodeoids.HOST_RESOURCES
-    # (nodeoids.py:71-74) already names hrProcessorLoad and hrStorageTable
-    # as "poll if the vendor OID resolves" and nothing in the app polls
-    # them (host_resources()'s own docstring above) — this persona adds
-    # hrSystemUptime and hrSWRunTable on top, so the demo can show a
-    # Windows box answering the whole group next to the vendor-specific
-    # health objects the network personas answer under their own arcs.
+    # HOST-RESOURCES-MIB, answered in full, to demonstrate a specific
+    # asymmetry: nodepoll._poll_vendor_health (nodepoll.py:2086-2148) falls
+    # back to nodeoids.GENERIC_HEALTH's hrProcessorLoad column_avg for
+    # cpu_pct when nothing better answered, and disk_pct always comes from
+    # _host_resources_disk_pct (nodepoll.py:2036-2063), filtered to rows
+    # typed hrStorageFixedDisk (nodeoids.HR_STORAGE_FIXED_DISK) — both of
+    # which this persona answers, so CPU and disk populate. mem_pct has NO
+    # such HOST-RESOURCES fallback anywhere in nodepoll.py: it comes only
+    # from UCD-SNMP-MIB (this persona answers none), the Cisco memory-pool
+    # special case (arc 9), or a Fortinet/Juniper VENDOR_HEALTH scalar —
+    # none of which applies to a Microsoft sysObjectID. So a Windows Server
+    # in this fleet reports CPU and disk but never memory, confirmed by
+    # exhaustive search of nodepoll.py for every mem_pct producer rather
+    # than inferred. hrSystemUptime and hrSWRunTable are answered too, on
+    # top of what nodeoids.HOST_RESOURCES (nodeoids.py:71-74) names.
     entries = system_scalars(
         "Hardware: AMD64 Family 25 Model 1 Stepping 1 AT/AT COMPATIBLE - "
         "Software: Windows Version 10.0 (Build 20348 Multiprocessor Free)",
@@ -1309,8 +1394,9 @@ def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(host_resources(4, [
         ("C:\\  Label:    Serial Number 4a3d9f21", 4096, 122_070_312, 0.58,
          HR_STORAGE_FIXED_DISK),
+        ("D:\\  Label: Data  Serial Number 9e6c1a04", 4096, 244_140_625, 0.37,
+         HR_STORAGE_FIXED_DISK),
         ("Physical Memory", 1024, 33_554_432, 0.61, HR_STORAGE_RAM),
-        ("Virtual Memory", 4096, 8_388_608, 0.24, HR_STORAGE_VIRTUAL_MEMORY),
     ]))
     entries.update(hr_sw_run([
         ("System", "", 2, 1),
@@ -1325,12 +1411,14 @@ def _build_windows_server(wrap32: bool, ports: int, vlan: str | None) -> dict:
 
 
 def _build_windows_endpoint(wrap32: bool, ports: int, vlan: str | None) -> dict:
-    # The same HOST-RESOURCES shape as windows_server, cut down to what a
-    # PC or tablet actually is: one adapter — wireless-looking, since the
-    # fleet's tablets and laptop-class PCs both go over Wi-Fi, hence
-    # ifType 71 (ieee80211) rather than 6 — one small disk, and a process
-    # table short enough that the many devices of this persona the fleet
-    # holds cost almost nothing beyond the one shared, memoised table.
+    # The same HOST-RESOURCES shape as windows_server — and the same CPU/
+    # disk-but-no-memory asymmetry, see that function's comment — cut down
+    # to what a PC or tablet actually is: one adapter — wireless-looking,
+    # since the fleet's tablets and laptop-class PCs both go over Wi-Fi,
+    # hence ifType 71 (ieee80211) rather than 6 — two small disks (a system
+    # drive and a recovery/data partition), and a process table short enough
+    # that the many devices of this persona the fleet holds cost almost
+    # nothing beyond the one shared, memoised table.
     entries = system_scalars(
         "Hardware: AMD64 Family 25 Model 1 Stepping 1 AT/AT COMPATIBLE - "
         "Software: Windows Version 10.0 (Build 19045 Multiprocessor Free)",
@@ -1340,6 +1428,8 @@ def _build_windows_endpoint(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries[HR_SYSTEM_UPTIME] = (T_TIMETICKS, lambda st, now: st.uptime_ticks(now))
     entries.update(host_resources(2, [
         ("C:\\  Label:    Serial Number 7c21ab90", 4096, 30_517_578, 0.71,
+         HR_STORAGE_FIXED_DISK),
+        ("D:\\  Label: Recovery  Serial Number 2b48f317", 4096, 1_310_720, 0.22,
          HR_STORAGE_FIXED_DISK),
         ("Physical Memory", 1024, 8_388_608, 0.66, HR_STORAGE_RAM),
     ]))
@@ -1383,6 +1473,7 @@ PERSONAS: dict[str, Persona] = {
                               "Windows Server 2022"),
     "windows_endpoint": Persona("windows_endpoint", _build_windows_endpoint, 1,
                                 "Windows PC/tablet"),
+    "eaton_ups": Persona("eaton_ups", _build_eaton_ups, 1, "Eaton 5PX 3000VA"),
 }
 
 
@@ -1452,35 +1543,86 @@ SPECIALS: dict[int, dict] = {
                  "charge/runtime-remaining scalars count down"},
     15: {"persona": "room_alert", "profile": "v2c-public", "knob": "temp_hot",
          "note": "the room sensor is pinned above a safe running "
-                 "temperature; nodepoll.read_dom decodes entPhySensorValue "
-                 "the same way it decodes a transceiver's DOM temperature"},
+                 "temperature; nodepoll._poll_environment turns it into a "
+                 "real temp_c metric and alertsdb's temp_high rule (35°C) "
+                 "fires off it"},
+    # The remaining four new device classes have no misbehaviour knob of
+    # their own — each is pinned here anyway so it, like every class above,
+    # is guaranteed present even at --count 25 rather than left to the
+    # weighted mix's shuffle luck; _FIXED_INDEX_MAX follows from this
+    # automatically.
+    16: {"persona": "printer_mfp", "profile": "v2c-public", "knob": "",
+         "note": "answers RFC 3805 Printer-MIB in full (toner level, page "
+                 "count, alerts); nothing in netpath polls 1.3.6.1.2.1.43 "
+                 "at all, so none of it reaches the app"},
+    17: {"persona": "windows_server", "profile": "v2c-public", "knob": "",
+         "note": "hrProcessorLoad and a hrStorageFixedDisk row both feed "
+                 "real metrics (cpu_pct, disk_pct), but no code path in "
+                 "nodepoll.py produces mem_pct for a Windows host — CPU "
+                 "and disk populate, memory never does"},
+    18: {"persona": "windows_endpoint", "profile": "v2c-public", "knob": "",
+         "note": "the same CPU/disk-but-no-memory gap as windows_server, "
+                 "at the scale (many PCs/tablets) that actually matters "
+                 "for the estate"},
+    19: {"persona": "eaton_ups", "profile": "v2c-public", "knob": "",
+         "note": "standard UPS-MIB only, no vendor arc extras — proves "
+                 "nodepoll._poll_ups_health's per-device (not per-arc) "
+                 "design works for a UPS that is not APC"},
+    # A real site has a fixed handful of these roles, not a number that
+    # grows with the fleet — the same reasoning index 0 (the one core
+    # switch) and index 1 (the one wireless controller) already follow.
+    # Pinning them here rather than in _MIX_WEIGHTS is what keeps them at a
+    # constant count regardless of --count; see that constant's own
+    # comment for the count that produced (2 perimeter firewalls per
+    # vendor, one at each of two independent edges; 3 distribution-layer
+    # switches and 3 remote-site backhaul routers — "a couple of firewalls
+    # ... a handful of routers").
+    20: {"persona": "fortigate", "profile": "v2c-public", "knob": "",
+         "note": "perimeter firewall #1 — a fixed role, not a proportional "
+                 "one; see _MIX_WEIGHTS' comment"},
+    21: {"persona": "fortigate", "profile": "v2c-public", "knob": "",
+         "note": "perimeter firewall #2 (the redundant edge)"},
+    22: {"persona": "paloalto", "profile": "v2c-public", "knob": "",
+         "note": "perimeter firewall #3 — the OT/plant-network boundary, "
+                 "a second vendor rather than a second unit of the same one"},
+    23: {"persona": "paloalto", "profile": "v2c-public", "knob": "",
+         "note": "perimeter firewall #4 (the corporate-network boundary)"},
+    24: {"persona": "juniper", "profile": "v2c-public", "knob": "",
+         "note": "a distribution-layer switch, one of three — a fixed "
+                 "count, not the access-switch proportional role"},
+    25: {"persona": "juniper", "profile": "v2c-public", "knob": ""},
+    26: {"persona": "juniper", "profile": "v2c-public", "knob": ""},
+    27: {"persona": "mikrotik", "profile": "v2c-public", "knob": "",
+         "note": "a remote-site backhaul router, one of three (one per "
+                 "site) — a fixed count, not a proportional one"},
+    28: {"persona": "mikrotik", "profile": "v2c-public", "knob": ""},
+    29: {"persona": "mikrotik", "profile": "v2c-public", "knob": ""},
 }
 
 # The last index SPECIALS occupies; the weighted mix starts one past it.
 _FIXED_INDEX_MAX = max(SPECIALS)
 
-# One 100-slot cycle of the weighted mix used from index _FIXED_INDEX_MAX+1 on.
-# A plant site is mostly access switches, but printers, UPSs, Room Alerts,
-# servers and (mostly) PCs/tablets outnumber the network gear in a real
-# building; windows_endpoint's 15 reflects that without letting it swamp the
-# switches that are still the majority of what this demo polls.
+# One 100-slot cycle of the weighted mix used from index _FIXED_INDEX_MAX+1 on
+# — for the roles a plant site has HUNDREDS of, proportional to fleet size.
+# fortigate/paloalto/juniper/mikrotik are deliberately NOT in here: a site
+# does not get more firewalls or more core/distribution gear as its fleet
+# grows, so those four are fixed-count SPECIALS entries (20-29) instead —
+# see the comment there. What is actually proportional in a plant is access
+# switches (still the majority), and then endpoints, printers, UPSs, Room
+# Alerts, servers, PtP bridges, industrial switches and PLCs, all in the
+# hundreds; windows_endpoint's 17 reflects PCs/tablets outnumbering
+# everything but the switches themselves. Each of the personas the fixed
+# SPECIALS block already covers additionally appears here too, for the
+# realistic bulk numbers beyond that one guaranteed instance.
 _MIX_WEIGHTS = (
-    ("cisco_access", 40), ("aruba_switch", 6), ("fortigate", 4),
-    ("paloalto", 2), ("juniper", 2), ("ubiquiti_airfiber", 4),
-    ("cambium_ptp", 2), ("mikrotik", 3), ("siemens_scalance", 3),
-    ("moxa", 2), ("rockwell_plc", 2), ("siemens_s7_plc", 1),
+    ("cisco_access", 43), ("aruba_switch", 6),
+    ("ubiquiti_airfiber", 4), ("cambium_ptp", 2),
+    ("siemens_scalance", 4), ("moxa", 3),
+    ("rockwell_plc", 3), ("siemens_s7_plc", 2),
     ("linux_host", 2),
-    ("windows_server", 3), ("windows_endpoint", 15),
-    ("apc_ups", 4), ("room_alert", 2), ("printer_mfp", 3),
+    ("windows_server", 3), ("windows_endpoint", 17),
+    ("apc_ups", 4), ("room_alert", 2), ("printer_mfp", 3), ("eaton_ups", 2),
 )
-
-# The five personas above are rare enough (2-15 slots out of 100) that a
-# small --count can draw the weighted cycle's first few slots and miss one
-# entirely by shuffle luck alone — and "at least one of each even at 25
-# devices" is the whole point of adding them. _mix_cycle() below guarantees
-# it structurally instead of hoping the seed cooperates.
-_MUST_APPEAR_EARLY = ("apc_ups", "room_alert", "printer_mfp",
-                      "windows_server", "windows_endpoint")
 
 _NAME_PREFIX = {
     "cisco_access": "acc-sw", "cisco_core": "core-sw", "aruba_switch": "aru-sw",
@@ -1489,31 +1631,20 @@ _NAME_PREFIX = {
     "siemens_scalance": "scal-sw", "moxa": "moxa-sw", "rockwell_plc": "plc-ab",
     "siemens_s7_plc": "plc-s7", "linux_host": "srv", "fortigate_wlc": "wlc",
     "apc_ups": "ups", "room_alert": "ra", "printer_mfp": "prn",
-    "windows_server": "winsrv", "windows_endpoint": "pc",
+    "windows_server": "winsrv", "windows_endpoint": "pc", "eaton_ups": "ups2",
 }
 
 
 def _mix_cycle() -> list[str]:
     """The 100-slot persona cycle, spread rather than blocked so a fleet of
     any size gets a representative mix. Deterministic: a fixed shuffle
-    seed, so run N twice and every device keeps its identity.
-
-    One instance of each _MUST_APPEAR_EARLY persona is pulled out of the
-    shuffled pool and placed at the front (itself shuffled, so it is not
-    alphabetical) — the remaining 95 slots stay in their post-shuffle order,
-    so the mix still looks organic past the first few devices."""
+    seed, so run N twice and every device keeps its identity."""
     import random
     slots: list[str] = []
     for key, weight in _MIX_WEIGHTS:
         slots.extend([key] * weight)
-    rng = random.Random(20260902)
-    rng.shuffle(slots)
-    head = []
-    for key in _MUST_APPEAR_EARLY:
-        slots.remove(key)
-        head.append(key)
-    rng.shuffle(head)
-    return head + slots
+    random.Random(20260902).shuffle(slots)
+    return slots
 
 
 _CYCLE = _mix_cycle()
@@ -1546,7 +1677,7 @@ def fleet_plan(count: int) -> list[dict]:
     `community` is what the DEVICE accepts, which is not always what the
     profile configures — index 3 exists precisely to show the difference.
     Index 0 is the core switch, index 1 the wireless controller, indices
-    2..15 are SPECIALS (13 is the ConfigRX SSH demo device), and everything
+    2..29 are SPECIALS (13 is the ConfigRX SSH demo device), and everything
     after is the weighted mix.
     """
     count = max(1, int(count))
@@ -1651,7 +1782,7 @@ if __name__ == "__main__":
     for row in plan:
         counts[row["persona"]] = counts.get(row["persona"], 0) + 1
     print(f"{len(plan)} devices, {len(counts)} personas")
-    for row in plan[:16]:
+    for row in plan[:30]:
         print(f"  {row['index']:>3} {row['ip']:<12} {row['name']:<12} "
               f"{row['persona']:<18} {row['profile']:<11} {row['site']}")
     for key, persona in PERSONAS.items():

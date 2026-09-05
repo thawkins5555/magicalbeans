@@ -63,11 +63,17 @@
   <button class="tab tab--group-start" data-tab="settings">SETTINGS</button>
   <button class="tab" data-tab="debug">DEBUG</button>
 </nav>
+<!-- Each of these three carries an icon AND a text label (.label): below
+     ~480px (app.css) the label is hidden and the icon shown instead — the
+     accessible name comes from title/aria-label either way, so nothing a
+     screen reader announces or a tooltip shows changes, only how much of
+     the bar the button costs. #whoami and #conn are untouched here: #conn
+     ("the one honest signal during an outage") keeps its place below too. -->
 <div id="tabs-utility" class="tabs-utility">
-  <button id="global-search-btn" class="linkish" title="Search (/)" aria-label="Search">Search</button>
+  <button id="global-search-btn" class="linkish icon-toggle" title="Search (/)" aria-label="Search"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><line x1="10.2" y1="10.2" x2="14" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span class="label">Search</span></button>
   <span id="whoami" class="conn user"></span>
-  <button id="account-btn" class="linkish">Account</button>
-  <button id="signout" class="linkish">Sign out</button>
+  <button id="account-btn" class="linkish icon-toggle" title="Account" aria-label="Account"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="5.2" r="2.8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 14c0-3.3 2.5-5.7 5.5-5.7s5.5 2.4 5.5 5.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span class="label">Account</span></button>
+  <button id="signout" class="linkish icon-toggle" title="Sign out" aria-label="Sign out"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6.5 2.5H4a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M9.5 5l3 3-3 3M12.2 8H5.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="label">Sign out</span></button>
   <!-- The one honest signal during an outage: announced, not just recoloured. -->
   <span id="conn" class="conn" role="status" aria-live="polite">connecting…</span>
 </div>
