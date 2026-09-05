@@ -167,7 +167,32 @@ CONFIRMED.** `demo/scenario.py:135-145` reads `/proc/<pid>/stat` and `/status`,
 catches `OSError`, returns `{}`; every CPU% and RSS column in the results is blank —
 which are precisely the numbers a scale campaign exists to produce.
 
-All five are now fixed, and verified independently of the person who fixed them:
+**W-7 — the harness told the application a downed device was reachable, and nothing
+failed. CONFIRMED (measured, then fixed).** Found while analysing the rehearsal run,
+and worth recording because of the *shape* of it rather than the incident.
+
+`demo/scenario.py`'s `start_app` built the application's environment with `PATH` (so
+the ICMP substitute is found) and `NETPATH_PING_MODE=subprocess` (so the socket path
+cannot bypass it) — and never set `FLEET_CONTROL_PORT`. `demo/bin/ping`'s
+`fleet_alive` defaults that to 8099, which is *also* `scenario.py`'s own default
+`--control-port`. So at default settings everything worked and nothing revealed the
+omission. Run with any other control port — which any run sharing a machine with a
+second fleet must do — and the shim queried 8099, found nothing, timed out, and fell
+through to "assume alive".
+
+Measured: after the outage step took thirteen devices down and the recovery step
+brought them back, the alert database held **zero `device_down` alerts and eleven open
+`snmp_failing_ping_ok`** — "SNMP failing while the device answers ping", which is
+exactly and accurately what the application saw. The product was right; the harness was
+lying to it, and the campaign would have reported a false negative about outage
+detection. Verified after the fix: `/alive` true → `ping_many` `(3, 3, 1.0)`; POST
+`down`; `/alive` false → `ping_many` `(3, 0, None)`.
+
+The class matters more than the case: **a default that happens to equal another
+component's default hides an omission, and the run that would catch it is exactly the
+run nobody does.**
+
+All of these are now fixed, and verified independently of the person who fixed them:
 
 - The fleet binds 2,000 devices in **0.85 s** across five shards, with devices at
   `127.0.0.2`, `127.0.1.100`, `127.0.3.50` and `127.0.7.200` — four different shards —
@@ -281,6 +306,36 @@ usually turn out to be a regex over the first eighty characters.
 | Environmental (Room Alert) | ENTITY-SENSOR-MIB is decoded only by `nodepoll.read_dom` (~2827), on demand, for one interface, and only for entities `entAliasMappingIdentifier` maps to an ifIndex (~2843-2851) | nothing. A sensor that maps to no port returns `[]` and the dialog says there are none. `temp_c` today comes from the Juniper `jnxOperatingTable` alone. |
 | Windows PC / server | `hrProcessorLoad` averaged, `hrStorageFixedDisk` rows | CPU yes, disk yes, **memory no** — `mem_pct` comes only from UCD-SNMP, a Fortinet scalar or the Cisco memory pool. |
 | Tablet | — | a tablet runs no SNMP agent; it is only ever a MAC in a forwarding table or a DHCP lease, and there is **no OUI or MAC-vendor lookup anywhere in `netpath/`**, so it is anonymous. |
+
+Two of those five were built during this pass and are now live; the table above
+describes the product as it was found. What the same instance reports today, queried
+device by device:
+
+```
+ups-01  (apc)        ups_battery_charge_pct  15.0 %
+                     ups_runtime_min          6.0 min
+                     ups_battery_status       4.0      (batteryDepleted)
+                     ups_battery_voltage    192.0 V
+                     ups_battery_temp_c      31.0 °C
+                     ups_input_voltage        0.0 V    (mains gone)
+                     ups_alarms               1.0
+ra-01   (avtech)     temp_c                  41.8 °C
+                     humidity_pct            40.7 %RH
+```
+
+A UPS running on battery with fifteen per cent charge and six minutes of runtime left
+is now something the product can see, alert on and chart. It could not, this morning.
+
+The two that were not built are worth stating as measurements rather than assertions,
+because the same query makes them concrete:
+
+- `prn-01`, correctly identified as `hp`, returns **twelve metrics — every one an
+  interface counter or a ping result.** No toner, no page count, no paper tray, no
+  printer status.
+- `pc-01`, correctly identified as `microsoft`, returns `cpu_pct 36.0` and
+  `disk_pct 72.4` and **no `mem_pct` at all** — because memory comes only from
+  UCD-SNMP, a Fortinet scalar or the Cisco memory pool, and a Windows host answers
+  none of the three.
 
 ### 5.2 The navigation bar
 
@@ -428,6 +483,64 @@ rule-scoped setting takes here.
 escalation when nobody acknowledges, no on-call rota, no ticket or runbook link on a
 rule, no per-recipient digest. `renotify_minutes` exists, so the product already
 understands "still happening" — it simply has nowhere else to send it.
+
+**O-17 — removing a custom alert rule silently destroys every alert it ever raised,
+including the resolved ones that are the record of past incidents. CONFIRMED.**
+`netpath/alertsdb.py:86` declares `rule_id INTEGER NOT NULL REFERENCES rules(id) ON
+DELETE CASCADE`. `delete_rule` (line 1122) refuses built-ins but deletes any custom
+rule, and SQLite then removes every row in `alerts` that points at it. The
+confirmation (`alerts.js:988-991`) reads, in full: *"Remove &lt;name&gt;?"* It does not
+mention the alerts, and neither does the API.
+
+So an operator who writes a rule for "PLC unreachable", runs it for a year, then tidies
+the rule list in an idle moment, deletes the entire incident history for that
+condition — with the dialog telling them nothing. Because the alert list is where a
+post-mortem starts, the loss is invisible until somebody goes looking a month later.
+
+Either fix is acceptable: refuse to delete a rule that has alerts and offer `enabled =
+0` instead — that column exists and already means "stop evaluating this" — or
+denormalise the rule's name onto the alert and change the constraint to `ON DELETE SET
+NULL`, so the history outlives its rule. At the very least the confirmation must say
+how many alerts will go with it.
+
+**O-18 — `temp_high` fired ten times on a twenty-five device fleet, because one metric
+key now means three different things. CONFIRMED (live instance).**
+
+The environmental and UPS polling this campaign added works: a running seeded instance
+raised *UPS running on battery power*, *UPS battery low* and *UPS battery depleted,
+replace it* against a simulated APC answering RFC 1628 — device states this product
+could not see at all a few hours earlier. It also raised **Temperature high ten times**
+on a fleet containing one or two Room Alerts.
+
+Queried device by device on that instance, `temp_c` is being reported by eleven
+devices:
+
+| Device | Vendor | `temp_c` | `humidity_pct` |
+| --- | --- | ---: | ---: |
+| acc-sw-001, 002, 004, 005, 006, 009, 010 | cisco | 40.4 – 44.5 | — |
+| core-sw-01, core-sw-02 | cisco | 43.3, 44.3 | — |
+| configrx-ssh-01 | cisco | 37.7 | — |
+| **ra-01** | **avtech** | **41.8** | **40.7** |
+
+Ten of the eleven are switches reporting their SFP transceivers' DOM temperature,
+where 40–55 °C is entirely normal and is the reason DOM exists. The eleventh is the
+one real environmental sensor — and 41.8 °C in a comms room is an emergency. **A
+single `temp_c` key with a single threshold cannot tell those two facts apart.** The
+operator's first day with the feature is ten alerts about healthy switches sitting
+beside one genuine air-conditioning failure, indistinguishable; their second action is
+to turn the rule off, which also turns off the alarm it was built for.
+
+That is precisely the failure the earlier review recorded for `mib_missing`, which
+opened on 234 devices of a fresh 250-device install and now ships with `notify` off
+because of it. The fix is not a higher threshold: ENTITY-SENSOR-MIB already
+distinguishes sensor types and `entPhysicalDescr` names each entity, so the sensor's
+kind is available in the walk already being done. Separate keys — `temp_ambient_c`,
+`temp_chassis_c`, `temp_optic_c` — give a plant an ambient threshold it can set once
+and trust.
+
+This was only visible because the fleet gained personas with real sensors. A
+network-only fleet would never have shown it, which is the argument for the persona
+work in section 2.2.
 
 ### 5.6 Answering for it afterwards
 

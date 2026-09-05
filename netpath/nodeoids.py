@@ -102,7 +102,18 @@ VENDOR_HEALTH = {
     ),
     2636: (     # Juniper — JUNIPER-MIB jnxOperatingTable
         ("cpu_pct", "CPU", "%", "1.3.6.1.4.1.2636.3.1.13.1.8", "column_first"),
-        ("temp_c", "Temperature", "°C", "1.3.6.1.4.1.2636.3.1.13.1.7", "column_max"),
+        # jnxOperatingTable's rows are routing engines, PICs, PSUs and fans
+        # INSIDE the chassis — the same population nodepoll._poll_environment
+        # calls temp_chassis_c for a device answering ENTITY-SENSOR-MIB
+        # instead. Was "temp_c" through 4.49.0's first cut of this feature;
+        # renamed once that single key turned out to be carrying a room's
+        # ambient reading, a chassis board reading and an SFP's DOM reading
+        # under one threshold rule, which read as ten false "Temperature
+        # high" alerts on a 25-device fleet with healthy switches in it. See
+        # nodepoll._poll_environment's docstring for the full reasoning and
+        # alertsdb._BUILTIN_RULES for the three rules this now feeds.
+        ("temp_chassis_c", "Chassis temperature", "°C",
+         "1.3.6.1.4.1.2636.3.1.13.1.7", "column_max"),
     ),
 }
 

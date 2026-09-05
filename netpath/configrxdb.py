@@ -40,6 +40,14 @@ import zlib
 
 from . import dbmaint, dbopen, settingsutil
 
+# RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
+# possible — see _delete_search_lines below, the same reasoning
+# syslogdb.py's own _delete_logs docstring gives for why a full
+# `INSERT INTO ..._fts(..._fts) VALUES('rebuild')` is avoided whenever a
+# more surgical delete is available.
+HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
+_REBUILD_INTERVAL_S = 3600.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS device_config (
     device_id           INTEGER PRIMARY KEY,
@@ -115,6 +123,71 @@ CREATE TABLE IF NOT EXISTS ssh_host_keys (
     trusted_by    TEXT,
     PRIMARY KEY (host, port)
 );
+
+-- Cross-device search index (configrx_search.py): each device's LATEST
+-- capture, one row per line so a match carries its own line number
+-- without re-splitting a whole capture at read time. Always built from
+-- REDACTED text, regardless of a device's store_secrets setting or that
+-- capture's own `redacted` flag on the backups row — see
+-- configrx_search.py's module docstring for why a cross-device search
+-- view earns the same "redact unconditionally" treatment
+-- get_configrx_diff already gives a comparison view, rather than the
+-- single-backup route's permission-gated one: a search box is probed with
+-- arbitrary substrings by design, which makes it a strictly worse place
+-- to leak a secret through than a single device's own download. Replaced
+-- wholesale for one device whenever a new backup lands for it — see
+-- replace_search_lines.
+CREATE TABLE IF NOT EXISTS config_lines (
+    id        INTEGER PRIMARY KEY,
+    device_id INTEGER NOT NULL,
+    line_no   INTEGER NOT NULL,
+    line      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_config_lines_device ON config_lines(device_id, line_no);
+
+-- Compliance (configrx_compliance.py): a named set of must-match/must-
+-- not-match rules against a device's latest capture, evaluated on a
+-- schedule and when a new capture arrives — never from a page load, so
+-- this table is what a 2,000-row device list actually reads rather than
+-- running every rule set's regexes per view.
+CREATE TABLE IF NOT EXISTS compliance_rule_sets (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT NOT NULL,
+    -- NULL scopes to every device; set to one Nodes device_groups.id so
+    -- "access switches must have port security" is not evaluated against
+    -- (and does not fail) every firewall.
+    device_group_id INTEGER,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_ts      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compliance_rules (
+    id          INTEGER PRIMARY KEY,
+    rule_set_id INTEGER NOT NULL REFERENCES compliance_rule_sets(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,
+    kind        TEXT NOT NULL,      -- configrx_compliance.RuleKind
+    -- Validated through configrx_search.compile_bounded before this row is
+    -- ever written (see add_rule), so a rule set can never be SAVED with a
+    -- pattern that would hang an evaluation later.
+    pattern     TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_compliance_rules_set ON compliance_rules(rule_set_id, ordinal);
+
+-- The one result per (device, rule set) a device list actually reads.
+-- `failed_rules` is a JSON list of {"rule_id", "description"} — never the
+-- line that failed the rule, so a compliance view cannot become a second
+-- way to read a config line a searcher would otherwise be refused (see
+-- configrx_compliance.py's module docstring). status is 'not_assessed'
+-- for a device with no capture yet, never a silent 'pass'.
+CREATE TABLE IF NOT EXISTS compliance_results (
+    device_id    INTEGER NOT NULL,
+    rule_set_id  INTEGER NOT NULL REFERENCES compliance_rule_sets(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL,
+    failed_rules TEXT NOT NULL DEFAULT '[]',
+    backup_id    INTEGER,
+    evaluated_ts REAL NOT NULL,
+    PRIMARY KEY (device_id, rule_set_id)
+);
 """
 
 DEFAULTS = {
@@ -175,6 +248,8 @@ class ConfigRxDatabase:
         # passwords, and was being created 0644.
         self._conn = dbopen.connect(path)
         self._conn.row_factory = sqlite3.Row
+        self.search_fts = False
+        self._last_search_rebuild: float | None = None
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -182,6 +257,7 @@ class ConfigRxDatabase:
             dbmaint.enable_incremental_vacuum(self._conn, "configrx.db")
             self._conn.executescript(SCHEMA)
             self._migrate()
+            self._enable_search_fts()
             self._conn.commit()
 
     def _migrate(self) -> None:
@@ -202,6 +278,24 @@ class ConfigRxDatabase:
                 if name not in present:
                     self._conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+    def _enable_search_fts(self) -> None:
+        """Same tokenizer choice and the same reasoning as
+        syslogdb.SyslogDatabase._enable_fts: `trigram` indexes every
+        three-character run rather than whole words, which is what lets a
+        search for part of a directive ("snmp-server community") or a
+        bare IP octet run find it mid-line. Absent silently — same
+        graceful degrade as syslogdb — on a build with no FTS5, or an
+        SQLite older than 3.34 (trigram's own floor); config_lines itself
+        still exists and is still searched, by full scan."""
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS config_lines_fts USING fts5("
+                " line, content='config_lines', content_rowid='id',"
+                " tokenize='trigram')")
+            self.search_fts = True
+        except sqlite3.OperationalError:
+            self.search_fts = False
 
     def close(self) -> None:
         with self._lock:
@@ -325,6 +419,8 @@ class ConfigRxDatabase:
         with self._lock:
             self._conn.execute("DELETE FROM device_config WHERE device_id = ?", (device_id,))
             self._conn.execute("DELETE FROM backups WHERE device_id = ?", (device_id,))
+            self._delete_search_lines(device_id)
+            self._conn.execute("DELETE FROM compliance_results WHERE device_id = ?", (device_id,))
             self._conn.commit()
 
     def devices_due(self, interval_hours: float) -> list[sqlite3.Row]:
@@ -515,6 +611,207 @@ class ConfigRxDatabase:
         if removed:
             dbmaint.reclaim(self._conn, self._lock, label="backups")
         return removed
+
+    # ------------------------------------------------------------ search index
+
+    def replace_search_lines(self, device_id: int, redacted_text: str) -> None:
+        """Replaces device_id's rows in the cross-device search index with
+        `redacted_text` split one line per row.
+
+        `redacted_text` must already be redacted — this method has no
+        opinion about secrets, the same division of responsibility
+        configrx.diff_texts's own docstring draws for the diff path.
+        configrx.ConfigRxWorker._backup_device is the one caller, and it
+        redacts unconditionally before calling this, regardless of that
+        device's store_secrets setting — see configrx_search.py's module
+        docstring for why.
+        """
+        lines = redacted_text.split("\n")
+        with self._lock:
+            self._delete_search_lines(device_id)
+            if lines:
+                self._conn.executemany(
+                    "INSERT INTO config_lines(device_id, line_no, line) VALUES (?,?,?)",
+                    [(device_id, i, line) for i, line in enumerate(lines, start=1)])
+                if self.search_fts:
+                    last_id = self._conn.execute(
+                        "SELECT last_insert_rowid()").fetchone()[0]
+                    first_id = last_id - len(lines) + 1
+                    self._conn.executemany(
+                        "INSERT INTO config_lines_fts(rowid, line) VALUES (?,?)",
+                        [(first_id + i, line) for i, line in enumerate(lines)])
+            self._conn.commit()
+
+    def _delete_search_lines(self, device_id: int) -> None:
+        """Must be called with the lock held (replace_search_lines and
+        forget_device both already hold it). Same RETURNING-based targeted
+        FTS delete as syslogdb._delete_logs, for the identical reason: a
+        full `INSERT INTO config_lines_fts(config_lines_fts) VALUES
+        ('rebuild')` re-indexes the WHOLE table, however many — or few —
+        of one device's lines are actually being replaced."""
+        if self.search_fts and HAS_RETURNING:
+            rows = self._conn.execute(
+                "DELETE FROM config_lines WHERE device_id = ? RETURNING id, line",
+                (device_id,)).fetchall()
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO config_lines_fts(config_lines_fts, rowid, line)"
+                    " VALUES ('delete', ?, ?)",
+                    [(row["id"], row["line"]) for row in rows])
+            return
+        cursor = self._conn.execute(
+            "DELETE FROM config_lines WHERE device_id = ?", (device_id,))
+        if cursor.rowcount and self.search_fts:
+            self._rebuild_search_index()
+
+    def _rebuild_search_index(self) -> None:
+        """Pre-3.35 fallback, at most once an hour — same shape and same
+        reasoning as syslogdb._rebuild_index: orphaned index rows are
+        harmless (search joins on the rowid and drops what config_lines no
+        longer has), so the rebuild is housekeeping, not correctness."""
+        now = time.monotonic()
+        if (self._last_search_rebuild is not None
+                and now - self._last_search_rebuild < _REBUILD_INTERVAL_S):
+            return
+        self._last_search_rebuild = now
+        self._conn.execute("INSERT INTO config_lines_fts(config_lines_fts) VALUES('rebuild')")
+
+    def search_fts_match(self, fts_query: str, device_ids: list[int] | None,
+                         limit: int) -> list[sqlite3.Row]:
+        """Rows (device_id, line_no, line) the FTS index says match —
+        configrx_search.py builds `fts_query` and applies the wall-clock
+        budget; this method is pure SQL."""
+        where = ""
+        params: list = [fts_query]
+        if device_ids:
+            marks = ",".join("?" * len(device_ids))
+            where = f" AND c.device_id IN ({marks})"
+            params.extend(device_ids)
+        with self._lock:
+            return self._conn.execute(
+                "SELECT c.device_id, c.line_no, c.line FROM config_lines_fts f"
+                " JOIN config_lines c ON c.id = f.rowid"
+                f" WHERE config_lines_fts MATCH ?{where} LIMIT ?",
+                (*params, limit)).fetchall()
+
+    def all_search_lines(self, device_ids: list[int] | None = None) -> list[sqlite3.Row]:
+        """Every indexed line, ordered by device so a caller can group them
+        per device cheaply (the rows already arrive in that order — see
+        ix_config_lines_device). The full-scan path: a query too short for
+        FTS5's trigram floor, an SQLite build with no FTS5 at all, or a
+        regular expression, which FTS5's own query language cannot express
+        no matter how it is indexed."""
+        where, params = "", []
+        if device_ids:
+            marks = ",".join("?" * len(device_ids))
+            where = f" WHERE device_id IN ({marks})"
+            params = list(device_ids)
+        with self._lock:
+            return self._conn.execute(
+                "SELECT device_id, line_no, line FROM config_lines"
+                f"{where} ORDER BY device_id, line_no", params).fetchall()
+
+    # ------------------------------------------------------------- compliance
+
+    def add_rule_set(self, name: str, device_group_id: int | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO compliance_rule_sets(name, device_group_id, created_ts)"
+                " VALUES (?,?,?)", (name, device_group_id, time.time()))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def update_rule_set(self, rule_set_id: int, **fields) -> None:
+        allowed = {k: v for k, v in fields.items()
+                  if k in ("name", "device_group_id", "enabled")}
+        if not allowed:
+            return
+        with self._lock:
+            clauses = ", ".join(f"{key} = ?" for key in allowed)
+            self._conn.execute(
+                f"UPDATE compliance_rule_sets SET {clauses} WHERE id = ?",
+                (*allowed.values(), rule_set_id))
+            self._conn.commit()
+
+    def delete_rule_set(self, rule_set_id: int) -> None:
+        """Cascades to its rules (ON DELETE CASCADE) and its stored results
+        (no FK there, since a result outlives whichever rule within the set
+        produced it — deleted explicitly instead, same one statement)."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM compliance_rule_sets WHERE id = ?", (rule_set_id,))
+            self._conn.execute(
+                "DELETE FROM compliance_results WHERE rule_set_id = ?", (rule_set_id,))
+            self._conn.commit()
+
+    def rule_sets(self, enabled_only: bool = False) -> list[sqlite3.Row]:
+        where = " WHERE enabled = 1" if enabled_only else ""
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT * FROM compliance_rule_sets{where} ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+
+    def rule_set(self, rule_set_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM compliance_rule_sets WHERE id = ?", (rule_set_id,)).fetchone()
+
+    def add_rule(self, rule_set_id: int, description: str, kind: str,
+                pattern: str, ordinal: int = 0) -> int:
+        """The caller (configrx_compliance.add_rule) is what runs `pattern`
+        through configrx_search.compile_bounded before this is ever
+        called — this method just stores what it is given."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO compliance_rules(rule_set_id, description, kind,"
+                " pattern, ordinal) VALUES (?,?,?,?,?)",
+                (rule_set_id, description, kind, pattern, ordinal))
+            self._conn.commit()
+            return cur.lastrowid
+
+    def delete_rule(self, rule_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM compliance_rules WHERE id = ?", (rule_id,))
+            self._conn.commit()
+
+    def rules_for(self, rule_set_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM compliance_rules WHERE rule_set_id = ?"
+                " ORDER BY ordinal, id", (rule_set_id,)).fetchall()
+
+    def set_compliance_result(self, device_id: int, rule_set_id: int, status: str,
+                              failed_rules: list, backup_id: int | None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO compliance_results(device_id, rule_set_id, status,"
+                " failed_rules, backup_id, evaluated_ts) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(device_id, rule_set_id) DO UPDATE SET"
+                " status=excluded.status, failed_rules=excluded.failed_rules,"
+                " backup_id=excluded.backup_id, evaluated_ts=excluded.evaluated_ts",
+                (device_id, rule_set_id, status, json.dumps(failed_rules),
+                 backup_id, time.time()))
+            self._conn.commit()
+
+    def compliance_result(self, device_id: int, rule_set_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM compliance_results WHERE device_id = ? AND rule_set_id = ?",
+                (device_id, rule_set_id)).fetchone()
+
+    def compliance_results_for_device(self, device_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM compliance_results WHERE device_id = ?",
+                (device_id,)).fetchall()
+
+    def compliance_results_for_rule_set(self, rule_set_id: int) -> list[sqlite3.Row]:
+        """Every device's latest result for one rule set — the column a
+        2,000-row device list actually reads."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM compliance_results WHERE rule_set_id = ?",
+                (rule_set_id,)).fetchall()
 
     # ------------------------------------------------------------- maintenance
 

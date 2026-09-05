@@ -3078,6 +3078,41 @@ class NodePoller:
     # 900-second window.
     _SENSOR_REFRESH_S = 300.0
 
+    def _walk_port_mapped_entities(self, device, config: dict) -> tuple[set, dict]:
+        """(port_entities, contained_in) — the same two ENTITY-MIB tables
+        read_dom() walks to answer "does this entity belong to THIS
+        ifIndex", generalised here to build the full set of entities that
+        belong to ANY port at all, once per device rather than once per
+        candidate sensor.
+
+        port_entities is every entPhysicalIndex entAliasMappingIdentifier
+        names as riding on some interface — unfiltered by which one,
+        unlike read_dom()'s own port_entities, which keeps only the rows
+        naming the one ifIndex a human opened a dialog for. contained_in
+        is entPhysicalContainedIn verbatim, exactly as read_dom builds it.
+        Kept as its own method, separate from read_dom's identical-shaped
+        inline code, so read_dom's behaviour is not this method's to
+        risk — see _decode_entity_sensor's docstring for why that
+        matters."""
+        alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
+        prefix = self._IF_INDEX_COLUMN + "."
+        port_entities = set()
+        for suffix, value in alias.items():
+            if not str(value).startswith(prefix):
+                continue
+            try:
+                port_entities.add(int(suffix.split(".")[0]))
+            except ValueError:
+                continue
+        contained_in = {}
+        for suffix, value in self._walk_column(
+                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
+            try:
+                contained_in[int(suffix)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return port_entities, contained_in
+
     def _poll_environment(self, device_id: int, device, config: dict,
                           already: set, now: float) -> None:
         """Device-level temperature/humidity from ENTITY-SENSOR-MIB (RFC
@@ -3085,14 +3120,42 @@ class NodePoller:
         router or PDU that exposes its own chassis sensors through the
         standard MIB rather than (or in addition to) a vendor-specific one.
 
-        Deliberately does NOT require entAliasMappingIdentifier the way
-        read_dom() does — see _decode_entity_sensor's docstring for why
-        that gate exists and why it made an environmental monitor's
-        sensors unreachable everywhere in this app. Every entity the walk
-        finds is used here, whether or not it maps to a port; an entity
-        read_dom also uses (a transceiver's temperature sensor) is not
-        excluded either; a hot SFP is still a true reading of "how hot is
-        this chassis running."
+        Deliberately does NOT require entAliasMappingIdentifier to decide
+        whether a sensor is WORTH READING — see _decode_entity_sensor's
+        docstring for why that gate on read_dom() made an environmental
+        monitor's sensors unreachable everywhere in this app. It DOES use
+        that same mapping to decide WHICH metric key a temperature reading
+        becomes, which is the fix for a real incident this shipped with
+        for about a day: 45 C is a perfectly healthy switch chassis and a
+        perfectly ordinary SFP DOM reading runs 40-55 C, but is a warning
+        sign in a comms closet — one "temp_c" key and one threshold rule
+        covering all three read as ten false "Temperature high" alerts on
+        a 25-device fleet with one Room Alert and some healthy switches in
+        it, the exact mib_missing-email-storm shape the product's own
+        prior review already burned an operator's trust on once. So a
+        temperature reading is classified into one of three keys before it
+        is ever stored, and the three get three separate rules with three
+        separate defaults instead of fighting over one:
+
+        - temp_optic_c: the sensor maps to a port (via the same containment
+          walk read_dom uses, generalised to "any port" by
+          _walk_port_mapped_entities) — an SFP/QSFP's own DOM temperature,
+          normal well above ambient.
+        - temp_ambient_c: the sensor maps to no port, AND this device also
+          answers at least one humidity sensor. A chassis essentially never
+          carries one; a dedicated room/rack environmental monitor (Room
+          Alert and the like) always does, on any vendor's arc, which is
+          why this is the humidity table itself rather than a vendor check
+          — it generalises past AVTECH for free.
+        - temp_chassis_c: everything else unmapped — the DEFAULT for "an
+          ordinary switch or router's own internal board/PSU/fan sensor",
+          chosen deliberately as the fallback rather than temp_ambient_c:
+          a device this cannot positively identify as an environmental
+          monitor must not have its plain chassis warmth silently read as
+          a room getting hot, which is the mistake being fixed here.
+          Lands in the SAME key jnxOperatingTable's reading uses (see
+          VENDOR_HEALTH), so a device answering both never reports two
+          disagreeing chassis temperatures.
 
         Best-effort and gated by _SENSOR_REFRESH_S rather than run every
         poll — see that constant's comment. A device with no ENTITY-MIB
@@ -3114,8 +3177,23 @@ class NodePoller:
         statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
         units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
         descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+        port_entities, contained_in = self._walk_port_mapped_entities(device, config)
 
-        temps: list[float] = []
+        def on_a_port(entity: int) -> bool:
+            seen = 0
+            while entity and seen < 16:   # a real containment tree is shallow
+                if entity in port_entities:
+                    return True
+                entity = contained_in.get(entity, 0)
+                seen += 1
+            return False
+
+        has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
+                           for suffix in sensor_values)
+
+        optic_temps: list[float] = []
+        ambient_temps: list[float] = []
+        chassis_temps: list[float] = []
         humidities: list[float] = []
         for suffix, raw in sensor_values.items():
             sensor_type = int(types.get(suffix) or 0)
@@ -3130,21 +3208,39 @@ class NodePoller:
             # nothing if it can silently be sourced from a dead probe.
             if reading is None or reading["status"] != "ok":
                 continue
-            (temps if sensor_type == self._SENSOR_TYPE_TEMPERATURE
-             else humidities).append(reading["value"])
+            if sensor_type == self._SENSOR_TYPE_HUMIDITY:
+                humidities.append(reading["value"])
+                continue
+            try:
+                entity = int(suffix)
+            except ValueError:
+                continue
+            if on_a_port(entity):
+                optic_temps.append(reading["value"])
+            elif has_humidity:
+                ambient_temps.append(reading["value"])
+            else:
+                chassis_temps.append(reading["value"])
 
+        # Worst (hottest/most humid) sensor of each kind wins — "the hot
+        # spot is what matters", the same reasoning VENDOR_HEALTH's
+        # column_max probes already use, applied per kind so an SFP
+        # running warm never masks a genuinely hot chassis sensor or vice
+        # versa.
         samples = []
-        if temps and "temp_c" not in already:
-            # Worst (hottest) sensor wins — the same "the hot spot is what
-            # matters" reasoning VENDOR_HEALTH's Juniper jnxOperatingTable
-            # read already uses for column_max — and deliberately the SAME
-            # metric key: a device answering both jnxOperatingTable and
-            # ENTITY-SENSOR-MIB must report one temperature, not two that
-            # disagree depending on which the poller happened to read
-            # this cycle. `already` is what this poll's vendor-health pass
-            # produced; a device with a better vendor-specific reading
-            # keeps it, and this only fills in for one that has none.
-            samples.append(("temp_c", "Temperature", "°C", "gauge", now, max(temps)))
+        if optic_temps:
+            samples.append(("temp_optic_c", "Optic temperature", "°C",
+                            "gauge", now, max(optic_temps)))
+        if ambient_temps:
+            samples.append(("temp_ambient_c", "Ambient temperature", "°C",
+                            "gauge", now, max(ambient_temps)))
+        if chassis_temps and "temp_chassis_c" not in already:
+            # `already` is what this poll's vendor-health pass produced —
+            # a device with a better vendor-specific chassis reading
+            # (Juniper's jnxOperatingTable) keeps it, and this only fills
+            # in for one that has none, same as the pre-split code did.
+            samples.append(("temp_chassis_c", "Chassis temperature", "°C",
+                            "gauge", now, max(chassis_temps)))
         if humidities:
             samples.append(("humidity_pct", "Humidity", "%RH", "gauge", now,
                             max(humidities)))

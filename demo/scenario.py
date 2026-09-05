@@ -313,6 +313,30 @@ def _suffix(args) -> str:
     return "".join(parts)
 
 
+def _parse_steps(spec: str) -> set[int] | None:
+    """--steps '1,3,5-7' -> {1,3,5,6,7}; '' (the default) -> None, meaning
+    every incident step runs — exactly the behaviour before this flag
+    existed. A 1,000- or 2,000-device tier is run for performance numbers,
+    not to re-prove every incident already covered at the 250-device tier,
+    so being able to name just the steps that matter (say, the outage and
+    its recovery) cuts a scale run down without touching the step
+    definitions themselves."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    steps: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            steps.update(range(int(lo), int(hi) + 1))
+        else:
+            steps.add(int(part))
+    return steps
+
+
 class Scenario:
     def __init__(self, args):
         self.args = args
@@ -339,6 +363,7 @@ class Scenario:
         self.client: Client | None = None
         self.app_pid = None
         self.steps: list[dict] = []
+        self.steps_filter = _parse_steps(getattr(args, "steps", ""))
         self.notes: list[str] = []
         self._plan: list[dict] | None = None
         self._log_handle = open(self.run_log, "a", encoding="utf-8")
@@ -885,6 +910,23 @@ class Scenario:
         self.steps.append(result)
         return result
 
+    def maybe_step(self, number: int, name: str, action, seconds: float) -> dict | None:
+        """run_step, unless --steps named a subset that excludes this one.
+
+        A skipped step leaves no entry in self.steps at all, rather than a
+        placeholder row — the results JSON/MD for a --steps run is exactly
+        the rows that ran, the same as if the excluded steps had never
+        existed, not a table with holes in it. This only thins out which
+        steps execute; it never renumbers the ones that do, so "step 5" in
+        a --steps 2,5 run's output is still recognisably the reboot step
+        from the full nine-step list, not a re-numbered second step.
+        """
+        if self.steps_filter is not None and number not in self.steps_filter:
+            self.log("")
+            self.log("=== step %d: %s (skipped — not in --steps) ===" % (number, name))
+            return None
+        return self.run_step(number, name, action, seconds)
+
     # -- the eight incidents ---------------------------------------------
 
     def incidents(self) -> None:
@@ -898,7 +940,7 @@ class Scenario:
         self.log("[plan] core=%s, %d flap targets, %d reboot, %d auth-fail"
                  % (core, len(access), len(reboot_set), len(auth_set)))
 
-        self.run_step(1, "baseline", lambda: {"note": "steady state"}, 120)
+        self.maybe_step(1, "baseline", lambda: {"note": "steady state"}, 120)
 
         def outage():
             events = [self.fleet_event("down", ips=core),
@@ -910,7 +952,7 @@ class Scenario:
         # third failed poll lands around 180 s; give the engine a tick or two
         # past that so the device_down alerts and their emails are inside
         # the window that counts them.
-        self.run_step(2, "core outage + Site-A access layer down", outage, 240)
+        self.maybe_step(2, "core outage + Site-A access layer down", outage, 240)
 
         def outage_over():
             events = [
@@ -919,21 +961,21 @@ class Scenario:
                                                "site": "Site-A", "limit": 500}),
             ]
             return {"events": events}
-        self.run_step(3, "outage recovery (core + Site-A back)", outage_over, 150)
+        self.maybe_step(3, "outage recovery (core + Site-A back)", outage_over, 150)
 
         def flaps():
             # fleet.py's apply() takes the interface index itself as `arg`
             # (demo/fleet.py:570), not a dict.
             return {"events": [self.fleet_event("flap_start", ips=access, arg=7)]}
-        self.run_step(4, "interface flap storm (if 7 on 100 switches)", flaps, 120)
+        self.maybe_step(4, "interface flap storm (if 7 on 100 switches)", flaps, 120)
 
         def reboots():
             return {"events": [self.fleet_event("reboot", ips=reboot_set)]}
-        self.run_step(5, "reboot 20 devices", reboots, 120)
+        self.maybe_step(5, "reboot 20 devices", reboots, 120)
 
         def auth_fail():
             return {"events": [self.fleet_event("auth_fail_on", ips=auth_set)]}
-        self.run_step(6, "SNMP auth failure on 5 devices", auth_fail, 90)
+        self.maybe_step(6, "SNMP auth failure on 5 devices", auth_fail, 90)
 
         def bursts():
             duration = max(5, int(60 * self.scale))
@@ -948,7 +990,7 @@ class Scenario:
                                ["--tcp", "--framing", "octet"]),
             ]
             return {"generators": sum(1 for p in started if p is not None)}
-        self.run_step(7, "trap + syslog burst (storm mix, TCP octet framing)",
+        self.maybe_step(7, "trap + syslog burst (storm mix, TCP octet framing)",
                       bursts, 75)
 
         def netflow():
@@ -956,7 +998,7 @@ class Scenario:
             started = self.generator("netflow", sources, 200, duration,
                                      ["--version", "mixed"])
             return {"generators": 1 if started else 0}
-        self.run_step(8, "netflow burst (mixed v5/v9, 200 flows/s)", netflow, 75)
+        self.maybe_step(8, "netflow burst (mixed v5/v9, 200 flows/s)", netflow, 75)
 
         def recovery():
             events = [
@@ -964,7 +1006,7 @@ class Scenario:
                 self.fleet_event("auth_fail_off", ips=auth_set),
             ]
             return {"events": events}
-        self.run_step(9, "recovery (flaps stop, auth restored)", recovery, 150)
+        self.maybe_step(9, "recovery (flaps stop, auth restored)", recovery, 150)
 
     # -- UI walk ----------------------------------------------------------
 
@@ -1192,6 +1234,12 @@ def main(argv=None) -> int:
     parser.add_argument("--defaults", action="store_true",
                         help="seed with the shipped settings: no threshold, "
                              "grace, interval, worker or mail-cap overrides")
+    parser.add_argument("--steps", default="",
+                        help="run only these incident step numbers, e.g. "
+                             "'2,3' or '1-3,9' (default: all nine) — for a "
+                             "1,000/2,000-device performance tier that does "
+                             "not need every incident re-proven, only "
+                             "re-measured at scale")
     args = parser.parse_args(argv)
 
     scenario = Scenario(args)
