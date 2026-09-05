@@ -5911,14 +5911,23 @@ def _first_run(service) -> bool:
 
 
 def get_session(service, params, body) -> dict:
+    # The version goes to the sign-in page as well as to a signed-in one: it
+    # is the first thing asked for when someone reports a problem, and the
+    # page that shows it to an operator who cannot get in yet is the page
+    # they are looking at. It is not a secret — the login page is served
+    # before any session exists, and so is every asset the version is
+    # stamped on.
+    from .. import __version__
     session = service.sessions.get(params.get("_token", ""))
     if not session:
-        return {"authenticated": False, "first_run": _first_run(service)}
+        return {"authenticated": False, "first_run": _first_run(service),
+                "version": __version__}
     row = service.app_db.user(session["username"])
     idle_remaining = service.sessions.idle_seconds - (time.time() - session["last_seen"])
     return {
         "authenticated": True,
         "username": session["username"],
+        "version": __version__,
         "must_change": bool(row["must_change"]) if row else False,
         "idle_timeout_minutes": service.sessions.idle_seconds // 60,
         "idle_seconds_remaining": max(0, round(idle_remaining)),
