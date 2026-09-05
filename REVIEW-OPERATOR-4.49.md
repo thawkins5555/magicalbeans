@@ -771,12 +771,28 @@ reboot during a run" and there is nowhere to put it.
 > capture and on an hourly sweep, storing pass/fail per device rather than re-running
 > patterns on every page view.
 >
-> **Neither is wired to a route or a screen.** So the operator-facing conclusion below —
-> that the question cannot be asked — remains true today, and section 6's ranking stands.
-> What has changed is that the work behind it is done rather than absent, and the
-> evidentiary claim in the paragraph below ("grepping `netpath/` returns nothing") is now
-> stale: it describes the product as found at the start of this pass, which is what a
-> finding should do, but a reader running that grep today will get two files.
+> **Update, later the same night: both are now wired to routes, neither to a screen.**
+> `server.py` carries `GET /api/configrx/search`, full rule-set and rule CRUD
+> (`/api/configrx/rule-sets`, its `(id)` and `(id)/rules` children), `GET
+> .../rule-sets/(id)/results`, `POST .../rule-sets/(id)/evaluate` and `GET
+> /api/configrx/devices/(id)/compliance` — all gated `configrx: read`/`write`
+> appropriately, and covered by `tests/test_configrx_search_routes.py` and
+> `tests/test_configrx_search_compliance.py`, both passing, including a fixture that ran
+> two real rule sets against five real SSH captures and got the pass/fail split (one clean
+> device, four with a named rule failure each) that a reader can query directly out of
+> `demo/out/configrx_compliance/configrx.db`. So an administrator with a token can already
+> ask the question this finding describes.
+>
+> **`configrx.js` has none of this.** No rule-set editor, no search box, no compliance
+> column on the device list, no way for an operator using the actual web application to
+> reach any of the routes above. So the operator-facing conclusion below — that the
+> question cannot be asked *through the interface* — is still true tonight, and section
+> 6's ranking still stands, but for a narrower reason than it did an hour ago: this is now
+> a UI gap on top of a complete, tested backend, not an absent feature. The evidentiary
+> claim in the paragraph below ("grepping `netpath/` returns nothing") is stale twice
+> over now: it describes the product as found at the start of this pass, which is what a
+> finding should do, but a reader running that grep today gets two substantial files and
+> a working API behind them.
 
 **O-5 — ConfigRX stores two thousand configurations and gives you no way to ask a
 question of them. CONFIRMED (exhaustive search of `configrx*.py` and the API).**
@@ -962,7 +978,7 @@ with a persistence requirement was checked against its own cadence:
 | Ten SNMP/ping thresholds — CPU, memory, disk, the four interface rates, discards, response time | `for_polls` 2 | 120 s | **4 min** |
 | The five new UPS/environmental thresholds — load, ambient, chassis, optic, humidity | `for_polls` 2 | 120 s | **4 min** |
 | `ups_on_battery`, `ups_battery_low`, `ups_battery_replace` | `for_polls` 1 | 120 s | up to **2 min** |
-| **`packet_loss_high`** | `for_seconds` 60 — *not* its `for_polls` 2 | 120 s | **~2 min** |
+| **`packet_loss_high`** | `for_seconds` 60 — *not* its `for_polls` 2 | 120 s | **4 min** |
 | `netpath_unreachable`, `netpath_latency_high` | `for_polls` 3 | 300 s | **15 min** |
 | `netpath_path_unstable` | 5 traces inside a one-hour lookback | 300 s | **25 min** before it can evaluate at all |
 | `dhcp_scope_exhaustion` | `for_polls` 1 | 15 min | up to **15 min** |
@@ -971,11 +987,32 @@ with a persistence requirement was checked against its own cadence:
 
 Two things in that table are worth an operator's attention beyond the arithmetic.
 
-**`packet_loss_high` is faster than the rules beside it, and you cannot tell from the rules
-table.** Its tuple carries `for_polls = 2` like its neighbours, but it also sets
-`for_seconds = 60`, and `evaluate_threshold` uses only one of the two — so `for_polls` is
-dead code for this rule. Its real floor is one poll interval, about two minutes, not four.
-Reading the tuple alone gets this wrong.
+**`packet_loss_high` carries two persistence settings, and only one of them runs.** Its
+tuple sets `for_polls = 2` like its neighbours, and `alertsdb.py:624` additionally gives it
+`for_seconds = 60`. `evaluate_threshold` (`alertrules.py:185-190`) returns on `for_seconds`
+before it ever reads `for_polls`, so for this one rule the number shown in the rules table
+is the number that does nothing.
+
+At the shipped cadence the two happen to agree, and the floor above is the 4 minutes its
+neighbours get. The reason is worth stating because it is not obvious and I got it wrong
+first: `breach_seconds` is measured from *sample* timestamps, not wall-clock
+(`alertengine.py:1177-1180`, and the comment there says so), so it does not tick up
+continuously — it jumps 0 → 120 → 240. A 60-second bar sitting inside the first 120-second
+interval is therefore cleared at exactly the same sample as a two-poll streak. Identical
+behaviour, by coincidence of the default interval.
+
+Change the interval and they stop agreeing. At a 30-second poll the `for_seconds = 60` bar
+needs three samples where the displayed `for_polls = 2` needs two — the rule becomes
+*slower* than its own configuration says. At a 300-second poll both need two and they agree
+again. So the defect is not the current timing; it is that a rule shows an operator a
+persistence value that is not the one in force, and the discrepancy appears and disappears
+depending on a setting on another page.
+
+Worth adding: `alertengine.py:1077-1083` documents fixing this same sample-versus-tick
+confusion once already in the engine itself, by gating streak advancement on
+`sample_ts != previous_ts`. Before that fix a 60-second bar *would* have been reachable
+inside one 120-second interval, off twelve five-second ticks. The code is right and the
+comment is good; the rules table is what is out of step.
 
 **And `interface_flapping` is not part of this problem at all.** Despite having its own
 window and transition-count settings, it is evaluated every five-second engine tick against
@@ -1241,6 +1278,26 @@ the better one that replaced it.
 **The three zeros are a finding of their own — see O-27.** After 5,261 polls, no LLDP
 walk, no PoE poll and no STP poll has ever happened, because no persona in the demo fleet
 implements any of those tables.
+
+> **O-31 and O-41 are both fixed in this pass.** `syslogd.py:511-519` no longer does
+> `counters["stored"] += self.db.insert(pending)` — `syslogdb.insert()` now returns
+> `(stored, collapsed)`, and both are added to their own counters (`"collapsed": 0` sits
+> beside `"stored"` in the counters dict), so `messages == stored + collapsed +
+> filtered + dropped` is reconstructible on screen rather than needing the `SUM(repeat_count)`
+> reconciliation below to be run by hand. Surfaced in `syslog.js`'s status line the same way
+> `filtered`/`dropped`/`rejected` already were.
+>
+> And the O-41 mechanism itself — the reason `collapsed` used to undercount a genuine
+> storm — is fixed too. `syslogdb.py:290-381` gives every not-yet-written row a mutable
+> one-element `repeat_count` holder, referenced directly from `_last_row` in place of a row
+> id, so a repeat later in the *same* batch bumps that holder in place instead of finding
+> nothing to bump against and becoming a row of its own. Regression-tested directly against
+> the case that broke: 50 brand-new identical messages fed in one `insert()` call now
+> produce one row with `repeat_count = 50`, not 50 rows — plus the control that a run
+> broken by an *interleaved* different message still does not collapse across the break,
+> and the `SUM(repeat_count)` reconciliation below still holds exactly after the fix, on a
+> randomised 80-batch, 1,717-message workload. The paragraphs below describe the product
+> as found, which is what a finding should do — the code they quote is no longer what ships.
 
 **O-31 — the syslog counters do not balance, so an operator cannot tell deduplication
 from data loss. CONFIRMED (three samples six seconds apart, then traced).** 35,997
@@ -1625,8 +1682,12 @@ deliberately, in the knowledge of what they multiply to, on the first day — an
 1. **No reporting.** Section 5.7 / O-12. I am asked for availability and utilisation
    figures every month by people who do not log in. Today I would have to write the
    SQL myself.
-2. **No configuration compliance and no search across stored configurations.** O-5.
-   This is the second product I would have to keep paying for.
+2. **No configuration compliance and no search across stored configurations, from the
+   interface.** O-5. The backend and the API are built and tested against real
+   captures as of tonight — an administrator with a token could already ask this
+   question — but there is no screen, so through the actual web application it is
+   still unaskable. This is the second product I would have to keep paying for, until
+   `configrx.js` catches up with the work already sitting behind it.
 3. **Alert routing is one mailing list.** O-6, O-7. Every recipient gets everything,
    so within a month nobody reads any of it.
 4. **The rollup needs two thousand manual edits before it works.** O-4. Until then a
@@ -1700,8 +1761,11 @@ if (payload.session.must_change && !state.promptedChange) {
 }
 ```
 
-**Settings is now a lazy module** — introduced by the cold-load work that took the first
-paint from 297 KB to 80 KB gzipped — so `pages.settings` does not exist yet, the branch is
+**Settings is now a lazy module** — introduced by the cold-load work that dropped the
+first paint's script cost from loading all thirteen files unconditionally (section 5.10's
+O-13: 1.17 MB uncompressed, ~324 KB gzipped) to just the three still-eager ones. Measured
+directly: `boot.js` (2,502 B), `app.js` (74,533 B) and `dashboard.js` (4,182 B) gzipped sum
+to **81,217 bytes, ≈79 KB** — so `pages.settings` does not exist yet, the branch is
 skipped silently, and `state.promptedChange = true` is set **unconditionally**, so it
 never retries for the rest of the session.
 
@@ -1721,7 +1785,8 @@ undercut by an operator who was never forced off `admin`/`admin`.
 **A performance change moved a security control's precondition.** That is the class of
 regression which appears in neither the performance review nor the security review,
 because it belongs to neither. Nothing about the lazy-loading work was wrong on its own
-terms; it was measured, tested, and verified at 58 of 58 browser checks.
+terms; it was measured and tested, and this is the one path its own browser walk could
+not exercise, for the reason given below.
 
 **And it was findable only because somebody drove a pristine instance.** Every other test
 in this campaign — every walk, every tier, every screenshot — ran against a seeded

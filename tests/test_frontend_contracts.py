@@ -409,6 +409,30 @@ check("state.promptedChange = true" in must_change_block.split("accountModal({ f
 check("function forcePasswordChange(" not in SETTINGS and "forcePasswordChange," not in SETTINGS,
       "the now-dead one-line delegate is gone from settings.js, not left orphaned")
 
+# ---------------------------------------------------------------------------
+# 18. dateShort/stamp reuse one Intl.DateTimeFormat instead of building one
+#     per call.
+#
+# `date.toLocaleDateString(locale, options)` builds a fresh formatter
+# internally on every call; dateShort is called once per row through
+# timeCell()'s own tooltip title (when(), unconditionally, regardless of
+# whether the row's visible text needs a date at all) — profiled live
+# against the Debug page's event log (up to 2,000 rows, uncapped on its
+# first render): dateShort was the single hottest JS-level function in that
+# page's own 200ms-plus long task. Pinned on the constructor call (not the
+# word "toLocaleDateString", which the explanatory comment above the fix
+# still legitimately says) so a reviewer re-introducing the pattern in a
+# fresh function is what this actually catches.
+check(re.search(r"new Intl\.DateTimeFormat\(", APP), "a cached Intl.DateTimeFormat exists")
+check(APP.count("new Intl.DateTimeFormat(") == 2,
+      "exactly two cached formatters (with year, without) — not rebuilt per call")
+formatting_block = APP[APP.index("function clock("):APP.index("function span(")]
+check(".format(d)" in formatting_block, "dateShort/stamp call .format() on the cached formatter")
+code_lines = [line for line in formatting_block.splitlines() if not line.strip().startswith("//")]
+check(not any("toLocaleDateString" in line for line in code_lines),
+      "no toLocaleDateString call remains in the formatting functions' own code "
+      "(the explanatory comment above the fix still legitimately names it)")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

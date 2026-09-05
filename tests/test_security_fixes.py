@@ -1203,13 +1203,57 @@ end
     check("D11 …and the stored row's own flag is reported, still False",
           payload.get("backup", {}).get("redacted") is False, str(payload))
 
-    # The diff route stays ConfigRX write, unlike the single-backup route
-    # above: a comparison view hands over the same configuration lines.
+    # The diff route was ConfigRX write through 4.48.0 and is ConfigRX read
+    # from 4.49.0. Refusing a comparison of two backups the same account may
+    # already open one at a time was never a boundary — a read-only account
+    # could diff them by eye — so the gate matched get_configrx_backup and
+    # the protection moved to where it does work: get_configrx_diff redacts
+    # unconditionally, ignoring each row's own `redacted` flag. That is
+    # STRICTER than the single-backup route, which still hands a write
+    # account the verbatim text of a store_secrets=True capture.
+    #
+    # `verbatim_id` below is exactly that capture — stored unredacted on
+    # purpose — so this pair is the case that would leak if the second
+    # redaction pass were ever dropped. The check is deliberately not
+    # "status == 200": it is that the secret is absent from the whole
+    # response, whatever shape it takes.
     status, _h, payload = req(
         "GET", f"/api/configrx/diff?device={backup_device}"
         f"&from={stored_id}&to={verbatim_id}", cookie=cx_reader)
-    check("D11 the diff route still needs ConfigRX write",
-          status == 403, f"{status} {payload}")
+    check("D11 a read-only ConfigRX account may now read a diff",
+          status == 200, f"{status} {payload}")
+    check("D11 …and the verbatim side's secret is redacted anyway, "
+          "even though that row is flagged NOT redacted",
+          "pl4nt-wr1te" not in json.dumps(payload), json.dumps(payload)[:400])
+    # This pair is the degenerate case the second redaction pass creates, and
+    # it is worth pinning rather than avoiding. The two rows have genuinely
+    # different stored bytes — different sha256, which the response itself
+    # reports — but one was stored redacted and the other verbatim, so after
+    # get_configrx_diff redacts BOTH the secret reads as the identical
+    # "<redacted>" token on each side and the diff comes back empty.
+    #
+    # Empty is the honest answer to "what changed in the text you are allowed
+    # to see". It is a misleading answer to "did anything change", which is
+    # what an operator clicking Diff is actually asking, and the response as
+    # it stands says both at once: hashes that differ, and a diff that says
+    # nothing does. See O-57 — the response needs to distinguish "identical"
+    # from "differs only in redacted material". Until it does, this asserts
+    # the current behaviour explicitly so the day it changes is a visible
+    # test failure and not a silent one.
+    check("D11 …the two rows really do differ on disk",
+          payload["from"]["sha256"] != payload["to"]["sha256"],
+          f'{payload["from"]["sha256"]} vs {payload["to"]["sha256"]}')
+    check("D11 …yet double redaction collapses the diff to empty, and nothing "
+          "in the response says why (O-57)",
+          payload.get("diff") == "" and payload.get("additions") == 0
+          and payload.get("removals") == 0, str(payload)[:300])
+    status, _h, payload = req(
+        "GET", f"/api/configrx/diff?device={backup_device}"
+        f"&from={stored_id}&to={verbatim_id}", cookie=admin_cookie)
+    check("D11 …and a ConfigRX WRITE account gets the secret redacted too — "
+          "the diff route never serves it to anyone",
+          status == 200 and "pl4nt-wr1te" not in json.dumps(payload),
+          f"{status} {json.dumps(payload)[:400]}")
 
     # ----------------------------------------------------- D12 probe pacing
     from netpath import ipam_scan

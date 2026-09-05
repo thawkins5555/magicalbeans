@@ -544,6 +544,8 @@ class Scenario:
             # campaign's overrides, so the numbers can be read beside a
             # customer's own install rather than only against each other.
             argv.append("--defaults")
+        if getattr(self.args, "ping_interval", None) is not None:
+            argv.extend(["--ping-interval", str(self.args.ping_interval)])
         self.log("[seed] %s" % " ".join(argv))
         seed_log = os.path.join(self.out, "seed-stdout-%d.log" % self.count)
         with open(seed_log, "w", encoding="utf-8") as handle:
@@ -1095,7 +1097,9 @@ class Scenario:
                 "## Seeding",
                 "",
                 "- %s devices added in %ss (%s devices/s) via one "
-                "`POST /api/nodes/devices` each — there is no bulk-add endpoint."
+                "`POST /api/nodes/devices` each. (`POST /api/nodes/devices/"
+                "bulk-import` has existed since 4.47.0; this harness was not "
+                "updated to use it, so this measures the per-device path.)"
                 % (devices.get("added"), devices.get("seconds"),
                    devices.get("devices_per_second")),
                 "",
@@ -1224,6 +1228,16 @@ def main(argv=None) -> int:
                              "this run starts (default 2201)")
     parser.add_argument("--workers", type=int, default=32,
                         help="nodes poll_workers seed.py should set")
+    parser.add_argument("--ping-interval", type=int, default=None,
+                        help="nodes ping_interval_s seed.py should set — "
+                             "passed straight through to seed.py's own "
+                             "--ping-interval. On Windows, where every ping "
+                             "is a real process spawn (~15ms measured), the "
+                             "shipped default of 0 means a large fleet's "
+                             "reachability probes cannot finish inside one "
+                             "poll interval; --ping-interval 300 is the "
+                             "usual remedy to measure against the shipped "
+                             "default")
     parser.add_argument("--skip-ui", action="store_true",
                         help="do not run demo/ui_walk.mjs at the end")
     parser.add_argument("--fast", action="store_true",

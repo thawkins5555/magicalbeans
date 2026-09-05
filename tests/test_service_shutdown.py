@@ -299,6 +299,80 @@ check("...and printed no traceback while doing it",
 
 shutil.rmtree(os.path.join(TMPDIR, "t3"), ignore_errors=True)
 
+
+# --------------------------------------- 4. the node poller, same bug class
+# Same shape as section 3, in NodePoller (netpath/nodepoll.py) rather than
+# the trace scheduler. NodePoller.stop() alone never waited for a poll
+# already running to finish, and tests/test_web_gates.py's own finally
+# block used to paper over exactly this by polling worker_state() for up
+# to 20 seconds before ever calling service.shutdown() -- a workaround at
+# the test level for a bug at the source, now removed from that file since
+# shutdown() does the waiting itself.
+service4 = new_service("t4")
+device_id = service4.nodes_db.add_device("10.0.0.9")
+real_poll_device = service4.node_poller._poll_device
+
+
+def closed_db_poll_device(device, config):
+    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+
+
+service4.node_poller._poll_device = closed_db_poll_device
+
+# 4a. Forced directly, same technique as 3a: _stop set first, exactly as
+# NodePoller.shutdown() would already have done before a poll still in
+# flight could reach a write.
+sys.stderr = captured4 = io.StringIO()
+service4.node_poller._stop.set()
+try:
+    service4.node_poller._run_one(device_id)
+finally:
+    sys.stderr = old_stderr
+    service4.node_poller._stop.clear()
+
+check("a poll that hits a closed database DURING a stop prints no traceback",
+     "Traceback" not in captured4.getvalue(), captured4.getvalue())
+last_message = service4.log.all()[-1].message if service4.log.all() else ""
+check("...and says so plainly in the event log instead of staying silent",
+     "poller stopped" in last_message, last_message)
+
+# 4b. The same exception NOT during a stop is still a real bug.
+sys.stderr = captured5 = io.StringIO()
+try:
+    service4.node_poller._run_one(device_id)   # _stop is clear again here
+finally:
+    sys.stderr = old_stderr
+
+check("the same error NOT during a stop still prints for the node poller too",
+     "Traceback" in captured5.getvalue())
+
+service4.node_poller._poll_device = real_poll_device
+
+# 4c. A device deleted mid-poll, same technique as 3d: the stubbed poll
+# deletes its own device as a side effect before raising the foreign-key
+# error that would really follow, rather than racing two real threads.
+def delete_then_poll(device, config):
+    service4.nodes_db.remove_device(device["id"])
+    raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+
+
+service4.node_poller._poll_device = delete_then_poll
+sys.stderr = captured6 = io.StringIO()
+try:
+    service4.node_poller._run_one(device_id)
+finally:
+    sys.stderr = old_stderr
+    service4.node_poller._poll_device = real_poll_device
+
+check("a device deleted mid-poll prints no traceback",
+     "Traceback" not in captured6.getvalue(), captured6.getvalue())
+last_message = service4.log.all()[-1].message if service4.log.all() else ""
+check("...and says so plainly in the event log instead",
+     "deleted while its poll was running" in last_message, last_message)
+
+service4.shutdown()
+shutil.rmtree(os.path.join(TMPDIR, "t4"), ignore_errors=True)
+
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

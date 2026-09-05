@@ -35,7 +35,9 @@ from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapoids
 from .. import nodeoids
 from .. import configrx
+from .. import configrx_compliance
 from .. import configrx_redact
+from .. import configrx_search
 from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
@@ -3177,6 +3179,15 @@ def _identification_json(service, row) -> dict:
         "learned_from": learned_from,
         "suggest_bundle": suggest,
         "vendor_display": enterprises.display_name(row["vendor_detected"] or row["vendor"] or ""),
+        # The enterprise arc this device's sysObjectID actually sits under,
+        # or None. vendor_source/vendor_confidence alone cannot tell apart
+        # a device with a real but unnamed arc from one that only answers a
+        # generic net-snmp sysObjectID and so has no arc at all — the
+        # second case can never receive VENDOR_HEALTH (keyed by arc), no
+        # matter what MIB work happens, so a device pane needs this to say
+        # "no health metrics because there's no enterprise ID to key them
+        # by" instead of showing a blank pane that reads as a fault.
+        "vendor_arc": row["vendor_arc"] if "vendor_arc" in keys else None,
         "learnable": learnable, "learn_reason": learn_reason,
     }
 
@@ -5189,6 +5200,21 @@ def delete_alerts_rule(service, params, body, rule_id) -> dict:
         raise ValueError("No such rule")
     if row["is_builtin"]:
         raise ValueError("A built-in rule cannot be deleted — disable it instead")
+    # rules.id is alerts.rule_id's ON DELETE CASCADE parent, so a rule with
+    # real history deletes that history along with it — a confirmation
+    # dialog reading only "Remove <name>?" says nothing about that. The
+    # refusal names the count and offers the alternative in the same
+    # sentence, so an operator who wanted the rule gone learns `enabled`
+    # exists at the moment they need it, rather than being told no with
+    # nowhere to go. remove_rule's own WHERE clause refuses this too (see
+    # its docstring) — this check is what turns that into a message an
+    # operator can act on instead of a silent no-op.
+    count = service.alerts_db.alert_count_for_rule(rule_id)
+    if count:
+        raise ValueError(
+            f"{row['name']} has raised {count} alert(s) — deleting it would "
+            f"delete their history too. Disable it instead to stop it firing "
+            f"without losing what it already recorded.")
     service.alerts_db.remove_rule(rule_id)
     service.log.add(ALERTS_CATEGORY, f"Removed alert rule {row['name']}")
     _audit(service, params, "alert_rule.delete", target=row["name"])
@@ -5250,12 +5276,24 @@ def delete_alerts_template(service, params, body, template_id) -> dict:
 def post_alerts_template_preview(service, params, body, template_id) -> dict:
     """Renders against a real recent alert (alert_id in the body) or a
     synthetic sample when none is given, so Preview works even before any
-    alert of that kind has ever fired. Sends nothing."""
+    alert of that kind has ever fired. Sends nothing.
+
+    `subject`/`body`/`is_html` in the request are an in-progress EDIT, not
+    yet saved — when present they render instead of the stored template's
+    own values, falling back to the stored row for whichever of the three
+    is absent. This is what lets a Preview button work against whatever is
+    currently typed into the edit form without saving first: the template
+    row itself is never read for writing here, only for whichever of these
+    three fields the caller did not send a draft for.
+    """
     from .. import alertmail
 
     row = service.alerts_db.template(template_id)
     if not row:
         raise ValueError("No such template")
+    subject = str(body["subject"]) if "subject" in body else row["subject"]
+    template_body = str(body["body"]) if "body" in body else row["body"]
+    is_html = bool(body["is_html"]) if "is_html" in body else bool(row["is_html"])
     alert_id = body.get("alert_id")
     if alert_id:
         alert_row = service.alerts_db.alert(int(alert_id))
@@ -5280,8 +5318,9 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
                   "previous_uptime": "12d 4h", "current_uptime": "0d 0h 2m",
                   "trap_name": "coldStart", "trap_oid": "1.3.6.1.6.3.1.1.5.1",
                   "varbinds": "(sample)"})
-    return {"subject": alertmail.render(row["subject"], context),
-            "body": alertmail.render(row["body"], context)}
+    return {"subject": alertmail.render(subject, context),
+            "body": alertmail.render(template_body, context),
+            "is_html": is_html}
 
 
 def post_alerts_smtp_credential(service, params, body) -> dict:
@@ -6188,6 +6227,189 @@ def post_configrx_worker(service, params, body) -> dict:
     service.bump_config()
     return {"running": service.configrx.running,
             "status": service.configrx.status_text()}
+
+
+# ------------------------------------------------------- search + compliance
+#
+# netpath/configrx_search.py and netpath/configrx_compliance.py: cross-device
+# config search, and the compliance rule sets that turn a repeated search
+# into a standing pass/fail column. Both modules already redact/bound
+# everything that needs it (see their own module docstrings) — these routes
+# are the thin dispatch on top, matching this file's own gate convention
+# (search and compliance results never carry an unredacted secret or a
+# matched line respectively, so both read as "configrx", R; rule-set/rule
+# CRUD changes monitoring policy, so "configrx", W, the same split
+# device-config/credential POST routes already use).
+
+def _configrx_search_json(service, result: dict) -> dict:
+    """search()'s raw {device_id, line_no, line} rows, with each match's
+    device name/ip hydrated in from one batch fetch rather than a
+    nodes_db.device() call per match."""
+    device_ids = {m["device_id"] for m in result["matches"]}
+    devices = {row["id"]: row for row in service.nodes_db.devices_by_ids(device_ids)}
+    matches = []
+    for m in result["matches"]:
+        device = devices.get(m["device_id"])
+        matches.append({
+            "device_id": m["device_id"],
+            "device_name": hostresolve.device_name(device) if device else None,
+            "device_ip": device["ip"] if device else None,
+            "line_no": m["line_no"], "line": m["line"],
+        })
+    return {"matches": matches, "truncated": result["truncated"], "indexed": result["indexed"]}
+
+
+CONFIGRX_SEARCH_MAX_LIMIT = 2000
+
+
+def get_configrx_search(service, params, body) -> dict:
+    """One query against every device's latest redacted capture — see
+    configrx_search.search. `mode=regex` runs a bounded regular expression
+    (configrx_search.UnsafeRegex, a ValueError subclass, reaches server.py's
+    ordinary ValueError->400 handling unchanged, so a refused pattern comes
+    back as a plain 400 naming what was wrong with it, not a 500)."""
+    query = str(params.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    mode = str(params.get("mode") or "text")
+    device_ids = _id_list(params.get("device"))
+    limit = max(1, min(int(_num(params, "limit", configrx_search.DEFAULT_LIMIT, int)
+                        or configrx_search.DEFAULT_LIMIT), CONFIGRX_SEARCH_MAX_LIMIT))
+    result = configrx_search.search(service.configrx_db, query, mode=mode,
+                                    device_ids=device_ids, limit=limit)
+    return _configrx_search_json(service, result)
+
+
+def get_configrx_rule_sets(service, params, body) -> dict:
+    enabled_only = str(params.get("enabled_only", "")).strip().lower() in ("1", "true", "yes")
+    return {"rule_sets": [dict(r) for r in
+                          service.configrx_db.rule_sets(enabled_only=enabled_only)]}
+
+
+def post_configrx_rule_set(service, params, body) -> dict:
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("A name is required")
+    device_group_id = body.get("device_group_id")
+    rule_set_id = configrx_compliance.add_rule_set(
+        service.configrx_db, name, int(device_group_id) if device_group_id else None)
+    service.log.add(CONFIGRX_CATEGORY, f"Added ConfigRX rule set {name}")
+    _audit(service, params, "configrx.rule_set.create", target=name)
+    return {"id": rule_set_id}
+
+
+def get_configrx_rule_set(service, params, body, rule_set_id) -> dict:
+    row = service.configrx_db.rule_set(rule_set_id)
+    if not row:
+        raise ValueError("No such rule set")
+    return {"rule_set": dict(row)}
+
+
+def put_configrx_rule_set(service, params, body, rule_set_id) -> dict:
+    # Fetched before the update — update_rule_set itself never reads the
+    # row it is about to change.
+    before = service.configrx_db.rule_set(rule_set_id)
+    if not before:
+        raise ValueError("No such rule set")
+    fields = {k: v for k, v in body.items() if k in ("name", "device_group_id", "enabled")}
+    service.configrx_db.update_rule_set(rule_set_id, **fields)
+    detail = _audit_diff(before, fields)
+    if detail:
+        _audit(service, params, "configrx.rule_set.update", target=before["name"],
+              detail=detail)
+    return {"ok": True}
+
+
+def delete_configrx_rule_set(service, params, body, rule_set_id) -> dict:
+    row = service.configrx_db.rule_set(rule_set_id)
+    if not row:
+        raise ValueError("No such rule set")
+    service.configrx_db.delete_rule_set(rule_set_id)
+    service.log.add(CONFIGRX_CATEGORY, f"Removed ConfigRX rule set {row['name']}")
+    _audit(service, params, "configrx.rule_set.delete", target=row["name"])
+    return {"ok": True}
+
+
+def get_configrx_rule_set_rules(service, params, body, rule_set_id) -> dict:
+    if not service.configrx_db.rule_set(rule_set_id):
+        raise ValueError("No such rule set")
+    return {"rules": [dict(r) for r in service.configrx_db.rules_for(rule_set_id)]}
+
+
+def post_configrx_rule_set_rule(service, params, body, rule_set_id) -> dict:
+    row = service.configrx_db.rule_set(rule_set_id)
+    if not row:
+        raise ValueError("No such rule set")
+    description = str(body.get("description", "")).strip()
+    kind = str(body.get("kind", ""))
+    pattern = str(body.get("pattern", ""))
+    ordinal = int(body.get("ordinal", 0) or 0)
+    # configrx_compliance.add_rule raises ValueError for a bad kind or an
+    # empty description, and configrx_search.UnsafeRegex (itself a
+    # ValueError) for a pattern unsafe to ever run — all three reach
+    # server.py's ordinary ValueError->400 handling unchanged.
+    rule_id = configrx_compliance.add_rule(
+        service.configrx_db, rule_set_id, description, kind, pattern, ordinal)
+    _audit(service, params, "configrx.rule.create", target=row["name"],
+          detail=f"{kind}: {description}")
+    return {"id": rule_id}
+
+
+def delete_configrx_rule_set_rule(service, params, body, rule_set_id, rule_id) -> dict:
+    rule_set = service.configrx_db.rule_set(rule_set_id)
+    if not rule_set:
+        raise ValueError("No such rule set")
+    rule = next((r for r in service.configrx_db.rules_for(rule_set_id)
+                if r["id"] == int(rule_id)), None)
+    if rule is None:
+        raise ValueError("No such rule")
+    service.configrx_db.delete_rule(rule_id)
+    _audit(service, params, "configrx.rule.delete", target=rule_set["name"],
+          detail=rule["description"])
+    return {"ok": True}
+
+
+def post_configrx_rule_set_evaluate(service, params, body, rule_set_id) -> dict:
+    """The manual "re-evaluate now" action — automatic evaluation already
+    happens on every new capture and on ConfigRxWorker's own hourly sweep,
+    so this exists for an operator who just edited a rule set and does not
+    want to wait for either."""
+    row = service.configrx_db.rule_set(rule_set_id)
+    if not row:
+        raise ValueError("No such rule set")
+    count = configrx_compliance.evaluate_all(
+        service.configrx_db, service.nodes_db, rule_set_id=rule_set_id)
+    _audit(service, params, "configrx.rule_set.evaluate", target=row["name"],
+          detail=f"{count} device(s) evaluated")
+    return {"evaluated": count}
+
+
+def _compliance_result_json(row) -> dict:
+    try:
+        failed_rules = json.loads(row["failed_rules"]) if row["failed_rules"] else []
+    except (TypeError, ValueError):
+        failed_rules = []
+    return {"device_id": row["device_id"], "rule_set_id": row["rule_set_id"],
+           "status": row["status"], "failed_rules": failed_rules,
+           "backup_id": row["backup_id"], "evaluated_ts": row["evaluated_ts"]}
+
+
+def get_configrx_rule_set_results(service, params, body, rule_set_id) -> dict:
+    """Every device's latest result for one rule set — the column a
+    2,000-row device list reads, one query rather than one per device."""
+    if not service.configrx_db.rule_set(rule_set_id):
+        raise ValueError("No such rule set")
+    rows = service.configrx_db.compliance_results_for_rule_set(rule_set_id)
+    return {"results": [_compliance_result_json(r) for r in rows]}
+
+
+def get_configrx_device_compliance(service, params, body, device_id) -> dict:
+    """The per-device tab equivalent of the route above: every rule set's
+    latest result for one device."""
+    if not service.nodes_db.device(device_id):
+        raise ValueError("No such device")
+    rows = service.configrx_db.compliance_results_for_device(device_id)
+    return {"results": [_compliance_result_json(r) for r in rows]}
 
 
 # ------------------------------------------------------------- ssh host keys

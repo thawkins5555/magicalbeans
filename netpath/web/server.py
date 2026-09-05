@@ -488,6 +488,30 @@ ROUTES = [
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
+    # Cross-device config search and compliance rule sets (netpath/
+    # configrx_search.py, netpath/configrx_compliance.py) — search results
+    # and compliance results never carry an unredacted secret or a matched
+    # line respectively (see both modules' own docstrings), so both read
+    # as a plain configrx read, matching diff/backup's own R gate above;
+    # rule-set/rule CRUD changes monitoring policy, so W.
+    ("GET", r"^/api/configrx/search$", api.get_configrx_search, ("configrx", R)),
+    ("GET", r"^/api/configrx/rule-sets$", api.get_configrx_rule_sets, ("configrx", R)),
+    ("POST", r"^/api/configrx/rule-sets$", api.post_configrx_rule_set, ("configrx", W)),
+    ("GET", r"^/api/configrx/rule-sets/(\d+)$", api.get_configrx_rule_set, ("configrx", R)),
+    ("PUT", r"^/api/configrx/rule-sets/(\d+)$", api.put_configrx_rule_set, ("configrx", W)),
+    ("DELETE", r"^/api/configrx/rule-sets/(\d+)$", api.delete_configrx_rule_set, ("configrx", W)),
+    ("GET", r"^/api/configrx/rule-sets/(\d+)/rules$",
+     api.get_configrx_rule_set_rules, ("configrx", R)),
+    ("POST", r"^/api/configrx/rule-sets/(\d+)/rules$",
+     api.post_configrx_rule_set_rule, ("configrx", W)),
+    ("DELETE", r"^/api/configrx/rule-sets/(\d+)/rules/(\d+)$",
+     api.delete_configrx_rule_set_rule, ("configrx", W)),
+    ("GET", r"^/api/configrx/rule-sets/(\d+)/results$",
+     api.get_configrx_rule_set_results, ("configrx", R)),
+    ("POST", r"^/api/configrx/rule-sets/(\d+)/evaluate$",
+     api.post_configrx_rule_set_evaluate, ("configrx", W)),
+    ("GET", r"^/api/configrx/devices/(\d+)/compliance$",
+     api.get_configrx_device_compliance, ("configrx", R)),
     # The remembered SSH host key for a device: shown and forgotten in
     # ConfigRX's device dialog, so both routes are ConfigRX's. Forgetting is
     # what lets the next connection accept a new key, and configrx write
