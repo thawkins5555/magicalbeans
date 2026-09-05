@@ -432,10 +432,13 @@ ROUTES = [
     # write gets it redacted rather than 403ing outright.
     ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
     # A diff hands over the device's own configuration lines exactly as
-    # reading one backup's content does (see get_configrx_backup's own
-    # comment above), so it is gated the same way — matched before the
-    # "(\d+)" backup route above could ever apply, though "diff" would
-    # never match \d+ anyway.
+    # reading one backup's content does, and until this release the two were
+    # gated identically. They are not any more: the content route above is a
+    # read, and this one is still a write. Worth stating plainly rather than
+    # leaving the older "gated the same way" comment to say otherwise — and
+    # worth revisiting, since a caller who can fetch two backups can diff
+    # them without this route at all. Matched before the "(\d+)" backup route
+    # above could ever apply, though "diff" would never match \d+ anyway.
     ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", W)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),

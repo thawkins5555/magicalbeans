@@ -66,9 +66,18 @@ use `spawn_stub("<script>.py")` for an agent, and keep the file name
 script and not standard-library-only: it drives a real Chromium through
 Playwright, because the things it checks — that a table has `scope` and
 `aria-sort`, that focus returns to the trigger when a dialog closes, that a hash
-route restores a selection, that no page error is thrown across twelve tabs —
-cannot be checked any other way. It is deliberately outside `run_all.py`, which
-stays dependency-free.
+route restores a selection, that no page error is thrown across twelve tabs,
+that ArrowRight moves both focus and selection on a nested `.subtabs` group,
+that a status timeline segment's colour-blind texture resolves against its
+own chart's `<defs>` rather than whichever chart's landed in the DOM first —
+cannot be checked any other way. Its own count of `role="tab"` is taken
+against `#tabs` specifically, not the whole document: Nodes, Alerts and
+IPAM's `.subtabs` groups are genuine nested tablists now, with their own
+`role="tablist"`/`"tab"`/`"tabpanel"`, so a
+document-wide count of either role is no longer twelve or one, and counting it
+that way would be asserting a number that stopped being true rather than the
+contract the top strip actually has. It is deliberately outside `run_all.py`,
+which stays dependency-free.
 
 It needs a running application with data behind it:
 
