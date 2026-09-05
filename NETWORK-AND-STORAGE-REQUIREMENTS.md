@@ -103,7 +103,7 @@ reachable.
 | Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers |
 | Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
 | Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
-| ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, never a push |
+| ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, plus, for a vendor whose login shell is not already privileged EXEC (currently just Cisco ASA), a fixed `enable` step; never a push |
 
 Traceroute probes go to every destination you add, and to every router on the
 path to it. Firewalls between here and a destination need to permit the probe
@@ -152,8 +152,10 @@ connection, and the one place it depends on a third-party library
 documented exception, made specifically so an SSH password never has to
 travel on a command line or appear in a process list; see
 `CREDENTIAL-SECURITY.md`. It only ever runs one fixed, read-only "show
-config" command per connection, never anything that could change a
-device's configuration.
+config" command per connection — plus, for a vendor without a privileged
+login shell (currently just Cisco ASA), the fixed `enable` command,
+answered with that device's own stored enable secret — never anything
+that could change a device's configuration.
 
 ### Local
 
@@ -196,7 +198,7 @@ directory can be read-only.
 | `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials | Device count × poll frequency × metrics per device |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
 | `wireless.db` | Controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials | Controller count × AP count per controller — normally small, a handful of controllers rather than hundreds |
-| `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
+| `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH and enable-mode credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
 
 The split is deliberate. The nine record files each hold one module's data
 and that module's own settings; nothing else goes in them. Configuration
@@ -211,11 +213,12 @@ One caveat specific to `ipam.db`, `nodes.db`, `alerts.db`, `wireless.db`
 and `configrx.db`: any stored credential in them — a DHCP server's
 password, a device or polling profile's SNMPv3 auth password, the SMTP
 password, a Wireless controller's SNMP auth password, a ConfigRX SSH
-password — is encrypted with Windows DPAPI, tied to the machine that
-encrypted it. Restoring one of these files onto different hardware
-brings the credential's existence back but not its usability — DPAPI
-will not decrypt it there, and the credential needs re-entering on the
-new machine. Everything else in each file restores normally.
+password, a ConfigRX enable secret — is encrypted with Windows DPAPI,
+tied to the machine that encrypted it. Restoring one of these files onto
+different hardware brings the credential's existence back but not its
+usability — DPAPI will not decrypt it there, and the credential needs
+re-entering on the new machine. Everything else in each file restores
+normally.
 
 All ten sit in one folder, chosen at first run:
 
