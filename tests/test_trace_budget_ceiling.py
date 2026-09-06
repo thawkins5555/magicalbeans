@@ -23,7 +23,7 @@ print("B1  the worst individually-legal combination is bounded — and this is "
 
 # db.py's own MAX_MAX_HOPS / MAX_PROBES / MAX_TIMEOUT_S, all at once -- every
 # one of these three values, alone, is accepted by the API route's own
-# validation (scenario-metrics' test_target_validation.py covers that side);
+# validation (test_target_validation.py covers that side);
 # this is what happens when a caller sets all three on the same target.
 MAX_HOPS, MAX_PROBES, MAX_TIMEOUT_S = 255, 20, 30.0
 
